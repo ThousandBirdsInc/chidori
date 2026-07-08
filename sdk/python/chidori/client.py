@@ -87,7 +87,7 @@ class Session:
     # None for plain `input()` pauses and non-signal states.
     pending_signal_name: str | None = None
     # The full awaited name set: `[name]` for `chidori.signal(name)`, the
-    # listen set for `chidori.signalAny(names)`. Empty for non-signal states.
+    # listen set for the fan-in `chidori.signal(names)`. Empty for non-signal states.
     pending_signal_names: list[str] = field(default_factory=list)
     # Absolute deadline (ISO timestamp) for a signal pause created with
     # `timeoutMs`; the server resolves the pause with the `{timedOut: true}`

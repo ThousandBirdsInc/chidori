@@ -493,14 +493,14 @@ pub(crate) fn run_module(
         Rc::new(move |effect: &str, args: &Value| h.call(effect, args))
     };
     engine.install_chidori_effects(dispatch);
-    // Install the JS-level `chidori` SDK sugar (tryCall/retry/parallel + the
-    // memory.set/get/delete/clear wrappers).
-    // These are pure-JS helpers layered on top of the native host object, so they
-    // must run *after* `install_chidori_effects` (the memory sugar wraps the
-    // native `chidori.memory`, and the script's guarded workspace shim no-ops
-    // because the rust engine already exposes a native `chidori.workspace`).
-    // Without this the meta-agent's `chidori.retry(...)`/`chidori.parallel(...)`
-    // calls hit `undefined is not a function`.
+    // Install the JS-level `chidori` SDK sugar (chidori.util.{tryCall,retry,
+    // parallel}, the chidori.memory namespace, and the chidori.actors handle
+    // wrappers). These are pure-JS helpers layered on top of the native host
+    // object, so they must run *after* `install_chidori_effects` (the memory
+    // and actors sugar wrap their native bindings, and the script's guarded
+    // workspace shim no-ops because the rust engine already exposes a native
+    // `chidori.workspace`). Without this, `chidori.util.retry(...)` /
+    // `chidori.memory.set(...)` calls hit `undefined is not a function`.
     engine
         .eval_cached(crate::runtime::typescript::helpers::CHIDORI_JS_HELPERS_SCRIPT)
         .map_err(|e| anyhow::anyhow!("installing chidori JS SDK helpers: {e}"))?;
@@ -1216,10 +1216,10 @@ mod tests {
         // braces and TS object braces stay literal.
         let src = r#"
             export async function agent(input: { name: string }) {
-                await chidori.checkpoint("start", { n: 1 });
+                await chidori.mark("start", { n: 1 });
                 const greeting = await chidori.template("Hello {{ name }}", { name: input.name });
-                await chidori.memory("set", "greeting", greeting, { namespace: "__NS__" });
-                const back = await chidori.memory("get", "greeting", null, { namespace: "__NS__" });
+                await chidori.memory.set("greeting", greeting, { namespace: "__NS__" });
+                const back = await chidori.memory.get("greeting", { namespace: "__NS__" });
                 return { greeting, back };
             }
         "#
@@ -1242,7 +1242,7 @@ mod tests {
 
         let records = ctx.call_log().into_records();
         let fns: Vec<&str> = records.iter().map(|r| r.function.as_str()).collect();
-        assert!(fns.contains(&"checkpoint"), "missing checkpoint: {fns:?}");
+        assert!(fns.contains(&"mark"), "missing mark: {fns:?}");
         assert!(fns.contains(&"template"), "missing template: {fns:?}");
         assert_eq!(
             fns.iter().filter(|f| **f == "memory").count(),
@@ -1260,7 +1260,7 @@ mod tests {
         // clear) is loaded from CHIDORI_JS_HELPERS_SCRIPT and installed after
         // the native host object. The agent below never defines
         // these itself, so it only passes if the engine layered them on — a
-        // regression guard for the meta-agent's `chidori.retry`/`chidori.parallel`
+        // regression guard for `chidori.util.retry`/`chidori.util.parallel`
         // calls, which otherwise hit "undefined is not a function".
         let ctx = RuntimeContext::new();
         let dir = std::env::temp_dir().join(format!("chidori-rust-sdk-{}", uuid::Uuid::new_v4()));
@@ -1269,23 +1269,23 @@ mod tests {
         let src = r#"
             export async function agent() {
                 let attempts = 0;
-                const value = await chidori.retry(async () => {
+                const value = await chidori.util.retry(async () => {
                     attempts += 1;
                     if (attempts < 2) throw new Error("flaky");
                     return 42;
                 }, { attempts: 3 });
-                const par = await chidori.parallel([
+                const par = await chidori.util.parallel([
                     async () => "a",
                     async () => "b",
                 ], { concurrency: 2 });
                 // Promise.all idiom: promises and plain values are accepted
                 // alongside thunks instead of throwing "must be a function".
-                const parMixed = await chidori.parallel([
+                const parMixed = await chidori.util.parallel([
                     Promise.resolve("p"),
                     "v",
                     async () => "t",
                 ]);
-                const caught = await chidori.tryCall(async () => { throw new Error("boom"); });
+                const caught = await chidori.util.tryCall(async () => { throw new Error("boom"); });
                 return {
                     value,
                     attempts,

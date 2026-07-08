@@ -43,9 +43,7 @@ export interface PromptOptions {
   system?: string;
   model?: string;
   maxTokens?: number;
-  max_tokens?: number;
   maxTurns?: number;
-  max_turns?: number;
   temperature?: number;
   tools?: string[];
   format?: "json" | (string & {});
@@ -64,12 +62,12 @@ export interface PromptOptions {
 export interface LlmResponseJson {
   content: string;
   blocks: AgentJson[];
-  tool_calls: { id: string; name: string; input: AgentJson }[];
-  stop_reason: string;
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
+  toolCalls: { id: string; name: string; input: AgentJson }[];
+  stopReason: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
 }
 
 /** Options for `Context.compact()` — explicit, opt-in window compaction. */
@@ -269,6 +267,8 @@ export interface Signal<T = AgentJson> {
   name: string;
   payload: T;
   from: SignalSender;
+  /** Never set on a delivered signal — the discriminant against {@link SignalTimeout}, so `if (result.timedOut)` narrows. */
+  timedOut?: undefined;
 }
 
 export interface SignalOptions {
@@ -285,7 +285,7 @@ export interface SignalOptions {
  * The sentinel a `timeoutMs` listen point resolves to when the deadline passes
  * with no matching delivery — a timeout resolves to this sentinel rather than
  * rejecting (`docs/signals.md`). `name` is the single awaited name, or `null`
- * for a multi-name `signalAny`.
+ * for a multi-name fan-in listen.
  */
 export interface SignalTimeout {
   name: string | null;
@@ -347,6 +347,203 @@ export interface RetryOptions {
   backoff?: "fixed" | "exponential";
 }
 
+/**
+ * What the runtime does when an actor iteration fails (`docs/actors.md`):
+ * - `"never"` (default) — the failure is the actor's final outcome;
+ * - `"clean"` — re-run the actor's module from scratch (fresh log, the
+ *   spawn-time filesystem anchor, the original input);
+ * - `"resume"` — replay the actor's accumulated call log with the trailing
+ *   failed records stripped, so completed work returns from cache and the
+ *   failing call itself retries live.
+ */
+export type ActorRestartStrategy = "never" | "clean" | "resume";
+
+export interface SpawnActorOptions {
+  /** Register the actor under a name for `actors.lookup`/`actors.send` addressing. */
+  name?: string;
+  /** Restart strategy applied when an iteration fails. Default `"never"`. */
+  restart?: ActorRestartStrategy;
+  /** Restart intensity cap (default 3). */
+  maxRestarts?: number;
+  /** Base delay between restarts, doubling per attempt (default 0). */
+  backoffMs?: number;
+  /**
+   * How long the actor may sit at an empty-mailbox listen point with no
+   * explicit `timeoutMs` before the runtime parks it as a `paused` outcome
+   * (default 300 000 ms).
+   */
+  idleTimeoutMs?: number;
+}
+
+/** How an actor's supervision loop settled. */
+export type ActorOutcomeStatus = "completed" | "failed" | "paused" | "stopped";
+
+/** The settlement `actors.join()`/`actors.stop()` resolve to. */
+export interface ActorOutcome<T extends AgentJson = AgentJson> {
+  pid: string;
+  status: ActorOutcomeStatus;
+  /** The actor's return value, when `status` is `"completed"`. */
+  output?: T;
+  /** The final failure, when `status` is `"failed"`. */
+  error?: string;
+  /** What the actor is parked on, when `status` is `"paused"`. */
+  pendingPrompt?: string;
+  /** How many supervised restarts the actor consumed. */
+  restarts: number;
+}
+
+/**
+ * What a `join`/`stop` with `timeoutMs` resolves to when the deadline passes
+ * before the actor settles: a snapshot, not a settlement — nothing merged,
+ * join again later. Discriminate with `outcome.status === "running"`.
+ */
+export interface ActorStillRunning {
+  pid: string;
+  status: "running";
+  restarts: number;
+}
+
+export interface ActorStatus {
+  pid: string;
+  status: ActorOutcomeStatus | "running" | "waiting" | "unknown";
+  restarts?: number;
+  /** Messages queued and not yet consumed. */
+  mailbox?: number;
+  /** The listen-point names a `"waiting"` actor is parked on. */
+  waitingFor?: string[];
+}
+
+/** A message consumed from a mailbox. */
+export interface ActorMessage<T = AgentJson> {
+  name: string;
+  payload: T;
+  /** Sender identity: `id` is the sending actor's pid, or `"run"`. */
+  from: SignalSender;
+  /** Never set on a delivered message — the discriminant against {@link SignalTimeout}. */
+  timedOut?: undefined;
+}
+
+export interface ReceiveOptions {
+  /** Resolve to the `{ timedOut: true }` sentinel after this many ms. */
+  timeoutMs?: number;
+}
+
+export interface JoinActorOptions {
+  /**
+   * Give up waiting after this many ms: the join resolves to
+   * {@link ActorStillRunning} without settling the actor — join again later.
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * A spawned actor's handle: its address plus its lifecycle methods, so code
+ * reads `worker.send(...)` / `worker.join()` instead of threading pid strings.
+ * Pure sugar — every method is one recorded durable host call, identical to
+ * the string-addressed forms on {@link Actors}.
+ */
+export interface ActorHandle {
+  pid: string;
+  /** The registered name, when the spawn options provided one. */
+  name: string | null;
+  send<T extends AgentJson = AgentJson>(name: string, payload?: T): Promise<{ delivered: boolean }>;
+  join<T extends AgentJson = AgentJson>(): Promise<ActorOutcome<T>>;
+  join<T extends AgentJson = AgentJson>(
+    options: JoinActorOptions,
+  ): Promise<ActorOutcome<T> | ActorStillRunning>;
+  stop<T extends AgentJson = AgentJson>(): Promise<ActorOutcome<T>>;
+  stop<T extends AgentJson = AgentJson>(
+    options: JoinActorOptions,
+  ): Promise<ActorOutcome<T> | ActorStillRunning>;
+  status(): Promise<ActorStatus>;
+}
+
+/**
+ * `chidori.actors` — supervised, message-passing actor processes
+ * (`docs/actors.md`). `spawn` starts another agent module as a concurrent,
+ * addressable sub-run with a durable mailbox and a restart policy; actors can
+ * spawn their own children, forming a supervision tree (settling is
+ * owner-only, `"parent"` addresses the owner, and supervisors reap their
+ * children). Every method is a recorded durable call: a replay re-runs
+ * nothing.
+ */
+export interface Actors {
+  spawn<TInput extends AgentJson = JsonObject>(
+    source: string,
+    input?: TInput,
+    options?: SpawnActorOptions,
+  ): Promise<ActorHandle>;
+  /**
+   * Deliver a named message to a mailbox. `to` is a pid, a registered name,
+   * or `"parent"` (the sender's spawner: its owning actor, or the run for a
+   * top-level actor). Never blocks; `delivered` is false once the target has
+   * settled.
+   */
+  send<T extends AgentJson = AgentJson>(
+    to: string,
+    name: string,
+    payload?: T,
+  ): Promise<{ delivered: boolean }>;
+  /** String-addressed `join` — see {@link ActorHandle.join}. Owner-only. */
+  join<T extends AgentJson = AgentJson>(target: string): Promise<ActorOutcome<T>>;
+  join<T extends AgentJson = AgentJson>(
+    target: string,
+    options: JoinActorOptions,
+  ): Promise<ActorOutcome<T> | ActorStillRunning>;
+  /**
+   * Request a cooperative stop (honored between iterations, at mailbox waits,
+   * and during restart backoff — a live LLM/tool call finishes first), then
+   * settle and merge exactly like `join`. Owner-only.
+   */
+  stop<T extends AgentJson = AgentJson>(target: string): Promise<ActorOutcome<T>>;
+  stop<T extends AgentJson = AgentJson>(
+    target: string,
+    options: JoinActorOptions,
+  ): Promise<ActorOutcome<T> | ActorStillRunning>;
+  /** A durable snapshot of an actor's lifecycle. */
+  status(target: string): Promise<ActorStatus>;
+  /** Registry lookup: a handle for the actor registered under `name`, or `null`. */
+  lookup(name: string): Promise<ActorHandle | null>;
+}
+
+/**
+ * `chidori.memory` — the persistent, namespaced key-value store. Values are
+ * JSON; `options.namespace` scopes keys (default `"default"`).
+ */
+export interface MemoryStore {
+  set<T extends AgentJson = AgentJson>(key: string, value: T, options?: JsonObject): Promise<void>;
+  get<T extends AgentJson = AgentJson>(key: string, options?: JsonObject): Promise<T | null>;
+  delete(key: string, options?: JsonObject): Promise<void>;
+  /** List entries, optionally filtered with `options.prefix`. */
+  list(options?: JsonObject): Promise<AgentJson[]>;
+  clear(options?: JsonObject): Promise<void>;
+}
+
+/**
+ * `chidori.util` — in-VM control-flow helpers. Unlike everything else on the
+ * host object these are pure JavaScript and record NOTHING: only the durable
+ * calls made inside your callbacks appear in the journal.
+ */
+export interface ChidoriUtil {
+  parallel<TTasks extends readonly (() => Promise<unknown>)[]>(
+    tasks: TTasks,
+    options?: ParallelOptions,
+  ): Promise<{ [Index in keyof TTasks]: Awaited<ReturnType<TTasks[Index]>> }>;
+  retry<T>(fn: () => Promise<T>, options?: RetryOptions): Promise<T>;
+  tryCall<T>(fn: () => Promise<T>): Promise<TryCallResult<T>>;
+}
+
+/**
+ * `chidori.appData` — the agent-run application-data store (generative-UI
+ * runs). Writes and queries execute through the host boundary (the agent
+ * never holds a credential) and are journaled like every other effect;
+ * `params` bind server-side (`$1`, `$2`, …), never string-concatenated.
+ */
+export interface AppData {
+  write(sql: string, params?: AgentJson[]): Promise<AgentJson>;
+  query(sql: string, params?: AgentJson[]): Promise<AgentJson>;
+}
+
 export interface TryCallResult<T> {
   ok: boolean;
   value?: T;
@@ -357,7 +554,6 @@ export interface TemplateOptions {
   source?: "file" | "inline";
 }
 
-export type MemoryAction = "get" | "set" | "delete" | "list" | "clear";
 
 export type WorkspaceFileStatus = "complete" | "writing" | "failed";
 
@@ -423,10 +619,14 @@ export interface Chidori {
    * is already queued in the durable mailbox), then resolve to
    * `{ name, payload, from }`. The inverse of `input()`: the run idles cheaply
    * on disk and an outside party delivers via `POST /sessions/{id}/signal`.
+   * Pass an array for fan-in — the resolved signal's `name` says which fired;
+   * pre-arrived candidates are consumed in delivery order. Reach for `signal`
+   * when the delivery comes from OUTSIDE the process; use `receive` for actor
+   * messages.
    */
-  signal<T = AgentJson>(name: string): Promise<Signal<T>>;
+  signal<T = AgentJson>(name: string | string[]): Promise<Signal<T>>;
   signal<T = AgentJson>(
-    name: string,
+    name: string | string[],
     options: SignalOptions,
   ): Promise<Signal<T> | SignalTimeout>;
   /**
@@ -436,17 +636,6 @@ export interface Chidori {
    */
   pollSignal<T = AgentJson>(name: string): Promise<Signal<T> | null>;
   /**
-   * Fan-in: pause until ANY of the named signals is delivered (or one is
-   * already queued in the durable mailbox). Resolves to the bare consumed
-   * signal — its `name` says which fired. Pre-arrived candidates are consumed
-   * in delivery order (lowest `delivery_seq` across the whole name set).
-   */
-  signalAny<T = AgentJson>(names: string[]): Promise<Signal<T>>;
-  signalAny<T = AgentJson>(
-    names: string[],
-    options: SignalOptions,
-  ): Promise<Signal<T> | SignalTimeout>;
-  /**
    * Durable value checkpoint: run `fn` once and journal its JSON-serializable
    * result; on replay/resume the recorded value (or error) is returned without
    * re-running `fn`. Wrap expensive deterministic computation in a step so a
@@ -455,6 +644,12 @@ export interface Chidori {
    * writes, timers, and async callbacks are refused inside a step.
    */
   step<T extends AgentJson = AgentJson>(name: string, fn: () => T): Promise<T>;
+  /**
+   * Run another agent module inline and return its output — a synchronous
+   * child call sharing this run's context and log. Of the three module
+   * runners: need the answer inline → `callAgent`; comparing strategies →
+   * `branch`; coordinating concurrent processes → `actors.spawn`.
+   */
   callAgent<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson>(
     path: string,
     input?: TInput,
@@ -470,25 +665,42 @@ export interface Chidori {
     variants: BranchVariant[],
     options?: BranchOptions,
   ): Promise<BranchOutcome<T>[]>;
+  /**
+   * Supervised actor processes: spawn agent modules as concurrent,
+   * addressable sub-runs with durable mailboxes, supervision trees, and
+   * restart policies (`docs/actors.md`).
+   */
+  actors: Actors;
+  /**
+   * Blocking, in-place message consumption: inside an actor, drains the
+   * actor's own mailbox; in the spawning run, drains messages actors sent to
+   * `"parent"` (and any pre-queued external signals). Unlike `signal()` —
+   * which pauses the whole run so an external party can resume it — `receive`
+   * waits in place and is woken directly by in-process senders. Reach for
+   * `receive` for actor messages; use `signal` for external deliveries.
+   */
+  receive<T = AgentJson>(names: string | string[]): Promise<ActorMessage<T>>;
+  receive<T = AgentJson>(
+    names: string | string[],
+    options: ReceiveOptions,
+  ): Promise<ActorMessage<T> | SignalTimeout>;
   tool<TArgs extends JsonObject = JsonObject, TResult extends AgentJson = AgentJson>(
     name: string,
     args?: TArgs,
   ): Promise<TResult>;
-  parallel<TTasks extends readonly (() => Promise<unknown>)[]>(
-    tasks: TTasks,
-    options?: ParallelOptions,
-  ): Promise<{ [Index in keyof TTasks]: Awaited<ReturnType<TTasks[Index]>> }>;
-  retry<T>(fn: () => Promise<T>, options?: RetryOptions): Promise<T>;
-  tryCall<T>(fn: () => Promise<T>): Promise<TryCallResult<T>>;
+  /** In-VM control-flow helpers (`parallel`, `retry`, `tryCall`) — pure JS, never recorded. */
+  util: ChidoriUtil;
   template(pathOrText: string, vars?: JsonObject, options?: TemplateOptions): Promise<string>;
   log(message: string, fields?: JsonObject): Promise<void>;
-  memory<T extends AgentJson = AgentJson>(
-    action: MemoryAction,
-    key?: string,
-    value?: T,
-    options?: JsonObject,
-  ): Promise<T | AgentJson[] | null>;
-  checkpoint(label?: string, data?: AgentJson): Promise<void>;
+  /** The persistent, namespaced key-value store. */
+  memory: MemoryStore;
+  /** The journaled agent-run application-data store (generative-UI runs). */
+  appData: AppData;
+  /**
+   * Record a labelled trace marker in the call log — an annotation, nothing
+   * more. (The durable VALUE checkpoint is `chidori.step`.)
+   */
+  mark(label?: string, data?: AgentJson): Promise<void>;
 }
 
 export type AgentFunction<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson> = (

@@ -194,7 +194,7 @@ fn host_operation_kind(function: &str) -> Option<PendingHostOperationKind> {
         "http" => Some(PendingHostOperationKind::Http),
         "template" => Some(PendingHostOperationKind::Template),
         "memory" => Some(PendingHostOperationKind::Memory),
-        "checkpoint" => Some(PendingHostOperationKind::Checkpoint),
+        "mark" => Some(PendingHostOperationKind::Checkpoint),
         "log" => Some(PendingHostOperationKind::Log),
         "signal" | "poll_signal" | "signal_any" => Some(PendingHostOperationKind::Signal),
         _ => None,
@@ -281,10 +281,10 @@ fn signal_names(args: &Value) -> Result<Vec<String>> {
                 .map(|v| v.as_str().map(str::to_string))
                 .collect::<Option<Vec<_>>>()
         })
-        .ok_or_else(|| anyhow::anyhow!("chidori.signalAny requires an array of names"))?
-        .ok_or_else(|| anyhow::anyhow!("chidori.signalAny names must all be strings"))?;
+        .ok_or_else(|| anyhow::anyhow!("chidori.signal fan-in requires an array of names"))?
+        .ok_or_else(|| anyhow::anyhow!("chidori.signal fan-in names must all be strings"))?;
     if names.is_empty() {
-        anyhow::bail!("chidori.signalAny requires at least one name");
+        anyhow::bail!("chidori.signal fan-in requires at least one name");
     }
     Ok(names)
 }
@@ -394,7 +394,7 @@ pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     Err(anyhow::anyhow!("{PAUSE_MARKER}: signal {name}"))
 }
 
-/// `chidori.signalAny(names, opts)` — the fan-in listen point (`docs/signals.md`
+/// `chidori.signal(names[], opts)` — the fan-in listen point (`docs/signals.md`
 /// §6.1): pause until ANY of the named signals is delivered (or one is already
 /// queued). Same shape as `execute_signal` with the match key `{ "names":
 /// [...] }` and function name `"signal_any"`. The result is the bare consumed
@@ -1003,16 +1003,16 @@ pub fn llm_response_to_json(response: &LlmResponse) -> Value {
     json!({
         "content": response.content,
         "blocks": response.blocks,
-        "tool_calls": response.tool_calls.iter().map(|call| json!({
+        "toolCalls": response.tool_calls.iter().map(|call| json!({
             "id": call.id,
             "name": call.name,
             "input": call.input,
         })).collect::<Vec<_>>(),
-        "stop_reason": response.stop_reason,
-        "input_tokens": response.input_tokens,
-        "output_tokens": response.output_tokens,
-        "cache_creation_tokens": response.cache_creation_tokens,
-        "cache_read_tokens": response.cache_read_tokens,
+        "stopReason": response.stop_reason,
+        "inputTokens": response.input_tokens,
+        "outputTokens": response.output_tokens,
+        "cacheCreationTokens": response.cache_creation_tokens,
+        "cacheReadTokens": response.cache_read_tokens,
     })
 }
 
@@ -1021,7 +1021,7 @@ pub fn llm_response_from_json(value: &Value) -> Option<LlmResponse> {
         content: value.get("content")?.as_str()?.to_string(),
         blocks: serde_json::from_value::<Vec<ContentBlock>>(value.get("blocks")?.clone()).ok()?,
         tool_calls: value
-            .get("tool_calls")?
+            .get("toolCalls")?
             .as_array()?
             .iter()
             .filter_map(|call| {
@@ -1032,16 +1032,15 @@ pub fn llm_response_from_json(value: &Value) -> Option<LlmResponse> {
                 })
             })
             .collect(),
-        stop_reason: value.get("stop_reason")?.as_str()?.to_string(),
-        input_tokens: value.get("input_tokens")?.as_u64()?,
-        output_tokens: value.get("output_tokens")?.as_u64()?,
-        // Absent in records written before prompt caching existed.
+        stop_reason: value.get("stopReason")?.as_str()?.to_string(),
+        input_tokens: value.get("inputTokens")?.as_u64()?,
+        output_tokens: value.get("outputTokens")?.as_u64()?,
         cache_creation_tokens: value
-            .get("cache_creation_tokens")
+            .get("cacheCreationTokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
         cache_read_tokens: value
-            .get("cache_read_tokens")
+            .get("cacheReadTokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
     })

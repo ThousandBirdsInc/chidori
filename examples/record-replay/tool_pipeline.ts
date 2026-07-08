@@ -28,7 +28,7 @@ export async function agent(
   });
 
   // The explicit tuple type keeps each branch's result type distinct.
-  const [weather, fx] = await chidori.parallel<
+  const [weather, fx] = await chidori.util.parallel<
     [() => Promise<Weather>, () => Promise<Fx>]
   >([
     () => chidori.tool<{ lat: number; lng: number }, Weather>("weather", {
@@ -42,7 +42,7 @@ export async function agent(
     `${city}: ${weather.tempC}°C, ${weather.conditions}. ` +
     `1 ${currency} = $${fx.usdPerUnit.toFixed(4)}.`;
 
-  await chidori.memory("set", `briefing:${city}`, { city, currency, briefing });
+  await chidori.memory.set(`briefing:${city}`, { city, currency, briefing });
 
   return { city, currency, briefing };
 }

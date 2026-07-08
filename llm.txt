@@ -95,8 +95,8 @@ Options:
   `"subagent"`, or `"final"`.
 - `model`: provider model override.
 - `system`: system prompt for this call.
-- `maxTokens` or `max_tokens`: output token cap.
-- `maxTurns` or `max_turns`: cap on provider tool-use turns.
+- `maxTokens`: output token cap.
+- `maxTurns`: cap on provider tool-use turns.
 - `temperature`: sampling temperature.
 - `tools`: registered tool names available to provider tool-use loops.
 - `format`: `"json"` parses the reply as JSON (falls back to the raw string).
@@ -137,7 +137,7 @@ first reads the shared prefix at the discounted cached rate.
 - `prompt(options?)` → `{ text, context }`: send, return the answer plus the
   context extended with the assistant turn (including any tool-use exchange).
 - `respond(options?)` → `{ response, context }`: one structured turn for
-  author-driven tool loops (`response.tool_calls`, `response.blocks`).
+  author-driven tool loops (`response.toolCalls`, `response.blocks`).
 - `digest()` → stable content hash of the assembled request, also recorded in
   each prompt's call-log args as `request_digest`.
 - `estimateTokens()` → rough local size estimate for window budgeting.
@@ -182,7 +182,7 @@ shared prefix at the cached rate each turn.
   assistant reply text; the dialogue advances in place. `options` are
   per-turn `PromptOptions` (override the conversation defaults).
 - `respond(message, options?)` → `Promise<LlmResponseJson>`: like `say()` but
-  returns the structured response (`tool_calls`, `blocks`) for author-driven
+  returns the structured response (`toolCalls`, `blocks`) for author-driven
   tool loops; append results with `chat.context.toolResult(...)`, then `say()`.
 - `loop(options?)` → `Promise<{role,text}[]>`: drive an interactive dialogue —
   read each human message via `chidori.input()` (terminal stdin under
@@ -217,7 +217,7 @@ const answer = await chidori.input("Approve this request?", {
 In server mode, `input()` pauses the session. Resume it with
 `POST /sessions/{id}/resume` or `AgentClient.resume(id, response)`.
 
-### signal / pollSignal / signalAny
+### signal / pollSignal
 
 ```ts
 // Pause at a named listen point until an outside party (human or agent)
@@ -227,13 +227,14 @@ const review = await chidori.signal("review");
 
 // With timeoutMs, resolves to { timedOut: true } after the deadline.
 const r = await chidori.signal("review", { timeoutMs: 60000 });
-if ("timedOut" in r && r.timedOut) { /* nobody answered */ }
+if (r.timedOut) { /* nobody answered */ }
 
 // Non-blocking: consume a queued signal or get null (recorded, replayable).
 const steer = await chidori.pollSignal("steer");
 
-// Fan-in: pause until ANY listed name fires; result.name says which.
-const fired = await chidori.signalAny(["review", "steer"]);
+// Fan-in: pass an array to pause until ANY listed name fires; result.name
+// says which.
+const fired = await chidori.signal(["review", "steer"]);
 ```
 
 Every consumed signal is recorded in the call log, so multiplayer sessions
@@ -259,18 +260,19 @@ const child = await chidori.callAgent("child.ts", { topic: "snapshots" });
 Sub-agents share the parent runtime context and call log. Runtime dispatch
 accepts TypeScript `.ts` sub-agents only.
 
-### parallel
+### util.parallel
 
 ```ts
-const [a, b] = await chidori.parallel([
+const [a, b] = await chidori.util.parallel([
   () => chidori.prompt("Draft option A", { type: "draft" }),
   () => chidori.prompt("Draft option B", { type: "draft" }),
 ]);
 ```
 
-The TypeScript helper uses `Promise.all` semantics;
-`options.concurrency` caps in-flight tasks. Host execution is not durably
-parallel.
+An in-VM helper with `Promise.all` semantics; `options.concurrency` caps
+in-flight tasks. Everything under `chidori.util` is pure JavaScript control
+flow and records nothing itself — only the durable calls made inside the
+tasks appear in the journal.
 
 ### branch
 
@@ -307,6 +309,60 @@ chidori branch-rerun <run-id> <branch-id>                   # re-run edited sour
 A resumed or re-run branch updates only its own store; the parent's recorded
 `branch` outcome is immutable history. See `docs/branching-execution.md`.
 
+### actors: spawn / send / receive / join / stop / status / lookup
+
+```ts
+// Start an agent module as a supervised, addressable, concurrent process.
+// spawn returns a HANDLE: the actor's address plus its lifecycle methods.
+const worker = await chidori.actors.spawn("workers/researcher.ts", { topic }, {
+  name: "researcher",      // optional registry name for actors.lookup / actors.send
+  restart: "resume",       // "never" (default) | "clean" | "resume"
+  maxRestarts: 3,
+  backoffMs: 500,          // doubles per attempt
+});
+
+// Message passing (never blocks). String-addressed sends take a pid, a
+// registered name, or "parent" (the sender's spawner).
+await worker.send("focus", { region: "EU" });
+await chidori.actors.send("researcher", "focus", { region: "EU" });
+
+// Blocking in-place consumption, in delivery order; fan-in via an array.
+const msg = await chidori.receive("draft");   // { name, payload, from: { kind, id } }
+const any = await chidori.receive(["draft", "cancel"], { timeoutMs: 60000 });
+if (any.timedOut) { /* deadline passed */ }
+
+// Settle: fold the actor's records into this run's log and get the outcome.
+const outcome = await worker.join();
+// → { pid, status: "completed"|"failed"|"paused"|"stopped", output?, error?, restarts }
+await worker.stop();                          // cooperative stop, then join
+await worker.status();                        // { pid, status, restarts, mailbox, waitingFor? }
+await chidori.actors.lookup("researcher");    // a handle, or null
+```
+
+Actors are supervised siblings of branches (`docs/actors.md`): each runs its
+own source module on an isolated VM and its records occupy a reserved,
+disjoint sequence range, but an actor is detached and addressable — it runs
+concurrently on its own thread with a durable mailbox. Inside an actor,
+`chidori.signal`/`pollSignal` consume actor messages too (the mailbox uses
+the signal envelope; `from.id` is the sending actor's pid, or `"run"`), and
+`receive` waits in place without pausing the run. Restart strategies:
+`clean` re-runs from scratch; `resume` replays the actor's accumulated log
+minus the trailing failed records, so completed work returns from cache and
+only the failing call retries. Every primitive is a durable call — replay of
+the spawning run re-runs nothing — and a crash before a join re-creates the
+actor on resume from the recorded spawn/send records.
+
+Actors form **supervision trees**: an actor can spawn its own supervised
+children (each level carves child sequence ranges out of its own, bounding
+depth at four actor levels), `"parent"` addresses the sender's spawner (the
+owning actor, or the run for a top-level actor), and join/stop are owner-only
+— an actor is settled by whoever spawned it. Supervisors reap their children:
+when an actor settles (or discards its log on a `clean` restart) its
+still-live children are cooperatively stopped and their registered names
+released; a `resume` restart keeps children (cached spawn records return the
+same live pids). A run may spawn at most 128 actors in total, restarted
+children included.
+
 ### http (fetch / node:http)
 
 There is no `chidori.http`. Use the standard `fetch` API (or the
@@ -340,11 +396,11 @@ Use templates for reusable prompt text. Inline templates are also supported.
 ### memory
 
 ```ts
-await chidori.memory("set", "draft", { text: "..." });
-const draft = await chidori.memory("get", "draft");
-const keys = await chidori.memory("list");
-await chidori.memory("delete", "draft");
-await chidori.memory("clear");
+await chidori.memory.set("draft", { text: "..." });
+const draft = await chidori.memory.get("draft");
+const keys = await chidori.memory.list();
+await chidori.memory.delete("draft");
+await chidori.memory.clear();
 ```
 
 Memory actions are logged and replay-aware.
@@ -389,14 +445,15 @@ Agents get a virtual `document` / `window`. `renderDOM()` flushes the pending
 DOM mutation batch as a journaled `dom_render` effect — recorded live, served
 from the journal on replay. See `docs/dom-runtime-prototype.md`.
 
-### checkpoint
+### mark
 
 ```ts
-await chidori.checkpoint("after-draft", { tokens: 120 });
+await chidori.mark("after-draft", { tokens: 120 });
 ```
 
-`checkpoint()` records an explicit call-log marker. Persisted runs also refresh
-snapshot manifest metadata at durable host safepoints.
+`mark()` records a labelled call-log marker — an annotation for the trace,
+nothing more (the durable VALUE checkpoint is `chidori.step`). Persisted runs
+also refresh snapshot manifest metadata at durable host safepoints.
 
 ### step
 
@@ -420,15 +477,15 @@ await chidori.log("Fetched candidates", { count: 3 });
 
 Use structured logs for progress and debugging. Logs are call-log records.
 
-### retry and tryCall
+### util.retry and util.tryCall
 
 ```ts
-const value = await chidori.retry(
+const value = await chidori.util.retry(
   () => fetch("https://example.com").then((r) => r.json()),
   { attempts: 3 },
 );
 
-const result = await chidori.tryCall(() => chidori.tool("maybe_fails", {}));
+const result = await chidori.util.tryCall(() => chidori.tool("maybe_fails", {}));
 if (!result.ok) {
   await chidori.log("Tool failed", { error: result.error });
 }
@@ -491,7 +548,7 @@ Stream event types:
 - `prompt_start`: prompt stream started.
 - `prompt_delta`: incremental token text.
 - `prompt_end`: prompt stream ended.
-- `paused`: the run paused at a `signal()` / `signalAny()` listen point and
+- `paused`: the run paused at a `signal()` listen point and
   stays live; a delivered signal (or the timeout deadline) resumes it on the
   same stream.
 - `done`: run completed, failed, or paused.

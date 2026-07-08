@@ -16,19 +16,24 @@ API reference.
 | `chidori.template(strOrPath, vars)` | Render a Jinja2 template with minijinja |
 | `chidori.tool(name, args)` | Invoke a registered tool |
 | `chidori.callAgent(path, input)` | Call a sub-agent |
-| `chidori.parallel(fns)` | Run functions concurrently |
+| `chidori.util.parallel(fns)` | Run functions concurrently (in-VM helper — records nothing itself) |
 | `chidori.branch(variants)` | Fork the run into per-strategy sub-runs from the current state; returns every outcome for comparison ([details](./branching-execution.md)) |
+| `chidori.actors.spawn(source, input, options)` | Start an agent module as a supervised, addressable, concurrent actor process with a durable mailbox and restart policy; returns a handle with `send`/`join`/`stop`/`status` ([details](./actors.md)) |
+| `chidori.actors.send(to, name, payload)` | Deliver a named message to an actor (pid or registered name) or to `"parent"` (the sender's spawner); never blocks |
+| `chidori.receive(names, options)` | Blocking in-place message consumption from the caller's mailbox (fan-in via an array; `timeoutMs` resolves to the timeout sentinel) |
+| `chidori.actors.join(target, options)` / `chidori.actors.stop(target, options)` | Settle an actor (owner-only): wait for its supervision loop, fold its records into this run's log, return `{ status, output?, error?, restarts }` |
+| `chidori.actors.status(target)` / `chidori.actors.lookup(name)` | Lifecycle snapshot / name-registry lookup (a handle, or `null`) |
 | `chidori.input(msg, options)` | Human-in-the-loop — pauses execution |
 | `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued; `timeoutMs` resolves to a `{ timedOut: true }` sentinel after the deadline |
 | `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
-| `chidori.signalAny(names, options)` | Fan-in — pause until ANY of the named signals is delivered; the result's `name` says which fired |
-| `chidori.memory(action, ...)` | Persistent key-value storage, namespaced on disk |
+| `chidori.signal(names[], options)` | Fan-in — pass an array to pause until ANY of the named signals is delivered; the result's `name` says which fired |
+| `chidori.memory.set/get/delete/list/clear` | Persistent key-value storage, namespaced on disk |
 | `chidori.workspace.{list,read,write,delete,manifest}` | Shared workspace files under the run's workspace root — policy-gated, recorded like every other effect |
 | `chidori.log(msg, data)` | Structured logging |
-| `chidori.checkpoint(label, data)` | Record an explicit call-log marker for trace/replay |
+| `chidori.mark(label, data)` | Record a labelled trace marker in the call log (the durable *value* checkpoint is `chidori.step`) |
 | `chidori.step(name, fn)` | Durable value checkpoint — run pure compute once, journal the result, never re-pay it on replay/resume |
-| `chidori.retry(fn, options)` | Retry with backoff |
-| `chidori.tryCall(fn)` | Capture errors without raising |
+| `chidori.util.retry(fn, options)` | Retry with backoff (in-VM helper) |
+| `chidori.util.tryCall(fn)` | Capture errors without raising (in-VM helper) |
 
 There is no `chidori.http`. Networking is done with the **standard web/Node
 APIs** — `fetch` (plus `Headers`/`Request`/`Response`) and the
@@ -48,6 +53,7 @@ const data = await res.json();
 ```
 
 See also [`docs/signals.md`](./signals.md) for the multiplayer signal model,
+[`docs/actors.md`](./actors.md) for the actor process model,
 [`docs/value-checkpoints.md`](./value-checkpoints.md) for `chidori.step`, and
 [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md)
 for the captured networking/filesystem/crypto/timer model.
@@ -65,7 +71,7 @@ const answer = await chidori.prompt("Write the final answer", { type: "final" })
 When using `--stream` or `POST /sessions/stream`, prompt calls emit
 `prompt_start`, `prompt_delta`, and `prompt_end` events with `stream_id`,
 `seq`, and `prompt_type`. This also works for prompts inside
-`chidori.parallel(...)` branches and `chidori.callAgent(...)` sub-agents. See
+`chidori.util.parallel(...)` fan-outs and `chidori.callAgent(...)` sub-agents. See
 [`examples/agents/streaming_progress.ts`](../examples/agents/streaming_progress.ts).
 
 ## Prompt caching

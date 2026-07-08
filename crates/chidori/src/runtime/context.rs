@@ -192,6 +192,15 @@ struct RuntimeContextInner {
     /// for *every* execution path that runs through the prompt bindings — the
     /// native agent loop and the TypeScript interactive engine alike.
     pub model_override: Option<ModelOverride>,
+    /// The run's actor hub (spawned actor sub-runs, their mailboxes, and the
+    /// name registry — `docs/actors.md`). Created lazily by the first
+    /// `chidori.actors.spawn`; actor sub-run contexts share the spawning run's
+    /// hub so sends, receives, and lookups all address one table.
+    pub actor_hub: Option<Arc<crate::runtime::host_actor::ActorHub>>,
+    /// Set on actor sub-run contexts: this context's pid in the hub. Routes
+    /// `chidori.receive` to the actor's own mailbox, stamps outgoing message
+    /// senders, and scopes join/stop to the owning spawner.
+    pub actor_id: Option<String>,
 }
 
 /// Host-supplied callback returning the current model override, or `None` to
@@ -245,7 +254,7 @@ pub struct PendingSignal {
     /// (`signalAny`). Kept as the primary name for views and messages.
     pub name: String,
     /// The full awaited name set. `[name]` for `chidori.signal(name)`; the
-    /// listen set for `chidori.signalAny(names)`. A delivery matching ANY of
+    /// listen set for the fan-in `chidori.signal(names[])`. A delivery matching ANY of
     /// these resolves the pause.
     #[serde(default)]
     pub names: Vec<String>,
@@ -347,6 +356,8 @@ impl RuntimeContext {
                 vfs: vfs_from_seed_env(),
                 is_branch: false,
                 model_override: None,
+                actor_hub: None,
+                actor_id: None,
             })),
         }
     }
@@ -414,6 +425,8 @@ impl RuntimeContext {
                 vfs,
                 is_branch: false,
                 model_override: None,
+                actor_hub: None,
+                actor_id: None,
             })),
         }
     }
@@ -451,6 +464,8 @@ impl RuntimeContext {
                 vfs: vfs_from_seed_env(),
                 is_branch: false,
                 model_override: None,
+                actor_hub: None,
+                actor_id: None,
             })),
         }
     }
@@ -498,6 +513,8 @@ impl RuntimeContext {
                 vfs: parent_inner.vfs.clone(),
                 is_branch: true,
                 model_override: parent_inner.model_override.clone(),
+                actor_hub: None,
+                actor_id: None,
             })),
         }
     }
@@ -546,6 +563,69 @@ impl RuntimeContext {
                 vfs,
                 is_branch: true,
                 model_override: None,
+                actor_hub: None,
+                actor_id: None,
+            })),
+        }
+    }
+
+    /// Build the context for one iteration of a spawned actor sub-run
+    /// (`docs/actors.md`). Like [`for_branch`](Self::for_branch), the parent's
+    /// config, workspace root, model override, streaming sink, and OTEL run are
+    /// inherited and the sequence counter starts at `base_seq` (the actor's
+    /// reserved range start minus one). Unlike a branch:
+    /// - `replay_log` carries the actor's own accumulated records, because the
+    ///   actor's supervision loop re-enters the source module on every message
+    ///   wait and restart (the standard resume-by-replay model);
+    /// - `signal_inbox` carries the actor mailbox entries left unconsumed by
+    ///   the previous iteration;
+    /// - the parent's `actor_hub` is shared, so the actor can send to siblings
+    ///   and to the parent;
+    /// - the call stack starts empty: top-level records are stamped with the
+    ///   parent's `join_actor` seq when they merge, not at record time (the
+    ///   join seq is unknown while the actor runs).
+    ///
+    /// Input mode is `Pause` so a `chidori.input()` inside an actor surfaces as
+    /// a paused outcome instead of reading stdin on a background thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_actor(
+        parent: &RuntimeContext,
+        actor_id: String,
+        base_seq: u64,
+        replay_log: Vec<CallRecord>,
+        vfs: Vfs,
+        signal_inbox: Vec<QueuedSignal>,
+        hub: Arc<crate::runtime::host_actor::ActorHub>,
+    ) -> Self {
+        let parent_inner = parent.inner.lock().unwrap();
+        Self {
+            inner: Arc::new(Mutex::new(RuntimeContextInner {
+                config: parent_inner.config.clone(),
+                call_log: CallLog::new(),
+                seq: base_seq,
+                replay_log: Some(replay_log),
+                run_id: actor_id.clone(),
+                persist_dir: None,
+                input_mode: InputMode::Pause,
+                pending_input: None,
+                pending_approval: None,
+                pending_signal: None,
+                active_step: None,
+                signal_inbox,
+                host_promises: HostPromiseTable::new(),
+                event_sender: parent_inner.event_sender.clone(),
+                emit_call_events: parent_inner.emit_call_events,
+                otel_run: parent_inner.otel_run.clone(),
+                host_operation_safepoint: None,
+                host_operation_completion_safepoint: None,
+                workspace_root: parent_inner.workspace_root.clone(),
+                call_stack: Vec::new(),
+                capabilities: CapabilityLedger::new(),
+                vfs,
+                is_branch: false,
+                model_override: parent_inner.model_override.clone(),
+                actor_hub: Some(hub),
+                actor_id: Some(actor_id),
             })),
         }
     }
@@ -553,6 +633,26 @@ impl RuntimeContext {
     /// Whether this context belongs to a `chidori.branch` sub-run.
     pub fn is_branch(&self) -> bool {
         self.inner.lock().unwrap().is_branch
+    }
+
+    /// The pid of the actor sub-run this context belongs to, if any.
+    pub fn actor_id(&self) -> Option<String> {
+        self.inner.lock().unwrap().actor_id.clone()
+    }
+
+    /// The run's actor hub, if one has been created.
+    pub fn actor_hub(&self) -> Option<Arc<crate::runtime::host_actor::ActorHub>> {
+        self.inner.lock().unwrap().actor_hub.clone()
+    }
+
+    /// The run's actor hub, created on first use (the first
+    /// `chidori.actors.spawn` in the run).
+    pub fn ensure_actor_hub(&self) -> Arc<crate::runtime::host_actor::ActorHub> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .actor_hub
+            .get_or_insert_with(|| Arc::new(crate::runtime::host_actor::ActorHub::new()))
+            .clone()
     }
 
     /// The run's persistence directory, when persistence is enabled. Branch
@@ -1088,7 +1188,7 @@ impl RuntimeContext {
     }
 
     /// As [`take_queued_signal`](Self::take_queued_signal), but matching ANY of
-    /// `names` (the `chidori.signalAny` fan-in drain). The lowest-`delivery_seq`
+    /// `names` (the `chidori.signal(names[])` fan-in drain). The lowest-`delivery_seq`
     /// entry across the whole set wins, so two queued candidates with different
     /// names are consumed in arrival order — and that choice is frozen into the
     /// recorded result.

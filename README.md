@@ -263,6 +263,11 @@ human-in-the-loop pause/resume loop — see
   [signals](./docs/signals.md) until a human or another agent delivers a payload.
 - **Branching exploration** — fork a run into per-strategy sub-runs and compare
   every outcome ([branching execution](./docs/branching-execution.md)).
+- **Supervised multi-agent processes** — spawn agent modules as concurrent,
+  addressable [actors](./docs/actors.md) with durable mailboxes, message
+  passing, supervision trees, and runtime-owned restart policies — including
+  restart-with-history, which replays an actor's completed work and retries
+  only the failing call.
 - **Cost-efficient prompting** — structural [prompt
   caching](./docs/context-management.md) re-bills stable prefixes at the cached
   rate, and replay pays zero tokens.
@@ -319,6 +324,7 @@ deterministic, replayable, and testable for free.
 | [Sandbox & security model](./docs/sandbox-model.md) | Deny-by-default policy, capability injection, resource limits |
 | [Context management & caching](./docs/context-management.md) | Immutable contexts, compaction, cost accounting |
 | [Signals & multiplayer](./docs/signals.md) | Named listen points, mailboxes, fan-in |
+| [Actors & supervision](./docs/actors.md) | Spawned agent processes, message passing, supervision trees, restart strategies |
 | [Python SDK](./sdk/python/README.md) · [TypeScript SDK](./sdk/typescript/README.md) | HTTP clients with no native bindings |
 | [`llm.txt`](./llm.txt) | Complete API reference, optimized for LLMs generating agents |
 

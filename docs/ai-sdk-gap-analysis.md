@@ -221,7 +221,7 @@ Gap:
 
 ### 8. Memory Ecosystem
 
-Chidori has a durable `chidori.memory(...)` host API and replay-aware memory
+Chidori has a durable `chidori.memory.*` host API and replay-aware memory
 operations.
 
 AI SDK documents provider-defined memory tools and integrations with memory

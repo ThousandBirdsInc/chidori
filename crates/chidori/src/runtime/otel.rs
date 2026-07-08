@@ -808,7 +808,7 @@ mod tests {
                 "{f} should map to SpanKind::Client"
             );
         }
-        for f in ["input", "template", "log", "checkpoint", "workspace"] {
+        for f in ["input", "template", "log", "mark", "workspace"] {
             assert!(
                 matches!(span_kind_for(f), SpanKind::Internal),
                 "{f} should map to SpanKind::Internal"

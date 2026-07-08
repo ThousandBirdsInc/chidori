@@ -4542,7 +4542,7 @@ mod tests {
         panic!("session {id} never reached {status:?}");
     }
 
-    /// `chidori.signalAny([..])` pauses on the whole listen set, advertises it
+    /// `chidori.signal([..])` pauses on the whole listen set, advertises it
     /// in the session view, and a delivery matching ANY listed name resolves
     /// the pause; the recorded call replays as `signal_any` with its `{names}`
     /// match key and the bare fired signal as result.
@@ -4554,7 +4554,7 @@ mod tests {
             &temp_dir,
             r#"
                 export async function agent(input, chidori) {
-                    const fired = await chidori.signalAny(["review", "steer"]);
+                    const fired = await chidori.signal(["review", "steer"]);
                     return { fired: fired.name, payload: fired.payload, by: fired.from.id };
                 }
             "#,
@@ -4707,7 +4707,7 @@ mod tests {
             &temp_dir,
             r#"
                 export async function agent(input, chidori) {
-                    const result = await chidori.signalAny(["a", "b"], { timeoutMs: 150 });
+                    const result = await chidori.signal(["a", "b"], { timeoutMs: 150 });
                     return { timedOut: result.timedOut === true, name: result.name };
                 }
             "#,

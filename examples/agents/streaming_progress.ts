@@ -6,7 +6,7 @@ export async function agent(input: { topic: string }, chidori: Chidori) {
     { type: "progress", maxTokens: 80 },
   );
 
-  const drafts = await chidori.parallel([
+  const drafts = await chidori.util.parallel([
     async () =>
       chidori.prompt("Draft two implementation risks for: " + input.topic, {
         type: "draft",

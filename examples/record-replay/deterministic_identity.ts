@@ -22,7 +22,7 @@ export async function agent(input: { prefix?: string }, chidori: Chidori) {
   // Derive a deterministic branch from the recorded id so the choice replays too.
   const lane = minted.epochMs % 2 === 0 ? "fast" : "slow";
 
-  await chidori.memory("set", "identity", { id: minted.id, lane });
+  await chidori.memory.set("identity", { id: minted.id, lane });
 
   return { runId: minted.id, startedAt: minted.epochMs, lane };
 }
