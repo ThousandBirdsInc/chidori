@@ -194,12 +194,12 @@ struct RuntimeContextInner {
     pub model_override: Option<ModelOverride>,
     /// The run's actor hub (spawned actor sub-runs, their mailboxes, and the
     /// name registry — `docs/actors.md`). Created lazily by the first
-    /// `chidori.spawnActor`; actor sub-run contexts share the spawning run's
+    /// `chidori.actors.spawn`; actor sub-run contexts share the spawning run's
     /// hub so sends, receives, and lookups all address one table.
     pub actor_hub: Option<Arc<crate::runtime::host_actor::ActorHub>>,
     /// Set on actor sub-run contexts: this context's pid in the hub. Routes
     /// `chidori.receive` to the actor's own mailbox, stamps outgoing message
-    /// senders, and forbids nested `spawnActor`/`joinActor` inside an actor.
+    /// senders, and scopes join/stop to the owning spawner.
     pub actor_id: Option<String>,
 }
 
@@ -254,7 +254,7 @@ pub struct PendingSignal {
     /// (`signalAny`). Kept as the primary name for views and messages.
     pub name: String,
     /// The full awaited name set. `[name]` for `chidori.signal(name)`; the
-    /// listen set for `chidori.signalAny(names)`. A delivery matching ANY of
+    /// listen set for the fan-in `chidori.signal(names[])`. A delivery matching ANY of
     /// these resolves the pause.
     #[serde(default)]
     pub names: Vec<String>,
@@ -646,7 +646,7 @@ impl RuntimeContext {
     }
 
     /// The run's actor hub, created on first use (the first
-    /// `chidori.spawnActor` in the run).
+    /// `chidori.actors.spawn` in the run).
     pub fn ensure_actor_hub(&self) -> Arc<crate::runtime::host_actor::ActorHub> {
         let mut inner = self.inner.lock().unwrap();
         inner
@@ -1188,7 +1188,7 @@ impl RuntimeContext {
     }
 
     /// As [`take_queued_signal`](Self::take_queued_signal), but matching ANY of
-    /// `names` (the `chidori.signalAny` fan-in drain). The lowest-`delivery_seq`
+    /// `names` (the `chidori.signal(names[])` fan-in drain). The lowest-`delivery_seq`
     /// entry across the whole set wins, so two queued candidates with different
     /// names are consumed in arrival order — and that choice is frozen into the
     /// recorded result.

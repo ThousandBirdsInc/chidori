@@ -7,15 +7,24 @@
 import type { SignalSender } from "./agent.js";
 
 export type {
+  ActorHandle,
   ActorMessage,
   ActorOutcome,
   ActorOutcomeStatus,
   ActorRestartStrategy,
+  Actors,
   ActorStatus,
+  ActorStillRunning,
   AgentFunction,
   AgentJson,
+  AppData,
+  BranchOptions,
+  BranchOutcome,
+  BranchStatus,
+  BranchVariant,
   CacheTtl,
   Chidori,
+  ChidoriUtil,
   CompactOptions,
   Context,
   Conversation,
@@ -29,7 +38,7 @@ export type {
   JsonSchema,
   LlmResponseJson,
   MapSetSnapshotPolicy,
-  MemoryAction,
+  MemoryStore,
   ParallelOptions,
   PromptOptions,
   PromptStreamType,
@@ -42,7 +51,6 @@ export type {
   SignalSender,
   SignalTimeout,
   SpawnActorOptions,
-  SpawnedActor,
   ToolDefinition,
   ToolFunction,
   TryCallResult,
@@ -265,7 +273,7 @@ export class Session {
     public pendingSignalName: string | null = null,
     /**
      * The full awaited name set when paused on a signal listen point: `[name]`
-     * for `chidori.signal(name)`, the listen set for `chidori.signalAny(names)`.
+     * for `chidori.signal(name)`, the listen set for the fan-in `chidori.signal(names)`.
      * Empty for non-signal states.
      */
     public pendingSignalNames: string[] = [],
@@ -330,7 +338,7 @@ export type StreamEvent =
     }
   | {
       /**
-       * The streamed run paused at a `signal()` / `signalAny()` listen point
+       * The streamed run paused at a `signal()` listen point
        * and stays live: the worker keeps supervising, and a delivered signal
        * (or the `timeoutMs` deadline) resumes it in-process — further events
        * follow on the same stream. Deliver with `client.signal`.

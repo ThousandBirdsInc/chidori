@@ -244,9 +244,9 @@ the exact same path with no external calls and no cost.
 - `chidori.callAgent(path, input?)` — run another agent file as a sub-run.
 - `chidori.branch(variants, options?)` — fork into parallel sub-runs.
 - `chidori.step(name, fn)` — durable checkpoint for an expensive computation.
-- `chidori.retry(fn, options?)` — retry with backoff.
-- `chidori.parallel(tasks, options?)` — run tasks concurrently.
-- `chidori.memory(action, key?, value?)` — persistent key/value store.
+- `chidori.util.retry(fn, options?)` — retry with backoff (in-VM helper, not recorded).
+- `chidori.util.parallel(tasks, options?)` — run tasks concurrently (in-VM helper, not recorded).
+- `chidori.memory.set/get/delete/list/clear` — persistent key/value store.
 - `chidori.log(message, fields?)` — structured log into the call trace.
 
 ## Writing a tool
@@ -393,7 +393,7 @@ const WORKER_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
  * result, repeat — until it produces an answer with no further tool calls.
  *
  * The loop is author-driven via `context.respond()`, which returns the model's
- * structured turn (`tool_calls` + `text`). Tool results are appended back to the
+ * structured turn (`toolCalls` + `text`). Tool results are appended back to the
  * context with `toolResult(...)`, and the next `respond()` continues from there.
  * Every turn and tool call is a durable host call, so the whole run replays for
  * free.
@@ -426,12 +426,12 @@ export async function agent(
     ctx = context; // the assistant turn (incl. tool-use blocks) is now in ctx
 
     // No tool calls means the worker is done.
-    if (!response.tool_calls || response.tool_calls.length === 0) {
+    if (!response.toolCalls || response.toolCalls.length === 0) {
       return { answer: response.content, steps };
     }
 
     // Run each requested tool and feed the result back for the next turn.
-    for (const call of response.tool_calls) {
+    for (const call of response.toolCalls) {
       const result = await chidori.tool(call.name, call.input);
       steps.push({ tool: call.name, input: call.input, result });
       ctx = ctx.toolResult(call.id, JSON.stringify(result));

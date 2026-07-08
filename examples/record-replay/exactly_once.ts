@@ -26,7 +26,7 @@ export async function agent(input: { name?: string }, chidori: Chidori) {
   );
 
   // Persist the outcome in durable memory so the result survives resume too.
-  await chidori.memory("set", "onboarding", { ticket: ticket.id, email: email.id });
+  await chidori.memory.set("onboarding", { ticket: ticket.id, email: email.id });
 
   return { ticket: ticket.id, emailId: email.id, delivered: email.delivered };
 }

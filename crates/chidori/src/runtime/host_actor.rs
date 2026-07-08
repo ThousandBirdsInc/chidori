@@ -1,4 +1,4 @@
-//! `chidori.spawnActor` — supervised, message-passing actor sub-runs.
+//! `chidori.actors.spawn` — supervised, message-passing actor sub-runs.
 //!
 //! An actor is a detached sibling of a `chidori.branch` sub-run: the agent
 //! spawns another agent module as a long-lived concurrent process with its own
@@ -150,7 +150,7 @@ impl SupervisionOptions {
         if let Some(ref name) = name {
             if name.is_empty() || name == PARENT_ADDRESS || name.starts_with("actor-") {
                 return Err(format!(
-                    "chidori.spawnActor: `{name}` is not a registrable actor name (reserved)"
+                    "chidori.actors.spawn: `{name}` is not a registrable actor name (reserved)"
                 ));
             }
         }
@@ -160,7 +160,7 @@ impl SupervisionOptions {
             Some("resume") => RestartStrategy::Resume,
             Some(other) => {
                 return Err(format!(
-                    "chidori.spawnActor: unknown restart strategy `{other}` \
+                    "chidori.actors.spawn: unknown restart strategy `{other}` \
                      (expected \"never\", \"clean\", or \"resume\")"
                 ))
             }
@@ -505,7 +505,7 @@ fn runtime_ctx<'a>(
 
 /// Anchor a relative actor source path to the project root (the entrypoint's
 /// directory, the same anchor `callAgent` and templates use) so
-/// `chidori.spawnActor("actors/x.ts")` works regardless of the host process's
+/// `chidori.actors.spawn("actors/x.ts")` works regardless of the host process's
 /// working directory.
 fn resolve_source(backend: &HostBindingBackend, source: &str) -> PathBuf {
     let path = std::path::Path::new(source);
@@ -516,16 +516,16 @@ fn resolve_source(backend: &HostBindingBackend, source: &str) -> PathBuf {
     }
 }
 
-/// `chidori.spawnActor(source, input, options)` — start a supervised actor
+/// `chidori.actors.spawn(source, input, options)` — start a supervised actor
 /// sub-run and return `{ pid, name }`. One durable `spawn_actor` record: a
 /// parent replay returns the pid from cache without starting a thread (the
 /// actor is re-created lazily by the next live call that addresses it — see
 /// [`ensure_live_actor`]).
 pub(crate) fn spawn_actor(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
-    let ctx = runtime_ctx(backend, "spawnActor")?;
+    let ctx = runtime_ctx(backend, "actors.spawn")?;
     if ctx.is_branch() {
         return Err(
-            "chidori.spawnActor is not supported inside a chidori.branch sub-run \
+            "chidori.actors.spawn is not supported inside a chidori.branch sub-run \
                     (a branch's records must stay inside its reserved sequence range)"
                 .to_string(),
         );
@@ -535,7 +535,7 @@ pub(crate) fn spawn_actor(backend: &HostBindingBackend, a: &Value) -> Result<Val
         .get("source")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or("chidori.spawnActor requires a source module path")?
+        .ok_or("chidori.actors.spawn requires a source module path")?
         .to_string();
     let input = a
         .get("input")
@@ -554,7 +554,7 @@ pub(crate) fn spawn_actor(backend: &HostBindingBackend, a: &Value) -> Result<Val
     // actor is (re)started.
     if !resolve_source(backend, &source).is_file() {
         return Err(format!(
-            "chidori.spawnActor: source module not found: {source}"
+            "chidori.actors.spawn: source module not found: {source}"
         ));
     }
 
@@ -601,14 +601,14 @@ fn start_actor(
         let mut inner = hub.inner.lock().unwrap();
         if inner.spawned_total >= MAX_ACTORS {
             return Err(format!(
-                "chidori.spawnActor: a run may spawn at most {MAX_ACTORS} actors \
+                "chidori.actors.spawn: a run may spawn at most {MAX_ACTORS} actors \
                  (restarted children count)"
             ));
         }
         if let Some(ref name) = options.name {
             if inner.names.contains_key(name) {
                 return Err(format!(
-                    "chidori.spawnActor: actor name `{name}` is already registered"
+                    "chidori.actors.spawn: actor name `{name}` is already registered"
                 ));
             }
         }
@@ -622,11 +622,11 @@ fn start_actor(
             None => (0, u64::MAX, ACTOR_TOP_RANGE_WIDTH, inner.range_cursor),
             Some(ref owner_pid) => {
                 let entry = inner.actors.get(owner_pid).ok_or_else(|| {
-                    format!("chidori.spawnActor: unknown owning actor `{owner_pid}`")
+                    format!("chidori.actors.spawn: unknown owning actor `{owner_pid}`")
                 })?;
                 if entry.child_width < MIN_ACTOR_RANGE_WIDTH {
                     return Err(format!(
-                        "chidori.spawnActor: supervision tree too deep — actor `{owner_pid}` \
+                        "chidori.actors.spawn: supervision tree too deep — actor `{owner_pid}` \
                          has no sequence-range headroom left to subdivide for children \
                          (each level divides its range by {ACTOR_RANGE_SUBDIVISION})"
                     ));
@@ -643,7 +643,7 @@ fn start_actor(
         let base = floor.div_ceil(width) * width;
         if origin + base + width > arena_end {
             return Err(format!(
-                "chidori.spawnActor: the spawner's reserved sequence range is exhausted \
+                "chidori.actors.spawn: the spawner's reserved sequence range is exhausted \
                  (cannot fit another child block of width {width})"
             ));
         }
@@ -718,7 +718,7 @@ fn start_actor(
                 hub.parent_notify.notify_all();
                 outcome
             })
-            .map_err(|err| format!("chidori.spawnActor: spawning actor thread: {err}"))?
+            .map_err(|err| format!("chidori.actors.spawn: spawning actor thread: {err}"))?
     };
 
     hub.inner.lock().unwrap().actors.insert(
@@ -735,36 +735,46 @@ fn start_actor(
         },
     );
 
-    Ok(json!({ "pid": pid, "name": options.name }))
+    let mut spawned = json!({ "pid": pid });
+    if let Some(ref name) = options.name {
+        spawned["name"] = json!(name);
+    }
+    Ok(spawned)
 }
 
-/// `chidori.sendActor(to, name, payload)` — deliver a named message to an
+/// `chidori.actors.send(to, name, payload)` — deliver a named message to an
 /// actor's mailbox (`to` = pid or registered name) or to the spawning run
 /// (`to = "parent"`). Durable: one `send_actor` record per delivery; replay
 /// returns the recorded receipt without re-delivering.
 pub(crate) fn send_actor(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
-    let ctx = runtime_ctx(backend, "sendActor")?;
+    let ctx = runtime_ctx(backend, "actors.send")?;
     let to = a
         .get("to")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or("chidori.sendActor requires a target (a pid, a registered name, or \"parent\")")?
+        .ok_or("chidori.actors.send requires a target (a pid, a registered name, or \"parent\")")?
         .to_string();
     let name = a
         .get("name")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or("chidori.sendActor requires a string message name")?
+        .ok_or("chidori.actors.send requires a string message name")?
         .to_string();
     let payload = a.get("payload").cloned().unwrap_or(Value::Null);
-    let from = Value::String(ctx.actor_id().unwrap_or_else(|| PARENT_ADDRESS.to_string()));
+    // Sender identity, in the same shape external signal senders use
+    // (`SignalSender`): `id` is the sending actor's pid, or `"run"` when the
+    // spawning run itself sends.
+    let from = json!({
+        "kind": "agent",
+        "id": ctx.actor_id().unwrap_or_else(|| "run".to_string()),
+    });
 
     let call_args = json!({ "to": to, "name": name, "payload": payload, "from": from });
     host_core::execute_durable_json_call(ctx, "send_actor", call_args, || {
         if to == PARENT_ADDRESS {
             let hub = ctx
                 .actor_hub()
-                .ok_or_else(|| anyhow::anyhow!("chidori.sendActor: no actor hub in this run"))?;
+                .ok_or_else(|| anyhow::anyhow!("chidori.actors.send: no actor hub in this run"))?;
             // "parent" is the sender's spawner: the owning actor for a child
             // in a supervision tree, the run's own mailbox for a top-level
             // actor (or the run itself — a recorded self-send).
@@ -772,7 +782,7 @@ pub(crate) fn send_actor(backend: &HostBindingBackend, a: &Value) -> Result<Valu
             match owner {
                 Some(owner_pid) => {
                     let shared = hub.shared_of(&owner_pid).ok_or_else(|| {
-                        anyhow::anyhow!("chidori.sendActor: unknown owning actor `{owner_pid}`")
+                        anyhow::anyhow!("chidori.actors.send: unknown owning actor `{owner_pid}`")
                     })?;
                     shared.deliver(&name, payload.clone(), from.clone());
                 }
@@ -784,7 +794,7 @@ pub(crate) fn send_actor(backend: &HostBindingBackend, a: &Value) -> Result<Valu
             ensure_live_actor(backend, ctx, &to).map_err(|err| anyhow::anyhow!(err))?;
         let shared = hub
             .shared_of(&pid)
-            .ok_or_else(|| anyhow::anyhow!("chidori.sendActor: unknown actor `{to}`"))?;
+            .ok_or_else(|| anyhow::anyhow!("chidori.actors.send: unknown actor `{to}`"))?;
         let live = !matches!(
             shared.state.lock().unwrap().lifecycle,
             Lifecycle::Terminal(_)
@@ -932,7 +942,7 @@ fn receive_live(
     }
 }
 
-/// `chidori.joinActor(pid, opts)` — wait for an actor's supervision loop to
+/// `chidori.actors.join(pid, opts)` — wait for an actor's supervision loop to
 /// settle, fold its records into this run's log (stamped with this call's seq
 /// so a replay absorbs the subtree here), and return the outcome
 /// `{ pid, status, output?, error?, pendingPrompt?, restarts }`. With
@@ -942,7 +952,7 @@ pub(crate) fn join_actor(backend: &HostBindingBackend, a: &Value) -> Result<Valu
     settle_actor_call(backend, a, "join_actor", false)
 }
 
-/// `chidori.stopActor(pid)` — request a cooperative stop (honored between
+/// `chidori.actors.stop(pid)` — request a cooperative stop (honored between
 /// iterations, at mailbox waits, and during backoff — a live LLM/tool call
 /// finishes first), then join and merge exactly like `joinActor`.
 pub(crate) fn stop_actor(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
@@ -955,12 +965,18 @@ fn settle_actor_call(
     function: &str,
     request_stop: bool,
 ) -> Result<Value, String> {
-    let ctx = runtime_ctx(backend, function)?;
+    // The JS-facing name for error messages; `function` is the journal name.
+    let display = if function == "stop_actor" {
+        "actors.stop"
+    } else {
+        "actors.join"
+    };
+    let ctx = runtime_ctx(backend, display)?;
     let target = a
         .get("pid")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("chidori.{function} requires an actor pid or registered name"))?
+        .ok_or_else(|| format!("chidori.{display} requires an actor pid or registered name"))?
         .to_string();
     let timeout_ms = a
         .get("opts")
@@ -980,7 +996,7 @@ fn settle_actor_call(
         let owner = hub.owner_of(&pid);
         if owner != caller {
             return Err(anyhow::anyhow!(
-                "chidori.{function}: `{target}` was spawned by {}, not {} — actors are \
+                "chidori.{display}: `{target}` was spawned by {}, not {} — actors are \
                  settled by their spawner",
                 owner.as_deref().unwrap_or("the run"),
                 caller.as_deref().unwrap_or("the run"),
@@ -999,7 +1015,7 @@ fn settle_actor_call(
         }
         let shared = hub
             .shared_of(&pid)
-            .ok_or_else(|| anyhow::anyhow!("chidori.{function}: unknown actor `{target}`"))?;
+            .ok_or_else(|| anyhow::anyhow!("chidori.{display}: unknown actor `{target}`"))?;
         if request_stop {
             shared.request_stop();
         }
@@ -1035,11 +1051,11 @@ fn settle_actor_call(
             let entry = inner
                 .actors
                 .get_mut(&pid)
-                .ok_or_else(|| anyhow::anyhow!("chidori.{function}: unknown actor `{target}`"))?;
+                .ok_or_else(|| anyhow::anyhow!("chidori.{display}: unknown actor `{target}`"))?;
             (entry.handle.take(), entry.sequence_range.clone())
         };
-        let handle = handle
-            .ok_or_else(|| anyhow::anyhow!("chidori.{function}: actor `{pid}` join raced"))?;
+        let handle =
+            handle.ok_or_else(|| anyhow::anyhow!("chidori.{display}: actor `{pid}` join raced"))?;
         let outcome = handle
             .join()
             .map_err(|_| anyhow::anyhow!("actor `{pid}` thread panicked"))?;
@@ -1087,15 +1103,15 @@ fn settle_actor_call(
     .map_err(|err| err.to_string())
 }
 
-/// `chidori.actorStatus(pid)` — a durable snapshot of an actor's lifecycle:
+/// `chidori.actors.status(pid)` — a durable snapshot of an actor's lifecycle:
 /// `{ pid, status, restarts, mailbox }`.
 pub(crate) fn actor_status(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
-    let ctx = runtime_ctx(backend, "actorStatus")?;
+    let ctx = runtime_ctx(backend, "actors.status")?;
     let target = a
         .get("pid")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or("chidori.actorStatus requires an actor pid or registered name")?
+        .ok_or("chidori.actors.status requires an actor pid or registered name")?
         .to_string();
     let call_args = json!({ "pid": target });
     host_core::execute_durable_json_call(ctx, "actor_status", call_args, || {
@@ -1123,15 +1139,15 @@ pub(crate) fn actor_status(backend: &HostBindingBackend, a: &Value) -> Result<Va
     .map_err(|err| err.to_string())
 }
 
-/// `chidori.whereis(name)` — durable registry lookup: `{ pid }` (null when
+/// `chidori.actors.lookup(name)` — durable registry lookup: `{ pid }` (null when
 /// the name is unregistered).
 pub(crate) fn whereis(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
-    let ctx = runtime_ctx(backend, "whereis")?;
+    let ctx = runtime_ctx(backend, "actors.lookup")?;
     let name = a
         .get("name")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or("chidori.whereis requires a registered actor name")?
+        .ok_or("chidori.actors.lookup requires a registered actor name")?
         .to_string();
     let call_args = json!({ "name": name });
     host_core::execute_durable_json_call(ctx, "whereis", call_args, || {
@@ -1484,7 +1500,7 @@ fn supervise(
 
 /// Drain everything delivered to the actor's shared mailbox into the run-level
 /// signal inbox, in delivery order, so the standard listen points
-/// (`chidori.signal` / `pollSignal` / `signalAny`) and `chidori.receive` see
+/// (`chidori.signal` / `pollSignal`) and `chidori.receive` see
 /// them. Called at the start of every iteration and (via
 /// [`pump_own_mailbox`]) right before each live listen-family host call.
 fn pump_mailbox(shared: &ActorShared, ctx: &RuntimeContext) {
@@ -1620,8 +1636,8 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__", { base: 21 });
-                const outcome = await chidori.joinActor(pid);
+                const { pid } = await chidori.actors.spawn("__WORKER__", { base: 21 });
+                const outcome = await chidori.actors.join(pid);
                 return { pid, outcome };
             }
         "#
@@ -1680,9 +1696,9 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__");
-                await chidori.sendActor(pid, "go", { speed: "fast" });
-                const outcome = await chidori.joinActor(pid);
+                const { pid } = await chidori.actors.spawn("__WORKER__");
+                await chidori.actors.send(pid, "go", { speed: "fast" });
+                const outcome = await chidori.actors.join(pid);
                 return outcome.output;
             }
         "#
@@ -1694,7 +1710,7 @@ mod tests {
         let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
         assert_eq!(
             output,
-            json!({ "got": { "speed": "fast" }, "from": "parent" })
+            json!({ "got": { "speed": "fast" }, "from": { "kind": "agent", "id": "run" } })
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -1712,7 +1728,7 @@ mod tests {
             r#"
             export async function agent() {
                 const task = await chidori.receive("task");
-                await chidori.sendActor("parent", "done", { answer: task.payload.n * 2 });
+                await chidori.actors.send("parent", "done", { answer: task.payload.n * 2 });
                 return { handled: 1 };
             }
             "#,
@@ -1720,11 +1736,11 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__");
-                await chidori.sendActor(pid, "task", { n: 21 });
+                const { pid } = await chidori.actors.spawn("__WORKER__");
+                await chidori.actors.send(pid, "task", { n: 21 });
                 const reply = await chidori.receive("done");
-                const outcome = await chidori.joinActor(pid);
-                return { answer: reply.payload.answer, from: reply.from, status: outcome.status };
+                const outcome = await chidori.actors.join(pid);
+                return { answer: reply.payload.answer, from: reply.from.id, status: outcome.status };
             }
         "#
         .replace("__WORKER__", &worker);
@@ -1770,9 +1786,9 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__");
-                await chidori.sendActor(pid, "go", { speed: "fast" });
-                const outcome = await chidori.joinActor(pid);
+                const { pid } = await chidori.actors.spawn("__WORKER__");
+                await chidori.actors.send(pid, "go", { speed: "fast" });
+                const outcome = await chidori.actors.join(pid);
                 return outcome;
             }
         "#
@@ -1836,11 +1852,11 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__", {}, {
+                const { pid } = await chidori.actors.spawn("__WORKER__", {}, {
                     restart: "clean",
                     maxRestarts: 3,
                 });
-                return await chidori.joinActor(pid);
+                return await chidori.actors.join(pid);
             }
         "#
         .replace("__WORKER__", &worker);
@@ -1895,11 +1911,11 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__", {}, {
+                const { pid } = await chidori.actors.spawn("__WORKER__", {}, {
                     restart: "resume",
                     maxRestarts: 2,
                 });
-                return await chidori.joinActor(pid);
+                return await chidori.actors.join(pid);
             }
         "#
         .replace("__WORKER__", &worker);
@@ -1937,11 +1953,11 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__", {}, {
+                const { pid } = await chidori.actors.spawn("__WORKER__", {}, {
                     restart: "clean",
                     maxRestarts: 2,
                 });
-                return await chidori.joinActor(pid);
+                return await chidori.actors.join(pid);
             }
         "#
         .replace("__WORKER__", &worker);
@@ -1989,9 +2005,9 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__");
-                await chidori.sendActor(pid, "go", { speed: "fast" });
-                const outcome = await chidori.joinActor(pid);
+                const { pid } = await chidori.actors.spawn("__WORKER__");
+                await chidori.actors.send(pid, "go", { speed: "fast" });
+                const outcome = await chidori.actors.join(pid);
                 await chidori.log("after join");
                 return outcome;
             }
@@ -2037,14 +2053,14 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const spawned = await chidori.spawnActor("__WORKER__", {}, { name: "greeter" });
-                const found = await chidori.whereis("greeter");
-                const missing = await chidori.whereis("nobody");
-                await chidori.sendActor("greeter", "ping", null);
-                const outcome = await chidori.joinActor("greeter");
+                const spawned = await chidori.actors.spawn("__WORKER__", {}, { name: "greeter" });
+                const found = await chidori.actors.lookup("greeter");
+                const missing = await chidori.actors.lookup("nobody");
+                await found.send("ping", null);
+                const outcome = await chidori.actors.join("greeter");
                 return {
                     samePid: spawned.pid === found.pid,
-                    missing: missing.pid,
+                    missing: missing === null,
                     status: outcome.status,
                     output: outcome.output,
                 };
@@ -2060,7 +2076,7 @@ mod tests {
             output,
             json!({
                 "samePid": true,
-                "missing": null,
+                "missing": true,
                 "status": "completed",
                 "output": { "got": "ping" },
             })
@@ -2085,7 +2101,7 @@ mod tests {
             r#"
             export async function agent() {
                 const task = await chidori.receive("task");
-                await chidori.sendActor("parent", "leaf-done", { doubled: task.payload.n * 2 });
+                await chidori.actors.send("parent", "leaf-done", { doubled: task.payload.n * 2 });
                 return { ok: true };
             }
             "#,
@@ -2095,10 +2111,10 @@ mod tests {
             "mid.ts",
             &r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__CHILD__", {});
-                await chidori.sendActor(pid, "task", { n: 21 });
+                const { pid } = await chidori.actors.spawn("__CHILD__", {});
+                await chidori.actors.send(pid, "task", { n: 21 });
                 const reply = await chidori.receive("leaf-done");
-                const outcome = await chidori.joinActor(pid);
+                const outcome = await chidori.actors.join(pid);
                 return { fromLeaf: reply.payload.doubled, leafStatus: outcome.status };
             }
             "#
@@ -2107,8 +2123,8 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__MID__");
-                const outcome = await chidori.joinActor(pid);
+                const { pid } = await chidori.actors.spawn("__MID__");
+                const outcome = await chidori.actors.join(pid);
                 return outcome.output;
             }
         "#
@@ -2181,8 +2197,8 @@ mod tests {
             "mid.ts",
             &r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__CHILD__");
-                const outcome = await chidori.joinActor(pid);
+                const { pid } = await chidori.actors.spawn("__CHILD__");
+                const outcome = await chidori.actors.join(pid);
                 return outcome.output;
             }
             "#
@@ -2191,8 +2207,8 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__MID__");
-                const outcome = await chidori.joinActor(pid);
+                const { pid } = await chidori.actors.spawn("__MID__");
+                const outcome = await chidori.actors.join(pid);
                 return outcome.output;
             }
         "#
@@ -2255,10 +2271,10 @@ mod tests {
             "sup.ts",
             &r#"
             export async function agent() {
-                const kid = await chidori.spawnActor("__CHILD__", {}, { name: "kid" });
+                const kid = await chidori.actors.spawn("__CHILD__", {}, { name: "kid" });
                 const { n } = await chidori.tool("attempt", {});
                 if (n < 2) throw new Error("supervisor transient failure " + n);
-                const outcome = await chidori.joinActor(kid.pid);
+                const outcome = await chidori.actors.join(kid.pid);
                 return { kid: outcome.status, attempt: n };
             }
             "#
@@ -2267,11 +2283,11 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__SUP__", {}, {
+                const { pid } = await chidori.actors.spawn("__SUP__", {}, {
                     restart: "clean",
                     maxRestarts: 2,
                 });
-                return await chidori.joinActor(pid);
+                return await chidori.actors.join(pid);
             }
         "#
         .replace("__SUP__", &supervisor);
@@ -2318,18 +2334,18 @@ mod tests {
             "meddler.ts",
             r#"
             export async function agent(input: { victim: string }) {
-                return await chidori.joinActor(input.victim);
+                return await chidori.actors.join(input.victim);
             }
             "#,
         );
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const victim = await chidori.spawnActor("__VICTIM__");
-                const meddler = await chidori.spawnActor("__MEDDLER__", { victim: victim.pid });
-                const meddled = await chidori.joinActor(meddler.pid);
-                await chidori.sendActor(victim.pid, "finish", null);
-                const victimOutcome = await chidori.joinActor(victim.pid);
+                const victim = await chidori.actors.spawn("__VICTIM__");
+                const meddler = await chidori.actors.spawn("__MEDDLER__", { victim: victim.pid });
+                const meddled = await chidori.actors.join(meddler.pid);
+                await chidori.actors.send(victim.pid, "finish", null);
+                const victimOutcome = await chidori.actors.join(victim.pid);
                 return { meddler: meddled.status, error: meddled.error, victim: victimOutcome.status };
             }
         "#
@@ -2365,8 +2381,8 @@ mod tests {
         let deep_path = dir.join("actors").join("deep.ts");
         let deep_src = r#"
             export async function agent(input: { depth: number }) {
-                const child = await chidori.spawnActor("__SELF__", { depth: input.depth + 1 });
-                const outcome = await chidori.joinActor(child.pid);
+                const child = await chidori.actors.spawn("__SELF__", { depth: input.depth + 1 });
+                const outcome = await chidori.actors.join(child.pid);
                 return { depth: input.depth, childOutcome: outcome };
             }
         "#
@@ -2375,8 +2391,8 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__DEEP__", { depth: 0 });
-                const outcome = await chidori.joinActor(pid);
+                const { pid } = await chidori.actors.spawn("__DEEP__", { depth: 0 });
+                const outcome = await chidori.actors.join(pid);
                 return outcome.output;
             }
         "#
@@ -2465,9 +2481,9 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__");
-                const status = await chidori.actorStatus(pid);
-                const outcome = await chidori.stopActor(pid);
+                const { pid } = await chidori.actors.spawn("__WORKER__");
+                const status = await chidori.actors.status(pid);
+                const outcome = await chidori.actors.stop(pid);
                 return { status: outcome.status, observed: status.status };
             }
         "#
@@ -2502,10 +2518,10 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__");
-                const first = await chidori.joinActor(pid, { timeoutMs: 100 });
-                await chidori.sendActor(pid, "go", null);
-                const second = await chidori.joinActor(pid);
+                const { pid } = await chidori.actors.spawn("__WORKER__");
+                const first = await chidori.actors.join(pid, { timeoutMs: 100 });
+                await chidori.actors.send(pid, "go", null);
+                const second = await chidori.actors.join(pid);
                 return { first: first.status, second: second.status, output: second.output };
             }
         "#
@@ -2535,9 +2551,9 @@ mod tests {
             "peer.ts",
             r#"
             export async function agent(input: { id: number }) {
-                await chidori.sendActor("parent", "ready", { id: input.id });
+                await chidori.actors.send("parent", "ready", { id: input.id });
                 const go = await chidori.receive("go");
-                await chidori.sendActor("parent", "done", { id: input.id, sum: input.id + go.payload.add });
+                await chidori.actors.send("parent", "done", { id: input.id, sum: input.id + go.payload.add });
                 return { id: input.id };
             }
             "#,
@@ -2545,16 +2561,16 @@ mod tests {
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const a = await chidori.spawnActor("__WORKER__", { id: 1 });
-                const b = await chidori.spawnActor("__WORKER__", { id: 2 });
+                const a = await chidori.actors.spawn("__WORKER__", { id: 1 });
+                const b = await chidori.actors.spawn("__WORKER__", { id: 2 });
                 await chidori.receive("ready");
                 await chidori.receive("ready");
-                await chidori.sendActor(a.pid, "go", { add: 10 });
-                await chidori.sendActor(b.pid, "go", { add: 20 });
+                await chidori.actors.send(a.pid, "go", { add: 10 });
+                await chidori.actors.send(b.pid, "go", { add: 20 });
                 const first = await chidori.receive("done");
                 const second = await chidori.receive("done");
-                await chidori.joinActor(a.pid);
-                await chidori.joinActor(b.pid);
+                await chidori.actors.join(a.pid);
+                await chidori.actors.join(b.pid);
                 const sums = [first.payload.sum, second.payload.sum].sort((x, y) => x - y);
                 return { sums };
             }

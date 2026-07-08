@@ -1887,7 +1887,7 @@ mod tests {
             &path,
             r#"
                 export async function agent(input, chidori) {
-                    await chidori.checkpoint("mid-run", { step: 1 });
+                    await chidori.mark("mid-run", { step: 1 });
                     throw new Error("after checkpoint");
                 }
             "#,
@@ -1936,7 +1936,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checkpoint.len(), 1);
-        assert_eq!(checkpoint[0].function, "checkpoint");
+        assert_eq!(checkpoint[0].function, "mark");
         assert_eq!(checkpoint[0].args["label"], serde_json::json!("mid-run"));
         assert_eq!(checkpoint[0].args["data"], serde_json::json!({ "step": 1 }));
 

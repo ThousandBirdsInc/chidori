@@ -186,12 +186,10 @@ impl HostBindingBackend {
             .unwrap_or(config.temperature);
         let max_tokens = options
             .get("maxTokens")
-            .or_else(|| options.get("max_tokens"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(config.max_tokens);
         let max_turns = options
             .get("maxTurns")
-            .or_else(|| options.get("max_turns"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(config.max_turns)
             .max(1);
@@ -568,7 +566,7 @@ impl HostBindingBackend {
 
     fn signal_any(&self, a: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
         let HostBindingBackend::Runtime { runtime_ctx, .. } = self else {
-            return Err("chidori.signalAny requires the runtime host backend".to_string());
+            return Err("chidori.signal requires the runtime host backend".to_string());
         };
         host_core::execute_signal_any(runtime_ctx, a).map_err(|err| err.to_string())
     }
@@ -930,12 +928,12 @@ impl HostBindingBackend {
                     Ok(a.get("value").cloned().unwrap_or(serde_json::Value::Null))
                 }
             },
-            "checkpoint" => {
+            "mark" => {
                 let args = serde_json::json!({
                     "label": a.get("label").cloned().unwrap_or(serde_json::Value::Null),
                     "data": a.get("data").cloned().unwrap_or(serde_json::Value::Null),
                 });
-                self.durable_call("checkpoint", args, || Ok(serde_json::Value::Null))
+                self.durable_call("mark", args, || Ok(serde_json::Value::Null))
                     .map(opt_null)
             }
             "prompt" => {

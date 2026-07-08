@@ -9,12 +9,12 @@ import { chidori, run } from "chidori:agent";
 
 run(async () => {
   const shards = [
-    await chidori.spawnActor("actors/supervisor.ts", { tasks: [1, 2, 3], workers: 2 }),
-    await chidori.spawnActor("actors/supervisor.ts", { tasks: [4, 5, 6], workers: 2 }),
+    await chidori.actors.spawn("actors/supervisor.ts", { tasks: [1, 2, 3], workers: 2 }),
+    await chidori.actors.spawn("actors/supervisor.ts", { tasks: [4, 5, 6], workers: 2 }),
   ];
   const outcomes = [];
   for (const shard of shards) {
-    outcomes.push(await chidori.joinActor(shard.pid));
+    outcomes.push(await shard.join());
   }
   return {
     statuses: outcomes.map((o) => o.status),

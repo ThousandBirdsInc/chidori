@@ -28,7 +28,7 @@ export async function agent(input: { order?: string }, chidori: Chidori) {
   if (decision.toLowerCase() === "approve") {
     // A real refund call would be a tool() here — recorded, so it never
     // double-refunds on replay.
-    await chidori.memory("set", `refund:${order}`, { status: "refunded", ...refund });
+    await chidori.memory.set(`refund:${order}`, { status: "refunded", ...refund });
     return { order, status: "refunded", amount: refund.amount };
   }
 

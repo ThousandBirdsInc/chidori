@@ -1,7 +1,7 @@
 import type { Chidori } from "chidori:agent";
 
 export async function agent(input: { topic: string }, chidori: Chidori) {
-  const drafts = await chidori.parallel(
+  const drafts = await chidori.util.parallel(
     [
       async () =>
         chidori.prompt("List two implementation risks for: " + input.topic, {

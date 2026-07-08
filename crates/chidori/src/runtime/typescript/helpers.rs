@@ -23,7 +23,12 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
 (() => {
     globalThis.chidori = globalThis.chidori || {};
 
-    globalThis.chidori.tryCall = async function tryCall(fn) {
+    // In-VM convenience helpers live under chidori.util, NOT flat on the host
+    // object: everything else on `chidori` is a recorded durable host call,
+    // and these three are pure JS control flow that records nothing.
+    globalThis.chidori.util = globalThis.chidori.util || {};
+
+    globalThis.chidori.util.tryCall = async function tryCall(fn) {
         try {
             return { ok: true, value: await fn() };
         } catch (err) {
@@ -34,7 +39,7 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
         }
     };
 
-    globalThis.chidori.retry = async function retry(fn, options) {
+    globalThis.chidori.util.retry = async function retry(fn, options) {
         const attempts = Math.max(1, Number(options && options.attempts) || 3);
         let lastErr;
         for (let i = 0; i < attempts; i += 1) {
@@ -47,9 +52,9 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
         throw lastErr;
     };
 
-    globalThis.chidori.parallel = async function parallel(tasks, options) {
+    globalThis.chidori.util.parallel = async function parallel(tasks, options) {
         if (!Array.isArray(tasks)) {
-            throw new Error("chidori.parallel expects an array of task functions");
+            throw new Error("chidori.util.parallel expects an array of task functions");
         }
         // Accept the Promise.all idiom too: a task may be a thunk (preferred —
         // it lets the scheduler control start time and concurrency), an
@@ -80,32 +85,95 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
         return results;
     };
 
+    // chidori.memory.<method> — the persistent KV store as a plain namespace.
+    // The native binding is a single action-dispatch function; it is wrapped
+    // here so authors never see the positional (action, key, value, options)
+    // form.
     globalThis.__chidori_install_memory_helpers = function installMemoryHelpers() {
         const current = globalThis.chidori && globalThis.chidori.memory;
         if (typeof current !== "function") {
             return null;
         }
         const memoryCall = current.__chidori_call || current;
-        function memory(...args) {
-            return memoryCall.call(globalThis.chidori, ...args);
-        }
-        memory.__chidori_call = memoryCall;
-        memory.set = memory.set || function set(key, value, options) {
-            return memory("set", key, value, options);
+        const call = (...args) => memoryCall.call(globalThis.chidori, ...args);
+        globalThis.chidori.memory = {
+            __chidori_call: memoryCall,
+            set(key, value, options) {
+                return call("set", key, value, options);
+            },
+            get(key, options) {
+                return call("get", key, null, options);
+            },
+            delete(key, options) {
+                return call("delete", key, null, options);
+            },
+            list(options) {
+                return call("list", null, null, options);
+            },
+            clear(options) {
+                return call("clear", null, null, options);
+            },
         };
-        memory.get = memory.get || function get(key, options) {
-            return memory("get", key, null, options);
-        };
-        memory.delete = memory.delete || function deleteKey(key, options) {
-            return memory("delete", key, null, options);
-        };
-        memory.clear = memory.clear || function clear(options) {
-            return memory("clear", null, null, options);
-        };
-        globalThis.chidori.memory = memory;
         return null;
     };
     globalThis.__chidori_install_memory_helpers();
+
+    // chidori.actors: wrap the native durable ops so spawn/lookup hand back a
+    // HANDLE — an object with the actor's address plus send/join/stop/status
+    // methods — instead of making authors thread pid strings around. The
+    // string-addressed forms remain on the namespace for actors known only by
+    // pid or registered name. Handles are plain in-VM sugar: every method
+    // still bottoms out in one recorded durable host call.
+    globalThis.__chidori_install_actor_helpers = function installActorHelpers() {
+        const native = globalThis.chidori && globalThis.chidori.actors;
+        if (!native || typeof native.spawn !== "function" || native.__chidori_wrapped) {
+            return null;
+        }
+        function makeHandle(info) {
+            const pid = info.pid;
+            const handle = {
+                pid,
+                name: info.name ?? null,
+                send(name, payload) {
+                    return native.send(pid, name, payload);
+                },
+                join(options) {
+                    return native.join(pid, options);
+                },
+                stop(options) {
+                    return native.stop(pid, options);
+                },
+                status() {
+                    return native.status(pid);
+                },
+            };
+            return handle;
+        }
+        globalThis.chidori.actors = {
+            __chidori_wrapped: true,
+            async spawn(source, input, options) {
+                return makeHandle(await native.spawn(source, input, options));
+            },
+            send(to, name, payload) {
+                return native.send(to, name, payload);
+            },
+            join(target, options) {
+                return native.join(target, options);
+            },
+            stop(target, options) {
+                return native.stop(target, options);
+            },
+            status(target) {
+                return native.status(target);
+            },
+            async lookup(name) {
+                const found = await native.lookup(name);
+                return found && found.pid ? makeHandle({ pid: found.pid, name }) : null;
+            },
+        };
+        return null;
+    };
+    globalThis.__chidori_install_actor_helpers();
 
     // chidori.context(): an immutable, turn-structured prompt builder. Each
     // builder call allocates ONE new node pointing at its parent, so contexts
@@ -390,7 +458,7 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                     turns.push({ role: "assistant", text: result.text });
                     return result.text;
                 },
-                // Like say(), but returns the structured response (tool_calls,
+                // Like say(), but returns the structured response (toolCalls,
                 // blocks) for author-driven tool loops. Append tool results with
                 // `chat.context.toolResult(...)` then call `chat.say(...)` again.
                 async respond(message, perTurn) {

@@ -9,8 +9,8 @@ import { chidori, run } from "chidori:agent";
 
 run(async () => {
   const workers = [
-    await chidori.spawnActor("actors/worker.ts", { id: 1 }, { name: "worker-1" }),
-    await chidori.spawnActor("actors/worker.ts", { id: 2 }, { name: "worker-2" }),
+    await chidori.actors.spawn("actors/worker.ts", { id: 1 }),
+    await chidori.actors.spawn("actors/worker.ts", { id: 2 }),
   ];
 
   // Wait for both workers to come up.
@@ -20,7 +20,7 @@ run(async () => {
   // Round-robin the tasks and collect every reply.
   const tasks = [1, 2, 3, 4, 5, 6];
   for (const [i, n] of tasks.entries()) {
-    await chidori.sendActor(workers[i % workers.length].pid, "task", { n });
+    await workers[i % workers.length].send("task", { n });
   }
   const results: { id: number; n: number; square: number }[] = [];
   while (results.length < tasks.length) {
@@ -31,8 +31,8 @@ run(async () => {
   // Tell the workers to finish and settle them.
   const summaries = [];
   for (const worker of workers) {
-    await chidori.sendActor(worker.pid, "finish", null);
-    const outcome = await chidori.joinActor(worker.pid);
+    await worker.send("finish", null);
+    const outcome = await worker.join();
     summaries.push(outcome.output);
   }
 

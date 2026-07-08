@@ -51,7 +51,7 @@ pub struct StoredSession {
     #[serde(default)]
     pub pending_signal_name: Option<String>,
     /// The full awaited name set for a signal pause: `[name]` for
-    /// `chidori.signal(name)`, the listen set for `chidori.signalAny(names)`.
+    /// `chidori.signal(name)`, the listen set for the fan-in `chidori.signal(names[])`.
     /// The delivery endpoint matches `body.name` against ANY of these. Empty
     /// when the session is not paused on a signal (sessions persisted before
     /// `signalAny` deserialize as empty; fall back to `pending_signal_name`).

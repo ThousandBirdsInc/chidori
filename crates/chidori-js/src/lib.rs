@@ -190,6 +190,10 @@ impl Engine {
                 )
             });
         let d = dispatch.clone();
+        // chidori.signal(name | names[], opts) — a single listen verb: a
+        // string listens for one name, an array is the fan-in form (routed to
+        // the signal_any host effect, whose recorded result's `name` says
+        // which fired).
         self.vm
             .define_method(&chidori, "signal", 2, move |vm, _t, args| {
                 let name = args
@@ -200,6 +204,14 @@ impl Engine {
                     .get(1)
                     .map(|v| vm.value_to_json(v))
                     .unwrap_or(serde_json::Value::Null);
+                if name.is_array() {
+                    return forward_effect(
+                        vm,
+                        &d,
+                        "signal_any",
+                        serde_json::json!({ "names": name, "opts": opts }),
+                    );
+                }
                 forward_effect(
                     vm,
                     &d,
@@ -299,26 +311,12 @@ impl Engine {
                 }
             });
         let d = dispatch.clone();
+        // chidori.mark(label, data) — a labelled trace marker in the call log.
+        // (Named `mark`, not `checkpoint`: the durable value checkpoint is
+        // `chidori.step`, and `checkpoint.json` is the run's call log — this
+        // is neither, just an annotation.)
         self.vm
-            .define_method(&chidori, "signalAny", 2, move |vm, _t, args| {
-                let names = args
-                    .first()
-                    .map(|v| vm.value_to_json(v))
-                    .unwrap_or(serde_json::Value::Null);
-                let opts = args
-                    .get(1)
-                    .map(|v| vm.value_to_json(v))
-                    .unwrap_or(serde_json::Value::Null);
-                forward_effect(
-                    vm,
-                    &d,
-                    "signal_any",
-                    serde_json::json!({ "names": names, "opts": opts }),
-                )
-            });
-        let d = dispatch.clone();
-        self.vm
-            .define_method(&chidori, "checkpoint", 2, move |vm, _t, args| {
+            .define_method(&chidori, "mark", 2, move |vm, _t, args| {
                 let label = args
                     .first()
                     .map(|v| vm.value_to_json(v))
@@ -330,7 +328,7 @@ impl Engine {
                 forward_effect(
                     vm,
                     &d,
-                    "checkpoint",
+                    "mark",
                     serde_json::json!({ "label": label, "data": data }),
                 )
             });
@@ -423,12 +421,16 @@ impl Engine {
                     serde_json::json!({ "variants": variants, "options": options }),
                 )
             });
-        // Actor sub-runs + message passing. Each method forwards its effect to
-        // the durable host, which owns spawning, mailboxes, supervision, and
-        // record/replay (`docs/actors.md`).
+        // chidori.actors.<method> — supervised actor sub-runs + message
+        // passing (`docs/actors.md`). Each method forwards its effect to the
+        // durable host, which owns spawning, mailboxes, supervision trees,
+        // and record/replay. The runtime's helper script wraps `spawn` and
+        // `lookup` results into actor handles (`.send()`/`.join()`/...);
+        // these natives return the raw durable JSON.
+        let actors = self.vm.new_object();
         let d = dispatch.clone();
         self.vm
-            .define_method(&chidori, "spawnActor", 3, move |vm, _t, args| {
+            .define_method(&actors, "spawn", 3, move |vm, _t, args| {
                 let source = args
                     .first()
                     .map(|v| vm.to_string_lossy(v))
@@ -450,7 +452,7 @@ impl Engine {
             });
         let d = dispatch.clone();
         self.vm
-            .define_method(&chidori, "sendActor", 3, move |vm, _t, args| {
+            .define_method(&actors, "send", 3, move |vm, _t, args| {
                 let to = args
                     .first()
                     .map(|v| vm.to_string_lossy(v))
@@ -472,25 +474,7 @@ impl Engine {
             });
         let d = dispatch.clone();
         self.vm
-            .define_method(&chidori, "receive", 2, move |vm, _t, args| {
-                let names = args
-                    .first()
-                    .map(|v| vm.value_to_json(v))
-                    .unwrap_or(serde_json::Value::Null);
-                let opts = args
-                    .get(1)
-                    .map(|v| vm.value_to_json(v))
-                    .unwrap_or(serde_json::Value::Null);
-                forward_effect(
-                    vm,
-                    &d,
-                    "receive",
-                    serde_json::json!({ "names": names, "opts": opts }),
-                )
-            });
-        let d = dispatch.clone();
-        self.vm
-            .define_method(&chidori, "joinActor", 2, move |vm, _t, args| {
+            .define_method(&actors, "join", 2, move |vm, _t, args| {
                 let pid = args
                     .first()
                     .map(|v| vm.to_string_lossy(v))
@@ -508,16 +492,25 @@ impl Engine {
             });
         let d = dispatch.clone();
         self.vm
-            .define_method(&chidori, "stopActor", 1, move |vm, _t, args| {
+            .define_method(&actors, "stop", 2, move |vm, _t, args| {
                 let pid = args
                     .first()
                     .map(|v| vm.to_string_lossy(v))
                     .unwrap_or_default();
-                forward_effect(vm, &d, "stop_actor", serde_json::json!({ "pid": pid }))
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "stop_actor",
+                    serde_json::json!({ "pid": pid, "opts": opts }),
+                )
             });
         let d = dispatch.clone();
         self.vm
-            .define_method(&chidori, "actorStatus", 1, move |vm, _t, args| {
+            .define_method(&actors, "status", 1, move |vm, _t, args| {
                 let pid = args
                     .first()
                     .map(|v| vm.to_string_lossy(v))
@@ -526,12 +519,34 @@ impl Engine {
             });
         let d = dispatch.clone();
         self.vm
-            .define_method(&chidori, "whereis", 1, move |vm, _t, args| {
+            .define_method(&actors, "lookup", 1, move |vm, _t, args| {
                 let name = args
                     .first()
                     .map(|v| vm.to_string_lossy(v))
                     .unwrap_or_default();
                 forward_effect(vm, &d, "whereis", serde_json::json!({ "name": name }))
+            });
+        self.vm
+            .define_value(&chidori, "actors", Value::Object(actors));
+        // chidori.receive stays top-level: it is the general listen verb for
+        // both the run (parent-addressed messages) and actor code.
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&chidori, "receive", 2, move |vm, _t, args| {
+                let names = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "receive",
+                    serde_json::json!({ "names": names, "opts": opts }),
+                )
             });
         let d = dispatch.clone();
         self.vm

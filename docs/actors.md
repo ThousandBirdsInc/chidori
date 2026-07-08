@@ -12,23 +12,23 @@ import { chidori, run } from "chidori:agent";
 run(async () => {
   // Start two workers with supervision: on failure, replay their completed
   // work from the journal and retry the failing call, up to 3 times.
-  const a = await chidori.spawnActor("workers/researcher.ts", { topic: "pricing" }, {
+  const a = await chidori.actors.spawn("workers/researcher.ts", { topic: "pricing" }, {
     name: "researcher",
     restart: "resume",
     maxRestarts: 3,
     backoffMs: 500,
   });
-  const b = await chidori.spawnActor("workers/critic.ts");
+  const b = await chidori.actors.spawn("workers/critic.ts");
 
-  // Talk to them while they run.
-  await chidori.sendActor(a.pid, "focus", { region: "EU" });
+  // Talk to them through their handles while they run.
+  await a.send("focus", { region: "EU" });
   const draft = await chidori.receive("draft");           // sent by the researcher
-  await chidori.sendActor(b.pid, "review", draft.payload);
+  await b.send("review", draft.payload);
 
   // Settle them: outcomes carry output/error/restart counts, and each actor's
   // full call history folds into this run's durable log.
-  const research = await chidori.joinActor(a.pid);
-  const review = await chidori.joinActor(b.pid);
+  const research = await a.join();
+  const review = await b.join();
   return { research: research.output, review: review.output };
 });
 ```
@@ -49,24 +49,25 @@ log replays from the top (recorded effects return from cache, side-effect
 free), then execution goes live at the frontier. The loop re-enters the module
 when:
 
-- a message arrives for an empty-mailbox listen point (`chidori.signal` /
-  `signalAny` inside an actor park the thread instead of ending the run);
+- a message arrives for an empty-mailbox listen point (`chidori.signal`
+  inside an actor parks the thread instead of ending the run);
 - an iteration fails and the spawn's restart policy allows another attempt.
 
 **Messages are signals.** An actor's mailbox uses the same
 `{ name, payload, from }` envelope and delivery-ordered consumption as the
 [signals](./signals.md) mailbox, and messages are consumable at the standard
-listen points (`chidori.signal`, `pollSignal`, `signalAny`) as well as with
-`chidori.receive`. `from` is the sender's pid, or `"parent"` for the spawning
-run.
+listen points (`chidori.signal`, `pollSignal`) as well as with
+`chidori.receive`. `from` carries the sender's identity in the same shape
+external signals use: `{ kind: "agent", id }`, where `id` is the sending
+actor's pid or `"run"`.
 
 ## API
 
-### spawnActor
+### actors.spawn
 
 ```ts
-const { pid, name } = await chidori.spawnActor(source, input?, {
-  name?: string,          // register for whereis/sendActor addressing
+const worker = await chidori.actors.spawn(source, input?, {
+  name?: string,          // register for actors.lookup / actors.send addressing
   restart?: "never" | "clean" | "resume",   // default "never"
   maxRestarts?: number,   // default 3
   backoffMs?: number,     // base restart delay, doubles per attempt; default 0
@@ -80,13 +81,18 @@ run may spawn at most 128 actors in total (the whole tree, restarted children
 included). Actors can spawn actors — see [Supervision
 trees](#supervision-trees) — but joining and stopping are **owner-only**: an
 actor is settled by whoever spawned it (its records fold into the spawner's
-log). `spawnActor` inside a `chidori.branch` sub-run is rejected for the same
+log). `actors.spawn` inside a `chidori.branch` sub-run is rejected for the same
 range-confinement reason as nested branches.
 
-### sendActor
+### handles and actors.send
 
 ```ts
-await chidori.sendActor(pidOrName, "message-name", payload?);
+// The handle is the usual way to talk to an actor you spawned:
+await worker.send("message-name", payload?);
+const outcome = await worker.join();
+
+// String-addressed forms cover actors known only by pid or registered name:
+await chidori.actors.send(pidOrName, "message-name", payload?);
 // → { delivered: boolean }   (false once the target has settled)
 ```
 
@@ -113,29 +119,29 @@ with no timeout, no live actors, and an empty mailbox fails fast instead of
 blocking forever; the timeout sentinel is the same `{ timedOut: true }` shape
 signals use.
 
-### joinActor / stopActor
+### actors.join / actors.stop
 
 ```ts
-const outcome = await chidori.joinActor(pid);
+const outcome = await worker.join();
 // → { pid, status, output?, error?, pendingPrompt?, restarts }
-const partial = await chidori.joinActor(pid, { timeoutMs: 5000 });
+const partial = await worker.join({ timeoutMs: 5000 });
 // → { pid, status: "running", restarts } when not settled yet — join again later
-const outcome = await chidori.stopActor(pid);   // cooperative stop, then join
+const stopped = await worker.stop();   // cooperative stop, then join
 ```
 
 `status` is `"completed"` (with the actor's return value), `"failed"` (restart
 budget spent; carries the final error), `"paused"` (parked on something the
 runtime can't answer in-process — interactive `input()`, a policy approval, or
-the idle cap on a mailbox wait), or `"stopped"`. `stopActor` is cooperative:
+the idle cap on a mailbox wait), or `"stopped"`. `stop` is cooperative:
 honored between iterations, at mailbox waits, and during restart backoff; a
 live LLM/tool call finishes first. Both are owner-only: an actor is settled
 by whoever spawned it.
 
-### actorStatus / whereis
+### actors.status / actors.lookup
 
 ```ts
-await chidori.actorStatus(pid);  // { pid, status, restarts, mailbox, waitingFor? }
-await chidori.whereis("researcher");  // { pid } or { pid: null }
+await worker.status();  // { pid, status, restarts, mailbox, waitingFor? }
+await chidori.actors.lookup("researcher");  // a handle, or null
 ```
 
 ## Restart strategies
@@ -168,14 +174,14 @@ policy:
 export async function agent(input: { shards: string[] }) {
   const workers = [];
   for (const shard of input.shards) {
-    workers.push(await chidori.spawnActor("worker.ts", { shard }, {
+    workers.push(await chidori.actors.spawn("worker.ts", { shard }, {
       restart: "resume",     // this supervisor's policy for ITS children
       maxRestarts: 3,
     }));
   }
   const results = [];
   for (const w of workers) {
-    const outcome = await chidori.joinActor(w.pid);   // owner-only
+    const outcome = await w.join();   // owner-only
     results.push(outcome.output);
   }
   return { results };
@@ -185,7 +191,7 @@ export async function agent(input: { shards: string[] }) {
 The tree rules:
 
 - **Ownership.** Every actor records who spawned it. Only the owner may
-  `joinActor`/`stopActor` it; anyone may `sendActor` to it. `"parent"` from a
+  `join`/`stop` it; anyone may `send` to it. `"parent"` from a
   child addresses its owning actor's mailbox (received there with
   `chidori.receive`), not the run.
 - **Ranges nest.** A child's reserved sequence range is carved out of its
@@ -194,7 +200,7 @@ The tree rules:
   whole subtree merge upward join by join while every record still lands
   inside the top-level actor's range at the final confinement check. The
   subdivision bounds tree depth: a fourth-generation actor has no headroom
-  left to subdivide and its `spawnActor` is refused with a clear error.
+  left to subdivide and its `spawn` is refused with a clear error.
 - **Supervisors reap their children.** When an actor settles — completed,
   failed, stopped, or paused — its still-live children are cooperatively
   stopped first, transitively, so children never outlive their supervisor. A
@@ -234,7 +240,7 @@ window).
   VM (like a concurrent branch wave). Actors suit tens of concurrent
   LLM-bound processes, not tens of thousands of compute-bound ones.
 - **Selective receive** falls out of names: `receive(["a", "b"])` and
-  `signalAny` consume the lowest-delivery-seq match and leave everything else
+  the fan-in `signal([...])` consume the lowest-delivery-seq match and leave everything else
   queued.
 - **Idle actors park, not leak**: an actor waiting on an empty mailbox with no
   explicit timeout settles as `paused` after `idleTimeoutMs` (default 5

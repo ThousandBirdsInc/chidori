@@ -10,7 +10,7 @@ run(async (input: { tasks: number[]; workers: number }) => {
     // Paths resolve against the run entrypoint's directory (the project
     // root), not this module's own directory.
     pool.push(
-      await chidori.spawnActor("actors/worker.ts", { id }, { restart: "clean", maxRestarts: 1 }),
+      await chidori.actors.spawn("actors/worker.ts", { id }, { restart: "clean", maxRestarts: 1 }),
     );
   }
   for (let i = 0; i < input.workers; i += 1) {
@@ -18,7 +18,7 @@ run(async (input: { tasks: number[]; workers: number }) => {
   }
 
   for (const [i, n] of input.tasks.entries()) {
-    await chidori.sendActor(pool[i % pool.length].pid, "task", { n });
+    await pool[i % pool.length].send("task", { n });
   }
   const results = [];
   while (results.length < input.tasks.length) {
@@ -28,8 +28,8 @@ run(async (input: { tasks: number[]; workers: number }) => {
 
   const summaries = [];
   for (const worker of pool) {
-    await chidori.sendActor(worker.pid, "finish", null);
-    summaries.push((await chidori.joinActor(worker.pid)).output);
+    await worker.send("finish", null);
+    summaries.push((await worker.join()).output);
   }
   results.sort((a, b) => a.n - b.n);
   return { results, summaries };
