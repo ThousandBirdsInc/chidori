@@ -555,6 +555,9 @@ struct HttpRelayRequest {
     method: &'static str,
     url: String,
     body: Option<Vec<u8>>,
+    /// Content type sent with a body; JSON for records/registry payloads,
+    /// octet-stream for raw blobs.
+    content_type: &'static str,
     reply: std::sync::mpsc::Sender<Result<(u16, Vec<u8>)>>,
 }
 
@@ -603,7 +606,9 @@ impl HttpRelay {
                                 builder = builder.bearer_auth(token);
                             }
                             if let Some(body) = request.body {
-                                builder = builder.body(body);
+                                builder = builder
+                                    .header("content-type", request.content_type)
+                                    .body(body);
                             }
                             builder
                                 .send()
@@ -624,12 +629,23 @@ impl HttpRelay {
     }
 
     fn request(&self, method: &'static str, url: String, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+        self.request_typed(method, url, body, "application/json")
+    }
+
+    fn request_typed(
+        &self,
+        method: &'static str,
+        url: String,
+        body: Option<Vec<u8>>,
+        content_type: &'static str,
+    ) -> Result<(u16, Vec<u8>)> {
         let (reply, receive) = std::sync::mpsc::channel();
         self.sender
             .send(HttpRelayRequest {
                 method,
                 url,
                 body,
+                content_type,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("run-store relay thread is gone"))?;
@@ -683,8 +699,20 @@ impl RunStore for HttpRunStore {
     }
 
     fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        self.relay
-            .expect_ok("PUT", self.blob_url(key), Some(bytes.to_vec()))
+        let (status, body) = self.relay.request_typed(
+            "PUT",
+            self.blob_url(key),
+            Some(bytes.to_vec()),
+            "application/octet-stream",
+        )?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "run store relay PUT blob {key} failed: HTTP {status} {}",
+                String::from_utf8_lossy(&body)
+            )
+        }
     }
 
     fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -1408,6 +1436,142 @@ mod tests {
         assert_eq!(factory.registry_list().unwrap().len(), 1);
         assert!(factory.registry_get("../evil").is_err());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// An in-process HTTP server speaking the run-store relay protocol over
+    /// memory — the same protocol the Cloudflare Durable Object shim
+    /// (`integrations/cloudflare-durable-objects`) serves. Returns its base
+    /// URL.
+    fn spawn_protocol_server() -> String {
+        use axum::extract::{Path as AxPath, State};
+        use axum::http::StatusCode;
+        use axum::routing::{get, post, put};
+        use std::collections::HashMap;
+
+        #[derive(Clone, Default)]
+        struct Mem {
+            records: Arc<Mutex<HashMap<String, Vec<CallRecord>>>>,
+            blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        }
+
+        let mem = Mem::default();
+        let app = axum::Router::new()
+            .route(
+                "/runs",
+                get(|State(mem): State<Mem>| async move {
+                    let ids: Vec<String> = mem.records.lock().unwrap().keys().cloned().collect();
+                    axum::Json(ids)
+                }),
+            )
+            .route(
+                "/runs/{id}/records",
+                get(
+                    |State(mem): State<Mem>, AxPath(id): AxPath<String>| async move {
+                        match mem.records.lock().unwrap().get(&id) {
+                            Some(records) => {
+                                (StatusCode::OK, axum::Json(records.clone())).into_response()
+                            }
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    },
+                )
+                .post(
+                    |State(mem): State<Mem>,
+                     AxPath(id): AxPath<String>,
+                     axum::Json(record): axum::Json<CallRecord>| async move {
+                        let mut records = mem.records.lock().unwrap();
+                        let entry = records.entry(id).or_default();
+                        entry.retain(|r| r.seq != record.seq);
+                        entry.push(record);
+                        StatusCode::OK
+                    },
+                )
+                .put(
+                    |State(mem): State<Mem>,
+                     AxPath(id): AxPath<String>,
+                     axum::Json(records): axum::Json<Vec<CallRecord>>| async move {
+                        mem.records.lock().unwrap().insert(id, records);
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .route(
+                "/runs/{id}/blobs",
+                get(
+                    |State(mem): State<Mem>, AxPath(id): AxPath<String>| async move {
+                        let prefix = format!("{id}/");
+                        let keys: Vec<String> = mem
+                            .blobs
+                            .lock()
+                            .unwrap()
+                            .keys()
+                            .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
+                            .collect();
+                        axum::Json(keys)
+                    },
+                ),
+            )
+            .route(
+                "/runs/{id}/blobs/{*key}",
+                get(
+                    |State(mem): State<Mem>,
+                     AxPath((id, key)): AxPath<(String, String)>| async move {
+                        match mem.blobs.lock().unwrap().get(&format!("{id}/{key}")) {
+                            Some(bytes) => (StatusCode::OK, bytes.clone()).into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    },
+                )
+                .put(
+                    |State(mem): State<Mem>,
+                     AxPath((id, key)): AxPath<(String, String)>,
+                     body: axum::body::Bytes| async move {
+                        mem.blobs
+                            .lock()
+                            .unwrap()
+                            .insert(format!("{id}/{key}"), body.to_vec());
+                        StatusCode::OK
+                    },
+                )
+                .delete(
+                    |State(mem): State<Mem>,
+                     AxPath((id, key)): AxPath<(String, String)>| async move {
+                        mem.blobs.lock().unwrap().remove(&format!("{id}/{key}"));
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(mem);
+
+        // The relay's dedicated request thread uses a blocking client, so the
+        // server needs its own runtime on its own thread.
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        use axum::response::IntoResponse as _;
+        format!("http://{}", addr_rx.recv().unwrap())
+    }
+
+    #[test]
+    fn http_run_store_conformance_over_relay_protocol() {
+        let base = spawn_protocol_server();
+        let relay = HttpRelay::new(base, None);
+        conformance(&HttpRunStore::new(relay.clone(), "run-http"));
+        // Runs are isolated per id, and the index lists what was written.
+        assert!(HttpRunStore::new(relay.clone(), "run-other")
+            .load_call_log()
+            .unwrap()
+            .is_none());
+        assert!(relay.list_runs().unwrap().contains(&"run-http".to_string()));
     }
 
     #[test]
