@@ -542,6 +542,7 @@ dependencies = [
  "chidori-js",
  "chrono",
  "clap",
+ "criterion",
  "cron",
  "derive_more",
  "flate2",
