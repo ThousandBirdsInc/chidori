@@ -363,6 +363,50 @@ released; a `resume` restart keeps children (cached spawn records return the
 same live pids). A run may spawn at most 128 actors in total, restarted
 children included.
 
+### agents: detached durable processes (spawn / send / join / stop / status / lookup)
+
+```ts
+// Start an agent module as a DETACHED durable process: its own run id and
+// journal, a registered name that outlives this run, a durable mailbox, and
+// a hibernate/wake lifecycle. spawn returns a handle like actors.spawn.
+const svc = await chidori.agents.spawn("services/inbox-triager.ts", {}, {
+  name: "inbox-triager",   // registry name; generated when omitted
+  restart: "resume",       // "never" | "clean" | "resume" (default)
+  maxRestarts: 3,
+  backoffMs: 500,
+});
+
+await svc.send("email", { from: "a@x.com" });          // durable delivery; wakes a
+await chidori.agents.send("inbox-triager", "email", p); // hibernating agent on match
+await svc.status();   // { name, runId, status, restarts, waitingFor?, deadline?, output?, error? }
+await svc.join({ timeoutMs: 30000 });   // waits for completed|failed|stopped|paused
+await svc.stop();                        // cooperative stop
+await chidori.agents.lookup("inbox-triager");   // { name, runId, status } handle, or null
+```
+
+Detached agents vs actors: an actor lives inside its spawning run (records
+fold into the parent at a join; unjoined work dies with the run); a detached
+agent is its own durable run and **outlives the spawner**. Inside the agent,
+`chidori.signal(name)` is a hibernate point — the agent holds no thread and
+no VM while waiting; a matching send (from any run, or `POST
+/agents/detached/{name}/send` on the server) wakes it under resume-by-replay.
+The fleet survives process restarts: `chidori serve` re-arms every
+registered agent at boot. Requires persistence. Statuses: `running`,
+`hibernating`, `paused` (interactive input/approval — no interactive
+counterpart yet), `completed`, `failed`, `stopped`. See
+`docs/detached-agents.md`.
+
+### alarm
+
+```ts
+const fired = await chidori.alarm(24 * 60 * 60 * 1000);  // → { timedOut: true }
+```
+
+A durable timer on the signal machinery: the run (or detached agent)
+hibernates and is woken at the deadline, surviving process restarts — the
+deadline is persisted and re-armed at boot. In a detached agent this is the
+idiomatic "do maintenance every N hours even with no traffic" primitive.
+
 ### http (fetch / node:http)
 
 There is no `chidori.http`. Use the standard `fetch` API (or the

@@ -268,6 +268,17 @@ human-in-the-loop pause/resume loop — see
   passing, supervision trees, and runtime-owned restart policies — including
   restart-with-history, which replays an actor's completed work and retries
   only the failing call.
+- **Detached durable agents** — spawn long-lived, named
+  [agent processes](./docs/detached-agents.md) that outlive the run that
+  started them: they hibernate at listen points holding zero threads and zero
+  memory, wake on a mailbox delivery or a durable
+  `chidori.alarm(ms)` deadline, and survive server restarts (the fleet
+  re-arms from a durable registry at boot).
+- **Replicated run storage** — mirror every run's journal to SQLite or a
+  [Cloudflare Durable Object per run](./docs/durable-storage.md)
+  (`CHIDORI_RUN_STORE`), hydrate runs back after machine loss, gate side
+  effects on journal durability (`CHIDORI_DURABILITY=strict`), and time-travel
+  with `chidori resume --until-seq`.
 - **Cost-efficient prompting** — structural [prompt
   caching](./docs/context-management.md) re-bills stable prefixes at the cached
   rate, and replay pays zero tokens.
@@ -331,6 +342,8 @@ deterministic, replayable, and testable for free.
 | [Context management & caching](./docs/context-management.md) | Immutable contexts, compaction, cost accounting |
 | [Signals & multiplayer](./docs/signals.md) | Named listen points, mailboxes, fan-in |
 | [Actors & supervision](./docs/actors.md) | Spawned agent processes, message passing, supervision trees, restart strategies |
+| [Detached agents](./docs/detached-agents.md) | Durable, addressable, hibernating agent processes; `chidori.alarm`; the `/agents/detached` HTTP surface |
+| [Durable storage](./docs/durable-storage.md) | The run store: append-only journal, SQLite / Durable Object mirrors, hydration, strict durability, leases, `--until-seq` |
 | [Python SDK](./sdk/python/README.md) · [TypeScript SDK](./sdk/typescript/README.md) | HTTP clients with no native bindings |
 | [`llm.txt`](./llm.txt) | Complete API reference, optimized for LLMs generating agents |
 

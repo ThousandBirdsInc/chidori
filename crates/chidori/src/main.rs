@@ -415,10 +415,7 @@ fn main() {
             run_id,
             dir,
             until_seq,
-        } => (
-            cmd_resume(&file, &run_id, dir.as_deref(), until_seq),
-            false,
-        ),
+        } => (cmd_resume(&file, &run_id, dir.as_deref(), until_seq), false),
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
         Commands::BranchResume {
             run_id,

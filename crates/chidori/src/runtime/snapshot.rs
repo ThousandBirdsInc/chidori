@@ -978,7 +978,10 @@ impl SnapshotStore {
         call_log: &[CallRecord],
     ) -> Result<()> {
         self.store
-            .put_blob(SNAPSHOT_MANIFEST_FILE, &serde_json::to_vec_pretty(manifest)?)
+            .put_blob(
+                SNAPSHOT_MANIFEST_FILE,
+                &serde_json::to_vec_pretty(manifest)?,
+            )
             .with_context(|| format!("writing {SNAPSHOT_MANIFEST_FILE}"))?;
 
         self.store
@@ -1018,9 +1021,10 @@ impl SnapshotStore {
 
     pub fn load_manifest(&self) -> Result<SnapshotManifest> {
         let manifest_path = self.run_dir.join(SNAPSHOT_MANIFEST_FILE);
-        let bytes = self.store.get_blob(SNAPSHOT_MANIFEST_FILE)?.ok_or_else(|| {
-            anyhow::anyhow!("reading {}: not found", manifest_path.display())
-        })?;
+        let bytes = self
+            .store
+            .get_blob(SNAPSHOT_MANIFEST_FILE)?
+            .ok_or_else(|| anyhow::anyhow!("reading {}: not found", manifest_path.display()))?;
         serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", manifest_path.display()))
     }

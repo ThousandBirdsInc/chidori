@@ -274,7 +274,10 @@ fn complete_persisted_pending_host_operation(
             completed_at,
         },
     };
-    store.put_blob(HOST_PROMISE_TABLE_FILE, &serde_json::to_vec_pretty(&records)?)?;
+    store.put_blob(
+        HOST_PROMISE_TABLE_FILE,
+        &serde_json::to_vec_pretty(&records)?,
+    )?;
     store.delete_blob(PENDING_HOST_OPERATION_FILE)?;
     Ok(Some(pending))
 }
@@ -316,7 +319,10 @@ fn complete_persisted_host_promise_record(
             completed_at,
         },
     };
-    store.put_blob(HOST_PROMISE_TABLE_FILE, &serde_json::to_vec_pretty(&records)?)?;
+    store.put_blob(
+        HOST_PROMISE_TABLE_FILE,
+        &serde_json::to_vec_pretty(&records)?,
+    )?;
     Ok(())
 }
 
@@ -798,7 +804,10 @@ async fn list_detached_agents() -> Response {
     .await
     {
         Ok(Ok(agents)) => Json(json!({ "agents": agents })).into_response(),
-        Ok(Err(err)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": err})))
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err})),
+        )
             .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,

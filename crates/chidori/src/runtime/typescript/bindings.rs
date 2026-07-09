@@ -1206,9 +1206,10 @@ impl HostBindingBackend {
             // supervising server / agent hub re-arms the deadline across
             // restarts; the wake resolves with the timeout sentinel.
             "alarm" => {
-                let ms = a.get("ms").and_then(serde_json::Value::as_u64).ok_or(
-                    "chidori.alarm requires a positive millisecond delay".to_string(),
-                )?;
+                let ms = a
+                    .get("ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("chidori.alarm requires a positive millisecond delay".to_string())?;
                 let args = serde_json::json!({
                     "name": crate::runtime::host_agent::ALARM_SIGNAL_NAME,
                     "opts": { "timeoutMs": ms },

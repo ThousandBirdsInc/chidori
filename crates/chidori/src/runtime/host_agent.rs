@@ -319,7 +319,10 @@ impl DetachedAgentHub {
             state.descriptor.status = "running".to_string();
             state.descriptor.updated_at = Utc::now();
         }
-        persist_descriptor(&entry.factory(), &entry.state.lock().unwrap().descriptor.clone());
+        persist_descriptor(
+            &entry.factory(),
+            &entry.state.lock().unwrap().descriptor.clone(),
+        );
         let name = entry.name.clone();
         std::thread::Builder::new()
             .name(format!("chidori-agent-{name}"))
@@ -750,7 +753,9 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             let matched = inbox
                 .iter()
                 .any(|queued| listen.names.iter().any(|n| n == &queued.name));
-            let expired = listen.deadline.is_some_and(|deadline| deadline <= Utc::now());
+            let expired = listen
+                .deadline
+                .is_some_and(|deadline| deadline <= Utc::now());
             if !matched && expired {
                 // Woken by the deadline: resolve the listen point with the
                 // timeout sentinel — the alarm fired.
@@ -803,7 +808,13 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         ctx.enable_persistence_with_store(run_dir.clone(), store.clone());
 
         let Ok(policy) = RuntimePolicy::from_env_for_durable_run(&run_id) else {
-            settle(hub, entry, "failed", None, Some("building runtime policy".into()));
+            settle(
+                hub,
+                entry,
+                "failed",
+                None,
+                Some("building runtime policy".into()),
+            );
             return;
         };
         let resolved = resolve_source(&parts.template_engine, &descriptor.source);
@@ -950,10 +961,9 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 };
                 let _ = store.write_call_log(&rewritten);
                 if descriptor.restart == "clean" {
-                    let _ = store
-                        .delete_blob(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE);
-                    let _ = store
-                        .delete_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE);
+                    let _ = store.delete_blob(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE);
+                    let _ =
+                        store.delete_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE);
                 }
             }
         }
@@ -1266,7 +1276,9 @@ pub(crate) fn agent_status(backend: &HostBindingBackend, a: &Value) -> Result<Va
         .to_string();
     let call_args = json!({ "to": to });
     host_core::execute_durable_json_call(ctx, "agent_status", call_args, || {
-        hub().status(&parts, &to).map_err(|err| anyhow::anyhow!(err))
+        hub()
+            .status(&parts, &to)
+            .map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
 }
@@ -1284,7 +1296,9 @@ pub(crate) fn lookup_agent(backend: &HostBindingBackend, a: &Value) -> Result<Va
         .to_string();
     let call_args = json!({ "name": name });
     host_core::execute_durable_json_call(ctx, "lookup_agent", call_args, || {
-        hub().lookup(&parts, &name).map_err(|err| anyhow::anyhow!(err))
+        hub()
+            .lookup(&parts, &name)
+            .map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
 }
@@ -1434,7 +1448,10 @@ mod tests {
 
         assert_eq!(output["wasHibernating"], json!("hibernating"));
         assert_eq!(output["outcome"]["status"], json!("completed"));
-        assert_eq!(output["outcome"]["output"], json!({ "got": { "speed": "fast" } }));
+        assert_eq!(
+            output["outcome"]["output"],
+            json!({ "got": { "speed": "fast" } })
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

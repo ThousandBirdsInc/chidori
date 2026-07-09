@@ -131,8 +131,8 @@ impl FsRunStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let mut file = std::fs::File::create(path)
-            .with_context(|| format!("writing {}", path.display()))?;
+        let mut file =
+            std::fs::File::create(path).with_context(|| format!("writing {}", path.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("writing {}", path.display()))?;
         if self.fsync_writes {
@@ -183,10 +183,7 @@ impl RunStore for FsRunStore {
         let checkpoint: Option<Vec<CallRecord>> =
             match std::fs::read(self.run_dir.join(CHECKPOINT_FILE)) {
                 Ok(bytes) => Some(serde_json::from_slice(&bytes).with_context(|| {
-                    format!(
-                        "parsing {}",
-                        self.run_dir.join(CHECKPOINT_FILE).display()
-                    )
+                    format!("parsing {}", self.run_dir.join(CHECKPOINT_FILE).display())
                 })?),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                 Err(err) => {
@@ -195,8 +192,7 @@ impl RunStore for FsRunStore {
                     })
                 }
             };
-        let tail: Vec<CallRecord> = match std::fs::read_to_string(self.run_dir.join(RECORDS_FILE))
-        {
+        let tail: Vec<CallRecord> = match std::fs::read_to_string(self.run_dir.join(RECORDS_FILE)) {
             Ok(text) => text
                 .lines()
                 .filter(|line| !line.trim().is_empty())
@@ -241,9 +237,7 @@ impl RunStore for FsRunStore {
             let entries = match std::fs::read_dir(&dir) {
                 Ok(entries) => entries,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(err).with_context(|| format!("listing {}", dir.display()))
-                }
+                Err(err) => return Err(err).with_context(|| format!("listing {}", dir.display())),
             };
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -276,8 +270,10 @@ fn union_checkpoint_and_tail(
     match checkpoint {
         Some(mut records) => {
             let known: BTreeSet<u64> = records.iter().map(|r| r.seq).collect();
-            let mut extra: Vec<CallRecord> =
-                tail.into_iter().filter(|r| !known.contains(&r.seq)).collect();
+            let mut extra: Vec<CallRecord> = tail
+                .into_iter()
+                .filter(|r| !known.contains(&r.seq))
+                .collect();
             extra.sort_by_key(|r| r.seq);
             records.extend(dedup_keep_last(extra));
             Some(records)
@@ -427,8 +423,8 @@ impl RunStore for SqliteRunStore {
 
     fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
         let conn = self.shared.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT data FROM run_records WHERE run_id = ?1 ORDER BY pos, seq")?;
+        let mut stmt =
+            conn.prepare("SELECT data FROM run_records WHERE run_id = ?1 ORDER BY pos, seq")?;
         let rows = stmt.query_map(rusqlite::params![self.run_id], |row| {
             row.get::<_, String>(0)
         })?;
@@ -455,8 +451,7 @@ impl RunStore for SqliteRunStore {
 
     fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let conn = self.shared.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT data FROM run_blobs WHERE run_id = ?1 AND key = ?2")?;
+        let mut stmt = conn.prepare("SELECT data FROM run_blobs WHERE run_id = ?1 AND key = ?2")?;
         let mut rows = stmt.query(rusqlite::params![self.run_id, key])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get::<_, Vec<u8>>(0)?)),
@@ -475,8 +470,7 @@ impl RunStore for SqliteRunStore {
 
     fn list_blobs(&self) -> Result<Vec<String>> {
         let conn = self.shared.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT key FROM run_blobs WHERE run_id = ?1 ORDER BY key")?;
+        let mut stmt = conn.prepare("SELECT key FROM run_blobs WHERE run_id = ?1 ORDER BY key")?;
         let rows = stmt.query_map(rusqlite::params![self.run_id], |row| {
             row.get::<_, String>(0)
         })?;
@@ -628,7 +622,12 @@ impl HttpRelay {
         Arc::new(Self { base_url, sender })
     }
 
-    fn request(&self, method: &'static str, url: String, body: Option<Vec<u8>>) -> Result<(u16, Vec<u8>)> {
+    fn request(
+        &self,
+        method: &'static str,
+        url: String,
+        body: Option<Vec<u8>>,
+    ) -> Result<(u16, Vec<u8>)> {
         self.request_typed(method, url, body, "application/json")
     }
 
@@ -677,13 +676,19 @@ impl HttpRelay {
 
 impl RunStore for HttpRunStore {
     fn append_record(&self, record: &CallRecord) -> Result<()> {
-        self.relay
-            .expect_ok("POST", self.records_url(), Some(serde_json::to_vec(record)?))
+        self.relay.expect_ok(
+            "POST",
+            self.records_url(),
+            Some(serde_json::to_vec(record)?),
+        )
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
-        self.relay
-            .expect_ok("PUT", self.records_url(), Some(serde_json::to_vec(records)?))
+        self.relay.expect_ok(
+            "PUT",
+            self.records_url(),
+            Some(serde_json::to_vec(records)?),
+        )
     }
 
     fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
@@ -692,7 +697,11 @@ impl RunStore for HttpRunStore {
             404 => Ok(None),
             s if (200..300).contains(&s) => {
                 let records: Vec<CallRecord> = serde_json::from_slice(&bytes)?;
-                Ok(if records.is_empty() { None } else { Some(records) })
+                Ok(if records.is_empty() {
+                    None
+                } else {
+                    Some(records)
+                })
             }
             s => anyhow::bail!("run store relay GET records failed: HTTP {s}"),
         }
@@ -864,8 +873,10 @@ impl RunStore for ScopedRunStore {
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
-        self.inner
-            .put_blob(&self.key(CHECKPOINT_FILE), &serde_json::to_vec_pretty(records)?)
+        self.inner.put_blob(
+            &self.key(CHECKPOINT_FILE),
+            &serde_json::to_vec_pretty(records)?,
+        )
     }
 
     fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
@@ -978,8 +989,9 @@ impl RunStoreFactory {
     /// mirror without threading a factory through every signature — one
     /// factory per base means one shared SQLite connection / HTTP relay.
     pub fn shared(run_base: &Path) -> Self {
-        static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, RunStoreFactory>>> =
-            std::sync::OnceLock::new();
+        static CACHE: std::sync::OnceLock<
+            Mutex<std::collections::HashMap<PathBuf, RunStoreFactory>>,
+        > = std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
         let mut cache = cache.lock().unwrap();
         cache
@@ -1041,8 +1053,7 @@ impl RunStoreFactory {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("listing {}", self.run_base.display()))
+                return Err(err).with_context(|| format!("listing {}", self.run_base.display()))
             }
         }
         match &self.backend {
@@ -1089,7 +1100,12 @@ impl RunStoreFactory {
     // keep them in their own keyspace (the `run_registry` table / the relay's
     // `/registry` resource) so a fresh machine can rediscover every agent.
 
-    pub fn registry_put(&self, name: &str, run_id: &str, descriptor: &serde_json::Value) -> Result<()> {
+    pub fn registry_put(
+        &self,
+        name: &str,
+        run_id: &str,
+        descriptor: &serde_json::Value,
+    ) -> Result<()> {
         let entry = serde_json::json!({
             "name": name,
             "run_id": run_id,
@@ -1100,8 +1116,7 @@ impl RunStoreFactory {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, &bytes)
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
         match &self.backend {
             RunStoreBackend::Fs => {}
             RunStoreBackend::Sqlite(shared) => {
@@ -1576,7 +1591,8 @@ mod tests {
 
     #[test]
     fn lease_acquire_renew_expire() {
-        let dir = std::env::temp_dir().join(format!("chidori-store-lease-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("chidori-store-lease-{}", uuid::Uuid::new_v4()));
         let store = FsRunStore::new(&dir);
         // Fresh acquire.
         let granted = acquire_lease(&store, "node-a", chrono::Duration::seconds(60)).unwrap();

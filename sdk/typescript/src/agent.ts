@@ -506,6 +506,95 @@ export interface Actors {
   lookup(name: string): Promise<ActorHandle | null>;
 }
 
+export interface SpawnAgentOptions {
+  /** Register the agent under a name in the durable registry; generated when omitted. */
+  name?: string;
+  /** Restart strategy applied when an iteration fails. Default `"resume"`. */
+  restart?: ActorRestartStrategy;
+  /** Restart intensity cap (default 3). */
+  maxRestarts?: number;
+  /** Base delay between restarts, doubling per attempt (default 0). */
+  backoffMs?: number;
+}
+
+/**
+ * A detached agent's lifecycle status (`docs/detached-agents.md`).
+ * `hibernating` means parked at a listen point holding no thread and no VM,
+ * waiting on a mailbox delivery or an alarm deadline.
+ */
+export type DetachedAgentStatus =
+  | "running"
+  | "hibernating"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "stopped";
+
+/** The snapshot `agents.status()`/`agents.join()` resolve to. */
+export interface DetachedAgentOutcome<T extends AgentJson = AgentJson> {
+  name: string;
+  runId: string;
+  status: DetachedAgentStatus;
+  output?: T;
+  error?: string;
+  restarts: number;
+  /** The listen-point names a hibernating agent wakes on. */
+  waitingFor?: string[] | null;
+  /** The alarm deadline, when the current wait carries one (ISO timestamp). */
+  deadline?: string | null;
+}
+
+/**
+ * A detached agent's handle — same sugar as {@link ActorHandle}, addressed by
+ * the agent's registered name. Every method is one recorded durable call.
+ */
+export interface DetachedAgentHandle {
+  name: string;
+  runId: string | null;
+  send<T extends AgentJson = AgentJson>(name: string, payload?: T): Promise<{ delivered: boolean }>;
+  join<T extends AgentJson = AgentJson>(
+    options?: JoinActorOptions,
+  ): Promise<DetachedAgentOutcome<T>>;
+  stop<T extends AgentJson = AgentJson>(options?: JoinActorOptions): Promise<DetachedAgentOutcome<T>>;
+  status<T extends AgentJson = AgentJson>(): Promise<DetachedAgentOutcome<T>>;
+}
+
+/**
+ * `chidori.agents` — detached, durable, addressable agent processes
+ * (`docs/detached-agents.md`). Where an actor lives inside its spawning run,
+ * a detached agent is its OWN durable run: it has its own journal, a
+ * registered name that outlives the spawner, a durable mailbox, and a
+ * hibernate/wake lifecycle that survives process restarts. Requires
+ * persistence.
+ */
+export interface DetachedAgents {
+  spawn<TInput extends AgentJson = JsonObject>(
+    source: string,
+    input?: TInput,
+    options?: SpawnAgentOptions,
+  ): Promise<DetachedAgentHandle>;
+  /** Durable delivery into the agent's mailbox; wakes a hibernating agent on a matching name. */
+  send<T extends AgentJson = AgentJson>(
+    to: string,
+    name: string,
+    payload?: T,
+  ): Promise<{ delivered: boolean }>;
+  /** Wait for the agent to settle; with `timeoutMs`, resolves to a status snapshot on expiry. */
+  join<T extends AgentJson = AgentJson>(
+    target: string,
+    options?: JoinActorOptions,
+  ): Promise<DetachedAgentOutcome<T>>;
+  /** Cooperative stop (a live LLM call finishes first). */
+  stop<T extends AgentJson = AgentJson>(
+    target: string,
+    options?: JoinActorOptions,
+  ): Promise<DetachedAgentOutcome<T>>;
+  /** Point-in-time snapshot; never blocks. */
+  status<T extends AgentJson = AgentJson>(target: string): Promise<DetachedAgentOutcome<T>>;
+  /** Registry lookup: a handle for the agent registered under `name`, or `null`. */
+  lookup(name: string): Promise<DetachedAgentHandle | null>;
+}
+
 /**
  * `chidori.memory` — the persistent, namespaced key-value store. Values are
  * JSON; `options.namespace` scopes keys (default `"default"`).
@@ -671,6 +760,19 @@ export interface Chidori {
    * restart policies (`docs/actors.md`).
    */
   actors: Actors;
+  /**
+   * Detached durable agent processes: spawn agent modules as long-lived,
+   * named runs that outlive the spawner, hibernate at listen points holding
+   * no thread and no VM, and wake on mailbox deliveries or alarm deadlines
+   * (`docs/detached-agents.md`).
+   */
+  agents: DetachedAgents;
+  /**
+   * A durable timer: hibernate until the deadline, surviving process
+   * restarts (the deadline is persisted and re-armed at boot). Resolves to
+   * the `{ timedOut: true }` sentinel when the alarm fires.
+   */
+  alarm(ms: number): Promise<SignalTimeout>;
   /**
    * Blocking, in-place message consumption: inside an actor, drains the
    * actor's own mailbox; in the spawning run, drains messages actors sent to
