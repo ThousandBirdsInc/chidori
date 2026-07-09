@@ -1,6 +1,6 @@
 //! Process-level heap accounting for the sandbox memory ceiling.
 //!
-//! [`CountingAllocator`] wraps the system allocator and maintains a running
+//! [`CountingAllocator`] wraps the backing allocator (mimalloc) and maintains a running
 //! count of live (allocated-minus-freed) bytes. The binary installs it as the
 //! `#[global_allocator]` (see `main.rs`); the rust-engine watchdog
 //! (`runtime::rust_engine`) samples a per-run meter on a background thread and
@@ -28,10 +28,20 @@
 //!     which has no `#[global_allocator]`), both counters stay at 0 and the
 //!     watchdog's memory check is simply inert.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+use mimalloc::MiMalloc;
+
+/// The allocator that actually services requests. mimalloc rather than
+/// [`std::alloc::System`]: callgrind profiles of the JS interpreter put glibc
+/// malloc at 20%+ of executed instructions on allocation-heavy workloads, and
+/// mimalloc roughly halves the allocator's share of that small-object churn.
+/// The counting wrapper below is allocator-agnostic — swap this constant to
+/// change the backing allocator.
+const INNER: MiMalloc = MiMalloc;
 
 /// Live bytes currently allocated through [`CountingAllocator`]. Relaxed
 /// ordering is sufficient: this is a monotonically-maintained statistic, not a
@@ -105,7 +115,7 @@ pub fn run_meter_bytes(meter: &AtomicIsize) -> usize {
     meter.load(Ordering::Relaxed).max(0) as usize
 }
 
-/// A `#[global_allocator]`-compatible wrapper over [`System`] that tracks live
+/// A `#[global_allocator]`-compatible wrapper over [`INNER`] (mimalloc) that tracks live
 /// byte usage. Per-call overhead is a relaxed atomic add/sub plus a
 /// thread-local check for the per-run meter — the same pattern used by crates
 /// like `cap`/`stats_alloc`.
@@ -113,7 +123,7 @@ pub struct CountingAllocator;
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
+        let ptr = INNER.alloc(layout);
         if !ptr.is_null() {
             charge(layout.size() as isize);
         }
@@ -121,12 +131,12 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
+        INNER.dealloc(ptr, layout);
         charge(-(layout.size() as isize));
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc_zeroed(layout);
+        let ptr = INNER.alloc_zeroed(layout);
         if !ptr.is_null() {
             charge(layout.size() as isize);
         }
@@ -134,7 +144,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = System.realloc(ptr, layout, new_size);
+        let new_ptr = INNER.realloc(ptr, layout, new_size);
         if !new_ptr.is_null() {
             // Adjust by the net delta of the resize.
             charge(new_size as isize - layout.size() as isize);

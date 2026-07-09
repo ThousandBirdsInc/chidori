@@ -79,6 +79,35 @@ Pass `--json PATH` to also dump every sample (min/median/mean/max per runtime)
 for offline analysis, or `--markdown PATH` to write the same two tables as a
 Markdown report.
 
+## Build variants: allocator, PGO, profiling
+
+The harness builds the chidori binary with `--features mimalloc`, swapping the
+global allocator of the benchmark binary (only — the library build is
+dependency-identical, and the feature is off by default to keep the crate free
+of C code). Callgrind put glibc malloc at 20%+ of executed instructions on
+json_roundtrip and string_build; mimalloc roughly halves the allocator's share.
+
+Two more knobs stack on top of the release profile's fat LTO + single codegen
+unit:
+
+- **PGO** — [`scripts/pgo-build.sh`](../../../scripts/pgo-build.sh) does the
+  instrument → run-this-corpus → rebuild-with-feedback cycle (needs
+  `rustup component add llvm-tools`). Interpreter dispatch is the textbook PGO
+  beneficiary (indirect branches, dense op bodies); measure the result with
+  this harness via
+  `node crates/chidori-js/benchmarks/run.mjs --no-build --chidori-bin target/pgo/release/examples/run`.
+  Instruction counts barely move under PGO — the win is branch prediction and
+  icache layout, so judge it by wall-clock, never callgrind.
+- **`-C target-cpu`** — node and bun JIT to host-native code while the AOT
+  build targets baseline x86-64, so for engine-vs-engine comparisons on one
+  machine, `RUSTFLAGS="-C target-cpu=native"` is the fairer build. Not the
+  default because the binary stops being portable.
+
+For profiler runs (perf/samply/callgrind), build with
+`cargo build --profile profiling ...` — release codegen plus line-table debug
+info, so inlined frames attribute correctly instead of smearing into their
+caller.
+
 ## CI integration
 
 [`.github/workflows/js-benchmarks.yml`](../../../.github/workflows/js-benchmarks.yml)

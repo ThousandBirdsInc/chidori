@@ -19,6 +19,16 @@ path = "src/lib.rs"
 # nothing. Enable for analysis only: `cargo run --example opstats --features
 # op-histogram`. See docs/interpreter-optimization.md (Phase 0).
 op-histogram = []
+# Opt-in mimalloc global allocator for the `run` example binary. OFF by
+# default so the crate keeps its no-C-code property: mimalloc is a C library
+# (vendored and built by libmimalloc-sys). Callgrind profiles put 20%+ of
+# instructions in glibc malloc on allocation-heavy workloads (json_roundtrip,
+# string_build), and mimalloc roughly halves that, so the cross-runtime
+# benchmark harness (benchmarks/run.mjs) enables this feature when it builds
+# the binary. Library consumers are unaffected either way: a global allocator
+# only takes effect in a final binary, and this one is only installed in
+# `examples/run.rs`.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 # Front end only: we consume the oxc AST and write no lexer/parser of our own.
@@ -49,6 +59,9 @@ icu_decimal = "2"
 # Temporal: the TC39 Temporal proposal implemented in Rust (calendars, time
 # zones, durations, and the spec arithmetic).
 temporal_rs = "0.2.3"
+# Optional, off by default (see the `mimalloc` feature above): faster global
+# allocator for the benchmark/`run` binary.
+mimalloc = { version = "0.1", optional = true, default-features = false }
 
 [dev-dependencies]
 criterion = "0.5"

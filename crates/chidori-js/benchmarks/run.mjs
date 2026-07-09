@@ -137,11 +137,17 @@ function resolveChidoriBin(opts) {
   }
   const builtPath = join(REPO_ROOT, "target", "release", "examples", "run");
   if (opts.build) {
-    process.stderr.write("building chidori-js run example (release)... ");
-    execFileSync("cargo", ["build", "--release", "-q", "-p", "chidori-js", "--example", "run"], {
-      cwd: REPO_ROOT,
-      stdio: ["ignore", "ignore", "inherit"],
-    });
+    process.stderr.write("building chidori-js run example (release, mimalloc)... ");
+    // `--features mimalloc` swaps the global allocator in the benchmark binary
+    // only; the library build stays dependency-identical (see Cargo.toml).
+    execFileSync(
+      "cargo",
+      ["build", "--release", "-q", "-p", "chidori-js", "--features", "mimalloc", "--example", "run"],
+      {
+        cwd: REPO_ROOT,
+        stdio: ["ignore", "ignore", "inherit"],
+      },
+    );
     process.stderr.write("done\n");
   }
   if (!existsSync(builtPath)) {
