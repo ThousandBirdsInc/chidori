@@ -19,6 +19,8 @@ pub mod prompt_cache;
 pub mod rust_engine;
 pub mod secret_env;
 pub mod snapshot;
+/// Pluggable persistence for the durable run artifact (journal + blobs).
+pub mod store;
 pub mod template;
 pub mod typescript;
 pub mod vfs;
