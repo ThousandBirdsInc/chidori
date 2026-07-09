@@ -52,6 +52,16 @@ pub fn execute_durable_json_call_at_seq(
         }
     }
 
+    // Strict-durability gate: once a journal write has failed, refuse to run
+    // further live side effects — the run would otherwise keep acting on the
+    // world without a recording of it (`docs/durable-storage.md`).
+    if let Some(failure) = ctx.persist_failure() {
+        anyhow::bail!(
+            "refusing live `{function}`: durable journal write failed earlier \
+             under CHIDORI_DURABILITY=strict: {failure}"
+        );
+    }
+
     let host_operation = operation_kind.map(|kind| {
         ctx.begin_host_operation_with_function(seq, kind, Some(function.to_string()), args.clone())
     });

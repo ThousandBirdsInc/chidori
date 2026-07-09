@@ -796,6 +796,84 @@ impl RunStore for TeeRunStore {
 }
 
 // ---------------------------------------------------------------------------
+// Scoped view
+// ---------------------------------------------------------------------------
+
+/// A view of a parent store under a key prefix — how a branch sub-store
+/// (`branches/op-N/branch-001/`) writes through the run's store (and any
+/// durable mirror) while addressing its artifacts relatively. The journal
+/// artifacts live at `<prefix>checkpoint.json`; appends are read-modify-write
+/// since scoped journals are only written at branch persist points, never in
+/// the per-record hot path.
+#[derive(Debug)]
+pub struct ScopedRunStore {
+    inner: Arc<dyn RunStore>,
+    prefix: String,
+}
+
+impl ScopedRunStore {
+    /// `prefix` is a run-dir-relative directory path; a trailing `/` is added
+    /// when missing.
+    pub fn new(inner: Arc<dyn RunStore>, prefix: impl Into<String>) -> Self {
+        let mut prefix = prefix.into();
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        Self { inner, prefix }
+    }
+
+    fn key(&self, key: &str) -> String {
+        format!("{}{key}", self.prefix)
+    }
+}
+
+impl RunStore for ScopedRunStore {
+    fn append_record(&self, record: &CallRecord) -> Result<()> {
+        let mut records = self.load_call_log()?.unwrap_or_default();
+        records.retain(|r| r.seq != record.seq);
+        records.push(record.clone());
+        self.write_call_log(&records)
+    }
+
+    fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        self.inner
+            .put_blob(&self.key(CHECKPOINT_FILE), &serde_json::to_vec_pretty(records)?)
+    }
+
+    fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
+        match self.inner.get_blob(&self.key(CHECKPOINT_FILE))? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put_blob(&self.key(key), bytes)
+    }
+
+    fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get_blob(&self.key(key))
+    }
+
+    fn delete_blob(&self, key: &str) -> Result<()> {
+        self.inner.delete_blob(&self.key(key))
+    }
+
+    fn list_blobs(&self) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .list_blobs()?
+            .into_iter()
+            .filter_map(|key| key.strip_prefix(&self.prefix).map(str::to_string))
+            .collect())
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.inner.flush()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory + configuration
 // ---------------------------------------------------------------------------
 

@@ -917,12 +917,30 @@ pub struct RuntimeSnapshot {
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
     run_dir: PathBuf,
+    /// Every write goes through this handle: the plain filesystem layout for
+    /// `SnapshotStore::new`, or the filesystem teed with a durable mirror for
+    /// `SnapshotStore::with_store` (`docs/durable-storage.md`). The on-disk
+    /// shape is identical either way.
+    store: std::sync::Arc<dyn crate::runtime::store::RunStore>,
 }
 
 impl SnapshotStore {
     pub fn new(run_dir: impl Into<PathBuf>) -> Self {
+        let run_dir = run_dir.into();
+        let store = std::sync::Arc::new(crate::runtime::store::FsRunStore::new(&run_dir));
+        Self { run_dir, store }
+    }
+
+    /// A snapshot store writing through an explicit [`RunStore`] handle
+    /// (e.g. the run's tee to a durable mirror). `run_dir` stays the
+    /// filesystem address of the artifacts for path-based consumers.
+    pub fn with_store(
+        run_dir: impl Into<PathBuf>,
+        store: std::sync::Arc<dyn crate::runtime::store::RunStore>,
+    ) -> Self {
         Self {
             run_dir: run_dir.into(),
+            store,
         }
     }
 
@@ -936,56 +954,10 @@ impl SnapshotStore {
         snapshot_blob: &[u8],
         call_log: &[CallRecord],
     ) -> Result<()> {
-        fs::create_dir_all(&self.run_dir)
-            .with_context(|| format!("creating snapshot dir {}", self.run_dir.display()))?;
-
-        fs::write(self.run_dir.join(&manifest.snapshot_file), snapshot_blob).with_context(
-            || {
-                format!(
-                    "writing {}",
-                    self.run_dir.join(&manifest.snapshot_file).display()
-                )
-            },
-        )?;
-
-        fs::write(
-            self.run_dir.join(SNAPSHOT_MANIFEST_FILE),
-            serde_json::to_vec_pretty(manifest)?,
-        )
-        .with_context(|| {
-            format!(
-                "writing {}",
-                self.run_dir.join(SNAPSHOT_MANIFEST_FILE).display()
-            )
-        })?;
-
-        fs::write(
-            self.run_dir.join("checkpoint.json"),
-            serde_json::to_vec_pretty(call_log)?,
-        )
-        .with_context(|| format!("writing {}", self.run_dir.join("checkpoint.json").display()))?;
-
-        match &manifest.pending {
-            Some(pending) => fs::write(
-                self.run_dir.join(PENDING_HOST_OPERATION_FILE),
-                serde_json::to_vec_pretty(pending)?,
-            )
-            .with_context(|| {
-                format!(
-                    "writing {}",
-                    self.run_dir.join(PENDING_HOST_OPERATION_FILE).display()
-                )
-            })?,
-            None => {
-                let pending_path = self.run_dir.join(PENDING_HOST_OPERATION_FILE);
-                if pending_path.exists() {
-                    fs::remove_file(&pending_path)
-                        .with_context(|| format!("removing {}", pending_path.display()))?;
-                }
-            }
-        }
-
-        Ok(())
+        self.store
+            .put_blob(&manifest.snapshot_file, snapshot_blob)
+            .with_context(|| format!("writing snapshot blob {}", manifest.snapshot_file))?;
+        self.save_manifest_only(manifest, call_log)
     }
 
     pub fn save_live_vm_snapshot(
@@ -1005,44 +977,26 @@ impl SnapshotStore {
         manifest: &SnapshotManifest,
         call_log: &[CallRecord],
     ) -> Result<()> {
-        fs::create_dir_all(&self.run_dir)
-            .with_context(|| format!("creating snapshot dir {}", self.run_dir.display()))?;
+        self.store
+            .put_blob(SNAPSHOT_MANIFEST_FILE, &serde_json::to_vec_pretty(manifest)?)
+            .with_context(|| format!("writing {SNAPSHOT_MANIFEST_FILE}"))?;
 
-        fs::write(
-            self.run_dir.join(SNAPSHOT_MANIFEST_FILE),
-            serde_json::to_vec_pretty(manifest)?,
-        )
-        .with_context(|| {
-            format!(
-                "writing {}",
-                self.run_dir.join(SNAPSHOT_MANIFEST_FILE).display()
-            )
-        })?;
-
-        fs::write(
-            self.run_dir.join("checkpoint.json"),
-            serde_json::to_vec_pretty(call_log)?,
-        )
-        .with_context(|| format!("writing {}", self.run_dir.join("checkpoint.json").display()))?;
+        self.store
+            .write_call_log(call_log)
+            .context("writing checkpoint")?;
 
         match &manifest.pending {
-            Some(pending) => fs::write(
-                self.run_dir.join(PENDING_HOST_OPERATION_FILE),
-                serde_json::to_vec_pretty(pending)?,
-            )
-            .with_context(|| {
-                format!(
-                    "writing {}",
-                    self.run_dir.join(PENDING_HOST_OPERATION_FILE).display()
+            Some(pending) => self
+                .store
+                .put_blob(
+                    PENDING_HOST_OPERATION_FILE,
+                    &serde_json::to_vec_pretty(pending)?,
                 )
-            })?,
-            None => {
-                let pending_path = self.run_dir.join(PENDING_HOST_OPERATION_FILE);
-                if pending_path.exists() {
-                    fs::remove_file(&pending_path)
-                        .with_context(|| format!("removing {}", pending_path.display()))?;
-                }
-            }
+                .with_context(|| format!("writing {PENDING_HOST_OPERATION_FILE}"))?,
+            None => self
+                .store
+                .delete_blob(PENDING_HOST_OPERATION_FILE)
+                .with_context(|| format!("removing {PENDING_HOST_OPERATION_FILE}"))?,
         }
 
         Ok(())
@@ -1050,19 +1004,25 @@ impl SnapshotStore {
 
     pub fn load(&self) -> Result<RuntimeSnapshot> {
         let manifest = self.load_manifest()?;
-        let blob_path = self.run_dir.join(&manifest.snapshot_file);
-        let blob =
-            fs::read(&blob_path).with_context(|| format!("reading {}", blob_path.display()))?;
+        let blob = self
+            .store
+            .get_blob(&manifest.snapshot_file)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "reading {}: not found",
+                    self.run_dir.join(&manifest.snapshot_file).display()
+                )
+            })?;
         Ok(RuntimeSnapshot { manifest, blob })
     }
 
     pub fn load_manifest(&self) -> Result<SnapshotManifest> {
         let manifest_path = self.run_dir.join(SNAPSHOT_MANIFEST_FILE);
-        serde_json::from_slice(
-            &fs::read(&manifest_path)
-                .with_context(|| format!("reading {}", manifest_path.display()))?,
-        )
-        .with_context(|| format!("parsing {}", manifest_path.display()))
+        let bytes = self.store.get_blob(SNAPSHOT_MANIFEST_FILE)?.ok_or_else(|| {
+            anyhow::anyhow!("reading {}: not found", manifest_path.display())
+        })?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", manifest_path.display()))
     }
 
     pub fn load_for_resume(
@@ -1114,18 +1074,18 @@ impl SnapshotStore {
         manifest: &ParallelBranchManifest,
     ) -> Result<PathBuf> {
         let dir = self.parallel_branch_dir(manifest.parallel_op_id);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("creating branch manifest dir {}", dir.display()))?;
-        fs::write(
-            dir.join(PARALLEL_BRANCH_MANIFEST_FILE),
-            serde_json::to_vec_pretty(manifest)?,
-        )
-        .with_context(|| {
-            format!(
-                "writing {}",
-                dir.join(PARALLEL_BRANCH_MANIFEST_FILE).display()
-            )
-        })?;
+        let key = format!(
+            "{}/{PARALLEL_BRANCH_MANIFEST_FILE}",
+            parallel_branch_prefix(manifest.parallel_op_id)
+        );
+        self.store
+            .put_blob(&key, &serde_json::to_vec_pretty(manifest)?)
+            .with_context(|| {
+                format!(
+                    "writing {}",
+                    dir.join(PARALLEL_BRANCH_MANIFEST_FILE).display()
+                )
+            })?;
         Ok(dir)
     }
 
@@ -1136,10 +1096,15 @@ impl SnapshotStore {
         let path = self
             .parallel_branch_dir(parallel_op_id)
             .join(PARALLEL_BRANCH_MANIFEST_FILE);
-        serde_json::from_slice(
-            &fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
-        )
-        .with_context(|| format!("parsing {}", path.display()))
+        let key = format!(
+            "{}/{PARALLEL_BRANCH_MANIFEST_FILE}",
+            parallel_branch_prefix(parallel_op_id)
+        );
+        let bytes = self
+            .store
+            .get_blob(&key)?
+            .ok_or_else(|| anyhow::anyhow!("reading {}: not found", path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
     }
 
     pub fn branch_store(
@@ -1150,9 +1115,21 @@ impl SnapshotStore {
         let branch = manifest
             .branch(branch_index)
             .ok_or_else(|| anyhow::anyhow!("unknown branch index {}", branch_index))?;
-        Ok(SnapshotStore::new(
+        let prefix = format!(
+            "{}/branch-{:03}",
+            parallel_branch_prefix(manifest.parallel_op_id),
+            branch.branch_index
+        );
+        // A scoped view of the run's store, so branch artifacts flow through
+        // the same handle (and any durable mirror) under their established
+        // relative paths.
+        Ok(SnapshotStore::with_store(
             self.parallel_branch_dir(manifest.parallel_op_id)
                 .join(format!("branch-{:03}", branch.branch_index)),
+            std::sync::Arc::new(crate::runtime::store::ScopedRunStore::new(
+                self.store.clone(),
+                prefix,
+            )),
         ))
     }
 
@@ -1161,6 +1138,11 @@ impl SnapshotStore {
             .join(BRANCHES_DIR)
             .join(format!("op-{:020}", parallel_op_id.0))
     }
+}
+
+/// The run-dir-relative key prefix of a parallel branch op's artifacts.
+fn parallel_branch_prefix(parallel_op_id: HostOperationId) -> String {
+    format!("{BRANCHES_DIR}/op-{:020}", parallel_op_id.0)
 }
 
 pub fn start_live_parallel_branch_runtimes<E: SnapshotCapableJsEngine>(

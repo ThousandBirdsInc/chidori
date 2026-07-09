@@ -13,6 +13,7 @@ use crate::runtime::snapshot::{
     PendingHostOperationKind, QueuedSignal, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
     SIGNAL_INBOX_FILE,
 };
+use crate::runtime::store::{FsRunStore, RunStore};
 use crate::runtime::vfs::Vfs;
 
 /// A streaming event the runtime emits while an agent runs. CallRecord is
@@ -116,9 +117,21 @@ struct RuntimeContextInner {
     /// Unique identifier for this run. Used as the subdirectory name
     /// under `.chidori/runs/` when persistence is enabled.
     pub run_id: String,
-    /// Directory into which the checkpoint file is written after each call.
-    /// None disables on-disk persistence.
+    /// Directory into which the run's durable artifacts are written.
+    /// None disables persistence. Kept alongside `store` because branch
+    /// stores and out-of-band tooling still address artifacts by path.
     pub persist_dir: Option<PathBuf>,
+    /// The persistence handle every durable write goes through. Filesystem by
+    /// default (`enable_persistence`); a configured durable mirror rides along
+    /// via `enable_persistence_with_store` (`docs/durable-storage.md`).
+    pub store: Option<Arc<dyn RunStore>>,
+    /// First persistence failure observed on this run, when the durability
+    /// policy is strict. Checked before the next live host effect executes so
+    /// a run cannot keep taking side effects its journal isn't recording.
+    pub persist_failure: Option<String>,
+    /// Whether persistence failures poison the run (`CHIDORI_DURABILITY=strict`)
+    /// or are logged and tolerated (default, the pre-store behavior).
+    pub strict_durability: bool,
     /// How `input()` should behave when there is no cached response:
     /// read from stdin, or pause the run and surface the prompt to the caller.
     pub input_mode: InputMode,
@@ -338,6 +351,9 @@ impl RuntimeContext {
                 replay_log: None,
                 run_id: uuid::Uuid::new_v4().to_string(),
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -407,6 +423,9 @@ impl RuntimeContext {
                 replay_log: Some(replay_log),
                 run_id: uuid::Uuid::new_v4().to_string(),
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -446,6 +465,9 @@ impl RuntimeContext {
                 replay_log: None,
                 run_id,
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -495,6 +517,9 @@ impl RuntimeContext {
                 replay_log: None,
                 run_id,
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: parent_inner.input_mode,
                 pending_input: None,
                 pending_approval: None,
@@ -545,6 +570,9 @@ impl RuntimeContext {
                 replay_log: Some(replay_log),
                 run_id,
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: InputMode::Pause,
                 pending_input: None,
                 pending_approval: None,
@@ -606,6 +634,9 @@ impl RuntimeContext {
                 replay_log: Some(replay_log),
                 run_id: actor_id.clone(),
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: InputMode::Pause,
                 pending_input: None,
                 pending_approval: None,
@@ -673,22 +704,60 @@ impl RuntimeContext {
             inner.seq = inner.seq.max(record.seq);
             inner.call_log.push(record);
         }
-        if let Some(ref dir) = inner.persist_dir {
-            if let Ok(json) = inner.call_log.to_json() {
-                let _ = std::fs::write(dir.join("checkpoint.json"), json);
-            }
+        if let Some(store) = inner.store.clone() {
+            let result = store.write_call_log(inner.call_log.records());
+            note_persist_result(&mut inner, result);
         }
     }
 
-    /// Enable on-disk persistence. Each `record_call` will rewrite
-    /// `<base_dir>/<run_id>/checkpoint.json` with the full log.
-    /// Returns the run directory path.
+    /// Enable persistence with the default filesystem layout. Each
+    /// `record_call` appends the record to `<base_dir>/<run_id>/records.jsonl`
+    /// (safepoints rewrite the full `checkpoint.json`). Returns the run
+    /// directory path.
     pub fn enable_persistence(&self, base_dir: PathBuf) -> PathBuf {
-        let mut inner = self.inner.lock().unwrap();
-        let run_dir = base_dir.join(&inner.run_id);
+        let run_dir = base_dir.join(self.run_id());
         let _ = std::fs::create_dir_all(&run_dir);
-        inner.persist_dir = Some(run_dir.clone());
+        self.enable_persistence_with_store(run_dir.clone(), Arc::new(FsRunStore::new(&run_dir)));
         run_dir
+    }
+
+    /// Enable persistence through an explicit [`RunStore`] handle (e.g. the
+    /// filesystem teed with a durable SQLite/HTTP mirror). `run_dir` remains
+    /// the filesystem address of the run's artifacts for path-based consumers.
+    pub fn enable_persistence_with_store(&self, run_dir: PathBuf, store: Arc<dyn RunStore>) {
+        let _ = std::fs::create_dir_all(&run_dir);
+        let mut inner = self.inner.lock().unwrap();
+        inner.persist_dir = Some(run_dir);
+        inner.store = Some(store);
+    }
+
+    /// The run's persistence handle, when persistence is enabled.
+    pub fn store(&self) -> Option<Arc<dyn RunStore>> {
+        self.inner.lock().unwrap().store.clone()
+    }
+
+    /// The first persistence failure recorded under strict durability, if any.
+    /// Host dispatch checks this before executing a live effect so a run whose
+    /// journal writes are failing stops taking side effects.
+    pub fn persist_failure(&self) -> Option<String> {
+        self.inner.lock().unwrap().persist_failure.clone()
+    }
+
+    /// Durability barrier for the run's store: every buffered write is durable
+    /// when this returns. Called by the engine before a run settles or pauses
+    /// (the output-gate point). Surfaces a strict-mode persistence failure.
+    pub fn flush_store(&self) -> anyhow::Result<()> {
+        let (store, failure) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.store.clone(), inner.persist_failure.clone())
+        };
+        if let Some(failure) = failure {
+            anyhow::bail!("durable journal write failed: {failure}");
+        }
+        if let Some(store) = store {
+            store.flush()?;
+        }
+        Ok(())
     }
 
     /// Override the run id. Used by the server's replay-based resume to keep the
@@ -850,10 +919,11 @@ impl RuntimeContext {
         }
         inner.seq = inner.seq.max(record.seq);
         inner.call_log.push(record.clone());
-        if let Some(ref dir) = inner.persist_dir {
-            if let Ok(json) = inner.call_log.to_json() {
-                let _ = std::fs::write(dir.join("checkpoint.json"), json);
-            }
+        if let Some(store) = inner.store.clone() {
+            // O(1) append to the journal (`records.jsonl` + any durable
+            // mirror); safepoints rewrite the full checkpoint artifact.
+            let result = store.append_record(&record);
+            note_persist_result(&mut inner, result);
         }
         // Stream this call's OTEL span now (buffered until its parent span
         // exists), so spans ship incrementally during the run rather than as one
@@ -1202,7 +1272,7 @@ impl RuntimeContext {
             .min_by_key(|(_, s)| s.delivery_seq)
             .map(|(i, _)| i)?;
         let signal = inner.signal_inbox.remove(idx);
-        persist_signal_inbox(&inner);
+        persist_signal_inbox(&mut inner);
         Some(signal)
     }
 
@@ -1220,7 +1290,7 @@ impl RuntimeContext {
             .iter()
             .position(|s| s.delivery_seq == delivery_seq)?;
         let signal = inner.signal_inbox.remove(idx);
-        persist_signal_inbox(&inner);
+        persist_signal_inbox(&mut inner);
         Some(signal)
     }
 
@@ -1253,7 +1323,7 @@ impl RuntimeContext {
             enqueued_at: chrono::Utc::now(),
         };
         inner.signal_inbox.push(queued.clone());
-        persist_signal_inbox(&inner);
+        persist_signal_inbox(&mut inner);
         queued
     }
 
@@ -1292,7 +1362,7 @@ impl RuntimeContext {
         let id = inner
             .host_promises
             .create_with_function(seq, kind, function, args);
-        persist_host_promises(&inner);
+        persist_host_promises(&mut inner);
         id
     }
 
@@ -1340,7 +1410,7 @@ impl RuntimeContext {
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.host_promises.resolve(id, value)?;
-        persist_host_promises(&inner);
+        persist_host_promises(&mut inner);
         Ok(())
     }
 
@@ -1351,7 +1421,7 @@ impl RuntimeContext {
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.host_promises.reject(id, error)?;
-        persist_host_promises(&inner);
+        persist_host_promises(&mut inner);
         Ok(())
     }
 
@@ -1421,46 +1491,51 @@ impl RuntimeContext {
     }
 }
 
-fn persist_host_promises(inner: &RuntimeContextInner) {
-    let Some(dir) = inner.persist_dir.as_ref() else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(dir);
-    let records = inner.host_promises.records();
-    if let Ok(json) = serde_json::to_vec_pretty(&records) {
-        let _ = std::fs::write(dir.join(HOST_PROMISE_TABLE_FILE), json);
-    }
-
-    let pending = inner.host_promises.active_pending_operation();
-    let pending_path = dir.join(PENDING_HOST_OPERATION_FILE);
-    match pending {
-        Some(pending) => {
-            if let Ok(json) = serde_json::to_vec_pretty(&pending) {
-                let _ = std::fs::write(pending_path, json);
+/// Record a persistence outcome on the context: strict durability latches the
+/// first failure (host dispatch refuses further live effects); the default
+/// policy logs and continues, preserving the pre-store behavior.
+fn note_persist_result(inner: &mut RuntimeContextInner, result: anyhow::Result<()>) {
+    if let Err(err) = result {
+        if inner.strict_durability {
+            if inner.persist_failure.is_none() {
+                inner.persist_failure = Some(err.to_string());
             }
-        }
-        None => {
-            if pending_path.exists() {
-                let _ = std::fs::remove_file(pending_path);
-            }
+        } else {
+            tracing::warn!(run_id = %inner.run_id, error = %err, "run persistence write failed");
         }
     }
 }
 
-/// Persist the in-memory signal mailbox to `SIGNAL_INBOX_FILE` under the run's
-/// persist dir. The inbox lives in a `signals/` subdirectory, so the parent dir
-/// is created first. No-op when persistence is disabled.
-fn persist_signal_inbox(inner: &RuntimeContextInner) {
-    let Some(dir) = inner.persist_dir.as_ref() else {
+fn persist_host_promises(inner: &mut RuntimeContextInner) {
+    let Some(store) = inner.store.clone() else {
         return;
     };
-    let inbox_path = dir.join(SIGNAL_INBOX_FILE);
-    if let Some(parent) = inbox_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_vec_pretty(&inner.signal_inbox) {
-        let _ = std::fs::write(inbox_path, json);
-    }
+    let records = inner.host_promises.records();
+    let result = serde_json::to_vec_pretty(&records)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| store.put_blob(HOST_PROMISE_TABLE_FILE, &json));
+    note_persist_result(inner, result);
+
+    let pending = inner.host_promises.active_pending_operation();
+    let result = match pending {
+        Some(pending) => serde_json::to_vec_pretty(&pending)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| store.put_blob(PENDING_HOST_OPERATION_FILE, &json)),
+        None => store.delete_blob(PENDING_HOST_OPERATION_FILE),
+    };
+    note_persist_result(inner, result);
+}
+
+/// Persist the in-memory signal mailbox to `SIGNAL_INBOX_FILE` through the
+/// run's store. No-op when persistence is disabled.
+fn persist_signal_inbox(inner: &mut RuntimeContextInner) {
+    let Some(store) = inner.store.clone() else {
+        return;
+    };
+    let result = serde_json::to_vec_pretty(&inner.signal_inbox)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| store.put_blob(SIGNAL_INBOX_FILE, &json));
+    note_persist_result(inner, result);
 }
 
 /// Load the durable signal mailbox from a run directory. Returns an empty vec
