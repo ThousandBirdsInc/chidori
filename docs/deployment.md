@@ -10,8 +10,9 @@ mirrored somewhere that survives the machine
 
 This document covers taking that from a laptop to production: the recommended
 zero-dependency single-machine setup, hardening the HTTP server, choosing a
-durability tier, running on easy-to-provision hosts (Fly.io, Railway, Render),
-what high availability looks like today, and the current scaling limits.
+durability tier, running on easy-to-provision hosts (Fly.io, Railway, Render)
+or an existing Kubernetes cluster, what high availability looks like today,
+and the current scaling limits.
 
 ## What a deployment consists of
 
@@ -281,6 +282,100 @@ alarms to fire). Use them for what they're good at, next to a Chidori host:
   is a Worker you deploy with `wrangler deploy`, and it only ever runs when a
   journal write or hydration read arrives.
 
+## Deploying to an existing Kubernetes cluster
+
+If your team already runs Kubernetes, Chidori is an easy tenant: one
+container, one port, one health endpoint, state either on a PVC or (better)
+in an `s3://` mirror. The constraints from the managed-hosts section translate
+directly into manifest choices:
+
+- **`replicas: 1` and `strategy: Recreate`.** One writer per run means no
+  replicas behind the Service — and the default `RollingUpdate` strategy
+  briefly runs old and new pods side by side, which is exactly the
+  double-driver overlap that `fs`/`s3://` leases only police advisorily
+  ([higher availability](#higher-availability)). `Recreate` stops the old pod
+  before starting the new one. (With the SQLite backend on a PVC or the
+  Durable Object relay, overlap is enforced away, but there's still no reason
+  to roll.)
+- **No HPA on this workload.** Scale up via resources +
+  `CHIDORI_MAX_CONCURRENT_SESSIONS`; scale out by adding a Deployment per
+  agent and routing by host/path at the Ingress.
+- **Kubernetes restarts are the recovery path.** Liveness-probe restarts and
+  node evictions are the same event as a crash: the pod comes back, hydrates
+  from the mirror, re-arms the detached-agent fleet, and resumes runs by
+  replay.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: my-agent }
+  template:
+    metadata:
+      labels: { app: my-agent }
+    spec:
+      containers:
+        - name: chidori
+          image: registry.example.com/my-agent:v1   # the Dockerfile above
+          ports:
+            - containerPort: 8080
+          env:
+            - name: CHIDORI_DURABILITY
+              value: "strict"
+            - name: CHIDORI_RUN_STORE
+              value: "s3://my-agent-runs"
+          envFrom:
+            - secretRef:
+                name: my-agent-secrets   # ANTHROPIC_API_KEY, CHIDORI_API_KEY,
+                                         # AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { memory: "4Gi" }   # pair with CHIDORI_JS_MEM_CAP_MB
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-agent
+spec:
+  selector: { app: my-agent }
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+Put your standard Ingress (or Gateway) with TLS in front of the Service, and
+keep `CHIDORI_API_KEY` set even inside the cluster — the session API is
+otherwise open to anything that can reach the Service.
+
+**State.** The manifest above is deliberately stateless: with the `s3://`
+mirror, a rescheduled pod hydrates whatever it's asked about, so it can land
+on any node. The alternative is a `ReadWriteOnce` PVC mounted at
+`/app/.chidori` (use a StatefulSet in that case); it works, but couples the
+pod to a volume the same way a Fly volume couples a machine to a host — reach
+for it only when no object store is available, and note that the in-cluster
+S3 answer (a MinIO deployment) keeps even that dependency inside the cluster.
+
+**If you use `--isolate`.** The OS-isolation layers degrade predictably in a
+container: the seccomp denylist is the required core
+(`CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` makes its absence fatal rather than a
+warning), Landlock needs a 5.13+ node kernel, and the empty network namespace
+needs `CAP_SYS_ADMIN` — which most clusters rightly deny, so expect that layer
+to be skipped and rely on the policy gate plus your cluster's NetworkPolicy
+for egress control. See [sandbox model](./sandbox-model.md).
+
 ## Higher availability
 
 Be precise about the constraint first: **a run has one writer at a time.**
@@ -354,4 +449,4 @@ keep the previous binary around until the new one has driven your runs.
 - [ ] `CHIDORI_DURABILITY=strict`
 - [ ] `.chidori/` backed up, or a mirror + hydration drill done
 - [ ] `Restart=always` (or the container equivalent) so resume-by-replay can do its job
-- [ ] On managed hosts: instance count pinned to 1 per agent, scale-to-zero/app-sleep disabled
+- [ ] On managed hosts / Kubernetes: one instance per agent (`replicas: 1`, `strategy: Recreate`), scale-to-zero/app-sleep disabled, no HPA
