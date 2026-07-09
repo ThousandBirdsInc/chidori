@@ -1,6 +1,6 @@
 {
   "name": "@1kbirds/chidori",
-  "version": "3.6.0",
+  "version": "3.7.0",
   "description": "TypeScript SDK for the Chidori agent framework — HTTP client plus agent authoring types.",
   "keywords": ["ai", "agents", "typescript", "llm", "replay"],
   "publishConfig": { "access": "public" },
