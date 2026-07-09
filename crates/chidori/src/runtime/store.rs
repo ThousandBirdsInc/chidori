@@ -944,6 +944,22 @@ impl RunStoreFactory {
         Self { run_base, backend }
     }
 
+    /// The process-wide factory for `run_base`, built from the environment on
+    /// first use and memoized. This is how path-based persistence helpers
+    /// (server session mutation, CLI resume) pick up the configured durable
+    /// mirror without threading a factory through every signature — one
+    /// factory per base means one shared SQLite connection / HTTP relay.
+    pub fn shared(run_base: &Path) -> Self {
+        static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, RunStoreFactory>>> =
+            std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let mut cache = cache.lock().unwrap();
+        cache
+            .entry(run_base.to_path_buf())
+            .or_insert_with(|| Self::from_env(run_base))
+            .clone()
+    }
+
     pub fn run_base(&self) -> &Path {
         &self.run_base
     }
@@ -1013,10 +1029,14 @@ impl RunStoreFactory {
     /// path after machine loss. No-op when the local journal already exists
     /// or no mirror is configured. Returns whether anything was hydrated.
     pub fn hydrate(&self, run_id: &str) -> Result<bool> {
-        let local = FsRunStore::new(self.run_base.join(run_id));
-        if local.load_call_log()?.is_some() {
+        let run_dir = self.run_base.join(run_id);
+        // Cheap presence check — hydration only kicks in when the local
+        // journal is entirely absent (a fresh machine), so callers can invoke
+        // this on every load without parsing anything.
+        if run_dir.join(CHECKPOINT_FILE).exists() || run_dir.join(RECORDS_FILE).exists() {
             return Ok(false);
         }
+        let local = FsRunStore::new(&run_dir);
         let Some(mirror) = self.mirror_for(run_id) else {
             return Ok(false);
         };

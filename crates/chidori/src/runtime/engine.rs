@@ -177,7 +177,9 @@ impl Engine {
     }
 
     pub fn with_persist_base(mut self, base: PathBuf) -> Self {
-        self.run_store = Some(crate::runtime::store::RunStoreFactory::from_env(&base));
+        // `shared` memoizes per base, so per-request engine builds (the
+        // server) reuse one factory — one SQLite connection / HTTP relay.
+        self.run_store = Some(crate::runtime::store::RunStoreFactory::shared(&base));
         self.persist_base = Some(base);
         self
     }
