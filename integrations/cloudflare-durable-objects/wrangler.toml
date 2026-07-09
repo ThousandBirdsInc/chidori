@@ -1,0 +1,22 @@
+name = "chidori-run-store"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+
+# One Durable Object per Chidori run: the run's journal and blobs live in the
+# object's SQLite-backed storage, giving every acknowledged write cross-
+# datacenter replication (Storage Relay Service) and 30-day point-in-time
+# recovery. Point CHIDORI_RUN_STORE at the deployed worker URL.
+
+[[durable_objects.bindings]]
+name = "RUN"
+class_name = "ChidoriRun"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChidoriRun"]
+
+[vars]
+# Set a bearer token in production:
+#   wrangler secret put CHIDORI_RUN_STORE_TOKEN
+# and export the same value as CHIDORI_RUN_STORE_TOKEN next to the chidori
+# process.

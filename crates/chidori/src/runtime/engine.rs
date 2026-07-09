@@ -35,6 +35,11 @@ pub struct Engine {
     approvals: Vec<(String, serde_json::Value)>,
     /// If set, each run persists its call log to `<persist_base>/<run_id>/checkpoint.json`.
     persist_base: Option<PathBuf>,
+    /// Hands out per-run persistence handles: the filesystem layout under
+    /// `persist_base`, teed with a durable mirror when one is configured
+    /// (`CHIDORI_RUN_STORE`, `docs/durable-storage.md`). Built alongside
+    /// `persist_base`; None when persistence is disabled.
+    run_store: Option<crate::runtime::store::RunStoreFactory>,
     /// Default root for `chidori.workspace`, used when the run's context has no
     /// workspace root of its own. The CLI points this at the agent's project
     /// directory so `chidori.workspace` works out of the box; an explicit
@@ -82,6 +87,58 @@ pub struct RunResult {
 /// always resumed engine-agnostically via call-log replay, never a VM image).
 /// Keeping the name leaves the manifest acceptable to the unchanged resume gate
 /// and lets artifacts written before the removal still load.
+pub(crate) fn persist_journal_scaffold(
+    base: &Path,
+    run_id: &str,
+    path: &Path,
+    source: &str,
+    policy: &RuntimePolicy,
+    ctx: &RuntimeContext,
+) -> Result<()> {
+    persist_rust_journal_scaffold(base, run_id, path, source, policy, ctx)
+}
+
+/// Install the durable-scaffold safepoints on a prepared context: the
+/// manifest + pending + checkpoint are persisted before every live host side
+/// effect and after every recorded completion, so a crash mid-run always
+/// leaves a resumable artifact. Shared by the engine's run path and the
+/// detached-agent supervisor (`host_agent`), which runs modules directly.
+pub(crate) fn install_journal_scaffold_safepoints(
+    base: &Path,
+    run_id: &str,
+    path: &Path,
+    source: &str,
+    policy: &RuntimePolicy,
+    ctx: &RuntimeContext,
+) {
+    let (base, run_id, path, source, policy) = (
+        base.to_path_buf(),
+        run_id.to_string(),
+        path.to_path_buf(),
+        source.to_string(),
+        policy.clone(),
+    );
+    {
+        let (base, run_id, path, source, policy) = (
+            base.clone(),
+            run_id.clone(),
+            path.clone(),
+            source.clone(),
+            policy.clone(),
+        );
+        let safepoint_ctx = ctx.clone();
+        ctx.set_host_operation_safepoint(HostOperationSafepoint::new(move |_operation| {
+            persist_rust_journal_scaffold(&base, &run_id, &path, &source, &policy, &safepoint_ctx)
+        }));
+    }
+    let completion_ctx = ctx.clone();
+    ctx.set_host_operation_completion_safepoint(HostOperationCompletionSafepoint::new(
+        move |_record| {
+            persist_rust_journal_scaffold(&base, &run_id, &path, &source, &policy, &completion_ctx)
+        },
+    ));
+}
+
 fn persist_rust_journal_scaffold(
     base: &Path,
     run_id: &str,
@@ -121,7 +178,14 @@ fn persist_rust_journal_scaffold(
         journal: Vec::new(),
     };
     let blob_bytes = serde_json::to_vec(&blob).unwrap_or_default();
-    SnapshotStore::new(base.join(run_id)).save(&manifest, &blob_bytes, &call_log)
+    // Write through the run's store handle when persistence is enabled, so a
+    // configured durable mirror receives the scaffold too; identical on-disk
+    // layout either way.
+    let store = match ctx.store() {
+        Some(store) => SnapshotStore::with_store(base.join(run_id), store),
+        None => SnapshotStore::new(base.join(run_id)),
+    };
+    store.save(&manifest, &blob_bytes, &call_log)
 }
 
 impl Engine {
@@ -139,6 +203,7 @@ impl Engine {
             mcp: Arc::new(McpManager::new()),
             approvals: Vec::new(),
             persist_base: None,
+            run_store: None,
             workspace_root: None,
         }
     }
@@ -164,7 +229,19 @@ impl Engine {
     }
 
     pub fn with_persist_base(mut self, base: PathBuf) -> Self {
+        // `shared` memoizes per base, so per-request engine builds (the
+        // server) reuse one factory — one SQLite connection / HTTP relay.
+        self.run_store = Some(crate::runtime::store::RunStoreFactory::shared(&base));
         self.persist_base = Some(base);
+        self
+    }
+
+    /// Persist runs through a pre-built [`RunStoreFactory`] — the server path,
+    /// which constructs the factory once at startup (a durable mirror holds
+    /// shared state like a SQLite connection) instead of once per engine.
+    pub fn with_run_store(mut self, factory: crate::runtime::store::RunStoreFactory) -> Self {
+        self.persist_base = Some(factory.run_base().to_path_buf());
+        self.run_store = Some(factory);
         self
     }
 
@@ -531,14 +608,21 @@ impl Engine {
             }
         }
 
-        // Enable on-disk persistence if configured.
-        if let Some(ref base) = self.persist_base {
-            let run_dir = ctx.enable_persistence(base.clone());
+        // Enable persistence if configured: the filesystem run dir, teed with
+        // the durable mirror when one is set up (`docs/durable-storage.md`).
+        if let Some(ref factory) = self.run_store {
+            let run_id = ctx.run_id();
+            let run_dir = factory.run_base().join(&run_id);
+            ctx.enable_persistence_with_store(run_dir, factory.store_for(&run_id));
             // Save the input alongside the checkpoint for later resume/trace.
-            let _ = std::fs::write(
-                run_dir.join("input.json"),
-                serde_json::to_string_pretty(inputs).unwrap_or_default(),
-            );
+            if let Some(store) = ctx.store() {
+                let _ = store.put_blob(
+                    "input.json",
+                    serde_json::to_string_pretty(inputs)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+            }
         }
 
         // Start a root OTEL span for this run. No-op when OTEL is disabled
@@ -651,6 +735,13 @@ impl Engine {
             // something to resume. The check runs
             // on `Ok` too in case the agent caught the sentinel and returned.
             let surface_pause = |ctx: &RuntimeContext| -> Option<RunResult> {
+                // A pause is externally visible (the caller renders a prompt /
+                // waits on a signal), so flush buffered journal writes first —
+                // the output-gate point for pauses. Failures are logged: the
+                // strict gate in host dispatch already stops further effects.
+                if let Err(err) = ctx.flush_store() {
+                    tracing_error!(run_id = %ctx.run_id(), error = %err, "flushing run store at pause");
+                }
                 if let Some(pending) = ctx.take_pending_input() {
                     if let Some(ref base) = self.persist_base {
                         let _ = persist_rust_journal_scaffold(
@@ -722,15 +813,23 @@ impl Engine {
                     }
                     info!(agent = %agent_name, run_id = %run_id, "rust-engine agent run ok");
                     if let Some(ref base) = self.persist_base {
-                        let run_dir = base.join(ctx.run_id());
-                        let _ = std::fs::write(
-                            run_dir.join("output.json"),
-                            serde_json::to_string_pretty(&output).unwrap_or_default(),
-                        );
+                        if let Some(store) = ctx.store() {
+                            let _ = store.put_blob(
+                                "output.json",
+                                serde_json::to_string_pretty(&output)
+                                    .unwrap_or_default()
+                                    .as_bytes(),
+                            );
+                        }
                         let _ = persist_rust_journal_scaffold(
                             base, &run_id, path, &source, &policy, &ctx,
                         );
                     }
+                    // Output gate: the run's result is not surfaced until the
+                    // journal is durable. A strict-mode persistence failure
+                    // fails the run here instead of returning an output whose
+                    // recording was lost (`docs/durable-storage.md`).
+                    ctx.flush_store()?;
                     emit_otel(&ctx, None);
                     Ok(RunResult {
                         output,

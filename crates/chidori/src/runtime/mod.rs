@@ -6,6 +6,8 @@ pub mod cost;
 pub mod crypto;
 pub mod engine;
 pub mod host_actor;
+/// Detached, durable, addressable agent processes (`chidori.agents.*`).
+pub mod host_agent;
 pub mod host_branch;
 pub mod host_core;
 /// OS-level isolation: run an agent in a sandboxed child process and broker its
@@ -19,6 +21,10 @@ pub mod prompt_cache;
 pub mod rust_engine;
 pub mod secret_env;
 pub mod snapshot;
+/// Pluggable persistence for the durable run artifact (journal + blobs).
+pub mod store;
+/// S3-compatible blob backend for the run store (S3 / R2 / GCS / MinIO).
+pub mod store_blob;
 pub mod template;
 pub mod typescript;
 pub mod vfs;

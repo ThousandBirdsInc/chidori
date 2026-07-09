@@ -26,6 +26,7 @@ tokio = { version = "1", features = ["full"] }
 # every release target. `*-native-roots` keeps using the platform trust store,
 # preserving custom/corporate-CA support (e.g. self-hosted LiteLLM proxies).
 reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
     "charset",
     "http2",
     "system-proxy",

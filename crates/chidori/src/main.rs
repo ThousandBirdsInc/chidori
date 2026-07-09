@@ -213,6 +213,12 @@ enum Commands {
         /// Project dir containing `.chidori/runs/` (defaults to agent file's parent)
         #[arg(short, long)]
         dir: Option<PathBuf>,
+
+        /// Time travel: replay only the records with seq <= N, then continue
+        /// live from that frontier — re-driving the run's logic from an
+        /// earlier point in its history (`docs/durable-storage.md`).
+        #[arg(long)]
+        until_seq: Option<u64>,
     },
 
     /// List a run's persisted `chidori.branch` sub-runs and their states.
@@ -404,9 +410,12 @@ fn main() {
         Commands::Check { file } => (cmd_check(&file), true),
         Commands::Tools { dir } => (cmd_tools(&dir), false),
         Commands::Stats { dir } => (cmd_stats(dir.as_deref()), false),
-        Commands::Resume { file, run_id, dir } => {
-            (cmd_resume(&file, &run_id, dir.as_deref()), false)
-        }
+        Commands::Resume {
+            file,
+            run_id,
+            dir,
+            until_seq,
+        } => (cmd_resume(&file, &run_id, dir.as_deref(), until_seq), false),
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
         Commands::BranchResume {
             run_id,
@@ -1222,25 +1231,43 @@ fn cmd_tools(dirs: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_resume(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+fn cmd_resume(
+    file: &PathBuf,
+    run_id: &str,
+    dir: Option<&std::path::Path>,
+    until_seq: Option<u64>,
+) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
         .or_else(|| file.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
-    let checkpoint_path = run_dir.join("checkpoint.json");
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
     let input_path = run_dir.join("input.json");
 
-    if !checkpoint_path.exists() {
-        anyhow::bail!("No checkpoint found at {}", checkpoint_path.display());
-    }
+    // Load through the run store: hydrates the run dir from a configured
+    // durable mirror when this machine has never seen the run, and unions the
+    // last checkpoint with any crash-stranded `records.jsonl` tail.
+    let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    let _ = factory.hydrate(run_id);
+    let mut records = factory
+        .store_for(run_id)
+        .load_call_log()?
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
 
-    let records: Vec<crate::runtime::call_log::CallRecord> = {
-        let text = std::fs::read_to_string(&checkpoint_path)
-            .with_context(|| format!("Failed to read {}", checkpoint_path.display()))?;
-        serde_json::from_str(&text).context("Failed to parse checkpoint.json")?
-    };
+    // Time travel: truncate the journal at the requested frontier; replay
+    // serves everything up to it from cache and the run continues live there.
+    if let Some(until) = until_seq {
+        let before = records.len();
+        records.retain(|r| r.seq <= until);
+        eprintln!(
+            "Time travel: replaying {} of {} records (seq <= {})",
+            records.len(),
+            before,
+            until
+        );
+    }
 
     let input_value: Value = if input_path.exists() {
         let text = std::fs::read_to_string(&input_path)?;
@@ -1336,17 +1363,15 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
-    let checkpoint_path = run_dir.join("checkpoint.json");
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
 
-    if !checkpoint_path.exists() {
-        anyhow::bail!("No checkpoint found at {}", checkpoint_path.display());
-    }
-
-    let text = std::fs::read_to_string(&checkpoint_path)
-        .with_context(|| format!("Failed to read {}", checkpoint_path.display()))?;
-    let records: Vec<crate::runtime::call_log::CallRecord> =
-        serde_json::from_str(&text).context("Failed to parse checkpoint.json")?;
+    let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    let _ = factory.hydrate(run_id);
+    let records = factory
+        .store_for(run_id)
+        .load_call_log()?
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
 
     println!("Run: {}", run_id);
     println!("Calls: {}", records.len());

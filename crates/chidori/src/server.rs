@@ -228,24 +228,25 @@ fn complete_persisted_pending_host_operation(
     let Some(run_id) = run_id else {
         return Ok(None);
     };
-    let run_dir = run_base.join(run_id);
-    let pending_path = run_dir.join(PENDING_HOST_OPERATION_FILE);
-    if !pending_path.exists() {
+    // Mutations go through the run's store so a configured durable mirror
+    // stays in step with the filesystem layout (`docs/durable-storage.md`).
+    let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
+    let _ = factory.hydrate(run_id);
+    let store = factory.store_for(run_id);
+    let Some(pending_bytes) = store.get_blob(PENDING_HOST_OPERATION_FILE)? else {
         return Ok(None);
-    }
+    };
 
-    let pending: PendingHostOperation = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
+    let pending: PendingHostOperation = serde_json::from_slice(&pending_bytes)?;
     if let Some((seq, kind)) = expected {
         if pending.seq != seq || pending.kind != kind {
             return Ok(None);
         }
     }
 
-    let table_path = run_dir.join(HOST_PROMISE_TABLE_FILE);
-    let mut records: Vec<HostPromiseRecord> = if table_path.exists() {
-        serde_json::from_slice(&std::fs::read(&table_path)?)?
-    } else {
-        Vec::new()
+    let mut records: Vec<HostPromiseRecord> = match store.get_blob(HOST_PROMISE_TABLE_FILE)? {
+        Some(bytes) => serde_json::from_slice(&bytes)?,
+        None => Vec::new(),
     };
     let completed_at = chrono::Utc::now();
     let record = records
@@ -273,8 +274,11 @@ fn complete_persisted_pending_host_operation(
             completed_at,
         },
     };
-    std::fs::write(&table_path, serde_json::to_vec_pretty(&records)?)?;
-    std::fs::remove_file(&pending_path)?;
+    store.put_blob(
+        HOST_PROMISE_TABLE_FILE,
+        &serde_json::to_vec_pretty(&records)?,
+    )?;
+    store.delete_blob(PENDING_HOST_OPERATION_FILE)?;
     Ok(Some(pending))
 }
 
@@ -287,11 +291,10 @@ fn complete_persisted_host_promise_record(
     let Some(run_id) = run_id else {
         return Ok(());
     };
-    let table_path = run_base.join(run_id).join(HOST_PROMISE_TABLE_FILE);
-    let mut records: Vec<HostPromiseRecord> = if table_path.exists() {
-        serde_json::from_slice(&std::fs::read(&table_path)?)?
-    } else {
-        Vec::new()
+    let store = crate::runtime::store::RunStoreFactory::shared(run_base).store_for(run_id);
+    let mut records: Vec<HostPromiseRecord> = match store.get_blob(HOST_PROMISE_TABLE_FILE)? {
+        Some(bytes) => serde_json::from_slice(&bytes)?,
+        None => Vec::new(),
     };
     let completed_at = chrono::Utc::now();
     let record = records
@@ -316,7 +319,10 @@ fn complete_persisted_host_promise_record(
             completed_at,
         },
     };
-    std::fs::write(&table_path, serde_json::to_vec_pretty(&records)?)?;
+    store.put_blob(
+        HOST_PROMISE_TABLE_FILE,
+        &serde_json::to_vec_pretty(&records)?,
+    )?;
     Ok(())
 }
 
@@ -327,6 +333,9 @@ fn load_persisted_host_promises(
     let Some(run_id) = run_id else {
         return Ok(Vec::new());
     };
+    // Materialize the run dir from the durable mirror first when this machine
+    // has never seen the run (the machine-loss recovery path).
+    let _ = crate::runtime::store::RunStoreFactory::shared(run_base).hydrate(run_id);
     let table_path = run_base.join(run_id).join(HOST_PROMISE_TABLE_FILE);
     if !table_path.exists() {
         return Ok(Vec::new());
@@ -342,6 +351,7 @@ fn load_persisted_vfs(run_base: &FsPath, run_id: Option<&str>) -> crate::runtime
     let Some(run_id) = run_id else {
         return crate::runtime::vfs::Vfs::new();
     };
+    let _ = crate::runtime::store::RunStoreFactory::shared(run_base).hydrate(run_id);
     match crate::runtime::snapshot::SnapshotStore::new(run_base.join(run_id)).load_manifest() {
         Ok(manifest) => manifest.vfs,
         Err(_) => crate::runtime::vfs::Vfs::new(),
@@ -379,12 +389,12 @@ fn enqueue_signal_to_inbox(
 
     let lock = state.signal_inbox_lock(run_id);
     let _guard = lock.lock().unwrap();
-    let run_dir = state.run_base.join(run_id);
-    let inbox_path = run_dir.join(SIGNAL_INBOX_FILE);
-    let mut inbox: Vec<QueuedSignal> = if inbox_path.exists() {
-        serde_json::from_slice(&std::fs::read(&inbox_path)?).unwrap_or_default()
-    } else {
-        Vec::new()
+    let factory = crate::runtime::store::RunStoreFactory::shared(&state.run_base);
+    let _ = factory.hydrate(run_id);
+    let store = factory.store_for(run_id);
+    let mut inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE)? {
+        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        None => Vec::new(),
     };
     let next_delivery_seq = inbox
         .iter()
@@ -400,10 +410,7 @@ fn enqueue_signal_to_inbox(
         enqueued_at: chrono::Utc::now(),
     };
     inbox.push(queued.clone());
-    if let Some(parent) = inbox_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&inbox_path, serde_json::to_vec_pretty(&inbox)?)?;
+    store.put_blob(SIGNAL_INBOX_FILE, &serde_json::to_vec_pretty(&inbox)?)?;
     Ok(queued)
 }
 
@@ -513,6 +520,39 @@ pub async fn serve(
         }
     }
 
+    // Re-arm the detached-agent fleet (`docs/detached-agents.md`): install the
+    // hub's runtime parts, then wake agents that were mid-run when the
+    // previous process died and re-arm hibernating agents' alarm deadlines.
+    {
+        let rt = Arc::new(crate::scheduler::new_tokio_runtime()?);
+        let tools_dir = state
+            .agent_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("tools");
+        let mut registry =
+            ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new());
+        for def in state.mcp_tools.iter() {
+            registry.register(def.clone());
+        }
+        let parts = crate::runtime::host_agent::AgentRuntimeParts {
+            providers: state.providers.clone(),
+            template_engine: state.template_engine.clone(),
+            tokio_rt: rt,
+            policy: session_policy(&state, None),
+            tools: Arc::new(registry),
+            mcp: state.mcp.clone(),
+            run_base: state.run_base.clone(),
+        };
+        match crate::runtime::host_agent::hub().rearm_from_registry(parts) {
+            Ok(count) if count > 0 => {
+                eprintln!("  Re-armed {count} detached agent(s) from the registry");
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("re-arming detached agents: {err}"),
+        }
+    }
+
     let auth_required = std::env::var("CHIDORI_API_KEY").is_ok();
     let cors_layer = build_cors_layer();
 
@@ -544,6 +584,13 @@ pub async fn serve(
         // configured agent. Lets clients like util-trace-webgl pick an
         // example to run without restarting the server.
         .route("/agents", get(list_agents))
+        // Detached durable agents (docs/detached-agents.md): registry
+        // listing, status, mailbox delivery (which wakes a hibernating
+        // agent), and cooperative stop.
+        .route("/agents/detached", get(list_detached_agents))
+        .route("/agents/detached/{name}", get(get_detached_agent))
+        .route("/agents/detached/{name}/send", post(send_detached_agent))
+        .route("/agents/detached/{name}/stop", post(stop_detached_agent))
         // Recipes + scheduler
         .route("/recipes", get(list_recipes))
         .route("/recipes/{name}/run", post(run_recipe))
@@ -743,6 +790,98 @@ fn run_agent_sync(app: &AppState, inputs: Value) -> anyhow::Result<Value> {
     let engine = build_engine(app, None);
     let result = engine.run(&app.agent_path, &inputs)?;
     Ok(result.output)
+}
+
+// ---------------------------------------------------------------------------
+// Detached durable agents (docs/detached-agents.md)
+// ---------------------------------------------------------------------------
+
+async fn list_detached_agents() -> Response {
+    match tokio::task::spawn_blocking(|| {
+        let hub = crate::runtime::host_agent::hub();
+        hub.installed_parts().and_then(|parts| hub.list(&parts))
+    })
+    .await
+    {
+        Ok(Ok(agents)) => Json(json!({ "agents": agents })).into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_detached_agent(Path(name): Path<String>) -> Response {
+    match tokio::task::spawn_blocking(move || {
+        let hub = crate::runtime::host_agent::hub();
+        hub.installed_parts()
+            .and_then(|parts| hub.status(&parts, &name))
+    })
+    .await
+    {
+        Ok(Ok(status)) => Json(status).into_response(),
+        Ok(Err(err)) => (StatusCode::NOT_FOUND, Json(json!({"error": err}))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SendDetachedAgentBody {
+    name: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+/// Deliver a named message into a detached agent's durable mailbox. A
+/// hibernating agent whose listen set matches is woken (resume-by-replay).
+async fn send_detached_agent(
+    Path(agent): Path<String>,
+    Json(body): Json<SendDetachedAgentBody>,
+) -> Response {
+    let from = json!({ "kind": "external", "id": "http" });
+    match tokio::task::spawn_blocking(move || {
+        let hub = crate::runtime::host_agent::hub();
+        hub.installed_parts()
+            .and_then(|parts| hub.send(&parts, &agent, &body.name, body.payload, from))
+    })
+    .await
+    {
+        Ok(Ok(receipt)) => Json(receipt).into_response(),
+        Ok(Err(err)) => (StatusCode::NOT_FOUND, Json(json!({"error": err}))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn stop_detached_agent(Path(name): Path<String>) -> Response {
+    match tokio::task::spawn_blocking(move || {
+        let hub = crate::runtime::host_agent::hub();
+        hub.installed_parts()
+            .and_then(|parts| hub.stop(&parts, &name))
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => Json(outcome).into_response(),
+        Ok(Err(err)) => (StatusCode::NOT_FOUND, Json(json!({"error": err}))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
