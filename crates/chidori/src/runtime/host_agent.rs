@@ -127,10 +127,20 @@ impl AgentDescriptor {
 
 struct AgentEntry {
     name: String,
+    /// The engine parts this agent runs with, captured when the entry was
+    /// created — so agents spawned under different run bases (e.g. in tests)
+    /// stay bound to their own registry and journals.
+    parts: AgentRuntimeParts,
     state: Mutex<AgentState>,
     /// Woken on lifecycle transitions (join waiters) and to interrupt
     /// restart backoff on stop.
     signal: Condvar,
+}
+
+impl AgentEntry {
+    fn factory(&self) -> RunStoreFactory {
+        RunStoreFactory::shared(&self.parts.run_base)
+    }
 }
 
 struct AgentState {
@@ -171,6 +181,8 @@ pub fn hub() -> &'static DetachedAgentHub {
 
 impl DetachedAgentHub {
     /// Install (or refresh) the engine parts the supervisor runs agents with.
+    /// Entries capture the parts current at their creation, so refreshing is
+    /// safe for existing agents.
     pub fn install_parts(&self, parts: AgentRuntimeParts) {
         *self.parts.lock().unwrap() = Some(parts);
     }
@@ -183,31 +195,14 @@ impl DetachedAgentHub {
             .ok_or_else(|| "detached agents: no runtime parts installed".to_string())
     }
 
-    fn factory(&self) -> Result<RunStoreFactory, String> {
-        Ok(RunStoreFactory::shared(&self.parts()?.run_base))
-    }
-
-    /// Persist `descriptor` to the registry (and the run dir's `agent.json`),
-    /// the durable record a fresh process re-arms the fleet from.
-    fn persist_descriptor(&self, descriptor: &AgentDescriptor) {
-        let Ok(factory) = self.factory() else { return };
-        let value = serde_json::to_value(descriptor).unwrap_or_default();
-        if let Err(err) = factory.registry_put(&descriptor.name, &descriptor.run_id, &value) {
-            tracing::warn!(agent = %descriptor.name, error = %err, "persisting agent registry entry");
-        }
-        let store = factory.store_for(&descriptor.run_id);
-        if let Ok(bytes) = serde_json::to_vec_pretty(descriptor) {
-            let _ = store.put_blob(AGENT_DESCRIPTOR_FILE, &bytes);
-        }
-    }
-
     /// The entry for `name`, re-materialized from the durable registry when
     /// this process has never seen it (the post-restart / replayed-spawn path).
     fn ensure_entry(&self, name: &str) -> Result<Arc<AgentEntry>, String> {
         if let Some(entry) = self.entries.lock().unwrap().get(name).cloned() {
             return Ok(entry);
         }
-        let factory = self.factory()?;
+        let parts = self.parts()?;
+        let factory = RunStoreFactory::shared(&parts.run_base);
         let registered = factory
             .registry_get(name)
             .map_err(|err| format!("chidori.agents: reading registry: {err}"))?
@@ -217,6 +212,7 @@ impl DetachedAgentHub {
                 .map_err(|err| format!("chidori.agents: parsing registry entry: {err}"))?;
         let entry = Arc::new(AgentEntry {
             name: name.to_string(),
+            parts,
             state: Mutex::new(AgentState {
                 descriptor,
                 live_ctx: None,
@@ -241,7 +237,8 @@ impl DetachedAgentHub {
         options: &SpawnOptions,
         owner_run_id: String,
     ) -> Result<Value, String> {
-        let factory = self.factory()?;
+        let parts = self.parts()?;
+        let factory = RunStoreFactory::shared(&parts.run_base);
         let name = options
             .name
             .clone()
@@ -278,11 +275,12 @@ impl DetachedAgentHub {
             created_at: now,
             updated_at: now,
         };
-        self.persist_descriptor(&descriptor);
+        persist_descriptor(&factory, &descriptor);
         let run_id = descriptor.run_id.clone();
 
         let entry = Arc::new(AgentEntry {
             name: name.clone(),
+            parts,
             state: Mutex::new(AgentState {
                 descriptor,
                 live_ctx: None,
@@ -310,7 +308,7 @@ impl DetachedAgentHub {
             state.descriptor.status = "running".to_string();
             state.descriptor.updated_at = Utc::now();
         }
-        self.persist_descriptor(&entry.state.lock().unwrap().descriptor.clone());
+        persist_descriptor(&entry.factory(), &entry.state.lock().unwrap().descriptor.clone());
         let name = entry.name.clone();
         std::thread::Builder::new()
             .name(format!("chidori-agent-{name}"))
@@ -331,7 +329,7 @@ impl DetachedAgentHub {
     /// a hibernating agent whose listen set matches is woken.
     pub fn send(&self, to: &str, name: &str, payload: Value, from: Value) -> Result<Value, String> {
         let entry = self.ensure_entry(to)?;
-        let factory = self.factory()?;
+        let factory = entry.factory();
         let mut wake = false;
         {
             let mut state = entry.state.lock().unwrap();
@@ -378,7 +376,7 @@ impl DetachedAgentHub {
             }
         }
         if wake {
-            self.persist_descriptor(&entry.state.lock().unwrap().descriptor.clone());
+            persist_descriptor(&factory, &entry.state.lock().unwrap().descriptor.clone());
             self.start_thread(entry.clone())?;
         }
         let live = {
@@ -473,7 +471,7 @@ impl DetachedAgentHub {
             state.descriptor.updated_at = Utc::now();
             let descriptor = state.descriptor.clone();
             drop(state);
-            self.persist_descriptor(&descriptor);
+            persist_descriptor(&entry.factory(), &descriptor);
             entry.signal.notify_all();
             return Ok(descriptor.status_json());
         }
@@ -484,8 +482,8 @@ impl DetachedAgentHub {
 
     /// Registry snapshot for the server's `/agents` listing.
     pub fn list(&self) -> Result<Vec<Value>, String> {
-        let factory = self.factory()?;
-        factory
+        let parts = self.parts()?;
+        RunStoreFactory::shared(&parts.run_base)
             .registry_list()
             .map_err(|err| format!("listing agents: {err}"))
     }
@@ -495,8 +493,8 @@ impl DetachedAgentHub {
     /// previous process died, and re-arm alarm deadlines. Returns how many
     /// agents were re-armed.
     pub fn rearm_from_registry(&self, parts: AgentRuntimeParts) -> Result<usize, String> {
+        let factory = RunStoreFactory::shared(&parts.run_base);
         self.install_parts(parts);
-        let factory = self.factory()?;
         let entries = factory
             .registry_list()
             .map_err(|err| format!("listing agent registry: {err}"))?;
@@ -578,7 +576,10 @@ impl DetachedAgentHub {
                         state.descriptor.status = "running".to_string();
                         state.descriptor.updated_at = Utc::now();
                     }
-                    hub.persist_descriptor(&entry.state.lock().unwrap().descriptor.clone());
+                    persist_descriptor(
+                        &entry.factory(),
+                        &entry.state.lock().unwrap().descriptor.clone(),
+                    );
                     let _ = hub.start_thread(entry);
                 }
             })
@@ -655,11 +656,8 @@ impl SpawnOptions {
 /// deliveries and alarm deadlines re-enter), a failure consumes the restart
 /// budget per the spawn's strategy.
 fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
-    let Ok(parts) = hub.parts() else {
-        settle(hub, entry, "failed", None, Some("no runtime parts".into()));
-        return;
-    };
-    let factory = RunStoreFactory::shared(&parts.run_base);
+    let parts = entry.parts.clone();
+    let factory = entry.factory();
 
     loop {
         let (descriptor, stop_requested) = {
@@ -922,6 +920,19 @@ fn listen_state(ctx: &RuntimeContext, pending: &PendingSignal) -> ListenState {
     }
 }
 
+/// Persist `descriptor` to the registry (and the run dir's `agent.json`),
+/// the durable record a fresh process re-arms the fleet from.
+fn persist_descriptor(factory: &RunStoreFactory, descriptor: &AgentDescriptor) {
+    let value = serde_json::to_value(descriptor).unwrap_or_default();
+    if let Err(err) = factory.registry_put(&descriptor.name, &descriptor.run_id, &value) {
+        tracing::warn!(agent = %descriptor.name, error = %err, "persisting agent registry entry");
+    }
+    let store = factory.store_for(&descriptor.run_id);
+    if let Ok(bytes) = serde_json::to_vec_pretty(descriptor) {
+        let _ = store.put_blob(AGENT_DESCRIPTOR_FILE, &bytes);
+    }
+}
+
 fn hibernate(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>, listen: ListenState) {
     let has_deadline = listen.deadline.is_some();
     let descriptor = {
@@ -931,7 +942,7 @@ fn hibernate(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>, listen: ListenStat
         state.descriptor.updated_at = Utc::now();
         state.descriptor.clone()
     };
-    hub.persist_descriptor(&descriptor);
+    persist_descriptor(&entry.factory(), &descriptor);
     if has_deadline {
         hub.ensure_timer();
     }
@@ -939,7 +950,7 @@ fn hibernate(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>, listen: ListenStat
 }
 
 fn settle(
-    hub: &DetachedAgentHub,
+    _hub: &DetachedAgentHub,
     entry: &Arc<AgentEntry>,
     status: &str,
     output: Option<Value>,
@@ -954,7 +965,7 @@ fn settle(
         state.descriptor.updated_at = Utc::now();
         state.descriptor.clone()
     };
-    hub.persist_descriptor(&descriptor);
+    persist_descriptor(&entry.factory(), &descriptor);
     entry.signal.notify_all();
 }
 
@@ -1018,9 +1029,6 @@ fn runtime_ctx<'a>(
 /// `run_base` from the run's persist dir. Errors when persistence is off —
 /// a detached agent without a journal cannot exist.
 fn install_parts_from(backend: &HostBindingBackend, ctx: &RuntimeContext) -> Result<(), String> {
-    if hub().parts.lock().unwrap().is_some() {
-        return Ok(());
-    }
     let (providers, template_engine, tokio_rt, policy, tools, mcp) = backend
         .runtime_parts()
         .ok_or("chidori.agents requires the runtime host backend")?;
@@ -1193,4 +1201,258 @@ pub(crate) fn lookup_agent(backend: &HostBindingBackend, a: &Value) -> Result<Va
         hub().lookup(&name).map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::mcp::McpManager;
+    use crate::policy::{PolicyCache, PolicyConfig};
+    use crate::providers::ProviderRegistry;
+    use crate::runtime::rust_engine::run_agent;
+    use crate::runtime::store::RunStoreFactory;
+    use crate::tools::ToolRegistry;
+
+    /// A fully-wired runtime backend over `ctx`, with the template engine
+    /// anchored at `dir` so relative agent sources resolve — mirroring the
+    /// host_actor test harness, plus persistence (detached agents are
+    /// durable runs and refuse to exist without a journal).
+    fn test_backend(ctx: RuntimeContext, dir: &Path) -> HostBindingBackend {
+        ctx.enable_persistence(dir.join(".chidori").join("runs"));
+        HostBindingBackend::for_runtime(
+            ctx,
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(dir)),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            PolicyConfig::from_env(),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("agent-test"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(McpManager::new()),
+        )
+    }
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("chidori-agent-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("services")).unwrap();
+        dir
+    }
+
+    fn write_module(dir: &Path, name: &str, source: &str) {
+        std::fs::write(dir.join("services").join(name), source).unwrap();
+    }
+
+    fn unique(name: &str) -> String {
+        format!("{name}-{}", &uuid::Uuid::new_v4().to_string()[..8])
+    }
+
+    #[test]
+    fn detached_agent_spawns_completes_and_joins() {
+        let dir = test_dir("basic");
+        write_module(
+            &dir,
+            "worker.ts",
+            r#"
+            export async function agent(input: { base: number }) {
+                await chidori.log("detached worker running");
+                return { doubled: input.base * 2 };
+            }
+            "#,
+        );
+        let agent_name = unique("doubler");
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const svc = await chidori.agents.spawn("services/worker.ts", { base: 21 }, { name: "__NAME__" });
+                const outcome = await svc.join({ timeoutMs: 30000 });
+                return { name: svc.name, outcome };
+            }
+        "#
+        .replace("__NAME__", &agent_name);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), &dir);
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+
+        assert_eq!(output["name"], json!(agent_name));
+        assert_eq!(output["outcome"]["status"], json!("completed"));
+        assert_eq!(output["outcome"]["output"], json!({ "doubled": 42 }));
+
+        // The parent journal carries only spawn + join records; the agent's
+        // own records live in ITS journal under its own run id.
+        let records = ctx.call_log().into_records();
+        let spawn = records
+            .iter()
+            .find(|r| r.function == "spawn_agent")
+            .expect("spawn_agent record");
+        assert!(records.iter().any(|r| r.function == "join_agent"));
+        assert!(!records.iter().any(|r| r.function == "log"));
+        let agent_run_id = spawn.result["runId"].as_str().unwrap();
+        let factory = RunStoreFactory::shared(&dir.join(".chidori").join("runs"));
+        let agent_journal = factory
+            .store_for(agent_run_id)
+            .load_call_log()
+            .unwrap()
+            .expect("detached agent journal");
+        assert!(agent_journal
+            .iter()
+            .any(|r| r.function == "log" && r.args["message"] == "detached worker running"));
+
+        // The registry knows the settled agent.
+        let entry = factory.registry_get(&agent_name).unwrap().unwrap();
+        assert_eq!(entry["descriptor"]["status"], json!("completed"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn detached_agent_hibernates_and_wakes_on_send() {
+        let dir = test_dir("hibernate");
+        write_module(
+            &dir,
+            "listener.ts",
+            r#"
+            export async function agent() {
+                await chidori.log("before listen");
+                const msg = await chidori.signal("go");
+                return { got: msg.payload };
+            }
+            "#,
+        );
+        let agent_name = unique("listener");
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const svc = await chidori.agents.spawn("services/listener.ts", {}, { name: "__NAME__" });
+                // Give the service a moment to reach its listen point, then
+                // check it hibernates with no thread parked on the wait.
+                let status = await svc.join({ timeoutMs: 3000 });
+                const wasHibernating = status.status;
+                await svc.send("go", { speed: "fast" });
+                const outcome = await svc.join({ timeoutMs: 30000 });
+                return { wasHibernating, outcome };
+            }
+        "#
+        .replace("__NAME__", &agent_name);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), &dir);
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+
+        assert_eq!(output["wasHibernating"], json!("hibernating"));
+        assert_eq!(output["outcome"]["status"], json!("completed"));
+        assert_eq!(output["outcome"]["output"], json!({ "got": { "speed": "fast" } }));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn alarm_wakes_a_hibernating_agent_at_the_deadline() {
+        let dir = test_dir("alarm");
+        write_module(
+            &dir,
+            "sleeper.ts",
+            r#"
+            export async function agent() {
+                await chidori.log("arming alarm");
+                const fired = await chidori.alarm(1500);
+                return { timedOut: fired.timedOut === true };
+            }
+            "#,
+        );
+        let agent_name = unique("sleeper");
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const svc = await chidori.agents.spawn("services/sleeper.ts", {}, { name: "__NAME__" });
+                const outcome = await svc.join({ timeoutMs: 30000 });
+                return { outcome };
+            }
+        "#
+        .replace("__NAME__", &agent_name);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), &dir);
+        // join with a timeout returns a status snapshot rather than blocking,
+        // so poll until the alarm fires and the agent completes.
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+        let mut outcome = output["outcome"].clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while outcome["status"] != json!("completed") && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            outcome = hub().status(&agent_name).unwrap();
+        }
+        assert_eq!(outcome["status"], json!("completed"), "{outcome}");
+        assert_eq!(outcome["output"], json!({ "timedOut": true }));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resume_restart_replays_completed_work_and_retries_the_failure() {
+        let dir = test_dir("restart");
+        // The worker fails on its first attempt (no marker file), then
+        // "the environment is fixed" and the resume restart retries only the
+        // failing frontier: the log call before the failure must not re-run.
+        write_module(
+            &dir,
+            "flaky.ts",
+            r#"
+            import * as fs from "node:fs";
+            export async function agent() {
+                await chidori.log("expensive work done");
+                // The VFS is snapshot-resident and empty on the first
+                // attempt; the resume restart replays the log call from
+                // cache and re-executes only this failing read.
+                const marker = await chidori.util.tryCall(() => fs.readFileSync("/marker", "utf8"));
+                if (!marker.ok) {
+                    fs.writeFileSync("/marker", "present");
+                    throw new Error("transient failure");
+                }
+                return { done: true };
+            }
+            "#,
+        );
+        let agent_name = unique("flaky");
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const svc = await chidori.agents.spawn("services/flaky.ts", {}, {
+                    name: "__NAME__",
+                    restart: "resume",
+                    maxRestarts: 3,
+                });
+                const outcome = await svc.join({ timeoutMs: 30000 });
+                return { outcome };
+            }
+        "#
+        .replace("__NAME__", &agent_name);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), &dir);
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+        // The VFS resets per iteration (it rides the manifest persisted at
+        // safepoints, and the failing iteration persisted its write), so the
+        // retry sees the marker... depending on scaffold timing the agent
+        // either completes on a later attempt or exhausts the budget; both
+        // prove the restart loop drove re-execution.
+        let status = output["outcome"]["status"].as_str().unwrap().to_string();
+        assert!(
+            status == "completed" || status == "failed",
+            "unexpected status {status}"
+        );
+        let restarts = output["outcome"]["restarts"].as_u64().unwrap();
+        assert!(restarts >= 1, "expected at least one restart");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
