@@ -834,6 +834,77 @@ impl HostBindingBackend {
         }
     }
 
+    /// As [`with_runtime_ctx`](Self::with_runtime_ctx), but also swapping the
+    /// durable runtime policy — for sub-runs that are their OWN durable runs
+    /// (detached agents), whose policy is derived from their own run id so a
+    /// wake on a fresh process reconstructs the identical policy.
+    pub(crate) fn with_runtime_ctx_and_policy(
+        &self,
+        runtime_ctx: RuntimeContext,
+        runtime_policy: RuntimePolicy,
+    ) -> Option<Self> {
+        match self.with_runtime_ctx(runtime_ctx) {
+            Some(HostBindingBackend::Runtime {
+                runtime_ctx,
+                providers,
+                template_engine,
+                tokio_rt,
+                policy,
+                tools,
+                mcp,
+                ..
+            }) => Some(HostBindingBackend::Runtime {
+                runtime_ctx,
+                providers,
+                template_engine,
+                tokio_rt,
+                policy,
+                // A fresh approval cache: a detached agent's approvals are its
+                // own, not the spawner's.
+                policy_cache: Arc::new(StdMutex::new(PolicyCache::default())),
+                runtime_policy,
+                tools,
+                mcp,
+            }),
+            other => other,
+        }
+    }
+
+    /// The engine parts shared by every run this backend can host — what a
+    /// detached-agent supervisor needs to run agent modules outside the
+    /// spawning run's lifetime. None for the recorder backend.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn runtime_parts(
+        &self,
+    ) -> Option<(
+        Arc<ProviderRegistry>,
+        Arc<TemplateEngine>,
+        Arc<tokio::runtime::Runtime>,
+        Arc<PolicyConfig>,
+        Arc<ToolRegistry>,
+        Arc<McpManager>,
+    )> {
+        match self {
+            HostBindingBackend::Runtime {
+                providers,
+                template_engine,
+                tokio_rt,
+                policy,
+                tools,
+                mcp,
+                ..
+            } => Some((
+                providers.clone(),
+                template_engine.clone(),
+                tokio_rt.clone(),
+                policy.clone(),
+                tools.clone(),
+                mcp.clone(),
+            )),
+            HostBindingBackend::Recorder(_) => None,
+        }
+    }
+
     /// The runtime context, when this is the runtime backend.
     pub(crate) fn runtime_ctx(&self) -> Option<&RuntimeContext> {
         match self {
@@ -1121,6 +1192,30 @@ impl HostBindingBackend {
             "branch" => crate::runtime::host_branch::run_branches(self, a),
             // Supervised actor sub-runs + message passing (docs/actors.md).
             "spawn_actor" => crate::runtime::host_actor::spawn_actor(self, a),
+            // Detached, durable, addressable agent processes
+            // (docs/detached-agents.md).
+            "spawn_agent" => crate::runtime::host_agent::spawn_agent(self, a),
+            "send_agent" => crate::runtime::host_agent::send_agent(self, a),
+            "join_agent" => crate::runtime::host_agent::join_agent(self, a),
+            "stop_agent" => crate::runtime::host_agent::stop_agent(self, a),
+            "agent_status" => crate::runtime::host_agent::agent_status(self, a),
+            "lookup_agent" => crate::runtime::host_agent::lookup_agent(self, a),
+            // chidori.alarm(ms) — a durable timer, lowered onto the signal
+            // machinery: a listen on the reserved alarm name with `ms` as the
+            // timeout. The run (or detached agent) hibernates and the
+            // supervising server / agent hub re-arms the deadline across
+            // restarts; the wake resolves with the timeout sentinel.
+            "alarm" => {
+                let ms = a.get("ms").and_then(serde_json::Value::as_u64).ok_or(
+                    "chidori.alarm requires a positive millisecond delay".to_string(),
+                )?;
+                let args = serde_json::json!({
+                    "name": crate::runtime::host_agent::ALARM_SIGNAL_NAME,
+                    "opts": { "timeoutMs": ms },
+                });
+                self.pump_actor_mailbox();
+                self.signal(&args)
+            }
             "send_actor" => crate::runtime::host_actor::send_actor(self, a),
             "receive" => crate::runtime::host_actor::receive(self, a),
             "join_actor" => crate::runtime::host_actor::join_actor(self, a),

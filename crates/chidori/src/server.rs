@@ -514,6 +514,39 @@ pub async fn serve(
         }
     }
 
+    // Re-arm the detached-agent fleet (`docs/detached-agents.md`): install the
+    // hub's runtime parts, then wake agents that were mid-run when the
+    // previous process died and re-arm hibernating agents' alarm deadlines.
+    {
+        let rt = Arc::new(crate::scheduler::new_tokio_runtime()?);
+        let tools_dir = state
+            .agent_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("tools");
+        let mut registry =
+            ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new());
+        for def in state.mcp_tools.iter() {
+            registry.register(def.clone());
+        }
+        let parts = crate::runtime::host_agent::AgentRuntimeParts {
+            providers: state.providers.clone(),
+            template_engine: state.template_engine.clone(),
+            tokio_rt: rt,
+            policy: session_policy(&state, None),
+            tools: Arc::new(registry),
+            mcp: state.mcp.clone(),
+            run_base: state.run_base.clone(),
+        };
+        match crate::runtime::host_agent::hub().rearm_from_registry(parts) {
+            Ok(count) if count > 0 => {
+                eprintln!("  Re-armed {count} detached agent(s) from the registry");
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("re-arming detached agents: {err}"),
+        }
+    }
+
     let auth_required = std::env::var("CHIDORI_API_KEY").is_ok();
     let cors_layer = build_cors_layer();
 
@@ -545,6 +578,13 @@ pub async fn serve(
         // configured agent. Lets clients like util-trace-webgl pick an
         // example to run without restarting the server.
         .route("/agents", get(list_agents))
+        // Detached durable agents (docs/detached-agents.md): registry
+        // listing, status, mailbox delivery (which wakes a hibernating
+        // agent), and cooperative stop.
+        .route("/agents/detached", get(list_detached_agents))
+        .route("/agents/detached/{name}", get(get_detached_agent))
+        .route("/agents/detached/{name}/send", post(send_detached_agent))
+        .route("/agents/detached/{name}/stop", post(stop_detached_agent))
         // Recipes + scheduler
         .route("/recipes", get(list_recipes))
         .route("/recipes/{name}/run", post(run_recipe))
@@ -744,6 +784,79 @@ fn run_agent_sync(app: &AppState, inputs: Value) -> anyhow::Result<Value> {
     let engine = build_engine(app, None);
     let result = engine.run(&app.agent_path, &inputs)?;
     Ok(result.output)
+}
+
+// ---------------------------------------------------------------------------
+// Detached durable agents (docs/detached-agents.md)
+// ---------------------------------------------------------------------------
+
+async fn list_detached_agents() -> Response {
+    match tokio::task::spawn_blocking(|| crate::runtime::host_agent::hub().list()).await {
+        Ok(Ok(agents)) => Json(json!({ "agents": agents })).into_response(),
+        Ok(Err(err)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": err})))
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_detached_agent(Path(name): Path<String>) -> Response {
+    match tokio::task::spawn_blocking(move || crate::runtime::host_agent::hub().status(&name))
+        .await
+    {
+        Ok(Ok(status)) => Json(status).into_response(),
+        Ok(Err(err)) => (StatusCode::NOT_FOUND, Json(json!({"error": err}))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SendDetachedAgentBody {
+    name: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+/// Deliver a named message into a detached agent's durable mailbox. A
+/// hibernating agent whose listen set matches is woken (resume-by-replay).
+async fn send_detached_agent(
+    Path(agent): Path<String>,
+    Json(body): Json<SendDetachedAgentBody>,
+) -> Response {
+    let from = json!({ "kind": "external", "id": "http" });
+    match tokio::task::spawn_blocking(move || {
+        crate::runtime::host_agent::hub().send(&agent, &body.name, body.payload, from)
+    })
+    .await
+    {
+        Ok(Ok(receipt)) => Json(receipt).into_response(),
+        Ok(Err(err)) => (StatusCode::NOT_FOUND, Json(json!({"error": err}))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn stop_detached_agent(Path(name): Path<String>) -> Response {
+    match tokio::task::spawn_blocking(move || crate::runtime::host_agent::hub().stop(&name)).await
+    {
+        Ok(Ok(outcome)) => Json(outcome).into_response(),
+        Ok(Err(err)) => (StatusCode::NOT_FOUND, Json(json!({"error": err}))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

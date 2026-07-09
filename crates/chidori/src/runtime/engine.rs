@@ -87,6 +87,58 @@ pub struct RunResult {
 /// always resumed engine-agnostically via call-log replay, never a VM image).
 /// Keeping the name leaves the manifest acceptable to the unchanged resume gate
 /// and lets artifacts written before the removal still load.
+pub(crate) fn persist_journal_scaffold(
+    base: &Path,
+    run_id: &str,
+    path: &Path,
+    source: &str,
+    policy: &RuntimePolicy,
+    ctx: &RuntimeContext,
+) -> Result<()> {
+    persist_rust_journal_scaffold(base, run_id, path, source, policy, ctx)
+}
+
+/// Install the durable-scaffold safepoints on a prepared context: the
+/// manifest + pending + checkpoint are persisted before every live host side
+/// effect and after every recorded completion, so a crash mid-run always
+/// leaves a resumable artifact. Shared by the engine's run path and the
+/// detached-agent supervisor (`host_agent`), which runs modules directly.
+pub(crate) fn install_journal_scaffold_safepoints(
+    base: &Path,
+    run_id: &str,
+    path: &Path,
+    source: &str,
+    policy: &RuntimePolicy,
+    ctx: &RuntimeContext,
+) {
+    let (base, run_id, path, source, policy) = (
+        base.to_path_buf(),
+        run_id.to_string(),
+        path.to_path_buf(),
+        source.to_string(),
+        policy.clone(),
+    );
+    {
+        let (base, run_id, path, source, policy) = (
+            base.clone(),
+            run_id.clone(),
+            path.clone(),
+            source.clone(),
+            policy.clone(),
+        );
+        let safepoint_ctx = ctx.clone();
+        ctx.set_host_operation_safepoint(HostOperationSafepoint::new(move |_operation| {
+            persist_rust_journal_scaffold(&base, &run_id, &path, &source, &policy, &safepoint_ctx)
+        }));
+    }
+    let completion_ctx = ctx.clone();
+    ctx.set_host_operation_completion_safepoint(HostOperationCompletionSafepoint::new(
+        move |_record| {
+            persist_rust_journal_scaffold(&base, &run_id, &path, &source, &policy, &completion_ctx)
+        },
+    ));
+}
+
 fn persist_rust_journal_scaffold(
     base: &Path,
     run_id: &str,

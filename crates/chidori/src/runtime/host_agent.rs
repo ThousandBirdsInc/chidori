@@ -1,0 +1,1196 @@
+//! `chidori.agents.spawn` — detached, durable, addressable agent processes.
+//!
+//! A detached agent is the durable-object-shaped sibling of an in-run actor
+//! (`docs/actors.md`). Where an actor is confined to its spawning run — its
+//! records fold into the parent journal at a join, its lifetime ends with the
+//! run — a detached agent is **its own durable run**: it has its own journal
+//! under `.chidori/runs/<run_id>/`, its own registered name that outlives the
+//! spawner, a durable mailbox other parties (including HTTP clients, via the
+//! server's `/agents` endpoints) can deliver into, and a runtime-owned restart
+//! policy. The parent's journal records only the `spawn_agent` / `send_agent`
+//! / `join_agent` host calls, so the whole conversation replays from cache
+//! without the fold-at-join sequence-range machinery.
+//!
+//! **Hibernation.** A detached agent waiting at a `chidori.signal(name)` /
+//! `chidori.alarm(ms)` listen point holds NO thread and NO VM: the pause
+//! unwinds the VM (the standard pause path), the supervisor persists the
+//! listen state into the agent's registry descriptor, and the thread exits. A
+//! matching delivery — or the alarm deadline — re-enters the module under
+//! resume-by-replay: recorded effects return from cache, execution goes live
+//! at the listen frontier. Because journal + mailbox + listen state are all
+//! durable (and mirrored when a durable run store is configured), a fresh
+//! process re-arms every hibernating agent from the registry at boot
+//! (`DetachedAgentHub::rearm_from_registry`), which is also how a server
+//! restart or machine replacement resumes the fleet.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::mcp::McpManager;
+use crate::policy::{PolicyCache, PolicyConfig};
+use crate::providers::ProviderRegistry;
+use crate::runtime::call_log::CallRecord;
+use crate::runtime::context::{PendingSignal, RuntimeContext, PAUSE_MARKER};
+use crate::runtime::host_core;
+use crate::runtime::snapshot::{QueuedSignal, RuntimePolicy, SIGNAL_INBOX_FILE};
+use crate::runtime::store::RunStoreFactory;
+use crate::runtime::template::TemplateEngine;
+use crate::runtime::typescript::bindings::HostBindingBackend;
+use crate::tools::ToolRegistry;
+
+/// Reserved listen name backing `chidori.alarm(ms)`: an alarm is a durable
+/// signal wait on this name with a timeout, so the whole wake machinery
+/// (hibernate, deadline re-arm after restart, timeout sentinel) is shared
+/// with ordinary signals.
+pub const ALARM_SIGNAL_NAME: &str = "__chidori.alarm__";
+
+const AGENT_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+const AGENT_DESCRIPTOR_FILE: &str = "agent.json";
+
+/// The engine parts a detached-agent supervisor needs to run agent modules
+/// outside any spawning run's lifetime. Installed from the first spawning
+/// backend, or by the server at boot (`rearm_from_registry`).
+#[derive(Clone)]
+pub struct AgentRuntimeParts {
+    pub providers: Arc<ProviderRegistry>,
+    pub template_engine: Arc<TemplateEngine>,
+    pub tokio_rt: Arc<tokio::runtime::Runtime>,
+    pub policy: Arc<PolicyConfig>,
+    pub tools: Arc<ToolRegistry>,
+    pub mcp: Arc<McpManager>,
+    /// `.chidori/runs` — the base every detached agent's journal lives under.
+    pub run_base: PathBuf,
+}
+
+/// The durable listen state of a hibernating agent: which names wake it, the
+/// pending listen call's seq/function (for the timeout sentinel's synthetic
+/// record), and the alarm deadline when the wait carries one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListenState {
+    pub names: Vec<String>,
+    pub seq: u64,
+    pub function: String,
+    #[serde(default)]
+    pub deadline: Option<DateTime<Utc>>,
+}
+
+/// The durable descriptor of a detached agent — persisted as the registry
+/// entry (and `agent.json` in the run dir) on every lifecycle transition, so
+/// a fresh process can rediscover and resume the whole fleet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDescriptor {
+    pub name: String,
+    pub run_id: String,
+    /// The source module path as given at spawn (possibly relative — replay
+    /// keys stay stable across hosts; resolution happens wherever the agent
+    /// is woken).
+    pub source: String,
+    pub input: Value,
+    pub restart: String,
+    pub max_restarts: u32,
+    pub backoff_ms: u64,
+    pub owner_run_id: String,
+    /// `running` | `hibernating` | `paused` | `completed` | `failed` | `stopped`
+    pub status: String,
+    #[serde(default)]
+    pub listen: Option<ListenState>,
+    #[serde(default)]
+    pub restarts: u32,
+    #[serde(default)]
+    pub output: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl AgentDescriptor {
+    fn status_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "runId": self.run_id,
+            "status": self.status,
+            "restarts": self.restarts,
+            "output": self.output,
+            "error": self.error,
+            "waitingFor": self.listen.as_ref().map(|l| l.names.clone()),
+            "deadline": self.listen.as_ref().and_then(|l| l.deadline),
+        })
+    }
+}
+
+struct AgentEntry {
+    name: String,
+    state: Mutex<AgentState>,
+    /// Woken on lifecycle transitions (join waiters) and to interrupt
+    /// restart backoff on stop.
+    signal: Condvar,
+}
+
+struct AgentState {
+    descriptor: AgentDescriptor,
+    /// The live iteration's context while a supervision thread is running —
+    /// the address live sends enqueue into (durably, through the ctx store).
+    live_ctx: Option<RuntimeContext>,
+    thread_live: bool,
+    stop_requested: bool,
+}
+
+impl AgentEntry {
+    fn is_settled(state: &AgentState) -> bool {
+        matches!(
+            state.descriptor.status.as_str(),
+            "completed" | "failed" | "stopped" | "paused"
+        )
+    }
+}
+
+/// Process-global supervisor for detached agents. One per process; agents are
+/// identified by their registered (or generated) name.
+pub struct DetachedAgentHub {
+    parts: Mutex<Option<AgentRuntimeParts>>,
+    entries: Mutex<HashMap<String, Arc<AgentEntry>>>,
+    timer_started: Mutex<bool>,
+}
+
+static HUB: OnceLock<DetachedAgentHub> = OnceLock::new();
+
+pub fn hub() -> &'static DetachedAgentHub {
+    HUB.get_or_init(|| DetachedAgentHub {
+        parts: Mutex::new(None),
+        entries: Mutex::new(HashMap::new()),
+        timer_started: Mutex::new(false),
+    })
+}
+
+impl DetachedAgentHub {
+    /// Install (or refresh) the engine parts the supervisor runs agents with.
+    pub fn install_parts(&self, parts: AgentRuntimeParts) {
+        *self.parts.lock().unwrap() = Some(parts);
+    }
+
+    fn parts(&self) -> Result<AgentRuntimeParts, String> {
+        self.parts
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "detached agents: no runtime parts installed".to_string())
+    }
+
+    fn factory(&self) -> Result<RunStoreFactory, String> {
+        Ok(RunStoreFactory::shared(&self.parts()?.run_base))
+    }
+
+    /// Persist `descriptor` to the registry (and the run dir's `agent.json`),
+    /// the durable record a fresh process re-arms the fleet from.
+    fn persist_descriptor(&self, descriptor: &AgentDescriptor) {
+        let Ok(factory) = self.factory() else { return };
+        let value = serde_json::to_value(descriptor).unwrap_or_default();
+        if let Err(err) = factory.registry_put(&descriptor.name, &descriptor.run_id, &value) {
+            tracing::warn!(agent = %descriptor.name, error = %err, "persisting agent registry entry");
+        }
+        let store = factory.store_for(&descriptor.run_id);
+        if let Ok(bytes) = serde_json::to_vec_pretty(descriptor) {
+            let _ = store.put_blob(AGENT_DESCRIPTOR_FILE, &bytes);
+        }
+    }
+
+    /// The entry for `name`, re-materialized from the durable registry when
+    /// this process has never seen it (the post-restart / replayed-spawn path).
+    fn ensure_entry(&self, name: &str) -> Result<Arc<AgentEntry>, String> {
+        if let Some(entry) = self.entries.lock().unwrap().get(name).cloned() {
+            return Ok(entry);
+        }
+        let factory = self.factory()?;
+        let registered = factory
+            .registry_get(name)
+            .map_err(|err| format!("chidori.agents: reading registry: {err}"))?
+            .ok_or_else(|| format!("chidori.agents: unknown agent `{name}`"))?;
+        let descriptor: AgentDescriptor =
+            serde_json::from_value(registered.get("descriptor").cloned().unwrap_or_default())
+                .map_err(|err| format!("chidori.agents: parsing registry entry: {err}"))?;
+        let entry = Arc::new(AgentEntry {
+            name: name.to_string(),
+            state: Mutex::new(AgentState {
+                descriptor,
+                live_ctx: None,
+                thread_live: false,
+                stop_requested: false,
+            }),
+            signal: Condvar::new(),
+        });
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), entry.clone());
+        Ok(entry)
+    }
+
+    /// Spawn a detached agent: persist its descriptor + registry entry, then
+    /// start its supervision thread. Returns `{ name, runId }`.
+    pub fn spawn(
+        &self,
+        source: &str,
+        input: Value,
+        options: &SpawnOptions,
+        owner_run_id: String,
+    ) -> Result<Value, String> {
+        let factory = self.factory()?;
+        let name = options
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("agent-{}", &uuid::Uuid::new_v4().to_string()[..8]));
+        // A live (non-settled) agent squats on its name; a settled one may be
+        // replaced by a fresh spawn.
+        if let Ok(Some(existing)) = factory.registry_get(&name) {
+            let status = existing
+                .get("descriptor")
+                .and_then(|d| d.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if matches!(status, "running" | "hibernating") {
+                return Err(format!(
+                    "chidori.agents.spawn: agent name `{name}` is already registered and live"
+                ));
+            }
+        }
+        let now = Utc::now();
+        let descriptor = AgentDescriptor {
+            name: name.clone(),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            source: source.to_string(),
+            input,
+            restart: options.restart.clone(),
+            max_restarts: options.max_restarts,
+            backoff_ms: options.backoff_ms,
+            owner_run_id,
+            status: "running".to_string(),
+            listen: None,
+            restarts: 0,
+            output: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.persist_descriptor(&descriptor);
+        let run_id = descriptor.run_id.clone();
+
+        let entry = Arc::new(AgentEntry {
+            name: name.clone(),
+            state: Mutex::new(AgentState {
+                descriptor,
+                live_ctx: None,
+                thread_live: false,
+                stop_requested: false,
+            }),
+            signal: Condvar::new(),
+        });
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(name.clone(), entry.clone());
+        self.start_thread(entry)?;
+        Ok(json!({ "name": name, "runId": run_id }))
+    }
+
+    /// Start the supervision thread for an entry that isn't already running.
+    fn start_thread(&self, entry: Arc<AgentEntry>) -> Result<(), String> {
+        {
+            let mut state = entry.state.lock().unwrap();
+            if state.thread_live {
+                return Ok(());
+            }
+            state.thread_live = true;
+            state.descriptor.status = "running".to_string();
+            state.descriptor.updated_at = Utc::now();
+        }
+        self.persist_descriptor(&entry.state.lock().unwrap().descriptor.clone());
+        let name = entry.name.clone();
+        std::thread::Builder::new()
+            .name(format!("chidori-agent-{name}"))
+            .stack_size(AGENT_THREAD_STACK_BYTES)
+            .spawn(move || {
+                supervise_detached(hub(), &entry);
+                let mut state = entry.state.lock().unwrap();
+                state.thread_live = false;
+                state.live_ctx = None;
+                entry.signal.notify_all();
+            })
+            .map_err(|err| format!("chidori.agents.spawn: spawning agent thread: {err}"))?;
+        Ok(())
+    }
+
+    /// Deliver a named message to an agent's durable mailbox. Live agents get
+    /// it in-memory too (write-through, like the server's live signal path);
+    /// a hibernating agent whose listen set matches is woken.
+    pub fn send(&self, to: &str, name: &str, payload: Value, from: Value) -> Result<Value, String> {
+        let entry = self.ensure_entry(to)?;
+        let factory = self.factory()?;
+        let mut wake = false;
+        {
+            let mut state = entry.state.lock().unwrap();
+            if let Some(ctx) = state.live_ctx.clone() {
+                // Write-through: in-memory mailbox + durable inbox mutate in
+                // one critical section inside enqueue_live_signal.
+                drop(state);
+                ctx.enqueue_live_signal(name, payload, from);
+                entry.signal.notify_all();
+                return Ok(json!({ "delivered": true }));
+            }
+            let run_id = state.descriptor.run_id.clone();
+            let store = factory.store_for(&run_id);
+            let mut inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE) {
+                Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let delivery_seq = inbox.iter().map(|s| s.delivery_seq).max().unwrap_or(0) + 1;
+            inbox.push(QueuedSignal {
+                name: name.to_string(),
+                payload,
+                from,
+                delivery_seq,
+                enqueued_at: Utc::now(),
+            });
+            let bytes = serde_json::to_vec_pretty(&inbox)
+                .map_err(|err| format!("chidori.agents.send: encoding inbox: {err}"))?;
+            store
+                .put_blob(SIGNAL_INBOX_FILE, &bytes)
+                .map_err(|err| format!("chidori.agents.send: persisting inbox: {err}"))?;
+            if state.descriptor.status == "hibernating" {
+                let matches = state
+                    .descriptor
+                    .listen
+                    .as_ref()
+                    .is_some_and(|l| l.names.iter().any(|n| n == name));
+                if matches {
+                    wake = true;
+                }
+            }
+            if wake {
+                state.descriptor.status = "running".to_string();
+                state.descriptor.updated_at = Utc::now();
+            }
+        }
+        if wake {
+            self.persist_descriptor(&entry.state.lock().unwrap().descriptor.clone());
+            self.start_thread(entry.clone())?;
+        }
+        let live = {
+            let state = entry.state.lock().unwrap();
+            !AgentEntry::is_settled(&state)
+        };
+        Ok(json!({ "delivered": live }))
+    }
+
+    /// Wait for an agent to settle (completed / failed / stopped / paused).
+    /// With a timeout, returns the current status snapshot on expiry. A
+    /// hibernating agent does not settle — services hibernate indefinitely by
+    /// design — so join a service only with a timeout.
+    pub fn join(&self, to: &str, timeout_ms: Option<u64>) -> Result<Value, String> {
+        let entry = self.ensure_entry(to)?;
+        let deadline = timeout_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
+        let mut state = entry.state.lock().unwrap();
+        loop {
+            if AgentEntry::is_settled(&state) {
+                return Ok(state.descriptor.status_json());
+            }
+            match deadline {
+                Some(deadline) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(state.descriptor.status_json());
+                    }
+                    state = entry
+                        .signal
+                        .wait_timeout(state, deadline.saturating_duration_since(now))
+                        .unwrap()
+                        .0;
+                }
+                None => {
+                    // A hibernating agent with no live thread and no alarm
+                    // deadline can only be woken by a send — an unbounded
+                    // join would hang; fail fast with guidance instead.
+                    if state.descriptor.status == "hibernating"
+                        && !state.thread_live
+                        && state
+                            .descriptor
+                            .listen
+                            .as_ref()
+                            .is_none_or(|l| l.deadline.is_none())
+                    {
+                        return Err(format!(
+                            "chidori.agents.join: `{to}` is hibernating on {:?} with no \
+                             deadline; join it with a timeoutMs or send it a message",
+                            state
+                                .descriptor
+                                .listen
+                                .as_ref()
+                                .map(|l| l.names.clone())
+                                .unwrap_or_default()
+                        ));
+                    }
+                    state = entry.signal.wait(state).unwrap();
+                }
+            }
+        }
+    }
+
+    pub fn status(&self, to: &str) -> Result<Value, String> {
+        let entry = self.ensure_entry(to)?;
+        let state = entry.state.lock().unwrap();
+        Ok(state.descriptor.status_json())
+    }
+
+    pub fn lookup(&self, name: &str) -> Result<Value, String> {
+        match self.ensure_entry(name) {
+            Ok(entry) => {
+                let state = entry.state.lock().unwrap();
+                Ok(json!({
+                    "name": state.descriptor.name,
+                    "runId": state.descriptor.run_id,
+                    "status": state.descriptor.status,
+                }))
+            }
+            Err(_) => Ok(Value::Null),
+        }
+    }
+
+    /// Cooperative stop: a live iteration finishes its current host call and
+    /// stops at the next boundary; a hibernating agent settles immediately.
+    pub fn stop(&self, to: &str) -> Result<Value, String> {
+        let entry = self.ensure_entry(to)?;
+        let mut state = entry.state.lock().unwrap();
+        state.stop_requested = true;
+        if !state.thread_live && !AgentEntry::is_settled(&state) {
+            state.descriptor.status = "stopped".to_string();
+            state.descriptor.listen = None;
+            state.descriptor.updated_at = Utc::now();
+            let descriptor = state.descriptor.clone();
+            drop(state);
+            self.persist_descriptor(&descriptor);
+            entry.signal.notify_all();
+            return Ok(descriptor.status_json());
+        }
+        entry.signal.notify_all();
+        drop(state);
+        self.join(to, Some(60_000))
+    }
+
+    /// Registry snapshot for the server's `/agents` listing.
+    pub fn list(&self) -> Result<Vec<Value>, String> {
+        let factory = self.factory()?;
+        factory
+            .registry_list()
+            .map_err(|err| format!("listing agents: {err}"))
+    }
+
+    /// Re-arm the fleet from the durable registry at process boot: install
+    /// the parts, re-create entries, wake agents that were mid-run when the
+    /// previous process died, and re-arm alarm deadlines. Returns how many
+    /// agents were re-armed.
+    pub fn rearm_from_registry(&self, parts: AgentRuntimeParts) -> Result<usize, String> {
+        self.install_parts(parts);
+        let factory = self.factory()?;
+        let entries = factory
+            .registry_list()
+            .map_err(|err| format!("listing agent registry: {err}"))?;
+        let mut rearmed = 0;
+        for value in entries {
+            let Ok(descriptor) = serde_json::from_value::<AgentDescriptor>(
+                value.get("descriptor").cloned().unwrap_or_default(),
+            ) else {
+                continue;
+            };
+            let name = descriptor.name.clone();
+            match descriptor.status.as_str() {
+                // Died mid-run: resume-by-replay continues at the frontier.
+                "running" => {
+                    let _ = factory.hydrate(&descriptor.run_id);
+                    let entry = self.ensure_entry(&name)?;
+                    self.start_thread(entry)?;
+                    rearmed += 1;
+                }
+                // Hibernating: entry re-created; sends and (via the timer
+                // thread) alarm deadlines wake it.
+                "hibernating" => {
+                    let _ = factory.hydrate(&descriptor.run_id);
+                    let entry = self.ensure_entry(&name)?;
+                    let has_deadline = {
+                        let state = entry.state.lock().unwrap();
+                        state
+                            .descriptor
+                            .listen
+                            .as_ref()
+                            .is_some_and(|l| l.deadline.is_some())
+                    };
+                    if has_deadline {
+                        self.ensure_timer();
+                    }
+                    rearmed += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(rearmed)
+    }
+
+    /// Lazily start the alarm timer thread: scans hibernating entries and
+    /// wakes any whose deadline has passed. Poll granularity is one second —
+    /// alarms are minute-scale scheduling, not precise timers.
+    fn ensure_timer(&self) {
+        let mut started = self.timer_started.lock().unwrap();
+        if *started {
+            return;
+        }
+        *started = true;
+        std::thread::Builder::new()
+            .name("chidori-agents-timer".to_string())
+            .spawn(|| loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let hub = hub();
+                let due: Vec<Arc<AgentEntry>> = {
+                    let entries = hub.entries.lock().unwrap();
+                    entries
+                        .values()
+                        .filter(|entry| {
+                            let state = entry.state.lock().unwrap();
+                            state.descriptor.status == "hibernating"
+                                && !state.thread_live
+                                && state
+                                    .descriptor
+                                    .listen
+                                    .as_ref()
+                                    .and_then(|l| l.deadline)
+                                    .is_some_and(|deadline| deadline <= Utc::now())
+                        })
+                        .cloned()
+                        .collect()
+                };
+                for entry in due {
+                    {
+                        let mut state = entry.state.lock().unwrap();
+                        state.descriptor.status = "running".to_string();
+                        state.descriptor.updated_at = Utc::now();
+                    }
+                    hub.persist_descriptor(&entry.state.lock().unwrap().descriptor.clone());
+                    let _ = hub.start_thread(entry);
+                }
+            })
+            .ok();
+    }
+}
+
+/// Parsed `chidori.agents.spawn` options.
+#[derive(Debug, Clone)]
+pub struct SpawnOptions {
+    pub name: Option<String>,
+    pub restart: String,
+    pub max_restarts: u32,
+    pub backoff_ms: u64,
+}
+
+impl SpawnOptions {
+    fn parse(value: &Value) -> Result<Self, String> {
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(ref name) = name {
+            if name.is_empty()
+                || name
+                    .chars()
+                    .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'))
+            {
+                return Err(format!(
+                    "chidori.agents.spawn: `{name}` is not a registrable agent name \
+                     (allowed: ASCII letters, digits, `-`, `_`, `.`)"
+                ));
+            }
+        }
+        let restart = value
+            .get("restart")
+            .and_then(Value::as_str)
+            .unwrap_or("resume")
+            .to_string();
+        if !matches!(restart.as_str(), "never" | "clean" | "resume") {
+            return Err(format!(
+                "chidori.agents.spawn: unknown restart strategy `{restart}` \
+                 (expected \"never\", \"clean\", or \"resume\")"
+            ));
+        }
+        Ok(Self {
+            name,
+            restart,
+            max_restarts: value
+                .get("maxRestarts")
+                .and_then(Value::as_u64)
+                .unwrap_or(3) as u32,
+            backoff_ms: value.get("backoffMs").and_then(Value::as_u64).unwrap_or(0),
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "restart": self.restart,
+            "maxRestarts": self.max_restarts,
+            "backoffMs": self.backoff_ms,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The supervision loop
+// ---------------------------------------------------------------------------
+
+/// One supervision pass for a detached agent: run the module under
+/// resume-by-replay, then settle — completed/failed/stopped are terminal,
+/// a signal wait persists its listen state and HIBERNATES (the thread exits;
+/// deliveries and alarm deadlines re-enter), a failure consumes the restart
+/// budget per the spawn's strategy.
+fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
+    let Ok(parts) = hub.parts() else {
+        settle(hub, entry, "failed", None, Some("no runtime parts".into()));
+        return;
+    };
+    let factory = RunStoreFactory::shared(&parts.run_base);
+
+    loop {
+        let (descriptor, stop_requested) = {
+            let state = entry.state.lock().unwrap();
+            (state.descriptor.clone(), state.stop_requested)
+        };
+        if stop_requested {
+            settle(hub, entry, "stopped", None, None);
+            return;
+        }
+
+        let run_id = descriptor.run_id.clone();
+        let run_dir = parts.run_base.join(&run_id);
+        let store = factory.store_for(&run_id);
+
+        // The accumulated journal (empty on first run), plus a synthetic
+        // timeout-sentinel record when this wake is an expired alarm/timeout
+        // rather than a matching delivery.
+        let mut replay: Vec<CallRecord> = store.load_call_log().ok().flatten().unwrap_or_default();
+        let inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE) {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if let Some(listen) = descriptor.listen.clone() {
+            let matched = inbox
+                .iter()
+                .any(|queued| listen.names.iter().any(|n| n == &queued.name));
+            let expired = listen.deadline.is_some_and(|deadline| deadline <= Utc::now());
+            if !matched && expired {
+                // Woken by the deadline: resolve the listen point with the
+                // timeout sentinel — the alarm fired.
+                replay.retain(|r| r.seq != listen.seq);
+                replay.push(CallRecord {
+                    seq: listen.seq,
+                    parent_seq: None,
+                    function: listen.function.clone(),
+                    args: if listen.function == "signal_any" {
+                        json!({ "names": listen.names })
+                    } else {
+                        json!({ "name": listen.names[0] })
+                    },
+                    result: host_core::signal_timeout_sentinel(&listen.names),
+                    duration_ms: 0,
+                    token_usage: None,
+                    timestamp: Utc::now(),
+                    error: None,
+                });
+            } else if !matched {
+                // Spuriously started with nothing to do — go back to sleep.
+                hibernate(hub, entry, listen);
+                return;
+            }
+            let mut state = entry.state.lock().unwrap();
+            state.descriptor.listen = None;
+        }
+
+        // Fresh VM + context under the agent's OWN durable identity: run id,
+        // journal, policy seed, and persistence handle all belong to the
+        // agent, not the spawner.
+        let host_promises = store
+            .get_blob(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE)
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let vfs = crate::runtime::snapshot::SnapshotStore::with_store(&run_dir, store.clone())
+            .load_manifest()
+            .map(|manifest| manifest.vfs)
+            .unwrap_or_default();
+        let ctx = RuntimeContext::with_replay_host_promises_vfs_and_signals(
+            replay,
+            host_promises,
+            vfs,
+            inbox,
+        );
+        ctx.set_run_id(run_id.clone());
+        ctx.set_input_mode(crate::runtime::context::InputMode::Pause);
+        ctx.enable_persistence_with_store(run_dir.clone(), store.clone());
+
+        let Ok(policy) = RuntimePolicy::from_env_for_durable_run(&run_id) else {
+            settle(hub, entry, "failed", None, Some("building runtime policy".into()));
+            return;
+        };
+        let resolved = resolve_source(&parts.template_engine, &descriptor.source);
+        let source_text = match std::fs::read_to_string(&resolved) {
+            Ok(source) => source,
+            Err(err) => {
+                settle(
+                    hub,
+                    entry,
+                    "failed",
+                    None,
+                    Some(format!("reading {}: {err}", resolved.display())),
+                );
+                return;
+            }
+        };
+        // The same durable scaffold a run gets from the engine: manifest +
+        // pending + checkpoint at every host-operation safepoint, so a crash
+        // mid-iteration leaves a resumable artifact.
+        crate::runtime::engine::install_journal_scaffold_safepoints(
+            &parts.run_base,
+            &run_id,
+            &resolved,
+            &source_text,
+            &policy,
+            &ctx,
+        );
+
+        let backend = HostBindingBackend::for_runtime(
+            ctx.clone(),
+            parts.providers.clone(),
+            parts.template_engine.clone(),
+            parts.tokio_rt.clone(),
+            parts.policy.clone(),
+            Arc::new(Mutex::new(PolicyCache::default())),
+            policy.clone(),
+            parts.tools.clone(),
+            parts.mcp.clone(),
+        );
+
+        {
+            let mut state = entry.state.lock().unwrap();
+            state.live_ctx = Some(ctx.clone());
+        }
+        let result =
+            crate::runtime::rust_engine::run_agent_file(&resolved, &descriptor.input, &backend);
+        {
+            let mut state = entry.state.lock().unwrap();
+            state.live_ctx = None;
+        }
+        ctx.clear_event_sender();
+        drop(backend);
+        let _ = crate::runtime::engine::persist_journal_scaffold(
+            &parts.run_base,
+            &run_id,
+            &resolved,
+            &source_text,
+            &policy,
+            &ctx,
+        );
+
+        match settle_iteration(result, &ctx) {
+            IterationEnd::Completed(output) => {
+                if let Some(store) = ctx.store() {
+                    let _ = store.put_blob(
+                        "output.json",
+                        serde_json::to_string_pretty(&output)
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    );
+                }
+                settle(hub, entry, "completed", Some(output), None);
+                return;
+            }
+            IterationEnd::Parked(prompt) => {
+                settle(
+                    hub,
+                    entry,
+                    "paused",
+                    None,
+                    prompt.map(|p| format!("paused: {p}")),
+                );
+                return;
+            }
+            IterationEnd::WaitSignal(pending) => {
+                // Re-check the durable inbox before parking: a delivery that
+                // raced in during the unwind must not be slept through.
+                let names = pending.listen_names();
+                let raced = ctx
+                    .signal_inbox()
+                    .iter()
+                    .any(|queued| names.iter().any(|n| n == &queued.name));
+                let listen = listen_state(&ctx, &pending);
+                if raced {
+                    continue;
+                }
+                hibernate(hub, entry, listen);
+                return;
+            }
+            IterationEnd::Failed(message) => {
+                let stop = entry.state.lock().unwrap().stop_requested;
+                if stop {
+                    settle(hub, entry, "stopped", None, None);
+                    return;
+                }
+                let (restarts, budget_left) = {
+                    let mut state = entry.state.lock().unwrap();
+                    let left = descriptor.restart != "never"
+                        && state.descriptor.restarts < descriptor.max_restarts;
+                    if left {
+                        state.descriptor.restarts += 1;
+                    }
+                    (state.descriptor.restarts, left)
+                };
+                if !budget_left {
+                    settle(hub, entry, "failed", None, Some(message));
+                    return;
+                }
+                if descriptor.backoff_ms > 0 {
+                    let backoff = descriptor
+                        .backoff_ms
+                        .saturating_mul(1u64 << (restarts - 1).min(16));
+                    let deadline = std::time::Instant::now() + Duration::from_millis(backoff);
+                    let mut state = entry.state.lock().unwrap();
+                    while !state.stop_requested {
+                        let now = std::time::Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        state = entry
+                            .signal
+                            .wait_timeout(state, deadline.saturating_duration_since(now))
+                            .unwrap()
+                            .0;
+                    }
+                }
+                // Rewrite the durable journal per the restart strategy: a
+                // `resume` restart strips the crash frontier so completed work
+                // replays from cache; `clean` starts over.
+                let records = ctx.call_log().into_records();
+                let rewritten = match descriptor.restart.as_str() {
+                    "clean" => Vec::new(),
+                    _ => strip_crash_frontier(records),
+                };
+                let _ = store.write_call_log(&rewritten);
+                if descriptor.restart == "clean" {
+                    let _ = store
+                        .delete_blob(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE);
+                    let _ = store
+                        .delete_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE);
+                }
+            }
+        }
+    }
+}
+
+/// The pending listen call's durable wake state, including the alarm deadline
+/// when the listen carries a timeout.
+fn listen_state(ctx: &RuntimeContext, pending: &PendingSignal) -> ListenState {
+    let names = pending.listen_names();
+    let function = ctx
+        .pending_host_operation(pending.id)
+        .and_then(|op| op.function)
+        .unwrap_or_else(|| {
+            if names.len() > 1 {
+                "signal_any"
+            } else {
+                "signal"
+            }
+            .to_string()
+        });
+    ListenState {
+        names,
+        seq: pending.seq,
+        function,
+        deadline: pending
+            .timeout_ms
+            .map(|ms| Utc::now() + chrono::Duration::milliseconds(ms as i64)),
+    }
+}
+
+fn hibernate(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>, listen: ListenState) {
+    let has_deadline = listen.deadline.is_some();
+    let descriptor = {
+        let mut state = entry.state.lock().unwrap();
+        state.descriptor.status = "hibernating".to_string();
+        state.descriptor.listen = Some(listen);
+        state.descriptor.updated_at = Utc::now();
+        state.descriptor.clone()
+    };
+    hub.persist_descriptor(&descriptor);
+    if has_deadline {
+        hub.ensure_timer();
+    }
+    entry.signal.notify_all();
+}
+
+fn settle(
+    hub: &DetachedAgentHub,
+    entry: &Arc<AgentEntry>,
+    status: &str,
+    output: Option<Value>,
+    error: Option<String>,
+) {
+    let descriptor = {
+        let mut state = entry.state.lock().unwrap();
+        state.descriptor.status = status.to_string();
+        state.descriptor.output = output;
+        state.descriptor.error = error;
+        state.descriptor.listen = None;
+        state.descriptor.updated_at = Utc::now();
+        state.descriptor.clone()
+    };
+    hub.persist_descriptor(&descriptor);
+    entry.signal.notify_all();
+}
+
+enum IterationEnd {
+    Completed(Value),
+    Failed(String),
+    Parked(Option<String>),
+    WaitSignal(PendingSignal),
+}
+
+fn settle_iteration(result: anyhow::Result<Value>, ctx: &RuntimeContext) -> IterationEnd {
+    match result {
+        Ok(output) => IterationEnd::Completed(output),
+        Err(err) if err.to_string().contains(PAUSE_MARKER) => {
+            if let Some(pending) = ctx.take_pending_signal() {
+                IterationEnd::WaitSignal(pending)
+            } else if let Some(pending) = ctx.take_pending_input() {
+                IterationEnd::Parked(Some(pending.prompt))
+            } else if let Some(pending) = ctx.take_pending_approval() {
+                IterationEnd::Parked(Some(format!("approval required: {}", pending.target)))
+            } else {
+                IterationEnd::Parked(None)
+            }
+        }
+        Err(err) => IterationEnd::Failed(err.to_string()),
+    }
+}
+
+/// Strip the trailing failed host records off a crashed iteration's log (the
+/// crash frontier), mirroring the actor `resume` restart semantics.
+fn strip_crash_frontier(mut records: Vec<CallRecord>) -> Vec<CallRecord> {
+    while records.last().is_some_and(|r| r.error.is_some()) {
+        records.pop();
+    }
+    records
+}
+
+fn resolve_source(template_engine: &TemplateEngine, source: &str) -> PathBuf {
+    let path = Path::new(source);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        template_engine.base_dir().join(path)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host bindings (`chidori.agents.*`)
+// ---------------------------------------------------------------------------
+
+fn runtime_ctx<'a>(
+    backend: &'a HostBindingBackend,
+    what: &str,
+) -> Result<&'a RuntimeContext, String> {
+    backend
+        .runtime_ctx()
+        .ok_or_else(|| format!("chidori.{what} requires the runtime host backend"))
+}
+
+/// Install the hub's runtime parts from a spawning backend, deriving
+/// `run_base` from the run's persist dir. Errors when persistence is off —
+/// a detached agent without a journal cannot exist.
+fn install_parts_from(backend: &HostBindingBackend, ctx: &RuntimeContext) -> Result<(), String> {
+    if hub().parts.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    let (providers, template_engine, tokio_rt, policy, tools, mcp) = backend
+        .runtime_parts()
+        .ok_or("chidori.agents requires the runtime host backend")?;
+    let run_base = ctx
+        .persist_dir()
+        .and_then(|dir| dir.parent().map(Path::to_path_buf))
+        .ok_or(
+            "chidori.agents requires persistence: detached agents are durable runs \
+             (run with a project dir so `.chidori/runs/` exists)",
+        )?;
+    hub().install_parts(AgentRuntimeParts {
+        providers,
+        template_engine,
+        tokio_rt,
+        policy,
+        tools,
+        mcp,
+        run_base,
+    });
+    Ok(())
+}
+
+/// `chidori.agents.spawn(source, input, options)` — start a detached agent
+/// and return `{ name, runId }`. One durable `spawn_agent` record: a parent
+/// replay returns the identity from cache without starting anything (the
+/// agent is re-materialized from the registry by the next live call that
+/// addresses it).
+pub(crate) fn spawn_agent(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
+    let ctx = runtime_ctx(backend, "agents.spawn")?;
+    if ctx.is_branch() {
+        return Err(
+            "chidori.agents.spawn is not supported inside a chidori.branch sub-run".to_string(),
+        );
+    }
+    install_parts_from(backend, ctx)?;
+    let source = a
+        .get("source")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("chidori.agents.spawn requires a source module path")?
+        .to_string();
+    let input = a
+        .get("input")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .unwrap_or_else(|| json!({}));
+    let options_value = a
+        .get("options")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .unwrap_or_else(|| json!({}));
+    let options = SpawnOptions::parse(&options_value)?;
+    if !resolve_source(&backend.template_engine(), &source).is_file() {
+        return Err(format!(
+            "chidori.agents.spawn: source module not found: {source}"
+        ));
+    }
+    let call_args = json!({
+        "source": source,
+        "input": input,
+        "options": options.to_json(),
+    });
+    let owner = ctx.run_id();
+    host_core::execute_durable_json_call(ctx, "spawn_agent", call_args, || {
+        hub()
+            .spawn(&source, input.clone(), &options, owner.clone())
+            .map_err(|err| anyhow::anyhow!(err))
+    })
+    .map_err(|err| err.to_string())
+}
+
+/// `chidori.agents.send(to, name, payload)` — durable delivery into a
+/// detached agent's mailbox; wakes it when it hibernates on a matching name.
+pub(crate) fn send_agent(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
+    let ctx = runtime_ctx(backend, "agents.send")?;
+    install_parts_from(backend, ctx)?;
+    let to = a
+        .get("to")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("chidori.agents.send requires a target agent name")?
+        .to_string();
+    let name = a
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("chidori.agents.send requires a string message name")?
+        .to_string();
+    let payload = a.get("payload").cloned().unwrap_or(Value::Null);
+    let from = json!({ "kind": "agent", "id": ctx.run_id() });
+    let call_args = json!({ "to": to, "name": name, "payload": payload, "from": from });
+    host_core::execute_durable_json_call(ctx, "send_agent", call_args, || {
+        hub()
+            .send(&to, &name, payload.clone(), from.clone())
+            .map_err(|err| anyhow::anyhow!(err))
+    })
+    .map_err(|err| err.to_string())
+}
+
+/// `chidori.agents.join(to, opts)` — wait for a detached agent to settle.
+pub(crate) fn join_agent(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
+    let ctx = runtime_ctx(backend, "agents.join")?;
+    install_parts_from(backend, ctx)?;
+    let to = a
+        .get("to")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("chidori.agents.join requires a target agent name")?
+        .to_string();
+    let timeout_ms = a
+        .get("opts")
+        .and_then(|o| o.get("timeoutMs"))
+        .and_then(Value::as_u64);
+    let call_args = json!({ "to": to, "opts": { "timeoutMs": timeout_ms } });
+    host_core::execute_durable_json_call(ctx, "join_agent", call_args, || {
+        hub()
+            .join(&to, timeout_ms)
+            .map_err(|err| anyhow::anyhow!(err))
+    })
+    .map_err(|err| err.to_string())
+}
+
+/// `chidori.agents.stop(to)` — cooperative stop.
+pub(crate) fn stop_agent(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
+    let ctx = runtime_ctx(backend, "agents.stop")?;
+    install_parts_from(backend, ctx)?;
+    let to = a
+        .get("to")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("chidori.agents.stop requires a target agent name")?
+        .to_string();
+    let call_args = json!({ "to": to });
+    host_core::execute_durable_json_call(ctx, "stop_agent", call_args, || {
+        hub().stop(&to).map_err(|err| anyhow::anyhow!(err))
+    })
+    .map_err(|err| err.to_string())
+}
+
+/// `chidori.agents.status(to)`.
+pub(crate) fn agent_status(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
+    let ctx = runtime_ctx(backend, "agents.status")?;
+    install_parts_from(backend, ctx)?;
+    let to = a
+        .get("to")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("chidori.agents.status requires a target agent name")?
+        .to_string();
+    let call_args = json!({ "to": to });
+    host_core::execute_durable_json_call(ctx, "agent_status", call_args, || {
+        hub().status(&to).map_err(|err| anyhow::anyhow!(err))
+    })
+    .map_err(|err| err.to_string())
+}
+
+/// `chidori.agents.lookup(name)` — a registry lookup: `{name, runId, status}`
+/// or null.
+pub(crate) fn lookup_agent(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
+    let ctx = runtime_ctx(backend, "agents.lookup")?;
+    install_parts_from(backend, ctx)?;
+    let name = a
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("chidori.agents.lookup requires an agent name")?
+        .to_string();
+    let call_args = json!({ "name": name });
+    host_core::execute_durable_json_call(ctx, "lookup_agent", call_args, || {
+        hub().lookup(&name).map_err(|err| anyhow::anyhow!(err))
+    })
+    .map_err(|err| err.to_string())
+}

@@ -175,6 +175,59 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
     };
     globalThis.__chidori_install_actor_helpers();
 
+    // chidori.agents: same handle sugar as chidori.actors, addressed by the
+    // agent's registered name. Every method bottoms out in one recorded
+    // durable host call.
+    globalThis.__chidori_install_agent_helpers = function installAgentHelpers() {
+        const native = globalThis.chidori && globalThis.chidori.agents;
+        if (!native || typeof native.spawn !== "function" || native.__chidori_wrapped) {
+            return null;
+        }
+        function makeHandle(info) {
+            const name = info.name;
+            return {
+                name,
+                runId: info.runId ?? null,
+                send(message, payload) {
+                    return native.send(name, message, payload);
+                },
+                join(options) {
+                    return native.join(name, options);
+                },
+                stop(options) {
+                    return native.stop(name, options);
+                },
+                status() {
+                    return native.status(name);
+                },
+            };
+        }
+        globalThis.chidori.agents = {
+            __chidori_wrapped: true,
+            async spawn(source, input, options) {
+                return makeHandle(await native.spawn(source, input, options));
+            },
+            send(to, message, payload) {
+                return native.send(to, message, payload);
+            },
+            join(target, options) {
+                return native.join(target, options);
+            },
+            stop(target, options) {
+                return native.stop(target, options);
+            },
+            status(target) {
+                return native.status(target);
+            },
+            async lookup(name) {
+                const found = await native.lookup(name);
+                return found && found.name ? makeHandle(found) : null;
+            },
+        };
+        return null;
+    };
+    globalThis.__chidori_install_agent_helpers();
+
     // chidori.context(): an immutable, turn-structured prompt builder. Each
     // builder call allocates ONE new node pointing at its parent, so contexts
     // share their prefix structurally — `base.user("a")` and `base.user("b")`

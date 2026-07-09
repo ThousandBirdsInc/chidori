@@ -528,6 +528,125 @@ impl Engine {
             });
         self.vm
             .define_value(&chidori, "actors", Value::Object(actors));
+        // chidori.agents.<method> — detached, durable, addressable agent
+        // processes. Unlike actors (in-run, fold-at-join), a detached agent is
+        // its own durable run with a registered name, a durable mailbox, and a
+        // hibernate/wake lifecycle owned by the process-global supervisor. The
+        // natives return the raw durable JSON; the helper script wraps spawn/
+        // lookup results into handles.
+        let agents = self.vm.new_object();
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "spawn", 3, move |vm, _t, args| {
+                let source = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let input = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let options = args
+                    .get(2)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "spawn_agent",
+                    serde_json::json!({ "source": source, "input": input, "options": options }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "send", 3, move |vm, _t, args| {
+                let to = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let name = args
+                    .get(1)
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let payload = args
+                    .get(2)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "send_agent",
+                    serde_json::json!({ "to": to, "name": name, "payload": payload }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "join", 2, move |vm, _t, args| {
+                let to = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "join_agent",
+                    serde_json::json!({ "to": to, "opts": opts }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "stop", 2, move |vm, _t, args| {
+                let to = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "stop_agent",
+                    serde_json::json!({ "to": to, "opts": opts }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "status", 1, move |vm, _t, args| {
+                let to = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                forward_effect(vm, &d, "agent_status", serde_json::json!({ "to": to }))
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "lookup", 1, move |vm, _t, args| {
+                let name = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                forward_effect(vm, &d, "lookup_agent", serde_json::json!({ "name": name }))
+            });
+        self.vm
+            .define_value(&chidori, "agents", Value::Object(agents));
+        // chidori.alarm(ms) — a durable timer: the run (or detached agent)
+        // hibernates and is woken at the deadline, surviving process
+        // restarts. Lowered onto the durable signal machinery host-side.
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&chidori, "alarm", 1, move |vm, _t, args| {
+                let ms = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(vm, &d, "alarm", serde_json::json!({ "ms": ms }))
+            });
         // chidori.receive stays top-level: it is the general listen verb for
         // both the run (parent-addressed messages) and actor code.
         let d = dispatch.clone();
