@@ -23,6 +23,8 @@ pub mod secret_env;
 pub mod snapshot;
 /// Pluggable persistence for the durable run artifact (journal + blobs).
 pub mod store;
+/// S3-compatible blob backend for the run store (S3 / R2 / GCS / MinIO).
+pub mod store_blob;
 pub mod template;
 pub mod typescript;
 pub mod vfs;

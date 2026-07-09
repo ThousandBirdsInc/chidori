@@ -263,7 +263,7 @@ impl RunStore for FsRunStore {
 /// Union a full checkpoint with the appended tail: checkpoint order wins;
 /// tail records whose seq the checkpoint doesn't know (writes stranded after
 /// the last safepoint by a crash) are appended in seq order.
-fn union_checkpoint_and_tail(
+pub(crate) fn union_checkpoint_and_tail(
     checkpoint: Option<Vec<CallRecord>>,
     tail: Vec<CallRecord>,
 ) -> Option<Vec<CallRecord>> {
@@ -552,6 +552,8 @@ struct HttpRelayRequest {
     /// Content type sent with a body; JSON for records/registry payloads,
     /// octet-stream for raw blobs.
     content_type: &'static str,
+    /// Extra headers, verbatim — the S3 backend's SigV4 signature headers.
+    headers: Vec<(String, String)>,
     reply: std::sync::mpsc::Sender<Result<(u16, Vec<u8>)>>,
 }
 
@@ -572,6 +574,12 @@ impl std::fmt::Debug for HttpRelay {
 }
 
 impl HttpRelay {
+    /// A relay with no base URL or bearer token — the S3 backend signs its
+    /// own requests and always passes absolute URLs through `request_full`.
+    pub(crate) fn new_headless() -> Arc<Self> {
+        Self::new(String::new(), None)
+    }
+
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Arc<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let (sender, receiver) = std::sync::mpsc::channel::<HttpRelayRequest>();
@@ -598,6 +606,9 @@ impl HttpRelay {
                             };
                             if let Some(ref token) = token {
                                 builder = builder.bearer_auth(token);
+                            }
+                            for (name, value) in &request.headers {
+                                builder = builder.header(name, value);
                             }
                             if let Some(body) = request.body {
                                 builder = builder
@@ -638,6 +649,19 @@ impl HttpRelay {
         body: Option<Vec<u8>>,
         content_type: &'static str,
     ) -> Result<(u16, Vec<u8>)> {
+        self.request_full(method, url, body, content_type, Vec::new())
+    }
+
+    /// Full-control request used by the S3 backend: caller-supplied headers
+    /// (the SigV4 signature set) ride verbatim.
+    pub(crate) fn request_full(
+        &self,
+        method: &'static str,
+        url: String,
+        body: Option<Vec<u8>>,
+        content_type: &'static str,
+        headers: Vec<(String, String)>,
+    ) -> Result<(u16, Vec<u8>)> {
         let (reply, receive) = std::sync::mpsc::channel();
         self.sender
             .send(HttpRelayRequest {
@@ -645,6 +669,7 @@ impl HttpRelay {
                 url,
                 body,
                 content_type,
+                headers,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("run-store relay thread is gone"))?;
@@ -925,6 +950,8 @@ pub enum RunStoreBackend {
     Sqlite(Arc<SqliteRunStoreShared>),
     /// Mirror to a remote relay (Durable Object shim or compatible).
     Http(Arc<HttpRelay>),
+    /// Mirror to an S3-compatible object store (S3, R2, GCS, MinIO, ...).
+    Blob(Arc<crate::runtime::store_blob::S3BlobStore>),
 }
 
 /// Hands out per-run [`RunStore`] handles and owns backend-wide operations
@@ -973,6 +1000,20 @@ impl RunStoreFactory {
                     value,
                     std::env::var("CHIDORI_RUN_STORE_TOKEN").ok(),
                 ))
+            }
+            Ok(value) if value.starts_with("s3://") => {
+                match crate::runtime::store_blob::S3BlobStore::from_env(&value) {
+                    Ok(store) => {
+                        tracing::info!("run store: s3-compatible mirror at {value}");
+                        RunStoreBackend::Blob(store)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "run store s3 mirror failed ({err}); falling back to fs only"
+                        );
+                        RunStoreBackend::Fs
+                    }
+                }
             }
             Ok(value) if !value.is_empty() && !value.eq_ignore_ascii_case("fs") => {
                 tracing::warn!("unknown CHIDORI_RUN_STORE `{value}`; using fs only");
@@ -1023,6 +1064,13 @@ impl RunStoreFactory {
                 primary,
                 Arc::new(HttpRunStore::new(relay.clone(), run_id)),
             )),
+            RunStoreBackend::Blob(store) => Arc::new(TeeRunStore::new(
+                primary,
+                Arc::new(crate::runtime::store_blob::BlobRunStore::new(
+                    store.clone(),
+                    run_id,
+                )),
+            )),
         }
     }
 
@@ -1036,6 +1084,9 @@ impl RunStoreFactory {
             RunStoreBackend::Http(relay) => {
                 Some(Arc::new(HttpRunStore::new(relay.clone(), run_id)))
             }
+            RunStoreBackend::Blob(store) => Some(Arc::new(
+                crate::runtime::store_blob::BlobRunStore::new(store.clone(), run_id),
+            )),
         }
     }
 
@@ -1060,6 +1111,9 @@ impl RunStoreFactory {
             RunStoreBackend::Fs => {}
             RunStoreBackend::Sqlite(shared) => ids.extend(shared.list_runs()?),
             RunStoreBackend::Http(relay) => ids.extend(relay.list_runs()?),
+            RunStoreBackend::Blob(store) => {
+                ids.extend(crate::runtime::store_blob::list_runs(store)?)
+            }
         }
         Ok(ids.into_iter().collect())
     }
@@ -1135,6 +1189,9 @@ impl RunStoreFactory {
                     Some(bytes),
                 )?;
             }
+            RunStoreBackend::Blob(store) => {
+                crate::runtime::store_blob::registry_put(store, name, &entry)?;
+            }
         }
         Ok(())
     }
@@ -1168,6 +1225,7 @@ impl RunStoreFactory {
                     s => anyhow::bail!("run store relay GET registry failed: HTTP {s}"),
                 }
             }
+            RunStoreBackend::Blob(store) => crate::runtime::store_blob::registry_get(store, name),
         }
     }
 
@@ -1196,6 +1254,13 @@ impl RunStoreFactory {
                         if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
                             by_name.insert(name.to_string(), entry.clone());
                         }
+                    }
+                }
+            }
+            RunStoreBackend::Blob(store) => {
+                for entry in crate::runtime::store_blob::registry_list(store)? {
+                    if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
+                        by_name.insert(name.to_string(), entry.clone());
                     }
                 }
             }

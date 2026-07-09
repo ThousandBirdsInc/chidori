@@ -274,11 +274,12 @@ human-in-the-loop pause/resume loop — see
   memory, wake on a mailbox delivery or a durable
   `chidori.alarm(ms)` deadline, and survive server restarts (the fleet
   re-arms from a durable registry at boot).
-- **Replicated run storage** — mirror every run's journal to SQLite or a
-  [Cloudflare Durable Object per run](./docs/durable-storage.md)
-  (`CHIDORI_RUN_STORE`), hydrate runs back after machine loss, gate side
-  effects on journal durability (`CHIDORI_DURABILITY=strict`), and time-travel
-  with `chidori resume --until-seq`.
+- **Replicated run storage** — mirror every run's journal to
+  [any S3-compatible bucket (S3/R2/GCS/MinIO), SQLite, or a Cloudflare
+  Durable Object per run](./docs/durable-storage.md) (`CHIDORI_RUN_STORE`),
+  hydrate runs back after machine loss, gate side effects on journal
+  durability (`CHIDORI_DURABILITY=strict`), and time-travel with
+  `chidori resume --until-seq`.
 - **Cost-efficient prompting** — structural [prompt
   caching](./docs/context-management.md) re-bills stable prefixes at the cached
   rate, and replay pays zero tokens.

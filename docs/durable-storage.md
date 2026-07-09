@@ -56,7 +56,13 @@ Selected by `CHIDORI_RUN_STORE`:
 |---|---|
 | unset / `fs` | Filesystem only (the default — exactly the pre-existing behavior) |
 | `sqlite` | Mirror to a shared SQLite database (`CHIDORI_RUN_DB`, default `<run_base>/runs.sqlite3`). One row per record — not the session store's blob-per-session shortcut. |
-| `http(s)://…` | Mirror to a remote relay speaking the run-store REST protocol. The reference deployment is one **Cloudflare Durable Object per run** (`integrations/cloudflare-durable-objects/`), which gives every acknowledged write cross-datacenter replication and 30-day point-in-time recovery. `CHIDORI_RUN_STORE_TOKEN` adds bearer auth. |
+| `s3://bucket[/prefix]` | Mirror to any **S3-compatible object store** — AWS S3, Cloudflare R2, GCS interop, Backblaze, MinIO, LocalStack. No server-side code to deploy: point `CHIDORI_RUN_STORE_ENDPOINT` at the store (default `https://s3.<region>.amazonaws.com`), supply the standard `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (or `CHIDORI_RUN_STORE_*` overrides), and requests are SigV4-signed in-process (no AWS SDK). Each journal append is one object PUT (`runs/<id>/records/<seq>.json`); safepoint checkpoints compact the tail objects. Bucket versioning gives point-in-time recovery for free. **This is the recommended default mirror.** |
+| `http(s)://…` | Mirror to a remote relay speaking the run-store REST protocol. The reference deployment is one **Cloudflare Durable Object per run** (`integrations/cloudflare-durable-objects/`), which gives every acknowledged write cross-datacenter replication, 30-day point-in-time recovery, and a **serialized writer per run** (the platform enforces a single instance per id — the strongest lease story). `CHIDORI_RUN_STORE_TOKEN` adds bearer auth. |
+
+Choosing between the remote backends: reach for `s3://` when you want durability
+with zero deployment surface (most users); reach for the Durable Object relay
+when you want platform-enforced single writers and the lowest write
+confirmation latency, or as the beachhead for future multi-node routing.
 
 ## Write-error policy: `CHIDORI_DURABILITY`
 
@@ -101,9 +107,11 @@ which process owns a run, with a TTL. The detached-agent supervisor
 (`docs/detached-agents.md`) takes a run's lease before executing and releases
 it on hibernate/settle; a second process sharing the same mirror stands down,
 and an expired lease (a dead node) transfers on the next wake. Note the
-check-and-set is last-writer-wins on the plain filesystem backend — real
-multi-writer deployments should use the SQLite or HTTP backends, which
-serialize writers.
+check-and-set is last-writer-wins on the plain filesystem backend **and on
+S3-compatible object stores** (no compare-and-swap is used) — deployments
+that need enforced single writers should use the SQLite backend (one
+connection serializes writers) or the Durable Object relay (the platform
+guarantees one instance per run).
 
 ## What this layer deliberately does not do
 
