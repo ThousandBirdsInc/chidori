@@ -13,8 +13,8 @@ use crate::runtime::context::{
     PendingInput, PendingSignal, RuntimeContext, RuntimeEvent,
 };
 use crate::runtime::snapshot::{
-    HostPromiseRecord, RuntimePolicy, SnapshotAbi, SnapshotManifest, SnapshotStore,
-    SourceFingerprint,
+    HostPromiseRecord, RuntimePolicy, SnapshotAbi, SnapshotManifest, SnapshotModuleGraphEntry,
+    SnapshotStore, SourceFingerprint,
 };
 use crate::runtime::template::TemplateEngine;
 use crate::tools::ToolRegistry;
@@ -95,14 +95,140 @@ pub(crate) fn persist_journal_scaffold(
     policy: &RuntimePolicy,
     ctx: &RuntimeContext,
 ) -> Result<()> {
-    persist_rust_journal_scaffold(base, run_id, path, source, policy, ctx)
+    ScaffoldPersister::new(base, run_id, path, source, policy)
+        .persist(ctx, CheckpointWrite::Compact)
+}
+
+/// Whether a scaffold persist rewrites the full `checkpoint.json`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointWrite {
+    /// Write only when the in-memory log holds records the O(1) journal
+    /// appends did not cover (`RuntimeContext::call_log_checkpoint_dirty`) —
+    /// the per-safepoint cadence. Live records are already durable in
+    /// `records.jsonl` via `record_call`, and the loader unions the last
+    /// checkpoint with the appended tail, so skipping the rewrite loses
+    /// nothing.
+    IfDirty,
+    /// Always write — the compaction points: pause, settle, one-shot scaffold
+    /// snapshots.
+    Compact,
+}
+
+/// Per-run persister for the durable journal scaffold. Caches the pieces that
+/// are invariant for the run's lifetime — the entry fingerprint, the module
+/// fingerprints + import graph (a disk walk over every imported module), and
+/// the serialized code-bundle blob — so the per-host-call safepoints pay for
+/// none of them. Before this existed, every safepoint re-walked the module
+/// graph from disk twice and rewrote the whole checkpoint: O(history) bytes
+/// and O(modules) disk reads per host call.
+pub(crate) struct ScaffoldPersister {
+    base: PathBuf,
+    run_id: String,
+    path: PathBuf,
+    source: String,
+    policy: RuntimePolicy,
+    entry: SourceFingerprint,
+    /// `(dependency fingerprints, full module graph)` — computed on first use
+    /// (set only on success, so a transient read failure retries).
+    modules: std::sync::OnceLock<(Vec<SourceFingerprint>, Vec<SnapshotModuleGraphEntry>)>,
+    /// The rust engine has no VM image to serialize; resume is call-log
+    /// replay. We still write a non-empty blob — the durable code bundle the
+    /// journal keys reference — so `SnapshotStore::load()` round-trips and
+    /// the on-disk shape matches the established scaffold shape
+    /// (manifest + blob + checkpoint + pending). The bytes are run-invariant,
+    /// so they are serialized once here and written once per run.
+    blob_bytes: Vec<u8>,
+    blob_written: std::sync::atomic::AtomicBool,
+}
+
+impl ScaffoldPersister {
+    pub(crate) fn new(
+        base: &Path,
+        run_id: &str,
+        path: &Path,
+        source: &str,
+        policy: &RuntimePolicy,
+    ) -> Self {
+        let blob = chidori_js::replay::DurableBlob {
+            bundle: source.to_string(),
+            effects: Vec::new(),
+            journal: Vec::new(),
+        };
+        Self {
+            base: base.to_path_buf(),
+            run_id: run_id.to_string(),
+            path: path.to_path_buf(),
+            source: source.to_string(),
+            policy: policy.clone(),
+            entry: SourceFingerprint::from_source(path, source),
+            modules: std::sync::OnceLock::new(),
+            blob_bytes: serde_json::to_vec(&blob).unwrap_or_default(),
+            blob_written: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn modules(&self) -> Result<&(Vec<SourceFingerprint>, Vec<SnapshotModuleGraphEntry>)> {
+        if let Some(cached) = self.modules.get() {
+            return Ok(cached);
+        }
+        // Sources are fixed for the run's lifetime (the engine read them once
+        // at start and never re-reads), so the manifest must describe what the
+        // run is actually executing — caching is more correct than re-walking,
+        // not just cheaper.
+        let computed = crate::runtime::typescript::module_graph::snapshot_modules(
+            &self.path,
+            &self.source,
+            &self.policy,
+        )?;
+        Ok(self.modules.get_or_init(|| computed))
+    }
+
+    pub(crate) fn persist(&self, ctx: &RuntimeContext, checkpoint: CheckpointWrite) -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let pending = ctx.active_pending_host_operation();
+        let host_promises = ctx.host_promise_records();
+        let (modules, module_graph) = self.modules()?;
+        let manifest = SnapshotManifest::new(
+            &self.run_id,
+            SnapshotAbi::current("chidori-quickjs"),
+            self.policy.clone(),
+            self.entry.clone(),
+            modules.clone(),
+            pending,
+            ctx.call_log_len(),
+        )
+        .with_module_graph(module_graph.clone())
+        .with_host_promises(host_promises)
+        .with_capabilities(ctx.capabilities())
+        .with_vfs(ctx.vfs_snapshot());
+        // Write through the run's store handle when persistence is enabled, so
+        // a configured durable mirror receives the scaffold too; identical
+        // on-disk layout either way.
+        let store = match ctx.store() {
+            Some(store) => SnapshotStore::with_store(self.base.join(&self.run_id), store),
+            None => SnapshotStore::new(self.base.join(&self.run_id)),
+        };
+        if !self.blob_written.load(Ordering::Acquire) {
+            store.put_snapshot_blob(&manifest, &self.blob_bytes)?;
+            self.blob_written.store(true, Ordering::Release);
+        }
+        store.put_manifest(&manifest)?;
+        if checkpoint == CheckpointWrite::Compact || ctx.call_log_checkpoint_dirty() {
+            let call_log = ctx.call_log().into_records();
+            store.write_call_log(&call_log)?;
+            ctx.clear_call_log_checkpoint_dirty(call_log.len());
+        }
+        store.put_pending(manifest.pending.as_ref())
+    }
 }
 
 /// Install the durable-scaffold safepoints on a prepared context: the
-/// manifest + pending + checkpoint are persisted before every live host side
-/// effect and after every recorded completion, so a crash mid-run always
-/// leaves a resumable artifact. Shared by the engine's run path and the
-/// detached-agent supervisor (`host_agent`), which runs modules directly.
+/// manifest + pending (and, when the log is checkpoint-dirty, the full
+/// checkpoint) are persisted before every live host side effect and after
+/// every recorded completion, so a crash mid-run always leaves a resumable
+/// artifact. Shared by the engine's run path and the detached-agent
+/// supervisor (`host_agent`), which runs modules directly.
 pub(crate) fn install_journal_scaffold_safepoints(
     base: &Path,
     run_id: &str,
@@ -111,81 +237,28 @@ pub(crate) fn install_journal_scaffold_safepoints(
     policy: &RuntimePolicy,
     ctx: &RuntimeContext,
 ) {
-    let (base, run_id, path, source, policy) = (
-        base.to_path_buf(),
-        run_id.to_string(),
-        path.to_path_buf(),
-        source.to_string(),
-        policy.clone(),
-    );
+    let persister = Arc::new(ScaffoldPersister::new(base, run_id, path, source, policy));
+    install_scaffold_safepoints_with(persister, ctx);
+}
+
+/// Wire an existing per-run [`ScaffoldPersister`] into both host-operation
+/// safepoints (pre-effect and post-completion), each at the `IfDirty`
+/// checkpoint cadence.
+pub(crate) fn install_scaffold_safepoints_with(
+    persister: Arc<ScaffoldPersister>,
+    ctx: &RuntimeContext,
+) {
     {
-        let (base, run_id, path, source, policy) = (
-            base.clone(),
-            run_id.clone(),
-            path.clone(),
-            source.clone(),
-            policy.clone(),
-        );
+        let persister = persister.clone();
         let safepoint_ctx = ctx.clone();
         ctx.set_host_operation_safepoint(HostOperationSafepoint::new(move |_operation| {
-            persist_rust_journal_scaffold(&base, &run_id, &path, &source, &policy, &safepoint_ctx)
+            persister.persist(&safepoint_ctx, CheckpointWrite::IfDirty)
         }));
     }
     let completion_ctx = ctx.clone();
     ctx.set_host_operation_completion_safepoint(HostOperationCompletionSafepoint::new(
-        move |_record| {
-            persist_rust_journal_scaffold(&base, &run_id, &path, &source, &policy, &completion_ctx)
-        },
+        move |_record| persister.persist(&completion_ctx, CheckpointWrite::IfDirty),
     ));
-}
-
-fn persist_rust_journal_scaffold(
-    base: &Path,
-    run_id: &str,
-    path: &Path,
-    source: &str,
-    policy: &RuntimePolicy,
-    ctx: &RuntimeContext,
-) -> Result<()> {
-    let call_log = ctx.call_log().into_records();
-    let pending = ctx.active_pending_host_operation();
-    let host_promises = ctx.host_promise_records();
-    let modules = crate::runtime::typescript::module_graph::snapshot_module_fingerprints(
-        path, source, policy,
-    )?;
-    let module_graph =
-        crate::runtime::typescript::module_graph::snapshot_module_graph(path, source, policy)?;
-    let manifest = SnapshotManifest::new(
-        run_id,
-        SnapshotAbi::current("chidori-quickjs"),
-        policy.clone(),
-        SourceFingerprint::from_source(path, source),
-        modules,
-        pending.clone(),
-        call_log.len(),
-    )
-    .with_module_graph(module_graph)
-    .with_host_promises(host_promises)
-    .with_capabilities(ctx.capabilities())
-    .with_vfs(ctx.vfs_snapshot());
-    // The rust engine has no VM image to serialize; resume is call-log replay.
-    // We still write a non-empty blob — the durable code bundle the journal keys
-    // reference — so `SnapshotStore::load()` round-trips and the on-disk shape
-    // matches the established scaffold shape (manifest + blob + checkpoint + pending).
-    let blob = chidori_js::replay::DurableBlob {
-        bundle: source.to_string(),
-        effects: Vec::new(),
-        journal: Vec::new(),
-    };
-    let blob_bytes = serde_json::to_vec(&blob).unwrap_or_default();
-    // Write through the run's store handle when persistence is enabled, so a
-    // configured durable mirror receives the scaffold too; identical on-disk
-    // layout either way.
-    let store = match ctx.store() {
-        Some(store) => SnapshotStore::with_store(base.join(run_id), store),
-        None => SnapshotStore::new(base.join(run_id)),
-    };
-    store.save(&manifest, &blob_bytes, &call_log)
 }
 
 impl Engine {
@@ -687,43 +760,22 @@ impl Engine {
             );
             // Persist a durable journal scaffold before the run and at each
             // host-operation safepoint, so a pause/crash has a resumable
-            // artifact on disk (G2). Stores the engine's journal-shaped manifest.
-            if let Some(ref base) = self.persist_base {
-                let safepoint_base = base.clone();
-                let safepoint_run_id = run_id.clone();
-                let safepoint_path = path.to_path_buf();
-                let safepoint_source = source.clone();
-                let safepoint_policy = policy.clone();
-                let safepoint_ctx = ctx.clone();
-                ctx.set_host_operation_safepoint(HostOperationSafepoint::new(move |_operation| {
-                    persist_rust_journal_scaffold(
-                        &safepoint_base,
-                        &safepoint_run_id,
-                        &safepoint_path,
-                        &safepoint_source,
-                        &safepoint_policy,
-                        &safepoint_ctx,
-                    )
-                }));
-                let completion_base = base.clone();
-                let completion_run_id = run_id.clone();
-                let completion_path = path.to_path_buf();
-                let completion_source = source.clone();
-                let completion_policy = policy.clone();
-                let completion_ctx = ctx.clone();
-                ctx.set_host_operation_completion_safepoint(HostOperationCompletionSafepoint::new(
-                    move |_record| {
-                        persist_rust_journal_scaffold(
-                            &completion_base,
-                            &completion_run_id,
-                            &completion_path,
-                            &completion_source,
-                            &completion_policy,
-                            &completion_ctx,
-                        )
-                    },
-                ));
-                persist_rust_journal_scaffold(base, &run_id, path, &source, &policy, &ctx)?;
+            // artifact on disk (G2). Stores the engine's journal-shaped
+            // manifest. One persister per run: the module graph, entry
+            // fingerprint, and code-bundle blob are computed once and reused
+            // by every safepoint. The initial persist is `IfDirty`: a fresh
+            // run has nothing to checkpoint, and a resume must NOT rewrite
+            // `checkpoint.json` from its still-empty in-memory log — that
+            // would truncate the previous turn's journal while it is being
+            // replayed.
+            let persister = self.persist_base.as_ref().map(|base| {
+                Arc::new(ScaffoldPersister::new(
+                    base, &run_id, path, &source, &policy,
+                ))
+            });
+            if let Some(ref persister) = persister {
+                install_scaffold_safepoints_with(persister.clone(), &ctx);
+                persister.persist(&ctx, CheckpointWrite::IfDirty)?;
             }
 
             // Pause surfacing on the rust path (G1). A `chidori.input()` in
@@ -743,10 +795,8 @@ impl Engine {
                     tracing_error!(run_id = %ctx.run_id(), error = %err, "flushing run store at pause");
                 }
                 if let Some(pending) = ctx.take_pending_input() {
-                    if let Some(ref base) = self.persist_base {
-                        let _ = persist_rust_journal_scaffold(
-                            base, &run_id, path, &source, &policy, ctx,
-                        );
+                    if let Some(ref persister) = persister {
+                        let _ = persister.persist(ctx, CheckpointWrite::Compact);
                     }
                     emit_otel(ctx, None);
                     return Some(RunResult {
@@ -759,10 +809,8 @@ impl Engine {
                     });
                 }
                 if let Some(approval) = ctx.take_pending_approval() {
-                    if let Some(ref base) = self.persist_base {
-                        let _ = persist_rust_journal_scaffold(
-                            base, &run_id, path, &source, &policy, ctx,
-                        );
+                    if let Some(ref persister) = persister {
+                        let _ = persister.persist(ctx, CheckpointWrite::Compact);
                     }
                     emit_otel(ctx, None);
                     return Some(RunResult {
@@ -778,10 +826,8 @@ impl Engine {
                 // sets `pending_signal` and bails with `PAUSE_MARKER`, exactly
                 // like `input` — surface it as a paused run, not a failure.
                 if let Some(signal) = ctx.take_pending_signal() {
-                    if let Some(ref base) = self.persist_base {
-                        let _ = persist_rust_journal_scaffold(
-                            base, &run_id, path, &source, &policy, ctx,
-                        );
+                    if let Some(ref persister) = persister {
+                        let _ = persister.persist(ctx, CheckpointWrite::Compact);
                     }
                     emit_otel(ctx, None);
                     return Some(RunResult {
@@ -812,7 +858,7 @@ impl Engine {
                         return Ok(paused);
                     }
                     info!(agent = %agent_name, run_id = %run_id, "rust-engine agent run ok");
-                    if let Some(ref base) = self.persist_base {
+                    if let Some(ref persister) = persister {
                         if let Some(store) = ctx.store() {
                             let _ = store.put_blob(
                                 "output.json",
@@ -821,9 +867,7 @@ impl Engine {
                                     .as_bytes(),
                             );
                         }
-                        let _ = persist_rust_journal_scaffold(
-                            base, &run_id, path, &source, &policy, &ctx,
-                        );
+                        let _ = persister.persist(&ctx, CheckpointWrite::Compact);
                     }
                     // Output gate: the run's result is not surfaced until the
                     // journal is durable. A strict-mode persistence failure
@@ -846,10 +890,8 @@ impl Engine {
                     }
                     let err_msg = e.to_string();
                     tracing_error!(agent = %agent_name, run_id = %run_id, error = %err_msg, "rust-engine agent run failed");
-                    if let Some(ref base) = self.persist_base {
-                        let _ = persist_rust_journal_scaffold(
-                            base, &run_id, path, &source, &policy, &ctx,
-                        );
+                    if let Some(ref persister) = persister {
+                        let _ = persister.persist(&ctx, CheckpointWrite::Compact);
                     }
                     emit_otel(&ctx, Some(&err_msg));
                     Err(e)
@@ -2660,5 +2702,120 @@ def agent(value):
         assert_eq!(streamed, "reply two");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Pins the checkpoint-write cadence: steady-state safepoints must NOT
+    /// rewrite `checkpoint.json` (the O(1) `records.jsonl` append plus the
+    /// loader's union already carry the log), while replay-seeded logs
+    /// (checkpoint-dirty) and explicit compaction points must.
+    #[test]
+    fn scaffold_safepoints_skip_checkpoint_rewrite_until_dirty_or_compaction() {
+        use crate::runtime::store::RunStore as _;
+
+        let base =
+            std::env::temp_dir().join(format!("chidori-scaffold-cadence-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let agent_path = base.join("agent.ts");
+        std::fs::write(&agent_path, "export async function agent() { return 1; }").unwrap();
+        let source = std::fs::read_to_string(&agent_path).unwrap();
+
+        let record = |seq: u64, function: &str| CallRecord {
+            seq,
+            parent_seq: None,
+            function: function.to_string(),
+            args: serde_json::Value::Null,
+            result: serde_json::Value::Null,
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: chrono::Utc::now(),
+            error: None,
+        };
+
+        // Live run: records flow through `record_call`'s O(1) append.
+        let ctx = RuntimeContext::new();
+        let run_id = ctx.run_id();
+        let run_dir = ctx.enable_persistence(base.clone());
+        let policy = RuntimePolicy::durable_default(&run_id);
+        let persister = ScaffoldPersister::new(&base, &run_id, &agent_path, &source, &policy);
+
+        // Run-start persist: scaffold artifacts exist, no checkpoint yet.
+        persister.persist(&ctx, CheckpointWrite::IfDirty).unwrap();
+        assert!(run_dir
+            .join(crate::runtime::snapshot::SNAPSHOT_MANIFEST_FILE)
+            .is_file());
+        assert!(!run_dir.join("checkpoint.json").exists());
+
+        // A live record + its completion safepoint: still no checkpoint
+        // rewrite, but the journal loads complete via the union.
+        ctx.record_call(record(1, "prompt"));
+        persister.persist(&ctx, CheckpointWrite::IfDirty).unwrap();
+        assert!(
+            !run_dir.join("checkpoint.json").exists(),
+            "steady-state safepoint must not rewrite the checkpoint"
+        );
+        let loaded = crate::runtime::store::FsRunStore::new(&run_dir)
+            .load_call_log()
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].function, "prompt");
+
+        // A compaction point (pause/settle) writes the full checkpoint.
+        persister.persist(&ctx, CheckpointWrite::Compact).unwrap();
+        let checkpoint: Vec<CallRecord> =
+            serde_json::from_slice(&std::fs::read(run_dir.join("checkpoint.json")).unwrap())
+                .unwrap();
+        assert_eq!(checkpoint.len(), 1);
+
+        // Resume replay: replayed pushes bypass the append path, so the log
+        // is checkpoint-dirty and the first safepoint persists one full
+        // checkpoint covering the replayed prefix + synthetic record.
+        let resumed = RuntimeContext::with_replay(vec![record(1, "prompt"), record(2, "input")]);
+        resumed.enable_persistence_with_store(
+            run_dir.clone(),
+            Arc::new(crate::runtime::store::FsRunStore::new(&run_dir)),
+        );
+        assert!(resumed.try_replay(1).is_some());
+        assert!(resumed.try_replay(2).is_some());
+        assert!(resumed.call_log_checkpoint_dirty());
+        let resumed_persister =
+            ScaffoldPersister::new(&base, &run_id, &agent_path, &source, &policy);
+        resumed_persister
+            .persist(&resumed, CheckpointWrite::IfDirty)
+            .unwrap();
+        assert!(!resumed.call_log_checkpoint_dirty());
+        let checkpoint: Vec<CallRecord> =
+            serde_json::from_slice(&std::fs::read(run_dir.join("checkpoint.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            checkpoint.len(),
+            2,
+            "first safepoint past the replay frontier must persist replayed + synthetic records"
+        );
+
+        // Once clean, further live records go back to append-only cadence.
+        resumed.record_call(record(3, "tool"));
+        resumed_persister
+            .persist(&resumed, CheckpointWrite::IfDirty)
+            .unwrap();
+        let checkpoint: Vec<CallRecord> =
+            serde_json::from_slice(&std::fs::read(run_dir.join("checkpoint.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            checkpoint.len(),
+            2,
+            "clean safepoint must leave the checkpoint alone"
+        );
+        let loaded = crate::runtime::store::FsRunStore::new(&run_dir)
+            .load_call_log()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.len(),
+            3,
+            "the union must still see the appended tail"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

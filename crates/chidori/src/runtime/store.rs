@@ -55,8 +55,10 @@ pub trait RunStore: Send + Sync + std::fmt::Debug {
     fn append_record(&self, record: &CallRecord) -> Result<()>;
 
     /// Replace the whole journal with `records` (order-preserving). Called at
-    /// host-operation safepoints and merges; doubles as compaction of the
-    /// append-only artifact.
+    /// compaction points — run start after a resume replay, pause, settle,
+    /// branch merges, and any safepoint where the in-memory log holds records
+    /// the appends didn't cover (`RuntimeContext::call_log_checkpoint_dirty`).
+    /// Steady-state per-effect persistence is `append_record` alone.
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()>;
 
     /// Load the journal: the last full checkpoint unioned with any appended

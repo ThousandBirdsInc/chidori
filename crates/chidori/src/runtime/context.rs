@@ -109,6 +109,14 @@ struct RuntimeContextInner {
     pub config: AgentConfig,
     /// Accumulated call log for checkpointing / tracing.
     pub call_log: CallLog,
+    /// True when `call_log` holds records that never went through
+    /// `RunStore::append_record` — records pushed while replaying a resume
+    /// (`try_replay` / `absorb_replayed_subtree`), including the synthetic
+    /// resume record. The durable safepoints write the full `checkpoint.json`
+    /// only while this is set (or at explicit compaction points); live
+    /// records are already durable via the O(1) journal append in
+    /// `record_call`, so steady-state safepoints skip the O(history) rewrite.
+    pub call_log_dirty: bool,
     /// Sequence counter for call log entries.
     pub seq: u64,
     /// Pre-loaded call log for replay mode. When set, host functions
@@ -347,6 +355,7 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
                 call_log: CallLog::new(),
+                call_log_dirty: false,
                 seq: 0,
                 replay_log: None,
                 run_id: uuid::Uuid::new_v4().to_string(),
@@ -419,6 +428,7 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
                 call_log: CallLog::new(),
+                call_log_dirty: false,
                 seq: 0,
                 replay_log: Some(replay_log),
                 run_id: uuid::Uuid::new_v4().to_string(),
@@ -461,6 +471,9 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
                 call_log,
+                // Seeded records never went through this context's store
+                // handle; the first checkpoint write must include them.
+                call_log_dirty: true,
                 seq,
                 replay_log: None,
                 run_id,
@@ -513,6 +526,7 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: parent_inner.config.clone(),
                 call_log: CallLog::new(),
+                call_log_dirty: false,
                 seq: base_seq,
                 replay_log: None,
                 run_id,
@@ -566,6 +580,7 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
                 call_log: CallLog::new(),
+                call_log_dirty: false,
                 seq: base_seq,
                 replay_log: Some(replay_log),
                 run_id,
@@ -630,6 +645,7 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: parent_inner.config.clone(),
                 call_log: CallLog::new(),
+                call_log_dirty: false,
                 seq: base_seq,
                 replay_log: Some(replay_log),
                 run_id: actor_id.clone(),
@@ -704,16 +720,24 @@ impl RuntimeContext {
             inner.seq = inner.seq.max(record.seq);
             inner.call_log.push(record);
         }
+        // Merged branch records bypass `record_call`'s journal append, so the
+        // log is checkpoint-dirty until the full write below (or, when this
+        // context has no store, a later safepoint) covers them.
+        inner.call_log_dirty = true;
         if let Some(store) = inner.store.clone() {
             let result = store.write_call_log(inner.call_log.records());
+            if result.is_ok() {
+                inner.call_log_dirty = false;
+            }
             note_persist_result(&mut inner, result);
         }
     }
 
     /// Enable persistence with the default filesystem layout. Each
-    /// `record_call` appends the record to `<base_dir>/<run_id>/records.jsonl`
-    /// (safepoints rewrite the full `checkpoint.json`). Returns the run
-    /// directory path.
+    /// `record_call` appends the record to `<base_dir>/<run_id>/records.jsonl`;
+    /// the full `checkpoint.json` is rewritten only at compaction points (run
+    /// start, pause, settle) or when the log is checkpoint-dirty. Returns the
+    /// run directory path.
     pub fn enable_persistence(&self, base_dir: PathBuf) -> PathBuf {
         let run_dir = base_dir.join(self.run_id());
         let _ = std::fs::create_dir_all(&run_dir);
@@ -825,8 +849,14 @@ impl RuntimeContext {
                 if record.parent_seq.is_none() {
                     record.parent_seq = inner.call_stack.last().copied();
                 }
-                // Record the replayed call in the new call log.
+                // Record the replayed call in the new call log. Replay
+                // bypasses `record_call`'s journal append (the record is
+                // already durable from the turn that ran it live), so mark
+                // the log checkpoint-dirty: the first safepoint past the
+                // replay frontier writes one full checkpoint covering the
+                // replayed prefix plus any synthetic resume records.
                 inner.call_log.push(record.clone());
+                inner.call_log_dirty = true;
                 return Some(record);
             }
         }
@@ -901,7 +931,10 @@ impl RuntimeContext {
             if r.seq != root_seq && subtree.contains(&r.seq) {
                 // Keep the nested record in the replayed trace and advance the
                 // counter past it so the next outer call can't reuse its seq.
+                // Same checkpoint-dirty contract as `try_replay`: these pushes
+                // bypass the journal append.
                 inner.call_log.push(r.clone());
+                inner.call_log_dirty = true;
                 max_seq = max_seq.max(r.seq);
             }
         }
@@ -1171,6 +1204,31 @@ impl RuntimeContext {
 
     pub fn call_log(&self) -> CallLog {
         self.inner.lock().unwrap().call_log.clone()
+    }
+
+    /// Number of records in the accumulated call log, without cloning it.
+    pub fn call_log_len(&self) -> usize {
+        self.inner.lock().unwrap().call_log.records().len()
+    }
+
+    /// Whether the call log holds records the O(1) journal appends did not
+    /// cover (replayed/synthetic records pushed during resume). While set,
+    /// the durable safepoints must write the full checkpoint; once cleared,
+    /// they can skip the O(history) rewrite because `record_call` keeps the
+    /// append-only journal complete on its own.
+    pub fn call_log_checkpoint_dirty(&self) -> bool {
+        self.inner.lock().unwrap().call_log_dirty
+    }
+
+    /// Clear the checkpoint-dirty flag after a successful full-checkpoint
+    /// write of a log snapshot taken at `persisted_len` records. Guarded by
+    /// length so records pushed between the snapshot and this call keep the
+    /// log dirty.
+    pub(crate) fn clear_call_log_checkpoint_dirty(&self, persisted_len: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.call_log.records().len() == persisted_len {
+            inner.call_log_dirty = false;
+        }
     }
 
     pub fn set_input_mode(&self, mode: InputMode) {

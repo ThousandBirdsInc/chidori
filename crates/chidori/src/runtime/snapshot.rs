@@ -977,32 +977,57 @@ impl SnapshotStore {
         manifest: &SnapshotManifest,
         call_log: &[CallRecord],
     ) -> Result<()> {
+        self.put_manifest(manifest)?;
+        self.write_call_log(call_log)?;
+        self.put_pending(manifest.pending.as_ref())
+    }
+
+    /// Write just the snapshot blob under the manifest's blob file name.
+    /// The blob is run-invariant (the durable code bundle), so per-safepoint
+    /// persisters write it once per run instead of on every safepoint.
+    pub fn put_snapshot_blob(&self, manifest: &SnapshotManifest, blob: &[u8]) -> Result<()> {
+        self.store
+            .put_blob(&manifest.snapshot_file, blob)
+            .with_context(|| format!("writing snapshot blob {}", manifest.snapshot_file))
+    }
+
+    /// Write just the manifest artifact.
+    pub fn put_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
         self.store
             .put_blob(
                 SNAPSHOT_MANIFEST_FILE,
                 &serde_json::to_vec_pretty(manifest)?,
             )
-            .with_context(|| format!("writing {SNAPSHOT_MANIFEST_FILE}"))?;
+            .with_context(|| format!("writing {SNAPSHOT_MANIFEST_FILE}"))
+    }
 
+    /// Write the full-log checkpoint artifact (compacting the append-only
+    /// journal to match). O(history) — callers on per-effect paths should
+    /// reach for this only when the in-memory log holds records the O(1)
+    /// journal appends did not cover (see `RuntimeContext::record_call` /
+    /// `try_replay`), or at explicit compaction points (run start, pause,
+    /// settle).
+    pub fn write_call_log(&self, call_log: &[CallRecord]) -> Result<()> {
         self.store
             .write_call_log(call_log)
-            .context("writing checkpoint")?;
+            .context("writing checkpoint")
+    }
 
-        match &manifest.pending {
+    /// Write (or, when `None`, remove) the pending-host-operation artifact.
+    pub fn put_pending(&self, pending: Option<&PendingHostOperation>) -> Result<()> {
+        match pending {
             Some(pending) => self
                 .store
                 .put_blob(
                     PENDING_HOST_OPERATION_FILE,
                     &serde_json::to_vec_pretty(pending)?,
                 )
-                .with_context(|| format!("writing {PENDING_HOST_OPERATION_FILE}"))?,
+                .with_context(|| format!("writing {PENDING_HOST_OPERATION_FILE}")),
             None => self
                 .store
                 .delete_blob(PENDING_HOST_OPERATION_FILE)
-                .with_context(|| format!("removing {PENDING_HOST_OPERATION_FILE}"))?,
+                .with_context(|| format!("removing {PENDING_HOST_OPERATION_FILE}")),
         }
-
-        Ok(())
     }
 
     pub fn load(&self) -> Result<RuntimeSnapshot> {

@@ -39,14 +39,19 @@ Two artifacts per run:
 * **`records.jsonl`** — append-only, one JSON `CallRecord` per line. Every
   `record_call` appends O(1) bytes (previously each record rewrote the whole
   `checkpoint.json`, O(history) per call).
-* **`checkpoint.json`** — the full-log artifact, rewritten at host-operation
-  safepoints (and branch merges). Doubles as the compaction of the
-  append-only file: every safepoint rewrite truncates `records.jsonl` to
-  match, so neither file grows past one run's history.
+* **`checkpoint.json`** — the full-log artifact, rewritten at **compaction
+  points**: pause, settle, branch merges, and the first safepoint after a
+  resume replay (whose replayed + synthetic records bypass the append path —
+  the context tracks this as the checkpoint-dirty flag). Steady-state
+  per-effect safepoints persist only the manifest + pending artifacts: the
+  O(1) append already made the record durable, so rewriting the whole
+  checkpoint per host call would cost O(history²) bytes per run for nothing.
+  Each rewrite doubles as compaction of the append-only file: it truncates
+  `records.jsonl` to match, so neither file grows past one run's history.
 
 Loading unions the two: the last checkpoint wins per-seq, and any tail
-records a crash stranded after the last safepoint are recovered from
-`records.jsonl`.
+records appended after the last compaction — the steady-state case, not just
+crash recovery — are recovered from `records.jsonl`.
 
 ## Backends
 
