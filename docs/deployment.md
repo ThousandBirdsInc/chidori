@@ -10,7 +10,8 @@ mirrored somewhere that survives the machine
 
 This document covers taking that from a laptop to production: the recommended
 zero-dependency single-machine setup, hardening the HTTP server, choosing a
-durability tier, and the current scaling limits.
+durability tier, running on easy-to-provision hosts (Fly.io, Railway, Render),
+what high availability looks like today, and the current scaling limits.
 
 ## What a deployment consists of
 
@@ -196,21 +197,141 @@ Mount a volume at `/app/.chidori` (or skip the volume and configure an
 `s3://` mirror — hydration makes the container disposable). Everything in the
 systemd section applies unchanged; the env file becomes container env.
 
+## Easy-to-provision hosts: Fly.io, Railway, Render
+
+If you'd rather not manage a VM, any platform that runs a container as a
+**long-lived process** hosts Chidori well. The recipe is the same everywhere:
+the Dockerfile above, an `s3://` run-store mirror so the machine is
+disposable, TLS and a public hostname from the platform, and secrets via the
+platform's secret store. Two platform behaviors to check before choosing:
+
+- **No scale-to-zero.** Detached-agent alarms fire from a timer in the
+  running server ([detached agents](./detached-agents.md)); paused runs and
+  signal deliveries also need a process to arrive at. A platform that stops
+  idle machines silently stalls them until the next request. Pin at least one
+  instance always-on.
+- **One instance per agent.** Runs have a single writer
+  ([see below](#higher-availability)); set the platform's instance count to 1
+  rather than letting it autoscale replicas behind one hostname.
+
+### Fly.io walkthrough
+
+Fly runs your container as a Machine (a real VM), terminates TLS for you, and
+replaces failed machines automatically — a good match for a stateful
+single-process server.
+
+```toml
+# fly.toml
+app = "my-agent"
+primary_region = "iad"
+
+[env]
+  CHIDORI_DURABILITY = "strict"
+  CHIDORI_RUN_STORE = "s3://my-agent-runs"      # any S3-compatible bucket;
+                                                # Fly's Tigris storage speaks
+                                                # the S3 API too
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"      # keep alarms/signals live (see above)
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/health"
+    interval = "15s"
+    timeout = "2s"
+```
+
+```bash
+fly launch --no-deploy                # detects the Dockerfile
+fly secrets set ANTHROPIC_API_KEY=... CHIDORI_API_KEY=... \
+  AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+fly deploy
+fly scale count 1                     # one writer; don't add replicas
+```
+
+With the `s3://` mirror there is no volume to manage: if Fly replaces the
+machine (hardware failure, `fly deploy`), the fresh one hydrates any run it's
+asked about from the bucket, and the detached-agent fleet re-arms from the
+mirrored registry at boot. A Fly volume mounted at `/app/.chidori` also works,
+but pins the machine to one host — the mirror is the more available choice.
+
+**Railway** and **Render** are the same shape with different spelling: both
+build the Dockerfile from your repo, give you a TLS hostname, restart crashed
+services, and hold secrets. On Railway keep the service on a plan/setting
+without app sleeping; on Render use a Web Service (not a free-tier instance,
+which spins down when idle) and set the health check path to `/health`. On
+both, either attach their persistent disk at `/app/.chidori` or — better —
+skip the disk and use the `s3://` mirror.
+
+### Where Vercel (and serverless functions) fit
+
+Vercel, Netlify, and Lambda-style platforms run request-scoped functions, not
+long-lived processes with disks — they can't host the `chidori` binary itself
+(nowhere for the server to keep listening, hibernating agents to wake, or
+alarms to fire). Use them for what they're good at, next to a Chidori host:
+
+- **Frontend/API on Vercel, runtime elsewhere.** Your Vercel app drives a
+  Chidori server on Fly/Railway/a VM over HTTP with the
+  [TypeScript SDK](../sdk/typescript/README.md) (or plain `fetch` against the
+  [session API](./running-modes.md#2-http-server-event-driven--session-api)).
+  Set `CHIDORI_CORS_ORIGINS` if the browser calls Chidori directly.
+- **The one serverless piece that does exist** is on the storage side: the
+  [Cloudflare Durable Object run store](../integrations/cloudflare-durable-objects/)
+  is a Worker you deploy with `wrangler deploy`, and it only ever runs when a
+  journal write or hydration read arrives.
+
+## Higher availability
+
+Be precise about the constraint first: **a run has one writer at a time.**
+Leases arbitrate ownership, but nothing routes requests to a run's owner
+([durable storage](./durable-storage.md)), so "two identical servers behind a
+load balancer" is not the HA model today. What you can have — and what
+matters for agent workloads — is **no lost work and fast, automatic
+replacement**:
+
+1. **RPO ≈ 0: strict durability + a remote mirror.** With
+   `CHIDORI_DURABILITY=strict` and an `s3://` or Durable Object mirror, every
+   acknowledged side effect has a durable recording. Whatever dies, no
+   completed work is lost — recovery replays the journal.
+2. **RTO = a restart: auto-replacement + hydration.** Fly/Railway/Render
+   replace a dead machine (or systemd restarts the process) with no state to
+   restore: the new instance hydrates runs from the mirror on demand and
+   re-arms the detached-agent fleet from the mirrored registry at boot.
+   In-flight runs resume at their last safepoint by replay; paused runs stay
+   paused and answerable.
+3. **A lingering old instance stands down.** If the platform briefly runs old
+   and new instances side by side during replacement, run leases keep them
+   from double-driving. Note the backend difference: the SQLite backend and
+   the Durable Object relay **enforce** the single writer; `fs` and `s3://`
+   leases are advisory (last-writer-wins) — so on platforms that overlap
+   instances during deploys, prefer the Durable Object relay, or configure
+   the deploy strategy to stop the old machine before starting the new one.
+4. **Warm standby (active–passive).** For faster manual failover, keep a
+   second instance configured identically against the same mirror but
+   stopped; promoting it is starting it. Don't run it hot against the same
+   store — that's the double-driver shape leases exist to police, not a
+   supported active–active mode.
+5. **Horizontal capacity by sharding, not replicating.** To scale beyond one
+   machine, run one server per agent (or per tenant), each with its own state
+   directory and mirror prefix, and route by hostname or path at your proxy.
+   Each shard gets the HA recipe above independently.
+
+The strongest write story is the
+[Durable Object relay](../integrations/cloudflare-durable-objects/): every
+acknowledged write is replicated across data centers before Chidori proceeds,
+you get 30-day point-in-time recovery, and the platform guarantees one live
+object per run — so failover can't fork a run's history even in the overlap
+window. Multi-node request routing (true active–active) is future work;
+see the non-goals in [durable storage](./durable-storage.md).
+
 ## Scaling and topology limits
 
-Be deliberate about what the current storage layer does **not** do
-(documented in [durable storage](./durable-storage.md)):
-
-- **One process drives a run at a time.** Leases (`lease.json`, TTL-based)
-  arbitrate ownership so two servers sharing a mirror won't double-execute a
-  run — but nothing *routes* a request to the run's owner. Don't put a
-  round-robin load balancer in front of two servers sharing a store and expect
-  session affinity; today the supported shapes are one server, or several
-  servers each owning disjoint agents.
 - **Scale up before out.** The server is a single Rust process with an
   embedded JS engine per run; raising `CHIDORI_MAX_CONCURRENT_SESSIONS` on a
-  bigger machine is the intended growth path. For fleets, shard by agent:
-  one `chidori serve` per agent file, each with its own state directory.
+  bigger machine is the intended growth path. Going wider means sharding by
+  agent as described [above](#higher-availability) — not replicas behind one
+  load balancer.
 - **Replay cost is O(run history).** Resuming a very long run replays its
   journal (fast, zero LLM calls — see
   [resume performance](./resume-performance.md) for numbers and direction).
@@ -233,3 +354,4 @@ keep the previous binary around until the new one has driven your runs.
 - [ ] `CHIDORI_DURABILITY=strict`
 - [ ] `.chidori/` backed up, or a mirror + hydration drill done
 - [ ] `Restart=always` (or the container equivalent) so resume-by-replay can do its job
+- [ ] On managed hosts: instance count pinned to 1 per agent, scale-to-zero/app-sleep disabled
