@@ -1,6 +1,6 @@
 //! Process-level heap accounting for the sandbox memory ceiling.
 //!
-//! [`CountingAllocator`] wraps the backing allocator (mimalloc) and maintains a running
+//! [`CountingAllocator`] wraps the backing allocator and maintains a running
 //! count of live (allocated-minus-freed) bytes. The binary installs it as the
 //! `#[global_allocator]` (see `main.rs`); the rust-engine watchdog
 //! (`runtime::rust_engine`) samples a per-run meter on a background thread and
@@ -33,15 +33,15 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use mimalloc::MiMalloc;
-
-/// The allocator that actually services requests. mimalloc rather than
-/// [`std::alloc::System`]: callgrind profiles of the JS interpreter put glibc
-/// malloc at 20%+ of executed instructions on allocation-heavy workloads, and
-/// mimalloc roughly halves the allocator's share of that small-object churn.
-/// The counting wrapper below is allocator-agnostic — swap this constant to
-/// change the backing allocator.
-const INNER: MiMalloc = MiMalloc;
+/// The allocator that actually services requests. The counting wrapper below
+/// is allocator-agnostic — swap this constant to change the backing allocator.
+/// A mimalloc swap was measured (2026-07) and rejected: callgrind showed it
+/// cutting total instructions 10-13% on allocation-heavy JS workloads, but
+/// interleaved wall-clock ran ~9% *slower* geomean across the benchmark
+/// suite — glibc's tcache handles the interpreter's LIFO same-size churn
+/// better than the instruction counts suggest. See
+/// crates/chidori-js/benchmarks/README.md ("Build variants").
+const INNER: std::alloc::System = std::alloc::System;
 
 /// Live bytes currently allocated through [`CountingAllocator`]. Relaxed
 /// ordering is sufficient: this is a monotonically-maintained statistic, not a
@@ -115,7 +115,7 @@ pub fn run_meter_bytes(meter: &AtomicIsize) -> usize {
     meter.load(Ordering::Relaxed).max(0) as usize
 }
 
-/// A `#[global_allocator]`-compatible wrapper over [`INNER`] (mimalloc) that tracks live
+/// A `#[global_allocator]`-compatible wrapper over [`INNER`] that tracks live
 /// byte usage. Per-call overhead is a relaxed atomic add/sub plus a
 /// thread-local check for the per-run meter — the same pattern used by crates
 /// like `cap`/`stats_alloc`.

@@ -32,8 +32,9 @@ WORKLOADS="$REPO_ROOT/crates/chidori-js/benchmarks/workloads"
 PGO_DIR="$REPO_ROOT/target/pgo-data"
 TARGET_DIR="$REPO_ROOT/target/pgo"
 # Extra cargo args (e.g. --features mimalloc) can be passed via PGO_CARGO_ARGS.
-# The benchmark harness builds with mimalloc, so default to matching it.
-CARGO_ARGS=(${PGO_CARGO_ARGS---features mimalloc})
+# Default: none — PGO over the stock (glibc-malloc) build measured fastest
+# (-15.5% geomean vs release; PGO+mimalloc only reached -10.2%).
+CARGO_ARGS=(${PGO_CARGO_ARGS-})
 
 SYSROOT="$(rustc --print sysroot)"
 LLVM_PROFDATA="$(find "$SYSROOT" -name llvm-profdata | head -1)"

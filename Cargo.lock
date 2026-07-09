@@ -550,7 +550,6 @@ dependencies = [
  "hmac",
  "landlock",
  "libc",
- "mimalloc",
  "minijinja",
  "nodejs-semver",
  "opentelemetry",

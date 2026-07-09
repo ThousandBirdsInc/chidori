@@ -1,9 +1,8 @@
 use chidori_js::Engine;
 
-// glibc malloc is 20%+ of executed instructions on allocation-heavy workloads
-// (json_roundtrip, string_build); mimalloc halves the allocator's share. Kept
-// behind a feature so the default build stays free of C code — the benchmark
-// harness (benchmarks/run.mjs) builds with `--features mimalloc`.
+// Allocator experiment knob, off by default — measured net-negative on this
+// suite (fewer instructions on alloc-heavy workloads, but ~9% slower
+// wall-clock geomean; see the `mimalloc` feature comment in Cargo.toml).
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

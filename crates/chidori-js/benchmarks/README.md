@@ -79,29 +79,34 @@ Pass `--json PATH` to also dump every sample (min/median/mean/max per runtime)
 for offline analysis, or `--markdown PATH` to write the same two tables as a
 Markdown report.
 
-## Build variants: allocator, PGO, profiling
+## Build variants: PGO, allocator, target-cpu, profiling
 
-The harness builds the chidori binary with `--features mimalloc`, swapping the
-global allocator of the benchmark binary (only — the library build is
-dependency-identical, and the feature is off by default to keep the crate free
-of C code). Callgrind put glibc malloc at 20%+ of executed instructions on
-json_roundtrip and string_build; mimalloc roughly halves the allocator's share.
+The release profile already carries fat LTO + a single codegen unit. Knobs
+beyond that, with measurements from a 4-core container (2026-07; interleaved
+medians, 12 runs per workload per binary):
 
-Two more knobs stack on top of the release profile's fat LTO + single codegen
-unit:
-
-- **PGO** — [`scripts/pgo-build.sh`](../../../scripts/pgo-build.sh) does the
+- **PGO — adopted as the recommended benchmark/release build.**
+  [`scripts/pgo-build.sh`](../../../scripts/pgo-build.sh) does the
   instrument → run-this-corpus → rebuild-with-feedback cycle (needs
-  `rustup component add llvm-tools`). Interpreter dispatch is the textbook PGO
-  beneficiary (indirect branches, dense op bodies); measure the result with
-  this harness via
+  `rustup component add llvm-tools`). Interpreter dispatch is the textbook
+  PGO beneficiary (indirect branches, dense op bodies): **-15.5% wall-clock
+  geomean** across this suite vs the plain release build, up to -36%
+  (array_hof) and -24% (sort), no workload regressed. Measure it with
   `node crates/chidori-js/benchmarks/run.mjs --no-build --chidori-bin target/pgo/release/examples/run`.
   Instruction counts barely move under PGO — the win is branch prediction and
   icache layout, so judge it by wall-clock, never callgrind.
-- **`-C target-cpu`** — node and bun JIT to host-native code while the AOT
-  build targets baseline x86-64, so for engine-vs-engine comparisons on one
-  machine, `RUSTFLAGS="-C target-cpu=native"` is the fairer build. Not the
-  default because the binary stops being portable.
+- **mimalloc (`--features mimalloc` on the `run` example) — measured, and
+  rejected as a default.** Callgrind showed glibc malloc at ~23% of executed
+  instructions on json_roundtrip/string_build, and mimalloc did cut total
+  instructions 12.7%/10.2% there — but wall-clock across the suite ran ~9%
+  *slower* geomean (glibc tcache handles the interpreter's LIFO same-size
+  churn well; the instruction-count proxy misses cache/IPC effects). The
+  feature stays as a one-flag experiment for other hardware. A lesson worth
+  keeping: allocator changes must be judged by interleaved wall-clock, not Ir.
+- **`-C target-cpu=native`** — roughly neutral here (+0.4% geomean, mixed
+  per-workload): the interpreter is branchy, not vector-heavy. Worth trying
+  on newer hardware for engine-vs-engine fairness (node/bun JIT to
+  host-native code), but not a default — the binary stops being portable.
 
 For profiler runs (perf/samply/callgrind), build with
 `cargo build --profile profiling ...` — release codegen plus line-table debug

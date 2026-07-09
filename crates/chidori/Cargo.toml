@@ -72,15 +72,6 @@ rand = "0.8"
 
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
 chidori-js = { path = "../chidori-js", version = "0.3.2" }
-
-# Inner allocator behind mem_guard's CountingAllocator (the binary's
-# #[global_allocator]). glibc malloc showed up as 20%+ of executed
-# instructions on allocation-heavy JS workloads; mimalloc halves the
-# allocator's share of the interpreter's small-object churn. The binary
-# already links C (bundled SQLite below), so this adds no new build
-# requirements. Determinism is unaffected: replay identity never depends on
-# heap addresses (see chidori-js's determinism contract / indexmap comment).
-mimalloc = { version = "0.1", default-features = false }
 async-trait = "0.1"
 derive_more = { version = "1", features = ["display"] }
 

@@ -53,8 +53,8 @@ jobs:
       - name: Install GNU time (exact peak-RSS measurement)
         run: sudo apt-get install -y time || true
 
-      - name: Build chidori-js run example (release, mimalloc allocator)
-        run: cargo build --release -p chidori-js --features mimalloc --example run
+      - name: Build chidori-js run example (release)
+        run: cargo build --release -p chidori-js --example run
 
       # In-process heap numbers (tracking allocator: realm footprint, per-run
       # peak/churn/retained, leak check). Deterministic byte counts, so unlike
