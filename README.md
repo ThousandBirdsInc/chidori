@@ -345,6 +345,7 @@ deterministic, replayable, and testable for free.
 | [Actors & supervision](./docs/actors.md) | Spawned agent processes, message passing, supervision trees, restart strategies |
 | [Detached agents](./docs/detached-agents.md) | Durable, addressable, hibernating agent processes; `chidori.alarm`; the `/agents/detached` HTTP surface |
 | [Durable storage](./docs/durable-storage.md) | The run store: append-only journal, SQLite / Durable Object mirrors, hydration, strict durability, leases, `--until-seq` |
+| [Deployment](./docs/deployment.md) | Running in production: config, durability tiers, recipes for a plain VM / Fly.io / Kubernetes, failure & recovery |
 | [Python SDK](./sdk/python/README.md) · [TypeScript SDK](./sdk/typescript/README.md) | HTTP clients with no native bindings |
 | [`llm.txt`](./llm.txt) | Complete API reference, optimized for LLMs generating agents |
 
