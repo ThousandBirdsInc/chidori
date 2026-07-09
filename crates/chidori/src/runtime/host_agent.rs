@@ -187,6 +187,12 @@ impl DetachedAgentHub {
         *self.parts.lock().unwrap() = Some(parts);
     }
 
+    /// The parts installed at boot — how code without a spawning backend
+    /// (the server's HTTP handlers) addresses the hub.
+    pub fn installed_parts(&self) -> Result<AgentRuntimeParts, String> {
+        self.parts()
+    }
+
     fn parts(&self) -> Result<AgentRuntimeParts, String> {
         self.parts
             .lock()
@@ -197,11 +203,15 @@ impl DetachedAgentHub {
 
     /// The entry for `name`, re-materialized from the durable registry when
     /// this process has never seen it (the post-restart / replayed-spawn path).
-    fn ensure_entry(&self, name: &str) -> Result<Arc<AgentEntry>, String> {
+    fn ensure_entry(
+        &self,
+        parts: &AgentRuntimeParts,
+        name: &str,
+    ) -> Result<Arc<AgentEntry>, String> {
         if let Some(entry) = self.entries.lock().unwrap().get(name).cloned() {
             return Ok(entry);
         }
-        let parts = self.parts()?;
+        let parts = parts.clone();
         let factory = RunStoreFactory::shared(&parts.run_base);
         let registered = factory
             .registry_get(name)
@@ -232,12 +242,13 @@ impl DetachedAgentHub {
     /// start its supervision thread. Returns `{ name, runId }`.
     pub fn spawn(
         &self,
+        parts: &AgentRuntimeParts,
         source: &str,
         input: Value,
         options: &SpawnOptions,
         owner_run_id: String,
     ) -> Result<Value, String> {
-        let parts = self.parts()?;
+        let parts = parts.clone();
         let factory = RunStoreFactory::shared(&parts.run_base);
         let name = options
             .name
@@ -327,8 +338,15 @@ impl DetachedAgentHub {
     /// Deliver a named message to an agent's durable mailbox. Live agents get
     /// it in-memory too (write-through, like the server's live signal path);
     /// a hibernating agent whose listen set matches is woken.
-    pub fn send(&self, to: &str, name: &str, payload: Value, from: Value) -> Result<Value, String> {
-        let entry = self.ensure_entry(to)?;
+    pub fn send(
+        &self,
+        parts: &AgentRuntimeParts,
+        to: &str,
+        name: &str,
+        payload: Value,
+        from: Value,
+    ) -> Result<Value, String> {
+        let entry = self.ensure_entry(parts, to)?;
         let factory = entry.factory();
         let mut wake = false;
         {
@@ -390,8 +408,13 @@ impl DetachedAgentHub {
     /// With a timeout, returns the current status snapshot on expiry. A
     /// hibernating agent does not settle — services hibernate indefinitely by
     /// design — so join a service only with a timeout.
-    pub fn join(&self, to: &str, timeout_ms: Option<u64>) -> Result<Value, String> {
-        let entry = self.ensure_entry(to)?;
+    pub fn join(
+        &self,
+        parts: &AgentRuntimeParts,
+        to: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, String> {
+        let entry = self.ensure_entry(parts, to)?;
         let deadline = timeout_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
         let mut state = entry.state.lock().unwrap();
         loop {
@@ -439,14 +462,14 @@ impl DetachedAgentHub {
         }
     }
 
-    pub fn status(&self, to: &str) -> Result<Value, String> {
-        let entry = self.ensure_entry(to)?;
+    pub fn status(&self, parts: &AgentRuntimeParts, to: &str) -> Result<Value, String> {
+        let entry = self.ensure_entry(parts, to)?;
         let state = entry.state.lock().unwrap();
         Ok(state.descriptor.status_json())
     }
 
-    pub fn lookup(&self, name: &str) -> Result<Value, String> {
-        match self.ensure_entry(name) {
+    pub fn lookup(&self, parts: &AgentRuntimeParts, name: &str) -> Result<Value, String> {
+        match self.ensure_entry(parts, name) {
             Ok(entry) => {
                 let state = entry.state.lock().unwrap();
                 Ok(json!({
@@ -461,8 +484,8 @@ impl DetachedAgentHub {
 
     /// Cooperative stop: a live iteration finishes its current host call and
     /// stops at the next boundary; a hibernating agent settles immediately.
-    pub fn stop(&self, to: &str) -> Result<Value, String> {
-        let entry = self.ensure_entry(to)?;
+    pub fn stop(&self, parts: &AgentRuntimeParts, to: &str) -> Result<Value, String> {
+        let entry = self.ensure_entry(parts, to)?;
         let mut state = entry.state.lock().unwrap();
         state.stop_requested = true;
         if !state.thread_live && !AgentEntry::is_settled(&state) {
@@ -477,12 +500,11 @@ impl DetachedAgentHub {
         }
         entry.signal.notify_all();
         drop(state);
-        self.join(to, Some(60_000))
+        self.join(parts, to, Some(60_000))
     }
 
     /// Registry snapshot for the server's `/agents` listing.
-    pub fn list(&self) -> Result<Vec<Value>, String> {
-        let parts = self.parts()?;
+    pub fn list(&self, parts: &AgentRuntimeParts) -> Result<Vec<Value>, String> {
         RunStoreFactory::shared(&parts.run_base)
             .registry_list()
             .map_err(|err| format!("listing agents: {err}"))
@@ -494,6 +516,7 @@ impl DetachedAgentHub {
     /// agents were re-armed.
     pub fn rearm_from_registry(&self, parts: AgentRuntimeParts) -> Result<usize, String> {
         let factory = RunStoreFactory::shared(&parts.run_base);
+        let parts_for_entries = parts.clone();
         self.install_parts(parts);
         let entries = factory
             .registry_list()
@@ -510,7 +533,7 @@ impl DetachedAgentHub {
                 // Died mid-run: resume-by-replay continues at the frontier.
                 "running" => {
                     let _ = factory.hydrate(&descriptor.run_id);
-                    let entry = self.ensure_entry(&name)?;
+                    let entry = self.ensure_entry(&parts_for_entries, &name)?;
                     self.start_thread(entry)?;
                     rearmed += 1;
                 }
@@ -518,7 +541,7 @@ impl DetachedAgentHub {
                 // thread) alarm deadlines wake it.
                 "hibernating" => {
                     let _ = factory.hydrate(&descriptor.run_id);
-                    let entry = self.ensure_entry(&name)?;
+                    let entry = self.ensure_entry(&parts_for_entries, &name)?;
                     let has_deadline = {
                         let state = entry.state.lock().unwrap();
                         state
@@ -659,7 +682,49 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
     let parts = entry.parts.clone();
     let factory = entry.factory();
 
+    // Single-writer ownership: take the agent run's lease before executing.
+    // Two processes sharing a durable mirror (or a filesystem) cannot both
+    // drive the same agent — the loser backs off and leaves the run to the
+    // live holder; an expired lease (a dead node) transfers on the next wake.
+    let lease_owner = process_lease_owner();
+    let lease_ttl = chrono::Duration::minutes(5);
+    {
+        let run_id = entry.state.lock().unwrap().descriptor.run_id.clone();
+        let store = factory.store_for(&run_id);
+        match crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl) {
+            Ok(Ok(_)) => {}
+            Ok(Err(holder)) => {
+                tracing::info!(
+                    agent = %entry.name,
+                    holder = %holder.owner,
+                    "detached agent is leased to another process; standing down"
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(agent = %entry.name, error = %err, "acquiring agent lease");
+            }
+        }
+    }
+
     loop {
+        // Renew the lease each iteration so a long-running agent keeps its
+        // ownership fresh; renewal failure is logged, not fatal (the lease
+        // protects against concurrent drivers, not against running at all).
+        {
+            let run_id = entry.state.lock().unwrap().descriptor.run_id.clone();
+            let store = factory.store_for(&run_id);
+            if let Ok(Err(holder)) =
+                crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl)
+            {
+                tracing::warn!(
+                    agent = %entry.name,
+                    holder = %holder.owner,
+                    "lost the agent lease mid-run; standing down"
+                );
+                return;
+            }
+        }
         let (descriptor, stop_requested) = {
             let state = entry.state.lock().unwrap();
             (state.descriptor.clone(), state.stop_requested)
@@ -933,6 +998,21 @@ fn persist_descriptor(factory: &RunStoreFactory, descriptor: &AgentDescriptor) {
     }
 }
 
+/// The process-stable lease owner id: one per OS process, so every agent this
+/// process drives is leased under the same identity.
+fn process_lease_owner() -> &'static str {
+    static OWNER: OnceLock<String> = OnceLock::new();
+    OWNER.get_or_init(|| format!("chidori-{}", uuid::Uuid::new_v4()))
+}
+
+/// Release the agent run's lease — called when the agent stops executing here
+/// (hibernate or settle), so any process may drive the next wake.
+fn release_agent_lease(entry: &Arc<AgentEntry>) {
+    let run_id = entry.state.lock().unwrap().descriptor.run_id.clone();
+    let store = entry.factory().store_for(&run_id);
+    let _ = crate::runtime::store::release_lease(store.as_ref(), process_lease_owner());
+}
+
 fn hibernate(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>, listen: ListenState) {
     let has_deadline = listen.deadline.is_some();
     let descriptor = {
@@ -943,6 +1023,7 @@ fn hibernate(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>, listen: ListenStat
         state.descriptor.clone()
     };
     persist_descriptor(&entry.factory(), &descriptor);
+    release_agent_lease(entry);
     if has_deadline {
         hub.ensure_timer();
     }
@@ -966,6 +1047,7 @@ fn settle(
         state.descriptor.clone()
     };
     persist_descriptor(&entry.factory(), &descriptor);
+    release_agent_lease(entry);
     entry.signal.notify_all();
 }
 
@@ -1028,7 +1110,10 @@ fn runtime_ctx<'a>(
 /// Install the hub's runtime parts from a spawning backend, deriving
 /// `run_base` from the run's persist dir. Errors when persistence is off —
 /// a detached agent without a journal cannot exist.
-fn install_parts_from(backend: &HostBindingBackend, ctx: &RuntimeContext) -> Result<(), String> {
+fn install_parts_from(
+    backend: &HostBindingBackend,
+    ctx: &RuntimeContext,
+) -> Result<AgentRuntimeParts, String> {
     let (providers, template_engine, tokio_rt, policy, tools, mcp) = backend
         .runtime_parts()
         .ok_or("chidori.agents requires the runtime host backend")?;
@@ -1039,7 +1124,7 @@ fn install_parts_from(backend: &HostBindingBackend, ctx: &RuntimeContext) -> Res
             "chidori.agents requires persistence: detached agents are durable runs \
              (run with a project dir so `.chidori/runs/` exists)",
         )?;
-    hub().install_parts(AgentRuntimeParts {
+    let parts = AgentRuntimeParts {
         providers,
         template_engine,
         tokio_rt,
@@ -1047,8 +1132,9 @@ fn install_parts_from(backend: &HostBindingBackend, ctx: &RuntimeContext) -> Res
         tools,
         mcp,
         run_base,
-    });
-    Ok(())
+    };
+    hub().install_parts(parts.clone());
+    Ok(parts)
 }
 
 /// `chidori.agents.spawn(source, input, options)` — start a detached agent
@@ -1063,7 +1149,7 @@ pub(crate) fn spawn_agent(backend: &HostBindingBackend, a: &Value) -> Result<Val
             "chidori.agents.spawn is not supported inside a chidori.branch sub-run".to_string(),
         );
     }
-    install_parts_from(backend, ctx)?;
+    let parts = install_parts_from(backend, ctx)?;
     let source = a
         .get("source")
         .and_then(Value::as_str)
@@ -1094,7 +1180,7 @@ pub(crate) fn spawn_agent(backend: &HostBindingBackend, a: &Value) -> Result<Val
     let owner = ctx.run_id();
     host_core::execute_durable_json_call(ctx, "spawn_agent", call_args, || {
         hub()
-            .spawn(&source, input.clone(), &options, owner.clone())
+            .spawn(&parts, &source, input.clone(), &options, owner.clone())
             .map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
@@ -1104,7 +1190,7 @@ pub(crate) fn spawn_agent(backend: &HostBindingBackend, a: &Value) -> Result<Val
 /// detached agent's mailbox; wakes it when it hibernates on a matching name.
 pub(crate) fn send_agent(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
     let ctx = runtime_ctx(backend, "agents.send")?;
-    install_parts_from(backend, ctx)?;
+    let parts = install_parts_from(backend, ctx)?;
     let to = a
         .get("to")
         .and_then(Value::as_str)
@@ -1122,7 +1208,7 @@ pub(crate) fn send_agent(backend: &HostBindingBackend, a: &Value) -> Result<Valu
     let call_args = json!({ "to": to, "name": name, "payload": payload, "from": from });
     host_core::execute_durable_json_call(ctx, "send_agent", call_args, || {
         hub()
-            .send(&to, &name, payload.clone(), from.clone())
+            .send(&parts, &to, &name, payload.clone(), from.clone())
             .map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
@@ -1131,7 +1217,7 @@ pub(crate) fn send_agent(backend: &HostBindingBackend, a: &Value) -> Result<Valu
 /// `chidori.agents.join(to, opts)` — wait for a detached agent to settle.
 pub(crate) fn join_agent(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
     let ctx = runtime_ctx(backend, "agents.join")?;
-    install_parts_from(backend, ctx)?;
+    let parts = install_parts_from(backend, ctx)?;
     let to = a
         .get("to")
         .and_then(Value::as_str)
@@ -1145,7 +1231,7 @@ pub(crate) fn join_agent(backend: &HostBindingBackend, a: &Value) -> Result<Valu
     let call_args = json!({ "to": to, "opts": { "timeoutMs": timeout_ms } });
     host_core::execute_durable_json_call(ctx, "join_agent", call_args, || {
         hub()
-            .join(&to, timeout_ms)
+            .join(&parts, &to, timeout_ms)
             .map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
@@ -1154,7 +1240,7 @@ pub(crate) fn join_agent(backend: &HostBindingBackend, a: &Value) -> Result<Valu
 /// `chidori.agents.stop(to)` — cooperative stop.
 pub(crate) fn stop_agent(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
     let ctx = runtime_ctx(backend, "agents.stop")?;
-    install_parts_from(backend, ctx)?;
+    let parts = install_parts_from(backend, ctx)?;
     let to = a
         .get("to")
         .and_then(Value::as_str)
@@ -1163,7 +1249,7 @@ pub(crate) fn stop_agent(backend: &HostBindingBackend, a: &Value) -> Result<Valu
         .to_string();
     let call_args = json!({ "to": to });
     host_core::execute_durable_json_call(ctx, "stop_agent", call_args, || {
-        hub().stop(&to).map_err(|err| anyhow::anyhow!(err))
+        hub().stop(&parts, &to).map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
 }
@@ -1171,7 +1257,7 @@ pub(crate) fn stop_agent(backend: &HostBindingBackend, a: &Value) -> Result<Valu
 /// `chidori.agents.status(to)`.
 pub(crate) fn agent_status(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
     let ctx = runtime_ctx(backend, "agents.status")?;
-    install_parts_from(backend, ctx)?;
+    let parts = install_parts_from(backend, ctx)?;
     let to = a
         .get("to")
         .and_then(Value::as_str)
@@ -1180,7 +1266,7 @@ pub(crate) fn agent_status(backend: &HostBindingBackend, a: &Value) -> Result<Va
         .to_string();
     let call_args = json!({ "to": to });
     host_core::execute_durable_json_call(ctx, "agent_status", call_args, || {
-        hub().status(&to).map_err(|err| anyhow::anyhow!(err))
+        hub().status(&parts, &to).map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
 }
@@ -1189,7 +1275,7 @@ pub(crate) fn agent_status(backend: &HostBindingBackend, a: &Value) -> Result<Va
 /// or null.
 pub(crate) fn lookup_agent(backend: &HostBindingBackend, a: &Value) -> Result<Value, String> {
     let ctx = runtime_ctx(backend, "agents.lookup")?;
-    install_parts_from(backend, ctx)?;
+    let parts = install_parts_from(backend, ctx)?;
     let name = a
         .get("name")
         .and_then(Value::as_str)
@@ -1198,7 +1284,7 @@ pub(crate) fn lookup_agent(backend: &HostBindingBackend, a: &Value) -> Result<Va
         .to_string();
     let call_args = json!({ "name": name });
     host_core::execute_durable_json_call(ctx, "lookup_agent", call_args, || {
-        hub().lookup(&name).map_err(|err| anyhow::anyhow!(err))
+        hub().lookup(&parts, &name).map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
 }
@@ -1388,7 +1474,8 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while outcome["status"] != json!("completed") && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));
-            outcome = hub().status(&agent_name).unwrap();
+            let parts = hub().installed_parts().unwrap();
+            outcome = hub().status(&parts, &agent_name).unwrap();
         }
         assert_eq!(outcome["status"], json!("completed"), "{outcome}");
         assert_eq!(outcome["output"], json!({ "timedOut": true }));

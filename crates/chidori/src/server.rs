@@ -791,7 +791,12 @@ fn run_agent_sync(app: &AppState, inputs: Value) -> anyhow::Result<Value> {
 // ---------------------------------------------------------------------------
 
 async fn list_detached_agents() -> Response {
-    match tokio::task::spawn_blocking(|| crate::runtime::host_agent::hub().list()).await {
+    match tokio::task::spawn_blocking(|| {
+        let hub = crate::runtime::host_agent::hub();
+        hub.installed_parts().and_then(|parts| hub.list(&parts))
+    })
+    .await
+    {
         Ok(Ok(agents)) => Json(json!({ "agents": agents })).into_response(),
         Ok(Err(err)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": err})))
             .into_response(),
@@ -804,8 +809,12 @@ async fn list_detached_agents() -> Response {
 }
 
 async fn get_detached_agent(Path(name): Path<String>) -> Response {
-    match tokio::task::spawn_blocking(move || crate::runtime::host_agent::hub().status(&name))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        let hub = crate::runtime::host_agent::hub();
+        hub.installed_parts()
+            .and_then(|parts| hub.status(&parts, &name))
+    })
+    .await
     {
         Ok(Ok(status)) => Json(status).into_response(),
         Ok(Err(err)) => (StatusCode::NOT_FOUND, Json(json!({"error": err}))).into_response(),
@@ -832,7 +841,9 @@ async fn send_detached_agent(
 ) -> Response {
     let from = json!({ "kind": "external", "id": "http" });
     match tokio::task::spawn_blocking(move || {
-        crate::runtime::host_agent::hub().send(&agent, &body.name, body.payload, from)
+        let hub = crate::runtime::host_agent::hub();
+        hub.installed_parts()
+            .and_then(|parts| hub.send(&parts, &agent, &body.name, body.payload, from))
     })
     .await
     {
@@ -847,7 +858,12 @@ async fn send_detached_agent(
 }
 
 async fn stop_detached_agent(Path(name): Path<String>) -> Response {
-    match tokio::task::spawn_blocking(move || crate::runtime::host_agent::hub().stop(&name)).await
+    match tokio::task::spawn_blocking(move || {
+        let hub = crate::runtime::host_agent::hub();
+        hub.installed_parts()
+            .and_then(|parts| hub.stop(&parts, &name))
+    })
+    .await
     {
         Ok(Ok(outcome)) => Json(outcome).into_response(),
         Ok(Err(err)) => (StatusCode::NOT_FOUND, Json(json!({"error": err}))).into_response(),
