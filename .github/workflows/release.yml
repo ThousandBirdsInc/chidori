@@ -168,10 +168,12 @@ jobs:
   #
   # Targets the runner can execute natively are built with PGO
   # (scripts/pgo-build.sh --bin chidori): instrument, run the offline training
-  # agents, rebuild with feedback — measured -15.5% wall-clock geomean on the
-  # JS benchmark suite vs the plain release build. PGO has to *run* the
-  # instrumented binary, so the cross-compiled x86_64-apple-darwin target
-  # keeps the plain release build rather than gambling on Rosetta.
+  # agents, rebuild with feedback. Measured on the shipped binary: -19%
+  # wall-clock on in-corpus interpreter-heavy work, -7% on a held-out
+  # JS-heavy agent, ~-2% on startup/actor-IPC-bound runs (byte-identical
+  # agent outputs). PGO has to *run* the instrumented binary, so the
+  # cross-compiled x86_64-apple-darwin target keeps the plain release build
+  # rather than gambling on Rosetta.
   binaries:
     name: Build ${{ matrix.target }}
     needs: verify
