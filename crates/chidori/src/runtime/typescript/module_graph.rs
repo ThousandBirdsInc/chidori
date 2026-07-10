@@ -24,15 +24,7 @@ pub fn snapshot_module_fingerprints(
     source: &str,
     policy: &RuntimePolicy,
 ) -> Result<Vec<SourceFingerprint>> {
-    let entry_path = stable_path(path);
-    let mut builder = SnapshotModuleBuilder::new(policy);
-    builder.collect(path, source)?;
-    Ok(builder
-        .modules
-        .iter()
-        .filter(|module| module.path != entry_path)
-        .map(|module| SourceFingerprint::from_source(module.path.clone(), &module.source))
-        .collect())
+    Ok(snapshot_modules(path, source, policy)?.0)
 }
 
 /// The full module import graph (entry + dependencies) for the manifest.
@@ -41,9 +33,28 @@ pub fn snapshot_module_graph(
     source: &str,
     policy: &RuntimePolicy,
 ) -> Result<Vec<SnapshotModuleGraphEntry>> {
+    Ok(snapshot_modules(path, source, policy)?.1)
+}
+
+/// Both manifest views of the module walk — dependency fingerprints and the
+/// full import graph — from a single collection pass, so callers that need
+/// both (the per-run scaffold persister) read each module file once instead
+/// of twice.
+pub fn snapshot_modules(
+    path: &Path,
+    source: &str,
+    policy: &RuntimePolicy,
+) -> Result<(Vec<SourceFingerprint>, Vec<SnapshotModuleGraphEntry>)> {
+    let entry_path = stable_path(path);
     let mut builder = SnapshotModuleBuilder::new(policy);
     builder.collect(path, source)?;
-    Ok(builder
+    let fingerprints = builder
+        .modules
+        .iter()
+        .filter(|module| module.path != entry_path)
+        .map(|module| SourceFingerprint::from_source(module.path.clone(), &module.source))
+        .collect();
+    let graph = builder
         .modules
         .iter()
         .map(|module| SnapshotModuleGraphEntry {
@@ -57,7 +68,8 @@ pub fn snapshot_module_graph(
                 })
                 .collect(),
         })
-        .collect())
+        .collect();
+    Ok((fingerprints, graph))
 }
 
 struct SnapshotModuleBuilder<'policy> {
