@@ -431,6 +431,27 @@ impl Vm {
         )
     }
 
+    /// Entry check for kernels containing [`KOp::CharCodeAt`]: the canonical
+    /// String prototype's `charCodeAt` must still be a plain DATA property
+    /// holding the pinned canonical function (methods are writable). The
+    /// receiver side needs no per-access check at all: a primitive string's
+    /// property lookup goes through an own-index/length wrapper straight to
+    /// `String.prototype` (nothing can shadow the method), the base local is
+    /// pinned (in-region stores reject at translation), strings are
+    /// immutable, and the entry guard proved the slot holds a string.
+    fn kernel_char_code_ok(&self) -> bool {
+        let Some(canon) = &self.realm.string_char_code_at else {
+            return false;
+        };
+        matches!(
+            self.realm.string_proto.borrow().props.get(&PropertyKey::str("charCodeAt")),
+            Some(Property {
+                kind: PropertyKind::Data { value: Value::Object(o), .. },
+                ..
+            }) if o.ptr_eq(canon)
+        )
+    }
+
     /// Execute the typed loop kernel at `Op::LoopKernel(idx)` (see
     /// `kernel.rs` for the model). Runs only when per-op accounting is off
     /// (no op budget), every mapped numeric local holds a `Number`, and every
@@ -482,6 +503,12 @@ impl Vm {
                 crate::bytecode::KSlot::Local(l) => {
                     matches!(frame.locals[*l as usize], Value::Number(_))
                 }
+                // An own-frame cell in the TDZ (`Uninitialized`) or holding a
+                // non-Number declines like any other slot; the generic path
+                // then raises the ReferenceError / runs the coercion.
+                crate::bytecode::KSlot::Cell(c) => {
+                    matches!(*frame.cells[*c as usize].borrow(), Value::Number(_))
+                }
                 crate::bytecode::KSlot::Upvalue(u) => {
                     matches!(*frame.func.upvalues[*u as usize].borrow(), Value::Number(_))
                 }
@@ -501,6 +528,18 @@ impl Vm {
             if !matches!(frame.locals[l as usize], Value::Object(_)) {
                 return self.step(frame, &k.fallback);
             }
+        }
+        // String bases must hold primitive strings (a String OBJECT — or
+        // anything else — declines: the generic path owns wrapper receivers,
+        // accessor shadows and coercions). Pinned local + immutable value =
+        // every in-kernel string access is then bail-free.
+        for &l in k.sslots.iter() {
+            if !matches!(frame.locals[l as usize], Value::String(_)) {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        if k.uses_char_code && !self.kernel_char_code_ok() {
+            return self.step(frame, &k.fallback);
         }
         // A `StoreElem` may CREATE an element (hole fill / exact append), and
         // the spec's OrdinarySet consults the prototype chain when the own
@@ -645,6 +684,7 @@ impl Vm {
         for (r, slot) in k.locals.iter().enumerate() {
             let v = match slot {
                 crate::bytecode::KSlot::Local(l) => frame.locals[*l as usize].clone(),
+                crate::bytecode::KSlot::Cell(c) => frame.cells[*c as usize].borrow().clone(),
                 crate::bytecode::KSlot::Upvalue(u) => {
                     frame.func.upvalues[*u as usize].borrow().clone()
                 }
@@ -665,6 +705,13 @@ impl Vm {
         for &l in k.oslots.iter() {
             if let Value::Object(o) = &frame.locals[l as usize] {
                 objs.push(o.clone());
+            }
+        }
+        let mut strs = std::mem::take(&mut self.kernel_strs);
+        strs.clear();
+        for &l in k.sslots.iter() {
+            if let Value::String(s) = &frame.locals[l as usize] {
+                strs.push(s.clone());
             }
         }
         // Prop registers (the tail of the register file): load each resolved
@@ -723,14 +770,19 @@ impl Vm {
                         break;
                     };
                     // Number-returning, non-recursive, fully-supplied args,
-                    // canonical Math, Number upvalues — else stay generic.
+                    // no array-argument bases (the argument window carries
+                    // raw f64s only), canonical Math, Number upvalues —
+                    // else stay generic.
                     let ck_ok = ck.rec.is_none()
+                        && ck.arg_objs.is_empty()
                         && ck
                             .code
                             .iter()
                             .all(|op| !matches!(op, KOp::Ret { boolean: true, .. }))
                         && ck.locals.iter().all(|sl| match sl {
                             crate::bytecode::KSlot::Arg(a) => *a < u32::from(c.min_argc),
+                            // Loop-kernel-only slot; never in a fn kernel.
+                            crate::bytecode::KSlot::Cell(_) => false,
                             _ => true,
                         })
                         && (ck.math_used.is_empty() || self.kernel_math_ok(&ck.math_used))
@@ -753,6 +805,8 @@ impl Vm {
                 self.kernel_regs = regs;
                 objs.clear();
                 self.kernel_objs = objs;
+                strs.clear();
+                self.kernel_strs = strs;
                 self.kernel_prop_slots = prop_slots;
                 callee_bfs.clear();
                 self.kernel_callees = callee_bfs;
@@ -791,19 +845,13 @@ impl Vm {
                                     // Same latch-and-unwind as the interpreter
                                     // loop: zero the budget so a JS catch
                                     // cannot resume execution.
-                                    for (r, slot) in k.locals.iter().enumerate() {
-                                        if let crate::bytecode::KSlot::Local(l) = slot {
-                                            frame.locals[*l as usize] = Value::Number(regs[r]);
-                                        }
-                                    }
-                                    for (j, &l) in k.bool_locals.iter().enumerate() {
-                                        frame.locals[l as usize] =
-                                            Value::Bool(regs[bool_base + j] != 0.0);
-                                    }
+                                    writeback_kernel_slots(k, frame, &regs, bool_base);
                                     writeback_kernel_props(k, &objs, &prop_slots, &regs);
                                     self.kernel_regs = regs;
                                     objs.clear();
                                     self.kernel_objs = objs;
+                                    strs.clear();
+                                    self.kernel_strs = strs;
                                     self.kernel_prop_slots = prop_slots;
                                     callee_bfs.clear();
                                     self.kernel_callees = callee_bfs;
@@ -1093,6 +1141,28 @@ impl Vm {
                         branch!(bail)
                     }
                 }
+                // Pinned-string code-unit read: BAIL-FREE. The entry guard
+                // proved the slot holds a primitive string and the canonical
+                // `String.prototype.charCodeAt` resolves; every Number index
+                // then has a defined result — ToIntegerOrInfinity (NaN → 0,
+                // truncation toward zero) and NaN out of bounds, exactly the
+                // builtin, through the same `code_unit_at` accessor (O(1) on
+                // ASCII via the cached unit count).
+                KOp::CharCodeAt { dst, sslot, idx } => {
+                    let s = &strs[sslot as usize];
+                    let n = regs[idx as usize];
+                    let i = if n.is_nan() { 0.0 } else { n.trunc() };
+                    regs[dst as usize] = if i >= 0.0 && i < s.len_utf16() as f64 {
+                        s.code_unit_at(i as usize).expect("index checked in range") as f64
+                    } else {
+                        f64::NAN
+                    };
+                }
+                // Pinned-string `.length`: an own wrapper property, O(1)
+                // after the first unit-count read.
+                KOp::StrLen { dst, sslot } => {
+                    regs[dst as usize] = strs[sslot as usize].len_utf16() as f64
+                }
                 // Prop LOCALIZATION rewrote every LoadProp/StoreProp into a
                 // register Mov at kernel build; the slots live only in the
                 // entry load and the exit/unwind write-back now.
@@ -1142,18 +1212,13 @@ impl Vm {
                     if !run_callee_window(&mut regs, ck, win, dst as usize, &interrupt, &mut poll) {
                         // Interrupted on a callee back-edge: the same
                         // latch-and-unwind as an interrupted caller edge.
-                        for (r, slot) in k.locals.iter().enumerate() {
-                            if let crate::bytecode::KSlot::Local(l) = slot {
-                                frame.locals[*l as usize] = Value::Number(regs[r]);
-                            }
-                        }
-                        for (j, &l) in k.bool_locals.iter().enumerate() {
-                            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
-                        }
+                        writeback_kernel_slots(k, frame, &regs, bool_base);
                         writeback_kernel_props(k, &objs, &prop_slots, &regs);
                         self.kernel_regs = regs;
                         objs.clear();
                         self.kernel_objs = objs;
+                        strs.clear();
+                        self.kernel_strs = strs;
                         self.kernel_prop_slots = prop_slots;
                         callee_bfs.clear();
                         self.kernel_callees = callee_bfs;
@@ -1166,22 +1231,17 @@ impl Vm {
                 // contains CallKernel (translator invariant).
                 KOp::CallKernel { .. } => unreachable!("CallKernel in a plain kernel loop"),
                 // Function-kernel-only ops; loop translation never emits them.
-                KOp::Ret { .. } | KOp::SelfCall { .. } => unreachable!("fn op in a loop kernel"),
+                KOp::Ret { .. } | KOp::SelfCall { .. } | KOp::Abandon => {
+                    unreachable!("fn op in a loop kernel")
+                }
             }
             pc += 1;
         };
-        // Materialize: every mapped numeric local back to the frame (as
+        // Materialize: every mapped numeric local/cell back to the frame (as
         // Numbers), then the operand stack from the exit's shape (bottom-up:
         // registers as Numbers, object slots as objects), then resume the
         // bytecode interpreter at the exit's target.
-        for (r, slot) in k.locals.iter().enumerate() {
-            if let crate::bytecode::KSlot::Local(l) = slot {
-                frame.locals[*l as usize] = Value::Number(regs[r]);
-            }
-        }
-        for (j, &l) in k.bool_locals.iter().enumerate() {
-            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
-        }
+        writeback_kernel_slots(k, frame, &regs, bool_base);
         writeback_kernel_props(k, &objs, &prop_slots, &regs);
         for slot in k.shapes[shape as usize].iter() {
             match slot {
@@ -1194,6 +1254,14 @@ impl Vm {
                 crate::bytecode::KShapeSlot::Obj(o) => {
                     frame.stack.push(Value::Object(objs[*o as usize].clone()))
                 }
+                // The pinned local is unwritten and strings are immutable:
+                // the cached value IS the live value.
+                crate::bytecode::KShapeSlot::Str(s) => {
+                    frame.stack.push(Value::String(strs[*s as usize].clone()))
+                }
+                crate::bytecode::KShapeSlot::CharCodeFn => frame.stack.push(Value::Object(
+                    self.realm.string_char_code_at.clone().expect("guarded"),
+                )),
                 // The guard proved the live values ARE the canonicals.
                 crate::bytecode::KShapeSlot::MathObj => frame.stack.push(Value::Object(
                     self.realm.math_object.clone().expect("guarded"),
@@ -1212,6 +1280,8 @@ impl Vm {
         self.kernel_regs = regs;
         objs.clear();
         self.kernel_objs = objs;
+        strs.clear();
+        self.kernel_strs = strs;
         self.kernel_prop_slots = prop_slots;
         callee_bfs.clear();
         self.kernel_callees = callee_bfs;
@@ -1257,6 +1327,12 @@ impl Vm {
                 // proved a store dominates every read, so no frame slot is
                 // needed (and none exists).
                 crate::bytecode::KSlot::Local(_) => {}
+                // Own-frame cells exist only in loop kernels (frameless
+                // bodies have no cells); decline defensively.
+                crate::bytecode::KSlot::Cell(_) => {
+                    self.kernel_regs = regs;
+                    return None;
+                }
                 crate::bytecode::KSlot::Upvalue(u) => match &*bf.upvalues[*u as usize].borrow() {
                     Value::Number(n) => regs[r] = *n,
                     _ => {
@@ -1272,17 +1348,24 @@ impl Vm {
         }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
-        match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll) {
-            Some(ret) => {
+        match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll, args, &k.arg_objs) {
+            FnKernelFlow::Ret(ret) => {
                 self.kernel_regs = regs;
                 Some(Ok(ret))
             }
-            None => {
+            FnKernelFlow::Interrupted => {
                 // Interrupted on a back-edge: registers are pure scratch,
                 // nothing to write back on the unwind.
                 self.kernel_regs = regs;
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
+            }
+            // An array-argument access missed its fast path: the pure
+            // activation is discarded (registers are scratch, reads only)
+            // and the caller takes the ordinary frame path.
+            FnKernelFlow::Abandoned => {
+                self.kernel_regs = regs;
+                None
             }
         }
     }
@@ -1330,6 +1413,13 @@ impl Vm {
             }
             let f = funcs[wl].clone();
             let k = f.proto.fn_kernel.as_ref()?;
+            // No member may consume an array argument: SelfCall windows
+            // carry raw f64s, and an Abandon mid-recursion would have no
+            // caller frame to rerun windows from. (The entry kernel already
+            // can't — `kernelize_function` rejects rec + arg_objs.)
+            if !k.arg_objs.is_empty() {
+                return None;
+            }
             // Every member's Ret type must match the entry kernel's: a
             // mismatched value would land in a caller register of the wrong
             // static type. (Also rejects mixed-type non-recursive members.)
@@ -1442,6 +1532,8 @@ impl Vm {
                         }
                     }
                     crate::bytecode::KSlot::Local(_) => {}
+                    // Loop-kernel-only slot; a frameless body has no cells.
+                    crate::bytecode::KSlot::Cell(_) => return None,
                 }
             }
             arg_slots.push(aslots);
@@ -1716,9 +1808,12 @@ impl Vm {
                     | KOp::LoadElem { .. }
                     | KOp::StoreElem { .. }
                     | KOp::LoadLen { .. }
+                    | KOp::CharCodeAt { .. }
+                    | KOp::StrLen { .. }
                     | KOp::LoadProp { .. }
                     | KOp::StoreProp { .. }
                     | KOp::CallKernel { .. }
+                    | KOp::Abandon
                     | KOp::Exit { .. } => unreachable!("bail op in a function kernel"),
                 }
                 pc += 1;
@@ -1811,6 +1906,8 @@ impl Vm {
                 // every read, so a stale value from the previous call is
                 // never observable.
                 crate::bytecode::KSlot::Local(_) => {}
+                // Loop-kernel-only slot; a frameless body has no cells.
+                crate::bytecode::KSlot::Cell(_) => return None,
                 crate::bytecode::KSlot::Upvalue(u) => match &*p.bf.upvalues[*u as usize].borrow() {
                     Value::Number(n) => p.regs[r] = *n,
                     _ => return None,
@@ -1830,14 +1927,24 @@ impl Vm {
                 }
             }
         }
-        match exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll) {
-            Some(v) => Some(Ok(v)),
-            None => {
+        match exec_fn_kernel_code(
+            &k.code,
+            &mut p.regs,
+            &p.interrupt,
+            &mut p.poll,
+            args,
+            &k.arg_objs,
+        ) {
+            FnKernelFlow::Ret(v) => Some(Ok(v)),
+            FnKernelFlow::Interrupted => {
                 // Same latch-and-unwind as an interrupted kernel back-edge:
                 // zero the budget so a JS catch cannot resume execution.
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
             }
+            // Array-argument access miss: this element falls back to the
+            // generic call (the prepared handle stays usable for the next).
+            FnKernelFlow::Abandoned => None,
         }
     }
 
@@ -1859,6 +1966,9 @@ impl Vm {
             return None;
         }
         let k = p.bf.proto.fn_kernel.as_ref().expect("prepared");
+        if !k.arg_objs.is_empty() {
+            return None;
+        }
         if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
             return None;
         }
@@ -1871,6 +1981,8 @@ impl Vm {
                 // Consumes a third argument the comparator is never given.
                 crate::bytecode::KSlot::Arg(_) => return None,
                 crate::bytecode::KSlot::Local(_) => {}
+                // Loop-kernel-only slot; a frameless body has no cells.
+                crate::bytecode::KSlot::Cell(_) => return None,
                 crate::bytecode::KSlot::Upvalue(u) => match &*p.bf.upvalues[*u as usize].borrow() {
                     Value::Number(n) => p.regs[r] = *n,
                     _ => return None,
@@ -1911,21 +2023,23 @@ impl Vm {
         };
         let k = p.bf.proto.fn_kernel.as_ref().expect("prepared");
         let ret = if interrupted {
-            None
+            FnKernelFlow::Interrupted
         } else {
-            exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll)
+            exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll, &[], &[])
         };
         match ret {
-            Some(Value::Number(n)) => Ok(if n < 0.0 {
+            FnKernelFlow::Ret(Value::Number(n)) => Ok(if n < 0.0 {
                 -1
             } else if n > 0.0 {
                 1
             } else {
                 0
             }),
-            Some(Value::Bool(b)) => Ok(if b { 1 } else { 0 }),
-            Some(_) => unreachable!("fn kernels return Number or Bool"),
-            None => {
+            FnKernelFlow::Ret(Value::Bool(b)) => Ok(if b { 1 } else { 0 }),
+            FnKernelFlow::Ret(_) => unreachable!("fn kernels return Number or Bool"),
+            // `prime_prepared_cmp` declined array-argument kernels.
+            FnKernelFlow::Abandoned => unreachable!("array-arg kernel primed for f64 cmp"),
+            FnKernelFlow::Interrupted => {
                 self.op_budget = Some(0);
                 Err(self.throw_range("execution interrupted"))
             }
@@ -5874,6 +5988,33 @@ fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Valu
 /// every path that leaves the register world: normal exits, bails (which
 /// route through an Exit), and interrupt unwinds. Load-only classes never
 /// change, so their slots are left untouched.
+/// Write a loop kernel's register state back into the frame: `Local` slots
+/// as `Value::Number`, own-frame `Cell` slots through their `RefCell` (no
+/// borrow can be outstanding while a kernel runs), boolean locals as
+/// `Value::Bool`. `Upvalue`/`Arg` slots are read-only snapshots and never
+/// write back. Runs on every exit, bail, and interrupt unwind.
+fn writeback_kernel_slots(
+    k: &crate::bytecode::Kernel,
+    frame: &mut Frame,
+    regs: &[f64],
+    bool_base: usize,
+) {
+    for (r, slot) in k.locals.iter().enumerate() {
+        match slot {
+            crate::bytecode::KSlot::Local(l) => {
+                frame.locals[*l as usize] = Value::Number(regs[r])
+            }
+            crate::bytecode::KSlot::Cell(c) => {
+                *frame.cells[*c as usize].borrow_mut() = Value::Number(regs[r])
+            }
+            crate::bytecode::KSlot::Upvalue(_) | crate::bytecode::KSlot::Arg(_) => {}
+        }
+    }
+    for (j, &l) in k.bool_locals.iter().enumerate() {
+        frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
+    }
+}
+
 fn writeback_kernel_props(
     k: &crate::bytecode::Kernel,
     objs: &[JsObject],
@@ -5902,18 +6043,34 @@ fn writeback_kernel_props(
     }
 }
 
+/// Outcome of a frameless FUNCTION-kernel body run.
+enum FnKernelFlow {
+    /// The call's result — `Value::Number`, or `Value::Bool` for a
+    /// boolean-typed `Ret`.
+    Ret(Value),
+    /// The cooperative interrupt flag latched on a back-edge poll — the
+    /// caller owns the budget-zeroing unwind.
+    Interrupted,
+    /// An array access over an argument base missed its fast path
+    /// ([`KOp::Abandon`]): the pure activation is discarded and the caller
+    /// reruns the call generically.
+    Abandoned,
+}
+
 /// Execute a plain (non-recursive, frameless) FUNCTION kernel body over
-/// `regs`, returning the call's result — `Value::Number`, or `Value::Bool`
-/// for a boolean-typed `Ret`. Shared by the per-call [`Vm::run_fn_kernel`]
-/// entry and the prepared-callback path ([`Vm::exec_prepared_kernel`]).
-/// Returns `None` when the cooperative interrupt flag latched on a back-edge
-/// poll — the caller owns the budget-zeroing unwind.
+/// `regs`. Shared by the per-call [`Vm::run_fn_kernel`] entry and the
+/// prepared-callback path ([`Vm::exec_prepared_kernel`]). `args`/`arg_objs`
+/// resolve the READ-ONLY array-argument bases (`Kernel::arg_objs`); their
+/// element/length reads re-check the dense fast path per access and abandon
+/// on any miss.
 fn exec_fn_kernel_code(
     code: &[KOp],
     regs: &mut [f64],
     interrupt: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     poll: &mut u32,
-) -> Option<Value> {
+    args: &[Value],
+    arg_objs: &[u32],
+) -> FnKernelFlow {
     let mut pc = 0usize;
     loop {
         macro_rules! branch {
@@ -5924,7 +6081,7 @@ fn exec_fn_kernel_code(
                     if *poll & 0xFF == 0 {
                         if let Some(flag) = interrupt {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                return None;
+                                return FnKernelFlow::Interrupted;
                             }
                         }
                     }
@@ -6024,20 +6181,84 @@ fn exec_fn_kernel_code(
                 branch!(target)
             }
             KOp::Ret { src, boolean } => {
-                return Some(if boolean {
+                return FnKernelFlow::Ret(if boolean {
                     Value::Bool(regs[src as usize] != 0.0)
                 } else {
                     Value::Number(regs[src as usize])
                 })
             }
+            // READ-ONLY array-argument element access: the dense fast-path
+            // conditions re-check per access (exactly the loop-kernel arm);
+            // any miss branches to the shared Abandon stub — the pure
+            // activation is discarded and the caller reruns generically.
+            KOp::LoadElem {
+                dst,
+                obj,
+                idx,
+                bail,
+            } => {
+                let i = regs[idx as usize];
+                let mut ok = false;
+                if let Some(Value::Object(o)) = args.get(arg_objs[obj as usize] as usize) {
+                    if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
+                        let b = o.borrow();
+                        match &b.internal {
+                            Internal::Array(arr) if b.props.is_empty() => {
+                                if let Some(Value::Number(n)) = arr.get(i as usize) {
+                                    regs[dst as usize] = *n;
+                                    ok = true;
+                                }
+                            }
+                            // Numeric typed arrays: a valid-index [[Get]]
+                            // reads element storage directly — no props or
+                            // prototype consult, so no guard is needed.
+                            Internal::TypedArray(t) if !t.kind.is_bigint() => {
+                                let iu = i as usize;
+                                if iu < crate::typed_array::ta_eff_length(t) {
+                                    let off = t.byte_offset + iu * t.kind.bytes();
+                                    let buf = t.buffer.borrow();
+                                    if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
+                                        regs[dst as usize] =
+                                            crate::typed_array::decode(bytes, off, t.kind);
+                                        ok = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !ok {
+                    branch!(bail)
+                }
+            }
+            // Dense-array `.length` only: a typed array resolves `.length`
+            // through a prototype ACCESSOR no frameless kernel can guard —
+            // it abandons to the generic path.
+            KOp::LoadLen { dst, obj, bail } => {
+                let mut ok = false;
+                if let Some(Value::Object(o)) = args.get(arg_objs[obj as usize] as usize) {
+                    let b = o.borrow();
+                    if let Internal::Array(arr) = &b.internal {
+                        if b.props.is_empty() {
+                            regs[dst as usize] = arr.len() as f64;
+                            ok = true;
+                        }
+                    }
+                }
+                if !ok {
+                    branch!(bail)
+                }
+            }
+            KOp::Abandon => return FnKernelFlow::Abandoned,
             // A frameless kernel has no bytecode frame to bail into;
             // fn-mode translation rejects anything needing one. A
             // SelfCall implies `self_global`, dispatched by the caller.
             KOp::ArrayPush { .. }
             | KOp::ArrayPop { .. }
-            | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
-            | KOp::LoadLen { .. }
+            | KOp::CharCodeAt { .. }
+            | KOp::StrLen { .. }
             | KOp::LoadProp { .. }
             | KOp::StoreProp { .. }
             | KOp::Exit { .. }
@@ -6184,9 +6405,12 @@ fn run_callee_window(
             | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
+            | KOp::CharCodeAt { .. }
+            | KOp::StrLen { .. }
             | KOp::LoadProp { .. }
             | KOp::StoreProp { .. }
             | KOp::Exit { .. }
+            | KOp::Abandon
             | KOp::SelfCall { .. }
             | KOp::CallKernel { .. } => unreachable!("unsupported op in a callee kernel"),
         }

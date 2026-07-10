@@ -500,6 +500,107 @@ const CORPUS: &[&str] = &[
     "function h2(n) { return n <= 0 ? 0 : Math.max(n % 7, h2(n - 1)); } console.log(h2(40));",
     // Captured numeric upvalue inside a recursive const arrow.
     "const LIM = 3; const f2 = (n) => (n <= LIM ? n : f2(n - 2) + 1); console.log(f2(21));",
+    // --- OWN-FRAME CELLS: captured loop bounds and accumulators -----------
+    // Captured loop bound: `n` is a cell (the arrow captures it).
+    "let n = 100; const bound = () => n; let s = 0; for (let i = 0; i < n; i++) { s += i; } console.log(s, bound());",
+    // Captured accumulator: the loop WRITES the cell; the closure reads the
+    // final value after.
+    "let total = 0; const read = () => total; for (let i = 0; i < 50; i++) { total += i * 2; } console.log(total, read());",
+    // Statement-position ++ on a captured binding (IncCellStmt).
+    "let hits = 0; const h = () => hits; for (let i = 0; i < 20; i++) { if (i % 3 === 0) hits++; } console.log(hits, h());",
+    // fib-iteration entirely over captured bindings (cell loads and stores).
+    "let a = 0, b = 1; const keep = () => a + b; for (let i = 0; i < 30; i++) { const t = a + b; a = b; b = t; } console.log(a, b, keep());",
+    // Captured binding warms late: starts undefined (guard declines), then
+    // becomes a number (late entry) — result identical either way.
+    "let t; const g = () => t; let s = 0; for (let i = 0; i < 10; i++) { t = (t || 0) + i; s = t; } console.log(s, t, g());",
+    // A string flows through the captured accumulator: guard declines and the
+    // generic loop concatenates exactly.
+    "let acc = 0; const r = () => acc; for (let i = 0; i < 6; i++) { if (i === 3) acc = '' + acc; acc += i; } console.log(acc, r());",
+    // The captured BOUND is reassigned mid-loop (loop-carried compare operand
+    // through a cell register, written back on every exit).
+    "let n = 10; const f = () => n; let c = 0; for (let i = 0; i < n; i++) { if (i === 5) n = 8; c++; } console.log(c, n, f());",
+    // Cell WRITES + a pinned-closure call in one region: translation must
+    // exclude the combination (a callee upvalue snapshot could go stale) and
+    // the generic path owns it — including when the callee captures the very
+    // accumulator being written.
+    "const dbl = (x) => x * 2; let sum = 0; const peek = () => sum; for (let i = 0; i < 10; i++) { sum += dbl(i); } console.log(sum, peek());",
+    "let sum = 0; const addsum = (x) => x + sum; let s = 0; for (let i = 0; i < 5; i++) { s = addsum(i); sum += 1; } console.log(s, sum);",
+    // Cell READ + pinned-closure call is allowed: bound stays a cell, callee
+    // runs on its window.
+    "let n = 10; const keepn = () => n; const inc = (x) => x + 1; let s = 0; for (let i = 0; i < n; i++) { s += inc(i); } console.log(s, keepn());",
+    // Callee whose upvalue IS the read-only cell: snapshot equals the cell
+    // for the whole activation (no writes anywhere).
+    "let base = 7; const keep = () => base; const addb = (x) => x + base; let s = 0; for (let i = 0; i < 6; i++) { s += addb(i); } console.log(s, keep());",
+    // TDZ: the loop reads a captured `let` before initialization — the guard
+    // declines (Uninitialized) and the generic path throws the ReferenceError.
+    "try { let s = 0; for (let i = 0; i < b; i++) { s += b; } console.log('no'); } catch (e) { console.log(e.constructor.name); } let b = 5; const q = () => b;",
+    // Interleaved kernel and generic iterations must keep the cell coherent:
+    // taint the loop with a bail-y array access while accumulating in a cell.
+    "const a = [1, , 3, 4]; let acc = 0; const look = () => acc; for (let i = 0; i < a.length; i++) { acc += a[i] || 0; } console.log(acc, look());",
+    // -0 / NaN through a captured accumulator.
+    "let z = 5; const zz = () => z; for (let i = 0; i < 3; i++) { z = -0 * i + z * 0; } console.log(Object.is(z, -0), Object.is(zz(), -0));",
+    // --- STRING BASES: charCodeAt / length in loop kernels -----------------
+    // The canonical tokenizer scan (string_scan workload shape).
+    "const s = 'hello, kernel world! 0123456789'; let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; } console.log(h);",
+    // Non-ASCII: multi-byte UTF-8 and an astral pair (surrogate units).
+    "const s = 'a\\u00e9\\u4e2d\\ud83d\\ude00z'; let out = ''; for (let i = 0; i < s.length; i++) { out += s.charCodeAt(i) + ','; } console.log(out, s.length);",
+    // A lone surrogate is preserved as its raw unit.
+    "const s = 'x\\ud800y'; let sum = 0; for (let i = 0; i < s.length; i++) { sum += s.charCodeAt(i); } console.log(sum);",
+    // Out-of-bounds, fractional, negative and NaN indices (NaN result paths).
+    "const s = 'abc'; let r = ''; for (let i = -2; i < 6; i++) { r += s.charCodeAt(i) + ','; } console.log(r);",
+    "const s = 'abcdef'; let x = 0; for (let i = 0; i < 4; i++) { x += s.charCodeAt(i + 0.5) + s.charCodeAt(i * 1.5); } console.log(x);",
+    "const s = 'abc'; let n = 0; for (let i = 0; i < 3; i++) { n += s.charCodeAt(0 / 0) || -1; } console.log(n);",
+    // Empty string: zero iterations off `.length`, NaN off direct reads.
+    "const s = ''; let c = 0; for (let i = 0; i < s.length; i++) { c++; } console.log(c, s.charCodeAt(0));",
+    // Monkeypatched String.prototype.charCodeAt: the kernel declines and the
+    // patch is observed, then restored behavior returns.
+    "const orig = String.prototype.charCodeAt; String.prototype.charCodeAt = function (i) { return 7; }; const s = 'abc'; let t = 0; for (let i = 0; i < s.length; i++) { t += s.charCodeAt(i); } String.prototype.charCodeAt = orig; let u = 0; for (let i = 0; i < s.length; i++) { u += s.charCodeAt(i); } console.log(t, u);",
+    // String OBJECT receiver: the slot holds an Object, the guard declines,
+    // the generic wrapper path answers.
+    "const s = new String('abc'); let v = 0; for (let i = 0; i < s.length; i++) { v += s.charCodeAt(i); } console.log(v);",
+    // charCodeAt feeding arithmetic, Math, and array writes in one region.
+    "const s = 'kernelsss'; const a = new Array(9); for (let i = 0; i < s.length; i++) { a[i] = Math.max(s.charCodeAt(i) - 96, 0); } console.log(a.join(','));",
+    // Two distinct string bases in one loop.
+    "const a = 'abcdef', b = 'uvwxyz'; let d = 0; for (let i = 0; i < a.length; i++) { d += b.charCodeAt(i) - a.charCodeAt(i); } console.log(d);",
+    // charAt (string result) keeps the loop generic; results identical.
+    "const s = 'abc'; let r = ''; for (let i = 0; i < s.length; i++) { r += s.charAt(i); } console.log(r);",
+    // Rope-built string (the += builder) scanned afterwards.
+    "let b = ''; for (let i = 0; i < 40; i++) { b += 'ab'; } let q = 0; for (let i = 0; i < b.length; i++) { q += b.charCodeAt(i); } console.log(q, b.length);",
+    // --- FUNCTION kernels with ARRAY-typed arguments: (a, i) => a[i] -------
+    // The canonical accessor shapes, function and arrow.
+    "function get(a, i) { return a[i]; } const arr = [10, 20, 30]; let s = 0; for (let i = 0; i < 3; i++) { s += get(arr, i); } console.log(s, get(arr, 0));",
+    "const pick = (a, i) => a[i] * 2 + 1; const arr = [5, 6, 7, 8]; let s = 0; for (let i = 0; i < 4; i++) { s += pick(arr, i); } console.log(s);",
+    // `a.length` through a function kernel; a typed array must abandon (its
+    // length is a prototype accessor a frameless kernel cannot guard).
+    "const len = (a) => a.length; console.log(len([1, 2, 3]), len(new Float64Array(5)), len([]));",
+    // A whole loop INSIDE the kernelized body (dot product).
+    "function dot(a, b, n) { let s = 0; for (let i = 0; i < n; i++) { s += a[i] * b[i]; } return s; } const x = [1, 2, 3, 4], y = [5, 6, 7, 8]; console.log(dot(x, y, 4), dot(x, y, 0));",
+    // Holes, OOB, negative and fractional indices abandon to the exact
+    // generic semantics (undefined absorption, prototype consult).
+    "const get = (a, i) => a[i]; const h = [1, , 3]; console.log(get(h, 0), get(h, 1), get(h, 5), get(h, -1), get(h, 0.5));",
+    // A hole that reads THROUGH the prototype.
+    "const get = (a, i) => a[i]; const h = [1, , 3]; Array.prototype[1] = 99; console.log(get(h, 1)); delete Array.prototype[1];",
+    // Non-Number elements abandon per call (strings flow through generic).
+    "const get = (a, i) => a[i]; const m = [1, 'two', 3]; let out = ''; for (let i = 0; i < 3; i++) { out += get(m, i) + '|'; } console.log(out);",
+    // Non-array receivers: string (indexed chars), number (undefined),
+    // object with index props.
+    "const get = (a, i) => a[i]; console.log(get('xyz', 1), get(7, 0), get({ 0: 'zero' }, 0));",
+    // Typed arrays: valid-index reads run in-kernel; BigInt kinds abandon.
+    "const get = (a, i) => a[i]; const t = new Int32Array([4, 5, 6]); const f = new Float32Array([1.5, 2.5]); console.log(get(t, 1), get(f, 0), get(t, 9));",
+    "const get = (a, i) => a[i]; const b = new BigInt64Array(2); b[0] = 3n; console.log(typeof get(b, 0), String(get(b, 0)));",
+    // Element STORES keep the body generic (purity: abandon could not undo).
+    "function setz(a, i, v) { a[i] = v; return a[i]; } const arr = [0, 0]; console.log(setz(arr, 1, 42), arr.join(','));",
+    // Missing / extra arguments decline per call, generically.
+    "const get = (a, i) => a[i]; const arr = [9, 8]; console.log(get(arr), get(arr, 1, 'extra'), get());",
+    // Array mutated between calls: each access re-checks.
+    "const get = (a, i) => a[i]; const arr = [1]; console.log(get(arr, 0)); arr.push(2); console.log(get(arr, 1)); arr.length = 0; console.log(get(arr, 0));",
+    // Self-recursion consuming an array argument stays generic.
+    "function r(a, n) { return n <= 0 ? a[0] : r(a, n - 1); } console.log(r([7], 5));",
+    // An array-arg kernel used as a HOF callback (index into a sibling
+    // array) — reduce passes (acc, v, i, arr).
+    "const src2 = [10, 20, 30]; const sum = src2.reduce(function (acc, v, i, arr) { return acc + arr[i]; }, 0); console.log(sum);",
+    // Mixed: numeric args + array arg + Math in one kernelized body.
+    "function clampAt(a, i, lo) { return Math.max(a[i], lo); } const arr = [-5, 3, 12]; let s = 0; for (let i = 0; i < 3; i++) { s += clampAt(arr, i, 0); } console.log(s);",
 ];
 
 #[test]
@@ -613,6 +714,140 @@ fn v4_loops_get_kernels() {
     );
 }
 
+/// Captured-binding (own-frame CELL) loops actually kernelize — and the
+/// cell-write + pinned-closure-call combination never does (a callee's
+/// upvalue snapshot could go stale against the written cell).
+#[test]
+fn cell_loops_get_kernels() {
+    fn kernels_in(src: &str) -> usize {
+        fn count(p: &FuncProto) -> usize {
+            let mut n = p.kernels.len();
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    n += count(f);
+                }
+            }
+            n
+        }
+        count(&compile_script(src).expect("compiles"))
+    }
+    // Captured loop bound: the loop reads a cell every test.
+    assert!(
+        kernels_in("let n = 100; const f = () => n; let s = 0; for (let i = 0; i < n; i++) { s += i; } s;") >= 1,
+        "cell-bound loop must kernelize"
+    );
+    // Captured accumulator: the loop WRITES the cell.
+    assert!(
+        kernels_in("let total = 0; const f = () => total; for (let i = 0; i < 50; i++) { total += i; } total;") >= 1,
+        "cell-accumulator loop must kernelize"
+    );
+    // Cell WRITE + pinned closure call: excluded by translation.
+    assert_eq!(
+        kernels_in("const g = (x) => x * 2; let sum = 0; const f = () => sum; for (let i = 0; i < 10; i++) { sum += g(i); } sum;"),
+        0,
+        "cell-write + pinned-callee region must stay generic"
+    );
+    // Cell READ + pinned closure call: allowed.
+    assert!(
+        kernels_in("let n = 10; const keep = () => n; const g = (x) => x + 1; let s = 0; for (let i = 0; i < n; i++) { s += g(i); } s;") >= 1,
+        "read-only cell + pinned-callee loop must kernelize"
+    );
+}
+
+/// String-scan loops (`s.charCodeAt(i)` under an `s.length` bound) actually
+/// kernelize (pins the string-base tier against silent regressions).
+#[test]
+fn string_scan_loops_get_kernels() {
+    fn kernels_in(src: &str) -> usize {
+        fn count(p: &FuncProto) -> usize {
+            let mut n = p.kernels.len();
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    n += count(f);
+                }
+            }
+            n
+        }
+        count(&compile_script(src).expect("compiles"))
+    }
+    // The canonical tokenizer/hash scan.
+    assert!(
+        kernels_in("function f(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; } return h; }") >= 1,
+        "charCodeAt scan loop must kernelize"
+    );
+    // charCodeAt + dense-array write in one region.
+    assert!(
+        kernels_in("function f(s, a) { for (let i = 0; i < s.length; i++) { a[i] = s.charCodeAt(i); } }") >= 1,
+        "charCodeAt + array write loop must kernelize"
+    );
+    // charAt returns a STRING — unrepresentable, must stay generic.
+    assert_eq!(
+        kernels_in("function f(s) { let r = 0; for (let i = 0; i < s.length; i++) { r += s.charAt(i) ? 1 : 0; } return r; }"),
+        0,
+        "charAt loop must stay generic"
+    );
+}
+
+/// Array-argument bodies get FUNCTION kernels (`(a, i) => a[i]`) — and
+/// element stores / recursive array consumers never do (pins the arg-objs
+/// tier: reads abandon, stores and recursion stay generic).
+#[test]
+fn array_arg_functions_get_fn_kernels() {
+    fn first_fn_kernel(p: &FuncProto) -> Option<&chidori_js::bytecode::Kernel> {
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                if let Some(k) = &f.fn_kernel {
+                    return Some(k);
+                }
+                if let Some(k) = first_fn_kernel(f) {
+                    return Some(k);
+                }
+            }
+        }
+        None
+    }
+    // The canonical accessor kernelizes with one argument object slot.
+    let p = compile_script("const get = (a, i) => a[i]; get([1], 0);").expect("compiles");
+    let k = first_fn_kernel(&p).expect("(a, i) => a[i] must carry a function kernel");
+    assert_eq!(k.arg_objs.len(), 1, "one argument array base");
+    // `a.length` alone kernelizes too.
+    assert!(
+        first_fn_kernel(
+            &compile_script("const len = (a) => a.length; len([1]);").expect("compiles")
+        )
+        .is_some(),
+        "(a) => a.length must carry a function kernel"
+    );
+    // A loop over the array inside the body kernelizes (dot product).
+    assert!(
+        first_fn_kernel(
+            &compile_script("function dot(a, b, n) { let s = 0; for (let i = 0; i < n; i++) { s += a[i] * b[i]; } return s; } dot([1], [2], 1);")
+                .expect("compiles")
+        )
+        .is_some(),
+        "dot-product body must carry a function kernel"
+    );
+    // Element STORES are impure — no kernel.
+    assert!(
+        first_fn_kernel(
+            &compile_script("function setz(a, i, v) { a[i] = v; return 0; } setz([0], 0, 1);")
+                .expect("compiles")
+        )
+        .is_none(),
+        "element-storing body must stay generic"
+    );
+    // Recursion consuming an array argument — no kernel (an abandon deep in
+    // a recursion tree has nothing to rerun windows from).
+    assert!(
+        first_fn_kernel(
+            &compile_script("function r(a, n) { return n <= 0 ? a[0] : r(a, n - 1); } r([1], 2);")
+                .expect("compiles")
+        )
+        .is_none(),
+        "recursive array consumer must stay generic"
+    );
+}
+
 /// Tiny pure-scalar functions get a FUNCTION kernel (frameless call path) —
 /// and frame-dependent bodies never do (pins fn-kernel eligibility).
 #[test]
@@ -644,8 +879,9 @@ fn tiny_functions_get_fn_kernels() {
     for src in [
         // `arguments` needs a real frame.
         "function f() { return arguments.length; }",
-        // Property access needs a frame to bail into.
-        "const f = (a) => a.length;",
+        // NAMED property access (other than array-arg element/length reads,
+        // which the arg-objs tier abandons on) needs a frame to bail into.
+        "const f = (o) => o.x;",
         // Calls (incl. recursion) are off the allowlist.
         "function f(a, b) { return f(a) - b; }",
         // Allocation is off the allowlist.

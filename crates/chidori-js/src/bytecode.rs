@@ -1053,6 +1053,31 @@ pub enum KOp {
     /// `regs[dst] = <length>` of the dense array in object slot `obj`
     /// (unshadowed only — a reified `length` marker bails).
     LoadLen { dst: u16, obj: u16, bail: u16 },
+    /// `regs[dst] = s.charCodeAt(regs[idx])` over the pinned STRING in
+    /// string slot `sslot` — BAIL-FREE: the activation entry guard proved
+    /// the slot holds a primitive string (string-base locals are pinned
+    /// like array bases — in-region stores reject at translation, and
+    /// strings are immutable) and that the canonical
+    /// `String.prototype.charCodeAt` still backs the method (a primitive
+    /// receiver's property lookup goes through an own-index/length wrapper
+    /// straight to `String.prototype`, so nothing can shadow it). Every
+    /// `Number` index has a defined result: `ToIntegerOrInfinity` (NaN → 0,
+    /// truncation) then the code unit as f64 in bounds, NaN out of bounds —
+    /// exactly the builtin, sharing `JsString::code_unit_at` (O(1) on ASCII
+    /// strings via the cached unit count).
+    CharCodeAt { dst: u16, sslot: u16, idx: u16 },
+    /// `regs[dst] = s.length` of the pinned string in string slot `sslot` —
+    /// bail-free: `length` is an own property of the primitive's wrapper
+    /// (unshadowable), O(1) via the cached UTF-16 unit count.
+    StrLen { dst: u16, sslot: u16 },
+    /// FUNCTION kernels only: an array access over an argument base
+    /// ([`Kernel::arg_objs`]) missed its fast-path condition. A frameless
+    /// kernel has no bytecode frame to bail into, so the activation is
+    /// ABANDONED — sound because function kernels with array bases are
+    /// READ-ONLY pure (element/length reads; stores reject at translation),
+    /// so no effect has happened — and the caller reruns the whole call
+    /// generically, which performs the exact spec semantics.
+    Abandon,
     /// Materialize a comparison as a BOOLEAN register (`0.0`/`1.0`): the
     /// translator types the destination as Bool, so it writes back as
     /// `Value::Bool` and never feeds an array index.
@@ -1172,12 +1197,24 @@ pub struct KernelRec {
     pub globals: Box<[Box<str>]>,
 }
 
-/// A numeric register's source: a frame local (read/write), a captured
-/// upvalue cell (read-only snapshot), or — FUNCTION kernels only — a call
-/// argument (read-only; the entry guard requires it present and a `Number`).
+/// A numeric register's source: a frame local (read/write), an OWN-FRAME
+/// heap cell (read/write — a binding some nested closure captures, so
+/// localization left it a cell: the loop bound or accumulator shape), a
+/// captured upvalue cell (read-only snapshot), or — FUNCTION kernels only —
+/// a call argument (read-only; the entry guard requires it present and a
+/// `Number`).
+///
+/// `Cell` write-back is sound for the same reason upvalue snapshots are:
+/// nothing inside a kernel region can CALL the closure that captured the
+/// cell, so no observer exists between entry and the write-back at every
+/// exit/bail/interrupt. The one exception — pinned-closure calls
+/// ([`KOp::CallKernel`]), whose callees snapshot their upvalues once per
+/// activation — is excluded at translation: a region that WRITES any cell
+/// and calls a pinned closure stays generic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KSlot {
     Local(u32),
+    Cell(u32),
     Upvalue(u32),
     Arg(u32),
 }
@@ -1233,6 +1270,13 @@ pub enum KShapeSlot {
     /// materialized as `Value::Bool` — `typeof` must not see a number.
     Bool(u16),
     Obj(u16),
+    /// A pinned string base: materialized from the activation's string-slot
+    /// cache (the value is immutable and the local is pinned, so the cached
+    /// `JsString` IS the live value).
+    Str(u16),
+    /// The canonical `String.prototype.charCodeAt` function object (entry
+    /// guard proved the live value IS the canonical — like `ArrayPushFn`).
+    CharCodeFn,
     MathObj,
     MathFn(KMath),
 }
@@ -1324,10 +1368,12 @@ impl KMath {
 pub struct Kernel {
     pub code: Box<[KOp]>,
     /// Numeric slots mirrored into registers `0..locals.len()`: frame locals
-    /// (read/write) and UPVALUES (read-only snapshots — no call can run
-    /// inside a kernel, so nothing can write a captured cell mid-activation;
-    /// in-region upvalue WRITES reject at translation). The guard requires
-    /// `Value::Number` in every one; only `Local` slots write back.
+    /// (read/write), OWN-FRAME CELLS (read/write — captured loop bounds and
+    /// accumulators; see [`KSlot`]) and UPVALUES (read-only snapshots — no
+    /// call can run inside a kernel, so nothing can write a captured cell
+    /// mid-activation; in-region upvalue WRITES reject at translation). The
+    /// guard requires `Value::Number` in every one; `Local` and `Cell` slots
+    /// write back.
     ///
     /// FUNCTION kernels additionally use `Arg` slots (read-only; the guard
     /// requires the argument present and a `Number`), and their `Local` slots
@@ -1345,6 +1391,21 @@ pub struct Kernel {
     /// guard requires each to hold an object; per-access checks do the rest.
     /// Disjoint from `locals`, and never stored to inside the region.
     pub oslots: Box<[u32]>,
+    /// `frame.locals` indices of STRING BASES (`s` in `s.charCodeAt(i)` /
+    /// `s.length`): string slot `s` caches that local's `JsString` at kernel
+    /// entry. The guard requires each to hold a primitive string; the
+    /// accesses are then bail-free (strings are immutable and the local is
+    /// pinned). Disjoint from `locals` and `oslots`.
+    pub sslots: Box<[u32]>,
+    /// FUNCTION kernels only: ARGUMENT indices used as READ-ONLY array bases
+    /// (`(a, i) => a[i]` — object slot `s` resolves to `args[arg_objs[s]]`).
+    /// Element and `length` reads re-check their dense-array fast path per
+    /// access and [`KOp::Abandon`] the pure activation on any miss (the
+    /// caller reruns generically). Stores, and recursive kernels, reject at
+    /// translation; CallKernel/prepared-comparator callees with a non-empty
+    /// `arg_objs` decline at their guards (their argument windows carry raw
+    /// `f64`s only).
+    pub arg_objs: Box<[u32]>,
     /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
     pub shapes: Box<[Box<[KShapeSlot]>]>,
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
@@ -1390,6 +1451,10 @@ pub struct Kernel {
     /// identity-check the canonical getter for any typed-array LoadLen base.
     /// Kernels without a LoadLen skip that scan entirely.
     pub loads_len: bool,
+    /// Whether the code contains a [`KOp::CharCodeAt`]: the activation entry
+    /// must verify the canonical `String.prototype.charCodeAt` still backs
+    /// the `charCodeAt` property of the canonical String prototype.
+    pub uses_char_code: bool,
     /// Whether the code contains a [`KOp::ArrayPush`]: the activation entry
     /// must verify the canonical `Array.prototype.push` still backs the
     /// `push` property of the canonical Array prototype.
