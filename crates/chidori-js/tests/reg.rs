@@ -339,40 +339,35 @@ fn walk_protos(p: &FuncProto, f: &mut impl FnMut(&FuncProto)) {
 #[test]
 fn structural_translation_pins() {
     // Must translate: plain functions with calls, property access, loops
-    // over cells, closures, object literals, for-in, method calls.
-    for (name, src) in [
-        ("props+calls", "function f(o) { o.a = 1; return f2(o.a + o.b); } function f2(x) { return x * 2; } f({ b: 1 });"),
-        ("method call", "function m(a) { return a.slice(1).concat(9).length; } m([1, 2, 3]);"),
-        ("closure", "function mk(x) { return (y) => x + y; } mk(1)(2);"),
-        ("for-in", "function fi(o) { let s = ''; for (const k in o) s += k; return s; } fi({ a: 1 });"),
-        ("obj literal", "function ol() { return { a: 1, m() { return 2; }, get g() { return 3; } }; } ol();"),
-        ("ternary+logic", "function tl(a, b) { return (a ?? b) ? a && b : a || b; } tl(1, 2);"),
-        ("try/catch/finally", "function tc() { try { return 1; } catch (e) { return 2; } finally { } } tc();"),
-        ("for-of", "function fo(a) { let s = 0; for (const v of a) s += v; return s; } fo([1]);"),
-        ("array destructuring", "function ad(a) { const [x, , y = 9] = a; return x + y; } ad([1, 2]);"),
+    // over cells, closures, object literals, for-in, method calls, and (round
+    // 2) try/catch/finally, for-of, and array destructuring. Each pin names
+    // the function that must carry a register program — the top-level script
+    // proto almost always translates, so an any-function check would be
+    // vacuous.
+    for (name, needle, src) in [
+        ("props+calls", "f", "function f(o) { o.a = 1; return f2(o.a + o.b); } function f2(x) { return x * 2; } f({ b: 1 });"),
+        ("method call", "m", "function m(a) { return a.slice(1).concat(9).length; } m([1, 2, 3]);"),
+        ("closure", "mk", "function mk(x) { return (y) => x + y; } mk(1)(2);"),
+        ("for-in", "fi", "function fi(o) { let s = ''; for (const k in o) s += k; return s; } fi({ a: 1 });"),
+        ("obj literal", "ol", "function ol() { return { a: 1, m() { return 2; }, get g() { return 3; } }; } ol();"),
+        ("ternary+logic", "tl", "function tl(a, b) { return (a ?? b) ? a && b : a || b; } tl(1, 2);"),
+        ("try/catch", "tc", "function tc() { try { return this.x; } catch (e) { return 2; } } tc();"),
+        ("try/finally", "tf", "function tf(f) { try { return f(); } finally { console.log('x'); } } tf(() => 1);"),
+        ("for-of", "fo", "function fo(a) { let s = 0; for (const v of a) s += v; return s; } fo([1]);"),
+        ("destructuring", "ad", "function ad(a) { const [x, , y = 9] = a; return x + y; } ad([1, 2]);"),
     ] {
         let proto = compile_script(src).expect("compiles");
         let mut found = false;
         walk_protos(&proto, &mut |p| {
-            if p.reg.is_some() && !p.name.is_empty() {
+            if p.name == needle && p.reg.is_some() {
                 found = true;
             }
         });
-        assert!(found, "{name}: expected a register-translated function:\n{src}");
+        assert!(found, "{name}: `{needle}` must carry a register program:\n{src}");
     }
     // Must NOT translate: with, direct eval, generators, suspending async
     // bodies, `using` declarations, and loop-kernelized functions.
     for (name, needle, src) in [
-        (
-            "try",
-            "tc",
-            "function tc() { try { return 1; } catch (e) { return 2; } } tc();",
-        ),
-        (
-            "for-of",
-            "fo",
-            "function fo(a) { let s = 0; for (const v of a) s += v; return s; } fo([1]);",
-        ),
         (
             "with",
             "w",

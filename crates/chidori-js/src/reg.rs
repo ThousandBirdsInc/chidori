@@ -785,6 +785,14 @@ struct Emitter {
     /// rpc of the last emitted single-`dst` op whose result is the current
     /// virtual-stack top (for the `StoreLocal` dst-rewrite peephole).
     last_def: Option<usize>,
+    /// Normally-reachable ips from the pass-A dataflow: an `EndFinally` at a
+    /// normally-unreachable ip sits in an unwind-only pad and never falls
+    /// through (the entering unwind always parked a completion).
+    normal_visited: Vec<bool>,
+    /// `Op::CompletionJump` targets with NO converged label state (sorted).
+    /// Reached only through parked completions, so phase 2 draws no edge for
+    /// them; emitting a reachable jump to one declines the function.
+    unseeded_cj: Vec<u32>,
 }
 
 /// Translate a function's final stack bytecode into a register program.
@@ -837,108 +845,152 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
     // Phase 2: depth + maybe-TDZ dataflow to a fixpoint over the labels.
     // Depths are deterministic per label (mismatch = malformed input: bail);
     // TDZ sets grow monotonically under union, so this converges.
-    // Never iterated (get/insert only), so hasher nondeterminism is unobservable.
-    let mut label_states: HashMap<u32, LabelState> = HashMap::new();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let mut cur: Option<(u32, TdzSet)> = Some((0, TdzSet::empty(num_locals)));
-        for ip in 0..code.len() as u32 {
-            if is_label(ip) {
-                // Merge fall-in state into the label, then continue FROM the
-                // label's converged state.
-                if let Some((depth, tdz)) = cur.take() {
-                    match label_states.get_mut(&ip) {
+    //
+    // TWO passes. Pass A draws only the NORMAL control-flow edges, recording
+    // which ips are normally reachable: an `EndFinally` in an unwind-only
+    // finally pad (a for-of close pad — no normal edge ever enters it) can
+    // never fall through (the unwind that entered the pad always parked a
+    // completion first), so its dead fall-through edge must not constrain
+    // the join after the pad. Pass B re-runs the flow with the handler
+    // edges (catch at `depth + 1` — the exception register — and finally at
+    // the push-time depth, both with the conservative TDZ set), treating a
+    // normally-unreachable `EndFinally` as terminal.
+    let dataflow = |handler_edges: bool,
+                    endfin_linear: &dyn Fn(u32) -> bool|
+     -> Option<(HashMap<u32, LabelState>, Vec<bool>)> {
+        // Never iterated (get/insert only), so hasher nondeterminism is
+        // unobservable.
+        let mut label_states: HashMap<u32, LabelState> = HashMap::new();
+        let mut visited = vec![false; code.len()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut cur: Option<(u32, TdzSet)> = Some((0, TdzSet::empty(num_locals)));
+            for ip in 0..code.len() as u32 {
+                if is_label(ip) {
+                    // Merge fall-in state into the label, then continue FROM
+                    // the label's converged state.
+                    if let Some((depth, tdz)) = cur.take() {
+                        match label_states.get_mut(&ip) {
+                            Some(st) => {
+                                if st.depth != depth {
+                                    return None;
+                                }
+                                if st.tdz.union_with(&tdz) {
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                label_states.insert(ip, LabelState { depth, tdz });
+                                changed = true;
+                            }
+                        }
+                    }
+                    cur = label_states.get(&ip).map(|st| (st.depth, st.tdz.clone()));
+                }
+                let Some((depth, mut tdz)) = cur else {
+                    cur = None;
+                    continue;
+                };
+                visited[ip as usize] = true;
+                let op = &code[ip as usize];
+                let (pops, pushes) = effect(op).unwrap();
+                if depth < pops {
+                    return None; // malformed: operand-stack underflow
+                }
+                let after = depth - pops + pushes;
+                // Register indices are u16: `canon(depth) = num_locals + depth`
+                // (plus a scratch slot) must stay addressable. A pathological
+                // operand-stack depth (a 60k-element array literal) declines.
+                if num_locals + after + 8 > u16::MAX as u32 {
+                    return None;
+                }
+                tdz_transfer(op, &mut tdz);
+                // Propagate to the branch target (if any).
+                let mut edge = |target: u32, depth: u32, tdz: &TdzSet| -> Option<()> {
+                    if target as usize > code.len() {
+                        return None;
+                    }
+                    match label_states.get_mut(&target) {
                         Some(st) => {
                             if st.depth != depth {
                                 return None;
                             }
-                            if st.tdz.union_with(&tdz) {
+                            if st.tdz.union_with(tdz) {
                                 changed = true;
                             }
                         }
                         None => {
-                            label_states.insert(ip, LabelState { depth, tdz });
+                            label_states.insert(
+                                target,
+                                LabelState {
+                                    depth,
+                                    tdz: tdz.clone(),
+                                },
+                            );
                             changed = true;
                         }
                     }
-                }
-                cur = label_states.get(&ip).map(|st| (st.depth, st.tdz.clone()));
-            }
-            let Some((depth, mut tdz)) = cur else {
-                cur = None;
-                continue;
-            };
-            let op = &code[ip as usize];
-            let (pops, pushes) = effect(op).unwrap();
-            if depth < pops {
-                return None; // malformed: operand-stack underflow
-            }
-            let after = depth - pops + pushes;
-            // Register indices are u16: `canon(depth) = num_locals + depth`
-            // (plus a scratch slot) must stay addressable. A pathological
-            // operand-stack depth (a 60k-element array literal) declines.
-            if num_locals + after + 8 > u16::MAX as u32 {
-                return None;
-            }
-            tdz_transfer(op, &mut tdz);
-            // Propagate to the branch target (if any).
-            let mut edge = |target: u32, depth: u32, tdz: &TdzSet| -> Option<()> {
-                if target as usize > code.len() {
-                    return None;
-                }
-                match label_states.get_mut(&target) {
-                    Some(st) => {
-                        if st.depth != depth {
-                            return None;
+                    Some(())
+                };
+                if handler_edges {
+                    if let Op::PushTryHandler { catch, finally } = op {
+                        if *catch != u32::MAX {
+                            edge(*catch, depth + 1, &all_tdz)?;
                         }
-                        if st.tdz.union_with(tdz) {
-                            changed = true;
+                        if *finally != u32::MAX {
+                            edge(*finally, depth, &all_tdz)?;
                         }
                     }
-                    None => {
-                        label_states.insert(
-                            target,
-                            LabelState {
-                                depth,
-                                tdz: tdz.clone(),
-                            },
-                        );
-                        changed = true;
+                }
+                if matches!(op, Op::EndFinally) && !endfin_linear(ip) {
+                    cur = None;
+                    continue;
+                }
+                cur = match flow_of(op) {
+                    FlowKind::Linear => Some((after, tdz)),
+                    FlowKind::Jump(t) => {
+                        edge(t, after, &tdz)?;
+                        None
                     }
-                }
-                Some(())
-            };
-            // Handler edges: the catch target is entered with the exception
-            // at `canon(depth)` (depth + 1); the finally target at `depth`.
-            // Both use the conservative TDZ set.
-            if let Op::PushTryHandler { catch, finally } = op {
-                if *catch != u32::MAX {
-                    edge(*catch, depth + 1, &all_tdz)?;
-                }
-                if *finally != u32::MAX {
-                    edge(*finally, depth, &all_tdz)?;
-                }
+                    FlowKind::Branch(t) => {
+                        edge(t, after, &tdz)?;
+                        Some((after, tdz))
+                    }
+                    FlowKind::PeekBranch(t) => {
+                        // Target keeps the top value; fallthrough pops it.
+                        edge(t, depth, &tdz)?;
+                        Some((depth - 1, tdz))
+                    }
+                    FlowKind::Terminal => None,
+                };
             }
-            cur = match flow_of(op) {
-                FlowKind::Linear => Some((after, tdz)),
-                FlowKind::Jump(t) => {
-                    edge(t, after, &tdz)?;
-                    None
-                }
-                FlowKind::Branch(t) => {
-                    edge(t, after, &tdz)?;
-                    Some((after, tdz))
-                }
-                FlowKind::PeekBranch(t) => {
-                    // Target keeps the top value; fallthrough pops it.
-                    edge(t, depth, &tdz)?;
-                    Some((depth - 1, tdz))
-                }
-                FlowKind::Terminal => None,
-            };
         }
-    }
+        Some((label_states, visited))
+    };
+    // Pass A: normal edges only; every EndFinally provisionally falls through.
+    let (_, normal_visited) = dataflow(false, &|_| true)?;
+    // Pass B: handler edges; an EndFinally falls through iff its pad is ever
+    // entered on the normal path.
+    let endfin_linear = |ip: u32| normal_visited[ip as usize];
+    let (label_states, _) = dataflow(true, &endfin_linear)?;
+
+    // CompletionJump targets are reached only through the PARKED completion
+    // (phase 2 draws no edge): collect the ones no normal edge seeded, so a
+    // reachable jump to one declines the function (its code was skipped and
+    // the rpc mapping would be garbage) — e.g. a `while(true)` whose sole
+    // exits break through a `finally`.
+    let mut unseeded_cj: Vec<u32> = code
+        .iter()
+        .filter_map(|op| match op {
+            Op::CompletionJump { target, .. } if !label_states.contains_key(target) => {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .collect();
+    unseeded_cj.sort_unstable();
+    unseeded_cj.dedup();
 
     // Phase 3: emission.
     let mut e = Emitter {
@@ -949,6 +1001,8 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
         max_reg: num_locals.saturating_sub(1) as u16,
         ics: 0,
         last_def: None,
+        normal_visited,
+        unseeded_cj,
     };
     // rpc of each stack ip (branch targets remapped through this at the end).
     let mut rpc_at: Vec<u32> = vec![0; code.len() + 1];
@@ -990,15 +1044,6 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
             }
         }
         ip += consumed;
-    }
-    // Every branch target must have converged to a label state — a target
-    // reachable ONLY through parked completions (e.g. a `while(true)` whose
-    // sole exits break through a `finally`) has none, and remapping it would
-    // point into skipped code. Decline such functions.
-    for &t in &labels {
-        if (t as usize) < code.len() && !label_states.contains_key(&t) {
-            return None;
-        }
     }
     rpc_at[code.len()] = e.code.len() as u32;
     // Falling off the end of the code returns like the stack loop's
@@ -1927,6 +1972,15 @@ impl Emitter {
             }
             PopTryHandler => self.push_op(ROp::PopTryHandler),
             CompletionJump { target, boundary } => {
+                // The jump target is reached only through the PARKED
+                // completion (phase 2 draws no edge for it): it must have a
+                // normally-seeded label state, or the code there was skipped
+                // as unreachable and the rpc mapping would be garbage —
+                // decline (e.g. a `while(true)` whose sole exits break
+                // through a `finally`).
+                if self.unseeded_cj.binary_search(target).is_ok() {
+                    return None;
+                }
                 self.flush_all();
                 self.push_op(ROp::CompletionJump {
                     target: *target,
@@ -1940,6 +1994,13 @@ impl Emitter {
                 // registers.
                 self.flush_all();
                 self.push_op(ROp::EndFinally);
+                // In an unwind-only pad (never entered on the normal path)
+                // the completion is ALWAYS parked, so this never falls
+                // through — and its phantom fall-through must not flow into
+                // the join after the pad (pass B already excluded it).
+                if !self.normal_visited[ip as usize] {
+                    return Some((false, 1));
+                }
             }
             IteratorClose => {
                 let it = self.pop_reg();

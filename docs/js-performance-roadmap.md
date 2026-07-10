@@ -1211,6 +1211,14 @@ Wall-clock (idle container, 5-run median, execution-only):
 | json_roundtrip | 154 ms | 147 ms | 1.05× |
 | kernel-owned workloads | — | — | 1.0× (noise) |
 
+Handler-machinery spot check (round 2): an ad-hoc for-of/try/destructuring
+glue script (`Object.entries` iteration, destructuring in a helper called
+per entry, try/catch around a throwing path, try/finally in the loop body —
+all shapes round 1 declined) measures **518.9 M vs 646.6 M instructions
+(−19.8%)** and 84 ms vs 103 ms wall (1.23×) reg-on vs reg-off, RESULT
+byte-identical. The committed suite's rows are unchanged (no committed
+workload uses try/for-of in hot code).
+
 `mixed_helpers` is a new workload added with this round: small helper
 functions over objects and strings (property traffic across calls, string
 building, for-in, ternary classification) — the shape of real agent glue
