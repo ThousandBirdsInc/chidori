@@ -64,9 +64,10 @@ fn journal(n: u64, payload_bytes: usize) -> Vec<CallRecord> {
     (1..=n).map(|seq| record(seq, payload_bytes)).collect()
 }
 
-/// A resume sweep: look up every recorded seq in order, exactly as a
-/// replaying run does one host call at a time. Fresh context per iteration
-/// because `try_replay` re-records each hit into the new call log.
+/// A resume sweep: look up every recorded seq in order and absorb its
+/// subtree, exactly as `host_core::execute_host_call` does per replay hit.
+/// Fresh context per iteration because `try_replay` re-records each hit into
+/// the new call log.
 fn bench_replay_lookup(c: &mut Criterion) {
     let mut g = c.benchmark_group("replay_lookup");
     for n in [100u64, 1000, 4000] {
@@ -78,6 +79,7 @@ fn bench_replay_lookup(c: &mut Criterion) {
                 |ctx| {
                     for seq in 1..=n {
                         black_box(ctx.try_replay(seq));
+                        ctx.absorb_replayed_subtree(seq);
                     }
                 },
                 BatchSize::LargeInput,

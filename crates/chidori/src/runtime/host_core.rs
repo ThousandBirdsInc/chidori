@@ -1158,6 +1158,27 @@ const DEFAULT_USER_AGENT: &str = concat!(
     " (+https://github.com/ThousandBirdsInc/chidori)",
 );
 
+/// The process-wide HTTP client for the `http`/`fetch` host effect. Building
+/// a `reqwest::Client` loads TLS roots and allocates a fresh connection pool
+/// (~7 ms measured in `benches/runtime.rs`), and a per-call client also means
+/// a fresh TCP+TLS handshake for every fetch — so it is built once and
+/// shared; repeat fetches to the same host reuse pooled connections. The
+/// default User-Agent is applied per request (not here) so callers can still
+/// override it.
+fn http_client() -> Result<reqwest::Client> {
+    use std::sync::OnceLock;
+
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    // `gzip(true)` (with the reqwest `gzip` feature) sends Accept-Encoding
+    // and transparently decompresses gzipped response bodies, so tools get
+    // readable text instead of a binary blob.
+    let built = reqwest::Client::builder().gzip(true).build()?;
+    Ok(CLIENT.get_or_init(|| built).clone())
+}
+
 /// Rewrite `url` to the per-agent Mock Gateway when its host is listed in the
 /// `CHIDORI_INTEGRATION_BASE_URLS` env map (`{host: "http://127.0.0.1:port/__mock/<id>"}`),
 /// preserving path and query. Returns `None` (no rewrite) when the env var is
@@ -1380,20 +1401,16 @@ fn execute_http_with_secrets(
         .is_some_and(|map| map.keys().any(|key| key.eq_ignore_ascii_case("user-agent")));
 
     tokio_rt.block_on(async move {
-        // `gzip(true)` (with the reqwest `gzip` feature) sends Accept-Encoding
-        // and transparently decompresses gzipped response bodies, so tools get
-        // readable text instead of a binary blob.
-        let mut client_builder = reqwest::Client::builder().gzip(true);
+        let client = http_client()?;
+        let request_method =
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+        let mut req = client.request(request_method, &url);
         // Only install the default UA when the caller hasn't named their own —
         // reqwest's `header()` appends rather than replaces, so setting both
         // would put two User-Agent headers on the wire.
         if !caller_set_user_agent {
-            client_builder = client_builder.user_agent(DEFAULT_USER_AGENT);
+            req = req.header(reqwest::header::USER_AGENT, DEFAULT_USER_AGENT);
         }
-        let client = client_builder.build().map_err(|err| anyhow::anyhow!(err))?;
-        let request_method =
-            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-        let mut req = client.request(request_method, &url);
 
         if let Some(headers) = headers {
             for (name, value) in headers {
