@@ -28,7 +28,7 @@ use crate::runtime::host_core::signal_timeout_sentinel;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation,
     PendingHostOperationKind, RuntimePolicy, SnapshotAbi, SnapshotStore, SourceFingerprint,
-    HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
+    PENDING_HOST_OPERATION_FILE,
 };
 use crate::runtime::template::TemplateEngine;
 use crate::scheduler::{self, SchedulerDeps};
@@ -62,6 +62,144 @@ struct AppState {
     /// inbox mutation atomic, matching how the server already serializes per-run
     /// state. See `docs/signals.md` §11.
     signal_inbox_locks: Arc<StdMutex<HashMap<String, Arc<StdMutex<()>>>>>,
+    /// Warm-parked runs by SESSION id (`docs/resume-performance.md` §5): while
+    /// a run is parked at an `input()` pause its VM stays live on its blocking
+    /// thread, and `/resume` delivers the response through `resolution`
+    /// instead of replaying the whole history. Entries degrade gracefully —
+    /// removing one (cancel, eviction, restart) drops the resolution sender,
+    /// the parked bridge wakes with `Park`, and the run unwinds into the
+    /// classic replay-resume artifact.
+    warm_runs: Arc<StdMutex<HashMap<String, Arc<WarmRun>>>>,
+    /// How long a warm-parked run waits for its resume before evicting itself
+    /// back to the unwind path (freeing the thread and VM).
+    warm_evict: std::time::Duration,
+}
+
+/// One session's warm run: the channel its parked engine thread listens on
+/// (`Some` exactly while parked at an input pause) and the stream of leg
+/// outcomes — one `RunResult` per pause plus the terminal result.
+struct WarmRun {
+    resolution: StdMutex<Option<std::sync::mpsc::Sender<String>>>,
+    outcomes: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<anyhow::Result<RunResult>>>,
+}
+
+/// Kill switch: `CHIDORI_WARM_RESUME=0|false|off` restores unwind-and-replay
+/// for every pause.
+fn warm_resume_enabled() -> bool {
+    !matches!(
+        std::env::var("CHIDORI_WARM_RESUME").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
+fn warm_evict_from_env() -> std::time::Duration {
+    let ms = std::env::var("CHIDORI_WARM_RESUME_EVICT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(600_000);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Register a fresh warm run for `session_id` (replacing any stale entry) and
+/// build the [`WarmInputBridge`] its engine leg installs: on an `input()`
+/// pause the bridge surfaces a paused `RunResult` on the outcome channel —
+/// the exact shape the unwind path returns — and parks the engine thread
+/// awaiting the response. The caller spawns the leg and forwards its final
+/// result into the same outcome channel, so each HTTP request consumes
+/// exactly one outcome.
+fn install_warm_run(
+    state: &AppState,
+    session_id: &str,
+) -> (
+    Arc<WarmRun>,
+    tokio::sync::mpsc::UnboundedSender<anyhow::Result<RunResult>>,
+    crate::runtime::context::WarmInputBridge,
+) {
+    let (outcome_tx, outcome_rx) = tokio::sync::mpsc::unbounded_channel();
+    let warm = Arc::new(WarmRun {
+        resolution: StdMutex::new(None),
+        outcomes: tokio::sync::Mutex::new(outcome_rx),
+    });
+    state
+        .warm_runs
+        .lock()
+        .unwrap()
+        .insert(session_id.to_string(), warm.clone());
+    // The bridge holds only a WEAK reference to the entry: the resolution
+    // sender lives inside `WarmRun`, so if the bridge kept a strong Arc the
+    // parked thread would hold its own wake channel alive and a dropped
+    // entry (cancel, restart, server shutdown, test teardown) could never
+    // disconnect it. With the weak ref, removing the entry from the map
+    // drops the sender and the parked thread wakes with `Park` immediately.
+    let bridge_warm = Arc::downgrade(&warm);
+    let bridge_outcomes = outcome_tx.clone();
+    let evict = state.warm_evict;
+    let bridge_run_base = state.run_base.clone();
+    let bridge = crate::runtime::context::WarmInputBridge::new(move |ctx, pending| {
+        use crate::runtime::context::WarmInputWait;
+        // The pause becomes externally visible when the outcome surfaces, so
+        // drain the durability barrier first (mirror pipelines included) —
+        // the same output gate the unwind path runs at a pause.
+        if ctx.flush_store().is_err() {
+            return WarmInputWait::Park;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let Some(warm) = bridge_warm.upgrade() else {
+                return WarmInputWait::Park;
+            };
+            *warm.resolution.lock().unwrap() = Some(tx);
+            // The Arc drops here: while parked, this thread must NOT keep the
+            // entry (and thus its own sender) alive.
+        }
+        let leg = Ok(RunResult {
+            output: Value::Null,
+            call_log: ctx.call_log(),
+            run_id: ctx.run_id(),
+            paused: Some(pending.clone()),
+            paused_approval: None,
+            paused_signal: None,
+        });
+        if bridge_outcomes.send(leg).is_err() {
+            if let Some(warm) = bridge_warm.upgrade() {
+                *warm.resolution.lock().unwrap() = None;
+            }
+            return WarmInputWait::Park;
+        }
+        let outcome = match rx.recv_timeout(evict) {
+            Ok(response) => {
+                // Reload the durable signal inbox before continuing: a signal
+                // delivered while this run was parked landed in
+                // `signals/inbox.json` (the server enqueues around paused
+                // runs), which the live VM's in-memory inbox cannot see. The
+                // file is the union — live drains re-persist it — so the
+                // reload is exactly what a replay resume would have seeded.
+                let run_id = ctx.run_id();
+                ctx.set_signal_inbox(load_persisted_signal_inbox(&bridge_run_base, Some(&run_id)));
+                WarmInputWait::Delivered(response)
+            }
+            // Eviction deadline, or the entry was dropped (cancel/restart/
+            // shutdown — the sender disconnects): unwind into the ordinary
+            // paused artifact; a later /resume replays. The engine thread
+            // and VM are reclaimed.
+            Err(_) => WarmInputWait::Park,
+        };
+        if let Some(warm) = bridge_warm.upgrade() {
+            *warm.resolution.lock().unwrap() = None;
+        }
+        outcome
+    });
+    (warm, outcome_tx, bridge)
+}
+
+/// Drop a session's warm entry when its run settled terminally (or its live
+/// leg is gone), so the map holds only parked/parkable runs.
+fn release_warm_run_if_settled(state: &AppState, session: &StoredSession) {
+    if !matches!(session.status, SessionStatus::Paused) {
+        // Completed / Failed / AwaitingApproval / Cancelled: the leg ended (an
+        // approval pause always unwinds), so nothing is parked to deliver to.
+        state.warm_runs.lock().unwrap().remove(&session.id);
+    }
 }
 
 impl AppState {
@@ -182,24 +320,28 @@ fn validate_snapshot_manifest_for_resume(
         anyhow::anyhow!("reading resume source {}: {}", agent_path.display(), err)
     })?;
     let current_entry = SourceFingerprint::from_source(agent_path, &entry_source);
-    let mut current_modules = Vec::with_capacity(manifest.modules.len());
-    for module in &manifest.modules {
-        let source = std::fs::read_to_string(&module.path).map_err(|err| {
-            anyhow::anyhow!(
-                "reading resume module source {}: {}",
-                module.path.display(),
-                err
-            )
-        })?;
-        current_modules.push(SourceFingerprint::from_source(&module.path, &source));
-    }
-
     let expected_abi = SnapshotAbi::current("chidori-quickjs");
     let expected_policy = RuntimePolicy::from_env_for_durable_run(run_id)?;
-    let current_module_graph = if manifest.module_graph.is_empty() {
-        Vec::new()
+    // One module walk yields both manifest views (fingerprints + graph), so
+    // each imported module is read from disk once per resume instead of twice
+    // (once for its fingerprint, again inside the graph walk). Manifests
+    // written before the graph existed fall back to fingerprinting exactly
+    // the paths they list.
+    let (current_modules, current_module_graph) = if manifest.module_graph.is_empty() {
+        let mut current_modules = Vec::with_capacity(manifest.modules.len());
+        for module in &manifest.modules {
+            let source = std::fs::read_to_string(&module.path).map_err(|err| {
+                anyhow::anyhow!(
+                    "reading resume module source {}: {}",
+                    module.path.display(),
+                    err
+                )
+            })?;
+            current_modules.push(SourceFingerprint::from_source(&module.path, &source));
+        }
+        (current_modules, Vec::new())
     } else {
-        crate::runtime::typescript::module_graph::snapshot_module_graph(
+        crate::runtime::typescript::module_graph::snapshot_modules(
             agent_path,
             &entry_source,
             &expected_policy,
@@ -244,10 +386,10 @@ fn complete_persisted_pending_host_operation(
         }
     }
 
-    let mut records: Vec<HostPromiseRecord> = match store.get_blob(HOST_PROMISE_TABLE_FILE)? {
-        Some(bytes) => serde_json::from_slice(&bytes)?,
-        None => Vec::new(),
-    };
+    // Union the compacted table with any per-op blobs written since the last
+    // compaction; a delivery is a natural compaction point, so the updated
+    // table is folded back to `host_promises.json` and the blobs retired.
+    let mut records = crate::runtime::snapshot::load_host_promise_records(store.as_ref())?;
     let completed_at = chrono::Utc::now();
     let record = records
         .iter_mut()
@@ -274,10 +416,8 @@ fn complete_persisted_pending_host_operation(
             completed_at,
         },
     };
-    store.put_blob(
-        HOST_PROMISE_TABLE_FILE,
-        &serde_json::to_vec_pretty(&records)?,
-    )?;
+    crate::runtime::snapshot::SnapshotStore::with_store(run_base.join(run_id), store.clone())
+        .compact_host_promises(&records)?;
     store.delete_blob(PENDING_HOST_OPERATION_FILE)?;
     Ok(Some(pending))
 }
@@ -292,10 +432,7 @@ fn complete_persisted_host_promise_record(
         return Ok(());
     };
     let store = crate::runtime::store::RunStoreFactory::shared(run_base).store_for(run_id);
-    let mut records: Vec<HostPromiseRecord> = match store.get_blob(HOST_PROMISE_TABLE_FILE)? {
-        Some(bytes) => serde_json::from_slice(&bytes)?,
-        None => Vec::new(),
-    };
+    let mut records = crate::runtime::snapshot::load_host_promise_records(store.as_ref())?;
     let completed_at = chrono::Utc::now();
     let record = records
         .iter_mut()
@@ -319,10 +456,8 @@ fn complete_persisted_host_promise_record(
             completed_at,
         },
     };
-    store.put_blob(
-        HOST_PROMISE_TABLE_FILE,
-        &serde_json::to_vec_pretty(&records)?,
-    )?;
+    crate::runtime::snapshot::SnapshotStore::with_store(run_base.join(run_id), store.clone())
+        .compact_host_promises(&records)?;
     Ok(())
 }
 
@@ -335,13 +470,11 @@ fn load_persisted_host_promises(
     };
     // Materialize the run dir from the durable mirror first when this machine
     // has never seen the run (the machine-loss recovery path).
-    let _ = crate::runtime::store::RunStoreFactory::shared(run_base).hydrate(run_id);
-    let table_path = run_base.join(run_id).join(HOST_PROMISE_TABLE_FILE);
-    if !table_path.exists() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_slice(&std::fs::read(&table_path)?)
-        .map_err(|err| anyhow::anyhow!("parsing {}: {}", table_path.display(), err))
+    let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
+    let _ = factory.hydrate(run_id);
+    // Union of the compacted table and any per-op blobs written since the
+    // last compaction (`docs/durable-storage.md`).
+    crate::runtime::snapshot::load_host_promise_records(factory.store_for(run_id).as_ref())
 }
 
 /// Load the virtual filesystem captured in a run's snapshot manifest so a
@@ -508,6 +641,8 @@ pub async fn serve(
         acquire_timeout: std::time::Duration::from_millis(acquire_timeout_ms),
         active_sessions: Arc::new(StdMutex::new(HashMap::new())),
         signal_inbox_locks: Arc::new(StdMutex::new(HashMap::new())),
+        warm_runs: Arc::new(StdMutex::new(HashMap::new())),
+        warm_evict: warm_evict_from_env(),
     };
 
     // Re-arm signal-pause timeout timers (`timeoutMs`, `docs/signals.md`
@@ -1113,15 +1248,46 @@ async fn create_session(
     };
     let app_state = state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state, body.policy_profile.as_deref());
-        match replay_from {
-            Some(log) => engine.run_replay_pausable(&effective_agent_path, &body.input, log),
-            None => engine.run_pausable(&effective_agent_path, &body.input),
+    let result = if warm_resume_enabled() {
+        // Warm mode: run the leg under a supervisor task and consume ONE
+        // outcome — either an input pause surfaced by the bridge (the VM
+        // stays parked on its thread for `/resume` to continue in place) or
+        // the leg's final result.
+        let (warm, outcome_tx, bridge) = install_warm_run(&state, &id);
+        let leg_input = body.input.clone();
+        let leg_profile = body.policy_profile.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let engine =
+                    build_engine(&app_state, leg_profile.as_deref()).with_warm_input_bridge(bridge);
+                match replay_from {
+                    Some(log) => engine.run_replay_pausable(&effective_agent_path, &leg_input, log),
+                    None => engine.run_pausable(&effective_agent_path, &leg_input),
+                }
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(anyhow::anyhow!("agent run panicked: {join_err}")));
+            let _ = outcome_tx.send(result);
+        });
+        let outcome = {
+            let mut outcomes = warm.outcomes.lock().await;
+            outcomes.recv().await
+        };
+        match outcome {
+            Some(result) => result,
+            None => Err(anyhow::anyhow!("agent run ended without an outcome")),
         }
-    })
-    .await
-    .unwrap();
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let engine = build_engine(&app_state, body.policy_profile.as_deref());
+            match replay_from {
+                Some(log) => engine.run_replay_pausable(&effective_agent_path, &body.input, log),
+                None => engine.run_pausable(&effective_agent_path, &body.input),
+            }
+        })
+        .await
+        .unwrap()
+    };
 
     let mut session = StoredSession {
         id: id.clone(),
@@ -1150,6 +1316,7 @@ async fn create_session(
         return err;
     }
     arm_signal_timeout(&state, &session);
+    release_warm_run_if_settled(&state, &session);
     drop(permit);
     (StatusCode::CREATED, Json(session_view(&session))).into_response()
 }
@@ -1828,6 +1995,9 @@ async fn cancel_session(
         .unwrap_or_else(|| "session cancelled".to_string());
 
     let active = state.active_sessions.lock().unwrap().remove(&id);
+    // Dropping a warm entry drops its resolution sender: a parked engine
+    // thread wakes with `Park` and unwinds, reclaiming the thread and VM.
+    state.warm_runs.lock().unwrap().remove(&id);
     let was_active = active.is_some();
     let active_attempt_number = active.as_ref().and_then(|active| active.attempt_number);
     if let Some(active) = &active {
@@ -2072,8 +2242,21 @@ async fn complete_pending_and_resume(
     let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
+    // The resumed leg gets its own warm bridge (when enabled), so a LATER
+    // `input()` pause in the continuation parks the live VM for the next
+    // /resume instead of unwinding — every replay-based resume upgrades the
+    // session back onto the warm path.
+    let warm = if warm_resume_enabled() {
+        Some(install_warm_run(state, &original.id))
+    } else {
+        None
+    };
+    let run_leg = move |bridge: Option<crate::runtime::context::WarmInputBridge>| {
+        let mut engine =
+            build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
+        if let Some(bridge) = bridge {
+            engine = engine.with_warm_input_bridge(bridge);
+        }
         // Continue under the original run id (when known) so the resumed run
         // keeps its persisted run directory and stays a single durable run,
         // matching the live-VM resume path. Falls back to a fresh id only when
@@ -2098,9 +2281,31 @@ async fn complete_pending_and_resume(
                 signal_inbox,
             ),
         }
-    })
-    .await
-    .unwrap();
+    };
+
+    let result = match warm {
+        Some((warm, outcome_tx, bridge)) => {
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || run_leg(Some(bridge)))
+                    .await
+                    .unwrap_or_else(|join_err| {
+                        Err(anyhow::anyhow!("agent run panicked: {join_err}"))
+                    });
+                let _ = outcome_tx.send(result);
+            });
+            let outcome = {
+                let mut outcomes = warm.outcomes.lock().await;
+                outcomes.recv().await
+            };
+            match outcome {
+                Some(result) => result,
+                None => Err(anyhow::anyhow!("agent run ended without an outcome")),
+            }
+        }
+        None => tokio::task::spawn_blocking(move || run_leg(None))
+            .await
+            .unwrap(),
+    };
 
     let mut session = original;
     match result {
@@ -2113,12 +2318,14 @@ async fn complete_pending_and_resume(
                 return err;
             }
             arm_signal_timeout(state, &session);
+            release_warm_run_if_settled(state, &session);
             (StatusCode::OK, Json(session_view(&session))).into_response()
         }
         Err(e) => {
             session.status = SessionStatus::Failed;
             session.error = Some(e.to_string());
             let _ = state.session_store.put(&session);
+            state.warm_runs.lock().unwrap().remove(&session.id);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
@@ -2172,6 +2379,49 @@ async fn resume_session(
         )
             .into_response();
     };
+
+    // Warm fast path: this session's VM is parked on its thread awaiting
+    // exactly this response — deliver it and await the leg's next outcome
+    // (the next pause or the terminal result). The parked engine records the
+    // same journal entry the synthetic replay injection below produces, so
+    // the durable artifacts are identical either way. Falls back to the
+    // replay path when nothing is parked (server restart, eviction, kill
+    // switch) — that path re-derives everything from the journal.
+    let warm_entry = state.warm_runs.lock().unwrap().get(&id).cloned();
+    if let Some(warm) = warm_entry {
+        let parked = warm.resolution.lock().unwrap().take();
+        match parked {
+            Some(tx) if tx.send(body.response.clone()).is_ok() => {
+                let result = {
+                    let mut outcomes = warm.outcomes.lock().await;
+                    outcomes.recv().await
+                };
+                let mut session = original;
+                match result {
+                    Some(Ok(run_result)) => apply_run_outcome(&mut session, run_result),
+                    Some(Err(e)) => {
+                        session.status = SessionStatus::Failed;
+                        session.error = Some(e.to_string());
+                    }
+                    None => {
+                        session.status = SessionStatus::Failed;
+                        session.error = Some("agent run ended without an outcome".to_string());
+                    }
+                }
+                if let Some(err) = store_or_500(&state, &session) {
+                    return err;
+                }
+                arm_signal_timeout(&state, &session);
+                release_warm_run_if_settled(&state, &session);
+                return (StatusCode::OK, Json(session_view(&session))).into_response();
+            }
+            _ => {
+                // Not parked (evicted, unwound, or a racing resume won):
+                // retire the stale entry and take the replay path.
+                state.warm_runs.lock().unwrap().remove(&id);
+            }
+        }
+    }
 
     if let Err(err) = validate_snapshot_manifest_for_resume(
         &state.run_base,
@@ -2714,6 +2964,7 @@ async fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE;
     use axum::body;
 
     fn test_run_base(name: &str) -> PathBuf {
@@ -2738,6 +2989,8 @@ mod tests {
             acquire_timeout: std::time::Duration::from_millis(1),
             active_sessions: Arc::new(StdMutex::new(HashMap::new())),
             signal_inbox_locks: Arc::new(StdMutex::new(HashMap::new())),
+            warm_runs: Arc::new(StdMutex::new(HashMap::new())),
+            warm_evict: warm_evict_from_env(),
         }
     }
 
@@ -4018,6 +4271,232 @@ mod tests {
         let run_base = temp_dir.join(".chidori").join("runs");
         let state = test_state(run_base, agent_path);
         (temp_dir, state)
+    }
+
+    /// True while `id`'s engine thread is warm-parked at an input pause.
+    fn warm_parked(state: &AppState, id: &str) -> bool {
+        state
+            .warm_runs
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|warm| warm.resolution.lock().unwrap().is_some())
+            .unwrap_or(false)
+    }
+
+    const TWO_INPUT_AGENT: &str = r#"
+        export async function agent(input, chidori) {
+            const a = await chidori.input("first?");
+            const b = await chidori.input("second?");
+            return { a, b };
+        }
+    "#;
+
+    fn warm_create_request(session_id: &str) -> CreateSessionRequest {
+        CreateSessionRequest {
+            input: json!({}),
+            session_id: Some(session_id.to_string()),
+            attempt_number: None,
+            replay_from: None,
+            agent: None,
+            policy_profile: None,
+        }
+    }
+
+    async fn resume_with(state: &AppState, id: &str, response: &str) -> (StatusCode, Value) {
+        response_json(
+            resume_session(
+                State(state.clone()),
+                Path(id.to_string()),
+                Json(ResumeRequest {
+                    response: response.to_string(),
+                }),
+            )
+            .await,
+        )
+        .await
+    }
+
+    /// Records that matter for replay parity: (seq, function, args, result).
+    fn journal_shape(run_base: &FsPath, run_id: &str) -> Vec<(u64, String, Value, Value)> {
+        use crate::runtime::store::RunStore as _;
+        crate::runtime::store::FsRunStore::new(run_base.join(run_id))
+            .load_call_log()
+            .unwrap()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.seq, r.function, r.args, r.result))
+            .collect()
+    }
+
+    /// End-to-end warm resume: the run parks its live VM at each input pause,
+    /// /resume continues it in place, and the terminal outcome retires the
+    /// warm entry.
+    #[tokio::test]
+    async fn warm_resume_continues_parked_run_in_place() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "chidori-server-warm-resume-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agent_path = write_agent(&temp_dir, TWO_INPUT_AGENT);
+        let run_base = temp_dir.join(".chidori").join("runs");
+        std::fs::create_dir_all(&run_base).unwrap();
+        let state = test_state(run_base.clone(), agent_path);
+
+        let (status, body) = response_json(
+            create_session(State(state.clone()), Json(warm_create_request("warm-1"))).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["status"], json!("paused"));
+        assert_eq!(body["pending_prompt"], json!("first?"));
+        assert!(
+            warm_parked(&state, "warm-1"),
+            "engine thread must be warm-parked at the first pause"
+        );
+
+        let (status, body) = resume_with(&state, "warm-1", "A").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("paused"));
+        assert_eq!(body["pending_prompt"], json!("second?"));
+        assert!(warm_parked(&state, "warm-1"), "second pause must park too");
+
+        let (status, body) = resume_with(&state, "warm-1", "B").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("completed"));
+        assert_eq!(body["output"], json!({ "a": "A", "b": "B" }));
+        assert!(
+            state.warm_runs.lock().unwrap().get("warm-1").is_none(),
+            "terminal outcome must retire the warm entry"
+        );
+
+        // Durable parity: the journal carries the same input records the
+        // replay path would have injected.
+        let run_id = state
+            .session_store
+            .get("warm-1")
+            .unwrap()
+            .unwrap()
+            .run_id
+            .unwrap();
+        let journal = journal_shape(&run_base, &run_id);
+        assert_eq!(journal.len(), 2);
+        assert_eq!(
+            journal[0],
+            (
+                1,
+                "input".to_string(),
+                json!({ "prompt": "first?" }),
+                json!("A")
+            )
+        );
+        assert_eq!(
+            journal[1],
+            (
+                2,
+                "input".to_string(),
+                json!({ "prompt": "second?" }),
+                json!("B")
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// The warm and replay paths must be interchangeable: force the fallback
+    /// (retire the entry mid-pause, as a crash/restart would) and assert the
+    /// journal comes out identical to the warm run's.
+    #[tokio::test]
+    async fn warm_fallback_replay_produces_identical_journal() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "chidori-server-warm-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agent_path = write_agent(&temp_dir, TWO_INPUT_AGENT);
+        let run_base = temp_dir.join(".chidori").join("runs");
+        std::fs::create_dir_all(&run_base).unwrap();
+        let state = test_state(run_base.clone(), agent_path);
+
+        // Warm reference run.
+        let (_, body) = response_json(
+            create_session(State(state.clone()), Json(warm_create_request("warm-ref"))).await,
+        )
+        .await;
+        assert_eq!(body["status"], json!("paused"));
+        resume_with(&state, "warm-ref", "A").await;
+        let (_, body) = resume_with(&state, "warm-ref", "B").await;
+        assert_eq!(body["status"], json!("completed"));
+
+        // Fallback run: retire the entry at each pause so /resume must
+        // replay from the journal (the parked thread unwinds when its
+        // resolution sender drops with the entry).
+        let (_, body) = response_json(
+            create_session(State(state.clone()), Json(warm_create_request("warm-fb"))).await,
+        )
+        .await;
+        assert_eq!(body["status"], json!("paused"));
+        state.warm_runs.lock().unwrap().remove("warm-fb");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (_, body) = resume_with(&state, "warm-fb", "A").await;
+        assert_eq!(body["status"], json!("paused"));
+        state.warm_runs.lock().unwrap().remove("warm-fb");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (status, body) = resume_with(&state, "warm-fb", "B").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("completed"));
+        assert_eq!(body["output"], json!({ "a": "A", "b": "B" }));
+
+        let session = |id: &str| state.session_store.get(id).unwrap().unwrap();
+        let warm_journal = journal_shape(&run_base, &session("warm-ref").run_id.unwrap());
+        let fallback_journal = journal_shape(&run_base, &session("warm-fb").run_id.unwrap());
+        assert_eq!(
+            warm_journal, fallback_journal,
+            "warm and replay resumes must write the same journal"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Eviction: a parked run that nobody resumes unwinds after the deadline
+    /// and the session remains resumable through the replay path (which then
+    /// re-upgrades the continuation onto the warm path).
+    #[tokio::test]
+    async fn warm_park_evicts_and_session_stays_resumable() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "chidori-server-warm-evict-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agent_path = write_agent(&temp_dir, TWO_INPUT_AGENT);
+        let run_base = temp_dir.join(".chidori").join("runs");
+        std::fs::create_dir_all(&run_base).unwrap();
+        let mut state = test_state(run_base.clone(), agent_path);
+        state.warm_evict = std::time::Duration::from_millis(50);
+
+        let (_, body) = response_json(
+            create_session(State(state.clone()), Json(warm_create_request("warm-ev"))).await,
+        )
+        .await;
+        assert_eq!(body["status"], json!("paused"));
+
+        // Wait out the eviction deadline: the parked thread must unwind.
+        let mut waited = 0;
+        while warm_parked(&state, "warm-ev") && waited < 5_000 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            waited += 25;
+        }
+        assert!(
+            !warm_parked(&state, "warm-ev"),
+            "parked run must evict after the deadline"
+        );
+
+        let (_, body) = resume_with(&state, "warm-ev", "A").await;
+        assert_eq!(body["status"], json!("paused"));
+        let (status, body) = resume_with(&state, "warm-ev", "B").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("completed"));
+        assert_eq!(body["output"], json!({ "a": "A", "b": "B" }));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     fn create_request(policy_profile: Option<&str>) -> CreateSessionRequest {

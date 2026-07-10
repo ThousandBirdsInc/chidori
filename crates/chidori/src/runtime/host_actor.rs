@@ -15,9 +15,19 @@
 //! iteration = one pass of the actor's source module on a fresh VM, driven by
 //! the standard resume-by-replay model: the actor's accumulated call log is
 //! replayed from the top, recorded effects return from cache, and execution
-//! goes live at the frontier. The loop re-enters the module when the actor
-//! pauses on an empty mailbox (a message arrived → resume) and when it fails
-//! (a restart, if the spawn's supervision options allow one).
+//! goes live at the frontier.
+//!
+//! In the steady state an actor stays LIVE across messages: a
+//! `chidori.signal`-family listen point with an empty mailbox blocks in
+//! place on the shared-mailbox condvar (the [`ActorSignalWaiter`] installed
+//! per iteration) and continues when the next matching message (or the
+//! listen point's own timeout) arrives — the module is NOT re-executed per
+//! message. The loop re-enters the module only when the actor parks — the
+//! idle cap elapses or a stop is requested — and when it fails (a restart,
+//! if the spawn's supervision options allow one). `chidori.receive` blocks
+//! in place as it always has.
+//!
+//! [`ActorSignalWaiter`]: crate::runtime::context::ActorSignalWaiter
 //!
 //! ## Durability
 //!
@@ -1318,6 +1328,10 @@ fn supervise(
     let mut replay: Vec<CallRecord> = Vec::new();
     let mut carried_inbox: Vec<QueuedSignal> = Vec::new();
     let mut restarts: u32 = 0;
+    // Set when the inline listen-point wait already sat out the idle cap, so
+    // the pause-path fallback below parks immediately instead of waiting the
+    // idle window a second time.
+    let inline_idled = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let outcome = |status: &'static str,
                    output: Option<Value>,
@@ -1350,6 +1364,33 @@ fn supervise(
             hub.clone(),
         );
         pump_mailbox(shared, &ctx);
+        // Inline listen-point wait: a `chidori.signal` with an empty inbox
+        // blocks HERE for the next matching delivery (or its own timeout) and
+        // continues in place — the actor's history is not re-executed per
+        // message. Stop and idle return `Park`, falling back to the pause
+        // path this loop has always handled.
+        {
+            let waiter_shared = shared.clone();
+            let waiter_idled = inline_idled.clone();
+            let idle_timeout_ms = options.idle_timeout_ms;
+            ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
+                move |names, timeout_ms| {
+                    waiter_shared.set_lifecycle(Lifecycle::Waiting(names.to_vec()));
+                    let waited =
+                        wait_for_message(&waiter_shared, names, timeout_ms, idle_timeout_ms);
+                    waiter_shared.set_lifecycle(Lifecycle::Running);
+                    match waited {
+                        WaitOutcome::Matched => crate::runtime::context::ActorSignalWait::Delivered,
+                        WaitOutcome::TimedOut => crate::runtime::context::ActorSignalWait::TimedOut,
+                        WaitOutcome::Idle => {
+                            waiter_idled.store(true, std::sync::atomic::Ordering::SeqCst);
+                            crate::runtime::context::ActorSignalWait::Park
+                        }
+                        WaitOutcome::Stopped => crate::runtime::context::ActorSignalWait::Park,
+                    }
+                },
+            ));
+        }
         let Some(iter_backend) = backend.with_runtime_ctx(ctx.clone()) else {
             return outcome(
                 "failed",
@@ -1399,8 +1440,13 @@ fn supervise(
                         .to_string()
                     });
                 shared.set_lifecycle(Lifecycle::Waiting(names.clone()));
-                let waited =
-                    wait_for_message(shared, &names, pending.timeout_ms, options.idle_timeout_ms);
+                let waited = if inline_idled.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    // The inline wait already exhausted the idle cap for this
+                    // listen point; park now rather than waiting it again.
+                    WaitOutcome::Idle
+                } else {
+                    wait_for_message(shared, &names, pending.timeout_ms, options.idle_timeout_ms)
+                };
                 shared.set_lifecycle(Lifecycle::Running);
 
                 let records = ctx.call_log().into_records();

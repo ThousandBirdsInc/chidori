@@ -1471,15 +1471,12 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
 
     for entry in std::fs::read_dir(&runs_dir)? {
         let entry = entry?;
-        let checkpoint_path = entry.path().join("checkpoint.json");
-        if !checkpoint_path.exists() {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&checkpoint_path) else {
-            continue;
-        };
-        let Ok(records): Result<Vec<crate::runtime::call_log::CallRecord>, _> =
-            serde_json::from_str(&text)
+        // Union the last checkpoint with the append-only tail: mid-run and
+        // crashed runs have records in `records.jsonl` that the checkpoint —
+        // rewritten only at compaction points — doesn't carry yet.
+        use crate::runtime::store::RunStore as _;
+        let Ok(Some(records)) =
+            crate::runtime::store::FsRunStore::new(entry.path()).load_call_log()
         else {
             continue;
         };

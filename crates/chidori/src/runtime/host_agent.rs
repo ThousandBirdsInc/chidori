@@ -787,12 +787,8 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         // Fresh VM + context under the agent's OWN durable identity: run id,
         // journal, policy seed, and persistence handle all belong to the
         // agent, not the spawner.
-        let host_promises = store
-            .get_blob(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE)
-            .ok()
-            .flatten()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let host_promises =
+            crate::runtime::snapshot::load_host_promise_records(store.as_ref()).unwrap_or_default();
         let vfs = crate::runtime::snapshot::SnapshotStore::with_store(&run_dir, store.clone())
             .load_manifest()
             .map(|manifest| manifest.vfs)
@@ -964,6 +960,17 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                     let _ = store.delete_blob(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE);
                     let _ =
                         store.delete_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE);
+                    // Per-op promise blobs are part of the table; a clean
+                    // restart retires them too or the union loader would
+                    // resurrect the wiped state.
+                    if let Ok(keys) = store.list_blobs() {
+                        for key in keys {
+                            if key.starts_with(crate::runtime::snapshot::HOST_PROMISE_EVENTS_PREFIX)
+                            {
+                                let _ = store.delete_blob(&key);
+                            }
+                        }
+                    }
                 }
             }
         }

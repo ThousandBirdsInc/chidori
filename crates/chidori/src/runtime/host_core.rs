@@ -8,7 +8,8 @@ use crate::providers::{
 };
 use crate::runtime::call_log::{CallRecord, TokenUsage};
 use crate::runtime::context::{
-    InputMode, PendingInput, PendingSignal, RuntimeContext, PAUSE_MARKER,
+    ActorSignalWait, InputMode, PendingInput, PendingSignal, RuntimeContext, WarmInputWait,
+    PAUSE_MARKER,
 };
 use crate::runtime::memory::execute_memory_action;
 use crate::runtime::snapshot::{HostPromiseState, PendingHostOperationKind};
@@ -260,6 +261,41 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
             Ok(Value::String(response))
         }
         InputMode::Pause => {
+            // Warm resume (server flow): keep the LIVE VM parked on this
+            // thread and wait for the response instead of unwinding — the
+            // continuation costs O(1) rather than an O(history) replay
+            // re-execution. Durability is unchanged: the pending op is
+            // already on disk (begin + safepoint above), so a crash while
+            // parked resumes by replay exactly as an unwound pause would,
+            // and `Park` (eviction / capacity / no supervisor) falls back
+            // to that path immediately. The record written here is the
+            // same one the replay path's synthetic injection produces.
+            if let Some(bridge) = ctx.warm_input_bridge() {
+                let pending = PendingInput {
+                    seq,
+                    prompt: prompt.clone(),
+                };
+                match bridge.wait(ctx, &pending) {
+                    WarmInputWait::Delivered(response) => {
+                        let result = Value::String(response);
+                        ctx.resolve_host_operation(host_operation, result.clone())?;
+                        ctx.record_call(CallRecord {
+                            seq,
+                            parent_seq: None,
+                            function: "input".to_string(),
+                            args: json!({ "prompt": prompt }),
+                            result: result.clone(),
+                            duration_ms: 0,
+                            token_usage: None,
+                            timestamp: Utc::now(),
+                            error: None,
+                        });
+                        ctx.run_host_operation_completion_safepoint(host_operation)?;
+                        return Ok(result);
+                    }
+                    WarmInputWait::Park => {}
+                }
+            }
             ctx.set_pending_input(PendingInput {
                 seq,
                 prompt: prompt.clone(),
@@ -342,6 +378,95 @@ pub fn signal_timeout_sentinel(names: &[String]) -> Value {
 ///      pause *type* is distinguished from `input` by which pending slot is set).
 /// The durable match key is `{ "name": name }` only — the payload is unknown at
 /// pause time and rides in the result.
+/// Resolve a signal-family listen point in place: mark the host op resolved,
+/// append the journal record (the same shape a queued drain, a server-side
+/// synthetic resolution, or a timeout sentinel produces), and run the
+/// completion safepoint. Shared by the queued-inbox hit, the actor inline
+/// wait, and the inline timeout.
+fn settle_signal_listen(
+    ctx: &RuntimeContext,
+    host_operation: crate::runtime::snapshot::HostOperationId,
+    seq: u64,
+    function: &str,
+    match_args: Value,
+    result: Value,
+) -> Result<Value> {
+    ctx.resolve_host_operation(host_operation, result.clone())?;
+    ctx.record_call(CallRecord {
+        seq,
+        parent_seq: None,
+        function: function.to_string(),
+        args: match_args,
+        result: result.clone(),
+        duration_ms: 0,
+        token_usage: None,
+        timestamp: Utc::now(),
+        error: None,
+    });
+    ctx.run_host_operation_completion_safepoint(host_operation)?;
+    Ok(result)
+}
+
+/// Actor fast path for a listen point whose inbox is empty: block in place
+/// for the next matching delivery on the actor's shared mailbox instead of
+/// parking the actor and re-executing its whole history per message (the
+/// O(messages²) supervision loop). Returns `Some(result)` when the wait
+/// settled the listen point inline (message or timeout sentinel); `None` when
+/// the actor should park through the ordinary pause path (stop/idle), or when
+/// no waiter is installed (non-actor contexts).
+fn actor_inline_signal_wait(
+    ctx: &RuntimeContext,
+    host_operation: crate::runtime::snapshot::HostOperationId,
+    seq: u64,
+    function: &str,
+    names: &[String],
+    timeout_ms: Option<u64>,
+    match_args: &Value,
+) -> Result<Option<Value>> {
+    let Some(waiter) = ctx.actor_signal_waiter() else {
+        return Ok(None);
+    };
+    match waiter.wait(names, timeout_ms) {
+        ActorSignalWait::Delivered => {
+            // The waiter observed a matching message in the shared mailbox;
+            // pump it into the run-level inbox and drain through the same
+            // path a pre-queued signal takes (ordering + durable-inbox
+            // semantics included).
+            crate::runtime::host_actor::pump_own_mailbox(ctx);
+            if let Some(queued) = ctx.take_queued_signal_any(names) {
+                let result = json!({
+                    "name": queued.name,
+                    "payload": queued.payload,
+                    "from": queued.from,
+                });
+                return settle_signal_listen(
+                    ctx,
+                    host_operation,
+                    seq,
+                    function,
+                    match_args.clone(),
+                    result,
+                )
+                .map(Some);
+            }
+            // Defensive: the drain missed (should not happen — the actor
+            // thread is the mailbox's only consumer). Park via the pause
+            // path, which handles it exactly as an empty mailbox.
+            Ok(None)
+        }
+        ActorSignalWait::TimedOut => settle_signal_listen(
+            ctx,
+            host_operation,
+            seq,
+            function,
+            match_args.clone(),
+            signal_timeout_sentinel(names),
+        )
+        .map(Some),
+        ActorSignalWait::Park => Ok(None),
+    }
+}
+
 pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let name = signal_name("signal", args)?;
     let match_args = json!({ "name": name });
@@ -394,10 +519,23 @@ pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         return Ok(result);
     }
 
+    let names = vec![name.clone()];
+    if let Some(result) = actor_inline_signal_wait(
+        ctx,
+        host_operation,
+        seq,
+        "signal",
+        &names,
+        signal_timeout_ms(args),
+        &match_args,
+    )? {
+        return Ok(result);
+    }
+
     ctx.set_pending_signal(PendingSignal {
         seq,
         name: name.clone(),
-        names: vec![name.clone()],
+        names,
         timeout_ms: signal_timeout_ms(args),
         id: host_operation,
     });
@@ -460,6 +598,18 @@ pub fn execute_signal_any(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
             error: None,
         });
         ctx.run_host_operation_completion_safepoint(host_operation)?;
+        return Ok(result);
+    }
+
+    if let Some(result) = actor_inline_signal_wait(
+        ctx,
+        host_operation,
+        seq,
+        "signal_any",
+        &names,
+        signal_timeout_ms(args),
+        &match_args,
+    )? {
         return Ok(result);
     }
 
@@ -2341,14 +2491,15 @@ mod tests {
         ));
         let ctx = RuntimeContext::new();
         let run_dir = ctx.enable_persistence(base.clone());
-        let table_path = run_dir.join(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE);
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let completion_events = events.clone();
-        let completion_table_path = table_path.clone();
+        let completion_run_dir = run_dir.clone();
         ctx.set_host_operation_completion_safepoint(HostOperationCompletionSafepoint::new(
             move |record| {
-                let records: Vec<HostPromiseRecord> =
-                    serde_json::from_slice(&std::fs::read(&completion_table_path)?)?;
+                // The resolved state must be durable (per-op blob ∪ table)
+                // by the time the completion safepoint observes it.
+                let store = crate::runtime::store::FsRunStore::new(&completion_run_dir);
+                let records = crate::runtime::snapshot::load_host_promise_records(&store)?;
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].operation.id, record.operation.id);
                 assert!(matches!(
@@ -2849,6 +3000,89 @@ mod tests {
 
         let err = execute_signal_any(&ctx, &json!({ "names": null, "opts": null })).unwrap_err();
         assert!(err.to_string().contains("requires an array of names"));
+    }
+
+    /// The actor inline wait settles a listen point in place — message
+    /// consumed, journal record appended, NO pause — so a signal-driven actor
+    /// never re-executes its history per message.
+    #[test]
+    fn actor_inline_wait_settles_listen_point_without_pausing() {
+        let ctx = RuntimeContext::new();
+        let waiter_ctx = ctx.clone();
+        ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
+            move |names, _timeout_ms| {
+                // Simulate a delivery landing while the listen point waits.
+                waiter_ctx.enqueue_live_signal(&names[0], json!({ "n": 1 }), json!("tester"));
+                crate::runtime::context::ActorSignalWait::Delivered
+            },
+        ));
+        let result = execute_signal(&ctx, &json!({ "name": "go" })).unwrap();
+        assert_eq!(result["name"], json!("go"));
+        assert_eq!(result["payload"], json!({ "n": 1 }));
+        assert!(ctx.take_pending_signal().is_none(), "must not pause");
+        let log = ctx.call_log().into_records();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].function, "signal");
+        assert_eq!(log[0].result, result);
+    }
+
+    /// An inline wait that hits the listen point's own timeout resolves with
+    /// the sentinel in place — the same record the parked path's synthetic
+    /// injection produces, so replay is indistinguishable.
+    #[test]
+    fn actor_inline_wait_timeout_resolves_sentinel_inline() {
+        let ctx = RuntimeContext::new();
+        ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
+            |_names, timeout_ms| {
+                assert_eq!(timeout_ms, Some(5), "listen timeout must reach the waiter");
+                crate::runtime::context::ActorSignalWait::TimedOut
+            },
+        ));
+        let result =
+            execute_signal(&ctx, &json!({ "name": "go", "opts": { "timeoutMs": 5 } })).unwrap();
+        assert_eq!(result, signal_timeout_sentinel(&["go".to_string()]));
+        assert!(ctx.take_pending_signal().is_none(), "must not pause");
+        let log = ctx.call_log().into_records();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].function, "signal");
+    }
+
+    /// `Park` (stop requested / idle cap) falls back to the ordinary pause
+    /// path unchanged — pending signal set, PAUSE_MARKER raised.
+    #[test]
+    fn actor_inline_wait_park_falls_back_to_pause() {
+        let ctx = RuntimeContext::new();
+        ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
+            |_names, _timeout_ms| crate::runtime::context::ActorSignalWait::Park,
+        ));
+        let err = execute_signal(&ctx, &json!({ "name": "go" })).unwrap_err();
+        assert!(err.to_string().contains(PAUSE_MARKER));
+        let pending = ctx
+            .take_pending_signal()
+            .expect("pause path must set pending");
+        assert_eq!(pending.names, vec!["go".to_string()]);
+    }
+
+    /// The fan-in listen point takes the same inline path, draining whichever
+    /// name the delivery matched.
+    #[test]
+    fn actor_inline_wait_settles_signal_any() {
+        let ctx = RuntimeContext::new();
+        let waiter_ctx = ctx.clone();
+        ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
+            move |names, _timeout_ms| {
+                assert_eq!(names.len(), 2);
+                waiter_ctx.enqueue_live_signal(&names[1], json!("payload-b"), json!(null));
+                crate::runtime::context::ActorSignalWait::Delivered
+            },
+        ));
+        let result = execute_signal_any(&ctx, &json!({ "names": ["a", "b"] })).unwrap();
+        assert_eq!(result["name"], json!("b"));
+        assert_eq!(result["payload"], json!("payload-b"));
+        assert!(ctx.take_pending_signal().is_none());
+        let log = ctx.call_log().into_records();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].function, "signal_any");
     }
 
     #[test]

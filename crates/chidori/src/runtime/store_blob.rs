@@ -255,13 +255,15 @@ impl S3BlobStore {
 
     /// Send one signed request. `key` is bucket-relative ("" for a bucket-level
     /// operation like LIST); `query` must be the exact query the request uses.
-    fn signed(
+    /// Build the SigV4-signed request parts (url, headers, content type)
+    /// without sending — shared by the sync and pipelined paths.
+    fn build_signed(
         &self,
         method: &'static str,
         key: &str,
         query: &[(String, String)],
         body: Option<&[u8]>,
-    ) -> Result<(u16, Vec<u8>)> {
+    ) -> Result<(String, Vec<(String, String)>, &'static str)> {
         let now = chrono::Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = now.format("%Y%m%d").to_string();
@@ -345,8 +347,42 @@ impl S3BlobStore {
         } else {
             format!("{}{canonical_uri}?{canonical_query}", self.endpoint)
         };
+        Ok((url, headers, content_type))
+    }
+
+    fn signed(
+        &self,
+        method: &'static str,
+        key: &str,
+        query: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Result<(u16, Vec<u8>)> {
+        let (url, headers, content_type) = self.build_signed(method, key, query, body)?;
         self.relay
             .request_full(method, url, body.map(<[u8]>::to_vec), content_type, headers)
+    }
+
+    /// Pipelined PUT: signed like [`Self::signed`] but enqueued without
+    /// waiting for the round-trip; outcomes surface at the relay's barrier
+    /// (the `RunStore::flush` durability gate).
+    fn put_object_async(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let (url, headers, content_type) = self.build_signed("PUT", key, &[], Some(bytes))?;
+        self.relay.request_async(
+            "PUT",
+            url,
+            Some(bytes.to_vec()),
+            content_type,
+            headers,
+            false,
+        )
+    }
+
+    /// Pipelined DELETE; a 404 counts as success, matching
+    /// [`Self::delete_object`].
+    fn delete_object_async(&self, key: &str) -> Result<()> {
+        let (url, headers, content_type) = self.build_signed("DELETE", key, &[], None)?;
+        self.relay
+            .request_async("DELETE", url, None, content_type, headers, true)
     }
 }
 
@@ -413,6 +449,11 @@ fn xml_unescape(value: &str) -> String {
 pub struct BlobRunStore {
     store: Arc<S3BlobStore>,
     run_id: String,
+    /// Pipeline record appends through the relay instead of blocking one
+    /// network round-trip per record. Off under `CHIDORI_DURABILITY=strict`;
+    /// in besteffort mode the `flush()` barrier at pause/settle is the
+    /// durability gate (`RunStore::flush` contract).
+    pipelined: bool,
 }
 
 impl BlobRunStore {
@@ -420,6 +461,7 @@ impl BlobRunStore {
         Self {
             store,
             run_id: run_id.into(),
+            pipelined: !crate::runtime::store::strict_durability(),
         }
     }
 
@@ -437,8 +479,12 @@ impl RunStore for BlobRunStore {
         // One object per record: object stores have no append primitive, so
         // the journal tail is a keyspace and an append is a single PUT.
         // Re-appending a seq overwrites its object, matching the contract.
-        self.store
-            .put_object(&self.record_key(record.seq), &serde_json::to_vec(record)?)
+        let key = self.record_key(record.seq);
+        let bytes = serde_json::to_vec(record)?;
+        if self.pipelined {
+            return self.store.put_object_async(&key, &bytes);
+        }
+        self.store.put_object(&key, &bytes)
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
@@ -478,8 +524,11 @@ impl RunStore for BlobRunStore {
     }
 
     fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        self.store
-            .put_object(&self.run_key(&format!("blobs/{key}")), bytes)
+        let object_key = self.run_key(&format!("blobs/{key}"));
+        if self.pipelined {
+            return self.store.put_object_async(&object_key, bytes);
+        }
+        self.store.put_object(&object_key, bytes)
     }
 
     fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -488,8 +537,11 @@ impl RunStore for BlobRunStore {
     }
 
     fn delete_blob(&self, key: &str) -> Result<()> {
-        self.store
-            .delete_object(&self.run_key(&format!("blobs/{key}")))
+        let object_key = self.run_key(&format!("blobs/{key}"));
+        if self.pipelined {
+            return self.store.delete_object_async(&object_key);
+        }
+        self.store.delete_object(&object_key)
     }
 
     fn list_blobs(&self) -> Result<Vec<String>> {
@@ -502,6 +554,12 @@ impl RunStore for BlobRunStore {
     }
 
     fn flush(&self) -> Result<()> {
+        // Surface pipelined-append failures at the durability gate; only
+        // besteffort mode pipelines, and its contract is log-and-continue —
+        // matching the pre-pipelining per-append error handling.
+        if let Err(err) = self.store.relay.barrier() {
+            tracing::warn!(run_id = %self.run_id, error = %err, "s3 mirror pipelined writes failed");
+        }
         Ok(())
     }
 }

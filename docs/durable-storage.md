@@ -39,14 +39,31 @@ Two artifacts per run:
 * **`records.jsonl`** — append-only, one JSON `CallRecord` per line. Every
   `record_call` appends O(1) bytes (previously each record rewrote the whole
   `checkpoint.json`, O(history) per call).
-* **`checkpoint.json`** — the full-log artifact, rewritten at host-operation
-  safepoints (and branch merges). Doubles as the compaction of the
-  append-only file: every safepoint rewrite truncates `records.jsonl` to
-  match, so neither file grows past one run's history.
+* **`checkpoint.json`** — the full-log artifact, rewritten at **compaction
+  points**: pause, settle, branch merges, and the first safepoint after a
+  resume replay (whose replayed + synthetic records bypass the append path —
+  the context tracks this as the checkpoint-dirty flag). Steady-state
+  per-effect safepoints persist only the manifest + pending artifacts: the
+  O(1) append already made the record durable, so rewriting the whole
+  checkpoint per host call would cost O(history²) bytes per run for nothing.
+  Each rewrite doubles as compaction of the append-only file: it truncates
+  `records.jsonl` to match, so neither file grows past one run's history.
 
 Loading unions the two: the last checkpoint wins per-seq, and any tail
-records a crash stranded after the last safepoint are recovered from
-`records.jsonl`.
+records appended after the last compaction — the steady-state case, not just
+crash recovery — are recovered from `records.jsonl`.
+
+The **host-promise table** follows the same append+compact discipline. Each
+state change (begin/resolve/reject) writes one small per-operation blob
+(`host_promises/<id>.json`) — O(1) on every backend — instead of rewriting
+the whole `host_promises.json` table per host call. Compaction points (pause,
+settle, a server-side delivery) fold the blobs into the table file and delete
+them; readers union both, per-op blobs winning by id. The per-op blob is what
+keeps the crash-between-resolve-and-record dedup guarantee: a resolved effect
+whose journal record never landed is still recognized on resume and not
+re-executed. The manifest's embedded copy of the table has the same freshness
+contract as `checkpoint.json` (compaction-time snapshot; runtime resume never
+reads it).
 
 ## Backends
 
@@ -75,6 +92,18 @@ Journal writes are no longer fire-and-forget:
   recording of it"), filesystem journal writes fsync before acknowledging,
   and the run's completion is gated on a final flush (the output-gate point:
   a result is not surfaced until its journal is durable).
+
+The durability mode also decides how remote-mirror appends are paced. Under
+`besteffort`, HTTP/S3 record appends are **pipelined**: each append is
+enqueued on the mirror's single FIFO relay thread and the agent continues
+immediately instead of blocking one network round-trip per host call
+(ordering against later checkpoint writes and loads is preserved by the
+FIFO; in-flight requests are bounded, so a slow mirror applies backpressure
+rather than growing an unbounded queue). Failures surface at the next
+`flush()` barrier — pause, settle, output gate — where besteffort logs and
+continues, exactly as its per-append handling always did. Under `strict`,
+every append stays synchronous: acknowledged by the mirror before the next
+effect runs.
 
 ## Recovery after machine loss: hydration
 

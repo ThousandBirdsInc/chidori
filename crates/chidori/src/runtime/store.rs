@@ -55,8 +55,10 @@ pub trait RunStore: Send + Sync + std::fmt::Debug {
     fn append_record(&self, record: &CallRecord) -> Result<()>;
 
     /// Replace the whole journal with `records` (order-preserving). Called at
-    /// host-operation safepoints and merges; doubles as compaction of the
-    /// append-only artifact.
+    /// compaction points — run start after a resume replay, pause, settle,
+    /// branch merges, and any safepoint where the in-memory log holds records
+    /// the appends didn't cover (`RuntimeContext::call_log_checkpoint_dirty`).
+    /// Steady-state per-effect persistence is `append_record` alone.
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()>;
 
     /// Load the journal: the last full checkpoint unioned with any appended
@@ -371,6 +373,12 @@ impl SqliteRunStoreShared {
 pub struct SqliteRunStore {
     shared: Arc<SqliteRunStoreShared>,
     run_id: String,
+    /// Next `pos` ordinal for this handle's appends. Seeded from `MAX(pos)+1`
+    /// on first use and tracked in memory afterwards: `pos` has no index, so
+    /// the old per-append `MAX(pos)` subquery scanned every one of the run's
+    /// rows — O(history) per append, O(history²) per run. Lock order is
+    /// always `conn` before `next_pos`.
+    next_pos: Mutex<Option<i64>>,
 }
 
 impl SqliteRunStore {
@@ -378,6 +386,7 @@ impl SqliteRunStore {
         Self {
             shared,
             run_id: run_id.into(),
+            next_pos: Mutex::new(None),
         }
     }
 }
@@ -386,14 +395,25 @@ impl RunStore for SqliteRunStore {
     fn append_record(&self, record: &CallRecord) -> Result<()> {
         let data = serde_json::to_string(record)?;
         let conn = self.shared.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO run_records (run_id, seq, pos, data)
-             VALUES (?1, ?2,
-                     COALESCE((SELECT MAX(pos) FROM run_records WHERE run_id = ?1), 0) + 1,
-                     ?3)
+        let mut next_pos = self.next_pos.lock().unwrap();
+        let pos = match *next_pos {
+            Some(pos) => pos,
+            None => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT COALESCE(MAX(pos), 0) + 1 FROM run_records WHERE run_id = ?1",
+                )?;
+                stmt.query_row(rusqlite::params![self.run_id], |row| row.get(0))?
+            }
+        };
+        // Re-appending an existing seq (a synthetic resume record) keeps its
+        // original `pos` via the conflict clause; the skipped ordinal is a
+        // harmless gap — loads order by (pos, seq).
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(run_id, seq) DO UPDATE SET data = excluded.data",
-            rusqlite::params![self.run_id, record.seq as i64, data],
         )?;
+        stmt.execute(rusqlite::params![self.run_id, record.seq as i64, pos, data])?;
+        *next_pos = Some(pos + 1);
         Ok(())
     }
 
@@ -404,20 +424,24 @@ impl RunStore for SqliteRunStore {
             "DELETE FROM run_records WHERE run_id = ?1",
             rusqlite::params![self.run_id],
         )?;
-        for (pos, record) in records.iter().enumerate() {
-            tx.execute(
+        {
+            let mut stmt = tx.prepare_cached(
                 "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(run_id, seq) DO UPDATE SET
                      pos = excluded.pos, data = excluded.data",
-                rusqlite::params![
+            )?;
+            for (pos, record) in records.iter().enumerate() {
+                stmt.execute(rusqlite::params![
                     self.run_id,
                     record.seq as i64,
                     pos as i64,
                     serde_json::to_string(record)?
-                ],
-            )?;
+                ])?;
+            }
         }
         tx.commit()?;
+        // The rewrite renumbered `pos` to 0..len; continue appends from there.
+        *self.next_pos.lock().unwrap() = Some(records.len() as i64);
         Ok(())
     }
 
@@ -506,6 +530,12 @@ impl RunStore for SqliteRunStore {
 pub struct HttpRunStore {
     relay: Arc<HttpRelay>,
     run_id: String,
+    /// Pipeline appends through the relay instead of blocking a network
+    /// round-trip per record. Off under `CHIDORI_DURABILITY=strict`, which
+    /// wants every append acknowledged before the next effect runs; in the
+    /// default besteffort mode the `flush()` barrier at pause/settle is the
+    /// durability gate (`RunStore::flush` contract).
+    pipelined: bool,
 }
 
 impl HttpRunStore {
@@ -513,6 +543,7 @@ impl HttpRunStore {
         Self {
             relay,
             run_id: run_id.into(),
+            pipelined: !strict_durability(),
         }
     }
 
@@ -554,8 +585,35 @@ struct HttpRelayRequest {
     content_type: &'static str,
     /// Extra headers, verbatim — the S3 backend's SigV4 signature headers.
     headers: Vec<(String, String)>,
-    reply: std::sync::mpsc::Sender<Result<(u16, Vec<u8>)>>,
+    reply: RelayReply,
 }
+
+enum RelayReply {
+    /// Caller blocks on the outcome.
+    Sync(std::sync::mpsc::Sender<Result<(u16, Vec<u8>)>>),
+    /// Pipelined: the outcome lands in the relay's shared async state; the
+    /// caller surfaces failures at the next [`HttpRelay::barrier`] (the
+    /// `RunStore::flush` durability gate). `describe` labels the request in
+    /// the collected error; `tolerate_not_found` treats a 404 as success
+    /// (deleting an absent blob is Ok, matching the sync paths).
+    Async {
+        describe: String,
+        tolerate_not_found: bool,
+    },
+}
+
+/// Bookkeeping for pipelined relay requests: how many are still in the
+/// relay's queue/network, and the failures collected so far.
+#[derive(Default)]
+struct AsyncRelayState {
+    in_flight: usize,
+    errors: Vec<String>,
+}
+
+/// Backpressure bound on pipelined requests: an agent producing records
+/// faster than the mirror's network drains them blocks here instead of
+/// growing the relay queue without limit.
+const RELAY_MAX_IN_FLIGHT: usize = 128;
 
 /// The dedicated request thread + its channel. Owning the blocking client on
 /// a plain thread sidesteps every "blocking client inside an async runtime"
@@ -563,6 +621,7 @@ struct HttpRelayRequest {
 pub struct HttpRelay {
     base_url: String,
     sender: std::sync::mpsc::Sender<HttpRelayRequest>,
+    async_state: Arc<(Mutex<AsyncRelayState>, std::sync::Condvar)>,
 }
 
 impl std::fmt::Debug for HttpRelay {
@@ -583,6 +642,8 @@ impl HttpRelay {
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Arc<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let (sender, receiver) = std::sync::mpsc::channel::<HttpRelayRequest>();
+        let async_state: Arc<(Mutex<AsyncRelayState>, std::sync::Condvar)> = Arc::default();
+        let worker_async_state = async_state.clone();
         std::thread::Builder::new()
             .name("chidori-run-store-relay".to_string())
             .spawn(move || {
@@ -592,45 +653,76 @@ impl HttpRelay {
                 for request in receiver {
                     let result = match &client {
                         Ok(client) => {
-                            let mut builder = match request.method {
-                                "GET" => client.get(&request.url),
-                                "PUT" => client.put(&request.url),
-                                "POST" => client.post(&request.url),
-                                "DELETE" => client.delete(&request.url),
-                                other => {
-                                    let _ = request.reply.send(Err(anyhow::anyhow!(
-                                        "unsupported relay method {other}"
-                                    )));
-                                    continue;
-                                }
+                            let builder = match request.method {
+                                "GET" => Some(client.get(&request.url)),
+                                "PUT" => Some(client.put(&request.url)),
+                                "POST" => Some(client.post(&request.url)),
+                                "DELETE" => Some(client.delete(&request.url)),
+                                _ => None,
                             };
-                            if let Some(ref token) = token {
-                                builder = builder.bearer_auth(token);
+                            match builder {
+                                None => Err(anyhow::anyhow!(
+                                    "unsupported relay method {}",
+                                    request.method
+                                )),
+                                Some(mut builder) => {
+                                    if let Some(ref token) = token {
+                                        builder = builder.bearer_auth(token);
+                                    }
+                                    for (name, value) in &request.headers {
+                                        builder = builder.header(name, value);
+                                    }
+                                    if let Some(body) = request.body {
+                                        builder = builder
+                                            .header("content-type", request.content_type)
+                                            .body(body);
+                                    }
+                                    builder.send().map_err(anyhow::Error::from).and_then(
+                                        |response| {
+                                            let status = response.status().as_u16();
+                                            let bytes =
+                                                response.bytes().map_err(anyhow::Error::from)?;
+                                            Ok((status, bytes.to_vec()))
+                                        },
+                                    )
+                                }
                             }
-                            for (name, value) in &request.headers {
-                                builder = builder.header(name, value);
-                            }
-                            if let Some(body) = request.body {
-                                builder = builder
-                                    .header("content-type", request.content_type)
-                                    .body(body);
-                            }
-                            builder
-                                .send()
-                                .map_err(anyhow::Error::from)
-                                .and_then(|response| {
-                                    let status = response.status().as_u16();
-                                    let bytes = response.bytes().map_err(anyhow::Error::from)?;
-                                    Ok((status, bytes.to_vec()))
-                                })
                         }
                         Err(err) => Err(anyhow::anyhow!("building relay http client: {err}")),
                     };
-                    let _ = request.reply.send(result);
+                    match request.reply {
+                        RelayReply::Sync(tx) => {
+                            let _ = tx.send(result);
+                        }
+                        RelayReply::Async {
+                            describe,
+                            tolerate_not_found,
+                        } => {
+                            let (lock, cvar) = &*worker_async_state;
+                            let mut state = lock.lock().unwrap();
+                            state.in_flight -= 1;
+                            match result {
+                                Ok((404, _)) if tolerate_not_found => {}
+                                Ok((status, body)) if !(200..300).contains(&status) => {
+                                    state.errors.push(format!(
+                                        "{describe}: HTTP {status} {}",
+                                        String::from_utf8_lossy(&body)
+                                    ));
+                                }
+                                Err(err) => state.errors.push(format!("{describe}: {err}")),
+                                Ok(_) => {}
+                            }
+                            cvar.notify_all();
+                        }
+                    }
                 }
             })
             .expect("spawning run-store relay thread");
-        Arc::new(Self { base_url, sender })
+        Arc::new(Self {
+            base_url,
+            sender,
+            async_state,
+        })
     }
 
     fn request(
@@ -670,12 +762,72 @@ impl HttpRelay {
                 body,
                 content_type,
                 headers,
-                reply,
+                reply: RelayReply::Sync(reply),
             })
             .map_err(|_| anyhow::anyhow!("run-store relay thread is gone"))?;
         receive
             .recv()
             .map_err(|_| anyhow::anyhow!("run-store relay dropped the reply"))?
+    }
+
+    /// Pipelined request: enqueue and return immediately, without waiting for
+    /// the network round-trip. The relay worker is a single FIFO thread, so
+    /// ordering against later sync requests (checkpoint PUTs, loads) is
+    /// preserved. Outcomes are collected in the relay's async state and
+    /// surfaced by [`Self::barrier`]. Bounded by [`RELAY_MAX_IN_FLIGHT`].
+    pub(crate) fn request_async(
+        &self,
+        method: &'static str,
+        url: String,
+        body: Option<Vec<u8>>,
+        content_type: &'static str,
+        headers: Vec<(String, String)>,
+        tolerate_not_found: bool,
+    ) -> Result<()> {
+        {
+            let (lock, cvar) = &*self.async_state;
+            let mut state = lock.lock().unwrap();
+            while state.in_flight >= RELAY_MAX_IN_FLIGHT {
+                state = cvar.wait(state).unwrap();
+            }
+            state.in_flight += 1;
+        }
+        let describe = format!("{method} {url}");
+        self.sender
+            .send(HttpRelayRequest {
+                method,
+                url,
+                body,
+                content_type,
+                headers,
+                reply: RelayReply::Async {
+                    describe,
+                    tolerate_not_found,
+                },
+            })
+            .map_err(|_| {
+                let (lock, cvar) = &*self.async_state;
+                lock.lock().unwrap().in_flight -= 1;
+                cvar.notify_all();
+                anyhow::anyhow!("run-store relay thread is gone")
+            })
+    }
+
+    /// Durability barrier for pipelined requests: waits until every
+    /// [`Self::request_async`] has completed, then surfaces any collected
+    /// failures (draining them).
+    pub(crate) fn barrier(&self) -> Result<()> {
+        let (lock, cvar) = &*self.async_state;
+        let mut state = lock.lock().unwrap();
+        while state.in_flight > 0 {
+            state = cvar.wait(state).unwrap();
+        }
+        if state.errors.is_empty() {
+            Ok(())
+        } else {
+            let errors = std::mem::take(&mut state.errors);
+            anyhow::bail!("run-store mirror writes failed: {}", errors.join("; "))
+        }
     }
 
     fn expect_ok(&self, method: &'static str, url: String, body: Option<Vec<u8>>) -> Result<()> {
@@ -701,6 +853,16 @@ impl HttpRelay {
 
 impl RunStore for HttpRunStore {
     fn append_record(&self, record: &CallRecord) -> Result<()> {
+        if self.pipelined {
+            return self.relay.request_async(
+                "POST",
+                self.records_url(),
+                Some(serde_json::to_vec(record)?),
+                "application/json",
+                Vec::new(),
+                false,
+            );
+        }
         self.relay.expect_ok(
             "POST",
             self.records_url(),
@@ -733,6 +895,16 @@ impl RunStore for HttpRunStore {
     }
 
     fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        if self.pipelined {
+            return self.relay.request_async(
+                "PUT",
+                self.blob_url(key),
+                Some(bytes.to_vec()),
+                "application/octet-stream",
+                Vec::new(),
+                false,
+            );
+        }
         let (status, body) = self.relay.request_typed(
             "PUT",
             self.blob_url(key),
@@ -759,6 +931,16 @@ impl RunStore for HttpRunStore {
     }
 
     fn delete_blob(&self, key: &str) -> Result<()> {
+        if self.pipelined {
+            return self.relay.request_async(
+                "DELETE",
+                self.blob_url(key),
+                None,
+                "application/json",
+                Vec::new(),
+                true,
+            );
+        }
         let (status, _) = self.relay.request("DELETE", self.blob_url(key), None)?;
         if status == 404 || (200..300).contains(&status) {
             Ok(())
@@ -781,6 +963,13 @@ impl RunStore for HttpRunStore {
     }
 
     fn flush(&self) -> Result<()> {
+        // Surface pipelined-append failures at the durability gate. Only the
+        // besteffort mode pipelines (strict appends stay synchronous), and
+        // besteffort's contract is log-and-continue — matching what the
+        // per-append error handling did before pipelining.
+        if let Err(err) = self.relay.barrier() {
+            tracing::warn!(run_id = %self.run_id, error = %err, "durable mirror pipelined writes failed");
+        }
         Ok(())
     }
 }
@@ -1376,6 +1565,31 @@ mod tests {
             timestamp: chrono::Utc::now(),
             error: None,
         }
+    }
+
+    /// Pipelined appends never block or fail the hot path on mirror trouble:
+    /// the enqueue succeeds, the failure is collected at the relay barrier,
+    /// and the besteffort `flush()` logs and continues (matching the
+    /// pre-pipelining per-append warn-and-continue contract).
+    #[test]
+    fn pipelined_append_failures_surface_at_barrier_not_on_the_hot_path() {
+        // Port 1 on loopback: nothing listens there, connections are refused.
+        let relay = HttpRelay::new("http://127.0.0.1:1", None);
+        let store = HttpRunStore::new(relay.clone(), "run-pipelined-test");
+        if !store.pipelined {
+            // CHIDORI_DURABILITY=strict in the environment disables
+            // pipelining; the sync path is covered by the conformance tests.
+            return;
+        }
+        store.append_record(&record(1, "prompt")).unwrap();
+        store.append_record(&record(2, "tool")).unwrap();
+        let err = relay.barrier().expect_err("both appends must have failed");
+        assert!(err.to_string().contains("mirror writes failed"));
+        // Errors were drained; a second barrier is clean, and flush() on a
+        // fresh failure logs instead of failing.
+        relay.barrier().unwrap();
+        store.append_record(&record(3, "tool")).unwrap();
+        store.flush().unwrap();
     }
 
     fn conformance(store: &dyn RunStore) {
