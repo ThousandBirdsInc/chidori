@@ -702,12 +702,12 @@ impl Vm {
             }
             return Ok(res);
         }
-        let order: [&str; 2] = match hint {
-            Hint::String => ["toString", "valueOf"],
-            _ => ["valueOf", "toString"],
+        let order: [PropertyKey; 2] = match hint {
+            Hint::String => [crate::names::key_to_string(), crate::names::key_value_of()],
+            _ => [crate::names::key_value_of(), crate::names::key_to_string()],
         };
-        for name in order {
-            let method = self.get_prop(&Value::Object(obj.clone()), &PropertyKey::str(name))?;
+        for name in &order {
+            let method = self.get_prop(&Value::Object(obj.clone()), name)?;
             if self.is_callable(&method) {
                 let res = self.call(method, Value::Object(obj.clone()), &[])?;
                 if !matches!(res, Value::Object(_)) {
@@ -2156,6 +2156,16 @@ pub fn number_to_string(n: f64) -> String {
     }
     if n.is_infinite() {
         return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // Integral |n| <= 2^53: exact, and the plain decimal digits ARE the
+    // spec's shortest round-trip form (same reasoning as
+    // `push_number_string`). This is the common case — loop counters,
+    // indices, string concatenation with integers — and skips the grisu
+    // `format!("{:e}")` + mantissa-filter + format_decimal allocations.
+    if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_992.0 {
+        let mut out = String::new();
+        push_number_string(n, &mut out);
+        return out;
     }
     let neg = n < 0.0;
     let abs = n.abs();

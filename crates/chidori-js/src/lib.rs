@@ -23,6 +23,7 @@ pub mod jsx;
 pub mod kernel;
 pub mod localize;
 pub mod module;
+pub mod names;
 /// Phase-0 opcode-frequency instrumentation; present only under the
 /// `op-histogram` feature (see `docs/interpreter-optimization.md`).
 #[cfg(feature = "op-histogram")]

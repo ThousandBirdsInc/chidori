@@ -126,7 +126,7 @@ fn install_promise(vm: &mut Vm) {
     vm.define_method(&proto, "catch", 1, |vm, this, args| {
         // catch(onRejected) === Invoke(this, "then", [undefined, onRejected]) —
         // generic over any thenable, and routes through `then`'s species logic.
-        let then = vm.get_prop(&this, &PropertyKey::str("then"))?;
+        let then = vm.get_prop(&this, &crate::names::key_then())?;
         vm.call(then, this.clone(), &[Value::Undefined, arg(args, 0)])
     });
     vm.define_method(&proto, "finally", 1, |vm, this, args| {
@@ -328,13 +328,13 @@ fn get_promise_resolve(vm: &mut Vm, c: &Value) -> Result<Value, Value> {
 /// `Invoke(p, "then", [handler])` — exactly one argument (the spec's
 /// finally thunks call `then` unary, observable via `arguments.length`).
 fn invoke_then_one(vm: &mut Vm, p: &Value, handler: Value) -> Result<Value, Value> {
-    let then = vm.get_prop(p, &PropertyKey::str("then"))?;
+    let then = vm.get_prop(p, &crate::names::key_then())?;
     vm.call(then, p.clone(), &[handler])
 }
 
 /// `Invoke(p, "then", [onF, onR])`.
 fn invoke_then(vm: &mut Vm, p: &Value, on_f: Value, on_r: Value) -> Result<Value, Value> {
-    let then = vm.get_prop(p, &PropertyKey::str("then"))?;
+    let then = vm.get_prop(p, &crate::names::key_then())?;
     vm.call(then, p.clone(), &[on_f, on_r])
 }
 
@@ -709,7 +709,7 @@ fn install_generator(vm: &mut Vm) {
         let promise = vm.new_promise();
         let (resolve, reject) = make_resolving_functions(vm, &promise);
         let outcome = (|| -> Result<Option<Value>, Value> {
-            let ret = vm.get_prop(&this, &PropertyKey::str("return"))?;
+            let ret = vm.get_prop(&this, &crate::names::key_return())?;
             if ret.is_nullish() {
                 return Ok(None);
             }
@@ -755,7 +755,7 @@ fn install_generator(vm: &mut Vm) {
     // %IteratorPrototype%[@@dispose]: GetMethod(this, "return"); call it when
     // present; the result is discarded (return undefined).
     let sync_dispose = vm.new_native("[Symbol.dispose]", 0, |vm, this, _a| {
-        let ret = vm.get_prop(&this, &PropertyKey::str("return"))?;
+        let ret = vm.get_prop(&this, &crate::names::key_return())?;
         if !ret.is_nullish() {
             if !vm.is_callable(&ret) {
                 return Err(vm.throw_type("iterator return is not a function"));

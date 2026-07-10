@@ -851,6 +851,14 @@ pub enum Op {
     /// We implement as: IteratorNext leaves [iterator] and pushes result obj;
     /// the compiler then reads .done/.value.
     IteratorNext,
+    /// Fused sync for-of protocol round: pops `[next, iterator]` (the iterator
+    /// record the loop header read once), pushes `[value, done]` — `value` is
+    /// `undefined` when done. Observably identical to the sequence it replaces
+    /// (`Call(0); RequireIterResult; Dup; GetProp done; …; GetProp value`),
+    /// but when `next` is a pinned canonical builtin-iterator `next`
+    /// (`realm.builtin_iter_next`) the step runs inline: no call frame, no
+    /// `{value, done}` result object, no done/value property reads.
+    IteratorStepValue,
     /// Close the iterator (calls return()) — used on early loop exit.
     IteratorClose,
     /// for-in: build a list of enumerable keys from object; push an enumerator.

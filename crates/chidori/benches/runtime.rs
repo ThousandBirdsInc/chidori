@@ -6,37 +6,43 @@
 //! per state transition, and per run:
 //!
 //! ```text
-//! replay_lookup      — RuntimeContext::try_replay over a growing
-//!                      journal. A resume calls this once per recorded
-//!                      effect; the lookup is a linear scan today
-//!                      (runtime/context.rs), so a full resume sweep
-//!                      is O(N²) in journal length.
-//! record_call        — the live-path cost of recording one host call
-//!                      as payloads grow (deep CallRecord clones).
-//! session_store_put  — SqliteStore::put as the session's call log
-//!                      grows. Every pause/resume/approval state
-//!                      transition re-serializes the WHOLE session blob
-//!                      and pays a full fsync (no WAL) today
-//!                      (storage.rs).
-//! run_store_append   — SqliteRunStore::append_record against a run
-//!                      that already holds K records. The append's
-//!                      MAX(pos) subquery scans the run's rows, so
-//!                      appending the K-th record is O(K) today
-//!                      (runtime/store.rs) despite the trait's O(1)
-//!                      contract.
-//! per_run_setup      — fixed construction costs paid per agent run /
-//!                      per fetch: new_tokio_runtime() (built per run
-//!                      in server.rs/scheduler.rs) and a
-//!                      reqwest::Client (built per fetch() host
-//!                      call in runtime/host_core.rs).
+//! replay_lookup      — RuntimeContext::try_replay over a growing journal.
+//!                      A resume calls this once per recorded effect.
+//!                      Originally a linear scan (a full resume sweep was
+//!                      O(N²) in journal length); now a HashMap seq index
+//!                      (ReplayJournal, runtime/context.rs), so the sweep
+//!                      should stay linear.
+//! record_call        — the live-path cost of recording one host call as
+//!                      payloads grow (deep CallRecord clones).
+//! session_store_put  — SqliteStore::put as the session's call log grows.
+//!                      The full-fsync half of the original cost is gone
+//!                      (the store runs WAL + synchronous=NORMAL), but every
+//!                      pause/resume/approval transition still re-serializes
+//!                      and rewrites the WHOLE session blob — call log
+//!                      included — so this curve is still expected to grow
+//!                      with history (storage.rs).
+//! run_store_append   — SqliteRunStore::append_record against a run that
+//!                      already holds K records. Originally the append's
+//!                      MAX(pos) subquery scanned the run's rows (O(K) per
+//!                      append, against the trait's O(1) contract); now an
+//!                      in-memory next_pos counter plus a (run_id, pos)
+//!                      index for the one-time seed (runtime/store.rs).
+//! per_run_setup      — fixed construction costs that USED to be paid per
+//!                      agent run / per fetch: a tokio runtime (now
+//!                      process-shared, shared_tokio_runtime() in
+//!                      scheduler.rs) and a reqwest::Client (now a
+//!                      process-wide OnceLock, runtime/host_core.rs). Kept
+//!                      to price what a regression to per-call construction
+//!                      would cost.
 //! ```
 //!
 //! Run with: `cargo bench -p chidori --bench runtime`
 //! Smoke-check (each bench once, no statistics): append `-- --test`.
 //!
 //! The scaling groups parameterize size so the growth CURVE is visible in one
-//! report — a fix for any of the costs above should flatten the curve, and a
-//! regression re-steepens it.
+//! report. Where a fix has landed the flat curve is the contract these
+//! benches enforce — a regression re-steepens it; `session_store_put`'s
+//! remaining O(history) blob rewrite is the one curve still expected to grow.
 
 use std::time::Duration;
 
@@ -174,9 +180,12 @@ fn bench_run_store_append(c: &mut Criterion) {
     g.finish();
 }
 
-/// Fixed construction costs currently paid per run (tokio runtime, built in
-/// `server.rs::build_engine` and `scheduler.rs::run_once`) and per `fetch()`
-/// host call (`reqwest::Client`, built in `host_core.rs`).
+/// Fixed construction costs that used to be paid per run (tokio runtime; the
+/// server and scheduler now use `shared_tokio_runtime()`) and per `fetch()`
+/// host call (`reqwest::Client`; `host_core.rs` now caches one process-wide).
+/// `tokio_runtime_build_drop` and `reqwest_client_build` price the
+/// per-call construction a regression would reintroduce;
+/// `tokio_runtime_shared` is the steady-state cost actually paid today.
 fn bench_per_run_setup(c: &mut Criterion) {
     let mut g = c.benchmark_group("per_run_setup");
     g.sample_size(20).measurement_time(Duration::from_secs(4));
