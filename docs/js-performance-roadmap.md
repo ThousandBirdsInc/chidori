@@ -907,11 +907,12 @@ results flowing into property/element stores.
 
 ### 6.5.1 What's next (new baseline)
 
-- Remaining kernel candidates: `String.prototype.charCodeAt`-class reads,
+- ~~Remaining kernel candidates: `String.prototype.charCodeAt`-class reads,
   loop bounds via own-frame CELLS (captured accumulators), typed-array
   element access (a natural fit — elements are statically numeric), and
   argument-typed ARRAY parameters for function kernels (`(a, i) => a[i]`
-  needs arg object slots + a bail-free access story).
+  needs arg object slots + a bail-free access story).~~ **All landed** —
+  typed arrays in §6.8, the other three in §6.10.
 - Kernel-tier extensions with clear shapes: MUTUAL recursion (guard a
   small set of global bindings instead of one), self-calls through local/
   captured bindings (`const f = n => … f(…)`), and boolean-returning
@@ -1076,6 +1077,77 @@ recursion, captured numeric upvalues) and the depth-overflow differential
 now covers the mutual path; structural pins updated (boolean/mutual/
 captured-binding recursion MUST kernelize, parameter-recursion must not);
 full suites + Test262 gate green.
+
+## 6.10 Kernel v10 (landed 2026-07-10): the remaining §6.5.1 candidates —
+cells, string bases, and array-typed function-kernel arguments
+
+Three tiers in three commits, closing out the §6.5.1 candidate list. All
+safe Rust, zero new dependencies; gates green (full suites incl. the
+record→replay byte-identity tests, the kernels differential corpus + fuzz,
+Test262 gate); RESULT lines byte-identical on every measured workload.
+
+1. **Own-frame CELL slots (`KSlot::Cell`)** — a binding captured by a
+   nested closure stays a heap cell after localization, and any loop
+   touching one (the captured bound / accumulator shape: build a total in
+   a `forEach`, then loop to it) lost its kernel entirely. Cells now map
+   into kernel registers like locals: the entry guard requires
+   `Value::Number` (TDZ declines), and every exit/bail/interrupt unwind
+   writes the register back through the `RefCell`. Soundness is the
+   upvalue-snapshot argument — nothing inside a kernel region can CALL the
+   capturing closure — with one carve-out enforced at translation: a
+   region that WRITES a cell and calls a pinned closure (`KOp::CallKernel`)
+   stays generic, because the callee's once-per-activation upvalue snapshot
+   could be the very cell being written. Measured: a 4M-iteration
+   captured-bound/accumulator loop **810 → 145 ms (5.5×)**.
+
+2. **Pinned STRING bases (`Kernel::sslots`)** — the canonical tokenizer
+   scan (`for (i = 0; i < s.length; i++) s.charCodeAt(i)`) never
+   kernelized. String locals now pin into string slots, discovered like
+   array bases (`charCodeAt` consumption is the string-specific evidence
+   and wins the ambiguous `.length` discovery). Both accesses are
+   BAIL-FREE — unlike array elements: the entry guard requires a primitive
+   string (immutable + pinned local) and identity-checks the canonical
+   `String.prototype.charCodeAt` (a primitive receiver's lookup cannot be
+   shadowed anywhere else; pinned in the realm at install like
+   `Array.prototype.push`), after which every `Number` index has a defined
+   result — ToIntegerOrInfinity, code unit in bounds, NaN out — through
+   the same `JsString::code_unit_at` as the builtin. The activation-pinned
+   string also sidesteps a §6.7 gap: the generic path's per-call receiver
+   clone drops the per-instance `Cell` unit-count cache, so a JOIN-built
+   (non-rope) ASCII string still paid an O(n) scan per read — O(n²) per
+   loop. Measured: a 12.8 KB join-built scan ×200 **39.5 s → 0.16 s**;
+   the rope-built `string_scan` benchmark workload **56 → 25 ms (~2.2×)**.
+   (The clone-drops-cache pathology remains for non-kernel access — a
+   shareable unit-count cell is candidate follow-up work.)
+
+3. **Array-typed FUNCTION-kernel arguments (`Kernel::arg_objs`)** — fn
+   kernels rejected element access outright ("a bail needs a frame to
+   resume into"), keeping `(a, i) => a[i]`-class callbacks on the frame
+   path. Argument-typed READ-ONLY array bases now translate — `a[i]`
+   element reads (dense + numeric typed arrays) and dense `a.length` —
+   with a new answer to the bail problem: **`KOp::Abandon`**. A frameless
+   kernel with array bases is read-only pure (element stores reject at
+   translation), so an access missing its dense fast path simply discards
+   the register-only activation and the caller reruns the call
+   generically, which performs the exact spec semantics (holes, prototype
+   reads, OOB, BigInt elements, exotic receivers). The compiler's
+   parameter prologue copies `LoadArg` into locals, so translation binds
+   each discovered obj-local to exactly ONE argument slot at its
+   init-dominated prologue store; accesses resolve through
+   `args[arg_objs[slot]]` at runtime. Excluded wherever an abandon has no
+   caller to rerun from or argument windows carry raw `f64`s: recursive
+   kernels, mutual-recursion family members, `CallKernel` callees, and the
+   all-f64 comparator specialization all decline at their guards.
+   Typed-array `.length` abandons too (a prototype accessor no frameless
+   kernel can guard). Measured: a 4M-call accessor + dot-product workload
+   **1.08 s → 0.64 s (1.7×)**.
+
+Remaining kernel-tier headroom after v10: §6.9's per-outer-call family
+resolution scratch, `charCodeAt` bases via cells/arguments (the tier is
+locals-only), self-calls through parameters, and the shareable string
+unit-count cache above. The structural levers are unchanged: register
+bytecode (§3.5) for non-kernel dispatch, shapes (§3.7) for object
+building.
 
 ## 7. References
 
