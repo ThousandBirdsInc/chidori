@@ -21,8 +21,9 @@ pub fn decode(bytes: &[u8], off: usize, kind: TAKind) -> f64 {
     macro_rules! rd {
         ($t:ty, $n:expr) => {{
             let mut a = [0u8; $n];
-            if off + $n <= bytes.len() {
-                a.copy_from_slice(&bytes[off..off + $n]);
+            let end = off + $n;
+            if end <= bytes.len() {
+                a.copy_from_slice(&bytes[off..end]);
             }
             <$t>::from_le_bytes(a)
         }};
@@ -91,8 +92,9 @@ pub fn encode(bytes: &mut [u8], off: usize, kind: TAKind, v: f64) {
     macro_rules! wr {
         ($e:expr, $n:expr) => {{
             let b = ($e).to_le_bytes();
-            if off + $n <= bytes.len() {
-                bytes[off..off + $n].copy_from_slice(&b);
+            let end = off + $n;
+            if end <= bytes.len() {
+                bytes[off..end].copy_from_slice(&b);
             }
         }};
     }
@@ -130,9 +132,7 @@ fn to_int(v: f64) -> i64 {
 }
 
 fn to_uint8_clamp(v: f64) -> u8 {
-    if v.is_nan() {
-        0
-    } else if v <= 0.0 {
+    if v.is_nan() || v <= 0.0 {
         0
     } else if v >= 255.0 {
         255

@@ -11,10 +11,14 @@
 //! It builds a representative agent — real glue compute (prompt building, string
 //! scanning, modular arithmetic) interleaved with recorded host effects (an
 //! `llm` call per step) — then measures three things on the SAME workload:
-//!   * `compute_only`  — the JS compute with no host boundary (pure interpreter).
-//!   * `record`        — a live run building the journal (host returns instantly).
-//!   * `replay`        — re-running from the journal (no host calls at all).
-//! and models the live wall-clock under representative LLM latencies.
+//!
+//! ```text
+//! compute_only  — the JS compute with no host boundary (pure interpreter).
+//! record        — a live run building the journal (host returns instantly).
+//! replay        — re-running from the journal (no host calls at all).
+//! ```
+//!
+//! It also models the live wall-clock under representative LLM latencies.
 //!
 //! Run: `cargo run -q --release --example agent_replay -p chidori-js`
 

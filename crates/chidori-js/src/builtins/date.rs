@@ -51,7 +51,7 @@ fn time_clip(t: f64) -> f64 {
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64; // [0, 399]
+    let yoe = y - era * 400; // [0, 399]
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146097 + doe - 719468
@@ -432,10 +432,9 @@ fn find_zone_sign(s: &str) -> Option<usize> {
 fn parse_zone_offset(s: &str) -> Option<f64> {
     let (sign, rest) = if let Some(r) = s.strip_prefix('+') {
         (1.0, r)
-    } else if let Some(r) = s.strip_prefix('-') {
-        (-1.0, r)
     } else {
-        return None;
+        let r = s.strip_prefix('-')?;
+        (-1.0, r)
     };
     let (h, m) = if let Some((a, b)) = rest.split_once(':') {
         (a, b)
@@ -468,6 +467,7 @@ fn parse_uint(s: &str) -> Option<u64> {
 /// Accept the two human-readable forms this engine itself emits:
 ///   - `Www, DD Mmm YYYY HH:mm:ss GMT`            (toUTCString)
 ///   - `Www Mmm DD YYYY HH:mm:ss ...`             (toString / toDateString)
+///
 /// Both are interpreted as UTC. Returns None if neither matches.
 fn parse_legacy(s: &str) -> Option<f64> {
     // Tokenize on whitespace and commas.

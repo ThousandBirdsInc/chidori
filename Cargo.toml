@@ -6,6 +6,22 @@ members = [
 ]
 resolver = "2"
 
+# Workspace-wide lint levels, inherited by every crate via `[lints]
+# workspace = true`. CI and the pre-commit hook run
+# `cargo clippy --workspace --all-targets -- -D warnings`, so anything not
+# allowed here must be fixed (or suppressed narrowly with
+# `#[expect(..., reason = "...")]`). This table is the only place for blanket
+# allows — see docs/rust-style-guide.md.
+[workspace.lints.clippy]
+# The interpreter and runtime traffic in genuinely wide types (nested
+# generics over handles, callbacks, and journal entries); factoring every one
+# into a named alias hurts more than it helps. Reviewed case-by-case instead.
+type_complexity = "allow"
+# A few VM/runtime entry points thread many distinct parameters by design;
+# collapsing them into structs is a refactor to take deliberately, not to
+# satisfy a lint.
+too_many_arguments = "allow"
+
 # Shared metadata for the published crates. Inherited with `field.workspace =
 # true`; paths (like `readme`) resolve relative to this workspace root.
 [workspace.package]

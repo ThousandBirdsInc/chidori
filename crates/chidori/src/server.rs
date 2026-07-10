@@ -215,8 +215,6 @@ impl AppState {
     }
 }
 
-const PROMPT_TOOL_PAUSE_FILE: &str = "prompt_tool_pause.json";
-
 #[derive(Clone)]
 struct ActiveSession {
     cancelled: Arc<AtomicBool>,
@@ -422,6 +420,10 @@ fn complete_persisted_pending_host_operation(
     Ok(Some(pending))
 }
 
+// Not yet wired: the reject/timeout side of persisted host-promise completion.
+// `resolve_persisted_pending_host_operation` covers today's resolve path; this
+// generalizes it to arbitrary completions by operation id.
+#[allow(dead_code)]
 fn complete_persisted_host_promise_record(
     run_base: &FsPath,
     run_id: Option<&str>,
@@ -3078,150 +3080,6 @@ mod tests {
         assert_eq!(stored.error.as_deref(), Some("rewind"));
     }
 
-    struct ServerStaticProvider {
-        content: String,
-        input_tokens: u64,
-        output_tokens: u64,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::providers::LlmProvider for ServerStaticProvider {
-        fn supports_model(&self, _model: &str) -> bool {
-            true
-        }
-
-        async fn send(
-            &self,
-            _request: &crate::providers::LlmRequest,
-        ) -> anyhow::Result<crate::providers::LlmResponse> {
-            Ok(crate::providers::LlmResponse {
-                content: self.content.clone(),
-                blocks: vec![crate::providers::ContentBlock::Text {
-                    text: self.content.clone(),
-                }],
-                tool_calls: Vec::new(),
-                stop_reason: "end_turn".to_string(),
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                ..Default::default()
-            })
-        }
-    }
-
-    struct ServerToolUseProvider {
-        calls: std::sync::atomic::AtomicUsize,
-        tool_name: String,
-        tool_input: Value,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::providers::LlmProvider for ServerToolUseProvider {
-        fn supports_model(&self, _model: &str) -> bool {
-            true
-        }
-
-        async fn send(
-            &self,
-            _request: &crate::providers::LlmRequest,
-        ) -> anyhow::Result<crate::providers::LlmResponse> {
-            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                Ok(crate::providers::LlmResponse {
-                    content: String::new(),
-                    blocks: vec![crate::providers::ContentBlock::ToolUse {
-                        id: "toolu_1".to_string(),
-                        name: self.tool_name.clone(),
-                        input: self.tool_input.clone(),
-                    }],
-                    tool_calls: vec![crate::providers::ToolCall {
-                        id: "toolu_1".to_string(),
-                        name: self.tool_name.clone(),
-                        input: self.tool_input.clone(),
-                    }],
-                    stop_reason: "tool_use".to_string(),
-                    input_tokens: 2,
-                    output_tokens: 3,
-                    ..Default::default()
-                })
-            } else {
-                Ok(crate::providers::LlmResponse {
-                    content: "final answer".to_string(),
-                    blocks: vec![crate::providers::ContentBlock::Text {
-                        text: "final answer".to_string(),
-                    }],
-                    tool_calls: Vec::new(),
-                    stop_reason: "end_turn".to_string(),
-                    input_tokens: 5,
-                    output_tokens: 7,
-                    ..Default::default()
-                })
-            }
-        }
-    }
-
-    struct ServerRepeatedToolUseProvider {
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::providers::LlmProvider for ServerRepeatedToolUseProvider {
-        fn supports_model(&self, _model: &str) -> bool {
-            true
-        }
-
-        async fn send(
-            &self,
-            _request: &crate::providers::LlmRequest,
-        ) -> anyhow::Result<crate::providers::LlmResponse> {
-            match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                0 => Ok(crate::providers::LlmResponse {
-                    content: String::new(),
-                    blocks: vec![crate::providers::ContentBlock::ToolUse {
-                        id: "toolu_1".to_string(),
-                        name: "ask".to_string(),
-                        input: json!({ "prompt": "first tool?" }),
-                    }],
-                    tool_calls: vec![crate::providers::ToolCall {
-                        id: "toolu_1".to_string(),
-                        name: "ask".to_string(),
-                        input: json!({ "prompt": "first tool?" }),
-                    }],
-                    stop_reason: "tool_use".to_string(),
-                    input_tokens: 2,
-                    output_tokens: 3,
-                    ..Default::default()
-                }),
-                1 => Ok(crate::providers::LlmResponse {
-                    content: String::new(),
-                    blocks: vec![crate::providers::ContentBlock::ToolUse {
-                        id: "toolu_2".to_string(),
-                        name: "ask".to_string(),
-                        input: json!({ "prompt": "second tool?" }),
-                    }],
-                    tool_calls: vec![crate::providers::ToolCall {
-                        id: "toolu_2".to_string(),
-                        name: "ask".to_string(),
-                        input: json!({ "prompt": "second tool?" }),
-                    }],
-                    stop_reason: "tool_use".to_string(),
-                    input_tokens: 4,
-                    output_tokens: 5,
-                    ..Default::default()
-                }),
-                _ => Ok(crate::providers::LlmResponse {
-                    content: "final repeated answer".to_string(),
-                    blocks: vec![crate::providers::ContentBlock::Text {
-                        text: "final repeated answer".to_string(),
-                    }],
-                    tool_calls: Vec::new(),
-                    stop_reason: "end_turn".to_string(),
-                    input_tokens: 6,
-                    output_tokens: 7,
-                    ..Default::default()
-                }),
-            }
-        }
-    }
-
     fn write_completed_host_promises(
         run_base: &FsPath,
         run_id: &str,
@@ -3986,6 +3844,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
+    #[test]
     fn resume_resolves_persisted_pending_input_host_operation() {
         let temp_dir = std::env::temp_dir().join(format!(
             "chidori-server-resume-host-promise-test-{}",

@@ -38,7 +38,7 @@ struct Card {
     chosen: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct Frame {
     kind: String, // "branches" | "feedback" | "converged" | "replay"
     caption: String,
@@ -51,24 +51,6 @@ struct Frame {
     model_calls: usize,
     inputs: usize,
     replayed: usize,
-}
-
-impl Default for Frame {
-    fn default() -> Self {
-        Frame {
-            kind: String::new(),
-            caption: String::new(),
-            note: String::new(),
-            cards: Vec::new(),
-            html: String::new(),
-            tests: Vec::new(),
-            question: String::new(),
-            answer: String::new(),
-            model_calls: 0,
-            inputs: 0,
-            replayed: 0,
-        }
-    }
 }
 
 /// The agent + its durable journal. Both `prompt` (model) and `input` (human)

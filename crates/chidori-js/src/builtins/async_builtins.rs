@@ -229,11 +229,6 @@ fn install_promise(vm: &mut Vm) {
     });
 }
 
-/// Test-and-set an element's `alreadyCalled` flag. Returns `true` if the element
-/// has already settled (so the caller must bail out), `false` on the first call
-/// (and marks it settled). Mirrors the spec's per-element resolve/reject guard so
-/// a misbehaving thenable cannot double-count the combinator's pending counter.
-
 /// `IfAbruptCloseIterator`: on an abrupt completion mid-combinator, close the
 /// iterator (suppressing any close error — the original abrupt wins) and
 /// propagate.
@@ -611,6 +606,7 @@ fn make_aggregate_error(vm: &mut Vm, errors: Vec<Value>) -> Value {
     agg
 }
 
+#[allow(dead_code)] // Left from the pre-refactor combinator settle path; deletion candidate.
 fn settle_one(
     vm: &mut Vm,
     remaining: &Rc<RefCell<usize>>,

@@ -918,7 +918,6 @@ impl Dom {
                 (AttrOp::Prefix, Some(v)) => v.starts_with(&a.value),
                 (AttrOp::Suffix, Some(v)) => v.ends_with(&a.value),
                 (AttrOp::Substring, Some(v)) => v.contains(&a.value),
-                (AttrOp::Exists, None) => false,
             };
             if !ok {
                 return false;
@@ -1026,6 +1025,10 @@ struct AttrSel {
 }
 
 #[derive(Clone)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variants mirror the CSS pseudo-class names verbatim"
+)]
 enum Pseudo {
     FirstChild,
     LastChild,
@@ -1400,7 +1403,7 @@ impl DomHandle {
                 if once {
                     remove_listener(&self.0, node, ty, &handler, capture);
                 }
-                if let Err(e) = vm.call(handler, ct.clone(), &[event.clone()]) {
+                if let Err(e) = vm.call(handler, ct.clone(), std::slice::from_ref(&event)) {
                     let msg = vm.error_to_string(&e);
                     return Err(format!("event handler threw: {msg}"));
                 }

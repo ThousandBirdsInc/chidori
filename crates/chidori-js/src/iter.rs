@@ -92,11 +92,8 @@ impl Vm {
         }
         let it = self.get_iterator(v)?;
         let mut out = Vec::new();
-        loop {
-            match self.iterator_step(&it)? {
-                Some(val) => out.push(val),
-                None => break,
-            }
+        while let Some(val) = self.iterator_step(&it)? {
+            out.push(val);
         }
         Ok(out)
     }
@@ -218,14 +215,13 @@ impl Vm {
         let ta_oob = {
             let b = it.borrow();
             match &b.internal {
-                Internal::Iterator(st) if !st.done => {
-                    st.target
-                        .as_ref()
-                        .map_or(false, |t| match &t.borrow().internal {
-                            Internal::TypedArray(td) => crate::typed_array::ta_out_of_bounds(td),
-                            _ => false,
-                        })
-                }
+                Internal::Iterator(st) if !st.done => st.target.as_ref().is_some_and(|t| match &t
+                    .borrow()
+                    .internal
+                {
+                    Internal::TypedArray(td) => crate::typed_array::ta_out_of_bounds(td),
+                    _ => false,
+                }),
                 _ => false,
             }
         };

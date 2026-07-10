@@ -16,9 +16,14 @@ import "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Builtin
 
 local linters = new Mapping<String, Step> {
     // Rust formatter. `check` runs `cargo fmt --check`; `fix` runs `cargo fmt`.
-    // Only runs when *.rs files are involved. Add `Builtins.cargo_clippy` here
-    // later if we want lint enforcement too.
+    // Only runs when *.rs files are involved.
     ["cargo-fmt"] = Builtins.cargo_fmt
+    // Rust linter, mirroring the CI "Rust workspace → Clippy" gate
+    // (`cargo clippy --workspace --all-targets -- -D warnings`). `fix` applies
+    // machine-applicable suggestions; `check` verifies. Workspace-wide allows
+    // for the subjective lints live in `[workspace.lints.clippy]` in the root
+    // Cargo.toml, so the hook, CI, and a bare `cargo clippy` all agree.
+    ["cargo-clippy"] = Builtins.cargo_clippy
 }
 
 hooks {

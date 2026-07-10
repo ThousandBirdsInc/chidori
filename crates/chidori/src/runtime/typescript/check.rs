@@ -47,7 +47,7 @@ fn check_agent_source(
 ) -> Result<TypeScriptCheck> {
     let javascript = transpile_module(
         path,
-        &source,
+        source,
         &TranspileOptions {
             import_policy: policy.typescript_imports,
         },

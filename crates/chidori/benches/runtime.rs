@@ -5,37 +5,36 @@
 //! the same footing for the paths a live agent actually pays per host call,
 //! per state transition, and per run:
 //!
-//!   * `replay_lookup`      — `RuntimeContext::try_replay` over a growing
-//!                            journal. A resume calls this once per recorded
-//!                            effect. Originally a linear scan (a full resume
-//!                            sweep was O(N²) in journal length); now a
-//!                            `HashMap` seq index (`ReplayJournal`,
-//!                            `runtime/context.rs`), so the sweep should stay
-//!                            linear.
-//!   * `record_call`        — the live-path cost of recording one host call
-//!                            as payloads grow (deep `CallRecord` clones).
-//!   * `session_store_put`  — `SqliteStore::put` as the session's call log
-//!                            grows. The full-fsync half of the original cost
-//!                            is gone (the store runs WAL +
-//!                            `synchronous=NORMAL`), but every pause/resume/
-//!                            approval transition still re-serializes and
-//!                            rewrites the WHOLE session blob — call log
-//!                            included — so this curve is still expected to
-//!                            grow with history (`storage.rs`).
-//!   * `run_store_append`   — `SqliteRunStore::append_record` against a run
-//!                            that already holds K records. Originally the
-//!                            append's `MAX(pos)` subquery scanned the run's
-//!                            rows (O(K) per append, against the trait's O(1)
-//!                            contract); now an in-memory `next_pos` counter
-//!                            plus a `(run_id, pos)` index for the one-time
-//!                            seed (`runtime/store.rs`).
-//!   * `per_run_setup`      — fixed construction costs that USED to be paid
-//!                            per agent run / per fetch: a tokio runtime
-//!                            (now process-shared, `shared_tokio_runtime()`
-//!                            in `scheduler.rs`) and a `reqwest::Client`
-//!                            (now a process-wide `OnceLock`,
-//!                            `runtime/host_core.rs`). Kept to price what a
-//!                            regression to per-call construction would cost.
+//! ```text
+//! replay_lookup      — RuntimeContext::try_replay over a growing journal.
+//!                      A resume calls this once per recorded effect.
+//!                      Originally a linear scan (a full resume sweep was
+//!                      O(N²) in journal length); now a HashMap seq index
+//!                      (ReplayJournal, runtime/context.rs), so the sweep
+//!                      should stay linear.
+//! record_call        — the live-path cost of recording one host call as
+//!                      payloads grow (deep CallRecord clones).
+//! session_store_put  — SqliteStore::put as the session's call log grows.
+//!                      The full-fsync half of the original cost is gone
+//!                      (the store runs WAL + synchronous=NORMAL), but every
+//!                      pause/resume/approval transition still re-serializes
+//!                      and rewrites the WHOLE session blob — call log
+//!                      included — so this curve is still expected to grow
+//!                      with history (storage.rs).
+//! run_store_append   — SqliteRunStore::append_record against a run that
+//!                      already holds K records. Originally the append's
+//!                      MAX(pos) subquery scanned the run's rows (O(K) per
+//!                      append, against the trait's O(1) contract); now an
+//!                      in-memory next_pos counter plus a (run_id, pos)
+//!                      index for the one-time seed (runtime/store.rs).
+//! per_run_setup      — fixed construction costs that USED to be paid per
+//!                      agent run / per fetch: a tokio runtime (now
+//!                      process-shared, shared_tokio_runtime() in
+//!                      scheduler.rs) and a reqwest::Client (now a
+//!                      process-wide OnceLock, runtime/host_core.rs). Kept
+//!                      to price what a regression to per-call construction
+//!                      would cost.
+//! ```
 //!
 //! Run with: `cargo bench -p chidori --bench runtime`
 //! Smoke-check (each bench once, no statistics): append `-- --test`.

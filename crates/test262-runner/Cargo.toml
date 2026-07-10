@@ -19,3 +19,7 @@ chidori-js = { path = "../chidori-js" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+
+# Workspace-wide lint levels (see [workspace.lints] in the root Cargo.toml).
+[lints]
+workspace = true

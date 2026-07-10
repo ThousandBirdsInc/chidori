@@ -58,7 +58,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utilities
 anyhow = "1"
-thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
@@ -74,7 +73,6 @@ rand = "0.8"
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
 chidori-js = { path = "../chidori-js", version = "0.3.2" }
 async-trait = "0.1"
-derive_more = { version = "1", features = ["display"] }
 
 # SQLite session store
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -124,3 +122,7 @@ criterion = "0.5"
 [[bench]]
 name = "runtime"
 harness = false
+
+# Workspace-wide lint levels (see [workspace.lints] in the root Cargo.toml).
+[lints]
+workspace = true

@@ -422,7 +422,7 @@ impl LlmProvider for OpenAiProvider {
         }
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         for (_idx, (id, name, args)) in tool_acc {
-            let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| Value::String(args));
+            let input: Value = serde_json::from_str(&args).unwrap_or(Value::String(args));
             tool_calls.push(ToolCall {
                 id: id.clone(),
                 name: name.clone(),

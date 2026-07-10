@@ -12,7 +12,7 @@ mod server;
 mod storage;
 mod tools;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -759,6 +759,7 @@ fn cli_policy(untrusted: bool) -> Arc<policy::PolicyConfig> {
 ///   3. Explicit, valid CHIDORI_POLICY* configuration — as configured.
 ///   4. Nothing configured (or only malformed configuration, which fails
 ///      closed) — the deny-by-default serve profile.
+///
 /// Returns the policy plus a posture label for the startup banner.
 fn serve_policy(untrusted: bool, trusted: bool) -> (Arc<policy::PolicyConfig>, String) {
     if untrusted {
@@ -798,7 +799,7 @@ fn abs_dir(dir: &std::path::Path) -> PathBuf {
 }
 
 fn cmd_run(
-    file: &PathBuf,
+    file: &Path,
     inputs: &[String],
     trace: bool,
     verbose: bool,
@@ -899,7 +900,7 @@ fn cmd_run(
 /// event to stdout as the agent executes, then a final `done` event. Used by
 /// the builder server's SSE streaming bridge.
 fn cmd_run_stream(
-    file: &PathBuf,
+    file: &Path,
     inputs: &[String],
     verbose: bool,
     extra_tool_dirs: &[PathBuf],
@@ -1181,7 +1182,7 @@ fn cmd_chat(
     Ok(())
 }
 
-fn cmd_check(file: &PathBuf) -> Result<()> {
+fn cmd_check(file: &Path) -> Result<()> {
     let providers = Arc::new(ProviderRegistry::new());
     let template_engine = Arc::new(TemplateEngine::new("."));
     let tokio_rt =
@@ -1232,7 +1233,7 @@ fn cmd_tools(dirs: &[PathBuf]) -> Result<()> {
 }
 
 fn cmd_resume(
-    file: &PathBuf,
+    file: &Path,
     run_id: &str,
     dir: Option<&std::path::Path>,
     until_seq: Option<u64>,
@@ -1536,13 +1537,7 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(
-    file: &PathBuf,
-    port: u16,
-    verbose: bool,
-    untrusted: bool,
-    trusted: bool,
-) -> Result<()> {
+fn cmd_serve(file: &Path, port: u16, verbose: bool, untrusted: bool, trusted: bool) -> Result<()> {
     if verbose {
         tracing_subscriber::fmt()
             .with_env_filter("info")
@@ -1579,7 +1574,7 @@ fn cmd_serve(
     tokio_rt.block_on(server::serve(
         providers,
         template_engine,
-        file.clone(),
+        file.to_path_buf(),
         port,
         policy,
         policy_posture,

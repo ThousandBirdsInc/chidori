@@ -19,6 +19,7 @@ use crate::runtime::typescript::transpile::validate_imports;
 
 /// Module fingerprints for every dependency of `path` (excluding the entry
 /// itself), used to detect source drift on resume.
+#[allow(dead_code)] // Not yet wired into a call path; staged API.
 pub fn snapshot_module_fingerprints(
     path: &Path,
     source: &str,
@@ -28,6 +29,7 @@ pub fn snapshot_module_fingerprints(
 }
 
 /// The full module import graph (entry + dependencies) for the manifest.
+#[allow(dead_code)] // Not yet wired into a call path; staged API.
 pub fn snapshot_module_graph(
     path: &Path,
     source: &str,

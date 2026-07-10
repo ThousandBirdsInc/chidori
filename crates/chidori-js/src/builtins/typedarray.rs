@@ -333,7 +333,7 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
                 vm.throw_type("ArrayBuffer.prototype.slice: species returned the same buffer")
             );
         }
-        if (buffer_byte_length(&new_buf) as usize) < new_len {
+        if buffer_byte_length(&new_buf) < new_len {
             return Err(vm.throw_type(
                 "ArrayBuffer.prototype.slice: species returned a buffer that is too small",
             ));
@@ -1672,6 +1672,7 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
 
 /// Snapshot a typed array's elements into a fresh dense JS array (used to back
 /// the keys/values/entries iterators).
+#[allow(dead_code)] // Superseded by the index-based iterators; kept as the snapshot fallback.
 fn ta_snapshot_array(vm: &mut Vm, o: &JsObject) -> JsObject {
     let len = vm.ta_length(o).unwrap_or(0);
     let mut elems = Vec::with_capacity(len);
@@ -1684,7 +1685,7 @@ fn ta_snapshot_array(vm: &mut Vm, o: &JsObject) -> JsObject {
 /// In-place sort of typed-array element values. Elements are all one kind
 /// (Number or BigInt). Default compare is ascending numeric (NaN sorts to the
 /// end); an optional comparator is honored. Stable merge sort.
-fn ta_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> Result<(), Value> {
+fn ta_sort(vm: &mut Vm, items: &mut [Value], cmp: &Value, has_cmp: bool) -> Result<(), Value> {
     // The comparator's function kernel, prepared ONCE for the whole sort
     // (see `Vm::prepare_kernel_callback`).
     let mut prep = if has_cmp {
@@ -1721,7 +1722,7 @@ fn ta_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> R
 
 fn ta_sort_range(
     vm: &mut Vm,
-    items: &mut Vec<Value>,
+    items: &mut [Value],
     cmp: &Value,
     has_cmp: bool,
     prep: &mut Option<crate::exec::PreparedKernel>,
@@ -2010,7 +2011,7 @@ fn construct_typed_array(vm: &mut Vm, kind: TAKind, args: &[Value]) -> Result<Va
                 // A RESIZABLE buffer's auto-length view is length-tracking:
                 // its element count floors freely, with no alignment demand
                 // (the requirement applies to fixed buffers only).
-                if remaining % elem != 0 && ab_max_byte_length(&buffer).is_none() {
+                if !remaining.is_multiple_of(elem) && ab_max_byte_length(&buffer).is_none() {
                     return Err(vm.throw_range("Byte length is not aligned to element size"));
                 }
                 remaining / elem
@@ -2723,7 +2724,7 @@ enum AtomicOp {
 /// `ToIndex`: a non-negative integer ≤ 2^53−1, else a RangeError.
 fn to_index(vm: &mut Vm, v: &Value) -> Result<usize, Value> {
     let n = to_integer_or_infinity(vm, v)?;
-    if n < 0.0 || n > 9007199254740991.0 {
+    if !(0.0..=9007199254740991.0).contains(&n) {
         return Err(vm.throw_range("Atomics: index out of range"));
     }
     Ok(n as usize)

@@ -17,8 +17,8 @@ use std::str::FromStr;
 
 thread_local! {
     static CANONICALIZER: icu_locale::LocaleCanonicalizer =
-        icu_locale::LocaleCanonicalizer::new_extended();
-    static EXPANDER: icu_locale::LocaleExpander = icu_locale::LocaleExpander::new_extended();
+        const { icu_locale::LocaleCanonicalizer::new_extended() };
+    static EXPANDER: icu_locale::LocaleExpander = const { icu_locale::LocaleExpander::new_extended() };
 }
 
 pub fn install(vm: &mut Vm) {
@@ -1096,7 +1096,7 @@ fn nf_formatter(rec: &JsObject) -> DecimalFormatter {
         _ => GroupingStrategy::Auto,
     });
     // The full locale (not just its id) so the `-u-nu` numbering system applies.
-    DecimalFormatter::try_new((&loc).into(), opts.clone())
+    DecimalFormatter::try_new((&loc).into(), opts)
         .or_else(|_| DecimalFormatter::try_new(Default::default(), opts))
         .unwrap()
 }

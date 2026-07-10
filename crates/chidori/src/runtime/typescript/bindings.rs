@@ -684,7 +684,7 @@ impl HostBindingBackend {
                         server_id,
                         remote_name,
                     } => tokio_rt.block_on(async {
-                        mcp.call_tool(&server_id, &remote_name, &serde_json::Value::Object(kwargs))
+                        mcp.call_tool(server_id, remote_name, &serde_json::Value::Object(kwargs))
                             .await
                     }),
                     ToolBackend::TypeScript => {
@@ -838,6 +838,7 @@ impl HostBindingBackend {
     /// durable runtime policy — for sub-runs that are their OWN durable runs
     /// (detached agents), whose policy is derived from their own run id so a
     /// wake on a fresh process reconstructs the identical policy.
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub(crate) fn with_runtime_ctx_and_policy(
         &self,
         runtime_ctx: RuntimeContext,

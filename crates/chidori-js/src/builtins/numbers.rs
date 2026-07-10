@@ -799,7 +799,7 @@ pub(crate) fn math_round(n: f64) -> f64 {
     if n > 0.0 && n < 0.5 {
         return 0.0;
     }
-    if n < 0.0 && n >= -0.5 {
+    if (-0.5..0.0).contains(&n) {
         // -0 result, preserving sign.
         return -0.0;
     }

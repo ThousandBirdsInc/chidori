@@ -376,8 +376,10 @@ pub fn signal_timeout_sentinel(names: &[String]) -> Value {
 ///      WITHOUT pausing, recording the `{name,payload,from}` result;
 ///   4. otherwise PAUSE: set `PendingSignal` and bail with `PAUSE_MARKER` (the
 ///      pause *type* is distinguished from `input` by which pending slot is set).
+///
 /// The durable match key is `{ "name": name }` only — the payload is unknown at
 /// pause time and rides in the result.
+///
 /// Resolve a signal-family listen point in place: mark the host op resolved,
 /// append the journal record (the same shape a queued drain, a server-side
 /// synthetic resolution, or a timeout sentinel produces), and run the
@@ -697,6 +699,7 @@ pub fn execute_poll_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> 
 ///      `{cached: false}` — the binding runs the callback and reports its
 ///      result through [`execute_step_end`], which writes the record at this
 ///      same `seq`.
+///
 /// While the step is live, every other host effect is refused (the dispatchers
 /// check `active_step_name`), so the callback is guaranteed pure compute and
 /// skipping it on replay cannot desynchronize the journal. Steps never pause
@@ -1641,7 +1644,7 @@ fn execute_http_with_secrets(
             }
         };
         let text = secrets.redact(&String::from_utf8_lossy(&bytes));
-        let body = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text));
+        let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
 
         Ok(json!({
             "status": status,
@@ -2150,7 +2153,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["status"], json!(0));
-        assert!(result["error"].as_str().unwrap_or_default().len() > 0);
+        assert!(!result["error"].as_str().unwrap_or_default().is_empty());
         assert!(result["headers"].as_object().unwrap().is_empty());
         assert!(result["body"].is_null());
     }

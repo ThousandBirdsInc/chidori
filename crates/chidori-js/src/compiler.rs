@@ -638,7 +638,9 @@ struct FnCtx {
     uses_arguments: bool,
     /// Cell index of the implicit `this` binding (for non-arrow functions).
     this_cell: Option<u32>,
+    #[allow(dead_code)] // Reserved for new.target support; written but not yet read.
     new_target_cell: Option<u32>,
+    #[allow(dead_code)] // Reserved for mapped-arguments support; written but not yet read.
     arguments_cell: Option<u32>,
     /// Names captured by nested functions (conservative): such bindings become
     /// cells (always true here since all bindings are cells, but retained for
@@ -659,7 +661,7 @@ struct FnCtx {
     script_global: bool,
     /// Nesting depth of enclosing `with` statements within this function. When
     /// > 0, unqualified identifier reads/writes compile to dynamic name ops that
-    /// consult the runtime with-scope stack before the static binding.
+    /// > consult the runtime with-scope stack before the static binding.
     with_depth: u32,
     /// True when this function is textually nested inside a `with` block of an
     /// enclosing function: its free identifiers must also resolve dynamically
@@ -871,7 +873,7 @@ impl Compiler {
     fn region_has_arguments(&self, start: u32, end: u32) -> bool {
         self.source
             .get(start as usize..end as usize)
-            .map_or(true, |s| s.contains("arguments"))
+            .is_none_or(|s| s.contains("arguments"))
     }
 
     /// Whether the source region mentions `eval` — the conservative trigger
@@ -880,7 +882,7 @@ impl Compiler {
     fn region_has_eval(&self, start: u32, end: u32) -> bool {
         self.source
             .get(start as usize..end as usize)
-            .map_or(true, |s| s.contains("eval"))
+            .is_none_or(|s| s.contains("eval"))
     }
 }
 
@@ -1040,7 +1042,7 @@ impl Compiler {
     /// True while compiling directly in the top-level script body, where
     /// `var`/`function` declarations create global-object properties.
     fn in_global_scope(&self) -> bool {
-        self.fns.last().map_or(false, |f| f.script_global)
+        self.fns.last().is_some_and(|f| f.script_global)
     }
 
     /// Hoist one `var` binding pattern: a top-level simple identifier becomes a
@@ -2638,6 +2640,7 @@ impl Compiler {
         self.patch_jump(jhave2, have);
     }
 
+    #[allow(dead_code)] // Not referenced by the current iteration lowering; kept for the Op sequence it documents.
     fn emit_iter_step(&mut self, itc: u32) {
         self.emit(Op::LoadCell(itc)); // [iter]
         self.emit(Op::IteratorNext); // [iter, result]
@@ -3241,6 +3244,7 @@ impl Compiler {
     ///   `finally`) is taken by `do_completion`;
     /// - throw/return/break/continue in `body` or `catch`: `do_completion` runs
     ///   the finalizer with the completion parked, and `EndFinally` resumes it.
+    ///
     /// This single-copy model (vs. duplicating the finalizer per path) is what
     /// makes non-local exits run `finally`.
     fn compile_try_with_finally(&mut self, t: &TryStatement, finalizer: &BlockStatement) -> R {
@@ -4149,14 +4153,11 @@ impl Compiler {
                         self.emit(Op::TypeofExpr);
                         return Ok(());
                     }
-                    match self.resolve(name) {
-                        Resolved::Global => {
-                            let n = self.str_const(name);
-                            self.emit(Op::LoadGlobalTypeof(n));
-                            self.emit(Op::TypeofExpr);
-                            return Ok(());
-                        }
-                        _ => {}
+                    if let Resolved::Global = self.resolve(name) {
+                        let n = self.str_const(name);
+                        self.emit(Op::LoadGlobalTypeof(n));
+                        self.emit(Op::TypeofExpr);
+                        return Ok(());
                     }
                 }
                 self.compile_expr(&u.argument)?;
@@ -7092,6 +7093,5 @@ fn collect_pattern_names(pat: &BindingPattern, out: &mut Vec<String>) {
             }
         }
         BindingPattern::AssignmentPattern(a) => collect_pattern_names(&a.left, out),
-        _ => {}
     }
 }

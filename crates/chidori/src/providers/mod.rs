@@ -255,67 +255,9 @@ fn request_has_tool_result(request: &LlmRequest) -> bool {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn static_provider_returns_configured_response() {
-        let provider = StaticProvider {
-            response: "fixed response".to_string(),
-            tool_call: None,
-            calls: AtomicUsize::new(0),
-        };
-        let request = LlmRequest {
-            model: "any-model".to_string(),
-            messages: vec![Message::user_text("hello")],
-            system: None,
-            temperature: 0.0,
-            max_tokens: 10,
-            tools: Vec::new(),
-            cache: CacheLayout::default(),
-        };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let response = rt.block_on(provider.send(&request)).unwrap();
-
-        assert_eq!(response.content, "fixed response");
-        assert_eq!(response.stop_reason, "end_turn");
-    }
-
-    #[test]
-    fn static_provider_returns_configured_tool_call_once() {
-        let provider = StaticProvider {
-            response: "done".to_string(),
-            tool_call: Some(serde_json::json!({
-                "id": "call_1",
-                "name": "read",
-                "input": { "path": "notes.txt" }
-            })),
-            calls: AtomicUsize::new(0),
-        };
-        let request = LlmRequest {
-            model: "any-model".to_string(),
-            messages: vec![Message::user_text("hello")],
-            system: None,
-            temperature: 0.0,
-            max_tokens: 10,
-            tools: Vec::new(),
-            cache: CacheLayout::default(),
-        };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
-        let first = rt.block_on(provider.send(&request)).unwrap();
-        assert_eq!(first.content, "");
-        assert_eq!(first.stop_reason, "tool_use");
-        assert_eq!(first.tool_calls.len(), 1);
-        assert_eq!(first.tool_calls[0].id, "call_1");
-        assert_eq!(first.tool_calls[0].name, "read");
-        assert_eq!(first.tool_calls[0].input["path"], "notes.txt");
-
-        let second = rt.block_on(provider.send(&request)).unwrap();
-        assert_eq!(second.content, "done");
-        assert_eq!(second.stop_reason, "end_turn");
-        assert!(second.tool_calls.is_empty());
+impl Default for ProviderRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -426,5 +368,69 @@ impl ProviderRegistry {
             "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run `chidori model-login` to sign in with OpenRouter.",
             request.model
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_provider_returns_configured_response() {
+        let provider = StaticProvider {
+            response: "fixed response".to_string(),
+            tool_call: None,
+            calls: AtomicUsize::new(0),
+        };
+        let request = LlmRequest {
+            model: "any-model".to_string(),
+            messages: vec![Message::user_text("hello")],
+            system: None,
+            temperature: 0.0,
+            max_tokens: 10,
+            tools: Vec::new(),
+            cache: CacheLayout::default(),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let response = rt.block_on(provider.send(&request)).unwrap();
+
+        assert_eq!(response.content, "fixed response");
+        assert_eq!(response.stop_reason, "end_turn");
+    }
+
+    #[test]
+    fn static_provider_returns_configured_tool_call_once() {
+        let provider = StaticProvider {
+            response: "done".to_string(),
+            tool_call: Some(serde_json::json!({
+                "id": "call_1",
+                "name": "read",
+                "input": { "path": "notes.txt" }
+            })),
+            calls: AtomicUsize::new(0),
+        };
+        let request = LlmRequest {
+            model: "any-model".to_string(),
+            messages: vec![Message::user_text("hello")],
+            system: None,
+            temperature: 0.0,
+            max_tokens: 10,
+            tools: Vec::new(),
+            cache: CacheLayout::default(),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let first = rt.block_on(provider.send(&request)).unwrap();
+        assert_eq!(first.content, "");
+        assert_eq!(first.stop_reason, "tool_use");
+        assert_eq!(first.tool_calls.len(), 1);
+        assert_eq!(first.tool_calls[0].id, "call_1");
+        assert_eq!(first.tool_calls[0].name, "read");
+        assert_eq!(first.tool_calls[0].input["path"], "notes.txt");
+
+        let second = rt.block_on(provider.send(&request)).unwrap();
+        assert_eq!(second.content, "done");
+        assert_eq!(second.stop_reason, "end_turn");
+        assert!(second.tool_calls.is_empty());
     }
 }

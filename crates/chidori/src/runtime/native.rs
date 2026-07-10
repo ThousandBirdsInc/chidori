@@ -105,6 +105,11 @@ pub struct PendingBatch {
     pub pending_index: usize,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "transient control-flow result, never stored in bulk; boxing the \
+              pause payload buys nothing"
+)]
 enum BatchOutcome {
     Completed,
     Paused {

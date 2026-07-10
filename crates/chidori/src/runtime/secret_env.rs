@@ -141,6 +141,7 @@ impl SecretStore {
     }
 
     /// Recursively redact secret values from every string inside `value`.
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn redact_value(&self, value: &mut Value) {
         match value {
             Value::String(text) => {

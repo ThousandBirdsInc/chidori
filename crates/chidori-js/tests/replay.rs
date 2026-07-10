@@ -59,7 +59,7 @@ fn suspend_persist_restore_resume() {
     let mut rt = ReplayRuntime::record(BUNDLE, &["fetchValue", "report"]);
     let mut calls = 0;
     let mut handler =
-        |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+        |name: &str, _args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
             if name == "fetchValue" {
                 calls += 1;
                 if calls == 1 {

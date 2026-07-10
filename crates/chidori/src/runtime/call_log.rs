@@ -67,6 +67,12 @@ pub struct CallLog {
     records: Vec<CallRecord>,
 }
 
+impl Default for CallLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CallLog {
     pub fn new() -> Self {
         Self {

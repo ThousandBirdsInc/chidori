@@ -1315,7 +1315,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         defined.retain(|v| !v.is_undefined());
         let undef_count = item_count - defined.len();
         merge_sort(vm, &mut defined, &cmp, has_cmp)?;
-        defined.extend(std::iter::repeat(Value::Undefined).take(undef_count));
+        defined.extend(std::iter::repeat_n(Value::Undefined, undef_count));
         Ok(Value::Object(vm.new_array(defined)))
     });
     vm.define_method(proto, "toReversed", 0, |vm, this, _args| {
@@ -1540,12 +1540,7 @@ fn flatten_into(
     Ok(target_index)
 }
 
-fn merge_sort(
-    vm: &mut Vm,
-    items: &mut Vec<Value>,
-    cmp: &Value,
-    has_cmp: bool,
-) -> Result<(), Value> {
+fn merge_sort(vm: &mut Vm, items: &mut [Value], cmp: &Value, has_cmp: bool) -> Result<(), Value> {
     if items.len() <= 1 {
         return Ok(());
     }

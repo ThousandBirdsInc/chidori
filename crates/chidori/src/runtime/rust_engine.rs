@@ -35,6 +35,7 @@ pub struct RustReplayEngine {
     effects: Vec<String>,
 }
 
+#[allow(dead_code)] // Embedding surface for the replay engine; only trait-side entry points are wired today.
 impl RustReplayEngine {
     /// Begin a fresh durable execution of `bundle`, exposing the named host
     /// effects as global async functions.
@@ -91,7 +92,7 @@ const JS_TRACE_MAX_DEPTH: usize = 64;
 /// [`HostBindingBackend`], with policy enforcement and MCP. Relative and `node:`
 /// multi-file imports are resolved and linked by the engine; nested TypeScript
 /// tools and sub-agents run natively on this same engine.
-pub fn run_agent(
+pub(crate) fn run_agent(
     path: &Path,
     source: &str,
     inputs: &Value,
