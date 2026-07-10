@@ -2152,6 +2152,16 @@ pub fn number_to_string(n: f64) -> String {
     if n.is_infinite() {
         return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
+    // Integral |n| <= 2^53: exact, and the plain decimal digits ARE the
+    // spec's shortest round-trip form (same reasoning as
+    // `push_number_string`). This is the common case — loop counters,
+    // indices, string concatenation with integers — and skips the grisu
+    // `format!("{:e}")` + mantissa-filter + format_decimal allocations.
+    if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_992.0 {
+        let mut out = String::new();
+        push_number_string(n, &mut out);
+        return out;
+    }
     let neg = n < 0.0;
     let abs = n.abs();
     // Rust's `{:e}` is a correct shortest round-trip representation, giving the

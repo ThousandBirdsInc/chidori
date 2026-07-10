@@ -159,6 +159,17 @@ impl Vm {
 
     /// Advance a built-in iterator, returning an iterator-result object.
     pub fn builtin_iterator_next(&mut self, it: &JsObject) -> Result<Value, Value> {
+        Ok(match self.builtin_iterator_step(it)? {
+            Some(v) => self.make_iter_result(v, false),
+            None => self.make_iter_result(Value::Undefined, true),
+        })
+    }
+
+    /// Advance a built-in iterator, returning `Some(value)` or `None` when
+    /// done — the allocation-free core of [`builtin_iterator_next`].
+    /// `Op::IteratorStepValue` calls this directly when the loop's `next` is
+    /// the pinned canonical, skipping the `{value, done}` result object.
+    pub fn builtin_iterator_step(&mut self, it: &JsObject) -> Result<Option<Value>, Value> {
         // An Array* iterator over an array-like that is neither a dense array
         // nor a typed array (e.g. the `arguments` object): step it via generic
         // length/index reads, OUTSIDE the iterator borrow (the reads can run
@@ -193,14 +204,13 @@ impl Vm {
                 if let Internal::Iterator(st) = &mut it.borrow_mut().internal {
                     st.done = true;
                 }
-                return Ok(self.make_iter_result(Value::Undefined, true));
+                return Ok(None);
             }
             let v = self.get_index(&base, idx as u32)?;
             if let Internal::Iterator(st) = &mut it.borrow_mut().internal {
                 st.index += 1;
             }
-            let entry = self.iter_entry(kind, idx, v);
-            return Ok(self.make_iter_result(entry, false));
+            return Ok(Some(self.iter_entry(kind, idx, v)));
         }
         // %ArrayIterator%.next over a typed array re-validates the view each
         // step: a detached or out-of-bounds (shrunk resizable buffer) view is
@@ -335,9 +345,41 @@ impl Vm {
             }
         };
         Ok(match out {
-            Out::Done => self.make_iter_result(Value::Undefined, true),
-            Out::Value(v) => self.make_iter_result(v, false),
+            Out::Done => None,
+            Out::Value(v) => Some(v),
         })
+    }
+
+    /// One sync for-of protocol round for `Op::IteratorStepValue`: `next` is
+    /// the iterator record's cached next method, `it` the iterator. Returns
+    /// `(value, done)` with `value == undefined` when done. When `next` is a
+    /// pinned canonical builtin-iterator `next` and `it` a builtin iterator,
+    /// the step runs inline with no call frame or result object; otherwise
+    /// the generic path performs exactly the observable sequence this op
+    /// replaced: `Call(next)`, the iterator-result type check, `Get(done)`,
+    /// and `Get(value)` only when not done.
+    pub fn iterator_step_value(&mut self, next: Value, it: Value) -> Result<(Value, bool), Value> {
+        if let (Value::Object(nf), Value::Object(io)) = (&next, &it) {
+            if matches!(io.borrow().internal, Internal::Iterator(_))
+                && self.realm.builtin_iter_next.iter().any(|c| nf.ptr_eq(c))
+            {
+                let io = io.clone();
+                return Ok(match self.builtin_iterator_step(&io)? {
+                    Some(v) => (v, false),
+                    None => (Value::Undefined, true),
+                });
+            }
+        }
+        let res = self.call(next, it, &[])?;
+        if !matches!(res, Value::Object(_)) {
+            return Err(self.throw_type("Iterator result is not an object"));
+        }
+        let done = self.get_prop(&res, &crate::names::key_done())?;
+        if self.to_boolean(&done) {
+            Ok((Value::Undefined, true))
+        } else {
+            Ok((self.get_prop(&res, &crate::names::key_value())?, false))
+        }
     }
 
     fn iter_entry(&self, kind: IterKind, index: usize, value: Value) -> Value {
@@ -366,7 +408,18 @@ impl Vm {
     /// in deterministic order, de-duplicated, skipping shadowed keys.
     pub fn for_in_keys(&mut self, v: &Value) -> Result<Vec<JsString>, Value> {
         let mut out: Vec<JsString> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Dedup by `JsString` (an insert clones an `Rc`, not the bytes) under
+        // the deterministic Fx hasher — the std SipHash `HashSet<String>` it
+        // replaces paid a fresh `String` per key per chain level.
+        // `mutable_key_type` is a false positive: `JsString`'s interior
+        // `Cell` is a code-unit-count cache that participates in neither
+        // `Hash` nor `Eq` (both go through `wtf8_bytes`), the same contract
+        // the `props` maps already rely on.
+        #[allow(clippy::mutable_key_type)]
+        let mut seen: std::collections::HashSet<
+            JsString,
+            std::hash::BuildHasherDefault<crate::fxhash::FxHasher>,
+        > = Default::default();
         let obj = match v {
             Value::Object(o) => o.clone(),
             Value::Undefined | Value::Null => return Ok(out),
@@ -379,7 +432,7 @@ impl Vm {
                 // `getOwnPropertyDescriptor` trap, prototype via `getPrototypeOf`.
                 for k in self.own_property_keys(&o)? {
                     if let PropertyKey::Str(s) = &k {
-                        if !seen.insert(s.as_str().to_string()) {
+                        if !seen.insert(s.clone()) {
                             continue; // shadowed by a nearer object
                         }
                         let desc = self.proxy_get_own_descriptor(&o, &k)?;
@@ -402,14 +455,14 @@ impl Vm {
                 continue;
             }
             for k in self.enumerable_own_string_keys(&o) {
-                if seen.insert(k.as_str().to_string()) {
+                if seen.insert(k.clone()) {
                     out.push(k);
                 }
             }
             // Record even non-enumerable own keys as "seen" so they shadow.
             for k in self.own_keys(&o) {
                 if let PropertyKey::Str(s) = k {
-                    seen.insert(s.as_str().to_string());
+                    seen.insert(s);
                 }
             }
             cur = o.borrow().proto.clone();

@@ -3059,20 +3059,26 @@ impl Compiler {
         self.patch_jump(entry, call_next);
         self.emit(Op::LoadCell(next_cell));
         self.emit(Op::LoadCell(iter_cell)); // [next, iter]
-        self.emit(Op::Call(0)); // [result]
-        if f.r#await {
-            // for-await: the iterator's next() returns a promise of the result;
-            // await it before reading done/value (await of a non-promise is a
-            // no-op, so this also works for sync iterables of plain values).
+        let jt = if f.r#await {
+            self.emit(Op::Call(0)); // [result]
+                                    // for-await: the iterator's next() returns a promise of the result;
+                                    // await it before reading done/value (await of a non-promise is a
+                                    // no-op, so this also works for sync iterables of plain values).
             self.emit(Op::Await);
-        }
-        self.emit(Op::RequireIterResult);
-        self.emit(Op::Dup);
-        let done_k = self.str_const("done");
-        self.emit(Op::GetProp(done_k)); // [result, done]
-        let jt = self.emit(Op::JumpIfTrue(0)); // consumes done; [result]
-        let value_k = self.str_const("value");
-        self.emit(Op::GetProp(value_k)); // [value]
+            self.emit(Op::RequireIterResult);
+            self.emit(Op::Dup);
+            let done_k = self.str_const("done");
+            self.emit(Op::GetProp(done_k)); // [result, done]
+            let jt = self.emit(Op::JumpIfTrue(0)); // consumes done; [result]
+            let value_k = self.str_const("value");
+            self.emit(Op::GetProp(value_k)); // [value]
+            jt
+        } else {
+            // Sync: one fused protocol round — same observable sequence, and
+            // a pinned builtin `next` steps inline with no result object.
+            self.emit(Op::IteratorStepValue); // [value, done]
+            self.emit(Op::JumpIfTrue(0)) // consumes done; [value]
+        };
         let close_push = self.emit(Op::PushTryHandler {
             catch: u32::MAX,
             finally: u32::MAX,
@@ -3117,7 +3123,7 @@ impl Compiler {
         // (the protocol round runs outside it), so just drop the result.
         let done_label = self.here();
         self.patch_jump(jt, done_label);
-        self.emit(Op::Pop); // pop result on done path
+        self.emit(Op::Pop); // pop result (await) / undefined value (sync)
         let skip_close = self.emit(Op::Jump(0));
 
         // Close landing: reached only on abrupt completion (via the handler's

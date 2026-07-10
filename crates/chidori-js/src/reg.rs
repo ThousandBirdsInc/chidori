@@ -545,6 +545,13 @@ pub enum ROp {
         dst: u16,
         it: u16,
     },
+    /// Fused sync for-of round (`Op::IteratorStepValue`): writes the stepped
+    /// value to `dst` and the done flag to `dst + 1`.
+    IterStepValue {
+        dst: u16,
+        next: u16,
+        it: u16,
+    },
     ForInEnumerate {
         dst: u16,
         src: u16,
@@ -635,6 +642,7 @@ fn effect(op: &Op) -> Option<(u32, u32)> {
         IteratorClose => (1, 0),
         GetIterator | ForInEnumerate => (1, 1),
         IteratorNext => (0, 1),
+        IteratorStepValue => (2, 2),
         ForInNext => (0, 2),
         // Everything else — try/finally machinery, `with`/eval scope ops,
         // super/private/class wiring, dispose, suspension, delegation,
@@ -2147,6 +2155,15 @@ impl Emitter {
                 let it = self.reg_of(pos);
                 let dst = self.dst();
                 self.push_def(ROp::IterNext { dst, it });
+                self.push_temp();
+            }
+            IteratorStepValue => {
+                let it = self.pop_reg();
+                let next = self.pop_reg();
+                let dst = self.dst();
+                self.touch(dst + 1);
+                self.push_op(ROp::IterStepValue { dst, next, it });
+                self.push_temp();
                 self.push_temp();
             }
             ForInEnumerate => {
