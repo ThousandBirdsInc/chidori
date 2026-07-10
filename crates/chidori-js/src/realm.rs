@@ -33,6 +33,14 @@ pub struct Realm {
     pub array_push: Option<JsObject>,
     /// As `array_push`, for `Array.prototype.pop` (`KOp::ArrayPop`).
     pub array_pop: Option<JsObject>,
+    /// The canonical `next` function objects of the four builtin iterator
+    /// prototypes (array/string/map/set), pinned at install.
+    /// `Op::IteratorStepValue` identity-checks the loop's iterator-record
+    /// `next` against these: a match means the step can run inline
+    /// (`builtin_iterator_step`) without a call frame or a `{value, done}`
+    /// result object. A replaced or wrapped `next` never matches and takes
+    /// the generic, fully observable path.
+    pub builtin_iter_next: Vec<JsObject>,
 
     pub object_proto: JsObject,
     pub function_proto: JsObject,
@@ -189,6 +197,7 @@ impl Realm {
             ta_length_getter: None,
             array_push: None,
             array_pop: None,
+            builtin_iter_next: Vec::new(),
             object_proto: bare(),
             function_proto: bare(),
             array_proto: bare(),

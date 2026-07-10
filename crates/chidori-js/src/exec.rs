@@ -365,7 +365,7 @@ impl Vm {
         if !o.borrow().props.is_empty() {
             return false;
         }
-        let key = PropertyKey::str("length");
+        let key = crate::value::StrKeyRef("length");
         let mut cur = o.borrow().proto.clone();
         // The canonical chain is 2 hops (Float64Array.prototype →
         // %TypedArray%.prototype); a longer walk is already exotic. Bound it
@@ -397,7 +397,7 @@ impl Vm {
         {
             let g = self.realm.global.borrow();
             let math_ok = matches!(
-                g.props.get(&PropertyKey::str("Math")),
+                g.props.get(&crate::value::StrKeyRef("Math")),
                 Some(Property {
                     kind: PropertyKind::Data { value: Value::Object(o), .. },
                     ..
@@ -410,7 +410,7 @@ impl Vm {
         let mb = canon.borrow();
         used.iter().all(|k| {
             matches!(
-                mb.props.get(&PropertyKey::str(k.name())),
+                mb.props.get(&crate::value::StrKeyRef(k.name())),
                 Some(Property {
                     kind: PropertyKind::Data { value: Value::Object(o), .. },
                     ..
@@ -431,7 +431,7 @@ impl Vm {
             return false;
         };
         matches!(
-            self.realm.array_proto.borrow().props.get(&PropertyKey::str(name)),
+            self.realm.array_proto.borrow().props.get(&crate::value::StrKeyRef(name)),
             Some(Property {
                 kind: PropertyKind::Data { value: Value::Object(o), .. },
                 ..
@@ -2995,7 +2995,17 @@ impl Vm {
                     matches!(b.internal, Internal::Array(_)),
                 );
                 // Array exotics: `length` and index keys never take
-                // the IC (they don't live in the props map).
+                // the IC (they don't live in the props map). But `length`
+                // on an array with no own props — the loop bound of every
+                // non-kernelized `for (i = 0; i < arr.length; i++)` — is
+                // answered directly from the dense Vec, mirroring
+                // `get_from_object`'s array arm (a reified `length` can
+                // only live in `props`, which is empty here).
+                if is_arr && b.props.is_empty() && name.as_str() == "length" {
+                    if let Internal::Array(a) = &b.internal {
+                        return Ok(Value::Number(a.len() as f64));
+                    }
+                }
                 let plain_key = !is_arr
                     || (name.as_str() != "length"
                         && crate::value::canonical_index(name.as_str()).is_none());
@@ -3153,6 +3163,18 @@ impl Vm {
                             }
                         }
                     }
+                }
+            }
+        }
+        // String fast path: `s[i]` with an integral in-bounds Number key
+        // yields the code unit directly (O(1) on ASCII), skipping the
+        // Number→String key conversion and the digit re-parse inside
+        // `string_own_prop`. Out-of-bounds falls through — the spec path
+        // climbs to String.prototype, which is observable.
+        if let (Value::String(s), Value::Number(n)) = (&obj, &key_v) {
+            if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
+                if let Some(u) = s.code_unit_at(*n as usize) {
+                    return Ok(Value::String(JsString::from_code_units(&[u])));
                 }
             }
         }
@@ -4041,7 +4063,7 @@ impl Vm {
                         RUnary::Dec => tryv!(self.unary_arith(a, UnaryKind::Dec)),
                         RUnary::BitNot => tryv!(self.unary_arith(a, UnaryKind::BitNot)),
                         RUnary::Not => Value::Bool(!self.to_boolean(&a)),
-                        RUnary::Typeof => Value::str(a.type_of()),
+                        RUnary::Typeof => Value::String(crate::names::typeof_result(a.type_of())),
                         RUnary::ToStr => Value::String(tryv!(self.to_js_string(&a))),
                         RUnary::ToKey => match tryv!(self.to_property_key(&a)) {
                             PropertyKey::Str(s) => Value::String(s),
@@ -4050,34 +4072,40 @@ impl Vm {
                     };
                     wr!(*dst, r);
                 }
+                // Compare/branch operands are borrowed from the register
+                // file, not cloned out of it (`rd!` is an `Rc` round-trip
+                // per operand per iteration on string/object values).
+                // `frame` is a local distinct from `self`, and nested user
+                // code (a `valueOf` inside `cmp_values`) runs in its own
+                // frames — it can reach this frame's CELLS, never its
+                // locals — so the borrows are sound.
                 ROp::Cmp { cmp, dst, a, b } => {
-                    let (a, b) = (rd!(*a), rd!(*b));
-                    let r = tryv!(self.cmp_values(*cmp, &a, &b));
+                    let r = tryv!(self.cmp_values(
+                        *cmp,
+                        &frame.locals[*a as usize],
+                        &frame.locals[*b as usize]
+                    ));
                     wr!(*dst, Value::Bool(r));
                 }
                 // ---- control flow ----
                 ROp::Jmp { target } => pc = *target as usize,
                 ROp::BrTrue { src, target } => {
-                    let v = rd!(*src);
-                    if self.to_boolean(&v) {
+                    if self.to_boolean(&frame.locals[*src as usize]) {
                         pc = *target as usize;
                     }
                 }
                 ROp::BrFalse { src, target } => {
-                    let v = rd!(*src);
-                    if !self.to_boolean(&v) {
+                    if !self.to_boolean(&frame.locals[*src as usize]) {
                         pc = *target as usize;
                     }
                 }
                 ROp::BrFalsyKeep { src, target } => {
-                    let v = rd!(*src);
-                    if !self.to_boolean(&v) {
+                    if !self.to_boolean(&frame.locals[*src as usize]) {
                         pc = *target as usize;
                     }
                 }
                 ROp::BrTruthyKeep { src, target } => {
-                    let v = rd!(*src);
-                    if self.to_boolean(&v) {
+                    if self.to_boolean(&frame.locals[*src as usize]) {
                         pc = *target as usize;
                     }
                 }
@@ -4101,8 +4129,12 @@ impl Vm {
                     if_true,
                     target,
                 } => {
-                    let (a, b) = (rd!(*a), rd!(*b));
-                    if tryv!(self.cmp_values(*cmp, &a, &b)) == *if_true {
+                    let r = tryv!(self.cmp_values(
+                        *cmp,
+                        &frame.locals[*a as usize],
+                        &frame.locals[*b as usize]
+                    ));
+                    if r == *if_true {
                         pc = *target as usize;
                     }
                 }
@@ -4113,9 +4145,9 @@ impl Vm {
                     if_true,
                     target,
                 } => {
-                    let a = rd!(*a);
                     let b = self.const_val(&frame, *konst);
-                    if tryv!(self.cmp_values(*cmp, &a, &b)) == *if_true {
+                    let r = tryv!(self.cmp_values(*cmp, &frame.locals[*a as usize], &b));
+                    if r == *if_true {
                         pc = *target as usize;
                     }
                 }
@@ -4605,9 +4637,15 @@ impl Vm {
             }
             ROp::IterNext { dst, it } => {
                 let it = rd!(*it);
-                let next = self.get_prop(&it, &PropertyKey::str("next"))?;
+                let next = self.get_prop(&it, &crate::names::key_next())?;
                 let res = self.call(next, it, &[])?;
                 wr!(*dst, res);
+            }
+            ROp::IterStepValue { dst, next, it } => {
+                let (next, it) = (rd!(*next), rd!(*it));
+                let (value, done) = self.iterator_step_value(next, it)?;
+                wr!(*dst, value);
+                wr!(*dst + 1, Value::Bool(done));
             }
             ROp::ForInEnumerate { dst, src } => {
                 let v = rd!(*src);
@@ -4629,7 +4667,7 @@ impl Vm {
                 let it = rd!(*it);
                 let completion_is_throw =
                     matches!(frame.pending_completion, Some(Completion::Throw(_)));
-                let ret = match self.get_prop(&it, &PropertyKey::str("return")) {
+                let ret = match self.get_prop(&it, &crate::names::key_return()) {
                     Ok(r) => r,
                     Err(e) => {
                         if completion_is_throw {
@@ -5164,7 +5202,7 @@ impl Vm {
             Op::UShr => bin_arith(self, frame, ArithKind::UShr)?,
             Op::TypeofExpr => {
                 let a = pop!();
-                push!(Value::str(a.type_of()));
+                push!(Value::String(crate::names::typeof_result(a.type_of())));
             }
 
             // ---- comparison ----
@@ -5394,9 +5432,16 @@ impl Vm {
             }
             Op::IteratorNext => {
                 let it = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let next = self.get_prop(&it, &PropertyKey::str("next"))?;
+                let next = self.get_prop(&it, &crate::names::key_next())?;
                 let res = self.call(next, it, &[])?;
                 push!(res);
+            }
+            Op::IteratorStepValue => {
+                let it = pop!();
+                let next = pop!();
+                let (value, done) = self.iterator_step_value(next, it)?;
+                push!(value);
+                push!(Value::Bool(done));
             }
             Op::ForInPop => {
                 frame.enumerators.pop();
@@ -6297,7 +6342,7 @@ impl Vm {
                 let it = pop!();
                 let completion_is_throw =
                     matches!(frame.pending_completion, Some(Completion::Throw(_)));
-                let ret = match self.get_prop(&it, &PropertyKey::str("return")) {
+                let ret = match self.get_prop(&it, &crate::names::key_return()) {
                     Ok(r) => r,
                     Err(e) => {
                         if completion_is_throw {

@@ -656,7 +656,11 @@ impl PropertyKey {
         PropertyKey::Str(JsString::new(s))
     }
     pub fn from_index(i: u32) -> PropertyKey {
-        PropertyKey::Str(JsString::new(i.to_string()))
+        // Stack-format the digits so the key costs one allocation (the
+        // `Rc<str>`), not two — this runs per element in `own_keys` and the
+        // array builtins' generic paths.
+        let mut buf = [0u8; 10];
+        PropertyKey::Str(JsString::new(fmt_index(i, &mut buf)))
     }
     pub fn as_str(&self) -> Option<&str> {
         match self {

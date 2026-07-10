@@ -1895,13 +1895,20 @@ fn install_iterator_protos(vm: &mut Vm) {
         (vm.realm.map_iterator_proto.clone(), "Map Iterator"),
         (vm.realm.set_iterator_proto.clone(), "Set Iterator"),
     ] {
-        vm.define_method(&proto, "next", 0, |vm, this, _args| {
+        let next_fn = vm.new_native("next", 0, |vm, this, _args| {
             let o = match &this {
                 Value::Object(o) => o.clone(),
                 _ => return Err(vm.throw_type("Iterator.next called on non-object")),
             };
             vm.builtin_iterator_next(&o)
         });
+        proto.borrow_mut().props.insert(
+            PropertyKey::str("next"),
+            Property::builtin(Value::Object(next_fn.clone())),
+        );
+        // Pin the canonical `next` so `Op::IteratorStepValue` can step this
+        // iterator inline (see `Realm::builtin_iter_next`).
+        vm.realm.builtin_iter_next.push(next_fn);
         // %XIteratorPrototype%[@@toStringTag] — non-writable, non-enumerable,
         // configurable.
         let sym = vm.realm.symbol_to_string_tag.clone();
