@@ -951,27 +951,30 @@ impl RuntimeContext {
             record.parent_seq = inner.call_stack.last().copied();
         }
         inner.seq = inner.seq.max(record.seq);
-        inner.call_log.push(record.clone());
         if let Some(store) = inner.store.clone() {
             // O(1) append to the journal (`records.jsonl` + any durable
             // mirror); safepoints rewrite the full checkpoint artifact.
             let result = store.append_record(&record);
             note_persist_result(&mut inner, result);
         }
-        // Stream this call's OTEL span now (buffered until its parent span
-        // exists), so spans ship incrementally during the run rather than as one
-        // tree at the end. Only live-executed calls reach `record_call`; replayed
-        // calls (try_replay / absorb_replayed_subtree) don't re-emit. The
-        // `RuntimeEvent::Call` stream below is the other real-time surface.
-        let otel = inner.otel_run.clone();
         if inner.emit_call_events {
             if let Some(ref tx) = inner.event_sender {
                 let _ = tx.send(RuntimeEvent::Call(record.clone()));
             }
         }
-        drop(inner);
-        if let Some(otel) = otel {
+        // Stream this call's OTEL span now (buffered until its parent span
+        // exists), so spans ship incrementally during the run rather than as one
+        // tree at the end. Only live-executed calls reach `record_call`; replayed
+        // calls (try_replay / absorb_replayed_subtree) don't re-emit. The
+        // `RuntimeEvent::Call` stream above is the other real-time surface.
+        // A record's args/result can be large (a whole LLM response), so the
+        // record MOVES into the call log unless OTEL also needs its own copy.
+        if let Some(otel) = inner.otel_run.clone() {
+            inner.call_log.push(record.clone());
+            drop(inner);
             otel.stream_record(record);
+        } else {
+            inner.call_log.push(record);
         }
     }
 

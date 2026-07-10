@@ -181,6 +181,9 @@ fn bench_per_run_setup(c: &mut Criterion) {
     g.bench_function("tokio_runtime_build_drop", |b| {
         b.iter(|| drop(black_box(chidori::new_tokio_runtime().expect("runtime"))))
     });
+    g.bench_function("tokio_runtime_shared", |b| {
+        b.iter(|| black_box(chidori::shared_tokio_runtime().expect("runtime")))
+    });
     g.bench_function("reqwest_client_build", |b| {
         b.iter(|| {
             black_box(

@@ -964,6 +964,36 @@ checksums byte-identical across the suite. Remaining costs are parse-side
 object building (property-map hashing) and the interpreter reads around
 the loop — shape-cache territory, out of scope here.
 
+## 6.7 String code-unit reads (landed 2026-07-10): cached length + O(1) ASCII indexing
+
+A gap found while adding bench coverage, not by callgrind — no workload
+exercised it (the new `string_scan` closes that): the `charCodeAt`-class
+accessors (`charCodeAt`/`charAt`/`codePointAt`/`at`) materialized the ENTIRE
+string as a fresh `Vec<u16>` per call (`units_this` → `to_utf16_vec`), and
+`.length` on a plain `Utf8` string re-scanned it per read — so the canonical
+tokenizer loop `for (i = 0; i < s.length; i++) s.charCodeAt(i)` was O(n²)
+with n full-string allocations.
+
+Two changes, no new dependencies, no semantic surface:
+
+- `Repr::Utf8` carries a lazily-cached UTF-16 unit count (`Cell<u32>`,
+  computed on first `len_utf16`; `from_code_units` records it for free).
+  `.length` is O(1) after first read, and — since unit count == byte count
+  iff the string is pure ASCII — `code_unit_at` indexes bytes directly on
+  ASCII strings (the `Rope` arm already stores totals, so an ASCII rope
+  gets the same O(1) path over its flattened bytes). Construction stays
+  O(1); the bytecode-constant load path (`from_rc_str`) pays nothing.
+- The four accessor builtins read through `code_unit_at` instead of
+  materializing code units.
+
+Measured: `string_scan` (8 KB ASCII string, 12 scan rounds + a charAt pass)
+**1.50 s → 50 ms wall (30×)**; heap churn for the criterion variant
+**20.16 MiB / 166 k allocs → 167 KiB / 2.4 k allocs**. RESULT byte-identical
+to Node. Non-ASCII strings keep the O(i) iterator path per read — a rope
+index or WTF-8 offset table remains available headroom if a workload ever
+needs it, and kernel candidate (a) (§6.5.1) now has its O(1) accessor
+prerequisite.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

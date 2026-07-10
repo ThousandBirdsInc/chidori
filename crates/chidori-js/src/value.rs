@@ -32,7 +32,12 @@ pub struct JsString(Repr);
 #[derive(Clone)]
 enum Repr {
     /// No unpaired surrogate: the bytes are valid UTF-8 (== the legacy model).
-    Utf8(Rc<str>),
+    /// The `Cell` caches the UTF-16 code-unit count ([`UNITS_UNKNOWN`] until
+    /// first computed by `len_utf16`), so repeated `.length` reads are O(1)
+    /// and — because `units == byte len` iff the string is pure ASCII —
+    /// `code_unit_at` can index bytes directly on the overwhelmingly common
+    /// ASCII case instead of walking the prefix per access.
+    Utf8(Rc<str>, std::cell::Cell<u32>),
     /// Contains ≥1 unpaired surrogate. `bytes` is well-formed WTF-8; `lossy`
     /// is the U+FFFD-replaced UTF-8 view that backs `as_str()` (and the host
     /// boundary); `units` is the exact UTF-16 code-unit count.
@@ -69,6 +74,17 @@ struct Rope {
 /// flatten bookkeeping, and short-string behavior stays exactly as before.
 const ROPE_MIN_BYTES: usize = 64;
 
+/// Sentinel for a `Repr::Utf8` whose code-unit count has not been computed
+/// yet. Safe: [`MAX_STRING_LEN`] (16M units) keeps every real count far below
+/// `u32::MAX`.
+const UNITS_UNKNOWN: u32 = u32::MAX;
+
+/// A fresh `Utf8` arm with its unit count not yet computed. O(1) — callers on
+/// hot paths (bytecode constant loads) must not pay a scan here.
+fn utf8_repr(s: Rc<str>) -> Repr {
+    Repr::Utf8(s, std::cell::Cell::new(UNITS_UNKNOWN))
+}
+
 thread_local! {
     /// Shared empty backing for [`Rope`]'s iterative `Drop` (placeholder the
     /// children are replaced with while dismantling — an `Rc` bump, not an
@@ -83,7 +99,7 @@ impl Rope {
         let mut stack: Vec<&JsString> = vec![&self.right, &self.left];
         while let Some(part) = stack.pop() {
             match &part.0 {
-                Repr::Utf8(s) => out.push_str(s),
+                Repr::Utf8(s, _) => out.push_str(s),
                 Repr::Rope(r) => match r.flat.get() {
                     Some(f) => out.push_str(f),
                     None => {
@@ -104,7 +120,7 @@ impl Drop for Rope {
     fn drop(&mut self) {
         let empty = EMPTY_RC_STR.with(|e| e.clone());
         let take =
-            |slot: &mut JsString| std::mem::replace(slot, JsString(Repr::Utf8(empty.clone())));
+            |slot: &mut JsString| std::mem::replace(slot, JsString(utf8_repr(empty.clone())));
         let mut stack = vec![take(&mut self.left), take(&mut self.right)];
         while let Some(part) = stack.pop() {
             if let Repr::Rope(r) = part.0 {
@@ -155,21 +171,23 @@ impl JsString {
     /// Build from valid UTF-8 (the source of nearly every string: literals,
     /// number/JSON conversions, host input). Always the cheap `Utf8` arm.
     pub fn new(s: impl AsRef<str>) -> Self {
-        JsString(Repr::Utf8(Rc::from(s.as_ref())))
+        JsString(utf8_repr(Rc::from(s.as_ref())))
     }
     /// Adopt an existing `Rc<str>` without reallocating — used for bytecode
     /// string-constant loads, which are a hot path.
     pub fn from_rc_str(s: Rc<str>) -> Self {
-        JsString(Repr::Utf8(s))
+        JsString(utf8_repr(s))
     }
     /// Build from a UTF-16 code-unit sequence, re-pairing adjacent surrogates.
     /// Takes the `Utf8` arm when the result is well-formed.
     pub fn from_code_units(units: &[u16]) -> Self {
         if crate::wtf8::is_well_formed(units) {
-            // Well-formed ⇒ `from_utf16` cannot fail.
-            JsString(Repr::Utf8(Rc::from(
-                String::from_utf16_lossy(units).as_str(),
-            )))
+            // Well-formed ⇒ `from_utf16` cannot fail. The unit count is the
+            // input length — record it rather than rediscovering it later.
+            JsString(Repr::Utf8(
+                Rc::from(String::from_utf16_lossy(units).as_str()),
+                std::cell::Cell::new(units.len() as u32),
+            ))
         } else {
             let bytes = crate::wtf8::encode_wtf8(units);
             let lossy = crate::wtf8::to_string_lossy(&bytes);
@@ -187,7 +205,7 @@ impl JsString {
     /// preserve surrogates use the code-unit API instead.
     pub fn as_str(&self) -> &str {
         match &self.0 {
-            Repr::Utf8(s) => s,
+            Repr::Utf8(s, _) => s,
             Repr::Wtf8(w) => &w.lossy,
             Repr::Rope(r) => r.flat.get_or_init(|| {
                 let mut out = String::with_capacity(r.bytes);
@@ -200,7 +218,7 @@ impl JsString {
     /// engine's string-size guard on every concatenation.
     pub fn byte_len(&self) -> usize {
         match &self.0 {
-            Repr::Utf8(s) => s.len(),
+            Repr::Utf8(s, _) => s.len(),
             Repr::Wtf8(w) => w.bytes.len(),
             Repr::Rope(r) => r.bytes,
         }
@@ -208,29 +226,49 @@ impl JsString {
     /// Canonical well-formed WTF-8 bytes — the basis for equality and hashing.
     pub fn wtf8_bytes(&self) -> &[u8] {
         match &self.0 {
-            Repr::Utf8(s) => s.as_bytes(),
+            Repr::Utf8(s, _) => s.as_bytes(),
             Repr::Wtf8(w) => &w.bytes,
             // A rope is well-formed UTF-8; observing its bytes flattens once.
             Repr::Rope(_) => self.as_str().as_bytes(),
         }
     }
-    /// Length in UTF-16 code units (the JS `.length`). O(n) for the `Utf8`
-    /// arm — same cost as the previous code-point `.length`.
+    /// Length in UTF-16 code units (the JS `.length`). O(n) once for the
+    /// `Utf8` arm, then served from the per-handle cache — an `s.length`
+    /// read in a loop condition must not rescan the string per iteration.
     pub fn len_utf16(&self) -> usize {
         match &self.0 {
-            Repr::Utf8(s) => s.chars().map(|c| c.len_utf16()).sum(),
+            Repr::Utf8(s, units) => {
+                let cached = units.get();
+                if cached != UNITS_UNKNOWN {
+                    return cached as usize;
+                }
+                let n: usize = s.chars().map(|c| c.len_utf16()).sum();
+                units.set(n as u32);
+                n
+            }
             Repr::Wtf8(w) => w.units as usize,
             Repr::Rope(r) => r.units,
         }
     }
-    /// The UTF-16 code unit at index `i`, or `None` if out of range.
+    /// The UTF-16 code unit at index `i`, or `None` if out of range. O(1) for
+    /// pure-ASCII strings (unit count == byte count ⇔ every unit is one
+    /// ASCII byte); O(i) otherwise. The `charCodeAt`-class builtins loop over
+    /// this, so the ASCII case must not walk the prefix per call.
     pub fn code_unit_at(&self, i: usize) -> Option<u16> {
-        self.code_units().nth(i)
+        match &self.0 {
+            Repr::Utf8(s, units) if units.get() as usize == s.len() => {
+                s.as_bytes().get(i).map(|&b| b as u16)
+            }
+            Repr::Rope(r) if r.units == r.bytes => {
+                self.as_str().as_bytes().get(i).map(|&b| b as u16)
+            }
+            _ => self.code_units().nth(i),
+        }
     }
     /// Iterate the UTF-16 code units.
     pub fn code_units(&self) -> CodeUnits<'_> {
         match &self.0 {
-            Repr::Utf8(s) => CodeUnits::Utf8(s.encode_utf16()),
+            Repr::Utf8(s, _) => CodeUnits::Utf8(s.encode_utf16()),
             Repr::Wtf8(w) => CodeUnits::Wtf8(crate::wtf8::decode_units(&w.bytes)),
             Repr::Rope(_) => CodeUnits::Utf8(self.as_str().encode_utf16()),
         }
@@ -256,12 +294,12 @@ impl JsString {
     }
     /// `true` if the string contains no unpaired surrogate.
     pub fn is_well_formed(&self) -> bool {
-        matches!(self.0, Repr::Utf8(_) | Repr::Rope(_))
+        matches!(self.0, Repr::Utf8(..) | Repr::Rope(_))
     }
     /// Replace every unpaired surrogate with U+FFFD (`String.prototype.toWellFormed`).
     pub fn to_well_formed(&self) -> JsString {
         match &self.0 {
-            Repr::Utf8(_) | Repr::Rope(_) => self.clone(),
+            Repr::Utf8(..) | Repr::Rope(_) => self.clone(),
             Repr::Wtf8(w) => JsString::new(&*w.lossy),
         }
     }
@@ -274,7 +312,7 @@ impl JsString {
             // enough to matter; eager copy below the threshold (small-string
             // behavior unchanged, no node overhead). This turns the
             // `s += chunk` build loop from O(total²) into O(total).
-            (Repr::Utf8(_) | Repr::Rope(_), Repr::Utf8(_) | Repr::Rope(_)) => {
+            (Repr::Utf8(..) | Repr::Rope(_), Repr::Utf8(..) | Repr::Rope(_)) => {
                 let (lb, rb) = (self.byte_len(), other.byte_len());
                 if lb == 0 {
                     return other.clone();
@@ -296,7 +334,7 @@ impl JsString {
                 let mut s = String::with_capacity(lb + rb);
                 s.push_str(self.as_str());
                 s.push_str(other.as_str());
-                JsString(Repr::Utf8(Rc::from(s.as_str())))
+                JsString(utf8_repr(Rc::from(s.as_str())))
             }
             _ => {
                 let mut units = self.to_utf16_vec();
@@ -314,7 +352,7 @@ impl PartialEq for JsString {
         // usually compare a clone of the very same allocation. Content equality
         // is unchanged — `ptr_eq` can only confirm, never deny.
         match (&self.0, &other.0) {
-            (Repr::Utf8(a), Repr::Utf8(b)) if Rc::ptr_eq(a, b) => true,
+            (Repr::Utf8(a, _), Repr::Utf8(b, _)) if Rc::ptr_eq(a, b) => true,
             (Repr::Wtf8(a), Repr::Wtf8(b)) if Rc::ptr_eq(a, b) => true,
             (Repr::Rope(a), Repr::Rope(b)) if Rc::ptr_eq(a, b) => true,
             _ => self.wtf8_bytes() == other.wtf8_bytes(),
@@ -339,7 +377,7 @@ impl From<&str> for JsString {
 }
 impl From<String> for JsString {
     fn from(s: String) -> Self {
-        JsString(Repr::Utf8(Rc::from(s.as_str())))
+        JsString(utf8_repr(Rc::from(s.as_str())))
     }
 }
 
