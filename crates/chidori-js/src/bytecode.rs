@@ -1336,6 +1336,12 @@ pub struct Kernel {
     /// reified index entry (`protos_allow_any_index_create`). Read-only
     /// loops skip that walk entirely.
     pub stores_elems: bool,
+    /// Whether the code contains a [`KOp::LoadLen`]. A typed-array base
+    /// resolves `.length` through a prototype ACCESSOR (unlike a dense
+    /// array's own exotic property), so the activation entry guard must
+    /// identity-check the canonical getter for any typed-array LoadLen base.
+    /// Kernels without a LoadLen skip that scan entirely.
+    pub loads_len: bool,
     /// Whether the code contains a [`KOp::ArrayPush`]: the activation entry
     /// must verify the canonical `Array.prototype.push` still backs the
     /// `push` property of the canonical Array prototype.

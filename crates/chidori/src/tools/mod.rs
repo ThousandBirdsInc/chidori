@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,7 @@ impl ToolDef {
 }
 
 /// Registry of available tools loaded from local files and MCP servers.
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, ToolDef>,
     native_handlers: HashMap<String, NativeToolHandler>,
@@ -234,6 +235,51 @@ impl ToolRegistry {
             "loaded tool registry"
         );
 
+        Ok(registry)
+    }
+
+    /// [`ToolRegistry::load_from_dirs`] behind a process-wide fingerprint
+    /// cache. The server builds a registry for EVERY agent run, re-reading and
+    /// re-parsing each tool file from disk; here the walk only stats the
+    /// files and reuses the parsed registry while nothing changed. Editing a
+    /// tool file still takes effect on the next run — the fingerprint
+    /// (path, mtime, len per `.ts` file) changes with it.
+    pub fn load_from_dirs_cached(dirs: &[PathBuf]) -> Result<Arc<Self>> {
+        type Fingerprint = Vec<(PathBuf, Option<std::time::SystemTime>, u64)>;
+        type Cache = Mutex<HashMap<Vec<PathBuf>, (Fingerprint, Arc<ToolRegistry>)>>;
+        static CACHE: OnceLock<Cache> = OnceLock::new();
+
+        let mut fingerprint: Fingerprint = Vec::new();
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("ts") {
+                    let meta = entry.metadata().ok();
+                    fingerprint.push((
+                        path,
+                        meta.as_ref().and_then(|m| m.modified().ok()),
+                        meta.map(|m| m.len()).unwrap_or(0),
+                    ));
+                }
+            }
+        }
+        fingerprint.sort();
+
+        let cache = CACHE.get_or_init(Default::default);
+        let key: Vec<PathBuf> = dirs.to_vec();
+        if let Some((cached_fp, registry)) = cache.lock().unwrap().get(&key) {
+            if *cached_fp == fingerprint {
+                return Ok(registry.clone());
+            }
+        }
+        let registry = Arc::new(Self::load_from_dirs(dirs)?);
+        cache
+            .lock()
+            .unwrap()
+            .insert(key, (fingerprint, registry.clone()));
         Ok(registry)
     }
 }

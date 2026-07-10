@@ -426,6 +426,42 @@ const CORPUS: &[&str] = &[
     "function m(x, y) { return x * y; } let z = 1; for (let i = 0; i < 3; i++) { z = m(-0, i); } console.log(Object.is(z, -0), Object.is(m(0, -1), -0));",
     // Callee result stored through kernel props and elements.
     "const step = x => (x * 3 + 1) % 97; const o = { v: 5 }; const a = [0, 0, 0]; for (let i = 0; i < a.length; i++) { o.v = step(o.v); a[i] = o.v; } console.log(a.join(','), o.v);",
+    // --- TYPED ARRAYS as kernel element/length bases -----------------------
+    // Float64Array fill + sum + in-place transform.
+    "const a = new Float64Array(8); for (let i = 0; i < a.length; i++) a[i] = i * 1.5; let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; for (let i = 0; i < a.length; i++) a[i] = a[i] / 2 + 0.25; console.log(s, a[3], a[7]);",
+    // Float32 store rounds to f32 per write (visible on read-back).
+    "const f = new Float32Array(4); for (let i = 0; i < f.length; i++) f[i] = 0.1 * (i + 1); let s = 0; for (let i = 0; i < f.length; i++) s += f[i]; console.log(s, f[0]);",
+    // Int32 wrap on store, truncation of fractions.
+    "const n = new Int32Array(6); for (let i = 0; i < n.length; i++) n[i] = 2147483646 + i; let s = 0; for (let i = 0; i < n.length; i++) s += n[i]; console.log(s, n[3]);",
+    "const n = new Int32Array(4); for (let i = 0; i < n.length; i++) n[i] = -(i + 0.75); console.log(n.join(','));",
+    // NaN / infinities store as 0 in integer kinds.
+    "const n = new Int16Array(3); const src = [NaN, Infinity, -Infinity]; for (let i = 0; i < n.length; i++) n[i] = src[i]; console.log(n.join(','));",
+    // Uint8Clamped: clamp + round-half-to-even.
+    "const c = new Uint8ClampedArray(6); const v = [-5, 0.5, 1.5, 2.5, 254.5, 300]; for (let i = 0; i < c.length; i++) c[i] = v[i]; console.log(c.join(','));",
+    // Uint32 negative wrap.
+    "const u = new Uint32Array(3); for (let i = 0; i < u.length; i++) u[i] = -1 - i; let s = 0; for (let i = 0; i < u.length; i++) s = (s + u[i]) % 1000000007; console.log(s);",
+    // OOB read: undefined flows through + (NaN), exactly as generic.
+    "const a = new Float64Array(3); a[0] = 1; a[1] = 2; a[2] = 3; let s = 0; for (let i = 0; i < 5; i++) { s += a[i]; } console.log(s, s === s);",
+    // OOB write: silent no-op; in-bounds part persists.
+    "const a = new Float64Array(2); for (let i = 0; i < 4; i++) { a[i] = i + 1; } console.log(a.join(','), a.length);",
+    // Two views aliasing one buffer: writes through one visible via the other.
+    "const buf = new ArrayBuffer(32); const x = new Float64Array(buf); const y = new Float64Array(buf); for (let i = 0; i < x.length; i++) { x[i] = i; y[i] = y[i] + 10; } console.log(x.join(','));",
+    // Different-kind views over one buffer (byte-level aliasing).
+    "const buf = new ArrayBuffer(8); const i8 = new Int8Array(buf); const i32 = new Int32Array(buf); for (let i = 0; i < i8.length; i++) i8[i] = i + 1; let s = 0; for (let i = 0; i < i32.length; i++) s ^= i32[i]; console.log(s >>> 0);",
+    // Byte-offset subarray view.
+    "const buf = new ArrayBuffer(64); const v = new Float64Array(buf, 16, 4); for (let i = 0; i < v.length; i++) v[i] = i * 2; console.log(v.join(','), v.length);",
+    // Own `length` shadow: kernel declines, generic observes the shadow.
+    "const a = new Float64Array(5); Object.defineProperty(a, 'length', { value: 2 }); let s = 0; for (let i = 0; i < a.length; i++) { s += 1; } console.log(s);",
+    // Patched %TypedArray%.prototype length getter: declines, patch observed.
+    "const proto = Object.getPrototypeOf(Object.getPrototypeOf(new Float64Array(1))); const desc = Object.getOwnPropertyDescriptor(proto, 'length'); Object.defineProperty(proto, 'length', { get() { return 2; }, configurable: true }); const a = new Float64Array(5); let s = 0; for (let i = 0; i < a.length; i++) s++; Object.defineProperty(proto, 'length', desc); console.log(s);",
+    // Null proto: `length` is undefined (0 iterations); elements still read.
+    "const a = new Float64Array(3); Object.setPrototypeOf(a, null); let s = 0; for (let i = 0; i < a.length; i++) s++; console.log(s, a[1] === 0);",
+    // BigInt-element kinds stay generic (elements aren't Numbers).
+    "const b = new BigInt64Array(3); b[0] = 1n; b[1] = 2n; b[2] = 3n; let s = 0; for (let i = 0; i < b.length; i++) { s += Number(b[i]); } console.log(s);",
+    // Length-tracking view on a resizable buffer, resized between loop runs.
+    "const buf = new ArrayBuffer(16, { maxByteLength: 64 }); const v = new Float64Array(buf); function sum() { let s = 0; for (let i = 0; i < v.length; i++) s += v[i]; return s; } v[0] = 1; v[1] = 2; const s1 = sum(); buf.resize(32); v[2] = 3; v[3] = 4; console.log(s1, sum());",
+    // Mixed dense-array and typed-array bases in one region.
+    "const d = [1, 2, 3, 4]; const t = new Float64Array(4); for (let i = 0; i < d.length; i++) { t[i] = d[i] * 2; } let s = 0; for (let i = 0; i < t.length; i++) s += t[i]; console.log(s);",
 ];
 
 #[test]
@@ -530,6 +566,12 @@ fn v4_loops_get_kernels() {
     assert!(
         kernels_in("const N = 100; function f() { let s = 0; for (let i = 0; i < N; i++) { s += i; } return s; } f();") >= 1,
         "upvalue-bound loop must kernelize"
+    );
+    // Typed-array element/length loop (bases are runtime-checked, so the
+    // translation is the same as a dense array's — pin that it still fires).
+    assert!(
+        kernels_in("function f(t) { let s = 0; for (let i = 0; i < t.length; i++) { s += t[i]; } return s; } f(new Float64Array(4));") >= 1,
+        "typed-array loop must kernelize"
     );
 }
 

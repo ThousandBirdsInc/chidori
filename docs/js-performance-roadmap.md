@@ -994,6 +994,39 @@ index or WTF-8 offset table remains available headroom if a workload ever
 needs it, and kernel candidate (a) (§6.5.1) now has its O(1) accessor
 prerequisite.
 
+## 6.8 Typed-array kernel bases (landed 2026-07-10): §6.5.1 candidate (c)
+
+The loop-kernel translator always accepted `t[i]` / `t[i] = v` / `t.length`
+over a pinned object base — the RUNTIME arms just only recognized dense
+`Internal::Array`, so a typed-array loop kernelized and then bailed on every
+access. The arms now also take numeric typed arrays:
+
+- `LoadElem`/`StoreElem`: a valid-index integer-indexed [[Get]]/[[Set]]
+  reads/writes element storage directly — own props and the prototype chain
+  are never consulted, so no props/proto re-check is needed (unlike dense
+  arrays). The register already holds the ToNumber'd store value, and
+  `typed_array::encode`/`decode` are the SAME per-kind conversions the
+  builtin path uses (f32 rounding, ToInt32-class wrapping, u8 clamping) —
+  bit-identical by construction. OOB (incl. detached / shrunk views) bails:
+  the generic path owns undefined-absorption and silent-store semantics.
+  BigInt-element kinds always bail (elements aren't Numbers).
+- `LoadLen`: typed-array `.length` resolves through a prototype ACCESSOR, so
+  the activation entry guard (`kernel_ta_len_ok`, gated by the new
+  `Kernel::loads_len` flag) identity-checks that any typed-array LoadLen
+  base still resolves to the pinned canonical `%TypedArray%.prototype`
+  getter (`Realm::ta_length_getter`) with no own shadow. Sound for the whole
+  activation: nothing inside a kernel can add props, change protos, or
+  resize/detach a buffer (all require calls).
+
+Measured: the `typed_array` workload (Float64Array sum/dot/transform +
+Int32Array bit-mix) **637 ms → 37 ms wall (17×)** — from ~45× behind Node to
+roughly parity. Gates: the kernels differential corpus grew 17 typed-array
+programs (per-kind store semantics incl. clamping/wrapping/f32 rounding,
+OOB reads and writes, aliased same-buffer and cross-kind views, offset
+subarrays, own-`length` shadow, patched prototype getter, null proto,
+BigInt kinds, resizable-buffer length tracking, mixed dense+typed regions);
+full suites + Test262 gate green.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

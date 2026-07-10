@@ -20,6 +20,12 @@ pub struct Realm {
     /// exact objects; anything else declines to the generic path.
     pub math_object: Option<JsObject>,
     pub math_kernel: Vec<JsObject>,
+    /// The canonical `%TypedArray%.prototype.length` getter function, pinned
+    /// at install so the loop-kernel entry guard can identity-check that a
+    /// typed-array base still resolves `.length` to it (an own shadow, a
+    /// patched prototype accessor, or a re-proto'd receiver declines to the
+    /// generic path).
+    pub ta_length_getter: Option<JsObject>,
     /// The canonical `Array.prototype.push` function object, pinned at
     /// install so the kernel `ArrayPush` entry guard can identity-check the
     /// live `push` property (and a bail can reconstruct the method on the
@@ -180,6 +186,7 @@ impl Realm {
             eval_fn: None,
             math_object: None,
             math_kernel: Vec::new(),
+            ta_length_getter: None,
             array_push: None,
             array_pop: None,
             object_proto: bare(),

@@ -800,8 +800,10 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         .kops
         .iter()
         .any(|op| matches!(op, KOp::StoreElem { .. } | KOp::ArrayPush { .. }));
+    let loads_len = x.kops.iter().any(|op| matches!(op, KOp::LoadLen { .. }));
     Some(Kernel {
         stores_elems,
+        loads_len,
         uses_array_push: x.uses_array_push,
         uses_array_pop: x.uses_array_pop,
         code: std::mem::take(&mut x.kops).into_boxed_slice(),

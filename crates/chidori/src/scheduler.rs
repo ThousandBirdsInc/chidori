@@ -64,6 +64,10 @@ pub fn shared_tokio_runtime() -> std::io::Result<Arc<tokio::runtime::Runtime>> {
 
 #[derive(Clone)]
 pub struct SchedulerDeps {
+    /// Shared provider registry — the same one the server's session handlers
+    /// use, so scheduled runs see identical providers (and reuse its HTTP
+    /// clients) instead of rebuilding a registry from env on every tick.
+    pub providers: Arc<ProviderRegistry>,
     pub template_engine: Arc<TemplateEngine>,
     pub session_store: Arc<dyn SessionStore>,
     pub policy: Arc<PolicyConfig>,
@@ -127,7 +131,7 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
 
     let (id, session) = tokio::task::spawn_blocking(move || -> Result<(String, StoredSession)> {
         let rt = crate::scheduler::shared_tokio_runtime()?;
-        let providers = Arc::new(ProviderRegistry::from_env());
+        let providers = deps.providers.clone();
 
         // Build the tool registry: recipe-local dirs + default `<agent>/tools`
         // + any MCP tools the server handed us.
@@ -138,8 +142,9 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .join("tools"),
         );
-        let mut registry =
-            ToolRegistry::load_from_dirs(&dirs).unwrap_or_else(|_| ToolRegistry::new());
+        let mut registry = ToolRegistry::load_from_dirs_cached(&dirs)
+            .map(|r| (*r).clone())
+            .unwrap_or_else(|_| ToolRegistry::new());
         for def in &deps.mcp_tools {
             registry.register(def.clone());
         }

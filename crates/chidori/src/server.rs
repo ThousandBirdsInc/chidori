@@ -486,6 +486,7 @@ pub async fn serve(
     scheduler::spawn_all(
         recipes,
         SchedulerDeps {
+            providers: providers.clone(),
             template_engine: template_engine.clone(),
             session_store: session_store.clone(),
             policy: policy.clone(),
@@ -771,8 +772,9 @@ fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engine {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("tools");
-    let mut registry =
-        ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new());
+    let mut registry = ToolRegistry::load_from_dirs_cached(&[tools_dir])
+        .map(|r| (*r).clone())
+        .unwrap_or_else(|_| ToolRegistry::new());
     for def in app.mcp_tools.iter() {
         registry.register(def.clone());
     }
@@ -913,6 +915,7 @@ async fn run_recipe(State(state): State<AppState>, Path(name): Path<String>) -> 
             .into_response();
     };
     let deps = SchedulerDeps {
+        providers: state.providers.clone(),
         template_engine: state.template_engine.clone(),
         session_store: state.session_store.clone(),
         policy: state.policy.clone(),

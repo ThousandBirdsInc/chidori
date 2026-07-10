@@ -408,7 +408,7 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &JsString) -> Result<
 
     if start > units.len() {
         if global || sticky {
-            vm.set_prop(
+            vm.set_prop_strict(
                 &Value::Object(re.clone()),
                 &PropertyKey::str("lastIndex"),
                 Value::Number(0.0),
@@ -423,7 +423,7 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &JsString) -> Result<
     match m {
         None => {
             if global || sticky {
-                vm.set_prop(
+                vm.set_prop_strict(
                     &Value::Object(re.clone()),
                     &PropertyKey::str("lastIndex"),
                     Value::Number(0.0),
@@ -433,7 +433,7 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &JsString) -> Result<
         }
         Some(mat) => {
             if global || sticky {
-                vm.set_prop(
+                vm.set_prop_strict(
                     &Value::Object(re.clone()),
                     &PropertyKey::str("lastIndex"),
                     Value::Number(mat.end as f64),
@@ -504,9 +504,14 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value,
     let u = vm.get_prop(rx, &PropertyKey::str("unicode"))?;
     let unicode = vm.to_boolean(&u);
     let units = s.to_utf16_vec();
-    vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
+    vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
     let mut out: Vec<Value> = Vec::new();
     loop {
+        // Metered like the array builtins' O(len) walks: an adversarial
+        // receiver (e.g. an accessor `lastIndex` that swallows the advance)
+        // can otherwise pin this native loop, where no interpreter op runs to
+        // consume the budget or observe the interrupt.
+        vm.native_tick()?;
         let result = regexp_exec_abstract(vm, rx, s)?;
         if result.is_null() {
             break;
@@ -519,7 +524,7 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value,
             let li = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
             let next = advance_string_index(&units, li, unicode);
-            vm.set_prop(
+            vm.set_prop_strict(
                 rx,
                 &PropertyKey::str("lastIndex"),
                 Value::Number(next as f64),
@@ -537,12 +542,12 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value,
 pub fn sym_search_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value, Value> {
     let prev = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
     if !crate::value::same_value(&prev, &Value::Number(0.0)) {
-        vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
+        vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
     }
     let result = regexp_exec_abstract(vm, rx, s)?;
     let cur = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
     if !crate::value::same_value(&cur, &prev) {
-        vm.set_prop(rx, &PropertyKey::str("lastIndex"), prev)?;
+        vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), prev)?;
     }
     if result.is_null() {
         Ok(Value::Number(-1.0))
@@ -586,7 +591,7 @@ pub fn sym_match_all_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Va
     let matcher = vm.construct(&c, &[rx.clone(), Value::str(&flags)], &c)?;
     let li_v = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
     let li = vm.to_length(&li_v)?;
-    vm.set_prop(
+    vm.set_prop_strict(
         &matcher,
         &PropertyKey::str("lastIndex"),
         Value::Number(li as f64),
@@ -635,7 +640,7 @@ fn make_regexp_string_iterator(
             let li = vm.get_prop(&matcher, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
             let next_i = advance_string_index(&s.to_utf16_vec(), li, unicode);
-            vm.set_prop(
+            vm.set_prop_strict(
                 &matcher,
                 &PropertyKey::str("lastIndex"),
                 Value::Number(next_i as f64),
@@ -674,7 +679,7 @@ pub fn sym_replace_generic(
     let unicode = if global {
         let u = vm.get_prop(rx, &PropertyKey::str("unicode"))?;
         let unicode = vm.to_boolean(&u);
-        vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
+        vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
         unicode
     } else {
         false
@@ -682,6 +687,8 @@ pub fn sym_replace_generic(
     // Collect all results (one for non-global, every match for global).
     let mut results: Vec<Value> = Vec::new();
     loop {
+        // Metered like the array builtins' O(len) walks — see sym_match_generic.
+        vm.native_tick()?;
         let result = regexp_exec_abstract(vm, rx, s)?;
         if result.is_null() {
             break;
@@ -696,7 +703,7 @@ pub fn sym_replace_generic(
             let li = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
             let next = advance_string_index(&units, li, unicode);
-            vm.set_prop(
+            vm.set_prop_strict(
                 rx,
                 &PropertyKey::str("lastIndex"),
                 Value::Number(next as f64),

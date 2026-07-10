@@ -343,6 +343,40 @@ impl Vm {
         r
     }
 
+    /// Verify a typed-array kernel base still resolves `.length` through the
+    /// realm's canonical `%TypedArray%.prototype.length` getter: no own
+    /// properties (nothing can shadow), and the FIRST `length` owner up the
+    /// prototype chain is an accessor whose getter is the pinned canonical.
+    /// Checked once per activation — nothing inside a kernel region can add
+    /// properties or change prototypes. Any deviation declines the kernel and
+    /// the generic path observes whatever the program set up.
+    fn kernel_ta_len_ok(&self, o: &crate::value::JsObject) -> bool {
+        let Some(canon) = &self.realm.ta_length_getter else {
+            return false;
+        };
+        if !o.borrow().props.is_empty() {
+            return false;
+        }
+        let key = PropertyKey::str("length");
+        let mut cur = o.borrow().proto.clone();
+        // The canonical chain is 2 hops (Float64Array.prototype →
+        // %TypedArray%.prototype); a longer walk is already exotic. Bound it
+        // so a pathological proto chain can't turn the entry guard O(n).
+        for _ in 0..4 {
+            let Some(p) = cur else { break };
+            let b = p.borrow();
+            if let Some(prop) = b.props.get(&key) {
+                return matches!(
+                    &prop.kind,
+                    PropertyKind::Accessor { get: Some(Value::Object(g)), .. }
+                        if g.ptr_eq(canon)
+                );
+            }
+            cur = b.proto.clone();
+        }
+        false
+    }
+
     /// Verify the global `Math` binding and each used method are still the
     /// realm's canonical objects, as plain data properties. Any deviation —
     /// deleted/replaced/shadowed `Math`, an accessor, a monkeypatched method
@@ -479,6 +513,26 @@ impl Vm {
             for &l in k.oslots.iter() {
                 if let Value::Object(o) = &frame.locals[l as usize] {
                     if !crate::value::protos_allow_any_index_create(o) {
+                        return self.step(frame, &k.fallback);
+                    }
+                }
+            }
+        }
+        // Typed-array `.length` resolves through a prototype ACCESSOR (unlike
+        // a dense array's own exotic property), so any LoadLen base holding a
+        // typed array must still resolve to the canonical getter. Element
+        // reads/writes need no such check — valid-index integer-indexed
+        // [[Get]]/[[Set]] never consult own props or the chain, and every
+        // access re-checks kind/bounds and bails otherwise.
+        if k.loads_len {
+            for op in k.code.iter() {
+                let crate::bytecode::KOp::LoadLen { obj, .. } = op else {
+                    continue;
+                };
+                if let Value::Object(o) = &frame.locals[k.oslots[*obj as usize] as usize] {
+                    if matches!(o.borrow().internal, Internal::TypedArray(_))
+                        && !self.kernel_ta_len_ok(o)
+                    {
                         return self.step(frame, &k.fallback);
                     }
                 }
@@ -823,13 +877,32 @@ impl Vm {
                     let mut ok = false;
                     if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
                         let b = objs[obj as usize].borrow();
-                        if b.props.is_empty() {
-                            if let Internal::Array(arr) = &b.internal {
+                        match &b.internal {
+                            Internal::Array(arr) if b.props.is_empty() => {
                                 if let Some(Value::Number(n)) = arr.get(i as usize) {
                                     regs[dst as usize] = *n;
                                     ok = true;
                                 }
                             }
+                            // Numeric typed arrays: a valid-index [[Get]]
+                            // reads element storage directly — own props and
+                            // the prototype chain are never consulted, so no
+                            // props/proto check is needed. OOB (incl.
+                            // detached / shrunk-view) bails to the generic
+                            // path, which owns the `undefined` absorption.
+                            Internal::TypedArray(t) if !t.kind.is_bigint() => {
+                                let iu = i as usize;
+                                if iu < crate::typed_array::ta_eff_length(t) {
+                                    let off = t.byte_offset + iu * t.kind.bytes();
+                                    let buf = t.buffer.borrow();
+                                    if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
+                                        regs[dst as usize] =
+                                            crate::typed_array::decode(bytes, off, t.kind);
+                                        ok = true;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if !ok {
@@ -911,9 +984,10 @@ impl Vm {
                     let mut ok = false;
                     if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
                         let mut b = objs[obj as usize].borrow_mut();
-                        if b.props.is_empty() {
-                            let extensible = b.extensible;
-                            if let Internal::Array(arr) = &mut b.internal {
+                        let extensible = b.extensible;
+                        let props_empty = b.props.is_empty();
+                        match &mut b.internal {
+                            Internal::Array(arr) if props_empty => {
                                 let iu = i as usize;
                                 match arr.get_mut(iu) {
                                     Some(slot) if !matches!(slot, Value::Hole) => {
@@ -939,6 +1013,32 @@ impl Vm {
                                     }
                                 }
                             }
+                            // Numeric typed arrays: a valid-index [[Set]]
+                            // writes element storage directly, no props/proto
+                            // consult; the register already holds the
+                            // ToNumber'd value, and `encode` applies the same
+                            // per-kind conversion (f32 rounding, ToInt32-class
+                            // wrapping) as the builtin write path. OOB — a
+                            // silent no-op per spec — bails to the generic
+                            // path, which owns that behavior.
+                            Internal::TypedArray(t) if !t.kind.is_bigint() => {
+                                let iu = i as usize;
+                                if iu < crate::typed_array::ta_eff_length(t) {
+                                    let off = t.byte_offset + iu * t.kind.bytes();
+                                    let kind = t.kind;
+                                    let mut buf = t.buffer.borrow_mut();
+                                    if let Internal::ArrayBuffer(Some(bytes)) = &mut buf.internal {
+                                        crate::typed_array::encode(
+                                            bytes,
+                                            off,
+                                            kind,
+                                            regs[val as usize],
+                                        );
+                                        ok = true;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if !ok {
@@ -965,16 +1065,28 @@ impl Vm {
                 KOp::Math2 { kind, dst, a, b } => {
                     regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
                 }
-                // Dense array `length` (unshadowed only), else bail.
+                // Dense array `length` (unshadowed only) or typed-array
+                // effective length (the entry guard verified the canonical
+                // accessor resolution for typed-array bases; the length
+                // itself cannot change mid-activation — resize/detach require
+                // calls, which kernel regions exclude), else bail.
                 KOp::LoadLen { dst, obj, bail } => {
                     let mut ok = false;
                     {
                         let b = objs[obj as usize].borrow();
-                        if b.props.is_empty() {
-                            if let Internal::Array(arr) = &b.internal {
+                        match &b.internal {
+                            Internal::Array(arr) if b.props.is_empty() => {
                                 regs[dst as usize] = arr.len() as f64;
                                 ok = true;
                             }
+                            // Any kind — a BigInt-element array's `.length`
+                            // is the same plain count (its ELEMENT accesses
+                            // are what bail).
+                            Internal::TypedArray(t) => {
+                                regs[dst as usize] = crate::typed_array::ta_eff_length(t) as f64;
+                                ok = true;
+                            }
+                            _ => {}
                         }
                     }
                     if !ok {
