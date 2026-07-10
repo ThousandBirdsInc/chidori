@@ -360,6 +360,7 @@ impl std::fmt::Debug for ModelOverride {
 }
 
 impl ModelOverride {
+    #[allow(dead_code)] // Exercised only by tests today; the lib target sees it as dead.
     pub fn new(callback: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
         Self(Arc::new(callback))
     }
@@ -879,6 +880,7 @@ impl RuntimeContext {
     /// the full `checkpoint.json` is rewritten only at compaction points (run
     /// start, pause, settle) or when the log is checkpoint-dirty. Returns the
     /// run directory path.
+    #[allow(dead_code)] // Exercised only by tests today; the lib target sees it as dead.
     pub fn enable_persistence(&self, base_dir: PathBuf) -> PathBuf {
         let run_dir = base_dir.join(self.run_id());
         let _ = std::fs::create_dir_all(&run_dir);
@@ -1323,6 +1325,7 @@ impl RuntimeContext {
     /// Install a model-override hook consulted before every prompt host call,
     /// so a mid-run model change refreshes the model on the next provider
     /// request across all execution paths.
+    #[allow(dead_code)] // Exercised only by tests today; the lib target sees it as dead.
     pub fn set_model_override(&self, model_override: ModelOverride) {
         self.inner.lock().unwrap().model_override = Some(model_override);
     }
@@ -1861,9 +1864,7 @@ fn vfs_from_seed_env() -> Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::snapshot::{
-        HostPromiseState, PENDING_HOST_OPERATION_FILE,
-    };
+    use crate::runtime::snapshot::{HostPromiseState, PENDING_HOST_OPERATION_FILE};
 
     #[test]
     fn runtime_context_tracks_host_promise_lifecycle() {

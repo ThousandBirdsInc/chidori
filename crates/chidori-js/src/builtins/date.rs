@@ -467,6 +467,7 @@ fn parse_uint(s: &str) -> Option<u64> {
 /// Accept the two human-readable forms this engine itself emits:
 ///   - `Www, DD Mmm YYYY HH:mm:ss GMT`            (toUTCString)
 ///   - `Www Mmm DD YYYY HH:mm:ss ...`             (toString / toDateString)
+///
 /// Both are interpreted as UTC. Returns None if neither matches.
 fn parse_legacy(s: &str) -> Option<f64> {
     // Tokenize on whitespace and commas.

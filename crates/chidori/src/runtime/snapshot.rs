@@ -772,7 +772,6 @@ pub enum SnapshotBlobKind {
     LiveQuickJsVm,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifest {
     pub run_id: String,

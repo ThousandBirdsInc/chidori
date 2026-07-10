@@ -940,13 +940,12 @@ impl Vm {
     pub fn get_prop(&mut self, base: &Value, key: &PropertyKey) -> Result<Value, Value> {
         // Fast paths for primitives without boxing.
         match base {
-            Value::Undefined | Value::Uninitialized | Value::Hole | Value::Null => {
-                Err(self.throw_type(&format!(
+            Value::Undefined | Value::Uninitialized | Value::Hole | Value::Null => Err(self
+                .throw_type(&format!(
                     "Cannot read properties of {} (reading '{}')",
                     if base.is_null() { "null" } else { "undefined" },
                     key_display(key)
-                )))
-            }
+                ))),
             Value::String(s) => {
                 if let Some(v) = self.string_own_prop(s, key) {
                     return Ok(v);

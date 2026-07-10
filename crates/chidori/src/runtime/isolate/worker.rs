@@ -83,6 +83,7 @@ pub fn run() -> io::Result<()> {
 /// applying any per-process resource limits. Factored out of [`run`] so tests
 /// can drive the worker over an in-process socket without a subprocess — and
 /// without the worker's `setrlimit` floor leaking onto the test process.
+#[allow(dead_code)] // Exercised only by tests today; the lib target sees it as dead.
 pub fn serve<R: Read + 'static, W: Write + 'static>(reader: R, writer: W) -> io::Result<()> {
     serve_inner(reader, writer, false)
 }

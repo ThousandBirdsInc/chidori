@@ -22,8 +22,7 @@ pub struct ToolParam {
 
 /// How a tool is executed. File-backed tools are local `.ts` files; MCP-backed
 /// tools are dispatched to a running MCP server child process via `McpManager`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ToolBackend {
     /// The tool's body lives in a local .ts file with `export const tool` and
     /// `export async function run(args, chidori)`.
@@ -38,7 +37,6 @@ pub enum ToolBackend {
     /// application.
     Native,
 }
-
 
 /// A registered tool with its metadata and execution backend.
 #[derive(Debug, Clone)]

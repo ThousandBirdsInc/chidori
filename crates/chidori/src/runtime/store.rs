@@ -110,6 +110,7 @@ impl FsRunStore {
         }
     }
 
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn run_dir(&self) -> &Path {
         &self.run_dir
     }
@@ -359,6 +360,7 @@ impl SqliteRunStoreShared {
         }))
     }
 
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     fn list_runs(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -848,6 +850,7 @@ impl HttpRelay {
         }
     }
 
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     fn list_runs(&self) -> Result<Vec<String>> {
         let (status, bytes) = self.request("GET", format!("{}/runs", self.base_url), None)?;
         if !(200..300).contains(&status) {
@@ -1158,6 +1161,7 @@ pub struct RunStoreFactory {
 }
 
 impl RunStoreFactory {
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn fs(run_base: impl Into<PathBuf>) -> Self {
         Self {
             run_base: run_base.into(),
@@ -1241,6 +1245,7 @@ impl RunStoreFactory {
     }
 
     /// Whether a durable mirror is configured (vs filesystem only).
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn has_durable_mirror(&self) -> bool {
         !matches!(self.backend, RunStoreBackend::Fs)
     }
@@ -1287,6 +1292,7 @@ impl RunStoreFactory {
 
     /// Every run id the backend knows: local run directories, unioned with the
     /// durable mirror's runs (which may include runs from a lost machine).
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn list_runs(&self) -> Result<Vec<String>> {
         let mut ids = BTreeSet::new();
         match std::fs::read_dir(&self.run_base) {

@@ -155,6 +155,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 /// Current live bytes tracked by [`CountingAllocator`]. Returns 0 when the
 /// allocator is not installed.
+#[allow(dead_code)] // Diagnostic accessor; no production call sites yet.
 pub fn current_allocated_bytes() -> usize {
     ALLOCATED.load(Ordering::Relaxed)
 }

@@ -259,8 +259,11 @@ fn define_own_property_inner(
     // `current` afterwards so post-valueOf state is what gets validated.
     let obj_is_array = matches!(obj.borrow().internal, Internal::Array(_));
     let mut coerced_desc;
-    let d: &PropDesc = if obj_is_array && key.as_str() == Some("length") && d.value.is_some() {
-        let v = d.value.as_ref().unwrap();
+    let d: &PropDesc = if let Some(v) = d
+        .value
+        .as_ref()
+        .filter(|_| obj_is_array && key.as_str() == Some("length"))
+    {
         let new_len = vm.to_uint32(v)?;
         let number_len = vm.to_number(v)?;
         if (new_len as f64) != number_len {
@@ -1805,31 +1808,6 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
                         kind: PropertyKind::Data {
                             value: Value::String(JsString::from_code_units(&[u])),
                             writable: false,
-                        },
-                        enumerable: true,
-                        configurable: false,
-                    });
-                }
-            }
-            None
-        }
-        // Module Namespace exotic [[GetOwnProperty]] for an export name:
-        // a live {writable:true, enumerable:true, configurable:false} data
-        // property (an uninitialized binding reads as undefined here — the
-        // throwing TDZ check lives on the [[Get]] path).
-        Internal::ModuleNamespace(ns) => {
-            if let PropertyKey::Str(s) = key {
-                if let Some(cell) = ns.exports.get(s) {
-                    let v = cell.borrow().clone();
-                    let v = if matches!(v, Value::Uninitialized) {
-                        Value::Undefined
-                    } else {
-                        v
-                    };
-                    return Some(Property {
-                        kind: PropertyKind::Data {
-                            value: v,
-                            writable: true,
                         },
                         enumerable: true,
                         configurable: false,

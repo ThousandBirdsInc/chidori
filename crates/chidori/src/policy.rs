@@ -29,7 +29,6 @@ pub enum Decision {
     NeverAllow,
 }
 
-
 impl Decision {
     /// Total order by restrictiveness: AlwaysAllow < AskBefore < NeverAllow.
     fn strictness(self) -> u8 {

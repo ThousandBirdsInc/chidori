@@ -918,7 +918,6 @@ impl Dom {
                 (AttrOp::Prefix, Some(v)) => v.starts_with(&a.value),
                 (AttrOp::Suffix, Some(v)) => v.ends_with(&a.value),
                 (AttrOp::Substring, Some(v)) => v.contains(&a.value),
-                (AttrOp::Exists, None) => false,
             };
             if !ok {
                 return false;
@@ -1026,6 +1025,10 @@ struct AttrSel {
 }
 
 #[derive(Clone)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variants mirror the CSS pseudo-class names verbatim"
+)]
 enum Pseudo {
     FirstChild,
     LastChild,

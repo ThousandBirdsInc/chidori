@@ -41,6 +41,7 @@ struct PendingOp {
 
 struct JournalState {
     journal: Journal,
+    #[allow(dead_code)] // Recorded at construction; not yet read back.
     mode: Mode,
     counters: HashMap<String, u64>,
     pending: HashMap<u64, PendingOp>,

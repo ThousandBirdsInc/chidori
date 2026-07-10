@@ -1,3 +1,10 @@
+//! Workspace file store scaffolding: manifest, file/deleted entries, and the
+//! path-sanitized read/write/list/delete surface. Not yet wired into the
+//! runtime — hence the module-wide `dead_code` allow, same as the other
+//! staged runtime modules (`native.rs`, `snapshot.rs`, `capability.rs`,
+//! `vfs.rs`). Remove the allow when the first call site lands.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 

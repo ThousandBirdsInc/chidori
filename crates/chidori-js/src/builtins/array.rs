@@ -1540,12 +1540,7 @@ fn flatten_into(
     Ok(target_index)
 }
 
-fn merge_sort(
-    vm: &mut Vm,
-    items: &mut Vec<Value>,
-    cmp: &Value,
-    has_cmp: bool,
-) -> Result<(), Value> {
+fn merge_sort(vm: &mut Vm, items: &mut [Value], cmp: &Value, has_cmp: bool) -> Result<(), Value> {
     if items.len() <= 1 {
         return Ok(());
     }

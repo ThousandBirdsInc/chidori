@@ -5,29 +5,31 @@
 //! the same footing for the paths a live agent actually pays per host call,
 //! per state transition, and per run:
 //!
-//!   * `replay_lookup`      — `RuntimeContext::try_replay` over a growing
-//!                            journal. A resume calls this once per recorded
-//!                            effect; the lookup is a linear scan today
-//!                            (`runtime/context.rs`), so a full resume sweep
-//!                            is O(N²) in journal length.
-//!   * `record_call`        — the live-path cost of recording one host call
-//!                            as payloads grow (deep `CallRecord` clones).
-//!   * `session_store_put`  — `SqliteStore::put` as the session's call log
-//!                            grows. Every pause/resume/approval state
-//!                            transition re-serializes the WHOLE session blob
-//!                            and pays a full fsync (no WAL) today
-//!                            (`storage.rs`).
-//!   * `run_store_append`   — `SqliteRunStore::append_record` against a run
-//!                            that already holds K records. The append's
-//!                            `MAX(pos)` subquery scans the run's rows, so
-//!                            appending the K-th record is O(K) today
-//!                            (`runtime/store.rs`) despite the trait's O(1)
-//!                            contract.
-//!   * `per_run_setup`      — fixed construction costs paid per agent run /
-//!                            per fetch: `new_tokio_runtime()` (built per run
-//!                            in `server.rs`/`scheduler.rs`) and a
-//!                            `reqwest::Client` (built per `fetch()` host
-//!                            call in `runtime/host_core.rs`).
+//! ```text
+//! replay_lookup      — RuntimeContext::try_replay over a growing
+//!                      journal. A resume calls this once per recorded
+//!                      effect; the lookup is a linear scan today
+//!                      (runtime/context.rs), so a full resume sweep
+//!                      is O(N²) in journal length.
+//! record_call        — the live-path cost of recording one host call
+//!                      as payloads grow (deep CallRecord clones).
+//! session_store_put  — SqliteStore::put as the session's call log
+//!                      grows. Every pause/resume/approval state
+//!                      transition re-serializes the WHOLE session blob
+//!                      and pays a full fsync (no WAL) today
+//!                      (storage.rs).
+//! run_store_append   — SqliteRunStore::append_record against a run
+//!                      that already holds K records. The append's
+//!                      MAX(pos) subquery scans the run's rows, so
+//!                      appending the K-th record is O(K) today
+//!                      (runtime/store.rs) despite the trait's O(1)
+//!                      contract.
+//! per_run_setup      — fixed construction costs paid per agent run /
+//!                      per fetch: new_tokio_runtime() (built per run
+//!                      in server.rs/scheduler.rs) and a
+//!                      reqwest::Client (built per fetch() host
+//!                      call in runtime/host_core.rs).
+//! ```
 //!
 //! Run with: `cargo bench -p chidori --bench runtime`
 //! Smoke-check (each bench once, no statistics): append `-- --test`.

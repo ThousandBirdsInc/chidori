@@ -4,11 +4,14 @@
 //! property access, arrays, strings, closures).
 //!
 //! Three angles per workload:
-//!   * `compile`  — parse + lower to bytecode only (front-end cost).
-//!   * `eval`     — full `Engine::new()` + parse + compile + run (end-to-end,
-//!                  what a real `eval()` call pays, realm setup included).
-//!   * `interp`   — compile ONCE, then time only the VM running the bytecode
-//!                  (isolates the interpreter dispatch loop from the front end).
+//!
+//! ```text
+//! compile  — parse + lower to bytecode only (front-end cost).
+//! eval     — full `Engine::new()` + parse + compile + run (end-to-end,
+//!            what a real `eval()` call pays, realm setup included).
+//! interp   — compile ONCE, then time only the VM running the bytecode
+//!            (isolates the interpreter dispatch loop from the front end).
+//! ```
 //!
 //! Run with: `cargo bench -p chidori-js`
 //!

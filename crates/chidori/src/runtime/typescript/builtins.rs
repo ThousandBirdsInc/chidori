@@ -16,6 +16,7 @@ use std::path::Path;
 
 /// Allowlisted builtin names. Kept in sync with `NODE_BUILTIN_ALLOWLIST` in
 /// `transpile.rs`.
+#[allow(dead_code)] // Reference copy of the allowlist; transpile.rs owns the enforced one.
 pub const BUILTIN_NAMES: &[&str] = &[
     "process",
     "buffer",

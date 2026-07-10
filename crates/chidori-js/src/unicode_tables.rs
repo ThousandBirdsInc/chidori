@@ -3,7 +3,12 @@
 //     python3 crates/chidori-js/scripts/gen_unicode_tables.py
 //
 // Range slices are sorted, disjoint, and inclusive on both ends.
+//
+// The generator emits the complete UCD property set; builtins consume only a
+// subset, so unused tables are expected (dead_code allow below), and keeping
+// the full set beats special-casing the generator per consumer.
 #![allow(clippy::all)]
+#![allow(dead_code)]
 
 static GC_C: &[(u32, u32)] = &[
     (0x0, 0x1F),

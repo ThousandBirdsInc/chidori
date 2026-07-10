@@ -1672,6 +1672,7 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
 
 /// Snapshot a typed array's elements into a fresh dense JS array (used to back
 /// the keys/values/entries iterators).
+#[allow(dead_code)] // Superseded by the index-based iterators; kept as the snapshot fallback.
 fn ta_snapshot_array(vm: &mut Vm, o: &JsObject) -> JsObject {
     let len = vm.ta_length(o).unwrap_or(0);
     let mut elems = Vec::with_capacity(len);
@@ -1721,7 +1722,7 @@ fn ta_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> R
 
 fn ta_sort_range(
     vm: &mut Vm,
-    items: &mut Vec<Value>,
+    items: &mut [Value],
     cmp: &Value,
     has_cmp: bool,
     prep: &mut Option<crate::exec::PreparedKernel>,

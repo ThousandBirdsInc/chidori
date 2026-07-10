@@ -2651,7 +2651,7 @@ fn define_zdt_getter(
 /// A fresh system-clock `Now` (the bare conformance context reads real time,
 /// like `Date`; the durable runtime captures this as an effect at a higher layer).
 fn now_clock() -> temporal_rs::now::Now<temporal_rs::sys::LocalHostSystem> {
-    temporal_rs::Temporal::now()
+    temporal_rs::Temporal::local_now()
 }
 
 /// The optional `temporalTimeZoneLike` argument of the `Now` methods.

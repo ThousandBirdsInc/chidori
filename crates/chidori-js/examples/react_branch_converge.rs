@@ -38,8 +38,7 @@ struct Card {
     chosen: bool,
 }
 
-#[derive(Serialize)]
-#[derive(Default)]
+#[derive(Serialize, Default)]
 struct Frame {
     kind: String, // "branches" | "feedback" | "converged" | "replay"
     caption: String,
@@ -53,7 +52,6 @@ struct Frame {
     inputs: usize,
     replayed: usize,
 }
-
 
 /// The agent + its durable journal. Both `prompt` (model) and `input` (human)
 /// answers are recorded; on replay they are served for free — so a converged

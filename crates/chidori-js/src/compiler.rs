@@ -638,7 +638,9 @@ struct FnCtx {
     uses_arguments: bool,
     /// Cell index of the implicit `this` binding (for non-arrow functions).
     this_cell: Option<u32>,
+    #[allow(dead_code)] // Reserved for new.target support; written but not yet read.
     new_target_cell: Option<u32>,
+    #[allow(dead_code)] // Reserved for mapped-arguments support; written but not yet read.
     arguments_cell: Option<u32>,
     /// Names captured by nested functions (conservative): such bindings become
     /// cells (always true here since all bindings are cells, but retained for
@@ -2638,6 +2640,7 @@ impl Compiler {
         self.patch_jump(jhave2, have);
     }
 
+    #[allow(dead_code)] // Not referenced by the current iteration lowering; kept for the Op sequence it documents.
     fn emit_iter_step(&mut self, itc: u32) {
         self.emit(Op::LoadCell(itc)); // [iter]
         self.emit(Op::IteratorNext); // [iter, result]
@@ -3235,6 +3238,7 @@ impl Compiler {
     ///   `finally`) is taken by `do_completion`;
     /// - throw/return/break/continue in `body` or `catch`: `do_completion` runs
     ///   the finalizer with the completion parked, and `EndFinally` resumes it.
+    ///
     /// This single-copy model (vs. duplicating the finalizer per path) is what
     /// makes non-local exits run `finally`.
     fn compile_try_with_finally(&mut self, t: &TryStatement, finalizer: &BlockStatement) -> R {
@@ -7083,6 +7087,5 @@ fn collect_pattern_names(pat: &BindingPattern, out: &mut Vec<String>) {
             }
         }
         BindingPattern::AssignmentPattern(a) => collect_pattern_names(&a.left, out),
-        _ => {}
     }
 }

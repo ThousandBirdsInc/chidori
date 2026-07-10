@@ -247,6 +247,7 @@ impl S3BlobStore {
 
     /// The configured key prefix (empty or `…/`-terminated), so the factory
     /// can address `runs/…` / `agents/…` keyspaces.
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn key_prefix(&self) -> &str {
         &self.prefix
     }
@@ -565,6 +566,7 @@ impl RunStore for BlobRunStore {
 }
 
 /// Run ids known to the bucket (`runs/<id>/…` common prefixes).
+#[allow(dead_code)] // Not yet wired into a call path; staged API.
 pub fn list_runs(store: &S3BlobStore) -> Result<Vec<String>> {
     let prefix = format!("{}runs/", store.prefix);
     let (_, common) = store.list(&prefix, Some("/"))?;

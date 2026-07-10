@@ -337,6 +337,7 @@ impl Engine {
     /// Persist runs through a pre-built [`RunStoreFactory`] — the server path,
     /// which constructs the factory once at startup (a durable mirror holds
     /// shared state like a SQLite connection) instead of once per engine.
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn with_run_store(mut self, factory: crate::runtime::store::RunStoreFactory) -> Self {
         self.persist_base = Some(factory.run_base().to_path_buf());
         self.run_store = Some(factory);
@@ -505,6 +506,7 @@ impl Engine {
     /// approval requests. This is the in-process equivalent of the session
     /// server's interactive execution path for embedders that already own
     /// their UI/event loop.
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn run_streaming_pausable(
         &self,
         path: &Path,
@@ -517,6 +519,7 @@ impl Engine {
     /// As `run_streaming_pausable`, but installs an optional model-override hook
     /// (Pi-style save point) so a mid-run model change refreshes the model on
     /// the next provider request inside this run's tool loop.
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn run_streaming_pausable_with_model_override(
         &self,
         path: &Path,
@@ -593,6 +596,7 @@ impl Engine {
     /// replay resume uses this so a resumed run keeps its original id (and its
     /// persisted run directory), matching the live-VM resume path — a resumed
     /// run is the same durable run, not a new one.
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn run_replay_pausable_with_host_promises_and_vfs_preserving_run_id(
         &self,
         path: &Path,
@@ -675,6 +679,7 @@ impl Engine {
     /// Resume/replay an interactive streaming run with persisted host-promise
     /// state. Used by embedders that mirror the server session interaction
     /// without routing through HTTP.
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn run_streaming_replay_pausable_with_host_promises(
         &self,
         path: &Path,

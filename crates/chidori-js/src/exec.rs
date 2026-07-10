@@ -2750,6 +2750,7 @@ impl Vm {
     ///   finalizer (whose `EndFinally` resumes this dispatch);
     /// - once no more crossing handlers remain, the action is performed
     ///   (`Ctl::Return` / re-`throw` as `Err` / `Ctl::Jump` to the loop target).
+    ///
     /// PerformEval (spec 19.2.1.1) for a direct call to %eval%: compile the
     /// source against the call site's scope snapshot, run the spec's
     /// EvalDeclarationInstantiation checks (the sloppy `var arguments`
@@ -6978,9 +6979,7 @@ impl Vm {
 fn js_mod(a: f64, b: f64) -> f64 {
     if b == 0.0 || a.is_nan() || b.is_nan() || a.is_infinite() {
         f64::NAN
-    } else if b.is_infinite() {
-        a
-    } else if a == 0.0 {
+    } else if b.is_infinite() || a == 0.0 {
         a
     } else {
         // Fast path: both operands integral and exactly representable (|x| <=

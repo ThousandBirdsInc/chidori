@@ -508,20 +508,15 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         Ok(Value::str(str_this(vm, &this)?.to_lowercase()))
     });
     vm.define_method(proto, "trim", 0, |vm, this, _a| {
-        Ok(Value::str(
-            str_this(vm, &this)?.trim_matches(is_js_ws),
-        ))
+        Ok(Value::str(str_this(vm, &this)?.trim_matches(is_js_ws)))
     });
     vm.define_method(proto, "trimStart", 0, |vm, this, _a| {
         Ok(Value::str(
-            str_this(vm, &this)?
-                .trim_start_matches(is_js_ws),
+            str_this(vm, &this)?.trim_start_matches(is_js_ws),
         ))
     });
     vm.define_method(proto, "trimEnd", 0, |vm, this, _a| {
-        Ok(Value::str(
-            str_this(vm, &this)?.trim_end_matches(is_js_ws),
-        ))
+        Ok(Value::str(str_this(vm, &this)?.trim_end_matches(is_js_ws)))
     });
     vm.define_method(proto, "repeat", 1, |vm, this, args| {
         let s = str_this(vm, &this)?;
