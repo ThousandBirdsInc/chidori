@@ -40,6 +40,12 @@ pub struct Engine {
     /// (`CHIDORI_RUN_STORE`, `docs/durable-storage.md`). Built alongside
     /// `persist_base`; None when persistence is disabled.
     run_store: Option<crate::runtime::store::RunStoreFactory>,
+    /// Warm-resume bridge installed on every run leg's context (see
+    /// [`crate::runtime::context::WarmInputBridge`]): the session server sets
+    /// this so an `input()` pause parks the live VM instead of unwinding, and
+    /// the resume continues in place. None (CLI, tests, embedders) keeps the
+    /// classic pause-unwind behavior.
+    warm_input_bridge: Option<crate::runtime::context::WarmInputBridge>,
     /// Default root for `chidori.workspace`, used when the run's context has no
     /// workspace root of its own. The CLI points this at the agent's project
     /// directory so `chidori.workspace` works out of the box; an explicit
@@ -287,8 +293,17 @@ impl Engine {
             approvals: Vec::new(),
             persist_base: None,
             run_store: None,
+            warm_input_bridge: None,
             workspace_root: None,
         }
+    }
+
+    pub fn with_warm_input_bridge(
+        mut self,
+        bridge: crate::runtime::context::WarmInputBridge,
+    ) -> Self {
+        self.warm_input_bridge = Some(bridge);
+        self
     }
 
     pub fn with_approvals(mut self, approvals: Vec<(String, serde_json::Value)>) -> Self {
@@ -689,6 +704,9 @@ impl Engine {
             if let Some(ref root) = self.workspace_root {
                 ctx.set_workspace_root(root.clone());
             }
+        }
+        if let Some(ref bridge) = self.warm_input_bridge {
+            ctx.set_warm_input_bridge(bridge.clone());
         }
 
         // Enable persistence if configured: the filesystem run dir, teed with

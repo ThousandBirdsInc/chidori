@@ -1,8 +1,8 @@
 # Resume performance: what a resume costs, and how to make it cheap
 
 > **Status:** the two caches below are **landed** (branch
-> `claude/chidori-js-jit-compiler-btc3ec`); the warm-standby design in §5 is a
-> proposal. **Related:** [`docs/value-checkpoints.md`](./value-checkpoints.md)
+> `claude/chidori-js-jit-compiler-btc3ec`); the warm-standby design in §5 is
+> **landed** for `input()` pauses on the session server (see §5.1). **Related:** [`docs/value-checkpoints.md`](./value-checkpoints.md)
 > (the `chidori.step` memoization primitive),
 > [`docs/interpreter-optimization.md`](./interpreter-optimization.md) and
 > [`docs/jit.md`](./jit.md) (the retired dispatch-JIT experiment),
@@ -191,10 +191,39 @@ change — it should land behind a flag with the differential verifier on. It
 is the single largest remaining resume win: it removes the O(history) term
 entirely for the pause→deliver→resume class.
 
+### 5.1 Landed: warm input resume (session server)
+
+The conversion above landed in a simpler shape than the suspended-engine
+pool: the pause never tears the engine down in the first place. A
+`WarmInputBridge` installed on every server run leg intercepts the `input()`
+pause AFTER the pending operation is durable (begin + safepoint), surfaces
+the same paused `RunResult` the unwind path returns (so the HTTP handler
+responds normally), and **parks the engine thread** awaiting the response.
+`/resume` delivers through the parked channel: the continuation is O(1) —
+no realm rebuild, no transpile, no replay. The parked engine reloads the
+durable signal inbox before continuing (deliveries that arrived while
+parked), and records the exact journal entry the replay path's synthetic
+injection produces, so the durable artifacts are identical either way —
+pinned by a differential test (`warm_fallback_replay_produces_identical_journal`).
+
+Degradation is structural, not best-effort: `Park` (eviction deadline
+`CHIDORI_WARM_RESUME_EVICT_MS`, capacity, cancel, server shutdown — the
+entry's channel disconnecting) unwinds into the classic paused artifact,
+and `/resume` falls back to replay, which then re-upgrades the continuation
+back onto the warm path. `CHIDORI_WARM_RESUME=0` disables the whole
+mechanism. The blob/journal replay path remains the source of truth for
+crash recovery. Actor message loops got the equivalent treatment separately
+(inline listen-point waits in `host_actor`, `docs/actors.md`).
+
+Measured (debug build, 600-record history, via the HTTP server): resume
+23 ms warm vs 213 ms replay — and the warm number is flat in history size
+where the replay number grows with it.
+
 ## 6. Order of remaining work, by expected value
 
-1. **Warm-standby conversion (§5)** — removes the O(history) term for live
-   resumes.
+1. ~~**Warm-standby conversion (§5)**~~ — landed for input pauses (§5.1);
+   signal/approval pauses still resume by replay (now fast: the journal
+   replay path itself was made O(history) with small constants).
 2. **Lazy / shared-template realm construction** — removes most of the fixed
    ~3.6 ms per engine (`interpreter-optimization.md` §11.4 bonus row).
 3. **Per-segment replay-cost tracing** — a `chidori trace` view attributing

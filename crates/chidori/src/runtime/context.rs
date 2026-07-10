@@ -102,6 +102,47 @@ impl HostOperationCompletionSafepoint {
     }
 }
 
+/// Outcome of a warm input pause ([`WarmInputBridge`]).
+pub enum WarmInputWait {
+    /// The `input()` response arrived while the VM stayed live: continue with
+    /// it in place.
+    Delivered(String),
+    /// Park (no supervisor waiting, eviction deadline, capacity): unwind via
+    /// the ordinary PAUSE_MARKER path and resume by replay later.
+    Park,
+}
+
+/// Warm-resume bridge installed by the session server: when an `input()`
+/// listen point in Pause mode has no cached response, the bridge surfaces the
+/// pause to the server (which answers the HTTP request) and BLOCKS the engine
+/// thread until the response is delivered — the continuation then costs O(1)
+/// instead of an O(history) replay re-execution. The pending operation is
+/// durable on disk BEFORE the bridge is consulted, so a crash while parked
+/// resumes by replay exactly as an unwound pause would; `Park` (eviction,
+/// capacity, shutdown) degrades to that same path at any time.
+#[derive(Clone)]
+pub struct WarmInputBridge(
+    Arc<dyn Fn(&RuntimeContext, &PendingInput) -> WarmInputWait + Send + Sync>,
+);
+
+impl std::fmt::Debug for WarmInputBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WarmInputBridge").finish_non_exhaustive()
+    }
+}
+
+impl WarmInputBridge {
+    pub fn new(
+        callback: impl Fn(&RuntimeContext, &PendingInput) -> WarmInputWait + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn wait(&self, ctx: &RuntimeContext, pending: &PendingInput) -> WarmInputWait {
+        (self.0)(ctx, pending)
+    }
+}
+
 /// Outcome of an actor's inline listen-point wait ([`ActorSignalWaiter`]).
 pub enum ActorSignalWait {
     /// A matching message reached the actor's shared mailbox; the caller
@@ -235,6 +276,9 @@ struct RuntimeContextInner {
     /// Optional inline mailbox wait for actor listen points (see
     /// [`ActorSignalWaiter`]); installed per supervision iteration.
     pub actor_signal_waiter: Option<ActorSignalWaiter>,
+    /// Optional warm-resume bridge for `input()` pauses (see
+    /// [`WarmInputBridge`]); installed by the session server's run legs.
+    pub warm_input_bridge: Option<WarmInputBridge>,
     /// Optional scoped workspace root exposed through `chidori.workspace`.
     pub workspace_root: Option<PathBuf>,
     /// Seqs of host calls currently executing (their `live()` is on the
@@ -427,6 +471,7 @@ impl RuntimeContext {
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -502,6 +547,7 @@ impl RuntimeContext {
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -549,6 +595,7 @@ impl RuntimeContext {
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -604,6 +651,7 @@ impl RuntimeContext {
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: parent_inner.workspace_root.clone(),
                 call_stack: vec![parent_branch_seq],
                 capabilities: CapabilityLedger::new(),
@@ -660,6 +708,7 @@ impl RuntimeContext {
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: default_workspace_root(),
                 call_stack: vec![parent_branch_seq],
                 capabilities: CapabilityLedger::new(),
@@ -727,6 +776,7 @@ impl RuntimeContext {
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: parent_inner.workspace_root.clone(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -1263,6 +1313,14 @@ impl RuntimeContext {
     }
 
     #[allow(dead_code)]
+    pub fn set_warm_input_bridge(&self, bridge: WarmInputBridge) {
+        self.inner.lock().unwrap().warm_input_bridge = Some(bridge);
+    }
+
+    pub fn warm_input_bridge(&self) -> Option<WarmInputBridge> {
+        self.inner.lock().unwrap().warm_input_bridge.clone()
+    }
+
     pub fn set_actor_signal_waiter(&self, waiter: ActorSignalWaiter) {
         self.inner.lock().unwrap().actor_signal_waiter = Some(waiter);
     }

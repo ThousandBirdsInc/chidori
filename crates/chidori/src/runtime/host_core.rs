@@ -8,7 +8,8 @@ use crate::providers::{
 };
 use crate::runtime::call_log::{CallRecord, TokenUsage};
 use crate::runtime::context::{
-    ActorSignalWait, InputMode, PendingInput, PendingSignal, RuntimeContext, PAUSE_MARKER,
+    ActorSignalWait, InputMode, PendingInput, PendingSignal, RuntimeContext, WarmInputWait,
+    PAUSE_MARKER,
 };
 use crate::runtime::memory::execute_memory_action;
 use crate::runtime::snapshot::{HostPromiseState, PendingHostOperationKind};
@@ -260,6 +261,41 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
             Ok(Value::String(response))
         }
         InputMode::Pause => {
+            // Warm resume (server flow): keep the LIVE VM parked on this
+            // thread and wait for the response instead of unwinding — the
+            // continuation costs O(1) rather than an O(history) replay
+            // re-execution. Durability is unchanged: the pending op is
+            // already on disk (begin + safepoint above), so a crash while
+            // parked resumes by replay exactly as an unwound pause would,
+            // and `Park` (eviction / capacity / no supervisor) falls back
+            // to that path immediately. The record written here is the
+            // same one the replay path's synthetic injection produces.
+            if let Some(bridge) = ctx.warm_input_bridge() {
+                let pending = PendingInput {
+                    seq,
+                    prompt: prompt.clone(),
+                };
+                match bridge.wait(ctx, &pending) {
+                    WarmInputWait::Delivered(response) => {
+                        let result = Value::String(response);
+                        ctx.resolve_host_operation(host_operation, result.clone())?;
+                        ctx.record_call(CallRecord {
+                            seq,
+                            parent_seq: None,
+                            function: "input".to_string(),
+                            args: json!({ "prompt": prompt }),
+                            result: result.clone(),
+                            duration_ms: 0,
+                            token_usage: None,
+                            timestamp: Utc::now(),
+                            error: None,
+                        });
+                        ctx.run_host_operation_completion_safepoint(host_operation)?;
+                        return Ok(result);
+                    }
+                    WarmInputWait::Park => {}
+                }
+            }
             ctx.set_pending_input(PendingInput {
                 seq,
                 prompt: prompt.clone(),
