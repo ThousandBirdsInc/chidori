@@ -46,11 +46,17 @@ when a fan-out returns.
 **Each actor runs a supervision loop.** One iteration = one pass of the actor's
 module under the standard resume-by-replay model: the actor's accumulated call
 log replays from the top (recorded effects return from cache, side-effect
-free), then execution goes live at the frontier. The loop re-enters the module
-when:
+free), then execution goes live at the frontier.
 
-- a message arrives for an empty-mailbox listen point (`chidori.signal`
-  inside an actor parks the thread instead of ending the run);
+In the steady state an actor stays **live across messages**: a
+`chidori.signal` listen point with an empty mailbox blocks in place until the
+next matching message (or the listen point's own `timeoutMs`) arrives and
+then simply continues — the module is not re-executed per message, so
+processing M messages costs O(M), not O(M²). The loop re-enters the module
+only when:
+
+- the actor parks — the idle cap elapses with no message, or a stop is
+  requested — and a later delivery wakes it (resume-by-replay);
 - an iteration fails and the spawn's restart policy allows another attempt.
 
 **Messages are signals.** An actor's mailbox uses the same

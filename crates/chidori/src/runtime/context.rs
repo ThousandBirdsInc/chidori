@@ -102,6 +102,48 @@ impl HostOperationCompletionSafepoint {
     }
 }
 
+/// Outcome of an actor's inline listen-point wait ([`ActorSignalWaiter`]).
+pub enum ActorSignalWait {
+    /// A matching message reached the actor's shared mailbox; the caller
+    /// should pump the mailbox into the run-level inbox and retry the drain.
+    Delivered,
+    /// The listen point's own `timeoutMs` deadline elapsed: resolve with the
+    /// timeout sentinel in place.
+    TimedOut,
+    /// Park the actor (stop requested or idle cap reached): fall back to the
+    /// pause/hibernate path.
+    Park,
+}
+
+/// Inline mailbox wait installed by the actor supervisor
+/// (`host_actor::supervise`). When present, a `chidori.signal`-family listen
+/// point with an empty inbox BLOCKS here for the next matching delivery and
+/// resumes in place — the actor's history is not re-executed per message,
+/// which is what made a signal-driven actor O(messages²) over its lifetime.
+/// Stop and idle still park through the ordinary pause path (`Park`), so
+/// hibernation and supervision semantics are unchanged. Args: the listen
+/// names and the listen point's `timeoutMs`.
+#[derive(Clone)]
+pub struct ActorSignalWaiter(Arc<dyn Fn(&[String], Option<u64>) -> ActorSignalWait + Send + Sync>);
+
+impl std::fmt::Debug for ActorSignalWaiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorSignalWaiter").finish_non_exhaustive()
+    }
+}
+
+impl ActorSignalWaiter {
+    pub fn new(
+        callback: impl Fn(&[String], Option<u64>) -> ActorSignalWait + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn wait(&self, names: &[String], timeout_ms: Option<u64>) -> ActorSignalWait {
+        (self.0)(names, timeout_ms)
+    }
+}
+
 #[derive(Debug)]
 struct RuntimeContextInner {
     /// Agent-level defaults set via config().
@@ -190,6 +232,9 @@ struct RuntimeContextInner {
     /// Optional durable safepoint invoked after a host operation result is
     /// persisted and recorded, before control returns to JavaScript.
     pub host_operation_completion_safepoint: Option<HostOperationCompletionSafepoint>,
+    /// Optional inline mailbox wait for actor listen points (see
+    /// [`ActorSignalWaiter`]); installed per supervision iteration.
+    pub actor_signal_waiter: Option<ActorSignalWaiter>,
     /// Optional scoped workspace root exposed through `chidori.workspace`.
     pub workspace_root: Option<PathBuf>,
     /// Seqs of host calls currently executing (their `live()` is on the
@@ -381,6 +426,7 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -455,6 +501,7 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -501,6 +548,7 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -555,6 +603,7 @@ impl RuntimeContext {
                 otel_run: parent_inner.otel_run.clone(),
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
                 workspace_root: parent_inner.workspace_root.clone(),
                 call_stack: vec![parent_branch_seq],
                 capabilities: CapabilityLedger::new(),
@@ -610,6 +659,7 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: vec![parent_branch_seq],
                 capabilities: CapabilityLedger::new(),
@@ -676,6 +726,7 @@ impl RuntimeContext {
                 otel_run: parent_inner.otel_run.clone(),
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
                 workspace_root: parent_inner.workspace_root.clone(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -1212,6 +1263,14 @@ impl RuntimeContext {
     }
 
     #[allow(dead_code)]
+    pub fn set_actor_signal_waiter(&self, waiter: ActorSignalWaiter) {
+        self.inner.lock().unwrap().actor_signal_waiter = Some(waiter);
+    }
+
+    pub fn actor_signal_waiter(&self) -> Option<ActorSignalWaiter> {
+        self.inner.lock().unwrap().actor_signal_waiter.clone()
+    }
+
     pub fn set_host_operation_completion_safepoint(
         &self,
         safepoint: HostOperationCompletionSafepoint,
