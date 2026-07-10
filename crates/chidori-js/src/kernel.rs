@@ -83,6 +83,11 @@ const STACK_BASE: u16 = 64;
 /// final remap to sit right after the numeric locals.
 const BOOL_BASE: u16 = 32;
 const SCRATCH0: u16 = 252;
+/// Origin tag for FUNCTION-kernel ARGUMENT origins (`Xlate::origins`): a
+/// pushed `LoadArg(a)` records `a | ARG_ORIGIN`, letting `base_slot`
+/// discover argument array bases exactly like local ones. Real local
+/// indices never reach this bit, and stores never bump a tagged version.
+const ARG_ORIGIN: u32 = 1 << 31;
 
 /// Find every eligible loop in `code` and install kernels for them. Returns
 /// the (possibly rewritten) code and the kernel table. Loop-header ops are
@@ -143,18 +148,21 @@ pub fn kernelize(mut code: Vec<Op>, consts: &[Const]) -> (Vec<Op>, Vec<Kernel>) 
         let mut bools: Vec<u32> = Vec::new();
         let mut installed: Option<Kernel> = None;
         for _ in 0..6 {
-            let (k, d_obj, d_str, d_bool) = translate(
+            let (k, d_obj, d_str, d_args, d_bool) = translate(
                 &code[start..=end],
                 start as u32,
                 consts,
                 &kernels,
                 &oslots,
                 &sslots,
+                &[],
+                &[],
                 &bools,
                 false,
                 None,
                 false,
             );
+            debug_assert!(d_args.is_empty(), "LoadArg is fn-mode-only");
             let mut grew = false;
             for o in d_obj {
                 if !oslots.contains(&o) {
@@ -232,26 +240,44 @@ pub fn kernelize_function(
     // non-recursive bodies the assumption is never consulted — the first
     // pass decides.
     'ret_ty: for ret_bool in [false, true] {
-        // Same boolean-local fixpoint as `kernelize`; array- and string-base
-        // discoveries reject outright (element access can't run frameless).
+        // Same boolean-local fixpoint as `kernelize`, plus array-base
+        // ARGUMENTS and the LOCALS the parameter prologue copies them into
+        // (`(a, i) => a[i]` compiles to `LoadArg; StoreLocal` then reads the
+        // local); string bases reject outright (no frame slot to pin).
         let mut bools: Vec<u32> = Vec::new();
+        let mut obj_args: Vec<u32> = Vec::new();
+        let mut obj_locals: Vec<u32> = Vec::new();
         for _ in 0..6 {
-            let (k, d_obj, d_str, d_bool) = translate(
+            let (k, d_obj, d_str, d_args, d_bool) = translate(
                 code,
                 0,
                 consts,
                 inner,
                 &[],
                 &[],
+                &obj_args,
+                &obj_locals,
                 &bools,
                 true,
                 self_name,
                 ret_bool,
             );
-            if !d_obj.is_empty() || !d_str.is_empty() {
+            if !d_str.is_empty() {
                 return None;
             }
             let mut grew = false;
+            for a in d_args {
+                if !obj_args.contains(&a) {
+                    obj_args.push(a);
+                    grew = true;
+                }
+            }
+            for l in d_obj {
+                if !obj_locals.contains(&l) {
+                    obj_locals.push(l);
+                    grew = true;
+                }
+            }
             for b in d_bool {
                 if !bools.contains(&b) {
                     bools.push(b);
@@ -273,9 +299,17 @@ pub fn kernelize_function(
                         KSlot::Arg(a) => Some(*a + 1),
                         _ => None,
                     })
+                    .chain(k.arg_objs.iter().map(|a| *a + 1))
                     .max()
                     .unwrap_or(0);
                 if k.rec.is_some() {
+                    // A recursive kernel cannot take array arguments: a
+                    // SelfCall's argument window carries raw f64s only (so
+                    // no call site could supply one), and an Abandon deep in
+                    // the window stack would have nothing to rerun from.
+                    if !k.arg_objs.is_empty() {
+                        return None;
+                    }
                     // RECURSIVE kernel. Every SELF-call must supply every
                     // argument the body consumes (a short call would need
                     // the generic `undefined` parameter; mutual-recursion
@@ -436,6 +470,15 @@ struct Xlate<'a> {
     /// Locals designated as STRING bases (fixpoint-discovered from
     /// `charCodeAt` consumption) — empty in phase 1.
     sslot_locals: &'a [u32],
+    /// fn mode: ARGUMENT indices designated as READ-ONLY array bases
+    /// (fixpoint-discovered) — empty in phase 1 and in loop mode.
+    obj_args: &'a [u32],
+    /// fn mode: LOCALS designated as array bases (fixpoint-discovered). The
+    /// compiler's parameter prologue copies `LoadArg(k)` into a local, so
+    /// the base the body reads is a local ALIASING an argument; each one
+    /// must bind to exactly one argument slot (`local_arg_alias`), and its
+    /// accesses resolve through `args[arg_objs[slot]]` at runtime.
+    obj_locals: &'a [u32],
     /// Locals statically typed BOOLEAN (fixpoint-discovered from stores).
     bool_locals: &'a [u32],
     kops: Vec<KOp>,
@@ -461,6 +504,12 @@ struct Xlate<'a> {
     discovered: Vec<u32>,
     /// phase 1: locals observed as STRING bases (`charCodeAt` receivers).
     discovered_strs: Vec<u32>,
+    /// fn mode, phase 1: ARGUMENTS observed as array bases.
+    discovered_obj_args: Vec<u32>,
+    /// fn mode: (obj-local, argument object slot) bindings established by
+    /// the prologue stores this run. A read before a binding, or a second
+    /// binding to a DIFFERENT slot, rejects the region.
+    local_arg_alias: Vec<(u32, u16)>,
     /// locals observed receiving BOOLEAN stores (fixpoint feedback).
     discovered_bools: Vec<u32>,
     /// phase 1 origin tracking: (local, version) of a pushed LoadLocal.
@@ -513,11 +562,13 @@ fn translate(
     inner: &[Kernel],
     oslot_locals: &[u32],
     sslot_locals: &[u32],
+    obj_args: &[u32],
+    obj_locals: &[u32],
     bool_locals: &[u32],
     fn_mode: bool,
     self_name: Option<&str>,
     self_ret_bool: bool,
-) -> (Option<Kernel>, Vec<u32>, Vec<u32>, Vec<u32>) {
+) -> (Option<Kernel>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut is_target = vec![false; region.len()];
     for op in region {
         for t in op_targets(op) {
@@ -540,6 +591,8 @@ fn translate(
         rec_globals: Vec::new(),
         oslot_locals,
         sslot_locals,
+        obj_args,
+        obj_locals,
         bool_locals,
         kops: Vec::new(),
         kpc: vec![u16::MAX; region.len()],
@@ -551,6 +604,8 @@ fn translate(
         bool_reg: Vec::new(),
         discovered: Vec::new(),
         discovered_strs: Vec::new(),
+        discovered_obj_args: Vec::new(),
+        local_arg_alias: Vec::new(),
         discovered_bools: Vec::new(),
         origins: Vec::new(),
         versions: std::collections::HashMap::new(),
@@ -572,8 +627,9 @@ fn translate(
     let kernel = translate_inner(&mut x);
     let d_obj = std::mem::take(&mut x.discovered);
     let d_str = std::mem::take(&mut x.discovered_strs);
+    let d_args = std::mem::take(&mut x.discovered_obj_args);
     let d_bool = std::mem::take(&mut x.discovered_bools);
-    (kernel, d_obj, d_str, d_bool)
+    (kernel, d_obj, d_str, d_args, d_bool)
 }
 
 fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
@@ -660,10 +716,16 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         patch(&mut x.kops, kidx, pc);
     }
     // A FUNCTION kernel runs frameless — there is no bytecode frame to
-    // resume, so any path needing a generic-interpreter exit rejects the
-    // whole function (element access, or a body not ending in `Return`).
+    // resume into, so every would-be exit (an array access missing its fast
+    // path, or a stray fallthrough) is patched to ONE shared [`KOp::Abandon`]
+    // stub instead: the pure activation is discarded and the caller reruns
+    // the call generically. No shape table is needed — nothing is resumed.
     if x.fn_mode && !x.exits.is_empty() {
-        return None;
+        let stub = u16::try_from(x.kops.len()).ok()?;
+        x.kops.push(KOp::Abandon);
+        for (kidx, _, _) in std::mem::take(&mut x.exits) {
+            patch(&mut x.kops, kidx, stub);
+        }
     }
     // Cell WRITES + pinned-closure calls don't mix: a callee's upvalue
     // snapshot is loaded once per activation and could be the very cell the
@@ -795,7 +857,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *a = remap(*a);
                 *b = remap(*b);
             }
-            KOp::Br { .. } | KOp::Exit { .. } => {}
+            KOp::Br { .. } | KOp::Exit { .. } | KOp::Abandon => {}
             // Fusion (`fuse_kops`) runs after this remap.
             KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
                 unreachable!("fused op before fusion")
@@ -938,6 +1000,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         bool_locals: bool_locals.into_boxed_slice(),
         oslots: x.oslot_locals.to_vec().into_boxed_slice(),
         sslots: x.sslot_locals.to_vec().into_boxed_slice(),
+        arg_objs: x.obj_args.to_vec().into_boxed_slice(),
         shapes: shapes.into_boxed_slice(),
         math_used: std::mem::take(&mut x.math_used).into_boxed_slice(),
         props_used: std::mem::take(&mut x.props_used).into_boxed_slice(),
@@ -1074,7 +1137,10 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
     let mut label = vec![false; n];
     let mut preds = vec![0u32; n];
     for (j, op) in kops.iter_mut().enumerate() {
-        let falls = !matches!(op, KOp::Br { .. } | KOp::Ret { .. } | KOp::Exit { .. });
+        let falls = !matches!(
+            op,
+            KOp::Br { .. } | KOp::Ret { .. } | KOp::Exit { .. } | KOp::Abandon
+        );
         if falls && j + 1 < n {
             preds[j + 1] += 1;
         }
@@ -1184,7 +1250,7 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
             // Argument-window RANGE reads: leave the window registers alone,
             // only the result register is a plain def.
             KOp::CallKernel { dst, .. } | KOp::SelfCall { dst, .. } => kill!(*dst),
-            KOp::Br { .. } | KOp::Exit { .. } => {}
+            KOp::Br { .. } | KOp::Exit { .. } | KOp::Abandon => {}
             // Fusion (`fuse_kops`) runs after cleanup.
             KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
                 unreachable!("fused op before fusion")
@@ -1265,7 +1331,7 @@ fn max_reg(acc: u16, op: &KOp) -> u16 {
             see(*dst);
             see(base + argc);
         }
-        KOp::Br { .. } | KOp::Exit { .. } => {}
+        KOp::Br { .. } | KOp::Exit { .. } | KOp::Abandon => {}
         // Fusion (`fuse_kops`) runs after cleanup.
         KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
             unreachable!("fused op before fusion")
@@ -1329,7 +1395,7 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
                 uses[i] = bit(*src);
                 succ[i] = (false, None);
             }
-            KOp::Exit { .. } => succ[i] = (false, None),
+            KOp::Exit { .. } | KOp::Abandon => succ[i] = (false, None),
             KOp::LoadElem { dst, idx, bail, .. } => {
                 uses[i] = bit(*idx);
                 defs[i] = bit(*dst);
@@ -1469,6 +1535,7 @@ impl Xlate<'_> {
     fn lreg(&mut self, l: u32) -> Option<u16> {
         if self.oslot_locals.contains(&l)
             || self.sslot_locals.contains(&l)
+            || self.obj_locals.contains(&l)
             || self.bool_locals.contains(&l)
             || self.bool_reg.iter().any(|&(ll, _)| ll == l)
         {
@@ -1581,6 +1648,7 @@ impl Xlate<'_> {
         }
         if self.oslot_locals.contains(&l)
             || self.sslot_locals.contains(&l)
+            || self.obj_locals.contains(&l)
             || self.local_reg.iter().any(|&(sl, _)| sl == KSlot::Local(l))
         {
             return None;
@@ -1731,6 +1799,34 @@ impl Xlate<'_> {
                 let (l, ver) = self.origins[p]?;
                 if *self.versions.get(&l).unwrap_or(&0) != ver {
                     return None;
+                }
+                if self.fn_mode {
+                    // fn mode, phase 1: a tagged origin is a direct
+                    // argument base; an untagged one is a LOCAL the
+                    // prologue copied an argument into — discover it as an
+                    // obj local (the stable run then binds it to its
+                    // argument slot via `local_arg_alias`). The returned
+                    // slot only matters in the stable run, where no
+                    // discovery happens.
+                    if l & ARG_ORIGIN != 0 {
+                        let a = l & !ARG_ORIGIN;
+                        let s = match self.discovered_obj_args.iter().position(|&d| d == a) {
+                            Some(s) => s,
+                            None => {
+                                self.discovered_obj_args.push(a);
+                                self.discovered_obj_args.len() - 1
+                            }
+                        };
+                        return u16::try_from(s).ok();
+                    }
+                    let s = match self.discovered.iter().position(|&d| d == l) {
+                        Some(s) => s,
+                        None => {
+                            self.discovered.push(l);
+                            self.discovered.len() - 1
+                        }
+                    };
+                    return u16::try_from(s).ok();
                 }
                 let s = match self.discovered.iter().position(|&d| d == l) {
                     Some(s) => s,
@@ -1969,6 +2065,16 @@ impl Xlate<'_> {
                     // This local is an array base — push the object.
                     self.vstack.push(VE::Obj(pos as u16));
                     self.origins.push(None);
+                } else if self.obj_locals.contains(l) {
+                    // fn mode: a local aliasing an array ARGUMENT — the
+                    // prologue store must already have bound it.
+                    let slot = self
+                        .local_arg_alias
+                        .iter()
+                        .find(|&&(ll, _)| ll == *l)
+                        .map(|&(_, s)| s)?;
+                    self.vstack.push(VE::Obj(slot));
+                    self.origins.push(None);
                 } else if let Some(pos) = self.sslot_locals.iter().position(|&s| s == *l) {
                     // This local is a string base — push the pinned string.
                     self.vstack.push(VE::Str(pos as u16));
@@ -2104,9 +2210,19 @@ impl Xlate<'_> {
             // requires it present and a `Number`). Loop regions never see
             // `LoadArg` — parameters are copied to locals in the prologue.
             Op::LoadArg(a) if self.fn_mode => {
-                let src = self.argreg(*a)?;
-                let dst = self.push_num()?;
-                self.kops.push(K::Mov { dst, src });
+                if let Some(pos) = self.obj_args.iter().position(|&x| x == *a) {
+                    // This argument is an array base — push the object.
+                    self.vstack.push(VE::Obj(pos as u16));
+                    self.origins.push(None);
+                } else {
+                    let src = self.argreg(*a)?;
+                    let dst = self.push_num()?;
+                    self.kops.push(K::Mov { dst, src });
+                    // Tagged origin: lets `base_slot` discover this argument
+                    // as an array base (arguments are never stored to, so
+                    // version 0 is always current).
+                    *self.origins.last_mut()? = Some((*a | ARG_ORIGIN, 0));
+                }
             }
             // FUNCTION kernels: yield the (scalar) result and finish the
             // frameless call. Loop regions reject `Return` (the catch-all).
@@ -2127,6 +2243,45 @@ impl Xlate<'_> {
                     && !self.local_readable(*l)
                 {
                     return None;
+                }
+                // fn mode: binding an obj LOCAL — the top must be an
+                // argument-base object (the prologue's `LoadArg` value),
+                // consistently the SAME argument slot on every store. The
+                // store itself elides: the value lives in `args`, resolved
+                // per access.
+                if self.fn_mode && self.obj_locals.contains(l) {
+                    let s = match self.vstack.last() {
+                        Some(VE::Obj(s)) => *s,
+                        // The argument is not yet typed as a base (its
+                        // `LoadArg` pushed a tagged Num this run): record
+                        // the discovery — the fixpoint rerun types it
+                        // `VE::Obj` — and elide the store so later
+                        // discoveries in this (discarded) run still land.
+                        Some(VE::Num) => {
+                            let (o, _) = (*self.origins.last()?)?;
+                            if o & ARG_ORIGIN == 0 {
+                                return None;
+                            }
+                            let a = o & !ARG_ORIGIN;
+                            if !self.discovered_obj_args.contains(&a) {
+                                self.discovered_obj_args.push(a);
+                            }
+                            self.pop()?;
+                            self.store_of(*l);
+                            self.mark_init(*l);
+                            return Some(());
+                        }
+                        _ => return None,
+                    };
+                    match self.local_arg_alias.iter().find(|&&(ll, _)| ll == *l) {
+                        Some(&(_, prev)) if prev != s => return None,
+                        Some(_) => {}
+                        None => self.local_arg_alias.push((*l, s)),
+                    }
+                    self.pop()?;
+                    self.store_of(*l);
+                    self.mark_init(*l);
+                    return Some(());
                 }
                 match self.vstack.last() {
                     Some(VE::Undef) | Some(VE::Opaque) => {
@@ -2477,7 +2632,13 @@ impl Xlate<'_> {
                 self.exits.push((kidx, self.base_ip + i as u32, shape));
             }
             // `a[i] = v` write: pushes the value back (expression result).
+            // fn mode rejects: array-arg kernels must stay READ-ONLY pure —
+            // an ABANDON after a completed store could not be undone, and a
+            // generic rerun would observe its own earlier write.
             Op::SetPropDynamic => {
+                if self.fn_mode {
+                    return None;
+                }
                 let shape = self.vstack.clone();
                 let obj = self.base_slot(2)?;
                 let val = self.top_num_reg(0)?;
@@ -2599,6 +2760,11 @@ impl Xlate<'_> {
                 } else {
                     // Ordinary-object own data property: entry-resolved slot,
                     // no per-access check, no bail (see `KOp::LoadProp`).
+                    // Loop mode only — the per-activation slot resolution
+                    // machinery pins frame oslots, which fn kernels lack.
+                    if self.fn_mode {
+                        return None;
+                    }
                     let obj = self.base_slot(0)?;
                     let prop = self.kprop(obj, &key, true, false)?;
                     self.pop()?; // base

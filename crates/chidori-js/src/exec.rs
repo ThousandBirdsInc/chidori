@@ -770,8 +770,11 @@ impl Vm {
                         break;
                     };
                     // Number-returning, non-recursive, fully-supplied args,
-                    // canonical Math, Number upvalues — else stay generic.
+                    // no array-argument bases (the argument window carries
+                    // raw f64s only), canonical Math, Number upvalues —
+                    // else stay generic.
                     let ck_ok = ck.rec.is_none()
+                        && ck.arg_objs.is_empty()
                         && ck
                             .code
                             .iter()
@@ -1228,7 +1231,9 @@ impl Vm {
                 // contains CallKernel (translator invariant).
                 KOp::CallKernel { .. } => unreachable!("CallKernel in a plain kernel loop"),
                 // Function-kernel-only ops; loop translation never emits them.
-                KOp::Ret { .. } | KOp::SelfCall { .. } => unreachable!("fn op in a loop kernel"),
+                KOp::Ret { .. } | KOp::SelfCall { .. } | KOp::Abandon => {
+                    unreachable!("fn op in a loop kernel")
+                }
             }
             pc += 1;
         };
@@ -1343,17 +1348,24 @@ impl Vm {
         }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
-        match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll) {
-            Some(ret) => {
+        match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll, args, &k.arg_objs) {
+            FnKernelFlow::Ret(ret) => {
                 self.kernel_regs = regs;
                 Some(Ok(ret))
             }
-            None => {
+            FnKernelFlow::Interrupted => {
                 // Interrupted on a back-edge: registers are pure scratch,
                 // nothing to write back on the unwind.
                 self.kernel_regs = regs;
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
+            }
+            // An array-argument access missed its fast path: the pure
+            // activation is discarded (registers are scratch, reads only)
+            // and the caller takes the ordinary frame path.
+            FnKernelFlow::Abandoned => {
+                self.kernel_regs = regs;
+                None
             }
         }
     }
@@ -1401,6 +1413,13 @@ impl Vm {
             }
             let f = funcs[wl].clone();
             let k = f.proto.fn_kernel.as_ref()?;
+            // No member may consume an array argument: SelfCall windows
+            // carry raw f64s, and an Abandon mid-recursion would have no
+            // caller frame to rerun windows from. (The entry kernel already
+            // can't — `kernelize_function` rejects rec + arg_objs.)
+            if !k.arg_objs.is_empty() {
+                return None;
+            }
             // Every member's Ret type must match the entry kernel's: a
             // mismatched value would land in a caller register of the wrong
             // static type. (Also rejects mixed-type non-recursive members.)
@@ -1794,6 +1813,7 @@ impl Vm {
                     | KOp::LoadProp { .. }
                     | KOp::StoreProp { .. }
                     | KOp::CallKernel { .. }
+                    | KOp::Abandon
                     | KOp::Exit { .. } => unreachable!("bail op in a function kernel"),
                 }
                 pc += 1;
@@ -1907,14 +1927,24 @@ impl Vm {
                 }
             }
         }
-        match exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll) {
-            Some(v) => Some(Ok(v)),
-            None => {
+        match exec_fn_kernel_code(
+            &k.code,
+            &mut p.regs,
+            &p.interrupt,
+            &mut p.poll,
+            args,
+            &k.arg_objs,
+        ) {
+            FnKernelFlow::Ret(v) => Some(Ok(v)),
+            FnKernelFlow::Interrupted => {
                 // Same latch-and-unwind as an interrupted kernel back-edge:
                 // zero the budget so a JS catch cannot resume execution.
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
             }
+            // Array-argument access miss: this element falls back to the
+            // generic call (the prepared handle stays usable for the next).
+            FnKernelFlow::Abandoned => None,
         }
     }
 
@@ -1936,6 +1966,9 @@ impl Vm {
             return None;
         }
         let k = p.bf.proto.fn_kernel.as_ref().expect("prepared");
+        if !k.arg_objs.is_empty() {
+            return None;
+        }
         if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
             return None;
         }
@@ -1990,21 +2023,23 @@ impl Vm {
         };
         let k = p.bf.proto.fn_kernel.as_ref().expect("prepared");
         let ret = if interrupted {
-            None
+            FnKernelFlow::Interrupted
         } else {
-            exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll)
+            exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll, &[], &[])
         };
         match ret {
-            Some(Value::Number(n)) => Ok(if n < 0.0 {
+            FnKernelFlow::Ret(Value::Number(n)) => Ok(if n < 0.0 {
                 -1
             } else if n > 0.0 {
                 1
             } else {
                 0
             }),
-            Some(Value::Bool(b)) => Ok(if b { 1 } else { 0 }),
-            Some(_) => unreachable!("fn kernels return Number or Bool"),
-            None => {
+            FnKernelFlow::Ret(Value::Bool(b)) => Ok(if b { 1 } else { 0 }),
+            FnKernelFlow::Ret(_) => unreachable!("fn kernels return Number or Bool"),
+            // `prime_prepared_cmp` declined array-argument kernels.
+            FnKernelFlow::Abandoned => unreachable!("array-arg kernel primed for f64 cmp"),
+            FnKernelFlow::Interrupted => {
                 self.op_budget = Some(0);
                 Err(self.throw_range("execution interrupted"))
             }
@@ -6008,18 +6043,34 @@ fn writeback_kernel_props(
     }
 }
 
+/// Outcome of a frameless FUNCTION-kernel body run.
+enum FnKernelFlow {
+    /// The call's result — `Value::Number`, or `Value::Bool` for a
+    /// boolean-typed `Ret`.
+    Ret(Value),
+    /// The cooperative interrupt flag latched on a back-edge poll — the
+    /// caller owns the budget-zeroing unwind.
+    Interrupted,
+    /// An array access over an argument base missed its fast path
+    /// ([`KOp::Abandon`]): the pure activation is discarded and the caller
+    /// reruns the call generically.
+    Abandoned,
+}
+
 /// Execute a plain (non-recursive, frameless) FUNCTION kernel body over
-/// `regs`, returning the call's result — `Value::Number`, or `Value::Bool`
-/// for a boolean-typed `Ret`. Shared by the per-call [`Vm::run_fn_kernel`]
-/// entry and the prepared-callback path ([`Vm::exec_prepared_kernel`]).
-/// Returns `None` when the cooperative interrupt flag latched on a back-edge
-/// poll — the caller owns the budget-zeroing unwind.
+/// `regs`. Shared by the per-call [`Vm::run_fn_kernel`] entry and the
+/// prepared-callback path ([`Vm::exec_prepared_kernel`]). `args`/`arg_objs`
+/// resolve the READ-ONLY array-argument bases (`Kernel::arg_objs`); their
+/// element/length reads re-check the dense fast path per access and abandon
+/// on any miss.
 fn exec_fn_kernel_code(
     code: &[KOp],
     regs: &mut [f64],
     interrupt: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     poll: &mut u32,
-) -> Option<Value> {
+    args: &[Value],
+    arg_objs: &[u32],
+) -> FnKernelFlow {
     let mut pc = 0usize;
     loop {
         macro_rules! branch {
@@ -6030,7 +6081,7 @@ fn exec_fn_kernel_code(
                     if *poll & 0xFF == 0 {
                         if let Some(flag) = interrupt {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                return None;
+                                return FnKernelFlow::Interrupted;
                             }
                         }
                     }
@@ -6130,20 +6181,82 @@ fn exec_fn_kernel_code(
                 branch!(target)
             }
             KOp::Ret { src, boolean } => {
-                return Some(if boolean {
+                return FnKernelFlow::Ret(if boolean {
                     Value::Bool(regs[src as usize] != 0.0)
                 } else {
                     Value::Number(regs[src as usize])
                 })
             }
+            // READ-ONLY array-argument element access: the dense fast-path
+            // conditions re-check per access (exactly the loop-kernel arm);
+            // any miss branches to the shared Abandon stub — the pure
+            // activation is discarded and the caller reruns generically.
+            KOp::LoadElem {
+                dst,
+                obj,
+                idx,
+                bail,
+            } => {
+                let i = regs[idx as usize];
+                let mut ok = false;
+                if let Some(Value::Object(o)) = args.get(arg_objs[obj as usize] as usize) {
+                    if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
+                        let b = o.borrow();
+                        match &b.internal {
+                            Internal::Array(arr) if b.props.is_empty() => {
+                                if let Some(Value::Number(n)) = arr.get(i as usize) {
+                                    regs[dst as usize] = *n;
+                                    ok = true;
+                                }
+                            }
+                            // Numeric typed arrays: a valid-index [[Get]]
+                            // reads element storage directly — no props or
+                            // prototype consult, so no guard is needed.
+                            Internal::TypedArray(t) if !t.kind.is_bigint() => {
+                                let iu = i as usize;
+                                if iu < crate::typed_array::ta_eff_length(t) {
+                                    let off = t.byte_offset + iu * t.kind.bytes();
+                                    let buf = t.buffer.borrow();
+                                    if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
+                                        regs[dst as usize] =
+                                            crate::typed_array::decode(bytes, off, t.kind);
+                                        ok = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !ok {
+                    branch!(bail)
+                }
+            }
+            // Dense-array `.length` only: a typed array resolves `.length`
+            // through a prototype ACCESSOR no frameless kernel can guard —
+            // it abandons to the generic path.
+            KOp::LoadLen { dst, obj, bail } => {
+                let mut ok = false;
+                if let Some(Value::Object(o)) = args.get(arg_objs[obj as usize] as usize) {
+                    let b = o.borrow();
+                    if let Internal::Array(arr) = &b.internal {
+                        if b.props.is_empty() {
+                            regs[dst as usize] = arr.len() as f64;
+                            ok = true;
+                        }
+                    }
+                }
+                if !ok {
+                    branch!(bail)
+                }
+            }
+            KOp::Abandon => return FnKernelFlow::Abandoned,
             // A frameless kernel has no bytecode frame to bail into;
             // fn-mode translation rejects anything needing one. A
             // SelfCall implies `self_global`, dispatched by the caller.
             KOp::ArrayPush { .. }
             | KOp::ArrayPop { .. }
-            | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
-            | KOp::LoadLen { .. }
             | KOp::CharCodeAt { .. }
             | KOp::StrLen { .. }
             | KOp::LoadProp { .. }
@@ -6297,6 +6410,7 @@ fn run_callee_window(
             | KOp::LoadProp { .. }
             | KOp::StoreProp { .. }
             | KOp::Exit { .. }
+            | KOp::Abandon
             | KOp::SelfCall { .. }
             | KOp::CallKernel { .. } => unreachable!("unsupported op in a callee kernel"),
         }

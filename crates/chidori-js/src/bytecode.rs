@@ -1070,6 +1070,14 @@ pub enum KOp {
     /// bail-free: `length` is an own property of the primitive's wrapper
     /// (unshadowable), O(1) via the cached UTF-16 unit count.
     StrLen { dst: u16, sslot: u16 },
+    /// FUNCTION kernels only: an array access over an argument base
+    /// ([`Kernel::arg_objs`]) missed its fast-path condition. A frameless
+    /// kernel has no bytecode frame to bail into, so the activation is
+    /// ABANDONED — sound because function kernels with array bases are
+    /// READ-ONLY pure (element/length reads; stores reject at translation),
+    /// so no effect has happened — and the caller reruns the whole call
+    /// generically, which performs the exact spec semantics.
+    Abandon,
     /// Materialize a comparison as a BOOLEAN register (`0.0`/`1.0`): the
     /// translator types the destination as Bool, so it writes back as
     /// `Value::Bool` and never feeds an array index.
@@ -1389,6 +1397,15 @@ pub struct Kernel {
     /// accesses are then bail-free (strings are immutable and the local is
     /// pinned). Disjoint from `locals` and `oslots`.
     pub sslots: Box<[u32]>,
+    /// FUNCTION kernels only: ARGUMENT indices used as READ-ONLY array bases
+    /// (`(a, i) => a[i]` — object slot `s` resolves to `args[arg_objs[s]]`).
+    /// Element and `length` reads re-check their dense-array fast path per
+    /// access and [`KOp::Abandon`] the pure activation on any miss (the
+    /// caller reruns generically). Stores, and recursive kernels, reject at
+    /// translation; CallKernel/prepared-comparator callees with a non-empty
+    /// `arg_objs` decline at their guards (their argument windows carry raw
+    /// `f64`s only).
+    pub arg_objs: Box<[u32]>,
     /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
     pub shapes: Box<[Box<[KShapeSlot]>]>,
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),

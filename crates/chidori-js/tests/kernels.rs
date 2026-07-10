@@ -566,6 +566,41 @@ const CORPUS: &[&str] = &[
     "const s = 'abc'; let r = ''; for (let i = 0; i < s.length; i++) { r += s.charAt(i); } console.log(r);",
     // Rope-built string (the += builder) scanned afterwards.
     "let b = ''; for (let i = 0; i < 40; i++) { b += 'ab'; } let q = 0; for (let i = 0; i < b.length; i++) { q += b.charCodeAt(i); } console.log(q, b.length);",
+    // --- FUNCTION kernels with ARRAY-typed arguments: (a, i) => a[i] -------
+    // The canonical accessor shapes, function and arrow.
+    "function get(a, i) { return a[i]; } const arr = [10, 20, 30]; let s = 0; for (let i = 0; i < 3; i++) { s += get(arr, i); } console.log(s, get(arr, 0));",
+    "const pick = (a, i) => a[i] * 2 + 1; const arr = [5, 6, 7, 8]; let s = 0; for (let i = 0; i < 4; i++) { s += pick(arr, i); } console.log(s);",
+    // `a.length` through a function kernel; a typed array must abandon (its
+    // length is a prototype accessor a frameless kernel cannot guard).
+    "const len = (a) => a.length; console.log(len([1, 2, 3]), len(new Float64Array(5)), len([]));",
+    // A whole loop INSIDE the kernelized body (dot product).
+    "function dot(a, b, n) { let s = 0; for (let i = 0; i < n; i++) { s += a[i] * b[i]; } return s; } const x = [1, 2, 3, 4], y = [5, 6, 7, 8]; console.log(dot(x, y, 4), dot(x, y, 0));",
+    // Holes, OOB, negative and fractional indices abandon to the exact
+    // generic semantics (undefined absorption, prototype consult).
+    "const get = (a, i) => a[i]; const h = [1, , 3]; console.log(get(h, 0), get(h, 1), get(h, 5), get(h, -1), get(h, 0.5));",
+    // A hole that reads THROUGH the prototype.
+    "const get = (a, i) => a[i]; const h = [1, , 3]; Array.prototype[1] = 99; console.log(get(h, 1)); delete Array.prototype[1];",
+    // Non-Number elements abandon per call (strings flow through generic).
+    "const get = (a, i) => a[i]; const m = [1, 'two', 3]; let out = ''; for (let i = 0; i < 3; i++) { out += get(m, i) + '|'; } console.log(out);",
+    // Non-array receivers: string (indexed chars), number (undefined),
+    // object with index props.
+    "const get = (a, i) => a[i]; console.log(get('xyz', 1), get(7, 0), get({ 0: 'zero' }, 0));",
+    // Typed arrays: valid-index reads run in-kernel; BigInt kinds abandon.
+    "const get = (a, i) => a[i]; const t = new Int32Array([4, 5, 6]); const f = new Float32Array([1.5, 2.5]); console.log(get(t, 1), get(f, 0), get(t, 9));",
+    "const get = (a, i) => a[i]; const b = new BigInt64Array(2); b[0] = 3n; console.log(typeof get(b, 0), String(get(b, 0)));",
+    // Element STORES keep the body generic (purity: abandon could not undo).
+    "function setz(a, i, v) { a[i] = v; return a[i]; } const arr = [0, 0]; console.log(setz(arr, 1, 42), arr.join(','));",
+    // Missing / extra arguments decline per call, generically.
+    "const get = (a, i) => a[i]; const arr = [9, 8]; console.log(get(arr), get(arr, 1, 'extra'), get());",
+    // Array mutated between calls: each access re-checks.
+    "const get = (a, i) => a[i]; const arr = [1]; console.log(get(arr, 0)); arr.push(2); console.log(get(arr, 1)); arr.length = 0; console.log(get(arr, 0));",
+    // Self-recursion consuming an array argument stays generic.
+    "function r(a, n) { return n <= 0 ? a[0] : r(a, n - 1); } console.log(r([7], 5));",
+    // An array-arg kernel used as a HOF callback (index into a sibling
+    // array) — reduce passes (acc, v, i, arr).
+    "const src2 = [10, 20, 30]; const sum = src2.reduce(function (acc, v, i, arr) { return acc + arr[i]; }, 0); console.log(sum);",
+    // Mixed: numeric args + array arg + Math in one kernelized body.
+    "function clampAt(a, i, lo) { return Math.max(a[i], lo); } const arr = [-5, 3, 12]; let s = 0; for (let i = 0; i < 3; i++) { s += clampAt(arr, i, 0); } console.log(s);",
 ];
 
 #[test]
@@ -753,6 +788,66 @@ fn string_scan_loops_get_kernels() {
     );
 }
 
+/// Array-argument bodies get FUNCTION kernels (`(a, i) => a[i]`) — and
+/// element stores / recursive array consumers never do (pins the arg-objs
+/// tier: reads abandon, stores and recursion stay generic).
+#[test]
+fn array_arg_functions_get_fn_kernels() {
+    fn first_fn_kernel(p: &FuncProto) -> Option<&chidori_js::bytecode::Kernel> {
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                if let Some(k) = &f.fn_kernel {
+                    return Some(k);
+                }
+                if let Some(k) = first_fn_kernel(f) {
+                    return Some(k);
+                }
+            }
+        }
+        None
+    }
+    // The canonical accessor kernelizes with one argument object slot.
+    let p = compile_script("const get = (a, i) => a[i]; get([1], 0);").expect("compiles");
+    let k = first_fn_kernel(&p).expect("(a, i) => a[i] must carry a function kernel");
+    assert_eq!(k.arg_objs.len(), 1, "one argument array base");
+    // `a.length` alone kernelizes too.
+    assert!(
+        first_fn_kernel(
+            &compile_script("const len = (a) => a.length; len([1]);").expect("compiles")
+        )
+        .is_some(),
+        "(a) => a.length must carry a function kernel"
+    );
+    // A loop over the array inside the body kernelizes (dot product).
+    assert!(
+        first_fn_kernel(
+            &compile_script("function dot(a, b, n) { let s = 0; for (let i = 0; i < n; i++) { s += a[i] * b[i]; } return s; } dot([1], [2], 1);")
+                .expect("compiles")
+        )
+        .is_some(),
+        "dot-product body must carry a function kernel"
+    );
+    // Element STORES are impure — no kernel.
+    assert!(
+        first_fn_kernel(
+            &compile_script("function setz(a, i, v) { a[i] = v; return 0; } setz([0], 0, 1);")
+                .expect("compiles")
+        )
+        .is_none(),
+        "element-storing body must stay generic"
+    );
+    // Recursion consuming an array argument — no kernel (an abandon deep in
+    // a recursion tree has nothing to rerun windows from).
+    assert!(
+        first_fn_kernel(
+            &compile_script("function r(a, n) { return n <= 0 ? a[0] : r(a, n - 1); } r([1], 2);")
+                .expect("compiles")
+        )
+        .is_none(),
+        "recursive array consumer must stay generic"
+    );
+}
+
 /// Tiny pure-scalar functions get a FUNCTION kernel (frameless call path) —
 /// and frame-dependent bodies never do (pins fn-kernel eligibility).
 #[test]
@@ -784,8 +879,9 @@ fn tiny_functions_get_fn_kernels() {
     for src in [
         // `arguments` needs a real frame.
         "function f() { return arguments.length; }",
-        // Property access needs a frame to bail into.
-        "const f = (a) => a.length;",
+        // NAMED property access (other than array-arg element/length reads,
+        // which the arg-objs tier abandons on) needs a frame to bail into.
+        "const f = (o) => o.x;",
         // Calls (incl. recursion) are off the allowlist.
         "function f(a, b) { return f(a) - b; }",
         // Allocation is off the allowlist.
