@@ -93,6 +93,18 @@ Journal writes are no longer fire-and-forget:
   and the run's completion is gated on a final flush (the output-gate point:
   a result is not surfaced until its journal is durable).
 
+The durability mode also decides how remote-mirror appends are paced. Under
+`besteffort`, HTTP/S3 record appends are **pipelined**: each append is
+enqueued on the mirror's single FIFO relay thread and the agent continues
+immediately instead of blocking one network round-trip per host call
+(ordering against later checkpoint writes and loads is preserved by the
+FIFO; in-flight requests are bounded, so a slow mirror applies backpressure
+rather than growing an unbounded queue). Failures surface at the next
+`flush()` barrier — pause, settle, output gate — where besteffort logs and
+continues, exactly as its per-append handling always did. Under `strict`,
+every append stays synchronous: acknowledged by the mirror before the next
+effect runs.
+
 ## Recovery after machine loss: hydration
 
 With a mirror configured, the journal survives the machine. On a fresh
