@@ -1077,6 +1077,144 @@ now covers the mutual path; structural pins updated (boolean/mutual/
 captured-binding recursion MUST kernelize, parameter-recursion must not);
 full suites + Test262 gate green.
 
+## 6.10 Register bytecode (landed 2026-07-10): §3.5, scoped as a tier
+
+The remaining structural lever from §3.5, built the way this engine builds
+tiers rather than as the big-bang rewrite the original phase plan imagined:
+a compile-finish pass (`reg.rs`) translates a WHOLE eligible function body
+from the final stack bytecode into a register program
+(`FuncProto::reg: Option<Rc<RegProto>>`), and `Vm::run_frame` — the single
+funnel every call, construct, accessor, and module/script evaluation goes
+through — executes it via `run_reg_frame` instead of the stack loop. No
+operand stack, no per-value push/pop traffic, and one dispatch where the
+stack machine pays two or three: `LoadLocal a; LoadLocal b; Add; StoreLocal c`
+is a single `Add { dst: c, a, b }`.
+
+**Translation model** (mirrors the kernel tiers' discipline, over boxed
+values):
+
+- **Same helpers, same semantics.** Every register op calls the SAME `Vm`
+  helper as its stack twin. The inline-cache fast paths (`GetProp`/`SetProp`/
+  `LoadGlobal`) and the dense-array element fast paths were extracted into
+  shared `Vm` methods (`ic_get_prop`, `ic_set_prop`, `ic_load_global`,
+  `elem_get`, `elem_set`, …) that BOTH interpreters call, so each op keeps
+  exactly one implementation and the tiers cannot drift. Register programs
+  carry their own `IcEntry` table with the identical key-verified protocol.
+- **Registers are `frame.locals`.** Slots `0..num_locals` are the localized
+  bindings (same TDZ marker, same semantics); slots above are the canonical
+  homes of the stack machine's operand depths (`canon(d) = num_locals + d`).
+  A register frame is an ordinary pooled `Frame` — GC tracing, `arguments`,
+  cells, upvalues, and the frame pool all work unchanged.
+- **Lazy operands.** A virtual stack of entries abstract-interprets the
+  stack code at compile time. `LoadLocal`/`LoadConst`/`LoadThis`&c. emit
+  NOTHING — consuming ops read the local register or a `konst` operand
+  directly; everything is flushed to canonical form at control-flow edges,
+  and any op that writes a local first flushes live lazy references to it
+  (locals are provably unaliasable — that is what localization established).
+  A forward dataflow (intersection at joins, to a fixpoint) proves most
+  local reads can never see the TDZ marker, so they skip the check the
+  stack interpreter pays on every `LoadLocal`; unprovable reads emit an
+  explicit `TdzCheck`. The `Dup; GetProp(name); Swap` method-call prologue
+  fuses to one property op (plus at most one move). Fused stack
+  superinstructions map 1:1 onto fused register ops (`CmpBrK`,
+  `IncLocal`, `AddCellK`, …), so non-kernel loops keep their one-dispatch
+  tests and updates.
+- **Whole-function eligibility, tier ordering.** Any op outside the
+  translated subset declines the function: try/catch/finally (and therefore
+  for-of and array destructuring, whose iterator-close protocol rides the
+  handler machinery), `with`/direct-eval scope ops, `super`/private class
+  elements, dispose scopes, suspension ops, and `Op::LoopKernel` — a
+  loop-kernelized function keeps the stack tier because its unboxed kernels
+  are far faster than boxed register ops. The call paths still try
+  `fn_kernel` first, so the tier order per activation is: function kernel
+  (unboxed, frameless) → register program (boxed, framed) → stack loop.
+  Await-free `async` bodies translate (they contain no suspension ops and
+  run to completion in one shot); a real `await` declines the body.
+- **Determinism.** The register program is a pure function of the source,
+  compiled at compile finish. Like the kernel tiers, the register tier is
+  OFF whenever an op budget is installed — per-stack-op accounting stays
+  exact on the generic path — and it polls the cooperative interrupt flag
+  at the stack loop's cadence. (Consequence, inherited from the kernel
+  tiers' rule: the production server's default `CHIDORI_JS_OP_BUDGET=5e9
+  keeps agent runs on the stack tier; the tier pays off today in
+  unbudgeted embeddings, replay/test tooling, and the benchmark harness.
+  Making budget accounting conservative-but-deterministic on the fast
+  tiers is tracked as follow-up work.)
+- **Native stack discipline.** `run_reg_frame` keeps the hot ops inline and
+  delegates everything rare to an `#[inline(never)]` `rstep_cold`, the same
+  split (and reason) as `step`/`step_cold`; the depth-overflow differential
+  pins that deep recursion through register frames raises the same
+  catchable RangeError at the same depth.
+
+**Gates:** a 90-program differential corpus + 300-case deterministic fuzz
+(`tests/reg.rs`) require byte-identical output and errors reg-on vs reg-off
+across the virtual-stack shuffles (ternaries, logical operators, optional
+chains, method calls, compound assignment), TDZ edges, IC hit/miss/exotic
+paths, dense-element semantics, every call shape, closures/per-iteration
+capture, `arguments` aliasing, mixed-tier throws, and the decline
+boundaries; structural pins require the canonical shapes to translate and
+the excluded shapes to decline; the op-budget test additionally asserts the
+budget drains to the exact same count on both compiles. Full suites for
+both crates (118 + 761 tests, incl. record→replay byte-identity) and the
+Test262 gate: green. The pass is disabled under the `op-histogram` feature
+(register execution would hide per-op counts).
+
+### 6.10.1 Measured (callgrind instruction counts, whole workload)
+
+Reg-on vs reg-off, same commit, release build; RESULT checksums
+byte-identical on every workload:
+
+| workload | reg off | reg on | Δ instructions |
+| --- | ---: | ---: | ---: |
+| string_scan | 521.4 M | 368.3 M | **−29.4%** |
+| sort | 2.64 G | 2.07 G | **−21.5%** |
+| mixed_helpers (new) | 5.98 G | 5.18 G | **−13.5%** |
+| string_build | 183.3 M | 160.1 M | **−12.7%** |
+| json_roundtrip | 1.25 G | 1.20 G | −4.3% |
+| arith / fib / closures / property / array_hof / array_push_sum | — | — | ±0.003% |
+
+The unchanged rows are exactly the kernel-owned workloads: their hot
+functions decline register translation by design (the `+0.003%`-class
+deltas are the one-branch `proto.reg` probe per call, the same cost class
+as the `fn_kernel` probe). The wins land where the boxed interpreter
+itself carries the run — top-level glue around native/kernel calls (sort's
+build-and-invoke loop), string-scan/build loops, and `mixed_helpers`,
+which is all glue by construction. Geomean over the five
+interpreter-carried workloads: **−17%** instructions.
+
+Wall-clock (idle container, 5-run median, execution-only):
+
+| workload | reg off | reg on | speedup |
+| --- | ---: | ---: | ---: |
+| string_scan | 58 ms | 42 ms | 1.38× |
+| sort | 295 ms | 243 ms | 1.21× |
+| mixed_helpers | 724 ms | 620 ms | 1.17× |
+| string_build | 28 ms | 26 ms | 1.08× |
+| json_roundtrip | 154 ms | 147 ms | 1.05× |
+| kernel-owned workloads | — | — | 1.0× (noise) |
+
+`mixed_helpers` is a new workload added with this round: small helper
+functions over objects and strings (property traffic across calls, string
+building, for-in, ternary classification) — the shape of real agent glue
+where every function declines the kernel tiers and the interpreter itself
+carries the run. It is the register tier's home turf; the kernel-owned
+numeric workloads are untouched by design (their functions decline
+translation), and the suite's RESULT checksums are byte-identical reg-on
+vs reg-off across the board.
+
+### 6.10.2 What's next (post-register baseline)
+
+- **Try/finally support** — the largest coverage hole: for-of loops, array
+  destructuring, and try-wrapped agent code all keep the stack tier. Needs
+  a register-mode completion protocol (handler records the canonical depth;
+  catch entry writes the exception register and clears dead slots).
+- **Register-mode loop-kernel embedding** — let a function carry BOTH
+  kernels and a register program by teaching kernel bail-out to resume at a
+  register pc instead of a stack ip.
+- **Budget-compatible fast tiers** — a conservative deterministic op-count
+  mapping so production budgeted runs can use kernels + registers.
+- Re-run the callgrind sweep before choosing; §1.1's caveats stand.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

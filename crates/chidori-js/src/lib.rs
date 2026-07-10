@@ -30,6 +30,7 @@ pub mod opstats;
 pub mod promise;
 pub mod proxy;
 pub mod realm;
+pub mod reg;
 pub mod regexp;
 pub mod replay;
 pub mod trace;

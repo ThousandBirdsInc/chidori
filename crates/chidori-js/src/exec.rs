@@ -2553,7 +2553,32 @@ impl Vm {
     // The interpreter loop
     // =====================================================================
 
-    pub fn run_frame(&mut self, mut frame: Box<Frame>) -> Flow {
+    /// Run a frame to completion (or suspension): the register tier when the
+    /// proto carries a register program and per-op accounting is off, the
+    /// stack interpreter otherwise. Every execution entry point (calls,
+    /// [[Construct]], accessors, module/script evaluation, generator and
+    /// async resumption) funnels through here, so the two tiers can never be
+    /// entered inconsistently. Resumed generator/async frames always take the
+    /// stack path by construction: their protos contain suspension ops, which
+    /// decline register translation.
+    pub fn run_frame(&mut self, frame: Box<Frame>) -> Flow {
+        if let Some(reg) = &frame.func.proto.reg {
+            // The op budget demands EXACT per-stack-op accounting, so a
+            // budgeted run (the conformance runner, untrusted eval) stays on
+            // the generic path — the same rule the kernel tiers follow. The
+            // debug-assert documents the resumed-frame invariant.
+            debug_assert!(
+                frame.ip == 0 && frame.pending_throw.is_none() && frame.pending_return.is_none()
+            );
+            if self.op_budget.is_none() {
+                let reg = reg.clone();
+                return self.run_reg_frame(frame, &reg);
+            }
+        }
+        self.run_stack_frame(frame)
+    }
+
+    fn run_stack_frame(&mut self, mut frame: Box<Frame>) -> Flow {
         // Recycle this frame whole into the frame pool, then return the
         // (already-owned) outcome. Used only on synchronous Return/Throw exits;
         // the Suspend paths move the whole frame (buffers included) into the
@@ -2923,6 +2948,842 @@ impl Vm {
         })
     }
 
+    // =====================================================================
+    // Shared op bodies (stack interpreter + register tier)
+    //
+    // These are the op implementations with nontrivial inline logic — the
+    // key-verified inline caches and the dense-element fast paths. Both
+    // `step`/`step_cold` and `run_reg_frame` call them, so each op keeps
+    // exactly ONE implementation and the two tiers cannot drift.
+    // =====================================================================
+
+    /// `Op::GetProp` / `ROp::GetProp` body: IC-accelerated named property
+    /// read. See `FuncProto::ic` for the cache discipline (a stale hint is a
+    /// miss, never a wrong answer).
+    #[inline]
+    pub(crate) fn ic_get_prop(
+        &mut self,
+        obj: Value,
+        name: JsString,
+        ic: Option<&crate::bytecode::IcEntry>,
+    ) -> Result<Value, Value> {
+        // Inline cache (key-verified hints; see `FuncProto::ic`).
+        // Two levels:
+        //  - `holder == None`: the receiver's OWN data property at
+        //    `slot` (ordinary objects).
+        //  - `holder == Some(p)`: a data property at `slot` on `p`,
+        //    verified to still be the receiver's DIRECT prototype and
+        //    not shadowed by an own property — the method-lookup
+        //    pattern (`arr.push`, class instances calling prototype
+        //    methods). Array receivers exclude keys with exotic own
+        //    behavior (`length`, indices). Deeper chains, accessors,
+        //    proxies, and every other exotic fall to the unchanged
+        //    slow path.
+        if let Value::Object(o) = &obj {
+            if let Some(ic) = ic {
+                let b = o.borrow();
+                let (is_ord, is_arr) = (
+                    matches!(b.internal, Internal::Ordinary),
+                    matches!(b.internal, Internal::Array(_)),
+                );
+                // Array exotics: `length` and index keys never take
+                // the IC (they don't live in the props map).
+                let plain_key = !is_arr
+                    || (name.as_str() != "length"
+                        && crate::value::canonical_index(name.as_str()).is_none());
+                if (is_ord || is_arr) && plain_key {
+                    // Own-property hit: never touches the holder cell.
+                    if is_ord {
+                        if let Some((PropertyKey::Str(k), prop)) =
+                            b.props.get_index(ic.own_slot.get() as usize)
+                        {
+                            if let PropertyKind::Data { value, .. } = &prop.kind {
+                                if k == &name {
+                                    let v = value.clone();
+                                    return Ok(v);
+                                }
+                            }
+                        }
+                    }
+                    // Proto hit: valid only when the receiver has no
+                    // own props (nothing can shadow) and its CURRENT
+                    // direct proto is the cached holder.
+                    if b.props.is_empty() {
+                        let holder = ic.holder.borrow();
+                        if let Some(h) = &*holder {
+                            if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
+                                let hb = h.borrow();
+                                if let Some((PropertyKey::Str(k), prop)) =
+                                    hb.props.get_index(ic.proto_slot.get() as usize)
+                                {
+                                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                                        if k == &name {
+                                            let v = value.clone();
+                                            return Ok(v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Refill: own data property first (ordinary only),
+                    // then a one-level proto data property when no own
+                    // props can shadow.
+                    let key = PropertyKey::Str(name.clone());
+                    if is_ord {
+                        if let Some((idx, _, prop)) = b.props.get_full(&key) {
+                            if let PropertyKind::Data { value, .. } = &prop.kind {
+                                ic.own_slot.set(idx as u32);
+                                let v = value.clone();
+                                return Ok(v);
+                            }
+                        }
+                    }
+                    if b.props.is_empty() {
+                        if let Some(p) = &b.proto {
+                            let pb = p.borrow();
+                            if matches!(pb.internal, Internal::Ordinary)
+                                || matches!(pb.internal, Internal::Array(_))
+                            {
+                                if let Some((idx, _, prop)) = pb.props.get_full(&key) {
+                                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                                        ic.proto_slot.set(idx as u32);
+                                        let v = value.clone();
+                                        let holder_obj = p.clone();
+                                        drop(pb);
+                                        *ic.holder.borrow_mut() = Some(holder_obj);
+                                        return Ok(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.get_prop(&obj, &PropertyKey::Str(name))
+    }
+
+    /// `Op::SetProp` / `ROp::SetProp` body: IC-accelerated named property
+    /// write. Returns the value (the assignment expression's result).
+    #[inline]
+    pub(crate) fn ic_set_prop(
+        &mut self,
+        obj: Value,
+        name: JsString,
+        value: Value,
+        strict: bool,
+        ic: Option<&crate::bytecode::IcEntry>,
+    ) -> Result<Value, Value> {
+        // Inline cache (key-verified slot hint; see `FuncProto::ic`).
+        // Fast path only when the receiver is an ordinary object whose
+        // OWN property at the hinted slot is a WRITABLE data property —
+        // per OrdinarySetWithOwnDescriptor that assignment updates the
+        // value in place (attributes and slot order preserved, no
+        // prototype setter can intervene). Everything else (missing own
+        // key → proto-chain setters/read-only checks, accessors,
+        // non-writable → strict TypeError, exotics) takes the
+        // unchanged put_value path, which also refills the hint.
+        if let Value::Object(o) = &obj {
+            if let Some(ic) = ic {
+                let mut b = o.borrow_mut();
+                if matches!(b.internal, Internal::Ordinary) {
+                    if let Some((PropertyKey::Str(k), prop)) =
+                        b.props.get_index_mut(ic.own_slot.get() as usize)
+                    {
+                        if k == &name {
+                            if let PropertyKind::Data {
+                                value: slot,
+                                writable: true,
+                            } = &mut prop.kind
+                            {
+                                *slot = value.clone();
+                                return Ok(value);
+                            }
+                        }
+                    }
+                    let key = PropertyKey::Str(name.clone());
+                    if let Some((idx, _, prop)) = b.props.get_full_mut(&key) {
+                        if let PropertyKind::Data {
+                            value: slot,
+                            writable: true,
+                        } = &mut prop.kind
+                        {
+                            ic.own_slot.set(idx as u32);
+                            *slot = value.clone();
+                            return Ok(value);
+                        }
+                    }
+                }
+            }
+        }
+        self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
+        Ok(value)
+    }
+
+    /// `Op::GetPropDynamic` / `ROp::GetElem` body: computed-key read with the
+    /// dense-array integer fast path.
+    #[inline]
+    pub(crate) fn elem_get(&mut self, obj: Value, key_v: Value) -> Result<Value, Value> {
+        // Integer fast path: `a[i]` on a dense array with an integral
+        // Number key reads the element directly — skipping
+        // ToPropertyKey's Number→String conversion (a float-format +
+        // heap allocation per access!), the reparse back to an index,
+        // and the property-map machinery. Only when no reified props
+        // entry can shadow the dense element (`props.is_empty()`) and
+        // the slot is a real element (in bounds, not a hole);
+        // everything else takes the unchanged spec path.
+        if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+            if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
+                let b = o.borrow();
+                if let Internal::Array(arr) = &b.internal {
+                    if b.props.is_empty() {
+                        if let Some(v) = arr.get(*n as usize) {
+                            if !matches!(v, Value::Hole) {
+                                let v = v.clone();
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // GetValue: RequireObjectCoercible(base) (via ToObject) throws
+        // BEFORE ToPropertyKey coerces the key expression's value.
+        self.require_object_coercible(&obj, "read properties of")?;
+        let key = self.to_property_key(&key_v)?;
+        self.get_prop(&obj, &key)
+    }
+
+    /// `Op::SetPropDynamic` / `ROp::SetElem` body: computed-key write with
+    /// the dense-array fast paths (in-place overwrite, hole fill, append).
+    /// Returns the value (the assignment expression's result).
+    #[inline]
+    pub(crate) fn elem_set(
+        &mut self,
+        obj: Value,
+        key_v: Value,
+        value: Value,
+        strict: bool,
+    ) -> Result<Value, Value> {
+        // Integer fast path mirroring `elem_get`: overwrite an
+        // EXISTING dense element in place (an in-bounds non-hole dense
+        // slot is a plain writable data property per the array exotic
+        // [[Set]] — no setter, no length change, no extensibility
+        // interaction), fill an in-bounds HOLE, or append at exactly
+        // `length`. Filling and appending CREATE a property (the own
+        // property is absent), so they additionally require the array
+        // to be extensible (a sealed/prevented receiver must reject
+        // through the generic path), the dense-storage bound (the
+        // generic path owns that RangeError), and a prototype chain
+        // with no reified entry at the index — OrdinarySet consults
+        // the chain for an absent own property, so a proto accessor /
+        // non-writable index must intercept via the generic path
+        // (`protos_allow_index_create`). Gaps past the end, shadowed
+        // elements, and non-arrays take the spec path.
+        if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+            if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
+                let i = *n as usize;
+                let mut creates = None;
+                {
+                    let mut b = o.borrow_mut();
+                    if b.props.is_empty() {
+                        let extensible = b.extensible;
+                        if let Internal::Array(arr) = &mut b.internal {
+                            match arr.get_mut(i) {
+                                Some(slot) if !matches!(slot, Value::Hole) => {
+                                    *slot = value.clone();
+                                    return Ok(value);
+                                }
+                                Some(_) => {
+                                    if extensible {
+                                        creates = Some(b.proto.clone());
+                                    }
+                                }
+                                None => {
+                                    if extensible
+                                        && i == arr.len()
+                                        && i < crate::value::MAX_DENSE_ARRAY
+                                    {
+                                        creates = Some(b.proto.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(proto) = creates {
+                    if crate::value::protos_allow_index_create(proto, i as u32, 1) {
+                        // No user code ran since the conditions were
+                        // checked (same native frame), so they still
+                        // hold.
+                        let mut b = o.borrow_mut();
+                        if let Internal::Array(arr) = &mut b.internal {
+                            match arr.get_mut(i) {
+                                Some(slot) => *slot = value.clone(),
+                                None => arr.push(value.clone()),
+                            }
+                            return Ok(value);
+                        }
+                    }
+                }
+            }
+        }
+        self.require_object_coercible(&obj, "set properties of")?;
+        let key = self.to_property_key(&key_v)?;
+        self.put_value(&obj, &key, value.clone(), strict)?;
+        Ok(value)
+    }
+
+    /// `Op::LoadGlobal` / `ROp::LoadGlobal` body: IC-accelerated global read.
+    #[inline]
+    pub(crate) fn ic_load_global(
+        &mut self,
+        name: JsString,
+        ic: Option<&crate::bytecode::IcEntry>,
+    ) -> Result<Value, Value> {
+        let g = self.realm.global.clone();
+        // Inline cache (key-verified slot hint; see `FuncProto::ic`):
+        // after the first resolution, a global read — above all a
+        // function resolving its own recursive self-reference — is one
+        // indexed load plus a pointer-equality key check, no hashing.
+        if let Some(ic) = ic {
+            let b = g.borrow();
+            if let Some((PropertyKey::Str(k), prop)) = b.props.get_index(ic.own_slot.get() as usize)
+            {
+                if let PropertyKind::Data { value, .. } = &prop.kind {
+                    if k == &name {
+                        let v = value.clone();
+                        return Ok(v);
+                    }
+                }
+            }
+        }
+        let key = PropertyKey::Str(name.clone());
+        // Fast path: an own data property directly on the global object —
+        // the case for every top-level `function`/`var`/`let` binding.
+        // Resolves in a single hash with no prototype walk, and refills
+        // the inline cache with the slot it finds.
+        let fast = {
+            let b = g.borrow();
+            match b.props.get_full(&key) {
+                Some((
+                    idx,
+                    _,
+                    Property {
+                        kind: PropertyKind::Data { value, .. },
+                        ..
+                    },
+                )) => {
+                    if let Some(ic) = ic {
+                        ic.own_slot.set(idx as u32);
+                    }
+                    Some(value.clone())
+                }
+                _ => None,
+            }
+        };
+        match fast {
+            Some(v) => Ok(v),
+            None => {
+                // Accessor global, or a binding inherited via the global's
+                // prototype chain: fall back to the full [[Get]] (after the
+                // unresolvable-reference check that yields a ReferenceError).
+                if !self.has_own_or_proto(&g, &key) {
+                    return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
+                }
+                self.get_prop(&Value::Object(g), &key)
+            }
+        }
+    }
+
+    /// `Op::StoreGlobal` / `ROp::StoreGlobal` body.
+    #[inline]
+    pub(crate) fn store_global(
+        &mut self,
+        name: JsString,
+        v: Value,
+        strict: bool,
+    ) -> Result<(), Value> {
+        let g = self.realm.global.clone();
+        let key = PropertyKey::Str(name.clone());
+        // A bare assignment to a name bound nowhere is an unresolvable
+        // reference; PutValue on one throws ReferenceError in strict mode
+        // (a global-object property anywhere on the proto chain counts as
+        // resolvable). Sloppy mode creates the global property instead.
+        if strict && !self.has_prop(&Value::Object(g.clone()), &key)? {
+            return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
+        }
+        self.put_value(&Value::Object(g), &key, v, strict)
+    }
+
+    /// `Op::Closure` / `ROp::Closure` body: instantiate the nested function
+    /// template at const index `idx`, capturing cells/upvalues from `frame`
+    /// (plus the active with-scope, private-env, and [[HomeObject]]).
+    pub(crate) fn closure_from_const(&mut self, frame: &Frame, idx: u32) -> Result<Value, Value> {
+        let proto = match &frame.func.proto.consts[idx as usize] {
+            Const::Func(p) => p.clone(),
+            _ => return Err(self.throw_type("internal: bad closure const")),
+        };
+        let upvalues = proto
+            .upvalues
+            .iter()
+            .map(|src| match src {
+                UpvalueSource::ParentCell(idx) => frame.cells[*idx as usize].clone(),
+                UpvalueSource::ParentUpvalue(idx) => frame.func.upvalues[*idx as usize].clone(),
+            })
+            .collect();
+        let inherit_home = proto.kind.is_arrow() || proto.inherit_home;
+        let f = self.make_closure(proto, upvalues);
+        // Capture the active with-scope chain (closures defined inside
+        // `with` resolve free identifiers against it after the block)
+        // and the active private-environment chain (methods and
+        // initializers defined inside class bodies resolve `#x`
+        // against it). Arrows (and synthetic in-class closures) also
+        // inherit the creating frame's [[HomeObject]], so `super.x`
+        // inside them resolves like the enclosing method.
+        if !frame.with_scope.is_empty()
+            || frame.priv_env.is_some()
+            || (inherit_home && frame.func.home_object.is_some())
+        {
+            if let Internal::Function(FunctionInner::Bytecode(bf)) = &mut f.borrow_mut().internal {
+                let bf = Rc::make_mut(bf);
+                bf.captured_with = frame.with_scope.clone();
+                bf.captured_priv_env = frame.priv_env.clone();
+                if inherit_home {
+                    bf.home_object = frame.func.home_object.clone();
+                }
+            }
+        }
+        Ok(Value::Object(f))
+    }
+
+    /// `Op::BindThisSloppy` / `ROp::BindThisSloppy` body.
+    pub(crate) fn bind_this_sloppy(&mut self, t: Value) -> Result<Value, Value> {
+        Ok(match t {
+            Value::Undefined | Value::Null => Value::Object(self.realm.global.clone()),
+            Value::Object(_) => t,
+            // A primitive `this` is boxed (ToObject) in sloppy mode.
+            other => Value::Object(self.to_object(&other)?),
+        })
+    }
+
+    /// `Op::LoadRestArgs` / `ROp::RestArgs` body.
+    pub(crate) fn rest_args(&mut self, frame: &Frame, n: u32) -> Value {
+        let rest: Vec<Value> = if (n as usize) < frame.args.len() {
+            frame.args[n as usize..].to_vec()
+        } else {
+            Vec::new()
+        };
+        Value::Object(self.new_array(rest))
+    }
+
+    /// `Op::DeclareGlobal` / `ROp::DeclareGlobal` body.
+    pub(crate) fn declare_global(&mut self, name: JsString, deletable: bool) -> Result<(), Value> {
+        let g = self.realm.global.clone();
+        let key = PropertyKey::Str(name.clone());
+        let (present, extensible) = {
+            let b = g.borrow();
+            (b.props.contains_key(&key), b.extensible)
+        };
+        if !present {
+            // CanDeclareGlobalVar/Function: needs an extensible global.
+            if !extensible {
+                return Err(self.throw_type(&format!("Cannot declare global '{}'", name.as_str())));
+            }
+            // CreateGlobalVarBinding(N, D): writable, enumerable;
+            // configurable only for eval-created bindings.
+            g.borrow_mut().props.insert(
+                key,
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Undefined,
+                        writable: true,
+                    },
+                    enumerable: true,
+                    configurable: deletable,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// `Op::CanDeclareGlobalFunc` / `ROp::CanDeclareGlobalFunc` body.
+    pub(crate) fn can_declare_global_func(&mut self, name: JsString) -> Result<(), Value> {
+        let g = self.realm.global.clone();
+        let key = PropertyKey::Str(name.clone());
+        // CanDeclareGlobalFunction (9.1.1.4.16): an existing
+        // non-configurable property is acceptable only if it is a
+        // writable, enumerable data property; otherwise (or, when
+        // absent, on a non-extensible global) the declaration fails.
+        let definable = {
+            let b = g.borrow();
+            match b.props.get(&key) {
+                None => b.extensible,
+                Some(p) => {
+                    p.configurable
+                        || matches!(
+                            &p.kind,
+                            PropertyKind::Data { writable, .. }
+                                if *writable && p.enumerable
+                        )
+                }
+            }
+        };
+        if !definable {
+            return Err(self.throw_type(&format!(
+                "Cannot declare global function '{}'",
+                name.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `Op::DefineGlobalFunc` / `ROp::DefineGlobalFunc` body.
+    pub(crate) fn define_global_func(&mut self, name: JsString, value: Value, deletable: bool) {
+        let g = self.realm.global.clone();
+        let key = PropertyKey::Str(name.clone());
+        // CreateGlobalFunctionBinding (9.1.1.4.18): an absent or
+        // configurable existing property is (re)defined with function
+        // attributes; a non-configurable one keeps its attributes and
+        // is just assigned the new value.
+        let redefine = {
+            let b = g.borrow();
+            match b.props.get(&key) {
+                None => true,
+                Some(p) => p.configurable,
+            }
+        };
+        let mut b = g.borrow_mut();
+        if redefine {
+            b.props.insert(
+                key,
+                Property {
+                    kind: PropertyKind::Data {
+                        value,
+                        writable: true,
+                    },
+                    enumerable: true,
+                    configurable: deletable,
+                },
+            );
+        } else if let Some(p) = b.props.get_mut(&key) {
+            if let PropertyKind::Data { value: slot, .. } = &mut p.kind {
+                *slot = value;
+            }
+        }
+    }
+
+    /// `Op::GetTemplateObject` / `ROp::GetTemplateObject` body: the cached,
+    /// frozen template object, keyed by `(proto pointer, index)`.
+    pub(crate) fn template_object(&mut self, frame: &Frame, idx: u32) -> Result<Value, Value> {
+        let key = (Rc::as_ptr(&frame.func.proto) as *const () as usize, idx);
+        if let Some(o) = self.template_cache.get(&key) {
+            return Ok(Value::Object(o.clone()));
+        }
+        let parts = frame.func.proto.templates[idx as usize].clone();
+        // Cooked strings (an illegal escape cooks to `undefined`).
+        let cooked: Vec<Value> = parts
+            .cooked
+            .iter()
+            .map(|c| match c {
+                Some(s) => Value::String(JsString::from_rc_str(s.clone())),
+                None => Value::Undefined,
+            })
+            .collect();
+        let arr = self.new_array(cooked);
+        let raw: Vec<Value> = parts
+            .raw
+            .iter()
+            .map(|s| Value::String(JsString::from_rc_str(s.clone())))
+            .collect();
+        let raw_arr = self.new_array(raw);
+        // The `raw` array is frozen; `raw` is a non-enumerable,
+        // non-writable, non-configurable own property of the
+        // template object, which is itself frozen (spec
+        // GetTemplateObject / TemplateString integrity).
+        crate::builtins::fundamental::set_integrity_level(self, &raw_arr, true)?;
+        arr.borrow_mut().props.insert(
+            PropertyKey::str("raw"),
+            Property {
+                kind: PropertyKind::Data {
+                    value: Value::Object(raw_arr),
+                    writable: false,
+                },
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        crate::builtins::fundamental::set_integrity_level(self, &arr, true)?;
+        self.template_cache.insert(key, arr.clone());
+        Ok(Value::Object(arr))
+    }
+
+    /// `Op::ArraySpread` / `ROp::ArraySpread` body.
+    pub(crate) fn array_spread(&mut self, arr_v: &Value, src: &Value) -> Result<(), Value> {
+        let items = self.iterate_to_vec(src)?;
+        if let Value::Object(a) = arr_v {
+            let mut b = a.borrow_mut();
+            if let Internal::Array(elems) = &mut b.internal {
+                elems.extend(items);
+            }
+        }
+        Ok(())
+    }
+
+    /// The six `Op::Define*` / `ROp::DefineProp` bodies.
+    pub(crate) fn define_prop_kind(
+        &mut self,
+        kind: crate::reg::DefKind,
+        obj: &Value,
+        key_v: &Value,
+        value: Value,
+    ) -> Result<(), Value> {
+        use crate::reg::DefKind;
+        let key = self.to_property_key(key_v)?;
+        match kind {
+            DefKind::Field => {
+                if let Value::Object(o) = obj {
+                    crate::builtins::fundamental::create_data_property_or_throw(
+                        self, o, &key, value,
+                    )?;
+                }
+            }
+            DefKind::Method => {
+                // Class methods are non-enumerable (writable, configurable),
+                // defined with DefinePropertyOrThrow (a non-configurable own
+                // key — e.g. a computed static "prototype" — is a TypeError).
+                self.check_redefinable(obj, &key)?;
+                if let Value::Object(o) = obj {
+                    o.borrow_mut().props.insert(key, Property::builtin(value));
+                }
+            }
+            DefKind::Getter => {
+                self.check_redefinable(obj, &key)?;
+                self.define_accessor_with(obj, key, Some(value), None, true);
+            }
+            DefKind::Setter => {
+                self.check_redefinable(obj, &key)?;
+                self.define_accessor_with(obj, key, None, Some(value), true);
+            }
+            DefKind::MethodGetter => {
+                self.check_redefinable(obj, &key)?;
+                self.define_accessor_with(obj, key, Some(value), None, false);
+            }
+            DefKind::MethodSetter => {
+                self.check_redefinable(obj, &key)?;
+                self.define_accessor_with(obj, key, None, Some(value), false);
+            }
+        }
+        Ok(())
+    }
+
+    /// `Op::SetHomeObject` / `ROp::SetHomeObject` body (MakeMethod).
+    pub(crate) fn set_home_object_op(home: &Value, method: &Value) {
+        if let (Value::Object(home), Value::Object(m)) = (home, method) {
+            if let Internal::Function(FunctionInner::Bytecode(bf)) = &mut m.borrow_mut().internal {
+                Rc::make_mut(bf).home_object = Some(home.clone());
+            }
+        }
+    }
+
+    /// `Op::ObjectSpread` / `ROp::ObjectSpread` body.
+    pub(crate) fn object_spread(&mut self, target: &Value, src: &Value) -> Result<(), Value> {
+        if let Value::Object(t) = target {
+            if let Value::Object(s) = src {
+                for k in self.enumerable_own_keys_dyn(s)? {
+                    let val = self.get_prop(src, &k)?;
+                    t.borrow_mut().props.insert(k, Property::data(val));
+                }
+            } else if let Value::String(st) = src {
+                for (i, c) in st.as_str().chars().enumerate() {
+                    t.borrow_mut().props.insert(
+                        PropertyKey::from_index(i as u32),
+                        Property::data(Value::str(c.to_string())),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `Op::CopyDataPropertiesExcept` / `ROp::CopyDataPropsExcept` body
+    /// (keys already converted to property keys, in stack order).
+    pub(crate) fn copy_data_props_except(
+        &mut self,
+        target: &Value,
+        src: &Value,
+        excluded: &[PropertyKey],
+    ) -> Result<(), Value> {
+        if let Value::Object(t) = target {
+            if let Value::Object(s) = src {
+                // Excluded keys are skipped before ANY source access
+                // (CopyDataProperties step 4.b.i): a proxy source must
+                // not observe a [[GetOwnProperty]]/[[Get]] for them.
+                for k in self.enumerable_own_keys_excluding(s, excluded)? {
+                    let val = self.get_prop(src, &k)?;
+                    t.borrow_mut().props.insert(k, Property::data(val));
+                }
+            } else if let Value::String(st) = src {
+                // A primitive-string source contributes its index keys.
+                for (i, c) in st.as_str().chars().enumerate() {
+                    let k = PropertyKey::from_index(i as u32);
+                    if excluded.contains(&k) {
+                        continue;
+                    }
+                    t.borrow_mut()
+                        .props
+                        .insert(k, Property::data(Value::str(c.to_string())));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `Op::SetFunctionNameFromKey` / `ROp::SetFunctionNameFromKey` body.
+    pub(crate) fn set_function_name_from_key(
+        &mut self,
+        key: &Value,
+        value: &Value,
+        prefix: JsString,
+    ) {
+        if let Value::Object(f) = value {
+            if f.borrow().is_callable() {
+                let base = match key {
+                    Value::Symbol(sym) => match sym.description() {
+                        Some(d) => format!("[{d}]"),
+                        None => String::new(),
+                    },
+                    other => self.to_string_lossy(other),
+                };
+                let name = if prefix.as_str().is_empty() {
+                    base
+                } else {
+                    format!("{} {}", prefix.as_str(), base)
+                };
+                f.borrow_mut().props.insert(
+                    PropertyKey::str("name"),
+                    Property {
+                        kind: PropertyKind::Data {
+                            value: Value::str(name),
+                            writable: false,
+                        },
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+        }
+    }
+
+    /// `Op::SetProtoFromLiteral` / `ROp::SetProtoFromLiteral` body.
+    pub(crate) fn set_proto_from_literal(obj: &Value, v: Value) {
+        if let Value::Object(o) = obj {
+            match v {
+                Value::Object(p) => o.borrow_mut().proto = Some(p),
+                Value::Null => o.borrow_mut().proto = None,
+                // Non-object, non-null values are silently ignored.
+                _ => {}
+            }
+        }
+    }
+
+    /// `Op::DeleteProp` / `ROp::DelProp` body.
+    pub(crate) fn del_prop_named(
+        &mut self,
+        obj: Value,
+        name: JsString,
+        strict: bool,
+    ) -> Result<Value, Value> {
+        // `delete base.x` does ToObject(base) (spec step 5.b): a
+        // nullish base is a TypeError before any delete is attempted.
+        self.require_object_coercible(&obj, "delete properties of")?;
+        let r = self.delete_prop(&obj, &PropertyKey::Str(name.clone()))?;
+        // Strict-mode `delete` that fails throws (spec 13.5.1.2 step 5.c).
+        if !r && strict {
+            return Err(self.throw_type(&format!(
+                "Cannot delete property '{}' in strict mode",
+                name.as_str()
+            )));
+        }
+        Ok(Value::Bool(r))
+    }
+
+    /// `Op::DeletePropDynamic` / `ROp::DelElem` body.
+    pub(crate) fn del_prop_dynamic(
+        &mut self,
+        obj: Value,
+        key_v: Value,
+        strict: bool,
+    ) -> Result<Value, Value> {
+        self.require_object_coercible(&obj, "delete properties of")?;
+        let key = self.to_property_key(&key_v)?;
+        let r = self.delete_prop(&obj, &key)?;
+        if !r && strict {
+            return Err(self.throw_type("Cannot delete property in strict mode"));
+        }
+        Ok(Value::Bool(r))
+    }
+
+    /// `Op::ConcatStrings` / `ROp::ConcatStrings` body (template literals).
+    pub(crate) fn concat_strings(&mut self, parts: &[Value]) -> Result<Value, Value> {
+        let mut strs = Vec::with_capacity(parts.len());
+        let mut total = 0usize;
+        for p in parts {
+            let s = self.to_js_string(p)?;
+            // Same bound as `op_add`: a template-literal join in a doubling
+            // loop (`` s = `${s}${s}` ``) must not grow without limit.
+            total += s.byte_len();
+            if total > crate::value::MAX_STRING_LEN {
+                return Err(self.throw_range("invalid string length"));
+            }
+            strs.push(s);
+        }
+        // Fast path when every part is well-formed (the common case):
+        // a plain UTF-8 join. Otherwise go through code units so a
+        // surrogate straddling a boundary re-pairs (and lone surrogates
+        // survive instead of becoming U+FFFD).
+        let out = if strs.iter().all(|s| s.is_well_formed()) {
+            let mut out = String::with_capacity(total);
+            for s in &strs {
+                out.push_str(s.as_str());
+            }
+            JsString::new(out)
+        } else {
+            let mut units = Vec::new();
+            for s in &strs {
+                units.extend(s.code_units());
+            }
+            JsString::from_code_units(&units)
+        };
+        Ok(Value::String(out))
+    }
+
+    /// `Op::ForInEnumerate` / `ROp::ForInEnumerate` body: push a fresh
+    /// enumerator, returning its index value.
+    pub(crate) fn for_in_enumerate(
+        &mut self,
+        frame: &mut Frame,
+        v: &Value,
+    ) -> Result<Value, Value> {
+        let keys = self.for_in_keys(v)?;
+        frame.enumerators.push((keys, 0));
+        Ok(Value::Number((frame.enumerators.len() - 1) as f64))
+    }
+
+    /// `Op::ForInNext` / `ROp::ForInNext` body: `(key, has_next)`.
+    pub(crate) fn for_in_next(frame: &mut Frame) -> (Value, Value) {
+        let idx = frame.enumerators.len() - 1;
+        let (keys, cursor) = &mut frame.enumerators[idx];
+        if *cursor < keys.len() {
+            let k = keys[*cursor].clone();
+            *cursor += 1;
+            (Value::String(k), Value::Bool(true))
+        } else {
+            (Value::Undefined, Value::Bool(false))
+        }
+    }
+
     fn const_name(&self, frame: &Frame, idx: u32) -> JsString {
         match &frame.func.proto.consts[idx as usize] {
             Const::String(s) => s.clone(),
@@ -2943,6 +3804,778 @@ impl Vm {
             self.set_prop_strict(base, key, value)
         } else {
             self.set_prop(base, key, value)
+        }
+    }
+
+    // =====================================================================
+    // Register-tier execution (reg.rs; docs/js-performance-roadmap.md §3.5)
+    // =====================================================================
+
+    /// Execute a frame through its register program. Same observable
+    /// behavior as `run_stack_frame` over the same proto by construction:
+    /// every arm calls the SAME helper as its stack twin, and the reg-on/off
+    /// differential corpus (`tests/reg.rs`) pins it. Register frames carry
+    /// no try-handlers (functions with handlers decline translation), so a
+    /// thrown error always tears the frame down; and no suspension ops
+    /// translate, so this never returns `Flow::Suspend`.
+    fn run_reg_frame(&mut self, mut frame: Box<Frame>, reg: &crate::reg::RegProto) -> Flow {
+        use crate::reg::{ROp, RUnary};
+        macro_rules! done {
+            ($flow:expr) => {{
+                let outcome = $flow;
+                self.recycle_frame(frame);
+                return outcome;
+            }};
+        }
+        macro_rules! tryv {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => done!(Flow::Throw(e)),
+                }
+            };
+        }
+        let proto = frame.func.proto.clone();
+        // Registers 0..num_locals are the localized bindings (already sized
+        // by `init_frame`); the rest are the canonical operand slots.
+        frame.locals.resize(reg.num_regs as usize, Value::Undefined);
+        // Cooperative cancellation: the same latch-and-throw protocol as the
+        // stack loop (which polls every 256 ops). The op BUDGET never applies
+        // here — `run_frame` routes budgeted runs to the stack tier.
+        let interruptible = self.interrupt.is_some();
+        let mut poll: u32 = 0;
+        let code = &reg.code[..];
+        let mut pc: usize = 0;
+        loop {
+            if interruptible {
+                poll = poll.wrapping_add(1);
+                if poll & 0xFF == 0 {
+                    if let Some(flag) = &self.interrupt {
+                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            self.op_budget = Some(0);
+                            done!(Flow::Throw(self.throw_range("execution interrupted")));
+                        }
+                    }
+                }
+            }
+            let op = &code[pc];
+            pc += 1;
+            macro_rules! rd {
+                ($i:expr) => {
+                    frame.locals[$i as usize].clone()
+                };
+            }
+            macro_rules! wr {
+                ($i:expr, $v:expr) => {
+                    frame.locals[$i as usize] = $v
+                };
+            }
+            match op {
+                ROp::Mov { dst, src } => wr!(*dst, rd!(*src)),
+                ROp::Const { dst, idx } => wr!(*dst, self.const_val(&frame, *idx)),
+                ROp::Undef { dst } => wr!(*dst, Value::Undefined),
+                ROp::Null { dst } => wr!(*dst, Value::Null),
+                ROp::Bool { dst, v } => wr!(*dst, Value::Bool(*v)),
+                ROp::Hole { dst } => wr!(*dst, Value::Hole),
+                ROp::This { dst } => wr!(*dst, frame.this.clone()),
+                ROp::NewTarget { dst } => wr!(*dst, frame.new_target.clone()),
+                ROp::Arg { dst, idx } => wr!(
+                    *dst,
+                    frame
+                        .args
+                        .get(*idx as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined)
+                ),
+                ROp::TdzCheck { src } => {
+                    if matches!(frame.locals[*src as usize], Value::Uninitialized) {
+                        done!(Flow::Throw(self.throw_reference(
+                            "Cannot access binding before initialization"
+                        )));
+                    }
+                }
+                ROp::StoreLocalChecked { local, src } => {
+                    let v = rd!(*src);
+                    let slot = &mut frame.locals[*local as usize];
+                    if matches!(slot, Value::Uninitialized) {
+                        done!(Flow::Throw(self.throw_reference(
+                            "Cannot access binding before initialization"
+                        )));
+                    }
+                    *slot = v;
+                }
+                ROp::InitLocalTdz { local } => wr!(*local, Value::Uninitialized),
+                ROp::IncLocal { local, dec } => {
+                    let v = rd!(*local);
+                    if matches!(v, Value::Uninitialized) {
+                        done!(Flow::Throw(self.throw_reference(
+                            "Cannot access binding before initialization"
+                        )));
+                    }
+                    // ToNumeric may run user code, but a localized binding is
+                    // reachable only from this frame, so read-coerce-write is
+                    // exactly the unfused sequence.
+                    let n = tryv!(self.to_numeric(&v));
+                    let r = tryv!(
+                        self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })
+                    );
+                    wr!(*local, r);
+                }
+                ROp::LoadCell { dst, cell } => {
+                    let v = frame.cells[*cell as usize].borrow().clone();
+                    if matches!(v, Value::Uninitialized) {
+                        done!(Flow::Throw(self.throw_reference(
+                            "Cannot access binding before initialization"
+                        )));
+                    }
+                    wr!(*dst, v);
+                }
+                ROp::StoreCell { cell, src } => {
+                    let v = rd!(*src);
+                    *frame.cells[*cell as usize].borrow_mut() = v;
+                }
+                ROp::LoadUpvalue { dst, idx } => {
+                    let v = frame.func.upvalues[*idx as usize].borrow().clone();
+                    if matches!(v, Value::Uninitialized) {
+                        done!(Flow::Throw(self.throw_reference(
+                            "Cannot access binding before initialization"
+                        )));
+                    }
+                    wr!(*dst, v);
+                }
+                ROp::LoadGlobal { dst, name, ic } => {
+                    let name = Self::const_name_proto(&proto, *name);
+                    let v = tryv!(self.ic_load_global(name, reg.ic.get(*ic as usize)));
+                    wr!(*dst, v);
+                }
+                ROp::Add { dst, a, b } => {
+                    let r = tryv!(self.op_add(rd!(*a), rd!(*b)));
+                    wr!(*dst, r);
+                }
+                ROp::AddK { dst, a, konst } => {
+                    let b = self.const_val(&frame, *konst);
+                    let r = tryv!(self.op_add(rd!(*a), b));
+                    wr!(*dst, r);
+                }
+                ROp::Arith { kind, dst, a, b } => {
+                    let r = tryv!(self.arith(rd!(*a), rd!(*b), *kind));
+                    wr!(*dst, r);
+                }
+                ROp::ArithK {
+                    kind,
+                    dst,
+                    a,
+                    konst,
+                } => {
+                    let b = self.const_val(&frame, *konst);
+                    let r = tryv!(self.arith(rd!(*a), b, *kind));
+                    wr!(*dst, r);
+                }
+                ROp::AddCellK { dst, cell, konst } => {
+                    let a = frame.cells[*cell as usize].borrow().clone();
+                    if matches!(a, Value::Uninitialized) {
+                        done!(Flow::Throw(self.throw_reference(
+                            "Cannot access binding before initialization"
+                        )));
+                    }
+                    let b = self.const_val(&frame, *konst);
+                    let r = tryv!(self.op_add(a, b));
+                    wr!(*dst, r);
+                }
+                ROp::ArithCellK {
+                    kind,
+                    dst,
+                    cell,
+                    konst,
+                } => {
+                    let a = frame.cells[*cell as usize].borrow().clone();
+                    if matches!(a, Value::Uninitialized) {
+                        done!(Flow::Throw(self.throw_reference(
+                            "Cannot access binding before initialization"
+                        )));
+                    }
+                    let b = self.const_val(&frame, *konst);
+                    let r = tryv!(self.arith(a, b, *kind));
+                    wr!(*dst, r);
+                }
+                ROp::Unary { kind, dst, src } => {
+                    let a = rd!(*src);
+                    let r = match kind {
+                        RUnary::Neg => tryv!(self.unary_arith(a, UnaryKind::Neg)),
+                        // ToNumber throws TypeError for BigInt (unary + is
+                        // invalid on it).
+                        RUnary::Pos => Value::Number(tryv!(self.to_number(&a))),
+                        RUnary::ToNumeric => tryv!(self.to_numeric(&a)),
+                        RUnary::Inc => tryv!(self.unary_arith(a, UnaryKind::Inc)),
+                        RUnary::Dec => tryv!(self.unary_arith(a, UnaryKind::Dec)),
+                        RUnary::BitNot => tryv!(self.unary_arith(a, UnaryKind::BitNot)),
+                        RUnary::Not => Value::Bool(!self.to_boolean(&a)),
+                        RUnary::Typeof => Value::str(a.type_of()),
+                        RUnary::ToStr => Value::String(tryv!(self.to_js_string(&a))),
+                        RUnary::ToKey => match tryv!(self.to_property_key(&a)) {
+                            PropertyKey::Str(s) => Value::String(s),
+                            PropertyKey::Sym(s) => Value::Symbol(s),
+                        },
+                    };
+                    wr!(*dst, r);
+                }
+                ROp::Cmp { cmp, dst, a, b } => {
+                    let (a, b) = (rd!(*a), rd!(*b));
+                    let r = tryv!(self.cmp_values(*cmp, &a, &b));
+                    wr!(*dst, Value::Bool(r));
+                }
+                // ---- control flow ----
+                ROp::Jmp { target } => pc = *target as usize,
+                ROp::BrTrue { src, target } => {
+                    let v = rd!(*src);
+                    if self.to_boolean(&v) {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrFalse { src, target } => {
+                    let v = rd!(*src);
+                    if !self.to_boolean(&v) {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrFalsyKeep { src, target } => {
+                    let v = rd!(*src);
+                    if !self.to_boolean(&v) {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrTruthyKeep { src, target } => {
+                    let v = rd!(*src);
+                    if self.to_boolean(&v) {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrNotNullishKeep { src, target } => {
+                    if !frame.locals[*src as usize].is_nullish() {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrNullishUndef { reg, target } => {
+                    if frame.locals[*reg as usize].is_nullish() {
+                        // An optional chain short-circuits to `undefined` even
+                        // when the base was `null`.
+                        frame.locals[*reg as usize] = Value::Undefined;
+                        pc = *target as usize;
+                    }
+                }
+                ROp::CmpBr {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    let (a, b) = (rd!(*a), rd!(*b));
+                    if tryv!(self.cmp_values(*cmp, &a, &b)) == *if_true {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::CmpBrK {
+                    cmp,
+                    a,
+                    konst,
+                    if_true,
+                    target,
+                } => {
+                    let a = rd!(*a);
+                    let b = self.const_val(&frame, *konst);
+                    if tryv!(self.cmp_values(*cmp, &a, &b)) == *if_true {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::CmpBrCellK {
+                    cmp,
+                    cell,
+                    konst,
+                    if_true,
+                    target,
+                } => {
+                    let a = frame.cells[*cell as usize].borrow().clone();
+                    if matches!(a, Value::Uninitialized) {
+                        done!(Flow::Throw(self.throw_reference(
+                            "Cannot access binding before initialization"
+                        )));
+                    }
+                    let b = self.const_val(&frame, *konst);
+                    if tryv!(self.cmp_values(*cmp, &a, &b)) == *if_true {
+                        pc = *target as usize;
+                    }
+                }
+                // ---- property access ----
+                ROp::GetProp { dst, obj, name, ic } => {
+                    let obj = rd!(*obj);
+                    let name = Self::const_name_proto(&proto, *name);
+                    let v = tryv!(self.ic_get_prop(obj, name, reg.ic.get(*ic as usize)));
+                    wr!(*dst, v);
+                }
+                ROp::SetProp {
+                    dst,
+                    obj,
+                    name,
+                    src,
+                    ic,
+                } => {
+                    let obj = rd!(*obj);
+                    let value = rd!(*src);
+                    let name = Self::const_name_proto(&proto, *name);
+                    let v = tryv!(self.ic_set_prop(
+                        obj,
+                        name,
+                        value,
+                        proto.is_strict,
+                        reg.ic.get(*ic as usize)
+                    ));
+                    wr!(*dst, v);
+                }
+                ROp::GetElem { dst, obj, key } => {
+                    let (obj, key) = (rd!(*obj), rd!(*key));
+                    let v = tryv!(self.elem_get(obj, key));
+                    wr!(*dst, v);
+                }
+                ROp::SetElem { dst, obj, key, src } => {
+                    let (obj, key, value) = (rd!(*obj), rd!(*key), rd!(*src));
+                    let v = tryv!(self.elem_set(obj, key, value, proto.is_strict));
+                    wr!(*dst, v);
+                }
+                // ---- calls ----
+                ROp::Call {
+                    dst,
+                    func,
+                    this,
+                    at,
+                    argc,
+                    has_this,
+                } => {
+                    let func_v = rd!(*func);
+                    let this_v = if *has_this {
+                        rd!(*this)
+                    } else {
+                        Value::Undefined
+                    };
+                    let r = if let Some(bf) = peek_plain_bytecode(&func_v) {
+                        self.call_direct_reg(&mut frame, *at, *argc, bf, func_v, this_v)
+                    } else {
+                        // Arguments MOVE out of their (dead) canonical slots
+                        // into the pooled buffer — same ownership shape as the
+                        // stack path's drain.
+                        let mut args = self.take_value_vec();
+                        for i in *at..*at + *argc {
+                            args.push(std::mem::replace(
+                                &mut frame.locals[i as usize],
+                                Value::Undefined,
+                            ));
+                        }
+                        self.call_valuevec(func_v, this_v, args)
+                    };
+                    wr!(*dst, tryv!(r));
+                }
+                ROp::New {
+                    dst,
+                    ctor,
+                    at,
+                    argc,
+                } => {
+                    let ctor_v = rd!(*ctor);
+                    let args = &frame.locals[*at as usize..(*at + *argc) as usize];
+                    let v = tryv!(self.construct(&ctor_v, args, &ctor_v));
+                    wr!(*dst, v);
+                }
+                ROp::Ret { src } => {
+                    let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
+                    // Module linker hook: snapshot this frame's final cells
+                    // when it is the module body being evaluated.
+                    if let Some(p) = &self.module_capture_proto {
+                        if Rc::ptr_eq(&proto, p) {
+                            self.module_capture = Some(frame.cells.clone());
+                        }
+                    }
+                    done!(Flow::Return(v));
+                }
+                ROp::RetCompletion => {
+                    let v = frame.completion.clone();
+                    if let Some(p) = &self.module_capture_proto {
+                        if Rc::ptr_eq(&proto, p) {
+                            self.module_capture = Some(frame.cells.clone());
+                        }
+                    }
+                    done!(Flow::Return(v));
+                }
+                ROp::Throw { src } => {
+                    let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
+                    done!(Flow::Throw(v));
+                }
+                ROp::Closure { dst, idx } => {
+                    let f = tryv!(self.closure_from_const(&frame, *idx));
+                    wr!(*dst, f);
+                }
+                // Everything rarer runs through the cold arm, keeping this
+                // loop's native stack frame small (same split — and same
+                // reason — as `step`/`step_cold`).
+                cold => {
+                    tryv!(self.rstep_cold(&mut frame, reg, &proto, cold));
+                }
+            }
+        }
+    }
+
+    /// The register tier's rare ops. `#[inline(never)]` keeps their unioned
+    /// locals out of `run_reg_frame`'s native frame (deep JS recursion must
+    /// exhaust `max_call_depth` before the native stack; see `step_cold`).
+    /// Cold ops never branch, return, or call JS→JS directly, so the
+    /// signature carries no control flow.
+    #[inline(never)]
+    fn rstep_cold(
+        &mut self,
+        frame: &mut Frame,
+        reg: &crate::reg::RegProto,
+        proto: &Rc<crate::bytecode::FuncProto>,
+        op: &crate::reg::ROp,
+    ) -> Result<(), Value> {
+        use crate::reg::ROp;
+        macro_rules! rd {
+            ($i:expr) => {
+                frame.locals[$i as usize].clone()
+            };
+        }
+        macro_rules! wr {
+            ($i:expr, $v:expr) => {
+                frame.locals[$i as usize] = $v
+            };
+        }
+        match op {
+            ROp::RestArgs { dst, from } => {
+                let v = self.rest_args(frame, *from);
+                wr!(*dst, v);
+            }
+            ROp::Arguments { dst } => {
+                let v = self.make_arguments_object(frame);
+                wr!(*dst, v);
+            }
+            ROp::BindThisSloppy { reg: r } => {
+                let t = std::mem::replace(&mut frame.locals[*r as usize], Value::Undefined);
+                let bound = self.bind_this_sloppy(t)?;
+                wr!(*r, bound);
+            }
+            ROp::StoreCellChecked { cell, src } => {
+                let v = rd!(*src);
+                let mut slot = frame.cells[*cell as usize].borrow_mut();
+                if matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                *slot = v;
+            }
+            ROp::InitCell { cell, src } => {
+                let v = rd!(*src);
+                // A module's top-level cells are STABLE: mutate in place so a
+                // pre-wired import binding keeps pointing at the live cell.
+                if proto.stable_flags[*cell as usize] {
+                    *frame.cells[*cell as usize].borrow_mut() = v;
+                } else {
+                    let fresh = self.take_cell(v);
+                    let old = std::mem::replace(&mut frame.cells[*cell as usize], fresh);
+                    self.recycle_cell(old);
+                }
+            }
+            ROp::InitCellTdz { cell } => {
+                if proto.stable_flags[*cell as usize] {
+                    *frame.cells[*cell as usize].borrow_mut() = Value::Uninitialized;
+                } else {
+                    let fresh = self.take_cell(Value::Uninitialized);
+                    let old = std::mem::replace(&mut frame.cells[*cell as usize], fresh);
+                    self.recycle_cell(old);
+                }
+            }
+            ROp::IncCell { cell, dec } => {
+                let v = frame.cells[*cell as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let n = self.to_numeric(&v)?;
+                let r = self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })?;
+                *frame.cells[*cell as usize].borrow_mut() = r;
+            }
+            ROp::LoadCellInit { src, dest } => {
+                let v = frame.cells[*src as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                if proto.stable_flags[*dest as usize] {
+                    *frame.cells[*dest as usize].borrow_mut() = v;
+                } else {
+                    let fresh = self.take_cell(v);
+                    let old = std::mem::replace(&mut frame.cells[*dest as usize], fresh);
+                    self.recycle_cell(old);
+                }
+            }
+            ROp::StoreUpvalue { idx, src } => {
+                let v = rd!(*src);
+                *frame.func.upvalues[*idx as usize].borrow_mut() = v;
+            }
+            ROp::StoreUpvalueChecked { idx, src } => {
+                let v = rd!(*src);
+                let mut slot = frame.func.upvalues[*idx as usize].borrow_mut();
+                if matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                *slot = v;
+            }
+            ROp::StoreGlobal { name, src } => {
+                let v = rd!(*src);
+                let name = Self::const_name_proto(proto, *name);
+                self.store_global(name, v, proto.is_strict)?;
+            }
+            ROp::LoadGlobalTypeof { dst, name } => {
+                let name = Self::const_name_proto(proto, *name);
+                let g = self.realm.global.clone();
+                let v = self.get_prop(&Value::Object(g), &PropertyKey::Str(name))?;
+                wr!(*dst, v);
+            }
+            ROp::DeclareGlobal { name, deletable } => {
+                let name = Self::const_name_proto(proto, *name);
+                self.declare_global(name, *deletable)?;
+            }
+            ROp::CanDeclareGlobalFunc { name } => {
+                let name = Self::const_name_proto(proto, *name);
+                self.can_declare_global_func(name)?;
+            }
+            ROp::DefineGlobalFunc {
+                name,
+                deletable,
+                src,
+            } => {
+                // Clone, not move: `src` may be a live register (the
+                // translator does not canonicalize this operand).
+                let v = rd!(*src);
+                let name = Self::const_name_proto(proto, *name);
+                self.define_global_func(name, v, *deletable);
+            }
+            ROp::InstanceOf { dst, a, b } => {
+                let (a, b) = (rd!(*a), rd!(*b));
+                let r = self.instance_of(&a, &b)?;
+                wr!(*dst, Value::Bool(r));
+            }
+            ROp::DelProp { dst, obj, name } => {
+                let obj = rd!(*obj);
+                let name = Self::const_name_proto(proto, *name);
+                let v = self.del_prop_named(obj, name, proto.is_strict)?;
+                wr!(*dst, v);
+            }
+            ROp::DelElem { dst, obj, key } => {
+                let (obj, key) = (rd!(*obj), rd!(*key));
+                let v = self.del_prop_dynamic(obj, key, proto.is_strict)?;
+                wr!(*dst, v);
+            }
+            ROp::HasProp { dst, key, obj } => {
+                let (key_v, obj) = (rd!(*key), rd!(*obj));
+                let key = self.to_property_key(&key_v)?;
+                let r = self.has_prop(&obj, &key)?;
+                wr!(*dst, Value::Bool(r));
+            }
+            ROp::CallSpread {
+                dst,
+                func,
+                this,
+                args,
+            } => {
+                let (func, this, args_arr) = (rd!(*func), rd!(*this), rd!(*args));
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.call(func, this, &args)?;
+                wr!(*dst, r);
+            }
+            ROp::NewSpread { dst, ctor, args } => {
+                let (ctor, args_arr) = (rd!(*ctor), rd!(*args));
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.construct(&ctor, &args, &ctor)?;
+                wr!(*dst, r);
+            }
+            ROp::ThrowConstAssign => {
+                return Err(self.throw_type("Assignment to constant variable."));
+            }
+            ROp::NewObject { dst } => wr!(*dst, Value::Object(self.new_object())),
+            ROp::NewArray { dst, at, n } => {
+                let mut elems = Vec::with_capacity(*n as usize);
+                for i in *at..*at + *n {
+                    elems.push(std::mem::replace(
+                        &mut frame.locals[i as usize],
+                        Value::Undefined,
+                    ));
+                }
+                wr!(*dst, Value::Object(self.new_array(elems)));
+            }
+            ROp::ArraySpread { arr, src } => {
+                let (arr_v, src) = (rd!(*arr), rd!(*src));
+                self.array_spread(&arr_v, &src)?;
+            }
+            ROp::DefineProp {
+                kind,
+                obj,
+                key,
+                val,
+            } => {
+                let (obj, key_v, value) = (rd!(*obj), rd!(*key), rd!(*val));
+                self.define_prop_kind(*kind, &obj, &key_v, value)?;
+            }
+            ROp::SetHomeObject { obj, val } => {
+                let (home, m) = (rd!(*obj), rd!(*val));
+                Self::set_home_object_op(&home, &m);
+            }
+            ROp::ObjectSpread { target, src } => {
+                let (target, src) = (rd!(*target), rd!(*src));
+                self.object_spread(&target, &src)?;
+            }
+            ROp::CopyDataPropsExcept { target, src, at, n } => {
+                let mut excluded: Vec<PropertyKey> = Vec::with_capacity(*n as usize);
+                for i in *at..*at + *n {
+                    let k = std::mem::replace(&mut frame.locals[i as usize], Value::Undefined);
+                    excluded.push(self.to_property_key(&k)?);
+                }
+                let (target, src) = (rd!(*target), rd!(*src));
+                self.copy_data_props_except(&target, &src, &excluded)?;
+            }
+            ROp::GetTemplateObject { dst, idx } => {
+                let v = self.template_object(frame, *idx)?;
+                wr!(*dst, v);
+            }
+            ROp::NewRegExp {
+                dst,
+                pattern,
+                flags,
+            } => {
+                let p = Self::const_name_proto(proto, *pattern);
+                let f = Self::const_name_proto(proto, *flags);
+                let re = self.make_regexp(p.as_str(), f.as_str())?;
+                wr!(*dst, re);
+            }
+            ROp::ConcatStrings { dst, at, n } => {
+                let parts = &frame.locals[*at as usize..(*at + *n) as usize];
+                let v = self.concat_strings(parts)?;
+                wr!(*dst, v);
+            }
+            ROp::RequireObjectCoercible { src } => {
+                if frame.locals[*src as usize].is_nullish() {
+                    return Err(self.throw_type("Cannot destructure a null or undefined value"));
+                }
+            }
+            ROp::RequireCoercible { src } => {
+                let v = rd!(*src);
+                self.require_object_coercible(&v, "read properties of")?;
+            }
+            ROp::RequireIterResult { src } => {
+                if !matches!(frame.locals[*src as usize], Value::Object(_)) {
+                    return Err(self.throw_type("Iterator result is not an object"));
+                }
+            }
+            ROp::SetFunctionNameFromKey { prefix, key, val } => {
+                let (key, value) = (rd!(*key), rd!(*val));
+                let prefix = Self::const_name_proto(proto, *prefix);
+                self.set_function_name_from_key(&key, &value, prefix);
+            }
+            ROp::SetProtoFromLiteral { obj, src } => {
+                let (obj, v) = (rd!(*obj), rd!(*src));
+                Self::set_proto_from_literal(&obj, v);
+            }
+            ROp::GetIterator { dst, src } => {
+                let v = rd!(*src);
+                let it = self.get_iterator(&v)?;
+                wr!(*dst, it);
+            }
+            ROp::IterNext { dst, it } => {
+                let it = rd!(*it);
+                let next = self.get_prop(&it, &PropertyKey::str("next"))?;
+                let res = self.call(next, it, &[])?;
+                wr!(*dst, res);
+            }
+            ROp::ForInEnumerate { dst, src } => {
+                let v = rd!(*src);
+                let idx = self.for_in_enumerate(frame, &v)?;
+                wr!(*dst, idx);
+            }
+            ROp::ForInNext { dst } => {
+                let (k, more) = Self::for_in_next(frame);
+                wr!(*dst, k);
+                wr!(*dst + 1, more);
+            }
+            ROp::ForInPop => {
+                frame.enumerators.pop();
+            }
+            _ => unreachable!("op handled inline in run_reg_frame: {op:?}"),
+        }
+        let _ = reg;
+        Ok(())
+    }
+
+    /// The register tier's JS→JS fast call (`ROp::Call` with a plain sync
+    /// bytecode callee): mirror of [`Vm::call_direct`] with arguments moving
+    /// out of the caller's registers instead of its operand stack.
+    fn call_direct_reg(
+        &mut self,
+        caller: &mut Frame,
+        at: u16,
+        argc: u16,
+        bf: Rc<BytecodeFunction>,
+        func_v: Value,
+        this: Value,
+    ) -> Result<Value, Value> {
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        // Function kernel: run frameless straight off the caller's registers
+        // (the arguments sit contiguously at `at..at+argc`).
+        if bf.proto.fn_kernel.is_some() {
+            if let Some(r) =
+                self.run_fn_kernel(&bf, &caller.locals[at as usize..(at + argc) as usize])
+            {
+                self.call_depth -= 1;
+                return r;
+            }
+        }
+        let mut callee = self.take_frame();
+        for i in at..at + argc {
+            callee.args.push(std::mem::replace(
+                &mut caller.locals[i as usize],
+                Value::Undefined,
+            ));
+        }
+        let uses_arguments = bf.proto.uses_arguments;
+        self.init_frame(&mut callee, bf, this, Value::Undefined);
+        if uses_arguments {
+            if let Value::Object(o) = func_v {
+                callee.func_obj = Some(o);
+            }
+        }
+        let token = self.trace_enter(&callee.func.proto);
+        callee.trace_token = token;
+        let r = match self.run_frame(callee) {
+            Flow::Return(v) => {
+                self.trace_exit(token, false);
+                Ok(v)
+            }
+            Flow::Throw(e) => {
+                self.trace_exit(token, true);
+                Err(e)
+            }
+            Flow::Suspend(_) => Err(self.throw_type("internal: sync function suspended")),
+        };
+        self.call_depth -= 1;
+        r
+    }
+
+    /// `const_name` against a proto (the register tier has no `&Frame`
+    /// borrow to spare at its call sites).
+    #[inline]
+    fn const_name_proto(proto: &crate::bytecode::FuncProto, idx: u32) -> JsString {
+        match &proto.consts[idx as usize] {
+            Const::String(s) => s.clone(),
+            _ => JsString::new(""),
         }
     }
 
@@ -3158,80 +4791,15 @@ impl Vm {
             }
             Op::LoadGlobal(i) => {
                 let name = self.const_name(frame, *i);
-                let g = self.realm.global.clone();
-                // Inline cache (key-verified slot hint; see `FuncProto::ic`):
-                // after the first resolution, a global read — above all a
-                // function resolving its own recursive self-reference — is one
-                // indexed load plus a pointer-equality key check, no hashing.
-                if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                    let b = g.borrow();
-                    if let Some((PropertyKey::Str(k), prop)) =
-                        b.props.get_index(ic.own_slot.get() as usize)
-                    {
-                        if let PropertyKind::Data { value, .. } = &prop.kind {
-                            if k == &name {
-                                let v = value.clone();
-                                drop(b);
-                                push!(v);
-                                return Ok(Ctl::Next);
-                            }
-                        }
-                    }
-                }
-                let key = PropertyKey::Str(name.clone());
-                // Fast path: an own data property directly on the global object —
-                // the case for every top-level `function`/`var`/`let` binding.
-                // Resolves in a single hash with no prototype walk, and refills
-                // the inline cache with the slot it finds.
-                let fast = {
-                    let b = g.borrow();
-                    match b.props.get_full(&key) {
-                        Some((
-                            idx,
-                            _,
-                            Property {
-                                kind: PropertyKind::Data { value, .. },
-                                ..
-                            },
-                        )) => {
-                            if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                                ic.own_slot.set(idx as u32);
-                            }
-                            Some(value.clone())
-                        }
-                        _ => None,
-                    }
-                };
-                let v = match fast {
-                    Some(v) => v,
-                    None => {
-                        // Accessor global, or a binding inherited via the global's
-                        // prototype chain: fall back to the full [[Get]] (after the
-                        // unresolvable-reference check that yields a ReferenceError).
-                        if !self.has_own_or_proto(&g, &key) {
-                            return Err(
-                                self.throw_reference(&format!("{} is not defined", name.as_str()))
-                            );
-                        }
-                        self.get_prop(&Value::Object(g), &key)?
-                    }
-                };
+                let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
+                let v = self.ic_load_global(name, ic)?;
                 push!(v);
             }
             Op::StoreGlobal(i) => {
                 let name = self.const_name(frame, *i);
                 let v = pop!();
-                let g = self.realm.global.clone();
                 let strict = frame.func.proto.is_strict;
-                let key = PropertyKey::Str(name.clone());
-                // A bare assignment to a name bound nowhere is an unresolvable
-                // reference; PutValue on one throws ReferenceError in strict mode
-                // (a global-object property anywhere on the proto chain counts as
-                // resolvable). Sloppy mode creates the global property instead.
-                if strict && !self.has_prop(&Value::Object(g.clone()), &key)? {
-                    return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
-                }
-                self.put_value(&Value::Object(g), &key, v, strict)?;
+                self.store_global(name, v, strict)?;
             }
             Op::Pop => {
                 frame.stack.pop();
@@ -3264,277 +4832,31 @@ impl Vm {
             Op::GetProp(i) => {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
-                // Inline cache (key-verified hints; see `FuncProto::ic`).
-                // Two levels:
-                //  - `holder == None`: the receiver's OWN data property at
-                //    `slot` (ordinary objects).
-                //  - `holder == Some(p)`: a data property at `slot` on `p`,
-                //    verified to still be the receiver's DIRECT prototype and
-                //    not shadowed by an own property — the method-lookup
-                //    pattern (`arr.push`, class instances calling prototype
-                //    methods). Array receivers exclude keys with exotic own
-                //    behavior (`length`, indices). Deeper chains, accessors,
-                //    proxies, and every other exotic fall to the unchanged
-                //    slow path.
-                if let Value::Object(o) = &obj {
-                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                        let b = o.borrow();
-                        let (is_ord, is_arr) = (
-                            matches!(b.internal, Internal::Ordinary),
-                            matches!(b.internal, Internal::Array(_)),
-                        );
-                        // Array exotics: `length` and index keys never take
-                        // the IC (they don't live in the props map).
-                        let plain_key = !is_arr
-                            || (name.as_str() != "length"
-                                && crate::value::canonical_index(name.as_str()).is_none());
-                        if (is_ord || is_arr) && plain_key {
-                            // Own-property hit: never touches the holder cell.
-                            if is_ord {
-                                if let Some((PropertyKey::Str(k), prop)) =
-                                    b.props.get_index(ic.own_slot.get() as usize)
-                                {
-                                    if let PropertyKind::Data { value, .. } = &prop.kind {
-                                        if k == &name {
-                                            let v = value.clone();
-                                            drop(b);
-                                            push!(v);
-                                            return Ok(Ctl::Next);
-                                        }
-                                    }
-                                }
-                            }
-                            // Proto hit: valid only when the receiver has no
-                            // own props (nothing can shadow) and its CURRENT
-                            // direct proto is the cached holder.
-                            if b.props.is_empty() {
-                                let holder = ic.holder.borrow();
-                                if let Some(h) = &*holder {
-                                    if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
-                                        let hb = h.borrow();
-                                        if let Some((PropertyKey::Str(k), prop)) =
-                                            hb.props.get_index(ic.proto_slot.get() as usize)
-                                        {
-                                            if let PropertyKind::Data { value, .. } = &prop.kind {
-                                                if k == &name {
-                                                    let v = value.clone();
-                                                    drop(hb);
-                                                    drop(holder);
-                                                    drop(b);
-                                                    push!(v);
-                                                    return Ok(Ctl::Next);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // Refill: own data property first (ordinary only),
-                            // then a one-level proto data property when no own
-                            // props can shadow.
-                            let key = PropertyKey::Str(name.clone());
-                            if is_ord {
-                                if let Some((idx, _, prop)) = b.props.get_full(&key) {
-                                    if let PropertyKind::Data { value, .. } = &prop.kind {
-                                        ic.own_slot.set(idx as u32);
-                                        let v = value.clone();
-                                        drop(b);
-                                        push!(v);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                            if b.props.is_empty() {
-                                if let Some(p) = &b.proto {
-                                    let pb = p.borrow();
-                                    if matches!(pb.internal, Internal::Ordinary)
-                                        || matches!(pb.internal, Internal::Array(_))
-                                    {
-                                        if let Some((idx, _, prop)) = pb.props.get_full(&key) {
-                                            if let PropertyKind::Data { value, .. } = &prop.kind {
-                                                ic.proto_slot.set(idx as u32);
-                                                let v = value.clone();
-                                                let holder_obj = p.clone();
-                                                drop(pb);
-                                                *ic.holder.borrow_mut() = Some(holder_obj);
-                                                drop(b);
-                                                push!(v);
-                                                return Ok(Ctl::Next);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let v = self.get_prop(&obj, &PropertyKey::Str(name))?;
+                let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
+                let v = self.ic_get_prop(obj, name, ic)?;
                 push!(v);
             }
             Op::SetProp(i) => {
                 let name = self.const_name(frame, *i);
                 let value = pop!();
                 let obj = pop!();
-                // Inline cache (key-verified slot hint; see `FuncProto::ic`).
-                // Fast path only when the receiver is an ordinary object whose
-                // OWN property at the hinted slot is a WRITABLE data property —
-                // per OrdinarySetWithOwnDescriptor that assignment updates the
-                // value in place (attributes and slot order preserved, no
-                // prototype setter can intervene). Everything else (missing own
-                // key → proto-chain setters/read-only checks, accessors,
-                // non-writable → strict TypeError, exotics) takes the
-                // unchanged put_value path, which also refills the hint.
-                if let Value::Object(o) = &obj {
-                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                        let mut b = o.borrow_mut();
-                        if matches!(b.internal, Internal::Ordinary) {
-                            if let Some((PropertyKey::Str(k), prop)) =
-                                b.props.get_index_mut(ic.own_slot.get() as usize)
-                            {
-                                if k == &name {
-                                    if let PropertyKind::Data {
-                                        value: slot,
-                                        writable: true,
-                                    } = &mut prop.kind
-                                    {
-                                        *slot = value.clone();
-                                        drop(b);
-                                        push!(value);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                            let key = PropertyKey::Str(name.clone());
-                            if let Some((idx, _, prop)) = b.props.get_full_mut(&key) {
-                                if let PropertyKind::Data {
-                                    value: slot,
-                                    writable: true,
-                                } = &mut prop.kind
-                                {
-                                    ic.own_slot.set(idx as u32);
-                                    *slot = value.clone();
-                                    drop(b);
-                                    push!(value);
-                                    return Ok(Ctl::Next);
-                                }
-                            }
-                        }
-                    }
-                }
                 let strict = frame.func.proto.is_strict;
-                self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
+                let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
+                let value = self.ic_set_prop(obj, name, value, strict, ic)?;
                 push!(value);
             }
             Op::GetPropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
-                // Integer fast path: `a[i]` on a dense array with an integral
-                // Number key reads the element directly — skipping
-                // ToPropertyKey's Number→String conversion (a float-format +
-                // heap allocation per access!), the reparse back to an index,
-                // and the property-map machinery. Only when no reified props
-                // entry can shadow the dense element (`props.is_empty()`) and
-                // the slot is a real element (in bounds, not a hole);
-                // everything else takes the unchanged spec path.
-                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
-                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
-                        let b = o.borrow();
-                        if let Internal::Array(arr) = &b.internal {
-                            if b.props.is_empty() {
-                                if let Some(v) = arr.get(*n as usize) {
-                                    if !matches!(v, Value::Hole) {
-                                        let v = v.clone();
-                                        drop(b);
-                                        push!(v);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // GetValue: RequireObjectCoercible(base) (via ToObject) throws
-                // BEFORE ToPropertyKey coerces the key expression's value.
-                self.require_object_coercible(&obj, "read properties of")?;
-                let key = self.to_property_key(&key_v)?;
-                let v = self.get_prop(&obj, &key)?;
+                let v = self.elem_get(obj, key_v)?;
                 push!(v);
             }
             Op::SetPropDynamic => {
                 let value = pop!();
                 let key_v = pop!();
                 let obj = pop!();
-                // Integer fast path mirroring `GetPropDynamic`: overwrite an
-                // EXISTING dense element in place (an in-bounds non-hole dense
-                // slot is a plain writable data property per the array exotic
-                // [[Set]] — no setter, no length change, no extensibility
-                // interaction), fill an in-bounds HOLE, or append at exactly
-                // `length`. Filling and appending CREATE a property (the own
-                // property is absent), so they additionally require the array
-                // to be extensible (a sealed/prevented receiver must reject
-                // through the generic path), the dense-storage bound (the
-                // generic path owns that RangeError), and a prototype chain
-                // with no reified entry at the index — OrdinarySet consults
-                // the chain for an absent own property, so a proto accessor /
-                // non-writable index must intercept via the generic path
-                // (`protos_allow_index_create`). Gaps past the end, shadowed
-                // elements, and non-arrays take the spec path.
-                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
-                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
-                        let i = *n as usize;
-                        let mut creates = None;
-                        {
-                            let mut b = o.borrow_mut();
-                            if b.props.is_empty() {
-                                let extensible = b.extensible;
-                                if let Internal::Array(arr) = &mut b.internal {
-                                    match arr.get_mut(i) {
-                                        Some(slot) if !matches!(slot, Value::Hole) => {
-                                            *slot = value.clone();
-                                            drop(b);
-                                            push!(value);
-                                            return Ok(Ctl::Next);
-                                        }
-                                        Some(_) => {
-                                            if extensible {
-                                                creates = Some(b.proto.clone());
-                                            }
-                                        }
-                                        None => {
-                                            if extensible
-                                                && i == arr.len()
-                                                && i < crate::value::MAX_DENSE_ARRAY
-                                            {
-                                                creates = Some(b.proto.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(proto) = creates {
-                            if crate::value::protos_allow_index_create(proto, i as u32, 1) {
-                                // No user code ran since the conditions were
-                                // checked (same native frame), so they still
-                                // hold.
-                                let mut b = o.borrow_mut();
-                                if let Internal::Array(arr) = &mut b.internal {
-                                    match arr.get_mut(i) {
-                                        Some(slot) => *slot = value.clone(),
-                                        None => arr.push(value.clone()),
-                                    }
-                                    drop(b);
-                                    push!(value);
-                                    return Ok(Ctl::Next);
-                                }
-                            }
-                        }
-                    }
-                }
-                self.require_object_coercible(&obj, "set properties of")?;
-                let key = self.to_property_key(&key_v)?;
                 let strict = frame.func.proto.is_strict;
-                self.put_value(&obj, &key, value.clone(), strict)?;
+                let value = self.elem_set(obj, key_v, value, strict)?;
                 push!(value);
             }
             Op::HasProp => {
@@ -3628,45 +4950,8 @@ impl Vm {
             }
 
             Op::Closure(i) => {
-                let proto = match &frame.func.proto.consts[*i as usize] {
-                    Const::Func(p) => p.clone(),
-                    _ => return Err(self.throw_type("internal: bad closure const")),
-                };
-                let upvalues = proto
-                    .upvalues
-                    .iter()
-                    .map(|src| match src {
-                        UpvalueSource::ParentCell(idx) => frame.cells[*idx as usize].clone(),
-                        UpvalueSource::ParentUpvalue(idx) => {
-                            frame.func.upvalues[*idx as usize].clone()
-                        }
-                    })
-                    .collect();
-                let inherit_home = proto.kind.is_arrow() || proto.inherit_home;
-                let f = self.make_closure(proto, upvalues);
-                // Capture the active with-scope chain (closures defined inside
-                // `with` resolve free identifiers against it after the block)
-                // and the active private-environment chain (methods and
-                // initializers defined inside class bodies resolve `#x`
-                // against it). Arrows (and synthetic in-class closures) also
-                // inherit the creating frame's [[HomeObject]], so `super.x`
-                // inside them resolves like the enclosing method.
-                if !frame.with_scope.is_empty()
-                    || frame.priv_env.is_some()
-                    || (inherit_home && frame.func.home_object.is_some())
-                {
-                    if let Internal::Function(FunctionInner::Bytecode(bf)) =
-                        &mut f.borrow_mut().internal
-                    {
-                        let bf = Rc::make_mut(bf);
-                        bf.captured_with = frame.with_scope.clone();
-                        bf.captured_priv_env = frame.priv_env.clone();
-                        if inherit_home {
-                            bf.home_object = frame.func.home_object.clone();
-                        }
-                    }
-                }
-                push!(Value::Object(f));
+                let f = self.closure_from_const(frame, *i)?;
+                push!(f);
             }
 
             // ---- arithmetic ----
@@ -3959,17 +5244,9 @@ impl Vm {
                 frame.enumerators.pop();
             }
             Op::ForInNext => {
-                let idx = frame.enumerators.len() - 1;
-                let (keys, cursor) = &mut frame.enumerators[idx];
-                if *cursor < keys.len() {
-                    let k = keys[*cursor].clone();
-                    *cursor += 1;
-                    push!(Value::String(k));
-                    push!(Value::Bool(true));
-                } else {
-                    push!(Value::Undefined);
-                    push!(Value::Bool(false));
-                }
+                let (k, more) = Self::for_in_next(frame);
+                push!(k);
+                push!(more);
             }
 
             // ---- generators / async ----
@@ -4066,21 +5343,12 @@ impl Vm {
             }
             Op::BindThisSloppy => {
                 let t = pop!();
-                let bound = match t {
-                    Value::Undefined | Value::Null => Value::Object(self.realm.global.clone()),
-                    Value::Object(_) => t,
-                    // A primitive `this` is boxed (ToObject) in sloppy mode.
-                    other => Value::Object(self.to_object(&other)?),
-                };
+                let bound = self.bind_this_sloppy(t)?;
                 push!(bound);
             }
             Op::LoadRestArgs(n) => {
-                let rest: Vec<Value> = if (*n as usize) < frame.args.len() {
-                    frame.args[*n as usize..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                push!(Value::Object(self.new_array(rest)));
+                let v = self.rest_args(frame, *n);
+                push!(v);
             }
             Op::LoadArguments => {
                 let o = self.make_arguments_object(frame);
@@ -4096,98 +5364,17 @@ impl Vm {
             }
             Op::DeclareGlobal { name: i, deletable } => {
                 let name = self.const_name(frame, *i);
-                let g = self.realm.global.clone();
-                let key = PropertyKey::Str(name.clone());
-                let (present, extensible) = {
-                    let b = g.borrow();
-                    (b.props.contains_key(&key), b.extensible)
-                };
-                if !present {
-                    // CanDeclareGlobalVar/Function: needs an extensible global.
-                    if !extensible {
-                        return Err(
-                            self.throw_type(&format!("Cannot declare global '{}'", name.as_str()))
-                        );
-                    }
-                    // CreateGlobalVarBinding(N, D): writable, enumerable;
-                    // configurable only for eval-created bindings.
-                    g.borrow_mut().props.insert(
-                        key,
-                        Property {
-                            kind: PropertyKind::Data {
-                                value: Value::Undefined,
-                                writable: true,
-                            },
-                            enumerable: true,
-                            configurable: *deletable,
-                        },
-                    );
-                }
+                self.declare_global(name, *deletable)?;
             }
 
             Op::CanDeclareGlobalFunc(i) => {
                 let name = self.const_name(frame, *i);
-                let g = self.realm.global.clone();
-                let key = PropertyKey::Str(name.clone());
-                // CanDeclareGlobalFunction (9.1.1.4.16): an existing
-                // non-configurable property is acceptable only if it is a
-                // writable, enumerable data property; otherwise (or, when
-                // absent, on a non-extensible global) the declaration fails.
-                let definable = {
-                    let b = g.borrow();
-                    match b.props.get(&key) {
-                        None => b.extensible,
-                        Some(p) => {
-                            p.configurable
-                                || matches!(
-                                    &p.kind,
-                                    PropertyKind::Data { writable, .. }
-                                        if *writable && p.enumerable
-                                )
-                        }
-                    }
-                };
-                if !definable {
-                    return Err(self.throw_type(&format!(
-                        "Cannot declare global function '{}'",
-                        name.as_str()
-                    )));
-                }
+                self.can_declare_global_func(name)?;
             }
             Op::DefineGlobalFunc { name: i, deletable } => {
                 let name = self.const_name(frame, *i);
                 let value = pop!();
-                let g = self.realm.global.clone();
-                let key = PropertyKey::Str(name.clone());
-                // CreateGlobalFunctionBinding (9.1.1.4.18): an absent or
-                // configurable existing property is (re)defined with function
-                // attributes; a non-configurable one keeps its attributes and
-                // is just assigned the new value.
-                let redefine = {
-                    let b = g.borrow();
-                    match b.props.get(&key) {
-                        None => true,
-                        Some(p) => p.configurable,
-                    }
-                };
-                let mut b = g.borrow_mut();
-                if redefine {
-                    b.props.insert(
-                        key,
-                        Property {
-                            kind: PropertyKind::Data {
-                                value,
-                                writable: true,
-                            },
-                            enumerable: true,
-                            configurable: *deletable,
-                        },
-                    );
-                } else if let Some(p) = b.props.get_mut(&key) {
-                    if let PropertyKind::Data { value: slot, .. } = &mut p.kind {
-                        *slot = value;
-                    }
-                }
+                self.define_global_func(name, value, *deletable);
             }
 
             Op::PushWithScope => {
@@ -4306,48 +5493,10 @@ impl Vm {
             }
 
             Op::GetTemplateObject(idx) => {
-                let key = (Rc::as_ptr(&frame.func.proto) as *const () as usize, *idx);
-                if let Some(o) = self.template_cache.get(&key) {
-                    push!(Value::Object(o.clone()));
-                } else {
-                    let parts = frame.func.proto.templates[*idx as usize].clone();
-                    // Cooked strings (an illegal escape cooks to `undefined`).
-                    let cooked: Vec<Value> = parts
-                        .cooked
-                        .iter()
-                        .map(|c| match c {
-                            Some(s) => Value::String(JsString::from_rc_str(s.clone())),
-                            None => Value::Undefined,
-                        })
-                        .collect();
-                    let arr = self.new_array(cooked);
-                    let raw: Vec<Value> = parts
-                        .raw
-                        .iter()
-                        .map(|s| Value::String(JsString::from_rc_str(s.clone())))
-                        .collect();
-                    let raw_arr = self.new_array(raw);
-                    // The `raw` array is frozen; `raw` is a non-enumerable,
-                    // non-writable, non-configurable own property of the
-                    // template object, which is itself frozen (spec
-                    // GetTemplateObject / TemplateString integrity).
-                    crate::builtins::fundamental::set_integrity_level(self, &raw_arr, true)?;
-                    arr.borrow_mut().props.insert(
-                        PropertyKey::str("raw"),
-                        Property {
-                            kind: PropertyKind::Data {
-                                value: Value::Object(raw_arr),
-                                writable: false,
-                            },
-                            enumerable: false,
-                            configurable: false,
-                        },
-                    );
-                    crate::builtins::fundamental::set_integrity_level(self, &arr, true)?;
-                    self.template_cache.insert(key, arr.clone());
-                    push!(Value::Object(arr));
-                }
+                let v = self.template_object(frame, *idx)?;
+                push!(v);
             }
+
             Op::ArrayPushElision => {
                 // For array literals we build via NewArray; elisions handled by
                 // pushing undefined holes at compile time.
@@ -4356,75 +5505,27 @@ impl Vm {
             Op::ArraySpread => {
                 let src = pop!();
                 let arr_v = pop!();
-                let items = self.iterate_to_vec(&src)?;
-                if let Value::Object(a) = &arr_v {
-                    let mut b = a.borrow_mut();
-                    if let Internal::Array(elems) = &mut b.internal {
-                        elems.extend(items);
-                    }
-                }
+                self.array_spread(&arr_v, &src)?;
                 push!(arr_v);
             }
-            Op::DefineField => {
+            Op::DefineField
+            | Op::DefineMethod
+            | Op::DefineGetter
+            | Op::DefineSetter
+            | Op::DefineMethodGetter
+            | Op::DefineMethodSetter => {
                 let value = pop!();
                 let key_v = pop!();
                 let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                if let Value::Object(o) = &obj {
-                    crate::builtins::fundamental::create_data_property_or_throw(
-                        self, o, &key, value,
-                    )?;
-                }
-                push!(obj);
-            }
-            Op::DefineMethod => {
-                // Class methods are non-enumerable (writable, configurable),
-                // defined with DefinePropertyOrThrow (a non-configurable own
-                // key — e.g. a computed static "prototype" — is a TypeError).
-                let value = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                if let Value::Object(o) = &obj {
-                    o.borrow_mut().props.insert(key, Property::builtin(value));
-                }
-                push!(obj);
-            }
-            Op::DefineGetter => {
-                let getter = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                self.define_accessor_with(&obj, key, Some(getter), None, true);
-                push!(obj);
-            }
-            Op::DefineSetter => {
-                let setter = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                self.define_accessor_with(&obj, key, None, Some(setter), true);
-                push!(obj);
-            }
-            Op::DefineMethodGetter => {
-                let getter = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                self.define_accessor_with(&obj, key, Some(getter), None, false);
-                push!(obj);
-            }
-            Op::DefineMethodSetter => {
-                let setter = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                self.define_accessor_with(&obj, key, None, Some(setter), false);
+                let kind = match op {
+                    Op::DefineField => crate::reg::DefKind::Field,
+                    Op::DefineMethod => crate::reg::DefKind::Method,
+                    Op::DefineGetter => crate::reg::DefKind::Getter,
+                    Op::DefineSetter => crate::reg::DefKind::Setter,
+                    Op::DefineMethodGetter => crate::reg::DefKind::MethodGetter,
+                    _ => crate::reg::DefKind::MethodSetter,
+                };
+                self.define_prop_kind(kind, &obj, &key_v, value)?;
                 push!(obj);
             }
             Op::SetHomeObject => {
@@ -4433,15 +5534,8 @@ impl Vm {
                 let n = frame.stack.len();
                 if n >= 3 {
                     let home = frame.stack[n - 3].clone();
-                    if let (Value::Object(home), Value::Object(m)) =
-                        (home, frame.stack[n - 1].clone())
-                    {
-                        if let Internal::Function(FunctionInner::Bytecode(bf)) =
-                            &mut m.borrow_mut().internal
-                        {
-                            Rc::make_mut(bf).home_object = Some(home);
-                        }
-                    }
+                    let m = frame.stack[n - 1].clone();
+                    Self::set_home_object_op(&home, &m);
                 }
             }
             Op::SetHomeObjectAt(n) => {
@@ -4506,21 +5600,7 @@ impl Vm {
             Op::ObjectSpread => {
                 let src = pop!();
                 let target = pop!();
-                if let Value::Object(t) = &target {
-                    if let Value::Object(s) = &src {
-                        for k in self.enumerable_own_keys_dyn(s)? {
-                            let val = self.get_prop(&src, &k)?;
-                            t.borrow_mut().props.insert(k, Property::data(val));
-                        }
-                    } else if let Value::String(st) = &src {
-                        for (i, c) in st.as_str().chars().enumerate() {
-                            t.borrow_mut().props.insert(
-                                PropertyKey::from_index(i as u32),
-                                Property::data(Value::str(c.to_string())),
-                            );
-                        }
-                    }
-                }
+                self.object_spread(&target, &src)?;
                 push!(target);
             }
             Op::CopyDataPropertiesExcept(n) => {
@@ -4532,28 +5612,7 @@ impl Vm {
                 }
                 let src = pop!();
                 let target = pop!();
-                if let Value::Object(t) = &target {
-                    if let Value::Object(s) = &src {
-                        // Excluded keys are skipped before ANY source access
-                        // (CopyDataProperties step 4.b.i): a proxy source must
-                        // not observe a [[GetOwnProperty]]/[[Get]] for them.
-                        for k in self.enumerable_own_keys_excluding(s, &excluded)? {
-                            let val = self.get_prop(&src, &k)?;
-                            t.borrow_mut().props.insert(k, Property::data(val));
-                        }
-                    } else if let Value::String(st) = &src {
-                        // A primitive-string source contributes its index keys.
-                        for (i, c) in st.as_str().chars().enumerate() {
-                            let k = PropertyKey::from_index(i as u32);
-                            if excluded.contains(&k) {
-                                continue;
-                            }
-                            t.borrow_mut()
-                                .props
-                                .insert(k, Property::data(Value::str(c.to_string())));
-                        }
-                    }
-                }
+                self.copy_data_props_except(&target, &src, &excluded)?;
                 push!(target);
             }
             Op::PrivateGet(i) => {
@@ -4776,47 +5835,14 @@ impl Vm {
                 if n >= 2 {
                     let value = frame.stack[n - 1].clone();
                     let key = frame.stack[n - 2].clone();
-                    if let Value::Object(f) = &value {
-                        if f.borrow().is_callable() {
-                            let base = match &key {
-                                Value::Symbol(sym) => match sym.description() {
-                                    Some(d) => format!("[{d}]"),
-                                    None => String::new(),
-                                },
-                                other => self.to_string_lossy(other),
-                            };
-                            let prefix = self.const_name(frame, *prefix);
-                            let name = if prefix.as_str().is_empty() {
-                                base
-                            } else {
-                                format!("{} {}", prefix.as_str(), base)
-                            };
-                            f.borrow_mut().props.insert(
-                                PropertyKey::str("name"),
-                                Property {
-                                    kind: PropertyKind::Data {
-                                        value: Value::str(name),
-                                        writable: false,
-                                    },
-                                    enumerable: false,
-                                    configurable: true,
-                                },
-                            );
-                        }
-                    }
+                    let prefix = self.const_name(frame, *prefix);
+                    self.set_function_name_from_key(&key, &value, prefix);
                 }
             }
             Op::SetProtoFromLiteral => {
                 let v = pop!();
                 let obj = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                if let Value::Object(o) = &obj {
-                    match v {
-                        Value::Object(p) => o.borrow_mut().proto = Some(p),
-                        Value::Null => o.borrow_mut().proto = None,
-                        // Non-object, non-null values are silently ignored.
-                        _ => {}
-                    }
-                }
+                Self::set_proto_from_literal(&obj, v);
             }
             Op::PushDisposeScope => {
                 frame.dispose_scopes.push(Vec::new());
@@ -4995,29 +6021,16 @@ impl Vm {
             Op::DeleteProp(i) => {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
-                // `delete base.x` does ToObject(base) (spec step 5.b): a
-                // nullish base is a TypeError before any delete is attempted.
-                self.require_object_coercible(&obj, "delete properties of")?;
-                let r = self.delete_prop(&obj, &PropertyKey::Str(name.clone()))?;
-                // Strict-mode `delete` that fails throws (spec 13.5.1.2 step 5.c).
-                if !r && frame.func.proto.is_strict {
-                    return Err(self.throw_type(&format!(
-                        "Cannot delete property '{}' in strict mode",
-                        name.as_str()
-                    )));
-                }
-                push!(Value::Bool(r));
+                let strict = frame.func.proto.is_strict;
+                let v = self.del_prop_named(obj, name, strict)?;
+                push!(v);
             }
             Op::DeletePropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
-                self.require_object_coercible(&obj, "delete properties of")?;
-                let key = self.to_property_key(&key_v)?;
-                let r = self.delete_prop(&obj, &key)?;
-                if !r && frame.func.proto.is_strict {
-                    return Err(self.throw_type("Cannot delete property in strict mode"));
-                }
-                push!(Value::Bool(r));
+                let strict = frame.func.proto.is_strict;
+                let v = self.del_prop_dynamic(obj, key_v, strict)?;
+                push!(v);
             }
             Op::ThrowConstAssign => {
                 return Err(self.throw_type("Assignment to constant variable."));
@@ -5159,9 +6172,8 @@ impl Vm {
             }
             Op::ForInEnumerate => {
                 let v = pop!();
-                let keys = self.for_in_keys(&v)?;
-                frame.enumerators.push((keys, 0));
-                push!(Value::Number((frame.enumerators.len() - 1) as f64));
+                let idx = self.for_in_enumerate(frame, &v)?;
+                push!(idx);
             }
             Op::AsyncReturn => {
                 let v = pop!();

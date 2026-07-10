@@ -116,6 +116,12 @@ pub struct FuncProto {
     /// the ordinary frame path. `None` for anything but tiny pure-scalar
     /// bodies (sort comparators, map/filter/reduce callbacks).
     pub fn_kernel: Option<Kernel>,
+    /// Register bytecode for the WHOLE body (reg.rs, docs/js-performance-
+    /// roadmap.md §3.5): executed by `Vm::run_reg_frame` instead of the stack
+    /// interpreter whenever present and no op budget is installed. `None`
+    /// when any op falls outside the translated subset (try/finally, `with`/
+    /// direct-eval, suspension, super/private, loop kernels, …).
+    pub reg: Option<Rc<crate::reg::RegProto>>,
     /// Number of plain (non-captured) local slots.
     pub num_locals: u32,
     /// Number of cell (captured-by-closure) slots.
@@ -210,6 +216,7 @@ impl FuncProto {
             consts: Vec::new(),
             kernels: Vec::new(),
             fn_kernel: None,
+            reg: None,
             num_locals: 0,
             num_cells: 0,
             num_params: 0,
