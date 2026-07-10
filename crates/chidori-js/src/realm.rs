@@ -33,6 +33,10 @@ pub struct Realm {
     pub array_push: Option<JsObject>,
     /// As `array_push`, for `Array.prototype.pop` (`KOp::ArrayPop`).
     pub array_pop: Option<JsObject>,
+    /// The canonical `String.prototype.charCodeAt`, pinned at install so the
+    /// kernel `CharCodeAt` entry guard can identity-check the live property
+    /// (and a bail can reconstruct the method on the operand stack).
+    pub string_char_code_at: Option<JsObject>,
 
     pub object_proto: JsObject,
     pub function_proto: JsObject,
@@ -189,6 +193,7 @@ impl Realm {
             ta_length_getter: None,
             array_push: None,
             array_pop: None,
+            string_char_code_at: None,
             object_proto: bare(),
             function_proto: bare(),
             array_proto: bare(),

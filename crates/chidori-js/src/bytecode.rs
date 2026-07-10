@@ -1053,6 +1053,23 @@ pub enum KOp {
     /// `regs[dst] = <length>` of the dense array in object slot `obj`
     /// (unshadowed only — a reified `length` marker bails).
     LoadLen { dst: u16, obj: u16, bail: u16 },
+    /// `regs[dst] = s.charCodeAt(regs[idx])` over the pinned STRING in
+    /// string slot `sslot` — BAIL-FREE: the activation entry guard proved
+    /// the slot holds a primitive string (string-base locals are pinned
+    /// like array bases — in-region stores reject at translation, and
+    /// strings are immutable) and that the canonical
+    /// `String.prototype.charCodeAt` still backs the method (a primitive
+    /// receiver's property lookup goes through an own-index/length wrapper
+    /// straight to `String.prototype`, so nothing can shadow it). Every
+    /// `Number` index has a defined result: `ToIntegerOrInfinity` (NaN → 0,
+    /// truncation) then the code unit as f64 in bounds, NaN out of bounds —
+    /// exactly the builtin, sharing `JsString::code_unit_at` (O(1) on ASCII
+    /// strings via the cached unit count).
+    CharCodeAt { dst: u16, sslot: u16, idx: u16 },
+    /// `regs[dst] = s.length` of the pinned string in string slot `sslot` —
+    /// bail-free: `length` is an own property of the primitive's wrapper
+    /// (unshadowable), O(1) via the cached UTF-16 unit count.
+    StrLen { dst: u16, sslot: u16 },
     /// Materialize a comparison as a BOOLEAN register (`0.0`/`1.0`): the
     /// translator types the destination as Bool, so it writes back as
     /// `Value::Bool` and never feeds an array index.
@@ -1245,6 +1262,13 @@ pub enum KShapeSlot {
     /// materialized as `Value::Bool` — `typeof` must not see a number.
     Bool(u16),
     Obj(u16),
+    /// A pinned string base: materialized from the activation's string-slot
+    /// cache (the value is immutable and the local is pinned, so the cached
+    /// `JsString` IS the live value).
+    Str(u16),
+    /// The canonical `String.prototype.charCodeAt` function object (entry
+    /// guard proved the live value IS the canonical — like `ArrayPushFn`).
+    CharCodeFn,
     MathObj,
     MathFn(KMath),
 }
@@ -1359,6 +1383,12 @@ pub struct Kernel {
     /// guard requires each to hold an object; per-access checks do the rest.
     /// Disjoint from `locals`, and never stored to inside the region.
     pub oslots: Box<[u32]>,
+    /// `frame.locals` indices of STRING BASES (`s` in `s.charCodeAt(i)` /
+    /// `s.length`): string slot `s` caches that local's `JsString` at kernel
+    /// entry. The guard requires each to hold a primitive string; the
+    /// accesses are then bail-free (strings are immutable and the local is
+    /// pinned). Disjoint from `locals` and `oslots`.
+    pub sslots: Box<[u32]>,
     /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
     pub shapes: Box<[Box<[KShapeSlot]>]>,
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
@@ -1404,6 +1434,10 @@ pub struct Kernel {
     /// identity-check the canonical getter for any typed-array LoadLen base.
     /// Kernels without a LoadLen skip that scan entirely.
     pub loads_len: bool,
+    /// Whether the code contains a [`KOp::CharCodeAt`]: the activation entry
+    /// must verify the canonical `String.prototype.charCodeAt` still backs
+    /// the `charCodeAt` property of the canonical String prototype.
+    pub uses_char_code: bool,
     /// Whether the code contains a [`KOp::ArrayPush`]: the activation entry
     /// must verify the canonical `Array.prototype.push` still backs the
     /// `push` property of the canonical Array prototype.

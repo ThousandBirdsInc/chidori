@@ -431,6 +431,27 @@ impl Vm {
         )
     }
 
+    /// Entry check for kernels containing [`KOp::CharCodeAt`]: the canonical
+    /// String prototype's `charCodeAt` must still be a plain DATA property
+    /// holding the pinned canonical function (methods are writable). The
+    /// receiver side needs no per-access check at all: a primitive string's
+    /// property lookup goes through an own-index/length wrapper straight to
+    /// `String.prototype` (nothing can shadow the method), the base local is
+    /// pinned (in-region stores reject at translation), strings are
+    /// immutable, and the entry guard proved the slot holds a string.
+    fn kernel_char_code_ok(&self) -> bool {
+        let Some(canon) = &self.realm.string_char_code_at else {
+            return false;
+        };
+        matches!(
+            self.realm.string_proto.borrow().props.get(&PropertyKey::str("charCodeAt")),
+            Some(Property {
+                kind: PropertyKind::Data { value: Value::Object(o), .. },
+                ..
+            }) if o.ptr_eq(canon)
+        )
+    }
+
     /// Execute the typed loop kernel at `Op::LoopKernel(idx)` (see
     /// `kernel.rs` for the model). Runs only when per-op accounting is off
     /// (no op budget), every mapped numeric local holds a `Number`, and every
@@ -507,6 +528,18 @@ impl Vm {
             if !matches!(frame.locals[l as usize], Value::Object(_)) {
                 return self.step(frame, &k.fallback);
             }
+        }
+        // String bases must hold primitive strings (a String OBJECT — or
+        // anything else — declines: the generic path owns wrapper receivers,
+        // accessor shadows and coercions). Pinned local + immutable value =
+        // every in-kernel string access is then bail-free.
+        for &l in k.sslots.iter() {
+            if !matches!(frame.locals[l as usize], Value::String(_)) {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        if k.uses_char_code && !self.kernel_char_code_ok() {
+            return self.step(frame, &k.fallback);
         }
         // A `StoreElem` may CREATE an element (hole fill / exact append), and
         // the spec's OrdinarySet consults the prototype chain when the own
@@ -674,6 +707,13 @@ impl Vm {
                 objs.push(o.clone());
             }
         }
+        let mut strs = std::mem::take(&mut self.kernel_strs);
+        strs.clear();
+        for &l in k.sslots.iter() {
+            if let Value::String(s) = &frame.locals[l as usize] {
+                strs.push(s.clone());
+            }
+        }
         // Prop registers (the tail of the register file): load each resolved
         // slot's current value. The guard above proved every one a Number.
         if !k.props_used.is_empty() {
@@ -762,6 +802,8 @@ impl Vm {
                 self.kernel_regs = regs;
                 objs.clear();
                 self.kernel_objs = objs;
+                strs.clear();
+                self.kernel_strs = strs;
                 self.kernel_prop_slots = prop_slots;
                 callee_bfs.clear();
                 self.kernel_callees = callee_bfs;
@@ -805,6 +847,8 @@ impl Vm {
                                     self.kernel_regs = regs;
                                     objs.clear();
                                     self.kernel_objs = objs;
+                                    strs.clear();
+                                    self.kernel_strs = strs;
                                     self.kernel_prop_slots = prop_slots;
                                     callee_bfs.clear();
                                     self.kernel_callees = callee_bfs;
@@ -1094,6 +1138,28 @@ impl Vm {
                         branch!(bail)
                     }
                 }
+                // Pinned-string code-unit read: BAIL-FREE. The entry guard
+                // proved the slot holds a primitive string and the canonical
+                // `String.prototype.charCodeAt` resolves; every Number index
+                // then has a defined result — ToIntegerOrInfinity (NaN → 0,
+                // truncation toward zero) and NaN out of bounds, exactly the
+                // builtin, through the same `code_unit_at` accessor (O(1) on
+                // ASCII via the cached unit count).
+                KOp::CharCodeAt { dst, sslot, idx } => {
+                    let s = &strs[sslot as usize];
+                    let n = regs[idx as usize];
+                    let i = if n.is_nan() { 0.0 } else { n.trunc() };
+                    regs[dst as usize] = if i >= 0.0 && i < s.len_utf16() as f64 {
+                        s.code_unit_at(i as usize).expect("index checked in range") as f64
+                    } else {
+                        f64::NAN
+                    };
+                }
+                // Pinned-string `.length`: an own wrapper property, O(1)
+                // after the first unit-count read.
+                KOp::StrLen { dst, sslot } => {
+                    regs[dst as usize] = strs[sslot as usize].len_utf16() as f64
+                }
                 // Prop LOCALIZATION rewrote every LoadProp/StoreProp into a
                 // register Mov at kernel build; the slots live only in the
                 // entry load and the exit/unwind write-back now.
@@ -1148,6 +1214,8 @@ impl Vm {
                         self.kernel_regs = regs;
                         objs.clear();
                         self.kernel_objs = objs;
+                        strs.clear();
+                        self.kernel_strs = strs;
                         self.kernel_prop_slots = prop_slots;
                         callee_bfs.clear();
                         self.kernel_callees = callee_bfs;
@@ -1181,6 +1249,14 @@ impl Vm {
                 crate::bytecode::KShapeSlot::Obj(o) => {
                     frame.stack.push(Value::Object(objs[*o as usize].clone()))
                 }
+                // The pinned local is unwritten and strings are immutable:
+                // the cached value IS the live value.
+                crate::bytecode::KShapeSlot::Str(s) => {
+                    frame.stack.push(Value::String(strs[*s as usize].clone()))
+                }
+                crate::bytecode::KShapeSlot::CharCodeFn => frame.stack.push(Value::Object(
+                    self.realm.string_char_code_at.clone().expect("guarded"),
+                )),
                 // The guard proved the live values ARE the canonicals.
                 crate::bytecode::KShapeSlot::MathObj => frame.stack.push(Value::Object(
                     self.realm.math_object.clone().expect("guarded"),
@@ -1199,6 +1275,8 @@ impl Vm {
         self.kernel_regs = regs;
         objs.clear();
         self.kernel_objs = objs;
+        strs.clear();
+        self.kernel_strs = strs;
         self.kernel_prop_slots = prop_slots;
         callee_bfs.clear();
         self.kernel_callees = callee_bfs;
@@ -1711,6 +1789,8 @@ impl Vm {
                     | KOp::LoadElem { .. }
                     | KOp::StoreElem { .. }
                     | KOp::LoadLen { .. }
+                    | KOp::CharCodeAt { .. }
+                    | KOp::StrLen { .. }
                     | KOp::LoadProp { .. }
                     | KOp::StoreProp { .. }
                     | KOp::CallKernel { .. }
@@ -6064,6 +6144,8 @@ fn exec_fn_kernel_code(
             | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
+            | KOp::CharCodeAt { .. }
+            | KOp::StrLen { .. }
             | KOp::LoadProp { .. }
             | KOp::StoreProp { .. }
             | KOp::Exit { .. }
@@ -6210,6 +6292,8 @@ fn run_callee_window(
             | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
+            | KOp::CharCodeAt { .. }
+            | KOp::StrLen { .. }
             | KOp::LoadProp { .. }
             | KOp::StoreProp { .. }
             | KOp::Exit { .. }

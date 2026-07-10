@@ -117,6 +117,17 @@ pub fn install(vm: &mut Vm) {
     });
 
     install_proto(vm, &proto);
+    // Pin the canonical `charCodeAt` for the kernel `CharCodeAt` fast path
+    // (entry identity check + bail-shape reconstruction) — the same pattern
+    // as `Array.prototype.push`/`pop` in `builtins::array`.
+    let f = proto
+        .borrow()
+        .props
+        .get(&PropertyKey::str("charCodeAt"))
+        .and_then(|p| p.value().cloned());
+    if let Some(Value::Object(o)) = f {
+        vm.realm.string_char_code_at = Some(o);
+    }
 }
 
 /// ECMAScript's trim set: `WhiteSpace` ∪ `LineTerminator`. This matches Unicode

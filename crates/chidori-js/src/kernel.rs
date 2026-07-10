@@ -132,21 +132,24 @@ pub fn kernelize(mut code: Vec<Op>, consts: &[Const]) -> (Vec<Op>, Vec<Kernel>) 
             continue;
         }
         // Iterate translation to a FIXPOINT over the discovered local types:
-        // array bases (`a` in `a[i]`) become object slots, and locals that
+        // array bases (`a` in `a[i]`) become object slots, string bases
+        // (`s` in `s.charCodeAt(i)`) become string slots, and locals that
         // receive boolean stores become Bool-typed registers. Each run feeds
         // its discoveries into the next; a stable run whose translation
         // succeeded installs the kernel. (Discovery is monotone over a
         // bounded set, so the cap is belt-and-braces.)
         let mut oslots: Vec<u32> = Vec::new();
+        let mut sslots: Vec<u32> = Vec::new();
         let mut bools: Vec<u32> = Vec::new();
         let mut installed: Option<Kernel> = None;
         for _ in 0..6 {
-            let (k, d_obj, d_bool) = translate(
+            let (k, d_obj, d_str, d_bool) = translate(
                 &code[start..=end],
                 start as u32,
                 consts,
                 &kernels,
                 &oslots,
+                &sslots,
                 &bools,
                 false,
                 None,
@@ -159,16 +162,32 @@ pub fn kernelize(mut code: Vec<Op>, consts: &[Const]) -> (Vec<Op>, Vec<Kernel>) 
                     grew = true;
                 }
             }
+            for s in d_str {
+                if !sslots.contains(&s) {
+                    sslots.push(s);
+                    grew = true;
+                }
+            }
             for b in d_bool {
                 if !bools.contains(&b) {
                     bools.push(b);
                     grew = true;
                 }
             }
-            if !grew {
-                installed = k;
-                break;
+            // A local can be discovered as BOTH an array and a string base:
+            // `.length` is ambiguous (phase 1 defaults it to an array base)
+            // while `charCodeAt` is string-specific — so strings win and the
+            // next run re-types the `.length` sites as `StrLen`. If the value
+            // really is an object, the entry guard just declines (the string
+            // slot demands a primitive string) and the loop runs generically.
+            // Monotone: once string-typed, a local's loads push `VE::Str`,
+            // which array-base discovery never re-claims.
+            if grew {
+                oslots.retain(|o| !sslots.contains(o));
+                continue;
             }
+            installed = k;
+            break;
         }
         if let Some(mut k) = installed {
             k.fallback = Box::new(code[start].clone());
@@ -213,22 +232,23 @@ pub fn kernelize_function(
     // non-recursive bodies the assumption is never consulted — the first
     // pass decides.
     'ret_ty: for ret_bool in [false, true] {
-        // Same boolean-local fixpoint as `kernelize`; array-base discoveries
-        // reject outright (element access can't run frameless).
+        // Same boolean-local fixpoint as `kernelize`; array- and string-base
+        // discoveries reject outright (element access can't run frameless).
         let mut bools: Vec<u32> = Vec::new();
         for _ in 0..6 {
-            let (k, d_obj, d_bool) = translate(
+            let (k, d_obj, d_str, d_bool) = translate(
                 code,
                 0,
                 consts,
                 inner,
+                &[],
                 &[],
                 &bools,
                 true,
                 self_name,
                 ret_bool,
             );
-            if !d_obj.is_empty() {
+            if !d_obj.is_empty() || !d_str.is_empty() {
                 return None;
             }
             let mut grew = false;
@@ -243,7 +263,9 @@ pub fn kernelize_function(
                     continue 'ret_ty;
                 };
                 // Frameless kernels are self-contained by construction.
-                debug_assert!(k.oslots.is_empty() && k.shapes.is_empty());
+                debug_assert!(
+                    k.oslots.is_empty() && k.sslots.is_empty() && k.shapes.is_empty()
+                );
                 k.args_used = k
                     .locals
                     .iter()
@@ -369,6 +391,16 @@ enum VE {
     ArrayPushFn(u16),
     /// `a.pop`, likewise (consumed by `Call(0)` → [`KOp::ArrayPop`]).
     ArrayPopFn(u16),
+    /// A pinned STRING base: string slot index (loop mode; discovered like
+    /// array bases, via `s.charCodeAt` consumption). The entry guard
+    /// requires the local to hold a primitive string.
+    Str(u16),
+    /// `s.charCodeAt` on the string base in the sslot — speculative: the
+    /// entry guard verifies the canonical `String.prototype.charCodeAt`
+    /// still backs the method. Consumed by `Call(1)` (fusing to the
+    /// bail-free [`KOp::CharCodeAt`]); survives to exit shapes as
+    /// [`KShapeSlot::CharCodeFn`].
+    CharCodeFn(u16),
 }
 
 struct Xlate<'a> {
@@ -401,6 +433,9 @@ struct Xlate<'a> {
     rec_globals: Vec<Box<str>>,
     /// Locals designated as array bases (phase 2) — empty in phase 1.
     oslot_locals: &'a [u32],
+    /// Locals designated as STRING bases (fixpoint-discovered from
+    /// `charCodeAt` consumption) — empty in phase 1.
+    sslot_locals: &'a [u32],
     /// Locals statically typed BOOLEAN (fixpoint-discovered from stores).
     bool_locals: &'a [u32],
     kops: Vec<KOp>,
@@ -424,6 +459,8 @@ struct Xlate<'a> {
     bool_reg: Vec<(u32, u16)>,
     /// phase 1: locals observed as array bases (with clean origins).
     discovered: Vec<u32>,
+    /// phase 1: locals observed as STRING bases (`charCodeAt` receivers).
+    discovered_strs: Vec<u32>,
     /// locals observed receiving BOOLEAN stores (fixpoint feedback).
     discovered_bools: Vec<u32>,
     /// phase 1 origin tracking: (local, version) of a pushed LoadLocal.
@@ -437,6 +474,9 @@ struct Xlate<'a> {
     exits: Vec<(usize, u32, Vec<VE>)>,
     /// Math intrinsics used (entry guard checks each against the realm).
     math_used: Vec<KMath>,
+    /// Whether the region contains a pinned `String.prototype.charCodeAt`
+    /// call (entry guard verifies the canonical still resolves).
+    uses_char_code: bool,
     /// Whether the region contains a pinned `Array.prototype.push` call
     /// (entry guard verifies the canonical still resolves).
     uses_array_push: bool,
@@ -472,11 +512,12 @@ fn translate(
     consts: &[Const],
     inner: &[Kernel],
     oslot_locals: &[u32],
+    sslot_locals: &[u32],
     bool_locals: &[u32],
     fn_mode: bool,
     self_name: Option<&str>,
     self_ret_bool: bool,
-) -> (Option<Kernel>, Vec<u32>, Vec<u32>) {
+) -> (Option<Kernel>, Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut is_target = vec![false; region.len()];
     for op in region {
         for t in op_targets(op) {
@@ -498,6 +539,7 @@ fn translate(
         self_refs: Vec::new(),
         rec_globals: Vec::new(),
         oslot_locals,
+        sslot_locals,
         bool_locals,
         kops: Vec::new(),
         kpc: vec![u16::MAX; region.len()],
@@ -508,6 +550,7 @@ fn translate(
         local_reg: Vec::new(),
         bool_reg: Vec::new(),
         discovered: Vec::new(),
+        discovered_strs: Vec::new(),
         discovered_bools: Vec::new(),
         origins: Vec::new(),
         versions: std::collections::HashMap::new(),
@@ -515,6 +558,7 @@ fn translate(
         fixups: Vec::new(),
         exits: Vec::new(),
         math_used: Vec::new(),
+        uses_char_code: false,
         uses_array_push: false,
         uses_array_pop: false,
         props_used: Vec::new(),
@@ -527,8 +571,9 @@ fn translate(
     x.init_at[0] = Some(Vec::new());
     let kernel = translate_inner(&mut x);
     let d_obj = std::mem::take(&mut x.discovered);
+    let d_str = std::mem::take(&mut x.discovered_strs);
     let d_bool = std::mem::take(&mut x.discovered_bools);
-    (kernel, d_obj, d_bool)
+    (kernel, d_obj, d_str, d_bool)
 }
 
 fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
@@ -715,6 +760,11 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *dst = remap(*dst);
                 *idx = remap(*idx);
             }
+            KOp::CharCodeAt { dst, idx, .. } => {
+                *dst = remap(*dst);
+                *idx = remap(*idx);
+            }
+            KOp::StrLen { dst, .. } => *dst = remap(*dst),
             KOp::ArrayPush { dst, val, .. } => {
                 *dst = remap(*dst);
                 *val = remap(*val);
@@ -761,6 +811,8 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     VE::Num => KShapeSlot::Num(remap(STACK_BASE + p as u16)),
                     VE::Bool => KShapeSlot::Bool(remap(STACK_BASE + p as u16)),
                     VE::Obj(o) => KShapeSlot::Obj(*o),
+                    VE::Str(s) => KShapeSlot::Str(*s),
+                    VE::CharCodeFn(_) => KShapeSlot::CharCodeFn,
                     VE::MathObj => KShapeSlot::MathObj,
                     VE::MathFn(k) => KShapeSlot::MathFn(*k),
                     VE::ArrayPushFn(_) => KShapeSlot::ArrayPushFn,
@@ -878,12 +930,14 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     Some(Kernel {
         stores_elems,
         loads_len,
+        uses_char_code: x.uses_char_code,
         uses_array_push: x.uses_array_push,
         uses_array_pop: x.uses_array_pop,
         code: std::mem::take(&mut x.kops).into_boxed_slice(),
         locals: locals.into_boxed_slice(),
         bool_locals: bool_locals.into_boxed_slice(),
         oslots: x.oslot_locals.to_vec().into_boxed_slice(),
+        sslots: x.sslot_locals.to_vec().into_boxed_slice(),
         shapes: shapes.into_boxed_slice(),
         math_used: std::mem::take(&mut x.math_used).into_boxed_slice(),
         props_used: std::mem::take(&mut x.props_used).into_boxed_slice(),
@@ -1110,7 +1164,7 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
             KOp::BrCmpK { a, .. } => resolve!(a),
             KOp::BrFalsy { src, .. } | KOp::BrTruthy { src, .. } => resolve!(src),
             KOp::Ret { src, .. } => resolve!(src),
-            KOp::LoadElem { dst, idx, .. } => {
+            KOp::LoadElem { dst, idx, .. } | KOp::CharCodeAt { dst, idx, .. } => {
                 resolve!(idx);
                 kill!(*dst);
             }
@@ -1118,7 +1172,9 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
                 resolve!(idx);
                 resolve!(val);
             }
-            KOp::LoadLen { dst, .. } | KOp::LoadProp { dst, .. } => kill!(*dst),
+            KOp::LoadLen { dst, .. } | KOp::StrLen { dst, .. } | KOp::LoadProp { dst, .. } => {
+                kill!(*dst)
+            }
             KOp::ArrayPush { dst, val, .. } => {
                 resolve!(val);
                 kill!(*dst);
@@ -1164,7 +1220,10 @@ fn max_reg(acc: u16, op: &KOp) -> u16 {
             see(*dst);
             see(*src);
         }
-        KOp::Const { dst, .. } | KOp::LoadLen { dst, .. } | KOp::LoadProp { dst, .. } => see(*dst),
+        KOp::Const { dst, .. }
+        | KOp::LoadLen { dst, .. }
+        | KOp::StrLen { dst, .. }
+        | KOp::LoadProp { dst, .. } => see(*dst),
         KOp::Add { dst, a, b }
         | KOp::Arith { dst, a, b, .. }
         | KOp::CmpSet { dst, a, b, .. }
@@ -1183,7 +1242,7 @@ fn max_reg(acc: u16, op: &KOp) -> u16 {
         }
         KOp::BrCmpK { a, .. } => see(*a),
         KOp::BrFalsy { src, .. } | KOp::BrTruthy { src, .. } | KOp::Ret { src, .. } => see(*src),
-        KOp::LoadElem { dst, idx, .. } => {
+        KOp::LoadElem { dst, idx, .. } | KOp::CharCodeAt { dst, idx, .. } => {
             see(*dst);
             see(*idx);
         }
@@ -1284,6 +1343,12 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
                 defs[i] = bit(*dst);
                 succ[i] = (true, Some(*bail));
             }
+            // Bail-free string reads: plain defs with fall-through.
+            KOp::CharCodeAt { dst, idx, .. } => {
+                uses[i] = bit(*idx);
+                defs[i] = bit(*dst);
+            }
+            KOp::StrLen { dst, .. } => defs[i] = bit(*dst),
             KOp::ArrayPush { dst, val, bail, .. } => {
                 uses[i] = bit(*val);
                 defs[i] = bit(*dst);
@@ -1403,6 +1468,7 @@ impl Xlate<'_> {
     /// rejects the region (some iteration would bail every time anyway).
     fn lreg(&mut self, l: u32) -> Option<u16> {
         if self.oslot_locals.contains(&l)
+            || self.sslot_locals.contains(&l)
             || self.bool_locals.contains(&l)
             || self.bool_reg.iter().any(|&(ll, _)| ll == l)
         {
@@ -1514,6 +1580,7 @@ impl Xlate<'_> {
             self.discovered_bools.push(l);
         }
         if self.oslot_locals.contains(&l)
+            || self.sslot_locals.contains(&l)
             || self.local_reg.iter().any(|&(sl, _)| sl == KSlot::Local(l))
         {
             return None;
@@ -1654,7 +1721,9 @@ impl Xlate<'_> {
             | VE::MathObj
             | VE::MathFn(_)
             | VE::ArrayPushFn(_)
-            | VE::ArrayPopFn(_) => None,
+            | VE::ArrayPopFn(_)
+            | VE::Str(_)
+            | VE::CharCodeFn(_) => None,
             VE::Num => {
                 // Phase 1 discovery only. (A local used BOTH as a base and
                 // numerically is caught in phase 2: its loads become `Obj`
@@ -1672,6 +1741,36 @@ impl Xlate<'_> {
                 };
                 Some(u16::try_from(s).ok()?)
             }
+        }
+    }
+
+    /// Resolve the entry at `depth_from_top` as a STRING BASE (the
+    /// `s.charCodeAt` receiver). Phase 1: a clean local origin records the
+    /// local as a discovered string base. Phase 2: it must be [`VE::Str`].
+    /// Loop mode only — string slots resolve against the frame.
+    fn str_slot(&mut self, depth_from_top: usize) -> Option<u16> {
+        if self.fn_mode {
+            return None;
+        }
+        let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
+        match self.vstack[p] {
+            VE::Str(s) => Some(s),
+            VE::Num => {
+                // Phase 1 discovery only (mirrors `base_slot`).
+                let (l, ver) = self.origins[p]?;
+                if *self.versions.get(&l).unwrap_or(&0) != ver {
+                    return None;
+                }
+                let s = match self.discovered_strs.iter().position(|&d| d == l) {
+                    Some(s) => s,
+                    None => {
+                        self.discovered_strs.push(l);
+                        self.discovered_strs.len() - 1
+                    }
+                };
+                u16::try_from(s).ok()
+            }
+            _ => None,
         }
     }
 
@@ -1869,6 +1968,10 @@ impl Xlate<'_> {
                 if let Some(pos) = self.oslot_locals.iter().position(|&o| o == *l) {
                     // This local is an array base — push the object.
                     self.vstack.push(VE::Obj(pos as u16));
+                    self.origins.push(None);
+                } else if let Some(pos) = self.sslot_locals.iter().position(|&s| s == *l) {
+                    // This local is a string base — push the pinned string.
+                    self.vstack.push(VE::Str(pos as u16));
                     self.origins.push(None);
                 } else if self.is_bool_local(*l) {
                     let src = self.blreg(*l)?;
@@ -2174,6 +2277,10 @@ impl Xlate<'_> {
                         self.vstack.push(VE::Obj(s));
                         self.origins.push(None);
                     }
+                    VE::Str(s) => {
+                        self.vstack.push(VE::Str(s));
+                        self.origins.push(None);
+                    }
                     VE::MathObj => {
                         self.vstack.push(VE::MathObj);
                         self.origins.push(None);
@@ -2183,7 +2290,8 @@ impl Xlate<'_> {
                     | VE::Opaque
                     | VE::SelfFn(_)
                     | VE::ArrayPushFn(_)
-                    | VE::ArrayPopFn(_) => return None,
+                    | VE::ArrayPopFn(_)
+                    | VE::CharCodeFn(_) => return None,
                 }
             }
             Op::Swap => {
@@ -2432,6 +2540,29 @@ impl Xlate<'_> {
                     Const::String(s) => s.as_str().to_string(),
                     _ => return None,
                 };
+                // `s.charCodeAt` — routes the receiver into a STRING slot
+                // (phase-1 discovery, exactly like an array base) and pushes
+                // the speculative method entry; the entry guard verifies the
+                // canonical `String.prototype.charCodeAt` still resolves.
+                // Loop mode only (string slots resolve against the frame).
+                if !self.fn_mode && key == "charCodeAt" {
+                    let s = self.str_slot(0)?;
+                    self.pop()?;
+                    self.vstack.push(VE::CharCodeFn(s));
+                    self.origins.push(None);
+                    self.uses_char_code = true;
+                    return Some(());
+                }
+                // `s.length` on a KNOWN string base: bail-free O(1) unit
+                // count (an own wrapper property — unshadowable).
+                if key == "length" {
+                    if let Some(VE::Str(s)) = self.vstack.last().copied() {
+                        self.pop()?;
+                        let dst = self.push_num()?;
+                        self.kops.push(K::StrLen { dst, sslot: s });
+                        return Some(());
+                    }
+                }
                 // `a.push` on an array base, in loop mode: the pinned
                 // canonical `Array.prototype.push` (entry-verified like a
                 // Math intrinsic; see `KOp::ArrayPush`). An Ordinary object
@@ -2560,6 +2691,34 @@ impl Xlate<'_> {
                         bail: u16::MAX,
                     });
                     self.exits.push((kidx, self.base_ip + i as u32, shape));
+                    return Some(());
+                }
+                // `s.charCodeAt(i)`: the compiler's method-call pattern
+                // [.., CharCodeFn(s), Str(s), idx] with exactly one
+                // statically-Number argument, fusing to the BAIL-FREE
+                // [`KOp::CharCodeAt`] (the entry guard pins the receiver's
+                // stringness and the canonical method for the whole
+                // activation; every Number index has a defined result). In
+                // phase 1 the receiver is still a Num-with-origin entry —
+                // `str_slot` resolves it to the same discovered slot.
+                if let VE::CharCodeFn(s) = *self.vstack.get(fn_pos)? {
+                    if n != 1 {
+                        return None;
+                    }
+                    match self.vstack.get(fn_pos + 1)? {
+                        VE::Str(s2) if *s2 == s => {}
+                        _ => {
+                            if self.str_slot(1)? != s {
+                                return None;
+                            }
+                        }
+                    }
+                    let idx = self.top_num_reg(0)?;
+                    self.pop()?; // arg
+                    self.pop()?; // this (the string)
+                    self.pop()?; // fn
+                    let dst = self.push_num()?;
+                    self.kops.push(K::CharCodeAt { dst, sslot: s, idx });
                     return Some(());
                 }
                 // `a.pop()`: [.., ArrayPopFn(s), Obj(s)], no arguments.

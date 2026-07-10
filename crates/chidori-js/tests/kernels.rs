@@ -539,6 +539,33 @@ const CORPUS: &[&str] = &[
     "const a = [1, , 3, 4]; let acc = 0; const look = () => acc; for (let i = 0; i < a.length; i++) { acc += a[i] || 0; } console.log(acc, look());",
     // -0 / NaN through a captured accumulator.
     "let z = 5; const zz = () => z; for (let i = 0; i < 3; i++) { z = -0 * i + z * 0; } console.log(Object.is(z, -0), Object.is(zz(), -0));",
+    // --- STRING BASES: charCodeAt / length in loop kernels -----------------
+    // The canonical tokenizer scan (string_scan workload shape).
+    "const s = 'hello, kernel world! 0123456789'; let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; } console.log(h);",
+    // Non-ASCII: multi-byte UTF-8 and an astral pair (surrogate units).
+    "const s = 'a\\u00e9\\u4e2d\\ud83d\\ude00z'; let out = ''; for (let i = 0; i < s.length; i++) { out += s.charCodeAt(i) + ','; } console.log(out, s.length);",
+    // A lone surrogate is preserved as its raw unit.
+    "const s = 'x\\ud800y'; let sum = 0; for (let i = 0; i < s.length; i++) { sum += s.charCodeAt(i); } console.log(sum);",
+    // Out-of-bounds, fractional, negative and NaN indices (NaN result paths).
+    "const s = 'abc'; let r = ''; for (let i = -2; i < 6; i++) { r += s.charCodeAt(i) + ','; } console.log(r);",
+    "const s = 'abcdef'; let x = 0; for (let i = 0; i < 4; i++) { x += s.charCodeAt(i + 0.5) + s.charCodeAt(i * 1.5); } console.log(x);",
+    "const s = 'abc'; let n = 0; for (let i = 0; i < 3; i++) { n += s.charCodeAt(0 / 0) || -1; } console.log(n);",
+    // Empty string: zero iterations off `.length`, NaN off direct reads.
+    "const s = ''; let c = 0; for (let i = 0; i < s.length; i++) { c++; } console.log(c, s.charCodeAt(0));",
+    // Monkeypatched String.prototype.charCodeAt: the kernel declines and the
+    // patch is observed, then restored behavior returns.
+    "const orig = String.prototype.charCodeAt; String.prototype.charCodeAt = function (i) { return 7; }; const s = 'abc'; let t = 0; for (let i = 0; i < s.length; i++) { t += s.charCodeAt(i); } String.prototype.charCodeAt = orig; let u = 0; for (let i = 0; i < s.length; i++) { u += s.charCodeAt(i); } console.log(t, u);",
+    // String OBJECT receiver: the slot holds an Object, the guard declines,
+    // the generic wrapper path answers.
+    "const s = new String('abc'); let v = 0; for (let i = 0; i < s.length; i++) { v += s.charCodeAt(i); } console.log(v);",
+    // charCodeAt feeding arithmetic, Math, and array writes in one region.
+    "const s = 'kernelsss'; const a = new Array(9); for (let i = 0; i < s.length; i++) { a[i] = Math.max(s.charCodeAt(i) - 96, 0); } console.log(a.join(','));",
+    // Two distinct string bases in one loop.
+    "const a = 'abcdef', b = 'uvwxyz'; let d = 0; for (let i = 0; i < a.length; i++) { d += b.charCodeAt(i) - a.charCodeAt(i); } console.log(d);",
+    // charAt (string result) keeps the loop generic; results identical.
+    "const s = 'abc'; let r = ''; for (let i = 0; i < s.length; i++) { r += s.charAt(i); } console.log(r);",
+    // Rope-built string (the += builder) scanned afterwards.
+    "let b = ''; for (let i = 0; i < 40; i++) { b += 'ab'; } let q = 0; for (let i = 0; i < b.length; i++) { q += b.charCodeAt(i); } console.log(q, b.length);",
 ];
 
 #[test]
@@ -689,6 +716,40 @@ fn cell_loops_get_kernels() {
     assert!(
         kernels_in("let n = 10; const keep = () => n; const g = (x) => x + 1; let s = 0; for (let i = 0; i < n; i++) { s += g(i); } s;") >= 1,
         "read-only cell + pinned-callee loop must kernelize"
+    );
+}
+
+/// String-scan loops (`s.charCodeAt(i)` under an `s.length` bound) actually
+/// kernelize (pins the string-base tier against silent regressions).
+#[test]
+fn string_scan_loops_get_kernels() {
+    fn kernels_in(src: &str) -> usize {
+        fn count(p: &FuncProto) -> usize {
+            let mut n = p.kernels.len();
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    n += count(f);
+                }
+            }
+            n
+        }
+        count(&compile_script(src).expect("compiles"))
+    }
+    // The canonical tokenizer/hash scan.
+    assert!(
+        kernels_in("function f(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; } return h; }") >= 1,
+        "charCodeAt scan loop must kernelize"
+    );
+    // charCodeAt + dense-array write in one region.
+    assert!(
+        kernels_in("function f(s, a) { for (let i = 0; i < s.length; i++) { a[i] = s.charCodeAt(i); } }") >= 1,
+        "charCodeAt + array write loop must kernelize"
+    );
+    // charAt returns a STRING — unrepresentable, must stay generic.
+    assert_eq!(
+        kernels_in("function f(s) { let r = 0; for (let i = 0; i < s.length; i++) { r += s.charAt(i) ? 1 : 0; } return r; }"),
+        0,
+        "charAt loop must stay generic"
     );
 }
 
