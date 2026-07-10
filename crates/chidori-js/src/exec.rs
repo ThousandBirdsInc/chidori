@@ -40,6 +40,14 @@ pub(crate) struct PreparedKernel {
     interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
+/// Control-flow outcome of a register-mode completion dispatch (the
+/// register tier neither suspends nor delegates, so this is `Ctl` minus
+/// those arms).
+enum RegCtl {
+    Jump(usize),
+    Return(Value),
+}
+
 /// Control-flow signal from a single opcode step.
 enum Ctl {
     Next,
@@ -3827,14 +3835,6 @@ impl Vm {
                 return outcome;
             }};
         }
-        macro_rules! tryv {
-            ($e:expr) => {
-                match $e {
-                    Ok(v) => v,
-                    Err(e) => done!(Flow::Throw(e)),
-                }
-            };
-        }
         let proto = frame.func.proto.clone();
         // Registers 0..num_locals are the localized bindings (already sized
         // by `init_frame`); the rest are the canonical operand slots.
@@ -3845,6 +3845,7 @@ impl Vm {
         let interruptible = self.interrupt.is_some();
         let mut poll: u32 = 0;
         let code = &reg.code[..];
+        let num_locals = proto.num_locals as usize;
         let mut pc: usize = 0;
         loop {
             if interruptible {
@@ -3870,6 +3871,50 @@ impl Vm {
                     frame.locals[$i as usize] = $v
                 };
             }
+            // Frame exit with the module-linker snapshot (mirror of the
+            // stack loop's `Ctl::Return` arm).
+            macro_rules! ret {
+                ($v:expr) => {{
+                    let v = $v;
+                    if let Some(p) = &self.module_capture_proto {
+                        if Rc::ptr_eq(&proto, p) {
+                            self.module_capture = Some(frame.cells.clone());
+                        }
+                    }
+                    done!(Flow::Return(v));
+                }};
+            }
+            // Dispatch an abrupt (or return) completion through the frame's
+            // try-handlers — the register-mode `do_completion`.
+            macro_rules! complete {
+                ($comp:expr) => {{
+                    match self.reg_do_completion(&mut frame, num_locals, $comp) {
+                        Ok(RegCtl::Jump(t)) => {
+                            pc = t;
+                            continue;
+                        }
+                        Ok(RegCtl::Return(v)) => ret!(v),
+                        Err(e) => done!(Flow::Throw(e)),
+                    }
+                }};
+            }
+            macro_rules! tryv {
+                ($e:expr) => {
+                    match $e {
+                        Ok(v) => v,
+                        Err(e) => complete!(Completion::Throw(e)),
+                    }
+                };
+            }
+            // A TDZ read outside any handler is overwhelmingly common; the
+            // checked form routes the ReferenceError like any other throw.
+            macro_rules! tdz_throw {
+                () => {
+                    complete!(Completion::Throw(
+                        self.throw_reference("Cannot access binding before initialization")
+                    ))
+                };
+            }
             match op {
                 ROp::Mov { dst, src } => wr!(*dst, rd!(*src)),
                 ROp::Const { dst, idx } => wr!(*dst, self.const_val(&frame, *idx)),
@@ -3889,18 +3934,14 @@ impl Vm {
                 ),
                 ROp::TdzCheck { src } => {
                     if matches!(frame.locals[*src as usize], Value::Uninitialized) {
-                        done!(Flow::Throw(self.throw_reference(
-                            "Cannot access binding before initialization"
-                        )));
+                        tdz_throw!();
                     }
                 }
                 ROp::StoreLocalChecked { local, src } => {
                     let v = rd!(*src);
                     let slot = &mut frame.locals[*local as usize];
                     if matches!(slot, Value::Uninitialized) {
-                        done!(Flow::Throw(self.throw_reference(
-                            "Cannot access binding before initialization"
-                        )));
+                        tdz_throw!();
                     }
                     *slot = v;
                 }
@@ -3908,9 +3949,7 @@ impl Vm {
                 ROp::IncLocal { local, dec } => {
                     let v = rd!(*local);
                     if matches!(v, Value::Uninitialized) {
-                        done!(Flow::Throw(self.throw_reference(
-                            "Cannot access binding before initialization"
-                        )));
+                        tdz_throw!();
                     }
                     // ToNumeric may run user code, but a localized binding is
                     // reachable only from this frame, so read-coerce-write is
@@ -3924,9 +3963,7 @@ impl Vm {
                 ROp::LoadCell { dst, cell } => {
                     let v = frame.cells[*cell as usize].borrow().clone();
                     if matches!(v, Value::Uninitialized) {
-                        done!(Flow::Throw(self.throw_reference(
-                            "Cannot access binding before initialization"
-                        )));
+                        tdz_throw!();
                     }
                     wr!(*dst, v);
                 }
@@ -3937,9 +3974,7 @@ impl Vm {
                 ROp::LoadUpvalue { dst, idx } => {
                     let v = frame.func.upvalues[*idx as usize].borrow().clone();
                     if matches!(v, Value::Uninitialized) {
-                        done!(Flow::Throw(self.throw_reference(
-                            "Cannot access binding before initialization"
-                        )));
+                        tdz_throw!();
                     }
                     wr!(*dst, v);
                 }
@@ -3974,9 +4009,7 @@ impl Vm {
                 ROp::AddCellK { dst, cell, konst } => {
                     let a = frame.cells[*cell as usize].borrow().clone();
                     if matches!(a, Value::Uninitialized) {
-                        done!(Flow::Throw(self.throw_reference(
-                            "Cannot access binding before initialization"
-                        )));
+                        tdz_throw!();
                     }
                     let b = self.const_val(&frame, *konst);
                     let r = tryv!(self.op_add(a, b));
@@ -3990,9 +4023,7 @@ impl Vm {
                 } => {
                     let a = frame.cells[*cell as usize].borrow().clone();
                     if matches!(a, Value::Uninitialized) {
-                        done!(Flow::Throw(self.throw_reference(
-                            "Cannot access binding before initialization"
-                        )));
+                        tdz_throw!();
                     }
                     let b = self.const_val(&frame, *konst);
                     let r = tryv!(self.arith(a, b, *kind));
@@ -4097,9 +4128,7 @@ impl Vm {
                 } => {
                     let a = frame.cells[*cell as usize].borrow().clone();
                     if matches!(a, Value::Uninitialized) {
-                        done!(Flow::Throw(self.throw_reference(
-                            "Cannot access binding before initialization"
-                        )));
+                        tdz_throw!();
                     }
                     let b = self.const_val(&frame, *konst);
                     if tryv!(self.cmp_values(*cmp, &a, &b)) == *if_true {
@@ -4187,27 +4216,65 @@ impl Vm {
                 }
                 ROp::Ret { src } => {
                     let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
-                    // Module linker hook: snapshot this frame's final cells
-                    // when it is the module body being evaluated.
-                    if let Some(p) = &self.module_capture_proto {
-                        if Rc::ptr_eq(&proto, p) {
-                            self.module_capture = Some(frame.cells.clone());
-                        }
+                    // Route through any enclosing `finally` blocks (mirror of
+                    // `Op::Return`); the no-handler fast path returns directly.
+                    if frame.handlers.is_empty() {
+                        ret!(v);
                     }
-                    done!(Flow::Return(v));
+                    complete!(Completion::Return(v));
                 }
                 ROp::RetCompletion => {
                     let v = frame.completion.clone();
-                    if let Some(p) = &self.module_capture_proto {
-                        if Rc::ptr_eq(&proto, p) {
-                            self.module_capture = Some(frame.cells.clone());
-                        }
+                    if frame.handlers.is_empty() {
+                        ret!(v);
                     }
-                    done!(Flow::Return(v));
+                    complete!(Completion::Return(v));
                 }
                 ROp::Throw { src } => {
                     let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
-                    done!(Flow::Throw(v));
+                    complete!(Completion::Throw(v));
+                }
+                // ---- exceptions / completions ----
+                ROp::PushTryHandler {
+                    catch,
+                    finally,
+                    depth,
+                } => {
+                    frame.handlers.push(TryHandler {
+                        catch_ip: if *catch == u32::MAX {
+                            None
+                        } else {
+                            Some(*catch)
+                        },
+                        finally_ip: if *finally == u32::MAX {
+                            None
+                        } else {
+                            Some(*finally)
+                        },
+                        // Register mode: the CANONICAL operand depth (the
+                        // register file holds `num_locals + depth` live slots).
+                        stack_depth: *depth as usize,
+                        with_depth: frame.with_scope.len(),
+                        priv_env: frame.priv_env.clone(),
+                        delegation: false,
+                        delegation_return_ip: None,
+                    });
+                }
+                ROp::PopTryHandler => {
+                    frame.handlers.pop();
+                }
+                ROp::CompletionJump { target, boundary } => {
+                    complete!(Completion::Jump {
+                        target: *target,
+                        boundary: *boundary,
+                    });
+                }
+                ROp::EndFinally => {
+                    // Resume a parked non-local completion; the normal path
+                    // (finalizer ran with nothing parked) falls through.
+                    if let Some(c) = frame.pending_completion.take() {
+                        complete!(c);
+                    }
                 }
                 ROp::Closure { dst, idx } => {
                     let f = tryv!(self.closure_from_const(&frame, *idx));
@@ -4220,6 +4287,56 @@ impl Vm {
                     tryv!(self.rstep_cold(&mut frame, reg, &proto, cold));
                 }
             }
+        }
+    }
+
+    /// Register-mode mirror of [`Vm::do_completion`]: walk the frame's
+    /// try-handlers with a pending completion. "Truncate the operand stack"
+    /// becomes "clear the canonical registers above the handler's recorded
+    /// depth" (value-lifetime parity with the stack machine's truncate), and
+    /// the exception lands in `canon(depth)` — exactly where the catch
+    /// label's register state expects it. The delegation arms cannot occur:
+    /// generators never carry register programs.
+    #[inline(never)]
+    fn reg_do_completion(
+        &mut self,
+        frame: &mut Frame,
+        num_locals: usize,
+        comp: Completion,
+    ) -> Result<RegCtl, Value> {
+        let boundary = match &comp {
+            Completion::Jump { boundary, .. } => *boundary as usize,
+            _ => 0,
+        };
+        debug_assert!(!frame.skip_delegation_throw);
+        while frame.handlers.len() > boundary {
+            let h = frame.handlers.pop().unwrap();
+            debug_assert!(!h.delegation && h.delegation_return_ip.is_none());
+            let base = num_locals + h.stack_depth;
+            for slot in frame.locals[base..].iter_mut() {
+                *slot = Value::Undefined;
+            }
+            // Discard any `with` environments entered after this handler and
+            // restore the private-environment chain (both constant in
+            // register frames today — the ops that change them decline
+            // translation — but kept for exactness).
+            frame.with_scope.truncate(h.with_depth);
+            frame.priv_env = h.priv_env.clone();
+            if let Completion::Throw(err) = &comp {
+                if let Some(catch_ip) = h.catch_ip {
+                    frame.locals[base] = err.clone();
+                    return Ok(RegCtl::Jump(catch_ip as usize));
+                }
+            }
+            if let Some(finally_ip) = h.finally_ip {
+                frame.pending_completion = Some(comp);
+                return Ok(RegCtl::Jump(finally_ip as usize));
+            }
+        }
+        match comp {
+            Completion::Return(v) => Ok(RegCtl::Return(v)),
+            Completion::Throw(e) => Err(e),
+            Completion::Jump { target, .. } => Ok(RegCtl::Jump(target as usize)),
         }
     }
 
@@ -4501,6 +4618,47 @@ impl Vm {
                 let (k, more) = Self::for_in_next(frame);
                 wr!(*dst, k);
                 wr!(*dst + 1, more);
+            }
+            ROp::IteratorClose { it } => {
+                // Reached only on an abrupt completion (for-of / destructuring
+                // landing pads), with that completion parked. Per spec
+                // (IteratorClose), if the completion is a throw, any error
+                // from `return()` is suppressed (the original throw wins);
+                // otherwise a `return()` error propagates and a non-object
+                // result is a TypeError.
+                let it = rd!(*it);
+                let completion_is_throw =
+                    matches!(frame.pending_completion, Some(Completion::Throw(_)));
+                let ret = match self.get_prop(&it, &PropertyKey::str("return")) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if completion_is_throw {
+                            Value::Undefined
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
+                if self.is_callable(&ret) {
+                    match self.call(ret, it.clone(), &[]) {
+                        Ok(v) => {
+                            if !completion_is_throw && !matches!(v, Value::Object(_)) {
+                                return Err(
+                                    self.throw_type("iterator return() result is not an object")
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if !completion_is_throw {
+                                return Err(e);
+                            }
+                        }
+                    }
+                } else if !ret.is_nullish() && !completion_is_throw {
+                    // GetMethod: a present but non-callable `return` is a
+                    // TypeError (masked only by an in-flight throw).
+                    return Err(self.throw_type("iterator return is not a function"));
+                }
             }
             ROp::ForInPop => {
                 frame.enumerators.pop();

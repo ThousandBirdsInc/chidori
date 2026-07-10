@@ -436,6 +436,33 @@ pub enum ROp {
     },
     ThrowConstAssign,
 
+    // ---- exceptions / completions ----
+    /// Push a try handler recording the CANONICAL operand depth (`depth`),
+    /// so an unwind can clear the dead registers above it and place the
+    /// exception at `canon(depth)`. `catch`/`finally` are rpcs
+    /// (`u32::MAX` = absent), mirroring `Op::PushTryHandler`.
+    PushTryHandler {
+        catch: u32,
+        finally: u32,
+        depth: u16,
+    },
+    PopTryHandler,
+    /// `break`/`continue` crossing enclosing `finally` regions: park a
+    /// `Jump` completion and run the crossed finallys (mirror of
+    /// `Op::CompletionJump`; `target` is an rpc).
+    CompletionJump {
+        target: u32,
+        boundary: u32,
+    },
+    /// End of a `finally` body: resume a parked completion, or fall through
+    /// on the normal path (mirror of `Op::EndFinally`).
+    EndFinally,
+    /// IteratorClose on the abrupt-exit landing pad (mirror of
+    /// `Op::IteratorClose`; consults the parked completion).
+    IteratorClose {
+        it: u16,
+    },
+
     // ---- closures / objects / arrays ----
     Closure {
         dst: u16,
@@ -604,6 +631,8 @@ fn effect(op: &Op) -> Option<(u32, u32)> {
         | CmpLocalConstBranchFalse { .. }
         | CmpLocalConstBranchTrue { .. } => (0, 0),
         JumpIfFalsyPeek(_) | JumpIfTruthyPeek(_) | JumpIfNullishPeek(_) => (0, 0),
+        PushTryHandler { .. } | PopTryHandler | CompletionJump { .. } | EndFinally => (0, 0),
+        IteratorClose => (1, 0),
         GetIterator | ForInEnumerate => (1, 1),
         IteratorNext => (0, 1),
         ForInNext => (0, 2),
@@ -644,7 +673,9 @@ fn flow_of(op: &Op) -> FlowKind {
         | CmpLocalConstBranchFalse { target, .. }
         | CmpLocalConstBranchTrue { target, .. } => FlowKind::Branch(*target),
         JumpIfFalsyPeek(t) | JumpIfTruthyPeek(t) | JumpIfNullishPeek(t) => FlowKind::PeekBranch(*t),
-        Return | ReturnUndefined | Throw | ThrowConstAssign => FlowKind::Terminal,
+        Return | ReturnUndefined | Throw | ThrowConstAssign | CompletionJump { .. } => {
+            FlowKind::Terminal
+        }
         _ => FlowKind::Linear,
     }
 }
@@ -771,10 +802,37 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
             FlowKind::Jump(t) | FlowKind::Branch(t) | FlowKind::PeekBranch(t) => labels.push(t),
             _ => {}
         }
+        match op {
+            Op::PushTryHandler { catch, finally } => {
+                if *catch != u32::MAX {
+                    labels.push(*catch);
+                }
+                if *finally != u32::MAX {
+                    labels.push(*finally);
+                }
+            }
+            Op::CompletionJump { target, .. } => labels.push(*target),
+            _ => {}
+        }
     }
     labels.sort_unstable();
     labels.dedup();
     let is_label = |ip: u32| labels.binary_search(&ip).is_ok();
+
+    // The conservative maybe-TDZ set for handler entries: a throw can occur
+    // at ANY point in the guarded region, so a catch/finally label assumes
+    // every TDZ-able local (an `InitLocalTdz` target anywhere in the body)
+    // might be uninitialized. Costs only a TdzCheck per read in the rare
+    // catch/finally code.
+    let all_tdz = {
+        let mut t = TdzSet::empty(num_locals);
+        for op in code {
+            if let Op::InitLocalTdz(i) = op {
+                t.set(*i);
+            }
+        }
+        t
+    };
 
     // Phase 2: depth + maybe-TDZ dataflow to a fixpoint over the labels.
     // Depths are deterministic per label (mismatch = malformed input: bail);
@@ -851,6 +909,17 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
                 }
                 Some(())
             };
+            // Handler edges: the catch target is entered with the exception
+            // at `canon(depth)` (depth + 1); the finally target at `depth`.
+            // Both use the conservative TDZ set.
+            if let Op::PushTryHandler { catch, finally } = op {
+                if *catch != u32::MAX {
+                    edge(*catch, depth + 1, &all_tdz)?;
+                }
+                if *finally != u32::MAX {
+                    edge(*finally, depth, &all_tdz)?;
+                }
+            }
             cur = match flow_of(op) {
                 FlowKind::Linear => Some((after, tdz)),
                 FlowKind::Jump(t) => {
@@ -922,6 +991,15 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
         }
         ip += consumed;
     }
+    // Every branch target must have converged to a label state — a target
+    // reachable ONLY through parked completions (e.g. a `while(true)` whose
+    // sole exits break through a `finally`) has none, and remapping it would
+    // point into skipped code. Decline such functions.
+    for &t in &labels {
+        if (t as usize) < code.len() && !label_states.contains_key(&t) {
+            return None;
+        }
+    }
     rpc_at[code.len()] = e.code.len() as u32;
     // Falling off the end of the code returns like the stack loop's
     // `ip >= code.len()` exit; also the landing pad for end-of-code jump
@@ -929,6 +1007,15 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
     e.code.push(ROp::RetCompletion);
     // Remap branch targets from stack ips to rpcs.
     for op in &mut e.code {
+        if let ROp::PushTryHandler { catch, finally, .. } = op {
+            if *catch != u32::MAX {
+                *catch = rpc_at[*catch as usize];
+            }
+            if *finally != u32::MAX {
+                *finally = rpc_at[*finally as usize];
+            }
+            continue;
+        }
         if let Some(t) = rop_target_mut(op) {
             *t = rpc_at[*t as usize];
         }
@@ -963,7 +1050,8 @@ fn rop_target_mut(op: &mut ROp) -> Option<&mut u32> {
         | ROp::BrNullishUndef { target, .. }
         | ROp::CmpBr { target, .. }
         | ROp::CmpBrK { target, .. }
-        | ROp::CmpBrCellK { target, .. } => Some(target),
+        | ROp::CmpBrCellK { target, .. }
+        | ROp::CompletionJump { target, .. } => Some(target),
         _ => None,
     }
 }
@@ -1821,6 +1909,41 @@ impl Emitter {
             ThrowConstAssign => {
                 self.push_op(ROp::ThrowConstAssign);
                 return Some((false, 1));
+            }
+
+            // ---- exceptions / completions ----
+            PushTryHandler { catch, finally } => {
+                // A throw anywhere in the guarded region transfers to the
+                // catch/finally label assuming all-canonical registers below
+                // the recorded depth — flush so the surviving entries (e.g.
+                // a for-of loop's iterator) live in their canonical slots.
+                self.flush_all();
+                let depth = self.entries.len() as u16;
+                self.push_op(ROp::PushTryHandler {
+                    catch: *catch,
+                    finally: *finally,
+                    depth,
+                });
+            }
+            PopTryHandler => self.push_op(ROp::PopTryHandler),
+            CompletionJump { target, boundary } => {
+                self.flush_all();
+                self.push_op(ROp::CompletionJump {
+                    target: *target,
+                    boundary: *boundary,
+                });
+                return Some((false, 1));
+            }
+            EndFinally => {
+                // A parked completion may leave through handlers; the normal
+                // path falls through. Either way the join expects canonical
+                // registers.
+                self.flush_all();
+                self.push_op(ROp::EndFinally);
+            }
+            IteratorClose => {
+                let it = self.pop_reg();
+                self.push_op(ROp::IteratorClose { it });
             }
 
             Closure(i) => {

@@ -10,9 +10,12 @@
 //! init dataflow that elides them, the shared inline-cache paths, dense-array
 //! element fast paths, every call shape (plain, method, native, bound,
 //! proxy, construct, spread, function-kernel callees, recursion at the depth
-//! limit), closures and per-iteration capture, `arguments` aliasing, and the
-//! decline boundaries (try/finally, for-of, `with`, direct eval, generators,
-//! real awaits) where the stack tier keeps the frame.
+//! limit), closures and per-iteration capture, `arguments` aliasing, the
+//! try/catch/finally handler machinery (rethrow, nested finallys,
+//! return-in-finally, break/continue crossing finally regions, for-of and
+//! destructuring iterator close), and the decline boundaries (`with`,
+//! direct eval, generators, real awaits, `using`) where the stack tier
+//! keeps the frame.
 
 use std::rc::Rc;
 
@@ -179,13 +182,58 @@ const CORPUS: &[&str] = &[
     "class Pt { constructor(x, y) { this.x = x; this.y = y; } dist() { return Math.abs(this.x) + Math.abs(this.y); } static of(x, y) { return new Pt(x, y); } get sum() { return this.x + this.y; } } const pt = Pt.of(-1, 4); console.log(pt.dist(), pt.sum);",
 
     // ---- decline boundaries: identical behavior via the stack tier ----
-    "let tf = ''; try { tf += 'a'; throw new Error('x'); } catch (e) { tf += 'b'; } finally { tf += 'c'; } console.log(tf);",
-    "let fo2 = 0; for (const v of [1, 2, 3]) fo2 += v; console.log(fo2);",
-    "const [d1, , d2 = 9] = [1, 2]; console.log(d1, d2);",
     "function* gg() { yield 1; yield 2; } console.log([...gg()].join(','));",
     "(async () => { const v = await Promise.resolve(41); console.log('await', v + 1); })();",
     "function ev() { let v = 3; return eval('v * 7'); } console.log(ev());",
     "with ({ wv: 5 }) { console.log(wv); }",
+
+    // ---- try/catch/finally (register-mode handler machinery) ----
+    // Plain catch, rethrow, nested handlers, error identity.
+    "let tf1 = ''; try { tf1 += 'a'; throw new Error('x'); tf1 += 'never'; } catch (e) { tf1 += 'b' + e.message; } finally { tf1 += 'c'; } console.log(tf1);",
+    "try { try { throw new TypeError('inner'); } catch (e) { throw new RangeError('re:' + e.message); } } catch (e) { console.log(e.constructor.name, e.message); }",
+    "let nst = ''; try { try { nst += '1'; throw 'x'; } finally { nst += '2'; } } catch (e) { nst += '3' + e; } console.log(nst);",
+    // finally runs on the normal path; completion value flows through.
+    "function fn1() { try { return 'ret'; } finally { console.log('fin'); } } console.log(fn1());",
+    // return-in-finally OVERRIDES the parked completion.
+    "function fn2() { try { return 1; } finally { return 2; } } console.log(fn2());",
+    "function fn3() { try { throw new Error('gone'); } finally { return 'swallowed'; } } console.log(fn3());",
+    // break/continue crossing one and two finally regions (CompletionJump).
+    "let bc = ''; for (let i = 0; i < 4; i++) { try { if (i === 2) break; if (i === 1) continue; bc += i; } finally { bc += 'f' + i; } } console.log(bc);",
+    "let bc2 = ''; outer: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { try { if (j === 1) continue outer; bc2 += `${i}${j}`; } finally { bc2 += 'f'; } } } console.log(bc2);",
+    // throw from a nested CALL caught by this frame's handler.
+    "function boom() { throw new Error('deep'); } let ct2 = ''; try { boom(); } catch (e) { ct2 = 'caught ' + e.message; } console.log(ct2);",
+    // catch binding shadowing + TDZ interaction inside catch.
+    "let cb = 'outer'; try { throw 'in'; } catch (cb2) { let inner = cb2 + '!'; console.log(cb, inner); } console.log(cb);",
+    // Exception value replaces mid-expression register state cleanly.
+    "const trap = { get g() { throw 'mid'; } }; let ms = 0; try { ms = 1 + trap.g + 100; } catch (e) { ms = 'e:' + e; } console.log(ms);",
+    // Conditional TDZ observed FROM catch code (conservative handler-entry set).
+    "function ctz(f) { try { if (f) throw 'early'; } catch (e) { try { tv; console.log('init?'); } catch (e2) { console.log('tdz', e2.constructor.name); } } let tv = 1; return tv; } console.log(ctz(true));",
+    // Deep finally chain unwinding a return.
+    "function deep() { try { try { try { return 'r'; } finally { console.log('f1'); } } finally { console.log('f2'); } } finally { console.log('f3'); } } console.log(deep());",
+    // while(true) whose ONLY exit crosses a finally (declines translation —
+    // parked-jump-only label — and must behave identically on the stack tier).
+    "function wt() { let n = 0; while (true) { try { n++; if (n > 2) break; } finally { n += 10; } } return n; } console.log(wt());",
+
+    // ---- for-of / destructuring (iterator-close landing pads) ----
+    "let fo3 = ''; for (const v of [10, 20, 30]) { fo3 += v + ','; } console.log(fo3);",
+    "let fo4 = 0; for (const v of [1, 2, 3, 4, 5]) { if (v === 4) break; fo4 += v; } console.log(fo4);",
+    // Custom iterator observes return() on break and NOT on exhaustion.
+    "const seen = []; function mkIt(n) { let i = 0; return { [Symbol.iterator]() { return this; }, next() { return { value: i, done: i++ >= n }; }, return(v) { seen.push('ret@' + i); return { done: true }; } }; } for (const v of mkIt(3)) {} for (const v of mkIt(9)) { if (v === 1) break; } console.log(seen.join('|'));",
+    // Iterator return() that THROWS during a break (spec: propagates).
+    "const badRet = { [Symbol.iterator]() { let i = 0; return { next: () => ({ value: i++, done: false }), return() { throw new Error('badret'); } }; } }; try { for (const v of badRet) { if (v === 1) break; } } catch (e) { console.log('close', e.message); }",
+    // Iterator return() error is SUPPRESSED when the body threw.
+    "const badRet2 = { [Symbol.iterator]() { let i = 0; return { next: () => ({ value: i++, done: false }), return() { throw new Error('masked'); } }; } }; try { for (const v of badRet2) { if (v === 1) throw new Error('body'); } } catch (e) { console.log('won', e.message); }",
+    // next() throwing mid-loop (no close on next-throw, per spec).
+    "const badNext = { [Symbol.iterator]() { let i = 0; return { next() { if (i === 2) throw new Error('next!'); return { value: i++, done: false }; } }; } }; let bn = 0; try { for (const v of badNext) bn += v; } catch (e) { console.log(bn, e.message); }",
+    // Array destructuring: holes, defaults, rest, iterator close.
+    "const [d3, , d4 = 7, ...dr] = [1, 2, undefined, 4, 5]; console.log(d3, d4, dr.join('+'));",
+    "function swapd(a, b) { [a, b] = [b, a]; return a + '/' + b; } console.log(swapd(1, 2));",
+    // Nested destructuring in for-of over entries (the idiomatic shape).
+    "const m = { x: 1, y: 2 }; let ent = ''; for (const [k, v] of Object.entries(m)) ent += k + '=' + v + ';'; console.log(ent);",
+    // String iteration (surrogate pairs stay whole).
+    "let si = []; for (const ch of 'a\u{1F600}b') si.push(ch.length); console.log(si.join(','));",
+    // for-of over a Map/Set (native iterators through the reg frame).
+    "const mp = new Map([[1, 'a'], [2, 'b']]); let mo = ''; for (const [k, v] of mp) mo += k + v; const st2 = new Set([3, 4]); for (const v of st2) mo += v; console.log(mo);",
 
     // ---- mixed tiers: throws crossing reg/stack frames ----
     // reg frame throws → stack frame (try) catches.
@@ -299,6 +347,9 @@ fn structural_translation_pins() {
         ("for-in", "function fi(o) { let s = ''; for (const k in o) s += k; return s; } fi({ a: 1 });"),
         ("obj literal", "function ol() { return { a: 1, m() { return 2; }, get g() { return 3; } }; } ol();"),
         ("ternary+logic", "function tl(a, b) { return (a ?? b) ? a && b : a || b; } tl(1, 2);"),
+        ("try/catch/finally", "function tc() { try { return 1; } catch (e) { return 2; } finally { } } tc();"),
+        ("for-of", "function fo(a) { let s = 0; for (const v of a) s += v; return s; } fo([1]);"),
+        ("array destructuring", "function ad(a) { const [x, , y = 9] = a; return x + y; } ad([1, 2]);"),
     ] {
         let proto = compile_script(src).expect("compiles");
         let mut found = false;
@@ -309,8 +360,8 @@ fn structural_translation_pins() {
         });
         assert!(found, "{name}: expected a register-translated function:\n{src}");
     }
-    // Must NOT translate: handlers, for-of, with, direct eval, generators,
-    // suspending async bodies, and loop-kernelized functions.
+    // Must NOT translate: with, direct eval, generators, suspending async
+    // bodies, `using` declarations, and loop-kernelized functions.
     for (name, needle, src) in [
         (
             "try",
@@ -434,6 +485,25 @@ fn reg_fuzz_differential() {
         if case % 5 == 0 {
             let v = rnd(nvars as u64);
             body.push_str(&format!("v{v} = mk(v{v})();\n"));
+        }
+        // Handler machinery: try/catch/finally around mixed statements,
+        // throws caught in-loop, for-of with early exits.
+        if case % 3 == 1 {
+            let v = rnd(nvars as u64);
+            match rnd(4) {
+                0 => body.push_str(&format!(
+                    "try {{ if (i === 5) throw v{v}; v{v} += 1; }} catch (e) {{ v{v} = ('' + e).length; }}\n"
+                )),
+                1 => body.push_str(&format!(
+                    "try {{ v{v} = helper(v{v}, i); }} finally {{ s += 'f'; }}\n"
+                )),
+                2 => body.push_str(&format!(
+                    "for (const q of arr) {{ v{v} = (v{v} | 0) + (q | 0); if (q === 6) break; }}\n"
+                )),
+                _ => body.push_str(&format!(
+                    "try {{ try {{ if (v{v} > 20) throw 'deep'; }} finally {{ s += 'g'; }} }} catch (e) {{ v{v} = 0; }}\n"
+                )),
+            }
         }
         let decls: Vec<String> = (0..nvars)
             .map(|v| format!("let v{v} = {};", [0, 1, -1, 42][v % 4]))

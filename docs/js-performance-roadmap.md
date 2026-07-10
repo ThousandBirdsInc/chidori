@@ -1120,16 +1120,32 @@ values):
   `IncLocal`, `AddCellK`, …), so non-kernel loops keep their one-dispatch
   tests and updates.
 - **Whole-function eligibility, tier ordering.** Any op outside the
-  translated subset declines the function: try/catch/finally (and therefore
-  for-of and array destructuring, whose iterator-close protocol rides the
-  handler machinery), `with`/direct-eval scope ops, `super`/private class
-  elements, dispose scopes, suspension ops, and `Op::LoopKernel` — a
-  loop-kernelized function keeps the stack tier because its unboxed kernels
-  are far faster than boxed register ops. The call paths still try
-  `fn_kernel` first, so the tier order per activation is: function kernel
-  (unboxed, frameless) → register program (boxed, framed) → stack loop.
-  Await-free `async` bodies translate (they contain no suspension ops and
-  run to completion in one shot); a real `await` declines the body.
+  translated subset declines the function: `with`/direct-eval scope ops,
+  `super`/private class elements, dispose scopes (`using`), suspension
+  ops, and `Op::LoopKernel` — a loop-kernelized function keeps the stack
+  tier because its unboxed kernels are far faster than boxed register ops.
+  The call paths still try `fn_kernel` first, so the tier order per
+  activation is: function kernel (unboxed, frameless) → register program
+  (boxed, framed) → stack loop. Await-free `async` bodies translate (they
+  contain no suspension ops and run to completion in one shot); a real
+  `await` declines the body.
+- **Try/catch/finally translate** (round 2, same day) — and with them
+  for-of loops and array destructuring, whose IteratorClose-on-abrupt-exit
+  protocol rides the handler machinery. `ROp::PushTryHandler` records the
+  CANONICAL operand depth after a full flush (so the surviving entries —
+  a for-of loop's iterator — sit where every unwind expects them); the
+  register-mode completion walk (`reg_do_completion`) mirrors
+  `do_completion` exactly, with "truncate the operand stack" becoming
+  "clear the canonical registers above the handler's depth" (value-
+  lifetime parity) and the exception landing in `canon(depth)` — the
+  register the catch label's seeded state reads it from. Catch/finally
+  labels are seeded in the pre-emission dataflow (catch at `depth + 1`)
+  with a conservative all-maybe TDZ set, since a throw can occur anywhere
+  in the guarded region. `Op::CompletionJump`/`Op::EndFinally` (break/
+  continue/return crossing finallys) translate 1:1; the delegation arms
+  cannot occur (generators never translate). A jump target reachable ONLY
+  through parked completions (a `while(true)` whose sole exits break
+  through a `finally`) has no seeded state and declines the function.
 - **Determinism.** The register program is a pure function of the source,
   compiled at compile finish. Like the kernel tiers, the register tier is
   OFF whenever an op budget is installed — per-stack-op accounting stays
@@ -1146,13 +1162,15 @@ values):
   pins that deep recursion through register frames raises the same
   catchable RangeError at the same depth.
 
-**Gates:** a 90-program differential corpus + 300-case deterministic fuzz
+**Gates:** a 110-program differential corpus + 300-case deterministic fuzz
 (`tests/reg.rs`) require byte-identical output and errors reg-on vs reg-off
 across the virtual-stack shuffles (ternaries, logical operators, optional
 chains, method calls, compound assignment), TDZ edges, IC hit/miss/exotic
 paths, dense-element semantics, every call shape, closures/per-iteration
-capture, `arguments` aliasing, mixed-tier throws, and the decline
-boundaries; structural pins require the canonical shapes to translate and
+capture, `arguments` aliasing, mixed-tier throws, the full handler-
+machinery surface (rethrow, nested finallys, return-in-finally overriding,
+break/continue crossing finally regions, iterator close on break/throw
+with throwing/suppressed `return()`), and the decline boundaries; structural pins require the canonical shapes to translate and
 the excluded shapes to decline; the op-budget test additionally asserts the
 budget drains to the exact same count on both compiles. Full suites for
 both crates (118 + 761 tests, incl. record→replay byte-identity) and the
@@ -1204,10 +1222,8 @@ vs reg-off across the board.
 
 ### 6.10.2 What's next (post-register baseline)
 
-- **Try/finally support** — the largest coverage hole: for-of loops, array
-  destructuring, and try-wrapped agent code all keep the stack tier. Needs
-  a register-mode completion protocol (handler records the canonical depth;
-  catch entry writes the exception register and clears dead slots).
+- ~~**Try/finally support**~~ — landed same day (see above): for-of,
+  array destructuring, and try-wrapped code now translate.
 - **Register-mode loop-kernel embedding** — let a function carry BOTH
   kernels and a register program by teaching kernel bail-out to resume at a
   register pc instead of a stack ip.
