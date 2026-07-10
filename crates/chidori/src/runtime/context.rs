@@ -121,6 +121,12 @@ struct RuntimeContextInner {
     /// Pre-loaded call log for replay mode. When set, host functions
     /// return cached results instead of executing for matching sequence numbers.
     pub replay_log: Option<Vec<CallRecord>>,
+    /// seq → index into `replay_log`, built once at construction (the replay
+    /// log is immutable for the context's lifetime). Turns the per-call
+    /// replay probe from a linear scan of the whole history — O(history²)
+    /// across one resume re-execution — into a hash lookup. First occurrence
+    /// wins, matching the scan semantics it replaces.
+    pub replay_index: std::collections::HashMap<u64, usize>,
     /// Unique identifier for this run. Used as the subdirectory name
     /// under `.chidori/runs/` when persistence is enabled.
     pub run_id: String,
@@ -357,6 +363,7 @@ impl RuntimeContext {
                 call_log_dirty: false,
                 seq: 0,
                 replay_log: None,
+                replay_index: std::collections::HashMap::new(),
                 run_id: uuid::Uuid::new_v4().to_string(),
                 persist_dir: None,
                 store: None,
@@ -429,6 +436,7 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 seq: 0,
+                replay_index: build_replay_index(&replay_log),
                 replay_log: Some(replay_log),
                 run_id: uuid::Uuid::new_v4().to_string(),
                 persist_dir: None,
@@ -475,6 +483,7 @@ impl RuntimeContext {
                 call_log_dirty: true,
                 seq,
                 replay_log: None,
+                replay_index: std::collections::HashMap::new(),
                 run_id,
                 persist_dir: None,
                 store: None,
@@ -528,6 +537,7 @@ impl RuntimeContext {
                 call_log_dirty: false,
                 seq: base_seq,
                 replay_log: None,
+                replay_index: std::collections::HashMap::new(),
                 run_id,
                 persist_dir: None,
                 store: None,
@@ -581,6 +591,7 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 seq: base_seq,
+                replay_index: build_replay_index(&replay_log),
                 replay_log: Some(replay_log),
                 run_id,
                 persist_dir: None,
@@ -646,6 +657,7 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 seq: base_seq,
+                replay_index: build_replay_index(&replay_log),
                 replay_log: Some(replay_log),
                 run_id: actor_id.clone(),
                 persist_dir: None,
@@ -834,30 +846,31 @@ impl RuntimeContext {
     /// If not, return None — the host function should execute normally.
     pub fn try_replay(&self, seq: u64) -> Option<CallRecord> {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(ref replay_log) = inner.replay_log {
-            if let Some(record) = replay_log.iter().find(|r| r.seq == seq) {
-                let mut record = record.clone();
-                // Nest a replayed call under the call currently executing, exactly
-                // as `record_call` does for live calls. Without this a replayed
-                // *nested* host call — e.g. a tool's inner `input`, injected as a
-                // synthetic resume record with no parent — would record at top
-                // level, so a later resume's `absorb_replayed_subtree` wouldn't
-                // recognize it as part of the container's subtree and the
-                // sequence counter would collide with the next call (replay
-                // divergence on a second suspension).
-                if record.parent_seq.is_none() {
-                    record.parent_seq = inner.call_stack.last().copied();
-                }
-                // Record the replayed call in the new call log. Replay
-                // bypasses `record_call`'s journal append (the record is
-                // already durable from the turn that ran it live), so mark
-                // the log checkpoint-dirty: the first safepoint past the
-                // replay frontier writes one full checkpoint covering the
-                // replayed prefix plus any synthetic resume records.
-                inner.call_log.push(record.clone());
-                inner.call_log_dirty = true;
-                return Some(record);
+        let hit = match (&inner.replay_log, inner.replay_index.get(&seq)) {
+            (Some(replay_log), Some(&index)) => replay_log.get(index).cloned(),
+            _ => None,
+        };
+        if let Some(mut record) = hit {
+            // Nest a replayed call under the call currently executing, exactly
+            // as `record_call` does for live calls. Without this a replayed
+            // *nested* host call — e.g. a tool's inner `input`, injected as a
+            // synthetic resume record with no parent — would record at top
+            // level, so a later resume's `absorb_replayed_subtree` wouldn't
+            // recognize it as part of the container's subtree and the
+            // sequence counter would collide with the next call (replay
+            // divergence on a second suspension).
+            if record.parent_seq.is_none() {
+                record.parent_seq = inner.call_stack.last().copied();
             }
+            // Record the replayed call in the new call log. Replay
+            // bypasses `record_call`'s journal append (the record is
+            // already durable from the turn that ran it live), so mark
+            // the log checkpoint-dirty: the first safepoint past the
+            // replay frontier writes one full checkpoint covering the
+            // replayed prefix plus any synthetic resume records.
+            inner.call_log.push(record.clone());
+            inner.call_log_dirty = true;
+            return Some(record);
         }
         None
     }
@@ -905,7 +918,10 @@ impl RuntimeContext {
     /// is safe to call unconditionally on every replay hit.
     pub fn absorb_replayed_subtree(&self, root_seq: u64) {
         let mut inner = self.inner.lock().unwrap();
-        let Some(replay_log) = inner.replay_log.clone() else {
+        // Move the log out instead of cloning it: this runs on EVERY replay
+        // hit, and a deep clone of the whole history made each resume
+        // re-execution O(history²). Restored below.
+        let Some(replay_log) = inner.replay_log.take() else {
             return;
         };
         // Transitive descendants of `root_seq` via `parent_seq`. Records may be
@@ -938,6 +954,7 @@ impl RuntimeContext {
             }
         }
         inner.seq = inner.seq.max(max_seq);
+        inner.replay_log = Some(replay_log);
     }
 
     pub fn record_call(&self, mut record: CallRecord) {
@@ -1574,6 +1591,16 @@ fn note_persist_result(inner: &mut RuntimeContextInner, result: anyhow::Result<(
             tracing::warn!(run_id = %inner.run_id, error = %err, "run persistence write failed");
         }
     }
+}
+
+/// First occurrence of each seq wins, matching the linear `.find()` this
+/// index replaces.
+fn build_replay_index(replay_log: &[CallRecord]) -> std::collections::HashMap<u64, usize> {
+    let mut index = std::collections::HashMap::with_capacity(replay_log.len());
+    for (i, record) in replay_log.iter().enumerate() {
+        index.entry(record.seq).or_insert(i);
+    }
+    index
 }
 
 fn persist_host_promise_change(inner: &mut RuntimeContextInner, id: HostOperationId) {
