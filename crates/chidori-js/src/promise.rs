@@ -66,7 +66,7 @@ impl Vm {
             }
             // `Get(value, "then")` is observable, and an abrupt completion
             // REJECTS the promise (spec PromiseResolveFunctions step 9).
-            let then = match self.get_prop(&value, &PropertyKey::str("then")) {
+            let then = match self.get_prop(&value, &crate::names::key_then()) {
                 Ok(t) => t,
                 Err(e) => {
                     self.reject_promise(promise, e);
@@ -81,7 +81,7 @@ impl Vm {
                 .promise_proto
                 .borrow()
                 .props
-                .get(&PropertyKey::str("then"))
+                .get(&StrKeyRef("then"))
                 .and_then(|p| p.value().cloned());
             let is_intrinsic_then = matches!(
                 (&then, &builtin_then),

@@ -696,12 +696,12 @@ impl Vm {
             }
             return Ok(res);
         }
-        let order: [&str; 2] = match hint {
-            Hint::String => ["toString", "valueOf"],
-            _ => ["valueOf", "toString"],
+        let order: [PropertyKey; 2] = match hint {
+            Hint::String => [crate::names::key_to_string(), crate::names::key_value_of()],
+            _ => [crate::names::key_value_of(), crate::names::key_to_string()],
         };
-        for name in order {
-            let method = self.get_prop(&Value::Object(obj.clone()), &PropertyKey::str(name))?;
+        for name in &order {
+            let method = self.get_prop(&Value::Object(obj.clone()), name)?;
             if self.is_callable(&method) {
                 let res = self.call(method, Value::Object(obj.clone()), &[])?;
                 if !matches!(res, Value::Object(_)) {

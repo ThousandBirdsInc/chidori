@@ -365,7 +365,7 @@ impl Vm {
         if !o.borrow().props.is_empty() {
             return false;
         }
-        let key = PropertyKey::str("length");
+        let key = crate::value::StrKeyRef("length");
         let mut cur = o.borrow().proto.clone();
         // The canonical chain is 2 hops (Float64Array.prototype →
         // %TypedArray%.prototype); a longer walk is already exotic. Bound it
@@ -397,7 +397,7 @@ impl Vm {
         {
             let g = self.realm.global.borrow();
             let math_ok = matches!(
-                g.props.get(&PropertyKey::str("Math")),
+                g.props.get(&crate::value::StrKeyRef("Math")),
                 Some(Property {
                     kind: PropertyKind::Data { value: Value::Object(o), .. },
                     ..
@@ -410,7 +410,7 @@ impl Vm {
         let mb = canon.borrow();
         used.iter().all(|k| {
             matches!(
-                mb.props.get(&PropertyKey::str(k.name())),
+                mb.props.get(&crate::value::StrKeyRef(k.name())),
                 Some(Property {
                     kind: PropertyKind::Data { value: Value::Object(o), .. },
                     ..
@@ -431,7 +431,7 @@ impl Vm {
             return false;
         };
         matches!(
-            self.realm.array_proto.borrow().props.get(&PropertyKey::str(name)),
+            self.realm.array_proto.borrow().props.get(&crate::value::StrKeyRef(name)),
             Some(Property {
                 kind: PropertyKind::Data { value: Value::Object(o), .. },
                 ..
@@ -4041,7 +4041,7 @@ impl Vm {
                         RUnary::Dec => tryv!(self.unary_arith(a, UnaryKind::Dec)),
                         RUnary::BitNot => tryv!(self.unary_arith(a, UnaryKind::BitNot)),
                         RUnary::Not => Value::Bool(!self.to_boolean(&a)),
-                        RUnary::Typeof => Value::str(a.type_of()),
+                        RUnary::Typeof => Value::String(crate::names::typeof_result(a.type_of())),
                         RUnary::ToStr => Value::String(tryv!(self.to_js_string(&a))),
                         RUnary::ToKey => match tryv!(self.to_property_key(&a)) {
                             PropertyKey::Str(s) => Value::String(s),
@@ -4605,7 +4605,7 @@ impl Vm {
             }
             ROp::IterNext { dst, it } => {
                 let it = rd!(*it);
-                let next = self.get_prop(&it, &PropertyKey::str("next"))?;
+                let next = self.get_prop(&it, &crate::names::key_next())?;
                 let res = self.call(next, it, &[])?;
                 wr!(*dst, res);
             }
@@ -4629,7 +4629,7 @@ impl Vm {
                 let it = rd!(*it);
                 let completion_is_throw =
                     matches!(frame.pending_completion, Some(Completion::Throw(_)));
-                let ret = match self.get_prop(&it, &PropertyKey::str("return")) {
+                let ret = match self.get_prop(&it, &crate::names::key_return()) {
                     Ok(r) => r,
                     Err(e) => {
                         if completion_is_throw {
@@ -5164,7 +5164,7 @@ impl Vm {
             Op::UShr => bin_arith(self, frame, ArithKind::UShr)?,
             Op::TypeofExpr => {
                 let a = pop!();
-                push!(Value::str(a.type_of()));
+                push!(Value::String(crate::names::typeof_result(a.type_of())));
             }
 
             // ---- comparison ----
@@ -5394,7 +5394,7 @@ impl Vm {
             }
             Op::IteratorNext => {
                 let it = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let next = self.get_prop(&it, &PropertyKey::str("next"))?;
+                let next = self.get_prop(&it, &crate::names::key_next())?;
                 let res = self.call(next, it, &[])?;
                 push!(res);
             }
@@ -6297,7 +6297,7 @@ impl Vm {
                 let it = pop!();
                 let completion_is_throw =
                     matches!(frame.pending_completion, Some(Completion::Throw(_)));
-                let ret = match self.get_prop(&it, &PropertyKey::str("return")) {
+                let ret = match self.get_prop(&it, &crate::names::key_return()) {
                     Ok(r) => r,
                     Err(e) => {
                         if completion_is_throw {

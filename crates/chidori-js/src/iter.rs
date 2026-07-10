@@ -44,16 +44,16 @@ impl Vm {
 
     /// Step an iterator: returns `Some(value)` or `None` when done.
     pub fn iterator_step(&mut self, it: &Value) -> Result<Option<Value>, Value> {
-        let next = self.get_prop(it, &PropertyKey::str("next"))?;
+        let next = self.get_prop(it, &crate::names::key_next())?;
         let res = self.call(next, it.clone(), &[])?;
         if !matches!(res, Value::Object(_)) {
             return Err(self.throw_type("iterator result is not an object"));
         }
-        let done = self.get_prop(&res, &PropertyKey::str("done"))?;
+        let done = self.get_prop(&res, &crate::names::key_done())?;
         if self.to_boolean(&done) {
             Ok(None)
         } else {
-            let value = self.get_prop(&res, &PropertyKey::str("value"))?;
+            let value = self.get_prop(&res, &crate::names::key_value())?;
             Ok(Some(value))
         }
     }
@@ -118,7 +118,7 @@ impl Vm {
     }
 
     pub fn iterator_close(&mut self, it: &Value) -> Result<(), Value> {
-        let ret = self.get_prop(it, &PropertyKey::str("return"))?;
+        let ret = self.get_prop(it, &crate::names::key_return())?;
         if self.is_callable(&ret) {
             let _ = self.call(ret, it.clone(), &[]);
         }
@@ -130,10 +130,10 @@ impl Vm {
         let o = self.new_object();
         o.borrow_mut()
             .props
-            .insert(PropertyKey::str("value"), Property::data(value));
+            .insert(crate::names::key_value(), Property::data(value));
         o.borrow_mut()
             .props
-            .insert(PropertyKey::str("done"), Property::data(Value::Bool(done)));
+            .insert(crate::names::key_done(), Property::data(Value::Bool(done)));
         Value::Object(o)
     }
 
