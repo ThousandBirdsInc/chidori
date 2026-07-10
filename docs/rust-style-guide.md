@@ -48,17 +48,21 @@ Applies to all Rust in the workspace:
 
 ## Clippy
 
-Run Clippy locally over everything CI builds and keep it clean:
+Clippy is enforced: CI and the pre-commit hook both run
 
 ```sh
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Guidance on lint levels:
+so run it locally before pushing. Guidance on lint levels:
 
 - The default groups (`correctness`, `suspicious`, `complexity`, `perf`,
   `style`) are the baseline. `correctness` findings are bugs — fix them, never
   suppress them.
+- The few workspace-wide exceptions live in `[workspace.lints.clippy]` in the
+  root `Cargo.toml` (each crate inherits via `[lints] workspace = true`), each
+  with a comment saying why. That table is the *only* place for blanket
+  allows; think hard before growing it.
 - When a lint is wrong for a specific site, suppress it **narrowly** (item
   level, not module level) and prefer `#[expect(clippy::..., reason = "...")]`
   over `#[allow]`: `expect` warns when the suppression goes stale, and the
@@ -67,11 +71,12 @@ Guidance on lint levels:
   `#![allow(dead_code)]` on not-yet-wired runtime modules) are the pattern for
   the *rare* legitimate blanket case: generated code and scaffolding, with the
   module header saying so.
-- Lints we treat as always-on discipline even though they are not (yet)
-  machine-enforced: `undocumented_unsafe_blocks` (every `unsafe` block gets a
-  `// SAFETY:` comment), `await_holding_lock` (no sync lock guards across
-  `.await`), `dbg_macro` and stray `todo!`/`unimplemented!` (never merged),
-  `let_underscore_future` (a dropped future silently does nothing).
+- Some discipline goes beyond what the default groups machine-check; treat
+  these as always-on reviewer expectations: `undocumented_unsafe_blocks`
+  (every `unsafe` block gets a `// SAFETY:` comment), `await_holding_lock`
+  (no sync lock guards across `.await`), `dbg_macro` and stray
+  `todo!`/`unimplemented!` (never merged), `let_underscore_future` (a dropped
+  future silently does nothing).
 
 ## Naming
 
@@ -360,10 +365,9 @@ The policy for closing the gap:
 3. **No drive-by churn.** Don't send mass mechanical rewrites mixed into
    feature work; a focused, reviewable cleanup PR for one module at a time is
    fine.
-4. Machine enforcement (Clippy in CI and the pre-commit hook, lint tables in
-   `Cargo.toml`) should follow once the noise floor makes `-D warnings`
-   tractable; until then, the lints named in [Clippy](#clippy) are reviewer
-   expectations.
+4. Clippy is already gated in CI and the pre-commit hook, so the tree stays
+   warning-free by construction; the remaining gap is the `unwrap()` /
+   `println!` backlog, which items 1–3 burn down over time.
 
 ## References
 
