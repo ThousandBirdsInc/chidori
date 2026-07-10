@@ -1,0 +1,933 @@
+<!doctype html>
+<!-- Animated history of the chidori-js cross-runtime benchmarks, PRs #87-#102
+     (July 2026). Data is embedded below, transcribed from each PR's sticky
+     CI comment (js-benchmarks.yml). Self-contained: open directly in a browser. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chidori-js perf history</title>
+<style>*,*::before,*::after{box-sizing:border-box}body{margin:0}</style>
+</head>
+<body>
+<style>
+  :root {
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --chidori: #2a78d6;
+    --chidori-wash: rgba(42, 120, 214, 0.10);
+    --node: #1baf7a;
+    --bun: #eda100;
+    --ctx-line: rgba(137, 135, 129, 0.55);
+    --ctx-line-dim: rgba(137, 135, 129, 0.28);
+    --good: #006300;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --chidori: #3987e5;
+      --chidori-wash: rgba(57, 135, 229, 0.14);
+      --node: #199e70;
+      --bun: #c98500;
+      --ctx-line: rgba(137, 135, 129, 0.60);
+      --ctx-line-dim: rgba(137, 135, 129, 0.30);
+      --good: #0ca30c;
+    }
+  }
+  :root[data-theme="light"] {
+    --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e;
+    --muted: #898781; --grid: #e1e0d9; --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --chidori: #2a78d6; --chidori-wash: rgba(42,120,214,0.10);
+    --node: #1baf7a; --bun: #eda100;
+    --ctx-line: rgba(137,135,129,0.55); --ctx-line-dim: rgba(137,135,129,0.28);
+    --good: #006300;
+  }
+  :root[data-theme="dark"] {
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --chidori: #3987e5; --chidori-wash: rgba(57,135,229,0.14);
+    --node: #199e70; --bun: #c98500;
+    --ctx-line: rgba(137,135,129,0.60); --ctx-line-dim: rgba(137,135,129,0.30);
+    --good: #0ca30c;
+  }
+
+  html { background: var(--page); }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    color: var(--ink);
+    background: var(--page);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 40px 24px 72px; }
+
+  header .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 10px;
+  }
+  header h1 {
+    font-size: clamp(26px, 4.2vw, 38px);
+    font-weight: 650;
+    letter-spacing: -0.015em;
+    line-height: 1.15;
+    margin: 0 0 12px;
+    text-wrap: balance;
+  }
+  header .sub {
+    color: var(--ink-2);
+    font-size: 15px;
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  .kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin: 28px 0 8px;
+  }
+  .kpi {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px 12px;
+  }
+  .kpi .k-label { font-size: 12.5px; color: var(--ink-2); margin: 0 0 2px; }
+  .kpi .k-value { font-size: 30px; font-weight: 640; letter-spacing: -0.01em; margin: 0; }
+  .kpi .k-value .unit { font-size: 16px; font-weight: 500; color: var(--ink-2); }
+  .kpi .k-delta { font-size: 12.5px; color: var(--muted); margin: 2px 0 0; }
+  .kpi .k-delta strong { color: var(--good); font-weight: 600; }
+
+  section { margin-top: 44px; }
+  section h2 {
+    font-size: 19px;
+    font-weight: 640;
+    letter-spacing: -0.01em;
+    margin: 0 0 4px;
+  }
+  section .desc { color: var(--ink-2); font-size: 13.5px; margin: 0 0 16px; max-width: 74ch; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 18px 14px;
+  }
+
+  /* ---- playbar (the one control row that scopes everything below) ---- */
+  .playbar {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin: 26px 0 0;
+    position: sticky;
+    top: 8px;
+    z-index: 30;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+  }
+  .playbar button {
+    font: 600 13.5px var(--sans);
+    color: var(--ink);
+    background: none;
+    border: 1px solid var(--baseline);
+    border-radius: 7px;
+    padding: 7px 14px;
+    min-width: 84px;
+    cursor: pointer;
+  }
+  .playbar button:hover { border-color: var(--ink-2); }
+  .playbar input[type="range"] {
+    flex: 1;
+    min-width: 160px;
+    accent-color: var(--chidori);
+    height: 22px;
+    cursor: pointer;
+  }
+  .frame-chip { min-width: 300px; flex: 1.2; }
+  .frame-chip .fc-pr {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--chidori);
+    font-weight: 600;
+  }
+  .frame-chip .fc-title {
+    font-size: 13px;
+    color: var(--ink-2);
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 52ch;
+  }
+  :focus-visible { outline: 2px solid var(--chidori); outline-offset: 2px; border-radius: 4px; }
+
+  /* ---- hero chart ---- */
+  .hero-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .readout { text-align: right; }
+  .readout .r-num {
+    font-size: 46px;
+    font-weight: 660;
+    letter-spacing: -0.02em;
+    line-height: 1.05;
+    color: var(--ink);
+  }
+  .readout .r-cap { font-size: 12.5px; color: var(--muted); }
+  .legend {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    align-items: center;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    margin: 2px 0 10px;
+  }
+  .legend .key { display: inline-flex; align-items: center; gap: 7px; }
+  .key .swatch-line { width: 18px; height: 0; border-top: 2.5px solid var(--chidori); border-radius: 2px; }
+  .key .swatch-line.gray { border-top: 2px solid var(--ctx-line); }
+  .key .swatch-rect { width: 12px; height: 12px; border-radius: 3px; background: var(--chidori); }
+  .key .swatch-tick { width: 3px; height: 14px; border-radius: 2px; }
+  .key .swatch-dot { width: 9px; height: 9px; border-radius: 50%; }
+  svg { display: block; }
+  svg text { font-family: var(--mono); font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  svg .endlabel { font-family: var(--sans); font-size: 12px; font-weight: 600; fill: var(--ink); }
+  svg .endlabel .lite { font-weight: 400; fill: var(--ink-2); }
+
+  /* ---- bars ---- */
+  .bars { margin-top: 4px; }
+  .bar-row {
+    display: grid;
+    grid-template-columns: 130px 1fr;
+    align-items: center;
+    gap: 12px;
+    padding: 3px 0;
+    border-radius: 6px;
+  }
+  .bar-row:hover, .bar-row:focus-within { background: var(--chidori-wash); }
+  .bar-name {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-2);
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .bar-track { position: relative; height: 20px; }
+  .bar-fill {
+    position: absolute; left: 0; top: 3px; height: 14px;
+    background: var(--chidori);
+    border-radius: 0 4px 4px 0;
+    min-width: 2px;
+  }
+  .bar-tick {
+    position: absolute; top: 1px; width: 3px; height: 18px;
+    border-radius: 2px;
+    box-shadow: 0 0 0 2px var(--surface);
+  }
+  .bar-tick.node { background: var(--node); }
+  .bar-tick.bun { background: var(--bun); }
+  .bar-val {
+    position: absolute; top: 1px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 18px;
+    color: var(--ink-2);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .bar-axis {
+    display: grid; grid-template-columns: 130px 1fr; gap: 12px;
+    margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--baseline);
+  }
+  .bar-axis .ticks { position: relative; height: 16px; font-family: var(--mono); font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar-axis .ticks span { position: absolute; transform: translateX(-50%); }
+
+  /* ---- small multiples ---- */
+  .grid-multiples {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+    gap: 12px;
+  }
+  .mini {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px 6px;
+  }
+  .mini h3 {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink);
+    margin: 0 0 2px;
+  }
+  .mini .mmax { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin: 0 0 4px; }
+
+  /* ---- memory ---- */
+  .mem-row {
+    display: grid; grid-template-columns: 130px 1fr; gap: 12px;
+    align-items: center; padding: 3px 0; border-radius: 6px;
+  }
+  .mem-row:hover { background: var(--chidori-wash); }
+  .mem-track { position: relative; height: 18px; }
+  .mem-track .rail { position: absolute; left: 0; right: 0; top: 8.5px; height: 1px; background: var(--grid); }
+  .mem-dot {
+    position: absolute; top: 4px; width: 10px; height: 10px; border-radius: 50%;
+    transform: translateX(-50%);
+    box-shadow: 0 0 0 2px var(--surface);
+  }
+  .mem-dot.c { background: var(--chidori); }
+  .mem-dot.n { background: var(--node); }
+  .mem-dot.b { background: var(--bun); }
+
+  /* ---- table ---- */
+  .tablewrap { overflow-x: auto; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td { padding: 7px 12px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; font-family: var(--mono); font-size: 12px; }
+  thead th { color: var(--ink-2); font-weight: 600; border-bottom: 1px solid var(--baseline); }
+  tbody tr:hover { background: var(--chidori-wash); }
+  tr.geo-row td { font-weight: 650; border-top: 1px solid var(--baseline); }
+  td.na { color: var(--muted); }
+  td .up { color: var(--good); font-weight: 600; }
+
+  /* ---- notes ---- */
+  .notes { color: var(--ink-2); font-size: 13px; max-width: 78ch; }
+  .notes li { margin: 6px 0; }
+  .notes code { font-family: var(--mono); font-size: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+  footer { margin-top: 48px; font-size: 12px; color: var(--muted); }
+  footer a { color: inherit; }
+
+  /* ---- tooltip ---- */
+  #tip {
+    position: fixed;
+    z-index: 99;
+    pointer-events: none;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: 0 4px 18px rgba(0,0,0,0.13);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    display: none;
+    max-width: 260px;
+  }
+  #tip .t-head { font-weight: 650; color: var(--ink); margin-bottom: 4px; font-size: 12.5px; }
+  #tip .t-row { display: flex; align-items: center; gap: 7px; padding: 1px 0; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  #tip .t-row .lk { width: 12px; height: 0; border-top: 2.5px solid var(--muted); border-radius: 2px; flex: none; }
+  #tip .t-row b { color: var(--ink); font-weight: 650; min-width: 52px; }
+  #tip .t-row span { font-family: var(--mono); font-size: 11px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">ThousandBirdsInc/chidori · crates/chidori-js · PRs #87 → #102</p>
+    <h1>chidori-js got ~15× faster in nine days</h1>
+    <p class="sub">
+      Every engine PR gets a CI comment benchmarking the same JS workloads under
+      chidori-js, Node&nbsp;20, and Bun on a shared runner. This page replays those
+      comments across ten merged PRs (July 2–10, 2026). Times are execution-only
+      medians — process startup measured separately and subtracted.
+    </p>
+  </header>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="playbar" role="group" aria-label="Benchmark timeline controls">
+    <button id="playBtn" type="button">Play</button>
+    <input id="scrub" type="range" min="0" max="9" step="0.001" value="0"
+           aria-label="Timeline position across benchmarked PRs">
+    <div class="frame-chip">
+      <span class="fc-pr" id="fcPr"></span>
+      <span class="fc-title" id="fcTitle"></span>
+    </div>
+  </div>
+
+  <section>
+    <h2>Speedup since the first benchmarked PR</h2>
+    <p class="desc">
+      Each gray line is one workload's chidori-js time at PR&nbsp;#87 divided by its
+      time at that PR — higher is faster. The blue line is the geometric mean of the
+      nine workloads benchmarked from day one. Log scale.
+    </p>
+    <div class="card">
+      <div class="hero-top">
+        <div class="legend">
+          <span class="key"><span class="swatch-line"></span>geometric mean (9 core workloads)</span>
+          <span class="key"><span class="swatch-line gray"></span>individual workloads</span>
+        </div>
+        <div class="readout">
+          <div class="r-num" id="geoNum">×1.0</div>
+          <div class="r-cap">geomean speedup vs #87</div>
+        </div>
+      </div>
+      <div id="hero" role="img" aria-label="Line chart of per-workload speedup relative to PR 87, across ten PRs. The geometric mean rises from 1 times at PR 87 to about 14.8 times at PR 102. Full values are in the data table below."></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Execution time by workload, PR by PR</h2>
+    <p class="desc">
+      chidori-js wall-clock per workload at the selected PR (blue bars), with Node
+      (green tick) and Bun (yellow tick) on the same run for reference. Fixed axis —
+      the shrinking is real. Workloads fade in as they were added to the suite.
+    </p>
+    <div class="card">
+      <div class="legend">
+        <span class="key"><span class="swatch-rect"></span>chidori-js</span>
+        <span class="key"><span class="swatch-tick" style="background:var(--node)"></span>Node 20</span>
+        <span class="key"><span class="swatch-tick" style="background:var(--bun)"></span>Bun</span>
+      </div>
+      <div class="bars" id="bars"></div>
+      <div class="bar-axis"><span></span><div class="ticks" id="barTicks"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Every workload, every runtime</h2>
+    <p class="desc">
+      Raw execution time across the ten PRs — chidori-js in blue, Node in green, Bun
+      in yellow. Each panel has its own linear scale (max shown top-left). Lines that
+      start mid-chart are workloads added to the suite later.
+    </p>
+    <div class="legend" style="margin-bottom:12px">
+      <span class="key"><span class="swatch-line"></span>chidori-js</span>
+      <span class="key"><span class="swatch-line" style="border-top-color:var(--node)"></span>Node 20</span>
+      <span class="key"><span class="swatch-line" style="border-top-color:var(--bun)"></span>Bun</span>
+    </div>
+    <div class="grid-multiples" id="multiples"></div>
+  </section>
+
+  <section>
+    <h2>Peak memory at #102</h2>
+    <p class="desc">
+      Max RSS per workload process (MiB) from the final snapshot — measured since
+      PR&nbsp;#94 and essentially flat across the sprint: the speedups didn't buy
+      speed with memory.
+    </p>
+    <div class="card">
+      <div class="legend">
+        <span class="key"><span class="swatch-dot" style="background:var(--chidori)"></span>chidori-js</span>
+        <span class="key"><span class="swatch-dot" style="background:var(--node)"></span>Node 20</span>
+        <span class="key"><span class="swatch-dot" style="background:var(--bun)"></span>Bun</span>
+      </div>
+      <div id="mem"></div>
+      <div class="bar-axis"><span></span><div class="ticks" id="memTicks"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2 id="tableHead">Data at #87</h2>
+    <p class="desc">Execution-only medians (ms) at the selected PR, with the derived columns used above.</p>
+    <div class="card tablewrap">
+      <table id="dataTable" aria-describedby="tableHead">
+        <thead>
+          <tr>
+            <th>workload</th><th>chidori</th><th>node</th><th>bun</th>
+            <th>chidori ÷ node</th><th>speedup vs first</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Method &amp; caveats</h2>
+    <ul class="notes">
+      <li><strong>Source.</strong> The sticky <code>&lt;!-- chidori-js-benchmarks --&gt;</code>
+        CI comment on each merged PR that touched <code>crates/chidori-js</code>
+        (workflow <code>js-benchmarks.yml</code>): 5 timed runs + 1 warmup per
+        workload, median reported, startup baseline subtracted, results
+        cross-checked across runtimes before timing is trusted.</li>
+      <li><strong>Shared runners.</strong> Numbers come from GitHub-hosted runners, so
+        run-to-run noise is real — Node/Bun wobble on identical code gives a sense of
+        the noise floor (e.g. the geomean's dip after #96 is within it). The
+        10–60× chidori-js movements dwarf it.</li>
+      <li><strong>Near-zero Node times.</strong> On <code>closures</code> and
+        <code>property_access</code> V8 nearly eliminates the benchmark loop, and
+        startup subtraction leaves Node at 0.0–1.4&nbsp;ms. The "chidori ÷ node"
+        column clamps Node at 0.5&nbsp;ms so those ratios stay finite; read them as
+        "V8 optimized this away", not a precise gap.</li>
+      <li><strong>The suite grew.</strong> <code>array_sum</code> appears from #89;
+        <code>string_scan</code>, <code>typed_array</code>, <code>mutual_recursion</code>
+        were added by #100; <code>mixed_helpers</code> by #102 — added precisely
+        because they were expected to be slow, so each debuts at the bottom. The
+        geomean sticks to the nine day-one workloads for comparability.</li>
+      <li><strong>PRs without data.</strong> #95 (npm package management) and #99
+        (safepoint fix, outside <code>chidori-js</code>) didn't trigger the benchmark
+        workflow and are omitted. #93 and #96 are non-perf PRs that still ran the
+        suite — they act as control points. Merge order differs from PR-number order
+        (#94 before #93, #99 before #97).</li>
+      <li><strong>Startup.</strong> chidori-js starts in ~2.6–3.1&nbsp;ms across
+        every snapshot vs ~27&nbsp;ms for Node and ~10–16&nbsp;ms for Bun — that
+        advantage predates the sprint and never regressed.</li>
+    </ul>
+  </section>
+
+  <footer>
+    Generated 2026-07-10 from PR comment history · workloads live in
+    <code>crates/chidori-js/benchmarks/workloads/</code> · harness:
+    <code>benchmarks/run.mjs</code>
+  </footer>
+</div>
+
+<div id="tip" role="status"></div>
+
+<script>
+"use strict";
+/* ================= data (from CI benchmark comments, ms) ================= */
+const PRS = [
+ {pr:87, short:"resume fixed-cost caches", date:"Jul 2",
+  title:"Cut resume fixed costs (transpile/proto/regexp caches) + retire the dispatch-JIT experiment",
+  w:{arith_loop:[349.4,4.0,5.0],array_hof:[373.0,24.1,19.3],array_push_sum:[603.9,13.5,13.2],closures:[676.2,1.0,3.7],fib_recursive:[1420,11.1,9.7],json_roundtrip:[237.6,50.1,24.1],property_access:[1060,2.1,4.3],sort:[1720,106.2,70.4],string_build:[503.2,7.7,3.1]}},
+ {pr:88, short:"inline caches + superinstructions", date:"Jul 2",
+  title:"Performance optimization: cells→locals, fast hasher, inline caches, superinstructions",
+  w:{arith_loop:[242.3,2.9,4.9],array_hof:[252.6,22.6,20.8],array_push_sum:[374.9,10.7,18.9],closures:[461.6,1.1,4.6],fib_recursive:[909.3,7.8,10.1],json_roundtrip:[211.1,47.8,25.6],property_access:[413.3,0.0,4.4],sort:[1420,106.5,71.0],string_build:[21.5,4.0,6.5]}},
+ {pr:89, short:"typed kernel tiers + JSON fast paths", date:"Jul 5",
+  title:"JS runtime performance: call-ceremony elimination, typed kernel tiers, JSON fast paths",
+  w:{arith_loop:[48.2,3.9,7.8],array_hof:[169.0,22.9,21.4],array_push_sum:[279.7,14.4,15.1],array_sum:[176.1,41.7,67.1],closures:[61.3,1.3,4.6],fib_recursive:[83.4,11.3,10.6],json_roundtrip:[127.0,52.2,26.2],property_access:[67.5,2.7,3.6],sort:[670.5,108.5,71.8],string_build:[22.4,8.3,4.3]}},
+ {pr:90, short:"dense-array fast paths + fn-kernel HOFs", date:"Jul 6",
+  title:"JS perf: dense-array write fast paths in builtins + prepared fn-kernel callbacks for native HOFs",
+  w:{arith_loop:[33.2,5.7,5.6],array_hof:[42.8,25.5,18.4],array_push_sum:[26.5,17.3,14.0],array_sum:[149.2,42.8,64.5],closures:[26.7,3.1,2.7],fib_recursive:[51.8,11.4,8.8],json_roundtrip:[138.5,54.7,30.0],property_access:[20.7,2.4,3.2],sort:[283.2,112.8,71.8],string_build:[22.0,7.5,2.9]}},
+ {pr:94, short:"memory benchmarks added", date:"Jul 8",
+  title:"Add memory-utilization benchmarks (in-process heap + cross-runtime max RSS)",
+  w:{arith_loop:[29.6,5.3,4.6],array_hof:[32.5,20.0,15.7],array_push_sum:[22.6,12.1,14.1],array_sum:[135.4,38.9,66.5],closures:[25.2,3.3,3.9],fib_recursive:[54.0,9.5,7.6],json_roundtrip:[125.1,52.9,23.2],property_access:[15.4,2.9,4.1],sort:[246.7,109.9,66.0],string_build:[18.0,7.1,2.2]}},
+ {pr:93, short:"supervised actors (control point)", date:"Jul 8",
+  title:"Supervised actors: message passing, mailboxes, restart strategies, and supervision trees",
+  w:{arith_loop:[31.9,2.8,3.9],array_hof:[36.9,22.8,16.6],array_push_sum:[24.6,13.5,15.5],array_sum:[169.3,39.0,66.4],closures:[27.8,0.9,4.1],fib_recursive:[62.3,12.6,8.4],json_roundtrip:[138.1,50.0,25.4],property_access:[19.8,2.3,3.3],sort:[278.2,105.4,69.4],string_build:[20.6,6.9,2.8]}},
+ {pr:96, short:"durable run storage (control point)", date:"Jul 9",
+  title:"Durable run storage (SQLite / Cloudflare DO mirrors) + detached hibernating agents",
+  w:{arith_loop:[24.4,2.7,4.7],array_hof:[32.7,20.4,11.3],array_push_sum:[20.8,12.1,12.2],array_sum:[116.2,31.7,50.3],closures:[20.5,1.2,2.9],fib_recursive:[39.4,7.7,6.4],json_roundtrip:[110.2,39.3,20.6],property_access:[14.8,0.4,2.6],sort:[219.1,84.2,56.1],string_build:[16.9,4.0,2.3]}},
+ {pr:97, short:"mimalloc + PGO build", date:"Jul 10",
+  title:"Release-build perf: mimalloc allocator, PGO build script, profiling profile",
+  w:{arith_loop:[32.3,2.2,5.4],array_hof:[38.1,23.5,12.1],array_push_sum:[24.9,13.0,14.7],array_sum:[152.1,39.4,66.9],closures:[26.6,0.3,4.8],fib_recursive:[63.7,10.9,9.1],json_roundtrip:[140.1,52.5,26.3],property_access:[20.4,1.4,4.2],sort:[293.1,108.7,71.2],string_build:[21.7,6.8,4.1]}},
+ {pr:100, short:"3 adversarial workloads added", date:"Jul 10",
+  title:"Add perf bench coverage: runtime-layer criterion suite + 3 JS workloads",
+  w:{arith_loop:[32.0,5.9,4.8],array_hof:[39.5,22.9,12.5],array_push_sum:[25.7,13.1,13.7],array_sum:[156.7,40.2,65.7],closures:[32.9,0.8,3.4],fib_recursive:[60.0,8.9,8.3],json_roundtrip:[139.0,49.2,25.0],mutual_recursion:[123.8,8.0,6.8],property_access:[22.2,1.2,3.6],sort:[287.4,105.6,70.0],string_build:[21.2,6.2,2.9],string_scan:[55.0,7.8,5.1],typed_array:[41.7,25.1,9.9]}},
+ {pr:102, short:"register bytecode tier", date:"Jul 10",
+  title:"Register bytecode tier: whole-function register programs over boxed values",
+  w:{arith_loop:[29.0,2.8,4.4],array_hof:[39.1,21.9,11.8],array_push_sum:[23.6,12.2,13.8],array_sum:[147.3,40.4,65.7],closures:[31.3,0.1,3.3],fib_recursive:[60.9,8.8,8.1],json_roundtrip:[136.3,50.2,25.5],mixed_helpers:[612.7,18.6,22.9],mutual_recursion:[117.3,8.7,6.5],property_access:[16.1,0.6,3.3],sort:[240.1,103.4,70.4],string_build:[18.6,4.8,2.9],string_scan:[39.2,4.9,4.8],typed_array:[39.1,23.1,10.0]}},
+];
+// Max RSS (MiB) at #102
+const RSS = {arith_loop:[7.4,44.2,40.0],array_hof:[19.5,59.4,50.5],array_push_sum:[18.8,57.1,55.4],array_sum:[16.5,57.7,40.6],closures:[7.3,43.3,40.6],fib_recursive:[7.1,43.3,39.3],json_roundtrip:[8.3,45.1,46.3],mixed_helpers:[8.0,49.1,61.9],mutual_recursion:[7.4,44.5,41.5],property_access:[7.3,43.3,40.3],sort:[10.2,57.2,43.6],string_build:[11.4,47.1,38.4],string_scan:[8.7,45.8,36.6],typed_array:[8.0,46.7,38.5]};
+
+/* ================= derived series ================= */
+const N = PRS.length;
+const CORE = Object.keys(PRS[0].w); // benchmarked since #87
+const firstIdx = {};
+PRS.forEach((p, i) => Object.keys(p.w).forEach((w) => { if (!(w in firstIdx)) firstIdx[w] = i; }));
+const ALL = Object.keys(firstIdx).sort((a, b) => PRS[firstIdx[b]].w[b][0] - PRS[firstIdx[a]].w[a][0]);
+const speedup = (w, i) => PRS[firstIdx[w]].w[w][0] / PRS[i].w[w][0];
+const geo = (i) => Math.exp(CORE.reduce((s, w) => s + Math.log(speedup(w, i)), 0) / CORE.length);
+const GEO = PRS.map((_, i) => geo(i));
+const gapToNode = (i) => Math.exp(CORE.reduce((s, w) => s + Math.log(PRS[i].w[w][0] / Math.max(PRS[i].w[w][1], 0.5)), 0) / CORE.length);
+
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const fmtMs = (v) => v >= 1000 ? (v / 1000).toFixed(2) + " s" : v >= 100 ? Math.round(v).toLocaleString() + " ms" : v.toFixed(1) + " ms";
+const fmtX = (v) => "×" + (v >= 30 ? Math.round(v) : v.toFixed(1));
+
+/* ================= KPI row ================= */
+(function kpis() {
+  const last = N - 1;
+  const items = [
+    { label: "Geomean speedup, #87 → #102", value: fmtX(GEO[last]), delta: "9 core workloads · 9 days" },
+    { label: "Gap to Node 20 (geomean)", value: fmtX(gapToNode(last)), delta: "was " + fmtX(gapToNode(0)) + " at #87" },
+    { label: "Biggest single win", value: "×" + Math.round(speedup("property_access", last)), delta: "property_access · 1.06 s → 16 ms" },
+    { label: "Startup (unchanged, still winning)", value: "2.9 ms", delta: "vs Node 28.1 ms · Bun 11.5 ms" },
+  ];
+  const root = document.getElementById("kpis");
+  for (const it of items) {
+    const d = document.createElement("div"); d.className = "kpi";
+    const l = document.createElement("p"); l.className = "k-label"; l.textContent = it.label;
+    const v = document.createElement("p"); v.className = "k-value"; v.textContent = it.value;
+    const s = document.createElement("p"); s.className = "k-delta"; s.textContent = it.delta;
+    d.append(l, v, s); root.appendChild(d);
+  }
+})();
+
+/* ================= shared tooltip ================= */
+const tip = document.getElementById("tip");
+function showTip(x, y, head, rows) {
+  tip.textContent = "";
+  const h = document.createElement("div"); h.className = "t-head"; h.textContent = head; tip.appendChild(h);
+  for (const r of rows) {
+    const d = document.createElement("div"); d.className = "t-row";
+    const k = document.createElement("span"); k.className = "lk"; k.style.borderTopColor = r.color;
+    const b = document.createElement("b"); b.textContent = r.value;
+    const s = document.createElement("span"); s.textContent = r.label;
+    d.append(k, b, s); tip.appendChild(d);
+  }
+  tip.style.display = "block";
+  const w = tip.offsetWidth, hgt = tip.offsetHeight;
+  tip.style.left = Math.min(x + 14, innerWidth - w - 10) + "px";
+  tip.style.top = Math.max(8, Math.min(y - hgt / 2, innerHeight - hgt - 10)) + "px";
+}
+const hideTip = () => { tip.style.display = "none"; };
+
+/* ================= svg helpers ================= */
+const NS = "http://www.w3.org/2000/svg";
+function el(name, attrs, parent) {
+  const e = document.createElementNS(NS, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+/* ================= hero chart ================= */
+const hero = { root: document.getElementById("hero") };
+function buildHero() {
+  hero.root.textContent = "";
+  const W = hero.root.clientWidth || 900;
+  const H = 360, padL = 46, padR = 172, padT = 14, padB = 34;
+  hero.W = W; hero.padL = padL; hero.padR = padR;
+  const yMin = 0.85, yMax = 90;
+  const x = (i) => padL + (i / (N - 1)) * (W - padL - padR);
+  const y = (v) => padT + (1 - (Math.log(v) - Math.log(yMin)) / (Math.log(yMax) - Math.log(yMin))) * (H - padT - padB);
+  hero.x = x; hero.y = y;
+  const svg = el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` }, hero.root);
+
+  for (const t of [1, 2, 5, 10, 20, 50]) {
+    el("line", { x1: padL, x2: W - padR, y1: y(t), y2: y(t), stroke: "var(--grid)", "stroke-width": 1 }, svg);
+    el("text", { x: padL - 8, y: y(t) + 4, "text-anchor": "end" }, svg).textContent = "×" + t;
+  }
+  el("line", { x1: padL, x2: W - padR, y1: y(yMin), y2: y(yMin), stroke: "var(--baseline)", "stroke-width": 1 }, svg);
+  PRS.forEach((p, i) => {
+    const t = el("text", { x: x(i), y: H - padB + 16, "text-anchor": "middle" }, svg);
+    t.textContent = "#" + p.pr;
+    if (i === 0 || i === 4 || i === N - 1 || i === 2) {
+      el("text", { x: x(i), y: H - padB + 30, "text-anchor": "middle", opacity: 0.75 }, svg).textContent = p.date;
+    }
+  });
+
+  const clip = el("clipPath", { id: "heroClip" }, el("defs", {}, svg));
+  hero.clipRect = el("rect", { x: padL - 6, y: 0, width: 0, height: H }, clip);
+  const plot = el("g", { "clip-path": "url(#heroClip)" }, svg);
+
+  const path = (pts) => pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join("");
+  hero.grayLines = [];
+  for (const w of CORE) {
+    const pts = PRS.map((_, i) => [x(i), y(speedup(w, i))]);
+    const p = el("path", { d: path(pts), fill: "none", stroke: "var(--ctx-line)", "stroke-width": 1.6, "stroke-linejoin": "round", "stroke-linecap": "round" }, plot);
+    hero.grayLines.push({ w, p });
+  }
+  const gpts = PRS.map((_, i) => [x(i), y(GEO[i])]);
+  el("path", { d: path(gpts), fill: "none", stroke: "var(--chidori)", "stroke-width": 2.5, "stroke-linejoin": "round", "stroke-linecap": "round" }, plot);
+  hero.dot = el("circle", { r: 5, fill: "var(--chidori)", stroke: "var(--surface)", "stroke-width": 2 }, svg);
+
+  // end labels (fade in near the end of the animation)
+  hero.endG = el("g", { opacity: 0 }, svg);
+  const lastI = N - 1;
+  const mk = (yv, main, sub, cls) => {
+    const t = el("text", { x: x(lastI) + 10, y: y(yv) + 4, class: "endlabel" }, hero.endG);
+    const a = document.createElementNS(NS, "tspan"); a.textContent = main; t.appendChild(a);
+    const b = document.createElementNS(NS, "tspan"); b.setAttribute("class", "lite"); b.textContent = " " + sub; t.appendChild(b);
+    if (cls) t.setAttribute("fill", cls);
+  };
+  mk(GEO[lastI], fmtX(GEO[lastI]), "geomean", "var(--chidori)");
+  mk(speedup("property_access", lastI), "×" + Math.round(speedup("property_access", lastI)), "property_access");
+  mk(speedup("json_roundtrip", lastI), fmtX(speedup("json_roundtrip", lastI)), "json_roundtrip");
+
+  hero.cross = el("line", { y1: padT, y2: H - padB, stroke: "var(--baseline)", "stroke-width": 1, opacity: 0 }, svg);
+
+  // hover: crosshair snapped to nearest PR, tooltip lists every series
+  svg.addEventListener("pointermove", (ev) => {
+    const r = svg.getBoundingClientRect();
+    const px = ev.clientX - r.left;
+    if (px < padL - 10 || px > W - padR + 10) { hero.cross.setAttribute("opacity", 0); hideTip(); return; }
+    const i = Math.max(0, Math.min(N - 1, Math.round(((px - padL) / (W - padL - padR)) * (N - 1))));
+    if (x(i) > x(0) + heroDrawWidth() + 8) { hero.cross.setAttribute("opacity", 0); hideTip(); return; }
+    hero.cross.setAttribute("x1", x(i)); hero.cross.setAttribute("x2", x(i));
+    hero.cross.setAttribute("opacity", 1);
+    const rows = [{ value: fmtX(GEO[i]), label: "geomean", color: cssVar("--chidori") }]
+      .concat(CORE.map((w) => ({ value: fmtX(speedup(w, i)), label: w, color: cssVar("--muted") }))
+      .sort((a, b) => parseFloat(b.value.slice(1)) - parseFloat(a.value.slice(1))));
+    showTip(ev.clientX, ev.clientY, "#" + PRS[i].pr + " · " + PRS[i].date + " — speedup vs #87", rows);
+  });
+  svg.addEventListener("pointerleave", () => { hero.cross.setAttribute("opacity", 0); hideTip(); });
+}
+function heroDrawWidth() { return parseFloat(hero.clipRect.getAttribute("width") || 0); }
+function lerp(a, b, f) { return a + (b - a) * f; }
+function seriesAt(vals, t) { // log-space interpolation between integer frames
+  const k = Math.max(0, Math.min(Math.floor(t), N - 2)), f = Math.max(0, Math.min(t - k, 1));
+  return Math.exp(lerp(Math.log(vals[k]), Math.log(vals[k + 1]), f));
+}
+function renderHero(t) {
+  const xNow = hero.x(t);
+  hero.clipRect.setAttribute("width", xNow - (hero.padL - 6) + 1);
+  const g = t >= N - 1 ? GEO[N - 1] : seriesAt(GEO, t);
+  hero.dot.setAttribute("cx", xNow);
+  hero.dot.setAttribute("cy", hero.y(g));
+  document.getElementById("geoNum").textContent = "×" + g.toFixed(1);
+  hero.endG.setAttribute("opacity", Math.max(0, Math.min(1, (t - (N - 1.35)) / 0.35)));
+}
+
+/* ================= bars panel ================= */
+const BAR_MAX = 1750;
+const bars = { rows: [] };
+function buildBars() {
+  const root = document.getElementById("bars");
+  for (const w of ALL) {
+    const row = document.createElement("div"); row.className = "bar-row"; row.tabIndex = 0;
+    const name = document.createElement("span"); name.className = "bar-name"; name.textContent = w;
+    const track = document.createElement("div"); track.className = "bar-track";
+    const fill = document.createElement("div"); fill.className = "bar-fill";
+    const tickN = document.createElement("div"); tickN.className = "bar-tick node";
+    const tickB = document.createElement("div"); tickB.className = "bar-tick bun";
+    const val = document.createElement("span"); val.className = "bar-val";
+    track.append(fill, tickN, tickB, val);
+    row.append(name, track); root.appendChild(row);
+    bars.rows.push({ w, row, fill, tickN, tickB, val });
+    const hover = (ev) => {
+      const i = Math.round(timeline.t);
+      const d = PRS[i].w[w];
+      const head = w + " · #" + PRS[i].pr;
+      const rows = d
+        ? [{ value: fmtMs(d[0]), label: "chidori-js", color: cssVar("--chidori") },
+           { value: fmtMs(d[1]), label: "Node 20", color: cssVar("--node") },
+           { value: fmtMs(d[2]), label: "Bun", color: cssVar("--bun") },
+           { value: "×" + (d[0] / Math.max(d[1], 0.5)).toFixed(1), label: "chidori ÷ node", color: cssVar("--muted") }]
+        : [{ value: "—", label: "not yet in the suite", color: cssVar("--muted") }];
+      showTip(ev.clientX ?? innerWidth / 2, ev.clientY ?? innerHeight / 2, head, rows);
+    };
+    row.addEventListener("pointermove", hover);
+    row.addEventListener("focus", hover);
+    row.addEventListener("pointerleave", hideTip);
+    row.addEventListener("blur", hideTip);
+  }
+  const ticks = document.getElementById("barTicks");
+  for (const v of [0, 250, 500, 750, 1000, 1250, 1500]) {
+    const s = document.createElement("span");
+    s.style.left = (v / BAR_MAX * 100) + "%";
+    s.textContent = v === 0 ? "0" : v >= 1000 ? (v / 1000) + "s" : v + "";
+    ticks.appendChild(s);
+  }
+  const lab = document.createElement("span");
+  lab.style.left = "100%"; lab.style.transform = "translateX(-100%)"; lab.textContent = "ms";
+  ticks.appendChild(lab);
+}
+function barValAt(w, t) {
+  const fi = firstIdx[w];
+  const k = Math.max(0, Math.min(Math.floor(t), N - 2)), f = Math.max(0, Math.min(t - k, 1));
+  if (t <= fi) return { v: PRS[fi].w[w], alpha: fi === 0 ? 1 : Math.max(0, 1 - (fi - t)) };
+  const a = PRS[Math.max(k, fi)].w[w], b = PRS[Math.max(k + 1, fi)].w[w];
+  const mix = (j) => lerp(a[j], b[j], k >= fi ? f : 1);
+  return { v: [mix(0), mix(1), mix(2)], alpha: 1 };
+}
+function renderBars(t) {
+  for (const r of bars.rows) {
+    const { v, alpha } = barValAt(r.w, t);
+    r.row.style.opacity = alpha === 1 ? "" : String(0.15 + 0.85 * alpha);
+    r.row.style.visibility = alpha <= 0 ? "hidden" : "visible";
+    if (alpha <= 0) continue;
+    const pct = Math.min(v[0] / BAR_MAX, 1) * 100;
+    r.fill.style.width = pct + "%";
+    r.tickN.style.left = "calc(" + (Math.min(v[1] / BAR_MAX, 1) * 100) + "% - 1.5px)";
+    r.tickB.style.left = "calc(" + (Math.min(v[2] / BAR_MAX, 1) * 100) + "% - 1.5px)";
+    r.val.textContent = fmtMs(v[0]);
+    r.val.style.left = "calc(" + pct + "% + 8px)";
+  }
+}
+
+/* ================= frame chip + table (integer-frame scoped) ================= */
+let shownFrame = -1;
+function renderFrame(i) {
+  if (i === shownFrame) return;
+  shownFrame = i;
+  const p = PRS[i];
+  document.getElementById("fcPr").textContent = "#" + p.pr + " · " + p.date + " · " + p.short;
+  document.getElementById("fcTitle").textContent = p.title;
+  document.getElementById("tableHead").textContent = "Data at #" + p.pr;
+  const tb = document.querySelector("#dataTable tbody");
+  tb.textContent = "";
+  for (const w of ALL) {
+    const tr = document.createElement("tr");
+    const d = p.w[w];
+    const cells = d
+      ? [w, fmtMs(d[0]), fmtMs(d[1]), fmtMs(d[2]), "×" + (d[0] / Math.max(d[1], 0.5)).toFixed(1),
+         firstIdx[w] === i ? "baseline" : "×" + speedup(w, i).toFixed(1)]
+      : [w, "—", "—", "—", "—", "—"];
+    cells.forEach((c, j) => {
+      const td = document.createElement("td");
+      if (!d || (j === 5 && c === "baseline")) td.className = "na";
+      if (j === 5 && d && c !== "baseline") {
+        const s = document.createElement("span"); s.className = "up"; s.textContent = c; td.appendChild(s);
+      } else td.textContent = c;
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  }
+  const tr = document.createElement("tr"); tr.className = "geo-row";
+  ["geomean (9 core)", "", "", "", "×" + gapToNode(i).toFixed(1), "×" + GEO[i].toFixed(1)].forEach((c) => {
+    const td = document.createElement("td"); td.textContent = c; tr.appendChild(td);
+  });
+  tb.appendChild(tr);
+}
+
+/* ================= small multiples (static) ================= */
+function buildMultiples() {
+  const root = document.getElementById("multiples");
+  for (const w of ALL) {
+    const card = document.createElement("div"); card.className = "mini";
+    const h = document.createElement("h3"); h.textContent = w;
+    const frames = PRS.map((p, i) => ({ i, d: p.w[w] })).filter((f) => f.d);
+    const max = Math.max(...frames.flatMap((f) => f.d)) * 1.08;
+    const mm = document.createElement("p"); mm.className = "mmax";
+    mm.textContent = "y max " + fmtMs(max / 1.08 >= 1000 ? max : Math.ceil(max));
+    card.append(h, mm);
+    const W = 232, H = 92, pL = 4, pR = 8, pT = 4, pB = 14;
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img",
+      "aria-label": w + " execution time across PRs for chidori-js, Node and Bun. Values in the data table." });
+    svg.style.aspectRatio = W + "/" + H;
+    const x = (i) => pL + (i / (N - 1)) * (W - pL - pR);
+    const y = (v) => pT + (1 - v / max) * (H - pT - pB);
+    el("line", { x1: pL, x2: W - pR, y1: y(0), y2: y(0), stroke: "var(--baseline)", "stroke-width": 1 }, svg);
+    const colors = ["var(--chidori)", "var(--node)", "var(--bun)"];
+    for (const j of [1, 2, 0]) {
+      const d = frames.map((f, k) => (k ? "L" : "M") + x(f.i).toFixed(1) + " " + y(f.d[j]).toFixed(1)).join("");
+      el("path", { d, fill: "none", stroke: colors[j], "stroke-width": j === 0 ? 2 : 1.6, "stroke-linejoin": "round", "stroke-linecap": "round", opacity: j === 0 ? 1 : 0.85 }, svg);
+      const last = frames[frames.length - 1];
+      el("circle", { cx: x(last.i), cy: y(last.d[j]), r: 3, fill: colors[j], stroke: "var(--surface)", "stroke-width": 1.5 }, svg);
+    }
+    el("text", { x: pL, y: H - 2 }, svg).textContent = "#" + PRS[frames[0].i].pr;
+    el("text", { x: W - pR, y: H - 2, "text-anchor": "end" }, svg).textContent = "#102";
+    svg.addEventListener("pointermove", (ev) => {
+      const r = svg.getBoundingClientRect();
+      const i = Math.max(0, Math.min(N - 1, Math.round(((ev.clientX - r.left) / r.width) * (N - 1))));
+      const d = PRS[i].w[w];
+      if (!d) { hideTip(); return; }
+      showTip(ev.clientX, ev.clientY, w + " · #" + PRS[i].pr, [
+        { value: fmtMs(d[0]), label: "chidori-js", color: cssVar("--chidori") },
+        { value: fmtMs(d[1]), label: "Node 20", color: cssVar("--node") },
+        { value: fmtMs(d[2]), label: "Bun", color: cssVar("--bun") },
+      ]);
+    });
+    svg.addEventListener("pointerleave", hideTip);
+    card.appendChild(svg);
+    root.appendChild(card);
+  }
+}
+
+/* ================= memory dots (final frame, static) ================= */
+function buildMem() {
+  const root = document.getElementById("mem");
+  const MAX = 65;
+  for (const w of ALL) {
+    const d = RSS[w]; if (!d) continue;
+    const row = document.createElement("div"); row.className = "mem-row";
+    const name = document.createElement("span"); name.className = "bar-name"; name.textContent = w;
+    const track = document.createElement("div"); track.className = "mem-track";
+    const rail = document.createElement("div"); rail.className = "rail"; track.appendChild(rail);
+    [["c", 0], ["n", 1], ["b", 2]].forEach(([cls, j]) => {
+      const dot = document.createElement("div"); dot.className = "mem-dot " + cls;
+      dot.style.left = (d[j] / MAX * 100) + "%";
+      track.appendChild(dot);
+    });
+    row.append(name, track); root.appendChild(row);
+    const hover = (ev) => showTip(ev.clientX, ev.clientY, w + " · max RSS at #102", [
+      { value: d[0].toFixed(1) + " MiB", label: "chidori-js", color: cssVar("--chidori") },
+      { value: d[1].toFixed(1) + " MiB", label: "Node 20", color: cssVar("--node") },
+      { value: d[2].toFixed(1) + " MiB", label: "Bun", color: cssVar("--bun") },
+    ]);
+    row.addEventListener("pointermove", hover);
+    row.addEventListener("pointerleave", hideTip);
+  }
+  const ticks = document.getElementById("memTicks");
+  for (const v of [0, 10, 20, 30, 40, 50, 60]) {
+    const s = document.createElement("span");
+    s.style.left = (v / MAX * 100) + "%"; s.textContent = String(v);
+    ticks.appendChild(s);
+  }
+  const lab = document.createElement("span");
+  lab.style.left = "100%"; lab.style.transform = "translateX(-100%)"; lab.textContent = "MiB";
+  ticks.appendChild(lab);
+}
+
+/* ================= timeline engine ================= */
+const timeline = { t: 0, playing: false, raf: 0, last: 0 };
+const SEG_MS = 1350; // per PR-to-PR segment
+const scrub = document.getElementById("scrub");
+const playBtn = document.getElementById("playBtn");
+
+function renderAll() {
+  renderHero(timeline.t);
+  renderBars(timeline.t);
+  renderFrame(Math.round(timeline.t));
+  scrub.value = timeline.t;
+}
+function tick(now) {
+  if (!timeline.playing) return;
+  const dt = Math.max(0, now - timeline.last); timeline.last = now;
+  timeline.t = Math.max(0, Math.min(timeline.t + dt / SEG_MS, N - 1));
+  renderAll();
+  if (timeline.t >= N - 1) setPlaying(false);
+  else timeline.raf = requestAnimationFrame(tick);
+}
+function setPlaying(on) {
+  timeline.playing = on;
+  playBtn.textContent = on ? "Pause" : (timeline.t >= N - 1 ? "Replay" : "Play");
+  if (on) {
+    if (timeline.t >= N - 1) timeline.t = 0;
+    if (reduceMotion) { timeline.t = N - 1; renderAll(); setPlaying(false); return; }
+    timeline.last = performance.now();
+    timeline.raf = requestAnimationFrame(tick);
+  } else cancelAnimationFrame(timeline.raf);
+}
+playBtn.addEventListener("click", () => setPlaying(!timeline.playing));
+scrub.addEventListener("input", () => {
+  setPlaying(false);
+  timeline.t = parseFloat(scrub.value);
+  renderAll();
+});
+
+/* ================= boot ================= */
+buildHero(); buildBars(); buildMultiples(); buildMem();
+if (reduceMotion) { timeline.t = N - 1; renderAll(); playBtn.textContent = "Replay"; }
+else { renderAll(); setTimeout(() => setPlaying(true), 700); }
+
+let rsz;
+addEventListener("resize", () => {
+  clearTimeout(rsz);
+  rsz = setTimeout(() => { buildHero(); renderHero(timeline.t); }, 150);
+});
+</script>
+
+</body>
+</html>

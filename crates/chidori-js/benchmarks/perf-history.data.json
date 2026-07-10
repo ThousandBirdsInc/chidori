@@ -1,0 +1,1049 @@
+{
+ "prs": [
+  {
+   "pr": 87,
+   "title": "Cut resume fixed costs (transpile/proto/regexp caches) + retire the dispatch-JIT experiment with data",
+   "merged_at": "2026-07-02T06:35:10Z",
+   "comment_created_at": "2026-07-02T01:26:01Z",
+   "comment_updated_at": "2026-07-02T05:27:31Z",
+   "startup_ms": {
+    "chidori": 3.1,
+    "node": 28.6,
+    "bun": 16.2
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 349.4,
+     "node": 4,
+     "bun": 5
+    },
+    "array_hof": {
+     "chidori": 373,
+     "node": 24.1,
+     "bun": 19.3
+    },
+    "array_push_sum": {
+     "chidori": 603.9,
+     "node": 13.5,
+     "bun": 13.2
+    },
+    "closures": {
+     "chidori": 676.2,
+     "node": 1,
+     "bun": 3.7
+    },
+    "fib_recursive": {
+     "chidori": 1420,
+     "node": 11.1,
+     "bun": 9.7
+    },
+    "json_roundtrip": {
+     "chidori": 237.6,
+     "node": 50.1,
+     "bun": 24.1
+    },
+    "property_access": {
+     "chidori": 1060,
+     "node": 2.1,
+     "bun": 4.3
+    },
+    "sort": {
+     "chidori": 1720,
+     "node": 106.2,
+     "bun": 70.4
+    },
+    "string_build": {
+     "chidori": 503.2,
+     "node": 7.7,
+     "bun": 3.1
+    }
+   },
+   "note": "CI benchmark comment present (workflow already active, contrary to expectation). fib_recursive/property_access/sort reported as 1.42s/1.06s/1.72s, converted to ms. No memory tables yet."
+  },
+  {
+   "pr": 88,
+   "title": "Performance optimization: cells→locals, fast hasher, inline caches, superinstructions",
+   "merged_at": "2026-07-02T22:32:05Z",
+   "comment_created_at": "2026-07-02T22:21:32Z",
+   "comment_updated_at": "2026-07-02T22:21:32Z",
+   "startup_ms": {
+    "chidori": 3.1,
+    "node": 30.2,
+    "bun": 15.2
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 242.3,
+     "node": 2.9,
+     "bun": 4.9
+    },
+    "array_hof": {
+     "chidori": 252.6,
+     "node": 22.6,
+     "bun": 20.8
+    },
+    "array_push_sum": {
+     "chidori": 374.9,
+     "node": 10.7,
+     "bun": 18.9
+    },
+    "closures": {
+     "chidori": 461.6,
+     "node": 1.1,
+     "bun": 4.6
+    },
+    "fib_recursive": {
+     "chidori": 909.3,
+     "node": 7.8,
+     "bun": 10.1
+    },
+    "json_roundtrip": {
+     "chidori": 211.1,
+     "node": 47.8,
+     "bun": 25.6
+    },
+    "property_access": {
+     "chidori": 413.3,
+     "node": 0,
+     "bun": 4.4
+    },
+    "sort": {
+     "chidori": 1420,
+     "node": 106.5,
+     "bun": 71
+    },
+    "string_build": {
+     "chidori": 21.5,
+     "node": 4,
+     "bun": 6.5
+    }
+   },
+   "note": "CI benchmark comment present. Anomaly: property_access node measured 0.0ms (subtraction artifact) yet both node and bun were bolded and 'fastest' listed as bun. sort reported as 1.42s, converted to ms. No memory tables yet."
+  },
+  {
+   "pr": 89,
+   "title": "JS runtime performance: call-ceremony elimination, typed kernel tiers (loops/functions/recursion/closures), JSON fast paths",
+   "merged_at": "2026-07-05T07:42:51Z",
+   "startup_ms": {
+    "chidori": 2.9,
+    "node": 27.8,
+    "bun": 14.8
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 48.2,
+     "node": 3.9,
+     "bun": 7.8
+    },
+    "array_hof": {
+     "chidori": 169,
+     "node": 22.9,
+     "bun": 21.4
+    },
+    "array_push_sum": {
+     "chidori": 279.7,
+     "node": 14.4,
+     "bun": 15.1
+    },
+    "array_sum": {
+     "chidori": 176.1,
+     "node": 41.7,
+     "bun": 67.1
+    },
+    "closures": {
+     "chidori": 61.3,
+     "node": 1.3,
+     "bun": 4.6
+    },
+    "fib_recursive": {
+     "chidori": 83.4,
+     "node": 11.3,
+     "bun": 10.6
+    },
+    "json_roundtrip": {
+     "chidori": 127,
+     "node": 52.2,
+     "bun": 26.2
+    },
+    "property_access": {
+     "chidori": 67.5,
+     "node": 2.7,
+     "bun": 3.6
+    },
+    "sort": {
+     "chidori": 670.5,
+     "node": 108.5,
+     "bun": 71.8
+    },
+    "string_build": {
+     "chidori": 22.4,
+     "node": 8.3,
+     "bun": 4.3
+    }
+   },
+   "note": "PR that introduced the benchmark harness; comment updated 2026-07-05 after later pushes. array_sum present in final table."
+  },
+  {
+   "pr": 90,
+   "title": "JS perf: dense-array write fast paths in builtins + prepared fn-kernel callbacks for native HOFs",
+   "merged_at": "2026-07-06T18:46:18Z",
+   "startup_ms": {
+    "chidori": 3.1,
+    "node": 28.6,
+    "bun": 16.3
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 33.2,
+     "node": 5.7,
+     "bun": 5.6
+    },
+    "array_hof": {
+     "chidori": 42.8,
+     "node": 25.5,
+     "bun": 18.4
+    },
+    "array_push_sum": {
+     "chidori": 26.5,
+     "node": 17.3,
+     "bun": 14
+    },
+    "array_sum": {
+     "chidori": 149.2,
+     "node": 42.8,
+     "bun": 64.5
+    },
+    "closures": {
+     "chidori": 26.7,
+     "node": 3.1,
+     "bun": 2.7
+    },
+    "fib_recursive": {
+     "chidori": 51.8,
+     "node": 11.4,
+     "bun": 8.8
+    },
+    "json_roundtrip": {
+     "chidori": 138.5,
+     "node": 54.7,
+     "bun": 30
+    },
+    "property_access": {
+     "chidori": 20.7,
+     "node": 2.4,
+     "bun": 3.2
+    },
+    "sort": {
+     "chidori": 283.2,
+     "node": 112.8,
+     "bun": 71.8
+    },
+    "string_build": {
+     "chidori": 22,
+     "node": 7.5,
+     "bun": 2.9
+    }
+   }
+  },
+  {
+   "pr": 94,
+   "title": "Add memory-utilization benchmarks (in-process heap + cross-runtime max RSS)",
+   "merged_at": "2026-07-08T00:42:24Z",
+   "comment_created_at": "2026-07-07T20:34:48Z",
+   "comment_updated_at": "2026-07-07T20:34:48Z",
+   "startup_ms": {
+    "chidori": 2.6,
+    "node": 26.8,
+    "bun": 15.4
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 29.6,
+     "node": 5.3,
+     "bun": 4.6
+    },
+    "array_hof": {
+     "chidori": 32.5,
+     "node": 20,
+     "bun": 15.7
+    },
+    "array_push_sum": {
+     "chidori": 22.6,
+     "node": 12.1,
+     "bun": 14.1
+    },
+    "array_sum": {
+     "chidori": 135.4,
+     "node": 38.9,
+     "bun": 66.5
+    },
+    "closures": {
+     "chidori": 25.2,
+     "node": 3.3,
+     "bun": 3.9
+    },
+    "fib_recursive": {
+     "chidori": 54,
+     "node": 9.5,
+     "bun": 7.6
+    },
+    "json_roundtrip": {
+     "chidori": 125.1,
+     "node": 52.9,
+     "bun": 23.2
+    },
+    "property_access": {
+     "chidori": 15.4,
+     "node": 2.9,
+     "bun": 4.1
+    },
+    "sort": {
+     "chidori": 246.7,
+     "node": 109.9,
+     "bun": 66
+    },
+    "string_build": {
+     "chidori": 18,
+     "node": 7.1,
+     "bun": 2.2
+    }
+   },
+   "max_rss_mb": {
+    "(startup)": {
+     "chidori": 7.1,
+     "node": 39.7,
+     "bun": 35.5
+    },
+    "arith_loop": {
+     "chidori": 7.4,
+     "node": 44.5,
+     "bun": 44.1
+    },
+    "array_hof": {
+     "chidori": 19.3,
+     "node": 59.7,
+     "bun": 55.6
+    },
+    "array_push_sum": {
+     "chidori": 18.8,
+     "node": 57.5,
+     "bun": 59.5
+    },
+    "array_sum": {
+     "chidori": 16.3,
+     "node": 58,
+     "bun": 45
+    },
+    "closures": {
+     "chidori": 7.2,
+     "node": 43.6,
+     "bun": 44.2
+    },
+    "fib_recursive": {
+     "chidori": 7.2,
+     "node": 43.6,
+     "bun": 43.2
+    },
+    "json_roundtrip": {
+     "chidori": 8.2,
+     "node": 45.5,
+     "bun": 50.8
+    },
+    "property_access": {
+     "chidori": 7.4,
+     "node": 43.5,
+     "bun": 44.2
+    },
+    "sort": {
+     "chidori": 10.2,
+     "node": 57.6,
+     "bun": 47.9
+    },
+    "string_build": {
+     "chidori": 11.5,
+     "node": 47.2,
+     "bun": 42.6
+    }
+   },
+   "note": "First PR whose sticky comment carries the peak-memory (max RSS, MiB) table — this is the PR that introduced it. array_sum workload appears for the first time (added between PR 88 and here). Merged before PR 93 despite lower PR number ordering."
+  },
+  {
+   "pr": 93,
+   "title": "Supervised actors: message passing, mailboxes, restart strategies, and supervision trees",
+   "merged_at": "2026-07-08T19:07:28Z",
+   "comment_created_at": "2026-07-07T20:14:19Z",
+   "comment_updated_at": "2026-07-08T14:21:20Z",
+   "startup_ms": {
+    "chidori": 2.9,
+    "node": 27.9,
+    "bun": 15.5
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 31.9,
+     "node": 2.8,
+     "bun": 3.9
+    },
+    "array_hof": {
+     "chidori": 36.9,
+     "node": 22.8,
+     "bun": 16.6
+    },
+    "array_push_sum": {
+     "chidori": 24.6,
+     "node": 13.5,
+     "bun": 15.5
+    },
+    "array_sum": {
+     "chidori": 169.3,
+     "node": 39,
+     "bun": 66.4
+    },
+    "closures": {
+     "chidori": 27.8,
+     "node": 0.9,
+     "bun": 4.1
+    },
+    "fib_recursive": {
+     "chidori": 62.3,
+     "node": 12.6,
+     "bun": 8.4
+    },
+    "json_roundtrip": {
+     "chidori": 138.1,
+     "node": 50,
+     "bun": 25.4
+    },
+    "property_access": {
+     "chidori": 19.8,
+     "node": 2.3,
+     "bun": 3.3
+    },
+    "sort": {
+     "chidori": 278.2,
+     "node": 105.4,
+     "bun": 69.4
+    },
+    "string_build": {
+     "chidori": 20.6,
+     "node": 6.9,
+     "bun": 2.8
+    }
+   },
+   "max_rss_mb": {
+    "(startup)": {
+     "chidori": 6.9,
+     "node": 39.7,
+     "bun": 35.2
+    },
+    "arith_loop": {
+     "chidori": 7.1,
+     "node": 44.3,
+     "bun": 43.6
+    },
+    "array_hof": {
+     "chidori": 19.3,
+     "node": 59.7,
+     "bun": 56.1
+    },
+    "array_push_sum": {
+     "chidori": 18.8,
+     "node": 57.4,
+     "bun": 59.4
+    },
+    "array_sum": {
+     "chidori": 16.2,
+     "node": 57.9,
+     "bun": 45.1
+    },
+    "closures": {
+     "chidori": 7.1,
+     "node": 43.5,
+     "bun": 44.4
+    },
+    "fib_recursive": {
+     "chidori": 7.1,
+     "node": 43.5,
+     "bun": 43.5
+    },
+    "json_roundtrip": {
+     "chidori": 8,
+     "node": 45.3,
+     "bun": 50.8
+    },
+    "property_access": {
+     "chidori": 7.1,
+     "node": 43.4,
+     "bun": 43.9
+    },
+    "sort": {
+     "chidori": 10,
+     "node": 57.5,
+     "bun": 48
+    },
+    "string_build": {
+     "chidori": 11.3,
+     "node": 47.2,
+     "bun": 42.4
+    }
+   },
+   "note": "Comment includes memory tables (base branch already contained PR 94's harness by the final update on 2026-07-08). Merged after PR 94 despite lower PR number."
+  },
+  {
+   "pr": 96,
+   "title": "Durable run storage (SQLite / Cloudflare Durable Object mirrors) + detached hibernating agents with durable alarms",
+   "merged_at": "2026-07-09T21:23:25Z",
+   "comment_created_at": "2026-07-09T20:50:26Z",
+   "comment_updated_at": "2026-07-09T21:05:31Z",
+   "startup_ms": {
+    "chidori": 2.5,
+    "node": 24.5,
+    "bun": 9.9
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 24.4,
+     "node": 2.7,
+     "bun": 4.7
+    },
+    "array_hof": {
+     "chidori": 32.7,
+     "node": 20.4,
+     "bun": 11.3
+    },
+    "array_push_sum": {
+     "chidori": 20.8,
+     "node": 12.1,
+     "bun": 12.2
+    },
+    "array_sum": {
+     "chidori": 116.2,
+     "node": 31.7,
+     "bun": 50.3
+    },
+    "closures": {
+     "chidori": 20.5,
+     "node": 1.2,
+     "bun": 2.9
+    },
+    "fib_recursive": {
+     "chidori": 39.4,
+     "node": 7.7,
+     "bun": 6.4
+    },
+    "json_roundtrip": {
+     "chidori": 110.2,
+     "node": 39.3,
+     "bun": 20.6
+    },
+    "property_access": {
+     "chidori": 14.8,
+     "node": 0.4,
+     "bun": 2.6
+    },
+    "sort": {
+     "chidori": 219.1,
+     "node": 84.2,
+     "bun": 56.1
+    },
+    "string_build": {
+     "chidori": 16.9,
+     "node": 4,
+     "bun": 2.3
+    }
+   },
+   "max_rss_mb": {
+    "(startup)": {
+     "chidori": 7.2,
+     "node": 40.8,
+     "bun": 31.3
+    },
+    "arith_loop": {
+     "chidori": 7.4,
+     "node": 45.5,
+     "bun": 39.9
+    },
+    "array_hof": {
+     "chidori": 19.3,
+     "node": 60.6,
+     "bun": 50.7
+    },
+    "array_push_sum": {
+     "chidori": 18.8,
+     "node": 58.5,
+     "bun": 55.5
+    },
+    "array_sum": {
+     "chidori": 16.2,
+     "node": 59.1,
+     "bun": 40.7
+    },
+    "closures": {
+     "chidori": 7.4,
+     "node": 44.6,
+     "bun": 40.2
+    },
+    "fib_recursive": {
+     "chidori": 7.2,
+     "node": 44.6,
+     "bun": 39.3
+    },
+    "json_roundtrip": {
+     "chidori": 8.1,
+     "node": 46.4,
+     "bun": 46.3
+    },
+    "property_access": {
+     "chidori": 7.3,
+     "node": 44.5,
+     "bun": 40.4
+    },
+    "sort": {
+     "chidori": 10.1,
+     "node": 58.4,
+     "bun": 43.7
+    },
+    "string_build": {
+     "chidori": 11.4,
+     "node": 48.2,
+     "bun": 38.6
+    }
+   }
+  },
+  {
+   "pr": 97,
+   "title": "Release-build perf: mimalloc allocator, PGO build script, profiling profile",
+   "merged_at": "2026-07-10T05:01:04Z",
+   "comment_created_at": "2026-07-09T21:20:17Z",
+   "comment_updated_at": "2026-07-09T21:32:36Z",
+   "startup_ms": {
+    "chidori": 2.9,
+    "node": 29.2,
+    "bun": 11.7
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 32.3,
+     "node": 2.2,
+     "bun": 5.4
+    },
+    "array_hof": {
+     "chidori": 38.1,
+     "node": 23.5,
+     "bun": 12.1
+    },
+    "array_push_sum": {
+     "chidori": 24.9,
+     "node": 13,
+     "bun": 14.7
+    },
+    "array_sum": {
+     "chidori": 152.1,
+     "node": 39.4,
+     "bun": 66.9
+    },
+    "closures": {
+     "chidori": 26.6,
+     "node": 0.3,
+     "bun": 4.8
+    },
+    "fib_recursive": {
+     "chidori": 63.7,
+     "node": 10.9,
+     "bun": 9.1
+    },
+    "json_roundtrip": {
+     "chidori": 140.1,
+     "node": 52.5,
+     "bun": 26.3
+    },
+    "property_access": {
+     "chidori": 20.4,
+     "node": 1.4,
+     "bun": 4.2
+    },
+    "sort": {
+     "chidori": 293.1,
+     "node": 108.7,
+     "bun": 71.2
+    },
+    "string_build": {
+     "chidori": 21.7,
+     "node": 6.8,
+     "bun": 4.1
+    }
+   },
+   "max_rss_mb": {
+    "(startup)": {
+     "chidori": 6.9,
+     "node": 39.5,
+     "bun": 31.3
+    },
+    "arith_loop": {
+     "chidori": 7.1,
+     "node": 44.2,
+     "bun": 40.1
+    },
+    "array_hof": {
+     "chidori": 19.3,
+     "node": 59.5,
+     "bun": 51.1
+    },
+    "array_push_sum": {
+     "chidori": 18.6,
+     "node": 57.3,
+     "bun": 55.6
+    },
+    "array_sum": {
+     "chidori": 16.3,
+     "node": 57.9,
+     "bun": 40.7
+    },
+    "closures": {
+     "chidori": 7,
+     "node": 43.4,
+     "bun": 40
+    },
+    "fib_recursive": {
+     "chidori": 7.2,
+     "node": 43.3,
+     "bun": 39.2
+    },
+    "json_roundtrip": {
+     "chidori": 8,
+     "node": 45.1,
+     "bun": 46.5
+    },
+    "property_access": {
+     "chidori": 7.2,
+     "node": 43.3,
+     "bun": 40.2
+    },
+    "sort": {
+     "chidori": 10.1,
+     "node": 57.4,
+     "bun": 43.6
+    },
+    "string_build": {
+     "chidori": 11.2,
+     "node": 47.1,
+     "bun": 38.4
+    }
+   }
+  },
+  {
+   "pr": 100,
+   "title": "Add perf bench coverage: runtime-layer criterion suite + 3 JS workloads",
+   "merged_at": "2026-07-10T05:43:41Z",
+   "comment_created_at": "2026-07-10T05:23:15Z",
+   "comment_updated_at": "2026-07-10T05:23:15Z",
+   "startup_ms": {
+    "chidori": 2.8,
+    "node": 26.8,
+    "bun": 11.3
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 32,
+     "node": 5.9,
+     "bun": 4.8
+    },
+    "array_hof": {
+     "chidori": 39.5,
+     "node": 22.9,
+     "bun": 12.5
+    },
+    "array_push_sum": {
+     "chidori": 25.7,
+     "node": 13.1,
+     "bun": 13.7
+    },
+    "array_sum": {
+     "chidori": 156.7,
+     "node": 40.2,
+     "bun": 65.7
+    },
+    "closures": {
+     "chidori": 32.9,
+     "node": 0.8,
+     "bun": 3.4
+    },
+    "fib_recursive": {
+     "chidori": 60,
+     "node": 8.9,
+     "bun": 8.3
+    },
+    "json_roundtrip": {
+     "chidori": 139,
+     "node": 49.2,
+     "bun": 25
+    },
+    "mutual_recursion": {
+     "chidori": 123.8,
+     "node": 8,
+     "bun": 6.8
+    },
+    "property_access": {
+     "chidori": 22.2,
+     "node": 1.2,
+     "bun": 3.6
+    },
+    "sort": {
+     "chidori": 287.4,
+     "node": 105.6,
+     "bun": 70
+    },
+    "string_build": {
+     "chidori": 21.2,
+     "node": 6.2,
+     "bun": 2.9
+    },
+    "string_scan": {
+     "chidori": 55,
+     "node": 7.8,
+     "bun": 5.1
+    },
+    "typed_array": {
+     "chidori": 41.7,
+     "node": 25.1,
+     "bun": 9.9
+    }
+   },
+   "max_rss_mb": {
+    "(startup)": {
+     "chidori": 7,
+     "node": 39.4,
+     "bun": 31.2
+    },
+    "arith_loop": {
+     "chidori": 7.2,
+     "node": 44.1,
+     "bun": 40.1
+    },
+    "array_hof": {
+     "chidori": 19.3,
+     "node": 59.4,
+     "bun": 51
+    },
+    "array_push_sum": {
+     "chidori": 19,
+     "node": 57.2,
+     "bun": 55.5
+    },
+    "array_sum": {
+     "chidori": 16.3,
+     "node": 57.9,
+     "bun": 40.7
+    },
+    "closures": {
+     "chidori": 7.1,
+     "node": 43.3,
+     "bun": 40.6
+    },
+    "fib_recursive": {
+     "chidori": 7.1,
+     "node": 43.3,
+     "bun": 39.2
+    },
+    "json_roundtrip": {
+     "chidori": 8.1,
+     "node": 45.2,
+     "bun": 46.3
+    },
+    "mutual_recursion": {
+     "chidori": 7.3,
+     "node": 44.5,
+     "bun": 41.5
+    },
+    "property_access": {
+     "chidori": 7.1,
+     "node": 43.3,
+     "bun": 40.3
+    },
+    "sort": {
+     "chidori": 10,
+     "node": 57.3,
+     "bun": 43.7
+    },
+    "string_build": {
+     "chidori": 11.4,
+     "node": 47.1,
+     "bun": 38.4
+    },
+    "string_scan": {
+     "chidori": 8.4,
+     "node": 45.8,
+     "bun": 36.6
+    },
+    "typed_array": {
+     "chidori": 8,
+     "node": 46.7,
+     "bun": 38.4
+    }
+   },
+   "note": "This PR added workloads string_scan, typed_array, mutual_recursion (first appearance in the tables)."
+  },
+  {
+   "pr": 102,
+   "title": "Register bytecode tier: whole-function register programs over boxed values (§3.5)",
+   "merged_at": "2026-07-10T19:41:11Z",
+   "comment_created_at": "2026-07-10T18:37:51Z",
+   "comment_updated_at": "2026-07-10T19:25:13Z",
+   "startup_ms": {
+    "chidori": 2.9,
+    "node": 28.1,
+    "bun": 11.5
+   },
+   "workloads": {
+    "arith_loop": {
+     "chidori": 29,
+     "node": 2.8,
+     "bun": 4.4
+    },
+    "array_hof": {
+     "chidori": 39.1,
+     "node": 21.9,
+     "bun": 11.8
+    },
+    "array_push_sum": {
+     "chidori": 23.6,
+     "node": 12.2,
+     "bun": 13.8
+    },
+    "array_sum": {
+     "chidori": 147.3,
+     "node": 40.4,
+     "bun": 65.7
+    },
+    "closures": {
+     "chidori": 31.3,
+     "node": 0.1,
+     "bun": 3.3
+    },
+    "fib_recursive": {
+     "chidori": 60.9,
+     "node": 8.8,
+     "bun": 8.1
+    },
+    "json_roundtrip": {
+     "chidori": 136.3,
+     "node": 50.2,
+     "bun": 25.5
+    },
+    "mixed_helpers": {
+     "chidori": 612.7,
+     "node": 18.6,
+     "bun": 22.9
+    },
+    "mutual_recursion": {
+     "chidori": 117.3,
+     "node": 8.7,
+     "bun": 6.5
+    },
+    "property_access": {
+     "chidori": 16.1,
+     "node": 0.6,
+     "bun": 3.3
+    },
+    "sort": {
+     "chidori": 240.1,
+     "node": 103.4,
+     "bun": 70.4
+    },
+    "string_build": {
+     "chidori": 18.6,
+     "node": 4.8,
+     "bun": 2.9
+    },
+    "string_scan": {
+     "chidori": 39.2,
+     "node": 4.9,
+     "bun": 4.8
+    },
+    "typed_array": {
+     "chidori": 39.1,
+     "node": 23.1,
+     "bun": 10
+    }
+   },
+   "max_rss_mb": {
+    "(startup)": {
+     "chidori": 7.3,
+     "node": 39.4,
+     "bun": 31.2
+    },
+    "arith_loop": {
+     "chidori": 7.4,
+     "node": 44.2,
+     "bun": 40
+    },
+    "array_hof": {
+     "chidori": 19.5,
+     "node": 59.4,
+     "bun": 50.5
+    },
+    "array_push_sum": {
+     "chidori": 18.8,
+     "node": 57.1,
+     "bun": 55.4
+    },
+    "array_sum": {
+     "chidori": 16.5,
+     "node": 57.7,
+     "bun": 40.6
+    },
+    "closures": {
+     "chidori": 7.3,
+     "node": 43.3,
+     "bun": 40.6
+    },
+    "fib_recursive": {
+     "chidori": 7.1,
+     "node": 43.3,
+     "bun": 39.3
+    },
+    "json_roundtrip": {
+     "chidori": 8.3,
+     "node": 45.1,
+     "bun": 46.3
+    },
+    "mixed_helpers": {
+     "chidori": 8,
+     "node": 49.1,
+     "bun": 61.9
+    },
+    "mutual_recursion": {
+     "chidori": 7.4,
+     "node": 44.5,
+     "bun": 41.5
+    },
+    "property_access": {
+     "chidori": 7.3,
+     "node": 43.3,
+     "bun": 40.3
+    },
+    "sort": {
+     "chidori": 10.2,
+     "node": 57.2,
+     "bun": 43.6
+    },
+    "string_build": {
+     "chidori": 11.4,
+     "node": 47.1,
+     "bun": 38.4
+    },
+    "string_scan": {
+     "chidori": 8.7,
+     "node": 45.8,
+     "bun": 36.6
+    },
+    "typed_array": {
+     "chidori": 8,
+     "node": 46.7,
+     "bun": 38.5
+    }
+   },
+   "note": "New workload mixed_helpers appears for the first time (added by this PR). max_rss values are MiB as reported."
+  }
+ ]
+}

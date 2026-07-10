@@ -129,6 +129,17 @@ GitHub-hosted runner and are meant as a ratio smell-test, not a hard perf gate.
 The comment step is skipped for fork PRs (their token can't comment) and for
 manual `workflow_dispatch` runs; the artifact is still available in both cases.
 
+## Historical results
+
+[`perf-history.html`](./perf-history.html) is a self-contained animated replay
+of these CI comments across the July 2026 perf sprint (PRs #87 → #102): a
+speedup timeline, per-workload bars at each PR, per-runtime small multiples,
+and the max-RSS comparison. Open it directly in a browser. The per-PR numbers
+transcribed from the sticky comments live in
+[`perf-history.data.json`](./perf-history.data.json); to extend the page after
+a new PR, append that PR's table to the JSON and mirror it into the `PRS`
+array embedded in the HTML.
+
 ## How it stays honest
 
 Every workload prints exactly one `RESULT=<value>` line. The harness extracts it
