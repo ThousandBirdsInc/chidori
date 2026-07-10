@@ -500,6 +500,45 @@ const CORPUS: &[&str] = &[
     "function h2(n) { return n <= 0 ? 0 : Math.max(n % 7, h2(n - 1)); } console.log(h2(40));",
     // Captured numeric upvalue inside a recursive const arrow.
     "const LIM = 3; const f2 = (n) => (n <= LIM ? n : f2(n - 2) + 1); console.log(f2(21));",
+    // --- OWN-FRAME CELLS: captured loop bounds and accumulators -----------
+    // Captured loop bound: `n` is a cell (the arrow captures it).
+    "let n = 100; const bound = () => n; let s = 0; for (let i = 0; i < n; i++) { s += i; } console.log(s, bound());",
+    // Captured accumulator: the loop WRITES the cell; the closure reads the
+    // final value after.
+    "let total = 0; const read = () => total; for (let i = 0; i < 50; i++) { total += i * 2; } console.log(total, read());",
+    // Statement-position ++ on a captured binding (IncCellStmt).
+    "let hits = 0; const h = () => hits; for (let i = 0; i < 20; i++) { if (i % 3 === 0) hits++; } console.log(hits, h());",
+    // fib-iteration entirely over captured bindings (cell loads and stores).
+    "let a = 0, b = 1; const keep = () => a + b; for (let i = 0; i < 30; i++) { const t = a + b; a = b; b = t; } console.log(a, b, keep());",
+    // Captured binding warms late: starts undefined (guard declines), then
+    // becomes a number (late entry) — result identical either way.
+    "let t; const g = () => t; let s = 0; for (let i = 0; i < 10; i++) { t = (t || 0) + i; s = t; } console.log(s, t, g());",
+    // A string flows through the captured accumulator: guard declines and the
+    // generic loop concatenates exactly.
+    "let acc = 0; const r = () => acc; for (let i = 0; i < 6; i++) { if (i === 3) acc = '' + acc; acc += i; } console.log(acc, r());",
+    // The captured BOUND is reassigned mid-loop (loop-carried compare operand
+    // through a cell register, written back on every exit).
+    "let n = 10; const f = () => n; let c = 0; for (let i = 0; i < n; i++) { if (i === 5) n = 8; c++; } console.log(c, n, f());",
+    // Cell WRITES + a pinned-closure call in one region: translation must
+    // exclude the combination (a callee upvalue snapshot could go stale) and
+    // the generic path owns it — including when the callee captures the very
+    // accumulator being written.
+    "const dbl = (x) => x * 2; let sum = 0; const peek = () => sum; for (let i = 0; i < 10; i++) { sum += dbl(i); } console.log(sum, peek());",
+    "let sum = 0; const addsum = (x) => x + sum; let s = 0; for (let i = 0; i < 5; i++) { s = addsum(i); sum += 1; } console.log(s, sum);",
+    // Cell READ + pinned-closure call is allowed: bound stays a cell, callee
+    // runs on its window.
+    "let n = 10; const keepn = () => n; const inc = (x) => x + 1; let s = 0; for (let i = 0; i < n; i++) { s += inc(i); } console.log(s, keepn());",
+    // Callee whose upvalue IS the read-only cell: snapshot equals the cell
+    // for the whole activation (no writes anywhere).
+    "let base = 7; const keep = () => base; const addb = (x) => x + base; let s = 0; for (let i = 0; i < 6; i++) { s += addb(i); } console.log(s, keep());",
+    // TDZ: the loop reads a captured `let` before initialization — the guard
+    // declines (Uninitialized) and the generic path throws the ReferenceError.
+    "try { let s = 0; for (let i = 0; i < b; i++) { s += b; } console.log('no'); } catch (e) { console.log(e.constructor.name); } let b = 5; const q = () => b;",
+    // Interleaved kernel and generic iterations must keep the cell coherent:
+    // taint the loop with a bail-y array access while accumulating in a cell.
+    "const a = [1, , 3, 4]; let acc = 0; const look = () => acc; for (let i = 0; i < a.length; i++) { acc += a[i] || 0; } console.log(acc, look());",
+    // -0 / NaN through a captured accumulator.
+    "let z = 5; const zz = () => z; for (let i = 0; i < 3; i++) { z = -0 * i + z * 0; } console.log(Object.is(z, -0), Object.is(zz(), -0));",
 ];
 
 #[test]
@@ -610,6 +649,46 @@ fn v4_loops_get_kernels() {
     assert!(
         kernels_in("function f(t) { let s = 0; for (let i = 0; i < t.length; i++) { s += t[i]; } return s; } f(new Float64Array(4));") >= 1,
         "typed-array loop must kernelize"
+    );
+}
+
+/// Captured-binding (own-frame CELL) loops actually kernelize — and the
+/// cell-write + pinned-closure-call combination never does (a callee's
+/// upvalue snapshot could go stale against the written cell).
+#[test]
+fn cell_loops_get_kernels() {
+    fn kernels_in(src: &str) -> usize {
+        fn count(p: &FuncProto) -> usize {
+            let mut n = p.kernels.len();
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    n += count(f);
+                }
+            }
+            n
+        }
+        count(&compile_script(src).expect("compiles"))
+    }
+    // Captured loop bound: the loop reads a cell every test.
+    assert!(
+        kernels_in("let n = 100; const f = () => n; let s = 0; for (let i = 0; i < n; i++) { s += i; } s;") >= 1,
+        "cell-bound loop must kernelize"
+    );
+    // Captured accumulator: the loop WRITES the cell.
+    assert!(
+        kernels_in("let total = 0; const f = () => total; for (let i = 0; i < 50; i++) { total += i; } total;") >= 1,
+        "cell-accumulator loop must kernelize"
+    );
+    // Cell WRITE + pinned closure call: excluded by translation.
+    assert_eq!(
+        kernels_in("const g = (x) => x * 2; let sum = 0; const f = () => sum; for (let i = 0; i < 10; i++) { sum += g(i); } sum;"),
+        0,
+        "cell-write + pinned-callee region must stay generic"
+    );
+    // Cell READ + pinned closure call: allowed.
+    assert!(
+        kernels_in("let n = 10; const keep = () => n; const g = (x) => x + 1; let s = 0; for (let i = 0; i < n; i++) { s += g(i); } s;") >= 1,
+        "read-only cell + pinned-callee loop must kernelize"
     );
 }
 

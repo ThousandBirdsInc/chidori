@@ -448,6 +448,12 @@ struct Xlate<'a> {
     /// Pinned closure callees (loop mode; see [`KCallee`]): per oslot, the
     /// smallest argc any call site supplies.
     callees: Vec<KCallee>,
+    /// Whether the region STORES to any own-frame cell. Incompatible with
+    /// pinned-closure calls (`callees`): a callee's upvalue snapshot is
+    /// taken once per activation and could be the very cell being written —
+    /// the generic path would observe the updated value, the snapshot would
+    /// not. Checked after translation (either may be discovered first).
+    cells_stored: bool,
     /// a compare op fused with its following conditional jump: skip that ip.
     absorbed: Option<usize>,
     max_stack: u16,
@@ -513,6 +519,7 @@ fn translate(
         uses_array_pop: false,
         props_used: Vec::new(),
         callees: Vec::new(),
+        cells_stored: false,
         absorbed: None,
         max_stack: 0,
     };
@@ -611,6 +618,13 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     // resume, so any path needing a generic-interpreter exit rejects the
     // whole function (element access, or a body not ending in `Return`).
     if x.fn_mode && !x.exits.is_empty() {
+        return None;
+    }
+    // Cell WRITES + pinned-closure calls don't mix: a callee's upvalue
+    // snapshot is loaded once per activation and could be the very cell the
+    // region writes (see `Xlate::cells_stored`). Either side may be
+    // discovered first during emission, so the exclusion is checked here.
+    if x.cells_stored && !x.callees.is_empty() {
         return None;
     }
     // Synthesize exit stubs (deduplicated by resume ip + shape) and collect
@@ -817,7 +831,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 }
             } else {
                 for (r, slot) in locals.iter().enumerate() {
-                    if matches!(slot, KSlot::Local(_)) {
+                    if matches!(slot, KSlot::Local(_) | KSlot::Cell(_)) {
                         always_live |= 1 << r;
                     }
                 }
@@ -1406,6 +1420,29 @@ impl Xlate<'_> {
         Some(r)
     }
 
+    /// Register mirroring the numeric OWN-FRAME cell `frame.cells[c]` — a
+    /// binding some nested closure captures (the captured loop bound /
+    /// accumulator shape), which localization therefore left on the heap.
+    /// Read AND written like a local: the entry guard requires the cell to
+    /// hold a `Number` (TDZ `Uninitialized` declines), and every exit / bail
+    /// / interrupt unwind writes the register back. Loop mode only — a
+    /// frameless function kernel has no cells.
+    fn creg(&mut self, c: u32) -> Option<u16> {
+        if self.fn_mode {
+            return None;
+        }
+        let slot = KSlot::Cell(c);
+        if let Some(&(_, r)) = self.local_reg.iter().find(|(sl, _)| *sl == slot) {
+            return Some(r);
+        }
+        let r = u16::try_from(self.local_reg.len()).ok()?;
+        if r >= BOOL_BASE {
+            return None;
+        }
+        self.local_reg.push((slot, r));
+        Some(r)
+    }
+
     /// Register snapshotting captured upvalue cell `u` (read-only: nothing
     /// can write the cell during a kernel — regions contain no calls — and
     /// in-region upvalue writes are not on the allowlist).
@@ -1869,6 +1906,97 @@ impl Xlate<'_> {
                     self.kops.push(K::Mov { dst, src });
                 }
             }
+            // ---- own-frame cells (loop mode; see `Xlate::creg`). The entry
+            // guard proves each mapped cell holds a `Number`, so the TDZ
+            // check every cell read carries is statically satisfied and a
+            // checked store cannot throw. ----
+            Op::LoadCell(c) => {
+                let src = self.creg(*c)?;
+                let dst = self.push_num()?;
+                self.kops.push(K::Mov { dst, src });
+            }
+            Op::LoadCellConst { cell, konst } => {
+                let src = self.creg(*cell)?;
+                let dst0 = self.push_num()?;
+                self.kops.push(K::Mov { dst: dst0, src });
+                let (kv, k_bool) = self.scalar_const(*konst)?;
+                let dst1 = if k_bool {
+                    self.push_bool()?
+                } else {
+                    self.push_num()?
+                };
+                self.kops.push(K::Const { dst: dst1, k: kv });
+            }
+            // Cells carry no static boolean typing (unlike locals), so only
+            // NUMBER stores translate — a boolean/undefined top rejects the
+            // region and it stays generic.
+            Op::StoreCell(c) | Op::StoreCellChecked(c) => {
+                let dst = self.creg(*c)?;
+                let src = self.pop_num()?;
+                self.kops.push(K::Mov { dst, src });
+                self.cells_stored = true;
+            }
+            Op::AddCellConst { cell, konst } => {
+                let a = self.creg(*cell)?;
+                let (kv, _) = self.scalar_const(*konst)?;
+                let dst = self.push_num()?;
+                self.kops.push(K::AddK { dst, a, k: kv });
+            }
+            Op::ArithCellConst { cell, konst, kind } => {
+                let a = self.creg(*cell)?;
+                let (kv, _) = self.scalar_const(*konst)?;
+                let dst = self.push_num()?;
+                self.kops.push(K::ArithK {
+                    kind: *kind,
+                    dst,
+                    a,
+                    k: kv,
+                });
+            }
+            Op::IncCellStmt { cell, dec } => {
+                let r = self.creg(*cell)?;
+                self.kops.push(K::AddK {
+                    dst: r,
+                    a: r,
+                    k: if *dec { -1.0 } else { 1.0 },
+                });
+                self.cells_stored = true;
+            }
+            Op::CmpCellConstBranchFalse {
+                cell,
+                konst,
+                cmp,
+                target,
+            }
+            | Op::CmpCellConstBranchTrue {
+                cell,
+                konst,
+                cmp,
+                target,
+            } => {
+                let if_true = matches!(op, Op::CmpCellConstBranchTrue { .. });
+                let a = self.creg(*cell)?;
+                let (kv, k_bool) = self.scalar_const(*konst)?;
+                // A mapped cell is always number-typed.
+                if let Some(outcome) = static_cmp(*cmp, false, k_bool) {
+                    if outcome == if_true {
+                        let kidx = self.kops.len();
+                        self.kops.push(K::Br { target: u16::MAX });
+                        self.branch_to(kidx, *target, self.vstack.clone())?;
+                    }
+                } else {
+                    let kidx = self.kops.len();
+                    self.kops.push(K::BrCmpK {
+                        cmp: *cmp,
+                        a,
+                        k: kv,
+                        if_true,
+                        target: u16::MAX,
+                    });
+                    self.branch_to(kidx, *target, self.vstack.clone())?;
+                }
+            }
+
             // FUNCTION kernels: a call argument (read-only; the entry guard
             // requires it present and a `Number`). Loop regions never see
             // `LoadArg` — parameters are copied to locals in the prologue.

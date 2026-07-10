@@ -1172,12 +1172,24 @@ pub struct KernelRec {
     pub globals: Box<[Box<str>]>,
 }
 
-/// A numeric register's source: a frame local (read/write), a captured
-/// upvalue cell (read-only snapshot), or — FUNCTION kernels only — a call
-/// argument (read-only; the entry guard requires it present and a `Number`).
+/// A numeric register's source: a frame local (read/write), an OWN-FRAME
+/// heap cell (read/write — a binding some nested closure captures, so
+/// localization left it a cell: the loop bound or accumulator shape), a
+/// captured upvalue cell (read-only snapshot), or — FUNCTION kernels only —
+/// a call argument (read-only; the entry guard requires it present and a
+/// `Number`).
+///
+/// `Cell` write-back is sound for the same reason upvalue snapshots are:
+/// nothing inside a kernel region can CALL the closure that captured the
+/// cell, so no observer exists between entry and the write-back at every
+/// exit/bail/interrupt. The one exception — pinned-closure calls
+/// ([`KOp::CallKernel`]), whose callees snapshot their upvalues once per
+/// activation — is excluded at translation: a region that WRITES any cell
+/// and calls a pinned closure stays generic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KSlot {
     Local(u32),
+    Cell(u32),
     Upvalue(u32),
     Arg(u32),
 }
@@ -1324,10 +1336,12 @@ impl KMath {
 pub struct Kernel {
     pub code: Box<[KOp]>,
     /// Numeric slots mirrored into registers `0..locals.len()`: frame locals
-    /// (read/write) and UPVALUES (read-only snapshots — no call can run
-    /// inside a kernel, so nothing can write a captured cell mid-activation;
-    /// in-region upvalue WRITES reject at translation). The guard requires
-    /// `Value::Number` in every one; only `Local` slots write back.
+    /// (read/write), OWN-FRAME CELLS (read/write — captured loop bounds and
+    /// accumulators; see [`KSlot`]) and UPVALUES (read-only snapshots — no
+    /// call can run inside a kernel, so nothing can write a captured cell
+    /// mid-activation; in-region upvalue WRITES reject at translation). The
+    /// guard requires `Value::Number` in every one; `Local` and `Cell` slots
+    /// write back.
     ///
     /// FUNCTION kernels additionally use `Arg` slots (read-only; the guard
     /// requires the argument present and a `Number`), and their `Local` slots

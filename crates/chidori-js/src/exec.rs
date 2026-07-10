@@ -482,6 +482,12 @@ impl Vm {
                 crate::bytecode::KSlot::Local(l) => {
                     matches!(frame.locals[*l as usize], Value::Number(_))
                 }
+                // An own-frame cell in the TDZ (`Uninitialized`) or holding a
+                // non-Number declines like any other slot; the generic path
+                // then raises the ReferenceError / runs the coercion.
+                crate::bytecode::KSlot::Cell(c) => {
+                    matches!(*frame.cells[*c as usize].borrow(), Value::Number(_))
+                }
                 crate::bytecode::KSlot::Upvalue(u) => {
                     matches!(*frame.func.upvalues[*u as usize].borrow(), Value::Number(_))
                 }
@@ -645,6 +651,7 @@ impl Vm {
         for (r, slot) in k.locals.iter().enumerate() {
             let v = match slot {
                 crate::bytecode::KSlot::Local(l) => frame.locals[*l as usize].clone(),
+                crate::bytecode::KSlot::Cell(c) => frame.cells[*c as usize].borrow().clone(),
                 crate::bytecode::KSlot::Upvalue(u) => {
                     frame.func.upvalues[*u as usize].borrow().clone()
                 }
@@ -731,6 +738,8 @@ impl Vm {
                             .all(|op| !matches!(op, KOp::Ret { boolean: true, .. }))
                         && ck.locals.iter().all(|sl| match sl {
                             crate::bytecode::KSlot::Arg(a) => *a < u32::from(c.min_argc),
+                            // Loop-kernel-only slot; never in a fn kernel.
+                            crate::bytecode::KSlot::Cell(_) => false,
                             _ => true,
                         })
                         && (ck.math_used.is_empty() || self.kernel_math_ok(&ck.math_used))
@@ -791,15 +800,7 @@ impl Vm {
                                     // Same latch-and-unwind as the interpreter
                                     // loop: zero the budget so a JS catch
                                     // cannot resume execution.
-                                    for (r, slot) in k.locals.iter().enumerate() {
-                                        if let crate::bytecode::KSlot::Local(l) = slot {
-                                            frame.locals[*l as usize] = Value::Number(regs[r]);
-                                        }
-                                    }
-                                    for (j, &l) in k.bool_locals.iter().enumerate() {
-                                        frame.locals[l as usize] =
-                                            Value::Bool(regs[bool_base + j] != 0.0);
-                                    }
+                                    writeback_kernel_slots(k, frame, &regs, bool_base);
                                     writeback_kernel_props(k, &objs, &prop_slots, &regs);
                                     self.kernel_regs = regs;
                                     objs.clear();
@@ -1142,14 +1143,7 @@ impl Vm {
                     if !run_callee_window(&mut regs, ck, win, dst as usize, &interrupt, &mut poll) {
                         // Interrupted on a callee back-edge: the same
                         // latch-and-unwind as an interrupted caller edge.
-                        for (r, slot) in k.locals.iter().enumerate() {
-                            if let crate::bytecode::KSlot::Local(l) = slot {
-                                frame.locals[*l as usize] = Value::Number(regs[r]);
-                            }
-                        }
-                        for (j, &l) in k.bool_locals.iter().enumerate() {
-                            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
-                        }
+                        writeback_kernel_slots(k, frame, &regs, bool_base);
                         writeback_kernel_props(k, &objs, &prop_slots, &regs);
                         self.kernel_regs = regs;
                         objs.clear();
@@ -1170,18 +1164,11 @@ impl Vm {
             }
             pc += 1;
         };
-        // Materialize: every mapped numeric local back to the frame (as
+        // Materialize: every mapped numeric local/cell back to the frame (as
         // Numbers), then the operand stack from the exit's shape (bottom-up:
         // registers as Numbers, object slots as objects), then resume the
         // bytecode interpreter at the exit's target.
-        for (r, slot) in k.locals.iter().enumerate() {
-            if let crate::bytecode::KSlot::Local(l) = slot {
-                frame.locals[*l as usize] = Value::Number(regs[r]);
-            }
-        }
-        for (j, &l) in k.bool_locals.iter().enumerate() {
-            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
-        }
+        writeback_kernel_slots(k, frame, &regs, bool_base);
         writeback_kernel_props(k, &objs, &prop_slots, &regs);
         for slot in k.shapes[shape as usize].iter() {
             match slot {
@@ -1257,6 +1244,12 @@ impl Vm {
                 // proved a store dominates every read, so no frame slot is
                 // needed (and none exists).
                 crate::bytecode::KSlot::Local(_) => {}
+                // Own-frame cells exist only in loop kernels (frameless
+                // bodies have no cells); decline defensively.
+                crate::bytecode::KSlot::Cell(_) => {
+                    self.kernel_regs = regs;
+                    return None;
+                }
                 crate::bytecode::KSlot::Upvalue(u) => match &*bf.upvalues[*u as usize].borrow() {
                     Value::Number(n) => regs[r] = *n,
                     _ => {
@@ -1442,6 +1435,8 @@ impl Vm {
                         }
                     }
                     crate::bytecode::KSlot::Local(_) => {}
+                    // Loop-kernel-only slot; a frameless body has no cells.
+                    crate::bytecode::KSlot::Cell(_) => return None,
                 }
             }
             arg_slots.push(aslots);
@@ -1811,6 +1806,8 @@ impl Vm {
                 // every read, so a stale value from the previous call is
                 // never observable.
                 crate::bytecode::KSlot::Local(_) => {}
+                // Loop-kernel-only slot; a frameless body has no cells.
+                crate::bytecode::KSlot::Cell(_) => return None,
                 crate::bytecode::KSlot::Upvalue(u) => match &*p.bf.upvalues[*u as usize].borrow() {
                     Value::Number(n) => p.regs[r] = *n,
                     _ => return None,
@@ -1871,6 +1868,8 @@ impl Vm {
                 // Consumes a third argument the comparator is never given.
                 crate::bytecode::KSlot::Arg(_) => return None,
                 crate::bytecode::KSlot::Local(_) => {}
+                // Loop-kernel-only slot; a frameless body has no cells.
+                crate::bytecode::KSlot::Cell(_) => return None,
                 crate::bytecode::KSlot::Upvalue(u) => match &*p.bf.upvalues[*u as usize].borrow() {
                     Value::Number(n) => p.regs[r] = *n,
                     _ => return None,
@@ -5874,6 +5873,33 @@ fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Valu
 /// every path that leaves the register world: normal exits, bails (which
 /// route through an Exit), and interrupt unwinds. Load-only classes never
 /// change, so their slots are left untouched.
+/// Write a loop kernel's register state back into the frame: `Local` slots
+/// as `Value::Number`, own-frame `Cell` slots through their `RefCell` (no
+/// borrow can be outstanding while a kernel runs), boolean locals as
+/// `Value::Bool`. `Upvalue`/`Arg` slots are read-only snapshots and never
+/// write back. Runs on every exit, bail, and interrupt unwind.
+fn writeback_kernel_slots(
+    k: &crate::bytecode::Kernel,
+    frame: &mut Frame,
+    regs: &[f64],
+    bool_base: usize,
+) {
+    for (r, slot) in k.locals.iter().enumerate() {
+        match slot {
+            crate::bytecode::KSlot::Local(l) => {
+                frame.locals[*l as usize] = Value::Number(regs[r])
+            }
+            crate::bytecode::KSlot::Cell(c) => {
+                *frame.cells[*c as usize].borrow_mut() = Value::Number(regs[r])
+            }
+            crate::bytecode::KSlot::Upvalue(_) | crate::bytecode::KSlot::Arg(_) => {}
+        }
+    }
+    for (j, &l) in k.bool_locals.iter().enumerate() {
+        frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
+    }
+}
+
 fn writeback_kernel_props(
     k: &crate::bytecode::Kernel,
     objs: &[JsObject],
