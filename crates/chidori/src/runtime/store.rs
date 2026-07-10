@@ -336,6 +336,12 @@ impl SqliteRunStoreShared {
                  data TEXT NOT NULL,
                  PRIMARY KEY (run_id, seq)
              );
+             -- append_record derives each new pos from MAX(pos) for the run;
+             -- without this index that is a full scan of the run's rows, so
+             -- appending the K-th record cost O(K) — against the trait's O(1)
+             -- contract. With it, MAX(pos) is a B-tree seek.
+             CREATE INDEX IF NOT EXISTS idx_run_records_pos
+                 ON run_records(run_id, pos);
              CREATE TABLE IF NOT EXISTS run_blobs (
                  run_id TEXT NOT NULL,
                  key TEXT NOT NULL,

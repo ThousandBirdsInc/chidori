@@ -619,6 +619,7 @@ pub async fn serve(
     scheduler::spawn_all(
         recipes,
         SchedulerDeps {
+            providers: providers.clone(),
             template_engine: template_engine.clone(),
             session_store: session_store.clone(),
             policy: policy.clone(),
@@ -659,7 +660,7 @@ pub async fn serve(
     // hub's runtime parts, then wake agents that were mid-run when the
     // previous process died and re-arm hibernating agents' alarm deadlines.
     {
-        let rt = Arc::new(crate::scheduler::new_tokio_runtime()?);
+        let rt = crate::scheduler::shared_tokio_runtime()?;
         let tools_dir = state
             .agent_path
             .parent()
@@ -894,7 +895,7 @@ async fn health() -> impl IntoResponse {
 /// it here (rather than only at create time) keeps the tightened policy in
 /// force across resume/approve/replay re-runs of the same session.
 fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engine {
-    let rt = Arc::new(crate::scheduler::new_tokio_runtime().unwrap());
+    let rt = crate::scheduler::shared_tokio_runtime().unwrap();
     // Reuse the app's provider registry so a replay-based resume sees the same
     // providers as the live-VM resume path (which drives `state.providers`
     // directly). In production this is the env-derived registry passed to
@@ -906,8 +907,9 @@ fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engine {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("tools");
-    let mut registry =
-        ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new());
+    let mut registry = ToolRegistry::load_from_dirs_cached(&[tools_dir])
+        .map(|r| (*r).clone())
+        .unwrap_or_else(|_| ToolRegistry::new());
     for def in app.mcp_tools.iter() {
         registry.register(def.clone());
     }
@@ -1048,6 +1050,7 @@ async fn run_recipe(State(state): State<AppState>, Path(name): Path<String>) -> 
             .into_response();
     };
     let deps = SchedulerDeps {
+        providers: state.providers.clone(),
         template_engine: state.template_engine.clone(),
         session_store: state.session_store.clone(),
         policy: state.policy.clone(),

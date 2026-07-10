@@ -64,7 +64,9 @@
 //! corpus + fuzz (`tests/kernels.rs`) runs every supported construct with
 //! kernels on and off and asserts byte-identical behavior.
 
-use crate::bytecode::{CmpOp, Const, KCallee, KMath, KOp, KProp, KShapeSlot, KSlot, Kernel, Op};
+use crate::bytecode::{
+    CmpOp, Const, KCallee, KMath, KOp, KProp, KShapeSlot, KSlot, Kernel, KernelRec, Op, SelfRefKind,
+};
 use crate::exec::ArithKind;
 
 /// Bounds keeping `u16` fields comfortable and per-kernel work finite. Loops
@@ -148,6 +150,7 @@ pub fn kernelize(mut code: Vec<Op>, consts: &[Const]) -> (Vec<Op>, Vec<Kernel>) 
                 &bools,
                 false,
                 None,
+                false,
             );
             let mut grew = false;
             for o in d_obj {
@@ -203,33 +206,45 @@ pub fn kernelize_function(
     if !code.iter().any(|op| matches!(op, Op::Return)) {
         return None;
     }
-    // Same boolean-local fixpoint as `kernelize`; array-base discoveries
-    // reject outright (element access can't run frameless).
-    let mut bools: Vec<u32> = Vec::new();
-    for _ in 0..6 {
-        let (k, d_obj, d_bool) = translate(code, 0, consts, inner, &[], &bools, true, self_name);
-        if !d_obj.is_empty() {
-            return None;
-        }
-        let mut grew = false;
-        for b in d_bool {
-            if !bools.contains(&b) {
-                bools.push(b);
-                grew = true;
+    // Try the recursion's static return type as Number first, then Boolean
+    // (`isEven`-style predicates): the assumption types every `SelfCall` dst
+    // register, so a wrong guess fails translation (shape mismatch) or the
+    // homogeneity check below, and the other assumption gets its turn. For
+    // non-recursive bodies the assumption is never consulted — the first
+    // pass decides.
+    'ret_ty: for ret_bool in [false, true] {
+        // Same boolean-local fixpoint as `kernelize`; array-base discoveries
+        // reject outright (element access can't run frameless).
+        let mut bools: Vec<u32> = Vec::new();
+        for _ in 0..6 {
+            let (k, d_obj, d_bool) = translate(
+                code,
+                0,
+                consts,
+                inner,
+                &[],
+                &bools,
+                true,
+                self_name,
+                ret_bool,
+            );
+            if !d_obj.is_empty() {
+                return None;
             }
-        }
-        if !grew {
-            let mut k = k?;
-            // Frameless kernels are self-contained by construction.
-            debug_assert!(k.oslots.is_empty() && k.shapes.is_empty());
-            if k.code.iter().any(|op| matches!(op, KOp::SelfCall { .. })) {
-                // RECURSIVE kernel. Every self-call must supply every
-                // argument the body consumes (a short call would need the
-                // generic `undefined` parameter), and every return must be
-                // a NUMBER (a boolean result would land in a caller
-                // register statically typed Num — typeof/strict-eq would
-                // diverge). Either miss keeps the whole function generic.
-                let args_used = k
+            let mut grew = false;
+            for b in d_bool {
+                if !bools.contains(&b) {
+                    bools.push(b);
+                    grew = true;
+                }
+            }
+            if !grew {
+                let Some(mut k) = k else {
+                    continue 'ret_ty;
+                };
+                // Frameless kernels are self-contained by construction.
+                debug_assert!(k.oslots.is_empty() && k.shapes.is_empty());
+                k.args_used = k
                     .locals
                     .iter()
                     .filter_map(|sl| match sl {
@@ -238,16 +253,30 @@ pub fn kernelize_function(
                     })
                     .max()
                     .unwrap_or(0);
-                for op in k.code.iter() {
-                    match *op {
-                        KOp::SelfCall { argc, .. } if u32::from(argc) < args_used => return None,
-                        KOp::Ret { boolean: true, .. } => return None,
-                        _ => {}
+                if k.rec.is_some() {
+                    // RECURSIVE kernel. Every SELF-call must supply every
+                    // argument the body consumes (a short call would need
+                    // the generic `undefined` parameter; mutual-recursion
+                    // call sites are checked against the RESOLVED callee by
+                    // the entry guard), and every return must match the
+                    // assumed static type — a mixed-type recursion would
+                    // land a value in a caller register of the wrong static
+                    // type (typeof/strict-eq would diverge).
+                    for op in k.code.iter() {
+                        match *op {
+                            KOp::SelfCall {
+                                argc, callee: 0, ..
+                            } if u32::from(argc) < k.args_used => return None,
+                            KOp::Ret { boolean, .. } if boolean != ret_bool => {
+                                continue 'ret_ty;
+                            }
+                            _ => {}
+                        }
                     }
+                    k.ret_bool = ret_bool;
                 }
-                k.self_global = Some(self_name?.into());
+                return Some(k);
             }
-            return Some(k);
         }
     }
     None
@@ -322,11 +351,15 @@ enum VE {
     /// consumer is a store to a local (the `init` tracking then rejects any
     /// read of that local); everything else rejects.
     Opaque,
-    /// fn mode only: the function ITSELF, from `LoadGlobal` of its own name
-    /// — speculative: the entry guard verifies the global binding still
-    /// holds the very closure being invoked. Its ONLY legal consumer is a
-    /// `Call` (which fuses to [`KOp::SelfCall`]); everything else rejects.
-    SelfFn,
+    /// fn mode only: a RECURSIVE-CALL target — speculative, entry-guarded.
+    /// `SelfFn(0)` is the function ITSELF (from `LoadGlobal` of its own
+    /// name, or `LoadUpvalue` of a captured binding in callee position);
+    /// `SelfFn(1 + i)` is the mutual-recursion partner named by
+    /// `rec_globals[i]` (from `LoadGlobal` of another name). The entry
+    /// guard verifies each binding still holds the expected closure. Its
+    /// ONLY legal consumer is a `Call` (which fuses to [`KOp::SelfCall`]
+    /// with `callee` = the payload); everything else rejects.
+    SelfFn(u16),
     /// `a.push` on the array base in the oslot — speculative: the entry
     /// guard verifies the canonical `Array.prototype.push` still backs the
     /// `push` property of the canonical prototype, and the op re-checks the
@@ -352,8 +385,20 @@ struct Xlate<'a> {
     /// there is no entry guard over locals to type them.
     fn_mode: bool,
     /// fn mode: the function's own name — `LoadGlobal` of it becomes
-    /// [`VE::SelfFn`] and a direct recursive call fuses to `KOp::SelfCall`.
+    /// [`VE::SelfFn(_)`] and a direct recursive call fuses to `KOp::SelfCall`.
     self_name: Option<&'a str>,
+    /// fn mode: the ASSUMED static return type of the recursion —
+    /// [`KOp::SelfCall`] dst registers are typed by this, and
+    /// `kernelize_function` verifies every `Ret` agrees (retrying the whole
+    /// translation under the other assumption on mismatch).
+    self_ret_bool: bool,
+    /// fn mode: how the body referenced the function itself (deduplicated) —
+    /// becomes [`KernelRec::self_refs`].
+    self_refs: Vec<SelfRefKind>,
+    /// fn mode: GLOBAL names called recursively that are NOT the function's
+    /// own name (mutual recursion) — becomes [`KernelRec::globals`];
+    /// `VE::SelfFn(1 + i)` indexes into it.
+    rec_globals: Vec<Box<str>>,
     /// Locals designated as array bases (phase 2) — empty in phase 1.
     oslot_locals: &'a [u32],
     /// Locals statically typed BOOLEAN (fixpoint-discovered from stores).
@@ -424,6 +469,7 @@ fn translate(
     bool_locals: &[u32],
     fn_mode: bool,
     self_name: Option<&str>,
+    self_ret_bool: bool,
 ) -> (Option<Kernel>, Vec<u32>, Vec<u32>) {
     let mut is_target = vec![false; region.len()];
     for op in region {
@@ -442,6 +488,9 @@ fn translate(
         inner,
         fn_mode,
         self_name,
+        self_ret_bool,
+        self_refs: Vec::new(),
+        rec_globals: Vec::new(),
         oslot_locals,
         bool_locals,
         kops: Vec::new(),
@@ -572,7 +621,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     for (kidx, resume_ip, shape) in exits {
         if shape
             .iter()
-            .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn))
+            .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn(_)))
         {
             return None; // undefined/opaque/self never survives to an exit
         }
@@ -702,7 +751,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     VE::MathFn(k) => KShapeSlot::MathFn(*k),
                     VE::ArrayPushFn(_) => KShapeSlot::ArrayPushFn,
                     VE::ArrayPopFn(_) => KShapeSlot::ArrayPopFn,
-                    VE::Undef | VE::Opaque | VE::SelfFn => {
+                    VE::Undef | VE::Opaque | VE::SelfFn(_) => {
                         unreachable!("undef/opaque/self never crosses block boundaries")
                     }
                 })
@@ -800,8 +849,21 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         .kops
         .iter()
         .any(|op| matches!(op, KOp::StoreElem { .. } | KOp::ArrayPush { .. }));
+    let loads_len = x.kops.iter().any(|op| matches!(op, KOp::LoadLen { .. }));
+    // fn mode: recursion descriptor from the recorded self/extern references
+    // (`kernelize_function` fills `ret_bool`/`args_used` and verifies the
+    // recursive constraints).
+    let rec = if x.self_refs.is_empty() && x.rec_globals.is_empty() {
+        None
+    } else {
+        Some(Box::new(KernelRec {
+            self_refs: std::mem::take(&mut x.self_refs).into_boxed_slice(),
+            globals: std::mem::take(&mut x.rec_globals).into_boxed_slice(),
+        }))
+    };
     Some(Kernel {
         stores_elems,
+        loads_len,
         uses_array_push: x.uses_array_push,
         uses_array_pop: x.uses_array_pop,
         code: std::mem::take(&mut x.kops).into_boxed_slice(),
@@ -813,7 +875,9 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         props_used: std::mem::take(&mut x.props_used).into_boxed_slice(),
         callee_slots: std::mem::take(&mut x.callees).into_boxed_slice(),
         n_regs: prop_base + n_props,
-        self_global: None, // `kernelize_function` fills it for recursive kernels
+        rec,
+        ret_bool: false, // `kernelize_function` fills for recursive kernels
+        args_used: 0,    // `kernelize_function` fills for fn kernels
         fallback: Box::new(Op::Nop), // caller stores the real header op
     })
 }
@@ -1549,7 +1613,7 @@ impl Xlate<'_> {
             VE::Bool
             | VE::Undef
             | VE::Opaque
-            | VE::SelfFn
+            | VE::SelfFn(_)
             | VE::MathObj
             | VE::MathFn(_)
             | VE::ArrayPushFn(_)
@@ -1644,7 +1708,7 @@ impl Xlate<'_> {
     fn branch_to(&mut self, kidx: usize, t: u32, shape: Vec<VE>) -> Option<()> {
         if shape
             .iter()
-            .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn))
+            .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn(_)))
         {
             return None; // undefined/opaque/self never crosses block boundaries
         }
@@ -1711,10 +1775,15 @@ impl Xlate<'_> {
                 }
             }
 
-            // The only supported globals, both speculative (entry-guarded):
+            // The only supported globals, all speculative (entry-guarded):
             // `Math` (canonical object as a data property) and — fn mode —
-            // the function's OWN name (the binding must hold the closure
-            // being invoked; see `Kernel::self_global`).
+            // recursive-call targets: the function's OWN name (the binding
+            // must hold the closure being invoked) or ANOTHER global that
+            // the entry guard must resolve to a closure with a compatible
+            // recursive kernel (mutual recursion). A mis-speculated
+            // non-callee global just fails translation — `SelfFn`'s only
+            // legal consumer is `Call` — so this never loses a kernel that
+            // exists today (non-Math, non-self globals rejected outright).
             Op::LoadGlobal(c) => {
                 let name = match self.consts.get(*c as usize)? {
                     Const::String(n) => n.as_str(),
@@ -1723,7 +1792,25 @@ impl Xlate<'_> {
                 if name == "Math" {
                     self.vstack.push(VE::MathObj);
                 } else if self.fn_mode && Some(name) == self.self_name {
-                    self.vstack.push(VE::SelfFn);
+                    let r = SelfRefKind::Global(name.into());
+                    if !self.self_refs.contains(&r) {
+                        self.self_refs.push(r);
+                    }
+                    self.vstack.push(VE::SelfFn(0));
+                } else if self.fn_mode {
+                    let idx = match self.rec_globals.iter().position(|g| &**g == name) {
+                        Some(i) => i,
+                        None => {
+                            // Bounded: a body calling many distinct globals
+                            // is not a recursion family worth resolving.
+                            if self.rec_globals.len() >= 4 {
+                                return None;
+                            }
+                            self.rec_globals.push(name.into());
+                            self.rec_globals.len() - 1
+                        }
+                    };
+                    self.vstack.push(VE::SelfFn(1 + idx as u16));
                 } else {
                     return None;
                 }
@@ -1759,10 +1846,28 @@ impl Xlate<'_> {
                 }
             }
             // A captured (read-only in-region) numeric upvalue: snapshot.
+            // fn mode, CALLEE position (the compiler's plain-call pattern is
+            // `LoadUpvalue; LoadUndefined(this); args…; Call`): speculate the
+            // upvalue is the function ITSELF — `const f = n => … f(…)`
+            // captures its own binding. The entry guard verifies the cell
+            // holds the invoked closure; a different callee (a helper fn)
+            // just declines there and the call runs generically. A
+            // mis-speculated NUMERIC upvalue directly followed by
+            // `LoadUndefined` (no such pattern reaches a kernelizable
+            // consumer) only fails translation, never correctness.
             Op::LoadUpvalue(u) => {
-                let src = self.uvreg(*u)?;
-                let dst = self.push_num()?;
-                self.kops.push(K::Mov { dst, src });
+                if self.fn_mode && matches!(self.region.get(i + 1), Some(Op::LoadUndefined)) {
+                    let r = SelfRefKind::Upvalue(*u);
+                    if !self.self_refs.contains(&r) {
+                        self.self_refs.push(r);
+                    }
+                    self.vstack.push(VE::SelfFn(0));
+                    self.origins.push(None);
+                } else {
+                    let src = self.uvreg(*u)?;
+                    let dst = self.push_num()?;
+                    self.kops.push(K::Mov { dst, src });
+                }
             }
             // FUNCTION kernels: a call argument (read-only; the entry guard
             // requires it present and a `Number`). Loop regions never see
@@ -1948,7 +2053,7 @@ impl Xlate<'_> {
                     VE::MathFn(_)
                     | VE::Undef
                     | VE::Opaque
-                    | VE::SelfFn
+                    | VE::SelfFn(_)
                     | VE::ArrayPushFn(_)
                     | VE::ArrayPopFn(_) => return None,
                 }
@@ -1957,8 +2062,8 @@ impl Xlate<'_> {
                 let n = self.vstack.len();
                 let (pa, pb) = (n.checked_sub(2)?, n - 1);
                 let (ea, eb) = (self.vstack[pa], self.vstack[pb]);
-                if matches!(ea, VE::Undef | VE::Opaque | VE::SelfFn)
-                    || matches!(eb, VE::Undef | VE::Opaque | VE::SelfFn)
+                if matches!(ea, VE::Undef | VE::Opaque | VE::SelfFn(_))
+                    || matches!(eb, VE::Undef | VE::Opaque | VE::SelfFn(_))
                 {
                     return None;
                 }
@@ -2000,7 +2105,7 @@ impl Xlate<'_> {
                 let (ea, eb, ec) = (self.vstack[pa], self.vstack[pb], self.vstack[pc_]);
                 if [ea, eb, ec]
                     .iter()
-                    .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn))
+                    .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn(_)))
                 {
                     return None;
                 }
@@ -2270,7 +2375,7 @@ impl Xlate<'_> {
             Op::Call(argc) => {
                 let n = *argc as usize;
                 let fn_pos = self.vstack.len().checked_sub(n + 2)?;
-                if matches!(self.vstack.get(fn_pos)?, VE::SelfFn) {
+                if let VE::SelfFn(callee) = *self.vstack.get(fn_pos)? {
                     // Plain sloppy call: `this` is the pushed `undefined`.
                     if !matches!(self.vstack.get(fn_pos + 1)?, VE::Undef) {
                         return None;
@@ -2286,11 +2391,20 @@ impl Xlate<'_> {
                     for _ in 0..n + 2 {
                         self.pop()?;
                     }
-                    let dst = self.push_num()?;
+                    // The result register's static type is the recursion's
+                    // ASSUMED return type; `kernelize_function` verifies
+                    // every `Ret` agrees (and the mutual-recursion entry
+                    // guard, that every resolved callee kernel agrees).
+                    let dst = if self.self_ret_bool {
+                        self.push_bool()?
+                    } else {
+                        self.push_num()?
+                    };
                     self.kops.push(K::SelfCall {
                         dst,
                         base,
                         argc: u16::try_from(n).ok()?,
+                        callee,
                     });
                     return Some(());
                 }

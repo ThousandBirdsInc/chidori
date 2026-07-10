@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -44,8 +44,30 @@ pub fn new_tokio_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
+/// The process-wide host-effect runtime, built on first use and never
+/// dropped. The server and scheduler used to build (and tear down) a fresh
+/// multi-thread runtime PER AGENT RUN — spawning a full worker pool with
+/// [`JS_THREAD_STACK_BYTES`] stacks each time (~430 µs plus thread churn;
+/// `benches/runtime.rs` per_run_setup). Engines only `block_on` this runtime
+/// from blocking threads and never spawn run-scoped background tasks on it,
+/// so one shared runtime serves every run. It lives in a `static` so it is
+/// never dropped (dropping a runtime from async context panics); the CLI's
+/// one-runtime-per-invocation paths in `main.rs` are unaffected.
+pub fn shared_tokio_runtime() -> std::io::Result<Arc<tokio::runtime::Runtime>> {
+    static RT: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
+    if let Some(rt) = RT.get() {
+        return Ok(rt.clone());
+    }
+    let rt = Arc::new(new_tokio_runtime()?);
+    Ok(RT.get_or_init(|| rt).clone())
+}
+
 #[derive(Clone)]
 pub struct SchedulerDeps {
+    /// Shared provider registry — the same one the server's session handlers
+    /// use, so scheduled runs see identical providers (and reuse its HTTP
+    /// clients) instead of rebuilding a registry from env on every tick.
+    pub providers: Arc<ProviderRegistry>,
     pub template_engine: Arc<TemplateEngine>,
     pub session_store: Arc<dyn SessionStore>,
     pub policy: Arc<PolicyConfig>,
@@ -108,8 +130,8 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
     let recipe_name = recipe.name.clone();
 
     let (id, session) = tokio::task::spawn_blocking(move || -> Result<(String, StoredSession)> {
-        let rt = Arc::new(crate::scheduler::new_tokio_runtime()?);
-        let providers = Arc::new(ProviderRegistry::from_env());
+        let rt = crate::scheduler::shared_tokio_runtime()?;
+        let providers = deps.providers.clone();
 
         // Build the tool registry: recipe-local dirs + default `<agent>/tools`
         // + any MCP tools the server handed us.
@@ -120,8 +142,9 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .join("tools"),
         );
-        let mut registry =
-            ToolRegistry::load_from_dirs(&dirs).unwrap_or_else(|_| ToolRegistry::new());
+        let mut registry = ToolRegistry::load_from_dirs_cached(&dirs)
+            .map(|r| (*r).clone())
+            .unwrap_or_else(|_| ToolRegistry::new());
         for def in &deps.mcp_tools {
             registry.register(def.clone());
         }

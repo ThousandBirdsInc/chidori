@@ -1127,12 +1127,49 @@ pub enum KOp {
     /// `regs[dst]` of the calling window (always a Number — recursive
     /// kernels reject boolean returns). Only emitted when the body's callee
     /// is `LoadGlobal` of the function's OWN name; the entry guard then
-    /// verifies that global binding still holds the very closure being
-    /// invoked ([`Kernel::self_global`]), so a rebound name declines to the
-    /// generic path. Depth is tracked against the interpreter's limit; an
-    /// overflow ABANDONS the (pure, side-effect-free) kernel activation and
-    /// reruns the whole call generically, which raises the spec RangeError.
-    SelfCall { dst: u16, base: u16, argc: u16 },
+    /// verifies the referenced bindings still hold the expected closures
+    /// ([`Kernel::rec`]), so a rebound name declines to the generic path.
+    /// `callee` selects the target: 0 = the invoked closure itself
+    /// (self-recursion, whether referenced through its global name or a
+    /// captured binding), `1 + i` = the closure the entry guard resolved for
+    /// [`KernelRec::globals`]`[i]` (mutual recursion). Depth is tracked
+    /// against the interpreter's limit; an overflow ABANDONS the (pure,
+    /// side-effect-free) kernel activation and reruns the whole call
+    /// generically, which raises the spec RangeError.
+    SelfCall {
+        dst: u16,
+        base: u16,
+        argc: u16,
+        callee: u16,
+    },
+}
+
+/// How a recursive function kernel's body referenced the function ITSELF —
+/// the entry guard verifies each holds the very closure being invoked
+/// (pointer identity), so a rebound/shadowed reference declines to the
+/// generic path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfRefKind {
+    /// `function f() { … f() … }` — via the global binding `f`.
+    Global(Box<str>),
+    /// `const f = () => … f() …` — via the captured cell at upvalue index.
+    Upvalue(u32),
+}
+
+/// Recursion descriptor for a FUNCTION kernel containing [`KOp::SelfCall`]s.
+/// Present iff the kernel is recursive; such kernels run on the windowed
+/// executor (`Vm::run_fn_kernel_rec`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KernelRec {
+    /// Every way the body referenced the invoked function itself.
+    pub self_refs: Box<[SelfRefKind]>,
+    /// GLOBAL names of the OTHER functions the body calls recursively
+    /// (mutual recursion): [`KOp::SelfCall`] `callee` `1 + i` targets the
+    /// closure the entry guard resolves for `globals[i]`. The guard requires
+    /// each to be a plain data global holding a plain bytecode closure with
+    /// a compatible recursive-class kernel, closed transitively over the
+    /// whole call family.
+    pub globals: Box<[Box<str>]>,
 }
 
 /// A numeric register's source: a frame local (read/write), a captured
@@ -1322,13 +1359,24 @@ pub struct Kernel {
     pub math_used: Box<[KMath]>,
     /// Total register count (mapped locals + canonical stack slots).
     pub n_regs: u16,
-    /// FUNCTION kernels containing [`KOp::SelfCall`]: the GLOBAL name the
-    /// body's recursive callee resolves through. The entry guard requires
-    /// the global binding to be a plain data property holding the very
-    /// closure being invoked (pointer identity) — a shadowed/rebound/
-    /// accessor'd name declines the kernel and the call runs generically.
-    /// `None` for loop kernels and non-recursive function kernels.
-    pub self_global: Option<Box<str>>,
+    /// FUNCTION kernels containing [`KOp::SelfCall`]: how the body
+    /// references itself and its mutual-recursion partners. `None` for loop
+    /// kernels and non-recursive function kernels. See [`KernelRec`].
+    pub rec: Option<Box<KernelRec>>,
+    /// FUNCTION kernels: the static return type — `true` when every
+    /// completing path returns a BOOLEAN (`isEven`-style predicates). A
+    /// recursive kernel's translation types every [`KOp::SelfCall`] dst
+    /// register by this (mixed-type recursive returns stay generic), and
+    /// the mutual-recursion entry guard requires it to AGREE across the
+    /// whole resolved call family.
+    pub ret_bool: bool,
+    /// FUNCTION kernels: 1 + the highest argument index the body consumes
+    /// (0 = none). A recursive call must supply at least this many
+    /// arguments — a shorter call would need the generic `undefined`
+    /// parameter. Self-calls are checked at translation; mutual-recursion
+    /// call sites are checked against the RESOLVED callee's value by the
+    /// entry guard.
+    pub args_used: u32,
     /// Whether the code contains a [`KOp::StoreElem`]. A store may CREATE an
     /// element (hole fill / exact append), and the spec's OrdinarySet
     /// consults the prototype chain when the own property is absent — so the
@@ -1336,6 +1384,12 @@ pub struct Kernel {
     /// reified index entry (`protos_allow_any_index_create`). Read-only
     /// loops skip that walk entirely.
     pub stores_elems: bool,
+    /// Whether the code contains a [`KOp::LoadLen`]. A typed-array base
+    /// resolves `.length` through a prototype ACCESSOR (unlike a dense
+    /// array's own exotic property), so the activation entry guard must
+    /// identity-check the canonical getter for any typed-array LoadLen base.
+    /// Kernels without a LoadLen skip that scan entirely.
+    pub loads_len: bool,
     /// Whether the code contains a [`KOp::ArrayPush`]: the activation entry
     /// must verify the canonical `Array.prototype.push` still backs the
     /// `push` property of the canonical Array prototype.

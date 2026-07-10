@@ -964,6 +964,119 @@ checksums byte-identical across the suite. Remaining costs are parse-side
 object building (property-map hashing) and the interpreter reads around
 the loop — shape-cache territory, out of scope here.
 
+## 6.7 String code-unit reads (landed 2026-07-10): cached length + O(1) ASCII indexing
+
+A gap found while adding bench coverage, not by callgrind — no workload
+exercised it (the new `string_scan` closes that): the `charCodeAt`-class
+accessors (`charCodeAt`/`charAt`/`codePointAt`/`at`) materialized the ENTIRE
+string as a fresh `Vec<u16>` per call (`units_this` → `to_utf16_vec`), and
+`.length` on a plain `Utf8` string re-scanned it per read — so the canonical
+tokenizer loop `for (i = 0; i < s.length; i++) s.charCodeAt(i)` was O(n²)
+with n full-string allocations.
+
+Two changes, no new dependencies, no semantic surface:
+
+- `Repr::Utf8` carries a lazily-cached UTF-16 unit count (`Cell<u32>`,
+  computed on first `len_utf16`; `from_code_units` records it for free).
+  `.length` is O(1) after first read, and — since unit count == byte count
+  iff the string is pure ASCII — `code_unit_at` indexes bytes directly on
+  ASCII strings (the `Rope` arm already stores totals, so an ASCII rope
+  gets the same O(1) path over its flattened bytes). Construction stays
+  O(1); the bytecode-constant load path (`from_rc_str`) pays nothing.
+- The four accessor builtins read through `code_unit_at` instead of
+  materializing code units.
+
+Measured: `string_scan` (8 KB ASCII string, 12 scan rounds + a charAt pass)
+**1.50 s → 50 ms wall (30×)**; heap churn for the criterion variant
+**20.16 MiB / 166 k allocs → 167 KiB / 2.4 k allocs**. RESULT byte-identical
+to Node. Non-ASCII strings keep the O(i) iterator path per read — a rope
+index or WTF-8 offset table remains available headroom if a workload ever
+needs it, and kernel candidate (a) (§6.5.1) now has its O(1) accessor
+prerequisite.
+
+## 6.8 Typed-array kernel bases (landed 2026-07-10): §6.5.1 candidate (c)
+
+The loop-kernel translator always accepted `t[i]` / `t[i] = v` / `t.length`
+over a pinned object base — the RUNTIME arms just only recognized dense
+`Internal::Array`, so a typed-array loop kernelized and then bailed on every
+access. The arms now also take numeric typed arrays:
+
+- `LoadElem`/`StoreElem`: a valid-index integer-indexed [[Get]]/[[Set]]
+  reads/writes element storage directly — own props and the prototype chain
+  are never consulted, so no props/proto re-check is needed (unlike dense
+  arrays). The register already holds the ToNumber'd store value, and
+  `typed_array::encode`/`decode` are the SAME per-kind conversions the
+  builtin path uses (f32 rounding, ToInt32-class wrapping, u8 clamping) —
+  bit-identical by construction. OOB (incl. detached / shrunk views) bails:
+  the generic path owns undefined-absorption and silent-store semantics.
+  BigInt-element kinds always bail (elements aren't Numbers).
+- `LoadLen`: typed-array `.length` resolves through a prototype ACCESSOR, so
+  the activation entry guard (`kernel_ta_len_ok`, gated by the new
+  `Kernel::loads_len` flag) identity-checks that any typed-array LoadLen
+  base still resolves to the pinned canonical `%TypedArray%.prototype`
+  getter (`Realm::ta_length_getter`) with no own shadow. Sound for the whole
+  activation: nothing inside a kernel can add props, change protos, or
+  resize/detach a buffer (all require calls).
+
+Measured: the `typed_array` workload (Float64Array sum/dot/transform +
+Int32Array bit-mix) **637 ms → 37 ms wall (17×)** — from ~45× behind Node to
+roughly parity. Gates: the kernels differential corpus grew 17 typed-array
+programs (per-kind store semantics incl. clamping/wrapping/f32 rounding,
+OOB reads and writes, aliased same-buffer and cross-kind views, offset
+subarrays, own-`length` shadow, patched prototype getter, null proto,
+BigInt kinds, resizable-buffer length tracking, mixed dense+typed regions);
+full suites + Test262 gate green.
+
+## 6.9 Kernel v9 (landed 2026-07-10): the recursion shapes — mutual,
+boolean-returning, and captured-binding self-reference (§6.5.1 e/f/g)
+
+The three shapes v6's self-recursion tier declined, all landed in one
+generalization. `KOp::SelfCall` gained a `callee` selector, `Kernel::
+self_global` became a `KernelRec` descriptor (`self_refs` + partner
+`globals`), and the windowed executor became MULTI-FUNCTION:
+
+- **Boolean returns (g)**: translation runs under an assumed static return
+  type (Number first, then Boolean) — `SelfCall` dst registers are typed by
+  the assumption and every `Ret` must agree, so `isEven`-class predicates
+  kernelize while mixed-type recursions stay generic. A top-level boolean
+  result materializes `Value::Bool` (typeof/strict-eq exact).
+- **Captured-binding self-reference (f)**: `LoadUpvalue` in callee position
+  (the compiler's `LoadUpvalue; LoadUndefined(this); args…; Call` pattern)
+  speculates SELF; the entry guard requires the cell to hold the very
+  closure being invoked. `const gcd = (a, b) => … gcd(…)` and named
+  function expressions kernelize; a rebound `let` or a helper closure in
+  the cell declines observably. Mis-speculation only costs translation —
+  the shapes it could hit were never kernelizable.
+- **Mutual recursion (e)**: `LoadGlobal` of a non-self name in fn mode
+  becomes a speculative partner reference. The entry guard resolves the
+  whole call FAMILY once per activation (transitively, bounded at 8):
+  every name a plain data global holding a plain sync bytecode closure
+  with a function kernel, every member's self-references intact, every
+  member's `Ret` type matching the entry kernel's, every call site
+  supplying the RESOLVED callee's consumed arguments, canonical Math and
+  Number upvalues per member. Execution stacks per-member register
+  windows over one buffer; the current member's tables are hoisted so
+  same-kernel recursion (fib-class) pays nothing new — fib's count is
+  unchanged. Nothing inside a kernel writes globals or cells, so entry
+  resolution holds for the activation; rebinding a partner BETWEEN calls
+  declines and the patched binding is observed generically.
+
+Measured (idle machine, interleaved A/B medians): **mutual_recursion
+(isEven/isOdd over 20k outer calls + const-arrow gcd) 1.106 s → 0.160 s
+(6.9×)**; fib_recursive / closures / sort unchanged. RESULT byte-identical.
+Remaining headroom: the per-activation family resolution allocates its
+tables per OUTER call (~40k entries here) — an entry cache or Vm-pooled
+scratch would shave the shallow-recursion case further.
+
+Gates: the kernels differential corpus grew 16 recursion programs
+(boolean/mutual/const-binding families, typeof/strict-eq observation,
+partner and self rebinding declines, non-kernelizable family members,
+short-arg call sites at translation and at entry, −0 pins, Math inside
+recursion, captured numeric upvalues) and the depth-overflow differential
+now covers the mutual path; structural pins updated (boolean/mutual/
+captured-binding recursion MUST kernelize, parameter-recursion must not);
+full suites + Test262 gate green.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

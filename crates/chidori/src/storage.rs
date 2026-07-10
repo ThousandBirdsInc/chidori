@@ -145,6 +145,12 @@ impl SqliteStore {
         }
         let conn = rusqlite::Connection::open(&path)
             .with_context(|| format!("opening sqlite at {}", path.display()))?;
+        // WAL + NORMAL, matching the run store (`runtime/store.rs`): every
+        // session state transition rewrites the session row, and the default
+        // rollback journal pays a full fsync per put while blocking readers.
+        // In WAL a put is one log append and readers never block on the writer.
+        conn.pragma_update(None, "journal_mode", "WAL").ok();
+        conn.pragma_update(None, "synchronous", "NORMAL").ok();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                  id TEXT PRIMARY KEY,

@@ -869,6 +869,11 @@ fn install_ta_accessors(vm: &mut Vm, proto: &JsObject) {
         }
         Value::Number(ta_fields(o).map(|(_, _, l, _)| l).unwrap_or(0) as f64)
     });
+    // Pin the canonical getter so the loop-kernel `LoadLen` entry guard can
+    // identity-check that a typed-array base still resolves `.length` to it.
+    if let Value::Object(gobj) = &g {
+        vm.realm.ta_length_getter = Some(gobj.clone());
+    }
     vm.define_accessor(
         &Value::Object(proto.clone()),
         PropertyKey::str("length"),
