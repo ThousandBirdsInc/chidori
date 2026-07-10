@@ -659,7 +659,7 @@ struct FnCtx {
     script_global: bool,
     /// Nesting depth of enclosing `with` statements within this function. When
     /// > 0, unqualified identifier reads/writes compile to dynamic name ops that
-    /// consult the runtime with-scope stack before the static binding.
+    /// > consult the runtime with-scope stack before the static binding.
     with_depth: u32,
     /// True when this function is textually nested inside a `with` block of an
     /// enclosing function: its free identifiers must also resolve dynamically
@@ -871,7 +871,7 @@ impl Compiler {
     fn region_has_arguments(&self, start: u32, end: u32) -> bool {
         self.source
             .get(start as usize..end as usize)
-            .map_or(true, |s| s.contains("arguments"))
+            .is_none_or(|s| s.contains("arguments"))
     }
 
     /// Whether the source region mentions `eval` — the conservative trigger
@@ -880,7 +880,7 @@ impl Compiler {
     fn region_has_eval(&self, start: u32, end: u32) -> bool {
         self.source
             .get(start as usize..end as usize)
-            .map_or(true, |s| s.contains("eval"))
+            .is_none_or(|s| s.contains("eval"))
     }
 }
 
@@ -1040,7 +1040,7 @@ impl Compiler {
     /// True while compiling directly in the top-level script body, where
     /// `var`/`function` declarations create global-object properties.
     fn in_global_scope(&self) -> bool {
-        self.fns.last().map_or(false, |f| f.script_global)
+        self.fns.last().is_some_and(|f| f.script_global)
     }
 
     /// Hoist one `var` binding pattern: a top-level simple identifier becomes a
@@ -4143,14 +4143,11 @@ impl Compiler {
                         self.emit(Op::TypeofExpr);
                         return Ok(());
                     }
-                    match self.resolve(name) {
-                        Resolved::Global => {
-                            let n = self.str_const(name);
-                            self.emit(Op::LoadGlobalTypeof(n));
-                            self.emit(Op::TypeofExpr);
-                            return Ok(());
-                        }
-                        _ => {}
+                    if let Resolved::Global = self.resolve(name) {
+                        let n = self.str_const(name);
+                        self.emit(Op::LoadGlobalTypeof(n));
+                        self.emit(Op::TypeofExpr);
+                        return Ok(());
                     }
                 }
                 self.compile_expr(&u.argument)?;

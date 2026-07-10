@@ -1500,6 +1500,67 @@ pub fn builtin_name_from_path(path: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Vendored packages: self-contained UMD bundles served as synthetic ES modules.
+//
+// npm `react` / `react-dom` are CommonJS (internal `require`), which the
+// ESM-only engine can't link. The official UMD builds are self-contained, so we
+// wrap them in an ESM shim that runs the bundle (which populates `globalThis`)
+// and re-exports — making `import React from 'react'` and
+// `import { renderToStaticMarkup } from 'react-dom/server'` resolve and link.
+// This is analogous to the `node:` builtin shims above.
+// ---------------------------------------------------------------------------
+
+const REACT_UMD: &str = include_str!("../vendor/react/react.js");
+const REACT_DOM_SERVER_UMD: &str = include_str!("../vendor/react/react-dom-server.js");
+
+/// True for bare specifiers served from the vendored-package registry.
+pub fn is_vendored_package(specifier: &str) -> bool {
+    matches!(
+        specifier,
+        "react" | "react-dom" | "react-dom/server" | "react-dom/server.browser"
+    )
+}
+
+/// Resolve a vendored bare specifier to `(module_key, esm_source)`, or `None`.
+/// The key is stable so the module graph evaluates each bundle exactly once.
+pub fn vendored_module(specifier: &str) -> Option<(String, String)> {
+    match specifier {
+        "react" | "react-dom" => Some((
+            "vendor:react".to_string(),
+            format!(
+                "globalThis.self = globalThis; globalThis.global = globalThis;\n\
+                 {REACT_UMD}\n\
+                 const __R = globalThis.React;\n\
+                 export default __R;\n\
+                 export const createElement = __R.createElement,\n\
+                   cloneElement = __R.cloneElement, createContext = __R.createContext,\n\
+                   Fragment = __R.Fragment, Children = __R.Children,\n\
+                   Component = __R.Component, PureComponent = __R.PureComponent,\n\
+                   memo = __R.memo, forwardRef = __R.forwardRef,\n\
+                   isValidElement = __R.isValidElement, version = __R.version,\n\
+                   useState = __R.useState, useEffect = __R.useEffect,\n\
+                   useLayoutEffect = __R.useLayoutEffect, useMemo = __R.useMemo,\n\
+                   useRef = __R.useRef, useCallback = __R.useCallback,\n\
+                   useContext = __R.useContext, useReducer = __R.useReducer,\n\
+                   useId = __R.useId;\n"
+            ),
+        )),
+        "react-dom/server" | "react-dom/server.browser" => Some((
+            "vendor:react-dom/server".to_string(),
+            format!(
+                "import 'react';\n\
+                 {REACT_DOM_SERVER_UMD}\n\
+                 const __S = globalThis.ReactDOMServer;\n\
+                 export default __S;\n\
+                 export const renderToString = __S.renderToString,\n\
+                   renderToStaticMarkup = __S.renderToStaticMarkup;\n"
+            ),
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1598,66 +1659,5 @@ mod tests {
         let path = PathBuf::from("/some/workspace/src/index.ts");
         assert_eq!(builtin_name_from_path(&path), None);
         assert_eq!(source_for(&path), None);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Vendored packages: self-contained UMD bundles served as synthetic ES modules.
-//
-// npm `react` / `react-dom` are CommonJS (internal `require`), which the
-// ESM-only engine can't link. The official UMD builds are self-contained, so we
-// wrap them in an ESM shim that runs the bundle (which populates `globalThis`)
-// and re-exports — making `import React from 'react'` and
-// `import { renderToStaticMarkup } from 'react-dom/server'` resolve and link.
-// This is analogous to the `node:` builtin shims above.
-// ---------------------------------------------------------------------------
-
-const REACT_UMD: &str = include_str!("../vendor/react/react.js");
-const REACT_DOM_SERVER_UMD: &str = include_str!("../vendor/react/react-dom-server.js");
-
-/// True for bare specifiers served from the vendored-package registry.
-pub fn is_vendored_package(specifier: &str) -> bool {
-    matches!(
-        specifier,
-        "react" | "react-dom" | "react-dom/server" | "react-dom/server.browser"
-    )
-}
-
-/// Resolve a vendored bare specifier to `(module_key, esm_source)`, or `None`.
-/// The key is stable so the module graph evaluates each bundle exactly once.
-pub fn vendored_module(specifier: &str) -> Option<(String, String)> {
-    match specifier {
-        "react" | "react-dom" => Some((
-            "vendor:react".to_string(),
-            format!(
-                "globalThis.self = globalThis; globalThis.global = globalThis;\n\
-                 {REACT_UMD}\n\
-                 const __R = globalThis.React;\n\
-                 export default __R;\n\
-                 export const createElement = __R.createElement,\n\
-                   cloneElement = __R.cloneElement, createContext = __R.createContext,\n\
-                   Fragment = __R.Fragment, Children = __R.Children,\n\
-                   Component = __R.Component, PureComponent = __R.PureComponent,\n\
-                   memo = __R.memo, forwardRef = __R.forwardRef,\n\
-                   isValidElement = __R.isValidElement, version = __R.version,\n\
-                   useState = __R.useState, useEffect = __R.useEffect,\n\
-                   useLayoutEffect = __R.useLayoutEffect, useMemo = __R.useMemo,\n\
-                   useRef = __R.useRef, useCallback = __R.useCallback,\n\
-                   useContext = __R.useContext, useReducer = __R.useReducer,\n\
-                   useId = __R.useId;\n"
-            ),
-        )),
-        "react-dom/server" | "react-dom/server.browser" => Some((
-            "vendor:react-dom/server".to_string(),
-            format!(
-                "import 'react';\n\
-                 {REACT_DOM_SERVER_UMD}\n\
-                 const __S = globalThis.ReactDOMServer;\n\
-                 export default __S;\n\
-                 export const renderToString = __S.renderToString,\n\
-                   renderToStaticMarkup = __S.renderToStaticMarkup;\n"
-            ),
-        )),
-        _ => None,
     }
 }

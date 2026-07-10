@@ -23,9 +23,11 @@ pub struct ToolParam {
 /// How a tool is executed. File-backed tools are local `.ts` files; MCP-backed
 /// tools are dispatched to a running MCP server child process via `McpManager`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ToolBackend {
     /// The tool's body lives in a local .ts file with `export const tool` and
     /// `export async function run(args, chidori)`.
+    #[default]
     TypeScript,
     /// The tool is remote-hosted by an MCP server.
     Mcp {
@@ -37,11 +39,6 @@ pub enum ToolBackend {
     Native,
 }
 
-impl Default for ToolBackend {
-    fn default() -> Self {
-        ToolBackend::TypeScript
-    }
-}
 
 /// A registered tool with its metadata and execution backend.
 #[derive(Debug, Clone)]
@@ -97,6 +94,12 @@ pub struct ToolRegistry {
     /// a later "Unknown tool" error can explain *why* an expected tool isn't
     /// available, instead of the failure being a silent stderr warn.
     load_errors: Vec<(PathBuf, String)>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolRegistry {
@@ -376,7 +379,7 @@ mod tests {
         )
         .unwrap();
 
-        let registry = ToolRegistry::load_from_dirs(&[dir.clone()]).unwrap();
+        let registry = ToolRegistry::load_from_dirs(std::slice::from_ref(&dir)).unwrap();
         let tool = registry.get("web_search").unwrap();
 
         assert_eq!(tool.backend, ToolBackend::TypeScript);
@@ -416,7 +419,7 @@ mod tests {
         )
         .unwrap();
 
-        let registry = ToolRegistry::load_from_dirs(&[dir.clone()]).unwrap();
+        let registry = ToolRegistry::load_from_dirs(std::slice::from_ref(&dir)).unwrap();
 
         assert!(registry.get("legacy").is_none());
 
@@ -436,7 +439,7 @@ mod tests {
                 default: None,
                 required: true,
             }],
-            |args| Ok(args),
+            Ok,
         );
 
         let tool = registry.get("echo").unwrap();

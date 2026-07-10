@@ -232,7 +232,7 @@ impl ReplayRuntime {
         let state = self.state.clone();
         self.vm
             .define_method(&global, "durableStep", 1, move |vm, _this, args| {
-                let f = args.get(0).cloned().unwrap_or(Value::Undefined);
+                let f = args.first().cloned().unwrap_or(Value::Undefined);
                 let site = "durableStep".to_string();
                 let seq = {
                     let mut s = state.borrow_mut();

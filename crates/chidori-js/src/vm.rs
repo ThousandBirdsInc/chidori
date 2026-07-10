@@ -357,6 +357,12 @@ pub struct Vm {
     pub(crate) kernel_callees: Vec<(std::rc::Rc<crate::value::BytecodeFunction>, u32)>,
 }
 
+impl Default for Vm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Vm {
     pub fn new() -> Vm {
         let mut vm = Vm {
@@ -427,7 +433,7 @@ impl Vm {
         let id = self.symbol_counter;
         self.symbol_counter += 1;
         JsSymbol(Rc::new(SymbolData {
-            description: description.map(|d| Rc::from(d)),
+            description: description.map(Rc::from),
             id,
         }))
     }
@@ -640,7 +646,7 @@ impl Vm {
         );
         obj.borrow_mut().props.insert(
             PropertyKey::str("stack"),
-            Property::builtin(Value::str(&format!("{}: {}", kind.name(), message))),
+            Property::builtin(Value::str(format!("{}: {}", kind.name(), message))),
         );
         Value::Object(obj)
     }
@@ -935,7 +941,7 @@ impl Vm {
         // Fast paths for primitives without boxing.
         match base {
             Value::Undefined | Value::Uninitialized | Value::Hole | Value::Null => {
-                return Err(self.throw_type(&format!(
+                Err(self.throw_type(&format!(
                     "Cannot read properties of {} (reading '{}')",
                     if base.is_null() { "null" } else { "undefined" },
                     key_display(key)
@@ -947,23 +953,23 @@ impl Vm {
                 }
                 // fall through to String.prototype
                 let proto = self.realm.string_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::Number(_) => {
                 let proto = self.realm.number_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::Bool(_) => {
                 let proto = self.realm.boolean_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::Symbol(_) => {
                 let proto = self.realm.symbol_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::BigInt(_) => {
                 let proto = self.realm.bigint_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::Object(o) => self.get_from_object(o, key, base.clone()),
         }
@@ -1313,7 +1319,7 @@ impl Vm {
                         let dense_own = match &b.internal {
                             Internal::Array(arr) => match key.as_str() {
                                 Some("length") => true,
-                                _ => key.array_index().map_or(false, |i| {
+                                _ => key.array_index().is_some_and(|i| {
                                     (i as usize) < arr.len()
                                         && !matches!(arr[i as usize], Value::Hole)
                                 }),
@@ -2179,7 +2185,7 @@ fn format_decimal(s: &str, k: i32, n: i32) -> String {
         // Integer: all digits followed by n-k zeros.
         let mut out = String::with_capacity(n as usize);
         out.push_str(s);
-        out.extend(std::iter::repeat('0').take((n - k) as usize));
+        out.extend(std::iter::repeat_n('0', (n - k) as usize));
         out
     } else if 0 < n && n <= 21 {
         // Decimal point inside the digits.

@@ -5698,7 +5698,7 @@ impl Vm {
             }
             Op::SetHomeObjectAt(n) => {
                 let len = frame.stack.len();
-                if len >= *n as usize + 1 {
+                if len > *n as usize {
                     let home = frame.stack[len - 1 - *n as usize].clone();
                     if let (Value::Object(home), Value::Object(m)) =
                         (home, frame.stack[len - 1].clone())
@@ -6943,7 +6943,7 @@ impl Vm {
         let has_inst = self.realm.symbol_has_instance.clone();
         let method = self.get_prop(ctor, &PropertyKey::Sym(has_inst))?;
         if self.is_callable(&method) {
-            let r = self.call(method, ctor.clone(), &[obj.clone()])?;
+            let r = self.call(method, ctor.clone(), std::slice::from_ref(obj))?;
             return Ok(self.to_boolean(&r));
         }
         if !cobj.borrow().is_callable() {

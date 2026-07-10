@@ -1745,7 +1745,7 @@ mod tests {
     fn spawn_protocol_server() -> String {
         use axum::extract::{Path as AxPath, State};
         use axum::http::StatusCode;
-        use axum::routing::{get, post, put};
+        use axum::routing::get;
         use std::collections::HashMap;
 
         #[derive(Clone, Default)]

@@ -472,6 +472,12 @@ impl Default for AgentConfig {
     }
 }
 
+impl Default for RuntimeContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuntimeContext {
     pub fn new() -> Self {
         Self {
@@ -1856,7 +1862,7 @@ fn vfs_from_seed_env() -> Vfs {
 mod tests {
     use super::*;
     use crate::runtime::snapshot::{
-        HostPromiseState, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
+        HostPromiseState, PENDING_HOST_OPERATION_FILE,
     };
 
     #[test]

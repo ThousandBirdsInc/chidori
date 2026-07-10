@@ -2326,7 +2326,8 @@ fn install_errors(vm: &mut Vm) {
     // EvalError lacks a realm-resident prototype (nothing throws it internally);
     // create an ordinary prototype chaining to Error.prototype.
     let error_proto = vm.realm.error_proto.clone();
-    for name in ["EvalError"] {
+    {
+        let name = "EvalError";
         let proto = vm.alloc_ordinary(Some(error_proto.clone()));
         let ctor = install_error_kind(vm, &proto, name);
         // Subtype ctor inherits from the Error constructor.

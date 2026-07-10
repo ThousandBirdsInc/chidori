@@ -1641,7 +1641,7 @@ fn execute_http_with_secrets(
             }
         };
         let text = secrets.redact(&String::from_utf8_lossy(&bytes));
-        let body = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text));
+        let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
 
         Ok(json!({
             "status": status,
@@ -2150,7 +2150,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["status"], json!(0));
-        assert!(result["error"].as_str().unwrap_or_default().len() > 0);
+        assert!(!result["error"].as_str().unwrap_or_default().is_empty());
         assert!(result["headers"].as_object().unwrap().is_empty());
         assert!(result["body"].is_null());
     }

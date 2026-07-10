@@ -81,3 +81,7 @@ harness = false
 [[bench]]
 name = "memory"
 harness = false
+
+# Workspace-wide lint levels (see [workspace.lints] in the root Cargo.toml).
+[lints]
+workspace = true

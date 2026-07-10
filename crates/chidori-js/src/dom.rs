@@ -1400,7 +1400,7 @@ impl DomHandle {
                 if once {
                     remove_listener(&self.0, node, ty, &handler, capture);
                 }
-                if let Err(e) = vm.call(handler, ct.clone(), &[event.clone()]) {
+                if let Err(e) = vm.call(handler, ct.clone(), std::slice::from_ref(&event)) {
                     let msg = vm.error_to_string(&e);
                     return Err(format!("event handler threw: {msg}"));
                 }

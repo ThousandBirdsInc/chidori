@@ -684,7 +684,7 @@ impl HostBindingBackend {
                         server_id,
                         remote_name,
                     } => tokio_rt.block_on(async {
-                        mcp.call_tool(&server_id, &remote_name, &serde_json::Value::Object(kwargs))
+                        mcp.call_tool(server_id, remote_name, &serde_json::Value::Object(kwargs))
                             .await
                     }),
                     ToolBackend::TypeScript => {

@@ -119,7 +119,7 @@ fn number_to_bigint(vm: &mut Vm, n: f64) -> Result<BigInt, Value> {
 fn to_index(vm: &mut Vm, v: &Value) -> Result<u64, Value> {
     let n = vm.to_number(v)?;
     let i = if n.is_nan() { 0.0 } else { n.trunc() };
-    if i < 0.0 || i > 9007199254740991.0 {
+    if !(0.0..=9007199254740991.0).contains(&i) {
         return Err(vm.throw_range("Index out of range"));
     }
     let bits = i as u64;

@@ -211,7 +211,7 @@ impl Vm {
                 Internal::Iterator(st) if !st.done => {
                     st.target
                         .as_ref()
-                        .map_or(false, |t| match &t.borrow().internal {
+                        .is_some_and(|t| match &t.borrow().internal {
                             Internal::TypedArray(td) => crate::typed_array::ta_out_of_bounds(td),
                             _ => false,
                         })

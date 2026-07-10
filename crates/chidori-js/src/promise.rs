@@ -125,12 +125,12 @@ impl Vm {
         let p1 = promise.clone();
         let p2 = promise.clone();
         let resolve = self.new_native("", 1, move |vm, _this, args| {
-            let v = args.get(0).cloned().unwrap_or(Value::Undefined);
+            let v = args.first().cloned().unwrap_or(Value::Undefined);
             vm.resolve_promise(&p1, v);
             Ok(Value::Undefined)
         });
         let reject = self.new_native("", 1, move |vm, _this, args| {
-            let v = args.get(0).cloned().unwrap_or(Value::Undefined);
+            let v = args.first().cloned().unwrap_or(Value::Undefined);
             vm.reject_promise(&p2, v);
             Ok(Value::Undefined)
         });

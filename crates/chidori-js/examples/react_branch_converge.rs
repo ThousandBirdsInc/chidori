@@ -39,6 +39,7 @@ struct Card {
 }
 
 #[derive(Serialize)]
+#[derive(Default)]
 struct Frame {
     kind: String, // "branches" | "feedback" | "converged" | "replay"
     caption: String,
@@ -53,23 +54,6 @@ struct Frame {
     replayed: usize,
 }
 
-impl Default for Frame {
-    fn default() -> Self {
-        Frame {
-            kind: String::new(),
-            caption: String::new(),
-            note: String::new(),
-            cards: Vec::new(),
-            html: String::new(),
-            tests: Vec::new(),
-            question: String::new(),
-            answer: String::new(),
-            model_calls: 0,
-            inputs: 0,
-            replayed: 0,
-        }
-    }
-}
 
 /// The agent + its durable journal. Both `prompt` (model) and `input` (human)
 /// answers are recorded; on replay they are served for free — so a converged

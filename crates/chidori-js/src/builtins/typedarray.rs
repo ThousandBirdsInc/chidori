@@ -333,7 +333,7 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
                 vm.throw_type("ArrayBuffer.prototype.slice: species returned the same buffer")
             );
         }
-        if (buffer_byte_length(&new_buf) as usize) < new_len {
+        if buffer_byte_length(&new_buf) < new_len {
             return Err(vm.throw_type(
                 "ArrayBuffer.prototype.slice: species returned a buffer that is too small",
             ));
@@ -2010,7 +2010,7 @@ fn construct_typed_array(vm: &mut Vm, kind: TAKind, args: &[Value]) -> Result<Va
                 // A RESIZABLE buffer's auto-length view is length-tracking:
                 // its element count floors freely, with no alignment demand
                 // (the requirement applies to fixed buffers only).
-                if remaining % elem != 0 && ab_max_byte_length(&buffer).is_none() {
+                if !remaining.is_multiple_of(elem) && ab_max_byte_length(&buffer).is_none() {
                     return Err(vm.throw_range("Byte length is not aligned to element size"));
                 }
                 remaining / elem
@@ -2723,7 +2723,7 @@ enum AtomicOp {
 /// `ToIndex`: a non-negative integer ≤ 2^53−1, else a RangeError.
 fn to_index(vm: &mut Vm, v: &Value) -> Result<usize, Value> {
     let n = to_integer_or_infinity(vm, v)?;
-    if n < 0.0 || n > 9007199254740991.0 {
+    if !(0.0..=9007199254740991.0).contains(&n) {
         return Err(vm.throw_range("Atomics: index out of range"));
     }
     Ok(n as usize)

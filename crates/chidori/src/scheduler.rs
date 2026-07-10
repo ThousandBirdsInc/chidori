@@ -135,7 +135,7 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
 
         // Build the tool registry: recipe-local dirs + default `<agent>/tools`
         // + any MCP tools the server handed us.
-        let mut dirs: Vec<PathBuf> = recipe.tools.iter().cloned().collect();
+        let mut dirs: Vec<PathBuf> = recipe.tools.to_vec();
         dirs.push(
             agent_path
                 .parent()

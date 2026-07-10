@@ -21,17 +21,14 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Decision {
+    #[default]
     AlwaysAllow,
     AskBefore,
     NeverAllow,
 }
 
-impl Default for Decision {
-    fn default() -> Self {
-        Decision::AlwaysAllow
-    }
-}
 
 impl Decision {
     /// Total order by restrictiveness: AlwaysAllow < AskBefore < NeverAllow.

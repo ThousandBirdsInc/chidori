@@ -226,7 +226,7 @@ impl RunSpan {
         while let Some(pos) = state
             .pending
             .iter()
-            .position(|r| r.parent_seq.map_or(true, |p| state.emitted.contains(&p)))
+            .position(|r| r.parent_seq.is_none_or(|p| state.emitted.contains(&p)))
         {
             let record = state.pending.remove(pos);
             self.emit_one(state, &record);
@@ -242,7 +242,7 @@ impl RunSpan {
             let pos = state
                 .pending
                 .iter()
-                .position(|r| r.parent_seq.map_or(true, |p| state.emitted.contains(&p)))
+                .position(|r| r.parent_seq.is_none_or(|p| state.emitted.contains(&p)))
                 .unwrap_or(0);
             let record = state.pending.remove(pos);
             self.emit_one(state, &record);

@@ -53,7 +53,7 @@ fn get_increment(vm: &mut Vm, obj: &Value) -> Result<Option<RoundingIncrement>, 
         return Ok(None);
     }
     let n = vm.to_number(&v)?;
-    if !n.is_finite() || n.fract() != 0.0 || n < 1.0 || n > 1.0e9 {
+    if !n.is_finite() || n.fract() != 0.0 || !(1.0..=1.0e9).contains(&n) {
         return Err(vm.throw_range("invalid roundingIncrement"));
     }
     RoundingIncrement::try_new(n as u32)
@@ -227,7 +227,7 @@ fn this_duration(vm: &mut Vm, this: &Value) -> Result<Duration, Value> {
     if let Value::Object(o) = this {
         if let Internal::Temporal(slot) = &o.borrow().internal {
             if let TemporalSlot::Duration(d) = slot.as_ref() {
-                return Ok(d.clone());
+                return Ok(*d);
             }
         }
     }
@@ -289,7 +289,7 @@ fn to_temporal_duration(vm: &mut Vm, v: &Value) -> Result<Duration, Value> {
     if let Value::Object(o) = v {
         if let Internal::Temporal(slot) = &o.borrow().internal {
             if let TemporalSlot::Duration(d) = slot.as_ref() {
-                return Ok(d.clone());
+                return Ok(*d);
             }
         }
     }

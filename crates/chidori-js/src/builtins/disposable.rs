@@ -148,7 +148,7 @@ fn install_one(vm: &mut Vm, is_async: bool) {
         }
         let v = value.clone();
         let disposer = vm.new_native("", 0, move |vm, _t, _a| {
-            vm.call(on_dispose.clone(), Value::Undefined, &[v.clone()])
+            vm.call(on_dispose.clone(), Value::Undefined, std::slice::from_ref(&v))
         });
         push_disposer(&arr, Value::Object(disposer));
         Ok(value)

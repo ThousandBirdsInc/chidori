@@ -72,7 +72,7 @@ impl Engine {
     /// Compile and run a script to completion (draining microtasks), returning
     /// the completion value. Errors are returned as their string form.
     pub fn eval(&mut self, src: &str) -> Result<Value, String> {
-        let proto = compiler::compile_script(src).map_err(|e| e)?;
+        let proto = compiler::compile_script(src)?;
         let func = self.vm.make_closure(std::rc::Rc::new(proto), Vec::new());
         let result = self
             .vm

@@ -100,13 +100,12 @@ impl Vm {
                                     ));
                                 }
                             }
-                            PropertyKind::Accessor { get, .. } if get.is_none() => {
-                                if !result.is_undefined() {
+                            PropertyKind::Accessor { get, .. } if get.is_none()
+                                && !result.is_undefined() => {
                                     return Err(self.throw_type(
                                         "proxy get trap must report undefined for a non-configurable accessor with no getter",
                                     ));
                                 }
-                            }
                             _ => {}
                         }
                     }
@@ -903,8 +902,8 @@ impl Vm {
                         // Step 16.c: a non-configurable, writable target data
                         // property cannot be redefined as non-writable.
                         if let PropertyKind::Data { writable, .. } = &p.kind {
-                            if !p.configurable && *writable {
-                                if self.has_prop(&desc, &PropertyKey::str("writable"))? {
+                            if !p.configurable && *writable
+                                && self.has_prop(&desc, &PropertyKey::str("writable"))? {
                                     let w = self.get_prop(&desc, &PropertyKey::str("writable"))?;
                                     if !self.to_boolean(&w) {
                                         return Err(self.throw_type(
@@ -912,7 +911,6 @@ impl Vm {
                                         ));
                                     }
                                 }
-                            }
                         }
                     }
                 }

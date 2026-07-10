@@ -759,9 +759,11 @@ pub struct SnapshotBranchMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SnapshotBlobKind {
     /// Current scaffold: a serialized set of TypeScript context roots after
     /// initial module evaluation, not a suspended VM continuation.
+    #[default]
     InitialTypeScriptStateScaffold,
     /// Legacy blob kind for a live VM-image snapshot (async continuations, job
     /// queues, module records, and heap roots). VM-image snapshots are descoped
@@ -770,11 +772,6 @@ pub enum SnapshotBlobKind {
     LiveQuickJsVm,
 }
 
-impl Default for SnapshotBlobKind {
-    fn default() -> Self {
-        Self::InitialTypeScriptStateScaffold
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifest {

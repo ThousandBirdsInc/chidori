@@ -69,11 +69,10 @@ fn for_each_ip(op: &mut Op, mut f: impl FnMut(&mut u32)) {
         }
         // `target` is an ip; `boundary` is a handler-stack depth — do NOT remap.
         Op::CompletionJump { target, .. } => f(target),
-        Op::MarkDelegationHandler(t) => {
-            if *t != u32::MAX {
+        Op::MarkDelegationHandler(t)
+            if *t != u32::MAX => {
                 f(t);
             }
-        }
         _ => {}
     }
 }

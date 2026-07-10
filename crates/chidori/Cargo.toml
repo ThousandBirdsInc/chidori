@@ -122,3 +122,7 @@ criterion = "0.5"
 [[bench]]
 name = "runtime"
 harness = false
+
+# Workspace-wide lint levels (see [workspace.lints] in the root Cargo.toml).
+[lints]
+workspace = true

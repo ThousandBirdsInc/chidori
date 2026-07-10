@@ -874,7 +874,7 @@ struct SetRecord {
 impl SetRecord {
     /// Invoke `this.[[Has]](key)` and coerce the result to a boolean.
     fn has(&self, vm: &mut Vm, key: &Value) -> Result<bool, Value> {
-        let r = vm.call(self.has.clone(), self.obj.clone(), &[key.clone()])?;
+        let r = vm.call(self.has.clone(), self.obj.clone(), std::slice::from_ref(key))?;
         Ok(vm.to_boolean(&r))
     }
 
