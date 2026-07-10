@@ -79,6 +79,40 @@ Pass `--json PATH` to also dump every sample (min/median/mean/max per runtime)
 for offline analysis, or `--markdown PATH` to write the same two tables as a
 Markdown report.
 
+## Build variants: PGO, allocator, target-cpu, profiling
+
+The release profile already carries fat LTO + a single codegen unit. Knobs
+beyond that, with measurements from a 4-core container (2026-07; interleaved
+medians, 12 runs per workload per binary):
+
+- **PGO — adopted as the recommended benchmark/release build.**
+  [`scripts/pgo-build.sh`](../../../scripts/pgo-build.sh) does the
+  instrument → run-this-corpus → rebuild-with-feedback cycle (needs
+  `rustup component add llvm-tools`). Interpreter dispatch is the textbook
+  PGO beneficiary (indirect branches, dense op bodies): **-15.5% wall-clock
+  geomean** across this suite vs the plain release build, up to -36%
+  (array_hof) and -24% (sort), no workload regressed. Measure it with
+  `node crates/chidori-js/benchmarks/run.mjs --no-build --chidori-bin target/pgo/release/examples/run`.
+  Instruction counts barely move under PGO — the win is branch prediction and
+  icache layout, so judge it by wall-clock, never callgrind.
+- **mimalloc (`--features mimalloc` on the `run` example) — measured, and
+  rejected as a default.** Callgrind showed glibc malloc at ~23% of executed
+  instructions on json_roundtrip/string_build, and mimalloc did cut total
+  instructions 12.7%/10.2% there — but wall-clock across the suite ran ~9%
+  *slower* geomean (glibc tcache handles the interpreter's LIFO same-size
+  churn well; the instruction-count proxy misses cache/IPC effects). The
+  feature stays as a one-flag experiment for other hardware. A lesson worth
+  keeping: allocator changes must be judged by interleaved wall-clock, not Ir.
+- **`-C target-cpu=native`** — roughly neutral here (+0.4% geomean, mixed
+  per-workload): the interpreter is branchy, not vector-heavy. Worth trying
+  on newer hardware for engine-vs-engine fairness (node/bun JIT to
+  host-native code), but not a default — the binary stops being portable.
+
+For profiler runs (perf/samply/callgrind), build with
+`cargo build --profile profiling ...` — release codegen plus line-table debug
+info, so inlined frames attribute correctly instead of smearing into their
+caller.
+
 ## CI integration
 
 [`.github/workflows/js-benchmarks.yml`](../../../.github/workflows/js-benchmarks.yml)

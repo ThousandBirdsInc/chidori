@@ -19,3 +19,13 @@ license = "Apache-2.0"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Release + line-table debug info, for profilers (perf/samply/callgrind).
+# With fat LTO and one codegen unit the inlining is aggressive; without line
+# tables a profiler attributes an inlined callee's cost to whatever function
+# absorbed it, which skews the shares optimization decisions are based on.
+# Line tables add no runtime cost — they only grow the binary on disk.
+# Build with: cargo build --profile profiling ...
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
