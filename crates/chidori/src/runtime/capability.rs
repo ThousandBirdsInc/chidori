@@ -147,9 +147,9 @@ mod tests {
             Capability::Timer,
             Capability::Microtask,
         ] {
-            assert_eq!(Capability::from_str(cap.as_str()), Some(cap));
+            assert_eq!(Capability::parse(cap.as_str()), Some(cap));
         }
-        assert_eq!(Capability::from_str("nope"), None);
+        assert_eq!(Capability::parse("nope"), None);
     }
 
     #[test]

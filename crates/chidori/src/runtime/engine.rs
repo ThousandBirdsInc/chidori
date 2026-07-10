@@ -441,6 +441,7 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    #[allow(dead_code)] // Lib-facade entry point; the bin target compiles the module tree separately and never calls it.
     pub fn run_with_replay_and_host_promises(
         &self,
         path: &Path,
@@ -560,6 +561,7 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    #[allow(dead_code)] // Lib-facade entry point; the bin target compiles the module tree separately and never calls it.
     pub fn run_replay_pausable_with_host_promises(
         &self,
         path: &Path,
@@ -578,6 +580,7 @@ impl Engine {
 
     /// As `run_replay_pausable_with_host_promises`, restoring a snapshot
     /// manifest's virtual filesystem for the resumed run.
+    #[allow(dead_code)] // Lib-facade entry point; the bin target compiles the module tree separately and never calls it.
     pub fn run_replay_pausable_with_host_promises_and_vfs(
         &self,
         path: &Path,

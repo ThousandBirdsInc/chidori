@@ -1685,7 +1685,7 @@ fn ta_snapshot_array(vm: &mut Vm, o: &JsObject) -> JsObject {
 /// In-place sort of typed-array element values. Elements are all one kind
 /// (Number or BigInt). Default compare is ascending numeric (NaN sorts to the
 /// end); an optional comparator is honored. Stable merge sort.
-fn ta_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> Result<(), Value> {
+fn ta_sort(vm: &mut Vm, items: &mut [Value], cmp: &Value, has_cmp: bool) -> Result<(), Value> {
     // The comparator's function kernel, prepared ONCE for the whole sort
     // (see `Vm::prepare_kernel_callback`).
     let mut prep = if has_cmp {

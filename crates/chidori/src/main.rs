@@ -1574,7 +1574,7 @@ fn cmd_serve(file: &Path, port: u16, verbose: bool, untrusted: bool, trusted: bo
     tokio_rt.block_on(server::serve(
         providers,
         template_engine,
-        file.clone(),
+        file.to_path_buf(),
         port,
         policy,
         policy_posture,
