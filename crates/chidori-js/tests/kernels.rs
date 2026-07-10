@@ -462,6 +462,44 @@ const CORPUS: &[&str] = &[
     "const buf = new ArrayBuffer(16, { maxByteLength: 64 }); const v = new Float64Array(buf); function sum() { let s = 0; for (let i = 0; i < v.length; i++) s += v[i]; return s; } v[0] = 1; v[1] = 2; const s1 = sum(); buf.resize(32); v[2] = 3; v[3] = 4; console.log(s1, sum());",
     // Mixed dense-array and typed-array bases in one region.
     "const d = [1, 2, 3, 4]; const t = new Float64Array(4); for (let i = 0; i < d.length; i++) { t[i] = d[i] * 2; } let s = 0; for (let i = 0; i < t.length; i++) s += t[i]; console.log(s);",
+    // --- RECURSION: mutual, boolean-returning, captured-binding self ------
+    // Mutual recursion with boolean returns (the isEven/isOdd family).
+    "function isEven(n) { return n === 0 ? true : isOdd(n - 1); } function isOdd(n) { return n === 0 ? false : isEven(n - 1); } let c = 0; for (let i = 0; i < 30; i++) { if (isEven(i)) c++; } console.log(c, isEven(40), isOdd(7));",
+    // typeof / strict-eq observe REAL booleans from the recursion.
+    "function isEven(n) { return n === 0 ? true : isOdd(n - 1); } function isOdd(n) { return n === 0 ? false : isEven(n - 1); } const r = isEven(6); console.log(typeof r, r === true, isOdd(6) === false);",
+    // Numeric mutual recursion, multiple arguments.
+    "function a2(m, n) { return m <= 0 ? n : b2(m - 1, n + m); } function b2(m, n) { return m <= 0 ? n : a2(m - 1, n + 2 * m); } console.log(a2(20, 0), b2(20, 0));",
+    // Self-recursion through a captured `const` binding (arrow).
+    "const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b)); console.log(gcd(48, 18), gcd(17, 5), gcd(0, 9));",
+    // Named function expression: self-reference through its own binding.
+    "const k = function inner(n) { return n <= 0 ? 0 : n + inner(n - 1); }; console.log(k(40));",
+    // Boolean-returning SELF recursion.
+    "function tob(n) { return n <= 0 ? true : tob(n - 2); } console.log(tob(10), typeof tob(10));",
+    // Mixed-type returns stay generic (number on one path, boolean on the other).
+    "function mx(n) { if (n <= 0) return true; return n * mx(n - 1); } console.log(mx(3), mx(0));",
+    // Rebinding the mutual-recursion partner mid-program: the entry guard
+    // declines and the patched binding is observed.
+    "function ev(n) { return n === 0 ? true : od(n - 1); } function od(n) { return n === 0 ? false : ev(n - 1); } console.log(ev(4)); od = function () { return true; }; console.log(ev(4));",
+    // Rebinding the captured self binding: recursion dispatches to the NEW fn.
+    "let fr = (n) => (n <= 0 ? 0 : n + fr(n - 1)); const keep = fr; console.log(keep(5)); fr = () => 42; console.log(keep(5));",
+    // A family member whose body can't kernelize (strings) declines the family.
+    "function ping(n) { return n <= 0 ? 0 : pong(n - 1) + 1; } function pong(n) { return ('' + n).length > 9 ? 0 : ping(n - 1); } console.log(ping(9));",
+    // Mutual recursion past any single window's worth of calls. Depths in
+    // this corpus stay ~40: the kernels-OFF differential run holds real
+    // interpreter frames on the test thread's DEFAULT stack (debug frames
+    // are fat); the dedicated depth-overflow test owns the deep case on a
+    // big-stack thread.
+    "function e2(n) { return n === 0 ? true : o2(n - 1); } function o2(n) { return n === 0 ? false : e2(n - 1); } console.log(e2(40));",
+    // Short-arg self-call: translation declines (undefined parameter path).
+    "function sh(n, m) { return n <= 0 ? m : sh(n - 1); } console.log(sh(3, 7));",
+    // Short-arg MUTUAL call site: entry cross-check declines the family.
+    "function p2(n) { return n <= 0 ? 0 : q2(n - 1); } function q2(n, m) { return (m || 0) + (n <= 0 ? 1 : p2(n - 1)); } console.log(p2(9), q2(4, 2));",
+    // -0 propagation through recursive returns.
+    "function nz(n) { return n === 0 ? -0 : nz(n - 1) * -1; } const r = nz(3); console.log(Object.is(r, -0), Object.is(r, 0), 1 / nz(2));",
+    // Math intrinsics inside a recursive kernel.
+    "function h2(n) { return n <= 0 ? 0 : Math.max(n % 7, h2(n - 1)); } console.log(h2(40));",
+    // Captured numeric upvalue inside a recursive const arrow.
+    "const LIM = 3; const f2 = (n) => (n <= LIM ? n : f2(n - 2) + 1); console.log(f2(21));",
 ];
 
 #[test]
@@ -624,20 +662,17 @@ fn tiny_functions_get_fn_kernels() {
     }
 }
 
-/// Self-recursive numeric functions get a RECURSIVE function kernel
-/// (`self_global` set), and the shapes that must not — boolean returns,
-/// mutual recursion, named-expression self-reference — never do.
+/// Recursive numeric functions get a RECURSIVE function kernel
+/// (`Kernel::rec` set) — including boolean-returning predicates, mutual
+/// recursion (resolved at entry), and self-reference through a captured
+/// binding — and non-recursive/argument-fed shapes never do.
 #[test]
 fn recursive_functions_get_self_kernels() {
-    fn self_kernels(p: &FuncProto) -> usize {
-        let mut n = usize::from(
-            p.fn_kernel
-                .as_ref()
-                .is_some_and(|k| k.self_global.is_some()),
-        );
+    fn rec_kernels(p: &FuncProto) -> usize {
+        let mut n = usize::from(p.fn_kernel.as_ref().is_some_and(|k| k.rec.is_some()));
         for c in &p.consts {
             if let Const::Func(f) = c {
-                n += self_kernels(f);
+                n += rec_kernels(f);
             }
         }
         n
@@ -647,24 +682,28 @@ fn recursive_functions_get_self_kernels() {
         "function gcd(a, b) { return b === 0 ? a : gcd(b, a % b); }",
         "function ack(m, n) { return m === 0 ? n + 1 : n === 0 ? ack(m - 1, 1) : ack(m - 1, ack(m, n - 1)); }",
         "var f = function (n) { return n <= 0 ? 0 : n + f(n - 1); };",
+        // Boolean-returning recursion (result registers typed Bool).
+        "function tob(n) { return n <= 0 ? true : tob(n - 1); }",
+        // Mutual recursion: the partner resolves at entry.
+        "function even(n) { return n === 0 ? 1 : odd(n - 1); }",
+        // Self-reference through the captured `const` binding.
+        "const g = (a, b) => (b === 0 ? a : g(b, a % b));",
     ] {
         let proto = compile_script(src).expect("compiles");
         assert!(
-            self_kernels(&proto) >= 1,
+            rec_kernels(&proto) >= 1,
             "expected a recursive kernel in {src:?}"
         );
     }
     for src in [
-        // Boolean-returning recursion (result register is Number-typed).
-        "function tob(n) { return n <= 0 ? true : tob(n - 1); }",
-        // Mutual recursion is not a SELF call.
-        "function even(n) { return n === 0 ? 1 : odd(n - 1); }",
-        // A named expression's self-reference is lexical, not global.
-        "const k = function inner(n) { return n <= 0 ? 0 : n + inner(n - 1); };",
+        // Plain non-recursive body.
+        "function add(a, b) { return a + b; }",
+        // Recursion through a PARAMETER is a plain argument (not Number).
+        "function apply(f, n) { return n <= 0 ? 0 : f(f, n - 1); }",
     ] {
         let proto = compile_script(src).expect("compiles");
         assert_eq!(
-            self_kernels(&proto),
+            rec_kernels(&proto),
             0,
             "expected NO recursive kernel in {src:?}"
         );
@@ -683,21 +722,29 @@ fn self_kernel_depth_overflow_reruns_generic() {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(|| {
-            let src = "function rec(n) { return n <= 0 ? 0 : 1 + rec(n - 1); } \
-                       try { console.log(rec(1000)); } catch (e) { console.log('deep', e.constructor.name); } \
-                       console.log(rec(10));";
-            let mut outs = Vec::new();
-            for kernels in [true, false] {
-                let proto = Rc::new(compile_script_kernels(src, kernels).expect("compiles"));
-                let mut engine = Engine::new();
-                engine.vm.max_call_depth = 64;
-                let func = engine.vm.make_closure(proto, Vec::new());
-                let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
-                assert!(res.is_ok(), "caught in-script (kernels={kernels})");
-                outs.push(engine.console().to_vec());
+            for src in [
+                "function rec(n) { return n <= 0 ? 0 : 1 + rec(n - 1); } \
+                 try { console.log(rec(1000)); } catch (e) { console.log('deep', e.constructor.name); } \
+                 console.log(rec(10));",
+                // Same contract for the MUTUAL-recursion windowed path.
+                "function me(n) { return n === 0 ? true : mo(n - 1); } \
+                 function mo(n) { return n === 0 ? false : me(n - 1); } \
+                 try { console.log(me(1001)); } catch (e) { console.log('deep', e.constructor.name); } \
+                 console.log(me(10));",
+            ] {
+                let mut outs = Vec::new();
+                for kernels in [true, false] {
+                    let proto = Rc::new(compile_script_kernels(src, kernels).expect("compiles"));
+                    let mut engine = Engine::new();
+                    engine.vm.max_call_depth = 64;
+                    let func = engine.vm.make_closure(proto, Vec::new());
+                    let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
+                    assert!(res.is_ok(), "caught in-script (kernels={kernels})");
+                    outs.push(engine.console().to_vec());
+                }
+                assert_eq!(outs[0], outs[1], "depth overflow diverged:\n{src}");
+                assert_eq!(outs[0][0], "deep RangeError");
             }
-            assert_eq!(outs[0], outs[1], "depth overflow diverged");
-            assert_eq!(outs[0][0], "deep RangeError");
         })
         .expect("spawns")
         .join()

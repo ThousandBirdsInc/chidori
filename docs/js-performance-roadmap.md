@@ -1027,6 +1027,56 @@ subarrays, own-`length` shadow, patched prototype getter, null proto,
 BigInt kinds, resizable-buffer length tracking, mixed dense+typed regions);
 full suites + Test262 gate green.
 
+## 6.9 Kernel v9 (landed 2026-07-10): the recursion shapes — mutual,
+boolean-returning, and captured-binding self-reference (§6.5.1 e/f/g)
+
+The three shapes v6's self-recursion tier declined, all landed in one
+generalization. `KOp::SelfCall` gained a `callee` selector, `Kernel::
+self_global` became a `KernelRec` descriptor (`self_refs` + partner
+`globals`), and the windowed executor became MULTI-FUNCTION:
+
+- **Boolean returns (g)**: translation runs under an assumed static return
+  type (Number first, then Boolean) — `SelfCall` dst registers are typed by
+  the assumption and every `Ret` must agree, so `isEven`-class predicates
+  kernelize while mixed-type recursions stay generic. A top-level boolean
+  result materializes `Value::Bool` (typeof/strict-eq exact).
+- **Captured-binding self-reference (f)**: `LoadUpvalue` in callee position
+  (the compiler's `LoadUpvalue; LoadUndefined(this); args…; Call` pattern)
+  speculates SELF; the entry guard requires the cell to hold the very
+  closure being invoked. `const gcd = (a, b) => … gcd(…)` and named
+  function expressions kernelize; a rebound `let` or a helper closure in
+  the cell declines observably. Mis-speculation only costs translation —
+  the shapes it could hit were never kernelizable.
+- **Mutual recursion (e)**: `LoadGlobal` of a non-self name in fn mode
+  becomes a speculative partner reference. The entry guard resolves the
+  whole call FAMILY once per activation (transitively, bounded at 8):
+  every name a plain data global holding a plain sync bytecode closure
+  with a function kernel, every member's self-references intact, every
+  member's `Ret` type matching the entry kernel's, every call site
+  supplying the RESOLVED callee's consumed arguments, canonical Math and
+  Number upvalues per member. Execution stacks per-member register
+  windows over one buffer; the current member's tables are hoisted so
+  same-kernel recursion (fib-class) pays nothing new — fib's count is
+  unchanged. Nothing inside a kernel writes globals or cells, so entry
+  resolution holds for the activation; rebinding a partner BETWEEN calls
+  declines and the patched binding is observed generically.
+
+Measured (idle machine, interleaved A/B medians): **mutual_recursion
+(isEven/isOdd over 20k outer calls + const-arrow gcd) 1.106 s → 0.160 s
+(6.9×)**; fib_recursive / closures / sort unchanged. RESULT byte-identical.
+Remaining headroom: the per-activation family resolution allocates its
+tables per OUTER call (~40k entries here) — an entry cache or Vm-pooled
+scratch would shave the shallow-recursion case further.
+
+Gates: the kernels differential corpus grew 16 recursion programs
+(boolean/mutual/const-binding families, typeof/strict-eq observation,
+partner and self rebinding declines, non-kernelizable family members,
+short-arg call sites at translation and at entry, −0 pins, Math inside
+recursion, captured numeric upvalues) and the depth-overflow differential
+now covers the mutual path; structural pins updated (boolean/mutual/
+captured-binding recursion MUST kernelize, parameter-recursion must not);
+full suites + Test262 gate green.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —
