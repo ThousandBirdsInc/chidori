@@ -373,6 +373,12 @@ impl SqliteRunStoreShared {
 pub struct SqliteRunStore {
     shared: Arc<SqliteRunStoreShared>,
     run_id: String,
+    /// Next `pos` ordinal for this handle's appends. Seeded from `MAX(pos)+1`
+    /// on first use and tracked in memory afterwards: `pos` has no index, so
+    /// the old per-append `MAX(pos)` subquery scanned every one of the run's
+    /// rows — O(history) per append, O(history²) per run. Lock order is
+    /// always `conn` before `next_pos`.
+    next_pos: Mutex<Option<i64>>,
 }
 
 impl SqliteRunStore {
@@ -380,6 +386,7 @@ impl SqliteRunStore {
         Self {
             shared,
             run_id: run_id.into(),
+            next_pos: Mutex::new(None),
         }
     }
 }
@@ -388,14 +395,25 @@ impl RunStore for SqliteRunStore {
     fn append_record(&self, record: &CallRecord) -> Result<()> {
         let data = serde_json::to_string(record)?;
         let conn = self.shared.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO run_records (run_id, seq, pos, data)
-             VALUES (?1, ?2,
-                     COALESCE((SELECT MAX(pos) FROM run_records WHERE run_id = ?1), 0) + 1,
-                     ?3)
+        let mut next_pos = self.next_pos.lock().unwrap();
+        let pos = match *next_pos {
+            Some(pos) => pos,
+            None => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT COALESCE(MAX(pos), 0) + 1 FROM run_records WHERE run_id = ?1",
+                )?;
+                stmt.query_row(rusqlite::params![self.run_id], |row| row.get(0))?
+            }
+        };
+        // Re-appending an existing seq (a synthetic resume record) keeps its
+        // original `pos` via the conflict clause; the skipped ordinal is a
+        // harmless gap — loads order by (pos, seq).
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(run_id, seq) DO UPDATE SET data = excluded.data",
-            rusqlite::params![self.run_id, record.seq as i64, data],
         )?;
+        stmt.execute(rusqlite::params![self.run_id, record.seq as i64, pos, data])?;
+        *next_pos = Some(pos + 1);
         Ok(())
     }
 
@@ -406,20 +424,24 @@ impl RunStore for SqliteRunStore {
             "DELETE FROM run_records WHERE run_id = ?1",
             rusqlite::params![self.run_id],
         )?;
-        for (pos, record) in records.iter().enumerate() {
-            tx.execute(
+        {
+            let mut stmt = tx.prepare_cached(
                 "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(run_id, seq) DO UPDATE SET
                      pos = excluded.pos, data = excluded.data",
-                rusqlite::params![
+            )?;
+            for (pos, record) in records.iter().enumerate() {
+                stmt.execute(rusqlite::params![
                     self.run_id,
                     record.seq as i64,
                     pos as i64,
                     serde_json::to_string(record)?
-                ],
-            )?;
+                ])?;
+            }
         }
         tx.commit()?;
+        // The rewrite renumbered `pos` to 0..len; continue appends from there.
+        *self.next_pos.lock().unwrap() = Some(records.len() as i64);
         Ok(())
     }
 

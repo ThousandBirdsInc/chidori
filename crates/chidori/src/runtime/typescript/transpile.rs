@@ -102,32 +102,46 @@ pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -
     // output is memoized process-wide. This is the dominant fixed cost paid on
     // EVERY agent execution: initial runs, every pause→resume re-execution,
     // tool files, sub-agents, branch waves/resumes, and each imported module —
-    // all re-transpile byte-identical sources today. Keyed by the full
-    // `(path, source)` pair (hash + equality via the map), so a hit can never
-    // alias distinct inputs; only successes are cached (errors are cheap and
+    // all re-transpile byte-identical sources today. Keyed by path with the
+    // source matched by full string equality, so a hit can never alias
+    // distinct inputs; only successes are cached (errors are cheap and
     // deterministic to recompute).
     {
         let cache = transpile_cache().lock().expect("transpile cache poisoned");
-        if let Some(js) = cache.get(&(path.to_path_buf(), source.to_string())) {
-            return Ok(js.clone());
+        if let Some(entries) = cache.get(path) {
+            if let Some((_, js)) = entries.iter().find(|(cached, _)| cached == source) {
+                return Ok(js.clone());
+            }
         }
     }
     let js = transpile_source(path, source)?;
     {
         let mut cache = transpile_cache().lock().expect("transpile cache poisoned");
         // Bound the cache; a process sees dozens of distinct module sources.
-        // Clearing wholesale at the cap is simpler than LRU and has no
+        // Clearing wholesale at the caps is simpler than LRU and has no
         // order-dependent behavior.
         if cache.len() >= 256 {
             cache.clear();
         }
-        cache.insert((path.to_path_buf(), source.to_string()), js.clone());
+        let entries = cache.entry(path.to_path_buf()).or_default();
+        if entries.len() >= 8 {
+            entries.clear();
+        }
+        entries.push((source.to_string(), js.clone()));
     }
     Ok(js)
 }
 
-fn transpile_cache() -> &'static std::sync::Mutex<HashMap<(PathBuf, String), String>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(PathBuf, String), String>>> =
+/// Keyed by path, with the source carried in the per-path entries and matched
+/// by FULL string equality — a hit can never alias distinct inputs. The
+/// two-level shape lets a lookup borrow `&Path`/`&str` directly: the old
+/// `(PathBuf, String)` key forced a heap copy of the whole source (and a hash
+/// over every byte of it) on EVERY probe, hits included — per module, per
+/// execution, per resume.
+type TranspileCache = HashMap<PathBuf, Vec<(String, String)>>;
+
+fn transpile_cache() -> &'static std::sync::Mutex<TranspileCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<TranspileCache>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }

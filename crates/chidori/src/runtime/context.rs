@@ -952,24 +952,37 @@ impl RuntimeContext {
         }
         inner.seq = inner.seq.max(record.seq);
         inner.call_log.push(record.clone());
-        if let Some(store) = inner.store.clone() {
-            // O(1) append to the journal (`records.jsonl` + any durable
-            // mirror); safepoints rewrite the full checkpoint artifact.
+        let store = inner.store.clone();
+        let otel = inner.otel_run.clone();
+        let event_tx = if inner.emit_call_events {
+            inner.event_sender.clone()
+        } else {
+            None
+        };
+        drop(inner);
+        // O(1) append to the journal (`records.jsonl` + any durable mirror),
+        // OUTSIDE the context lock: under strict durability this write fsyncs,
+        // and a configured mirror adds a network round-trip — holding the lock
+        // across it would stall every other runtime-context access for the
+        // duration of the I/O. Concurrent appends may land out of seq order in
+        // the file; the loader's union sorts the tail by seq, so order on disk
+        // is not load-bearing. The append still happens BEFORE the record is
+        // surfaced on the event stream below, preserving the
+        // durable-before-visible ordering.
+        if let Some(store) = store {
             let result = store.append_record(&record);
-            note_persist_result(&mut inner, result);
+            if result.is_err() {
+                note_persist_result(&mut self.inner.lock().unwrap(), result);
+            }
         }
         // Stream this call's OTEL span now (buffered until its parent span
         // exists), so spans ship incrementally during the run rather than as one
         // tree at the end. Only live-executed calls reach `record_call`; replayed
         // calls (try_replay / absorb_replayed_subtree) don't re-emit. The
         // `RuntimeEvent::Call` stream below is the other real-time surface.
-        let otel = inner.otel_run.clone();
-        if inner.emit_call_events {
-            if let Some(ref tx) = inner.event_sender {
-                let _ = tx.send(RuntimeEvent::Call(record.clone()));
-            }
+        if let Some(tx) = event_tx {
+            let _ = tx.send(RuntimeEvent::Call(record.clone()));
         }
-        drop(inner);
         if let Some(otel) = otel {
             otel.stream_record(record);
         }

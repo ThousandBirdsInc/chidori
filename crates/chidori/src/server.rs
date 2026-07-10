@@ -182,24 +182,28 @@ fn validate_snapshot_manifest_for_resume(
         anyhow::anyhow!("reading resume source {}: {}", agent_path.display(), err)
     })?;
     let current_entry = SourceFingerprint::from_source(agent_path, &entry_source);
-    let mut current_modules = Vec::with_capacity(manifest.modules.len());
-    for module in &manifest.modules {
-        let source = std::fs::read_to_string(&module.path).map_err(|err| {
-            anyhow::anyhow!(
-                "reading resume module source {}: {}",
-                module.path.display(),
-                err
-            )
-        })?;
-        current_modules.push(SourceFingerprint::from_source(&module.path, &source));
-    }
-
     let expected_abi = SnapshotAbi::current("chidori-quickjs");
     let expected_policy = RuntimePolicy::from_env_for_durable_run(run_id)?;
-    let current_module_graph = if manifest.module_graph.is_empty() {
-        Vec::new()
+    // One module walk yields both manifest views (fingerprints + graph), so
+    // each imported module is read from disk once per resume instead of twice
+    // (once for its fingerprint, again inside the graph walk). Manifests
+    // written before the graph existed fall back to fingerprinting exactly
+    // the paths they list.
+    let (current_modules, current_module_graph) = if manifest.module_graph.is_empty() {
+        let mut current_modules = Vec::with_capacity(manifest.modules.len());
+        for module in &manifest.modules {
+            let source = std::fs::read_to_string(&module.path).map_err(|err| {
+                anyhow::anyhow!(
+                    "reading resume module source {}: {}",
+                    module.path.display(),
+                    err
+                )
+            })?;
+            current_modules.push(SourceFingerprint::from_source(&module.path, &source));
+        }
+        (current_modules, Vec::new())
     } else {
-        crate::runtime::typescript::module_graph::snapshot_module_graph(
+        crate::runtime::typescript::module_graph::snapshot_modules(
             agent_path,
             &entry_source,
             &expected_policy,
