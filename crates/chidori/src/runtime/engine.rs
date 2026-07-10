@@ -187,9 +187,9 @@ impl ScaffoldPersister {
         use std::sync::atomic::Ordering;
 
         let pending = ctx.active_pending_host_operation();
-        let host_promises = ctx.host_promise_records();
+        let compact = checkpoint == CheckpointWrite::Compact;
         let (modules, module_graph) = self.modules()?;
-        let manifest = SnapshotManifest::new(
+        let mut manifest = SnapshotManifest::new(
             &self.run_id,
             SnapshotAbi::current("chidori-quickjs"),
             self.policy.clone(),
@@ -199,9 +199,16 @@ impl ScaffoldPersister {
             ctx.call_log_len(),
         )
         .with_module_graph(module_graph.clone())
-        .with_host_promises(host_promises)
         .with_capabilities(ctx.capabilities())
         .with_vfs(ctx.vfs_snapshot());
+        // The embedded host-promise table has the same freshness contract as
+        // checkpoint.json: a compaction-time snapshot. Runtime resume never
+        // reads it (deliveries and replay load `host_promises.json` ∪ the
+        // per-op blobs); embedding the whole table per safepoint was the
+        // other O(history)-per-call term.
+        if compact {
+            manifest = manifest.with_host_promises(ctx.host_promise_records());
+        }
         // Write through the run's store handle when persistence is enabled, so
         // a configured durable mirror receives the scaffold too; identical
         // on-disk layout either way.
@@ -214,10 +221,13 @@ impl ScaffoldPersister {
             self.blob_written.store(true, Ordering::Release);
         }
         store.put_manifest(&manifest)?;
-        if checkpoint == CheckpointWrite::Compact || ctx.call_log_checkpoint_dirty() {
+        if compact || ctx.call_log_checkpoint_dirty() {
             let call_log = ctx.call_log().into_records();
             store.write_call_log(&call_log)?;
             ctx.clear_call_log_checkpoint_dirty(call_log.len());
+        }
+        if compact {
+            store.compact_host_promises(&manifest.host_promises)?;
         }
         store.put_pending(manifest.pending.as_ref())
     }
@@ -979,7 +989,7 @@ mod tests {
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("expected persisted run dir before provider"))??
                 .path();
-            let loaded = SnapshotStore::new(run_dir).load()?;
+            let loaded = SnapshotStore::new(&run_dir).load()?;
             let pending = loaded
                 .manifest
                 .pending
@@ -1012,13 +1022,18 @@ mod tests {
                     "pre-provider snapshot blob did not match expected live VM snapshot"
                 );
             }
+            // The pending promise must be durable BEFORE the provider runs.
+            // It lives in the per-op blob ∪ table union (the manifest embeds
+            // the table only at compaction points, like checkpoint.json).
+            let store = crate::runtime::store::FsRunStore::new(&run_dir);
+            let promises = crate::runtime::snapshot::load_host_promise_records(&store)?;
             anyhow::ensure!(
-                loaded.manifest.host_promises.len() == 1,
+                promises.len() == 1,
                 "expected one pending host promise before provider"
             );
             anyhow::ensure!(
                 matches!(
-                    loaded.manifest.host_promises[0].state,
+                    promises[0].state,
                     crate::runtime::snapshot::HostPromiseState::Pending
                 ),
                 "expected pending host promise before provider"

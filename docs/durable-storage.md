@@ -53,6 +53,18 @@ Loading unions the two: the last checkpoint wins per-seq, and any tail
 records appended after the last compaction — the steady-state case, not just
 crash recovery — are recovered from `records.jsonl`.
 
+The **host-promise table** follows the same append+compact discipline. Each
+state change (begin/resolve/reject) writes one small per-operation blob
+(`host_promises/<id>.json`) — O(1) on every backend — instead of rewriting
+the whole `host_promises.json` table per host call. Compaction points (pause,
+settle, a server-side delivery) fold the blobs into the table file and delete
+them; readers union both, per-op blobs winning by id. The per-op blob is what
+keeps the crash-between-resolve-and-record dedup guarantee: a resolved effect
+whose journal record never landed is still recognized on resume and not
+re-executed. The manifest's embedded copy of the table has the same freshness
+contract as `checkpoint.json` (compaction-time snapshot; runtime resume never
+reads it).
+
 ## Backends
 
 Selected by `CHIDORI_RUN_STORE`:

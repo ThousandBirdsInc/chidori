@@ -16,6 +16,13 @@ pub const SNAPSHOT_MANIFEST_FILE: &str = "runtime.snapshot.json";
 pub const SNAPSHOT_BLOB_FILE: &str = "runtime.snapshot";
 pub const PENDING_HOST_OPERATION_FILE: &str = "pending.json";
 pub const HOST_PROMISE_TABLE_FILE: &str = "host_promises.json";
+/// Per-operation host-promise blobs (`host_promises/<id>.json`), one written
+/// on every state change (begin/resolve/reject). This is the O(1) hot-path
+/// alternative to rewriting the whole `host_promises.json` table per host
+/// call (which cost O(history) per call, O(history²) per run). Compaction
+/// points fold the blobs into the table file and delete them; readers union
+/// both via [`load_host_promise_records`].
+pub const HOST_PROMISE_EVENTS_PREFIX: &str = "host_promises/";
 /// Durable per-run signal mailbox. Lives in a `signals/` subdirectory of the
 /// run directory (unlike the flat `pending.json`/`host_promises.json`), so
 /// writers must create the parent dir before writing. Holds the ordered
@@ -454,6 +461,52 @@ impl HostPromiseTable {
     pub fn records(&self) -> Vec<HostPromiseRecord> {
         self.records.values().cloned().collect()
     }
+}
+
+/// Blob key for one operation's durable host-promise state.
+pub fn host_promise_blob_key(id: HostOperationId) -> String {
+    format!("{HOST_PROMISE_EVENTS_PREFIX}{}.json", id.0)
+}
+
+/// Load the durable host-promise table: the compacted `host_promises.json`
+/// base unioned with any per-operation blobs written since the last
+/// compaction. A per-op blob wins over the base entry for its id — it is
+/// strictly newer (compaction deletes the blobs it folds in, and a blob that
+/// survives a crashed compaction carries the same state the table already
+/// folded). Returns an empty vec when the run has no table at all.
+pub fn load_host_promise_records(
+    store: &dyn crate::runtime::store::RunStore,
+) -> Result<Vec<HostPromiseRecord>> {
+    let mut records: Vec<HostPromiseRecord> = match store.get_blob(HOST_PROMISE_TABLE_FILE)? {
+        Some(bytes) => serde_json::from_slice(&bytes).context("parsing host promise table")?,
+        None => Vec::new(),
+    };
+    let mut tail: Vec<HostPromiseRecord> = Vec::new();
+    for key in store.list_blobs()? {
+        if !key.starts_with(HOST_PROMISE_EVENTS_PREFIX) {
+            continue;
+        }
+        let Some(bytes) = store.get_blob(&key)? else {
+            continue;
+        };
+        match serde_json::from_slice::<HostPromiseRecord>(&bytes) {
+            Ok(record) => tail.push(record),
+            // A crash can truncate a blob mid-write; the compacted base (or
+            // the pending re-execution path) covers that operation.
+            Err(_) => continue,
+        }
+    }
+    tail.sort_by_key(|record| record.operation.id.0);
+    for record in tail {
+        match records
+            .iter_mut()
+            .find(|existing| existing.operation.id == record.operation.id)
+        {
+            Some(existing) => *existing = record,
+            None => records.push(record),
+        }
+    }
+    Ok(records)
 }
 
 /// Args comparison for completed-operation replay, ignoring derived request
@@ -1013,6 +1066,26 @@ impl SnapshotStore {
             .context("writing checkpoint")
     }
 
+    /// Fold the host-promise table into its compacted artifact: write the
+    /// full `host_promises.json` and delete the per-operation blobs it now
+    /// covers. Write-then-delete ordering keeps a crash in between harmless —
+    /// a surviving blob carries the same state the table just folded, and the
+    /// union loader lets it win by id.
+    pub fn compact_host_promises(&self, records: &[HostPromiseRecord]) -> Result<()> {
+        self.store
+            .put_blob(
+                HOST_PROMISE_TABLE_FILE,
+                &serde_json::to_vec_pretty(records)?,
+            )
+            .with_context(|| format!("writing {HOST_PROMISE_TABLE_FILE}"))?;
+        for key in self.store.list_blobs()? {
+            if key.starts_with(HOST_PROMISE_EVENTS_PREFIX) {
+                self.store.delete_blob(&key)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Write (or, when `None`, remove) the pending-host-operation artifact.
     pub fn put_pending(&self, pending: Option<&PendingHostOperation>) -> Result<()> {
         match pending {
@@ -1444,4 +1517,90 @@ fn stable_source_hash(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+#[cfg(test)]
+mod host_promise_union_tests {
+    use super::*;
+    use crate::runtime::store::{FsRunStore, RunStore as _};
+
+    fn record(id: u64, state: HostPromiseState) -> HostPromiseRecord {
+        HostPromiseRecord {
+            operation: PendingHostOperation::new(
+                HostOperationId(id),
+                id,
+                PendingHostOperationKind::Prompt,
+                serde_json::json!({ "n": id }),
+            ),
+            state,
+        }
+    }
+
+    /// Pins the per-op blob ∪ compacted table protocol: a per-op blob wins
+    /// over the table entry for its id (it is strictly newer), new ids from
+    /// blobs are unioned in, and compaction folds everything into the table
+    /// file and retires the blobs.
+    #[test]
+    fn per_op_blobs_union_with_table_and_compact_away() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-host-promise-union-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = FsRunStore::new(&dir);
+
+        // Compacted base: op 1 still Pending.
+        store
+            .put_blob(
+                HOST_PROMISE_TABLE_FILE,
+                &serde_json::to_vec_pretty(&vec![record(1, HostPromiseState::Pending)]).unwrap(),
+            )
+            .unwrap();
+        // Per-op blobs written since: op 1 resolved, op 2 begun.
+        let resolved = record(
+            1,
+            HostPromiseState::Resolved {
+                value: serde_json::json!("done"),
+                completed_at: chrono::Utc::now(),
+            },
+        );
+        store
+            .put_blob(
+                &host_promise_blob_key(HostOperationId(1)),
+                &serde_json::to_vec_pretty(&resolved).unwrap(),
+            )
+            .unwrap();
+        store
+            .put_blob(
+                &host_promise_blob_key(HostOperationId(2)),
+                &serde_json::to_vec_pretty(&record(2, HostPromiseState::Pending)).unwrap(),
+            )
+            .unwrap();
+
+        let records = load_host_promise_records(&store).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            records[0].state,
+            HostPromiseState::Resolved { .. }
+        ));
+        assert!(matches!(records[1].state, HostPromiseState::Pending));
+
+        // Compaction folds the union into the table file and retires the blobs.
+        SnapshotStore::new(&dir)
+            .compact_host_promises(&records)
+            .unwrap();
+        assert!(!store
+            .list_blobs()
+            .unwrap()
+            .iter()
+            .any(|key| key.starts_with(HOST_PROMISE_EVENTS_PREFIX)));
+        let reloaded = load_host_promise_records(&store).unwrap();
+        assert_eq!(reloaded.len(), 2);
+        assert!(matches!(
+            reloaded[0].state,
+            HostPromiseState::Resolved { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

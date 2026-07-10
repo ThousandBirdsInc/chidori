@@ -10,8 +10,7 @@ use crate::runtime::capability::{Capability, CapabilityLedger};
 use crate::runtime::otel::RunSpan;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseTable, PendingHostOperation,
-    PendingHostOperationKind, QueuedSignal, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
-    SIGNAL_INBOX_FILE,
+    PendingHostOperationKind, QueuedSignal, PENDING_HOST_OPERATION_FILE, SIGNAL_INBOX_FILE,
 };
 use crate::runtime::store::{FsRunStore, RunStore};
 use crate::runtime::vfs::Vfs;
@@ -1433,7 +1432,7 @@ impl RuntimeContext {
         let id = inner
             .host_promises
             .create_with_function(seq, kind, function, args);
-        persist_host_promises(&mut inner);
+        persist_host_promise_change(&mut inner, id);
         id
     }
 
@@ -1481,7 +1480,7 @@ impl RuntimeContext {
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.host_promises.resolve(id, value)?;
-        persist_host_promises(&mut inner);
+        persist_host_promise_change(&mut inner, id);
         Ok(())
     }
 
@@ -1492,7 +1491,7 @@ impl RuntimeContext {
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.host_promises.reject(id, error)?;
-        persist_host_promises(&mut inner);
+        persist_host_promise_change(&mut inner, id);
         Ok(())
     }
 
@@ -1577,15 +1576,22 @@ fn note_persist_result(inner: &mut RuntimeContextInner, result: anyhow::Result<(
     }
 }
 
-fn persist_host_promises(inner: &mut RuntimeContextInner) {
+fn persist_host_promise_change(inner: &mut RuntimeContextInner, id: HostOperationId) {
     let Some(store) = inner.store.clone() else {
         return;
     };
-    let records = inner.host_promises.records();
-    let result = serde_json::to_vec_pretty(&records)
-        .map_err(anyhow::Error::from)
-        .and_then(|json| store.put_blob(HOST_PROMISE_TABLE_FILE, &json));
-    note_persist_result(inner, result);
+    // One O(1) blob per state change (`host_promises/<id>.json`) instead of
+    // rewriting the whole table — which made every host call O(history) and
+    // every run O(history²). Compaction points fold the blobs back into
+    // `host_promises.json`; readers union both (`load_host_promise_records`).
+    if let Some(record) = inner.host_promises.record(id).cloned() {
+        let result = serde_json::to_vec_pretty(&record)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| {
+                store.put_blob(&crate::runtime::snapshot::host_promise_blob_key(id), &json)
+            });
+        note_persist_result(inner, result);
+    }
 
     let pending = inner.host_promises.active_pending_operation();
     let result = match pending {
@@ -1747,20 +1753,24 @@ mod tests {
         );
 
         let pending_path = run_dir.join(PENDING_HOST_OPERATION_FILE);
-        let table_path = run_dir.join(HOST_PROMISE_TABLE_FILE);
         assert!(pending_path.exists());
-        assert!(table_path.exists());
         let pending: PendingHostOperation =
             serde_json::from_slice(&std::fs::read(&pending_path).unwrap()).unwrap();
         assert_eq!(pending.id, id);
         assert_eq!(pending.kind, PendingHostOperationKind::Prompt);
+        // The pending state is durable BEFORE the effect runs, via the O(1)
+        // per-op blob; the union loader is the read surface for the compacted
+        // table + blobs.
+        let store = crate::runtime::store::FsRunStore::new(&run_dir);
+        let records = crate::runtime::snapshot::load_host_promise_records(&store).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].state, HostPromiseState::Pending));
 
         ctx.resolve_host_operation(id, serde_json::json!("done"))
             .unwrap();
 
         assert!(!pending_path.exists());
-        let records: Vec<HostPromiseRecord> =
-            serde_json::from_slice(&std::fs::read(&table_path).unwrap()).unwrap();
+        let records = crate::runtime::snapshot::load_host_promise_records(&store).unwrap();
         assert_eq!(records.len(), 1);
         assert!(matches!(
             records[0].state,

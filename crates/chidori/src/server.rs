@@ -28,7 +28,7 @@ use crate::runtime::host_core::signal_timeout_sentinel;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation,
     PendingHostOperationKind, RuntimePolicy, SnapshotAbi, SnapshotStore, SourceFingerprint,
-    HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
+    PENDING_HOST_OPERATION_FILE,
 };
 use crate::runtime::template::TemplateEngine;
 use crate::scheduler::{self, SchedulerDeps};
@@ -248,10 +248,10 @@ fn complete_persisted_pending_host_operation(
         }
     }
 
-    let mut records: Vec<HostPromiseRecord> = match store.get_blob(HOST_PROMISE_TABLE_FILE)? {
-        Some(bytes) => serde_json::from_slice(&bytes)?,
-        None => Vec::new(),
-    };
+    // Union the compacted table with any per-op blobs written since the last
+    // compaction; a delivery is a natural compaction point, so the updated
+    // table is folded back to `host_promises.json` and the blobs retired.
+    let mut records = crate::runtime::snapshot::load_host_promise_records(store.as_ref())?;
     let completed_at = chrono::Utc::now();
     let record = records
         .iter_mut()
@@ -278,10 +278,8 @@ fn complete_persisted_pending_host_operation(
             completed_at,
         },
     };
-    store.put_blob(
-        HOST_PROMISE_TABLE_FILE,
-        &serde_json::to_vec_pretty(&records)?,
-    )?;
+    crate::runtime::snapshot::SnapshotStore::with_store(run_base.join(run_id), store.clone())
+        .compact_host_promises(&records)?;
     store.delete_blob(PENDING_HOST_OPERATION_FILE)?;
     Ok(Some(pending))
 }
@@ -296,10 +294,7 @@ fn complete_persisted_host_promise_record(
         return Ok(());
     };
     let store = crate::runtime::store::RunStoreFactory::shared(run_base).store_for(run_id);
-    let mut records: Vec<HostPromiseRecord> = match store.get_blob(HOST_PROMISE_TABLE_FILE)? {
-        Some(bytes) => serde_json::from_slice(&bytes)?,
-        None => Vec::new(),
-    };
+    let mut records = crate::runtime::snapshot::load_host_promise_records(store.as_ref())?;
     let completed_at = chrono::Utc::now();
     let record = records
         .iter_mut()
@@ -323,10 +318,8 @@ fn complete_persisted_host_promise_record(
             completed_at,
         },
     };
-    store.put_blob(
-        HOST_PROMISE_TABLE_FILE,
-        &serde_json::to_vec_pretty(&records)?,
-    )?;
+    crate::runtime::snapshot::SnapshotStore::with_store(run_base.join(run_id), store.clone())
+        .compact_host_promises(&records)?;
     Ok(())
 }
 
@@ -339,13 +332,11 @@ fn load_persisted_host_promises(
     };
     // Materialize the run dir from the durable mirror first when this machine
     // has never seen the run (the machine-loss recovery path).
-    let _ = crate::runtime::store::RunStoreFactory::shared(run_base).hydrate(run_id);
-    let table_path = run_base.join(run_id).join(HOST_PROMISE_TABLE_FILE);
-    if !table_path.exists() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_slice(&std::fs::read(&table_path)?)
-        .map_err(|err| anyhow::anyhow!("parsing {}: {}", table_path.display(), err))
+    let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
+    let _ = factory.hydrate(run_id);
+    // Union of the compacted table and any per-op blobs written since the
+    // last compaction (`docs/durable-storage.md`).
+    crate::runtime::snapshot::load_host_promise_records(factory.store_for(run_id).as_ref())
 }
 
 /// Load the virtual filesystem captured in a run's snapshot manifest so a
@@ -2718,6 +2709,7 @@ async fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE;
     use axum::body;
 
     fn test_run_base(name: &str) -> PathBuf {

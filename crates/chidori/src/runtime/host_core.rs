@@ -2341,14 +2341,15 @@ mod tests {
         ));
         let ctx = RuntimeContext::new();
         let run_dir = ctx.enable_persistence(base.clone());
-        let table_path = run_dir.join(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE);
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let completion_events = events.clone();
-        let completion_table_path = table_path.clone();
+        let completion_run_dir = run_dir.clone();
         ctx.set_host_operation_completion_safepoint(HostOperationCompletionSafepoint::new(
             move |record| {
-                let records: Vec<HostPromiseRecord> =
-                    serde_json::from_slice(&std::fs::read(&completion_table_path)?)?;
+                // The resolved state must be durable (per-op blob ∪ table)
+                // by the time the completion safepoint observes it.
+                let store = crate::runtime::store::FsRunStore::new(&completion_run_dir);
+                let records = crate::runtime::snapshot::load_host_promise_records(&store)?;
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].operation.id, record.operation.id);
                 assert!(matches!(
