@@ -66,4 +66,13 @@ pub const WORKLOADS: &[(&str, &str)] = &[
         "mutual_recursion",
         "(function(){ function isEven(n){ return n === 0 ? true : isOdd(n - 1); } function isOdd(n){ return n === 0 ? false : isEven(n - 1); } const gcd = (a, b) => b === 0 ? a : gcd(b, a % b); let c = 0; for (let i = 0; i < 600; i++) { if (isEven(i % 97)) c++; c += gcd(i + 1234, 991); } return c; })()",
     ),
+    // Mixed "glue code": small helpers over objects and strings — property
+    // traffic across calls, string building, for-in, ternary classification.
+    // Every function here declines the typed kernel tiers, so this is the
+    // register-bytecode tier's home turf (docs/js-performance-roadmap.md
+    // §6.10); mirrors benchmarks/workloads/mixed_helpers.js at bench scale.
+    (
+        "mixed_helpers",
+        "(function(){ function normalize(rec){ const out = { id: rec.id | 0, label: '', score: 0 }; for (const k in rec) { if (k === 'id') continue; const v = rec[k]; if (typeof v === 'number') out.score = out.score + v; else if (typeof v === 'string') out.label = out.label ? out.label + ':' + v : v; } return out; } function render(rec){ return '[' + rec.id + '] ' + (rec.label || '?') + ' => ' + rec.score; } function classify(score){ return score > 40 ? 'hi' : score > 15 ? 'mid' : 'lo'; } const buckets = { hi: 0, mid: 0, lo: 0 }; let checksum = 0; for (let i = 0; i < 4000; i++) { const rec = { id: i, name: 'item' + (i % 7), a: i % 13, b: (i * 3) % 29, kind: i % 2 ? 'x' : 'y' }; const norm = normalize(rec); const line = render(norm); buckets[classify(norm.score)]++; checksum = (checksum + line.length + norm.score) % 1000000007; } return checksum + buckets.hi + buckets.mid + buckets.lo; })()",
+    ),
 ];

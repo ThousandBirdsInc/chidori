@@ -152,6 +152,49 @@ pub fn compile_script_kernels(src: &str, kernels: bool) -> Result<FuncProto, Str
     })
 }
 
+/// Compile with the register-bytecode pass toggled — used by the register-tier
+/// differential test (`tests/reg.rs`), which asserts register and stack
+/// execution are byte-identical. Production uses [`compile_script`] (register
+/// bytecode on).
+pub fn compile_script_regs(src: &str, regs: bool) -> Result<FuncProto, String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::script();
+    let ret = Parser::new(&allocator, src, source_type).parse();
+    if !ret.errors.is_empty() {
+        let msg = ret
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("SyntaxError: {msg}"));
+    }
+    let program = ret.program;
+    let sem = oxc::semantic::SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&program);
+    if !sem.errors.is_empty() {
+        return Err(format!(
+            "SyntaxError: {}",
+            sem.errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    let mut c = Compiler::new();
+    c.source = src.to_string();
+    c.regify = regs;
+    c.compile_toplevel(&program).map_err(|e| {
+        if e.starts_with("SyntaxError") {
+            e
+        } else {
+            format!("SyntaxError: {e}")
+        }
+    })
+}
+
 /// Compile global eval code — `(0,eval)(src)`: identical to a script except
 /// `return` is illegal and the global `var`/function bindings it creates are
 /// DELETABLE (CreateGlobalVarBinding with D=true).
@@ -790,6 +833,11 @@ struct Compiler {
     /// Always on in production; disabled for the kernel differential test and
     /// under the `op-histogram` feature (kernels would hide per-op counts).
     kernelize: bool,
+    /// Compile register bytecode (`reg.rs`) for eligible whole function
+    /// bodies. Always on in production; disabled for the register-tier
+    /// differential test and under the `op-histogram` feature (register
+    /// execution would hide per-op counts).
+    regify: bool,
 }
 
 impl Compiler {
@@ -814,6 +862,7 @@ impl Compiler {
             fuse: true,
             localize: true,
             kernelize: !cfg!(feature = "op-histogram"),
+            regify: !cfg!(feature = "op-histogram"),
         }
     }
 
@@ -1810,11 +1859,24 @@ impl Compiler {
         } else {
             None
         };
+        // Register bytecode (reg.rs, docs/js-performance-roadmap.md §3.5):
+        // translate the whole body into a register program when every op is
+        // in the translated subset. Runs LAST so it sees the final stream;
+        // functions carrying loop kernels decline inside `regify` (the
+        // unboxed kernels are faster than boxed register ops and own their
+        // functions), as does anything with try/finally handlers, `with`/
+        // direct-eval machinery, suspension, or super/private class wiring.
+        let reg = if self.regify {
+            crate::reg::regify(&code, loc.num_locals).map(std::rc::Rc::new)
+        } else {
+            None
+        };
         FuncProto {
             eval_scopes: fc.eval_scopes.clone(),
             name: fc.name,
             kernels,
             fn_kernel,
+            reg,
             ic: code
                 .iter()
                 .map(|_| crate::bytecode::IcEntry {
