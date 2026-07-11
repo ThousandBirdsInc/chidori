@@ -403,6 +403,23 @@ impl Vm {
     /// Collect enumerable string keys across the prototype chain for `for-in`,
     /// in deterministic order, de-duplicated, skipping shadowed keys.
     pub fn for_in_keys(&mut self, v: &Value) -> Result<Vec<JsString>, Value> {
+        let obj = match v {
+            Value::Object(o) => o.clone(),
+            Value::Undefined | Value::Null => return Ok(Vec::new()),
+            _ => self.to_object(v)?,
+        };
+        // FAST PATH — the overwhelmingly common shape: an ORDINARY receiver
+        // whose prototype chain CONTRIBUTES no enumerable string key (every
+        // standard prototype is fully non-enumerable). One object's own
+        // enumerable string keys are unique by construction, and a chain
+        // that contributes nothing makes shadowing irrelevant — so the
+        // shadow set and the per-level `own_keys` key-clone Vecs (together
+        // ~14% of glue-shaped workloads) are skipped entirely. Anything
+        // else — proxy, exotic index sources, an enumerable proto key —
+        // falls back to the generic walk below, unchanged.
+        if let Some(out) = self.for_in_keys_fast(&obj) {
+            return Ok(out);
+        }
         let mut out: Vec<JsString> = Vec::new();
         // Dedup by `JsString` (an insert clones an `Rc`, not the bytes) under
         // the deterministic Fx hasher — the std SipHash `HashSet<String>` it
@@ -416,11 +433,6 @@ impl Vm {
             JsString,
             std::hash::BuildHasherDefault<crate::fxhash::FxHasher>,
         > = Default::default();
-        let obj = match v {
-            Value::Object(o) => o.clone(),
-            Value::Undefined | Value::Null => return Ok(out),
-            _ => self.to_object(v)?,
-        };
         let mut cur = Some(obj);
         while let Some(o) = cur {
             if self.is_proxy(&o) {
@@ -464,5 +476,85 @@ impl Vm {
             cur = o.borrow().proto.clone();
         }
         Ok(out)
+    }
+
+    /// `for_in_keys`' allocation-free fast path. `Some(keys)` iff the
+    /// receiver is an ordinary object and NO prototype-chain level
+    /// contributes an enumerable string key — then the receiver's own
+    /// enumerable string keys (index-likes sorted first, per
+    /// `[[OwnPropertyKeys]]`) ARE the for-in keys, no shadow set needed.
+    /// `None` = use the generic walk; the split is decided by the same
+    /// facts that walk reads, so both produce identical keys where this
+    /// path applies.
+    fn for_in_keys_fast(&self, obj: &JsObject) -> Option<Vec<JsString>> {
+        let mut out: Vec<JsString> = Vec::new();
+        let mut ints: Vec<u32> = Vec::new();
+        let proto = {
+            let b = obj.borrow();
+            // Ordinary receivers only: exotic internals (dense elements,
+            // string indices, typed arrays, proxies, namespace exports)
+            // synthesize own keys that live outside `props`.
+            if !matches!(b.internal, Internal::Ordinary) {
+                return None;
+            }
+            for (k, p) in b.props.iter() {
+                if let PropertyKey::Str(s) = k {
+                    // Internal-slot keys are non-enumerable by contract, so
+                    // `p.enumerable` alone excludes them, as on the generic
+                    // path.
+                    if !p.enumerable {
+                        continue;
+                    }
+                    match k.array_index() {
+                        Some(i) => ints.push(i),
+                        None => out.push(s.clone()),
+                    }
+                }
+            }
+            b.proto.clone()
+        };
+        // Index-like keys enumerate first, ascending (map keys are unique,
+        // so no dedup); the plain names keep insertion order after them.
+        if !ints.is_empty() {
+            ints.sort_unstable();
+            let mut merged: Vec<JsString> = Vec::with_capacity(ints.len() + out.len());
+            for i in ints {
+                match PropertyKey::from_index(i) {
+                    PropertyKey::Str(s) => merged.push(s),
+                    PropertyKey::Sym(_) => unreachable!("index keys are strings"),
+                }
+            }
+            merged.append(&mut out);
+            out = merged;
+        }
+        // The rest of the chain must contribute NOTHING: no enumerable
+        // string key in `props`, and no internal that synthesizes own
+        // enumerable keys. Any contribution (or a proxy, whose traps must
+        // run) sends the whole walk down the generic path.
+        let mut cur = proto;
+        while let Some(o) = cur {
+            let b = o.borrow();
+            match &b.internal {
+                Internal::Proxy(_)
+                | Internal::StringObj(_)
+                | Internal::TypedArray(_)
+                | Internal::ModuleNamespace(_) => return None,
+                // An EMPTY dense array (Array.prototype!) contributes only
+                // its non-enumerable `length`; any element is enumerable.
+                Internal::Array(arr) if arr.iter().any(|v| !matches!(v, Value::Hole)) => {
+                    return None;
+                }
+                _ => {}
+            }
+            for (k, p) in b.props.iter() {
+                if p.enumerable && matches!(k, PropertyKey::Str(_)) {
+                    return None;
+                }
+            }
+            let next = b.proto.clone();
+            drop(b);
+            cur = next;
+        }
+        Some(out)
     }
 }

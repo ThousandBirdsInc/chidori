@@ -1066,7 +1066,8 @@ Measured (idle machine, interleaved A/B medians): **mutual_recursion
 (6.9×)**; fib_recursive / closures / sort unchanged. RESULT byte-identical.
 Remaining headroom: the per-activation family resolution allocates its
 tables per OUTER call (~40k entries here) — an entry cache or Vm-pooled
-scratch would shave the shallow-recursion case further.
+scratch would shave the shallow-recursion case further. *(→ landed as the
+family cache + grow-only register buffer, §6.11.)*
 
 Gates: the kernels differential corpus grew 16 recursion programs
 (boolean/mutual/const-binding families, typeof/strict-eq observation,
@@ -1147,15 +1148,12 @@ values):
   through parked completions (a `while(true)` whose sole exits break
   through a `finally`) has no seeded state and declines the function.
 - **Determinism.** The register program is a pure function of the source,
-  compiled at compile finish. Like the kernel tiers, the register tier is
-  OFF whenever an op budget is installed — per-stack-op accounting stays
-  exact on the generic path — and it polls the cooperative interrupt flag
-  at the stack loop's cadence. (Consequence, inherited from the kernel
-  tiers' rule: the production server's default `CHIDORI_JS_OP_BUDGET=5e9
-  keeps agent runs on the stack tier; the tier pays off today in
-  unbudgeted embeddings, replay/test tooling, and the benchmark harness.
-  Making budget accounting conservative-but-deterministic on the fast
-  tiers is tracked as follow-up work.)
+  compiled at compile finish. It polls the cooperative interrupt flag at
+  the stack loop's cadence. ~~Like the kernel tiers, the register tier is
+  OFF whenever an op budget is installed~~ — superseded by §6.11: the tier
+  now carries EXACT per-op stack-unit costs and stays on under a budget,
+  so the production server's default `CHIDORI_JS_OP_BUDGET=5e9` runs get
+  the register tier too. The kernel tiers still decline under a budget.
 - **Native stack discipline.** `run_reg_frame` keeps the hot ops inline and
   delegates everything rare to an `#[inline(never)]` `rstep_cold`, the same
   split (and reason) as `step`/`step_cold`; the depth-overflow differential
@@ -1235,9 +1233,117 @@ vs reg-off across the board.
 - **Register-mode loop-kernel embedding** — let a function carry BOTH
   kernels and a register program by teaching kernel bail-out to resume at a
   register pc instead of a stack ip.
-- **Budget-compatible fast tiers** — a conservative deterministic op-count
-  mapping so production budgeted runs can use kernels + registers.
+- ~~**Budget-compatible fast tiers**~~ — the register half landed (§6.11):
+  budgeted runs keep the register tier with EXACT drain. The kernel tiers
+  (whose fused unboxed regions have no 1:1 stack-op correspondence at
+  bail boundaries) still decline under a budget; mapping them stays open.
 - Re-run the callgrind sweep before choosing; §1.1's caveats stand.
+
+## 6.11 Recursion-entry + for-in fast paths; the register tier joins budgeted runs (landed 2026-07-11)
+
+Four items from a fresh callgrind review of the two workloads the previous
+rounds left richest — mutual_recursion (1.43 G, ~22% per-activation
+overhead) and mixed_helpers (4.16 G, ~14% for-in machinery) — plus the
+op-budget follow-up §6.10.2 tracked. All safe Rust, zero new dependencies.
+
+1. **Grow-only kernel register buffer.** `Vm::kernel_regs` was cleared and
+   re-zeroed per activation, so a 300-deep `isEven` recursion re-zero-filled
+   every window on each of 40k outer calls — `Vec::resize` + memset were
+   11% of mutual_recursion. The buffer now keeps its high-water length
+   across activations and is never re-zeroed: stale `f64`s are unreadable
+   by construction (every register is loaded at entry or store-before-read
+   by translation proof — the same proofs the kernels already rely on).
+2. **Recursion-family cache** (`exec::RecFamily`, `Vm::rec_families`). v9's
+   per-activation family resolution allocated ~8 table Vecs and re-scanned
+   every member's kernel code (Ret-type + argc cross-checks) per OUTER
+   call. The resolved family is now cached keyed by the entry closure's
+   identity; a hit re-verifies only the dynamic facts — each recorded
+   global SLOT still holds its member (key-verified indexed read, no
+   hashing — insertion slots are stable under value writes and appends),
+   upvalue self-cells intact, `Math` canonical — and re-snapshots upvalue
+   values. Any failure drops the entry and re-resolves from scratch
+   (exactly the uncached path), so hit vs miss is unobservable. The
+   windowed executor's (return-pc, dst, window) stack is Vm-pooled, and
+   the family's tables are read through the cache during execution.
+   Bounded (8 entries, MRU); holding member closures across activations is
+   the same retention class as the prototype-holder ICs.
+3. **for-in fast path** (`Vm::for_in_keys_fast`). Every `for (k in o)`
+   built a shadowing `HashSet` and per-chain-level `own_keys` key-clone
+   Vecs — so a 5-key plain object also inserted Object.prototype's ~12
+   non-enumerable keys into a set that then rehashed and dropped, 60k
+   times (~14% of mixed_helpers + a large share of its allocator
+   traffic). Now: an ORDINARY receiver's own enumerable string keys come
+   straight off its property map (index-likes sorted first, own keys
+   unique by construction — no dedup needed for one level), and the
+   prototype chain is walked with an allocation-free "contributes any
+   enumerable string key?" scan. If nothing contributes (every standard
+   prototype), shadowing is irrelevant and the walk is done; a proxy, an
+   exotic index source, or any enumerable proto key falls back to the
+   generic path unchanged. Gated by an 18-case differential vs Node
+   (index ordering, shadowing incl. non-enumerable shadows, null proto,
+   mid-program `Object.prototype` injection, arrays/holes/strings,
+   enumerable accessors, frozen objects, array-valued protos).
+4. **The register tier joins budgeted runs** (`RegProto::costs`). The tier
+   previously declined whenever an op budget was installed — so the
+   production server's `CHIDORI_JS_OP_BUDGET=5e9` kept every agent run on
+   the stack tier, and §6.10's wins never reached production. Each
+   register op now carries the EXACT number of final stack-bytecode ops it
+   stands for, attributed during translation: elided pure loads accumulate
+   into the next ANCHOR op on their path (between a pure stack op and the
+   next anchor nothing observable runs, so charging there is exact); a
+   fall-through edge into a join sinks stranded units into a pure
+   `ROp::Charge`; the fused method-call window anchors at its `GetProp`
+   (unit 2 of 3) so a getter still runs — with the same remaining budget —
+   when the stack tier would have died exactly at the trailing `Swap`.
+   The charge is hard-checked before each op: the budget-exceeded throw
+   fires exactly where the stack loop's per-op check would have, no op
+   the stack tier would not have reached can run, and every control op
+   costs ≥ 1 so termination stays guaranteed. Unbudgeted runs pay one
+   predicted branch per op (the stack loop's own `counting` protocol).
+
+   En route this EXPOSED a pre-existing register-tier crash that budgeted
+   runs had masked: a zero-arg call/construct whose argument window starts
+   one past every touched register (`new`/method-call at virtual-stack
+   top, the Test262 `S13.2.2_A10` shape) panicked slicing
+   `locals[at..at]` out of range — the process-killing kind of bug the
+   conformance gate exists to catch, and it only surfaced because the gate
+   (which installs a 50M budget) now exercises the register tier at all.
+   Fixed with explicit empty-window guards; the shape is pinned in the reg
+   corpus.
+
+### 6.11.1 Measured (callgrind, whole workload, deterministic)
+
+Baseline = the branch point, same toolchain; RESULT checksums
+byte-identical across the suite and cross-checked against node/bun by the
+benchmark harness:
+
+| workload | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| mixed_helpers | 4.157 G | 2.953 G | **−29.0%** |
+| mutual_recursion | 1.434 G | 1.097 G | **−23.5%** |
+| json_roundtrip | 1.193 G | 1.191 G | −0.2% |
+| sort | 2.045 G | 2.051 G | +0.3% ¹ |
+| string_scan | 353.8 M | 354.9 M | +0.3% ¹ |
+| fib_recursive | 673.8 M | 676.5 M | +0.4% ² |
+| closures / arith_loop / property_access / array_sum / typed_array / array_hof / array_push_sum / string_build | — | — | unchanged (±0.1%) |
+
+¹ The register loop's `counting` branch — the price of budget
+eligibility, paid only by reg-carried workloads.
+² One instruction per self-call reading window sizes through the cached
+family instead of hoisted locals.
+
+Wall-clock (idle container, indicative per §1.1): mutual_recursion
+150 → 113 ms, mixed_helpers 587 → 427 ms.
+
+**Gates:** full suites for both crates green; kernels + reg differential
+corpora green (reg corpus grew the zero-arg-window pin); the op-budget
+test now genuinely exercises the register tier, joined by TWO new budget
+differentials — a full 0..=total budget sweep on a side-effecting program
+(every budget value must produce identical console output, completion,
+and remaining budget on both compiles) and boundary probes across the
+whole reg corpus; the 18-case for-in differential vs Node; Test262 gate
+green — now running the register tier under the runner's budget for the
+first time, i.e. 40k+ conformance tests newly executing the tier.
 
 ## 7. References
 

@@ -343,7 +343,11 @@ pub struct Vm {
     /// across activations so entering a kernel allocates nothing. Kernels
     /// never nest (a region containing a `LoopKernel` op is not kernelized),
     /// and the generic interpreter running under a kernel's fallback path
-    /// never touches this, so one buffer per Vm suffices.
+    /// never touches this, so one buffer per Vm suffices. GROW-ONLY: the
+    /// buffer keeps its high-water length across activations and is never
+    /// re-zeroed — stale `f64`s are unreadable (every register is either
+    /// loaded at entry or store-before-read by translation proof), and
+    /// zero-filling deep recursion windows per outer call was measurable.
     pub(crate) kernel_regs: Vec<f64>,
     /// Scratch cache of the array-base objects for the active kernel (see
     /// `kernel_regs`); cleared after every activation so the pool never
@@ -355,6 +359,15 @@ pub struct Vm {
     /// Pooled entry-verified closure callees for kernel `CallKernel`:
     /// (callee function, register-window base).
     pub(crate) kernel_callees: Vec<(std::rc::Rc<crate::value::BytecodeFunction>, u32)>,
+    /// Cached recursion-family resolutions for the windowed recursive-kernel
+    /// executor (see `exec::RecFamily`): resolving a family allocates tables
+    /// and walks member code, which dominated shallow recursions when paid
+    /// per outer call. Bounded; validated per activation; a pure perf cache
+    /// (hit vs miss is unobservable).
+    pub(crate) rec_families: Vec<crate::exec::RecFamily>,
+    /// Pooled (caller, return-pc, dst, window) stack for
+    /// `run_fn_kernel_rec`; parked empty.
+    pub(crate) rec_calls: Vec<(u8, u16, u16, u32)>,
 }
 
 impl Default for Vm {
@@ -397,6 +410,8 @@ impl Vm {
             kernel_objs: Vec::new(),
             kernel_prop_slots: Vec::new(),
             kernel_callees: Vec::new(),
+            rec_families: Vec::new(),
+            rec_calls: Vec::new(),
             dummy_bf: Rc::new(BytecodeFunction {
                 proto: Rc::new(crate::bytecode::FuncProto::empty(
                     "",

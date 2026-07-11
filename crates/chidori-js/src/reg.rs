@@ -31,9 +31,11 @@
 //!   bytecode at compile finish — a pure function of the source. Execution
 //!   order of every observable operation is identical to the stack path
 //!   (gated by the reg-on/off differential corpus in `tests/reg.rs`), so the
-//!   replay journal is byte-identical either way. Like kernels, the tier is
-//!   OFF whenever an op budget is installed: per-op accounting stays exact
-//!   on the generic path.
+//!   replay journal is byte-identical either way. Unlike the kernel tiers,
+//!   the register tier stays ON under an op budget: [`RegProto::costs`]
+//!   charges each register op its EXACT stack-op units, so a budgeted run
+//!   drains — and exhausts — identically on both tiers (gated by the
+//!   budget-sweep and corpus budget differentials in `tests/reg.rs`).
 //!
 //! # Translation scheme
 //!
@@ -75,6 +77,27 @@ use crate::exec::ArithKind;
 #[derive(Debug)]
 pub struct RegProto {
     pub code: Vec<ROp>,
+    /// Per-op budget charge, index-parallel to `code`: the EXACT number of
+    /// final stack-bytecode ops this register op stands for, so a budgeted
+    /// run drains and exhausts identically on both tiers.
+    ///
+    /// The charge is hard-checked before the op runs: `budget < cost`
+    /// throws the budget-exceeded RangeError WITHOUT executing it, exactly
+    /// where the stack loop's per-op check would have fired — no observable
+    /// op (user code, throw, heap write, host effect) can run that the
+    /// stack tier would not have reached. PURE stack ops (elided lazy
+    /// loads, a fused window's trailing `Swap`) accumulate into the next
+    /// anchor's charge on the same path — or a [`ROp::Charge`] at a
+    /// fall-through join — which is exact both ways: between a pure stack
+    /// op and the next anchor nothing observable runs, so dying at the
+    /// anchor's check is indistinguishable from dying mid-pures, and a
+    /// window's trailing units are charged only after its user-visible part
+    /// (a getter inside the fused method-call window) already ran, with the
+    /// budget it would have seen on the stack tier.
+    ///
+    /// Termination stays guaranteed: every control op (branch, jump,
+    /// return) is an anchor with cost >= 1, so no cycle executes at 0.
+    pub costs: Box<[u32]>,
     /// Total register-file size: `num_locals` localized bindings followed by
     /// the canonical operand slots. `Frame.locals` is resized to this on
     /// register-mode entry.
@@ -119,6 +142,11 @@ pub enum DefKind {
 #[derive(Clone, Debug)]
 pub enum ROp {
     // ---- moves / constants / frame values ----
+    /// Pure budget landing: runs nothing; exists so stranded pure stack-op
+    /// units on a fall-through edge into a label are charged on that path
+    /// (jump-in paths charged theirs at their control op). Its units live
+    /// in [`RegProto::costs`] like any anchor's.
+    Charge,
     Mov {
         dst: u16,
         src: u16,
@@ -801,6 +829,41 @@ struct Emitter {
     /// Reached only through parked completions, so phase 2 draws no edge for
     /// them; emitting a reachable jump to one declines the function.
     unseeded_cj: Vec<u32>,
+    /// Per-op budget charges, index-parallel to `code` (see
+    /// [`RegProto::costs`]).
+    costs: Vec<u32>,
+    /// Stack-op units consumed but not yet charged (elided lazy loads,
+    /// `Nop`s, peepholed stores, a fused window's trailing pure ops):
+    /// charged into the next anchor on the same path, or sunk into a
+    /// [`ROp::Charge`] at a fall-through edge.
+    pending: u32,
+    /// Set by a fusion arm whose window has trailing PURE stack ops after
+    /// the semantic anchor (the method-call prologue's `Swap`): the number
+    /// of window units up to and including the anchor. `None` = the anchor
+    /// is the window's last unit.
+    anchor_units: Option<u32>,
+}
+
+/// Register ops that are PURE for budget purposes: no user code, no throw,
+/// no heap- or host-visible effect — executing one past the stack tier's
+/// exhaustion point is unobservable, because the uncatchable budget throw
+/// kills the frame before anything can read a register. Everything else is
+/// an ANCHOR: it takes the accumulated charge as a hard `pre` check and
+/// must not execute unless the stack tier would have reached its twin.
+/// (Whitelist deliberately minimal — anchoring a pure op is always sound.)
+fn rop_budget_pure(op: &ROp) -> bool {
+    matches!(
+        op,
+        ROp::Charge
+            | ROp::Mov { .. }
+            | ROp::Const { .. }
+            | ROp::Undef { .. }
+            | ROp::Null { .. }
+            | ROp::Bool { .. }
+            | ROp::Hole { .. }
+            | ROp::This { .. }
+            | ROp::NewTarget { .. }
+    )
 }
 
 /// Translate a function's final stack bytecode into a register program.
@@ -1011,6 +1074,9 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
         last_def: None,
         normal_visited,
         unseeded_cj,
+        costs: Vec::with_capacity(code.len()),
+        pending: 0,
+        anchor_units: None,
     };
     // rpc of each stack ip (branch targets remapped through this at the end).
     let mut rpc_at: Vec<u32> = vec![0; code.len() + 1];
@@ -1020,10 +1086,16 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
         if is_label(ip) {
             if live {
                 e.flush_all();
+                // Charge stranded pure units on this fall-through edge
+                // BEFORE the join (jump-in paths charged theirs at their
+                // control op; `rpc_at` below makes them land past this).
+                e.sink_pending();
                 debug_assert_eq!(
                     e.entries.len() as u32,
                     label_states.get(&ip).map(|s| s.depth).unwrap_or(0)
                 );
+            } else {
+                debug_assert_eq!(e.pending, 0, "dead code cannot strand units");
             }
             match label_states.get(&ip) {
                 Some(st) => {
@@ -1043,7 +1115,9 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
             ip += 1;
             continue;
         }
+        let emit_start = e.code.len();
         let (fallthrough, consumed) = e.emit_op(code, ip, &is_label)?;
+        e.assign_cost(emit_start, consumed);
         live = fallthrough;
         for k in 0..consumed {
             tdz_transfer(&code[(ip + k) as usize], &mut e.tdz);
@@ -1053,11 +1127,19 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
         }
         ip += consumed;
     }
+    // Stranded pure units on a live fall-off-the-end path charge before the
+    // landing pad (jump-to-end targets land ON the pad, past this).
+    if live {
+        e.sink_pending();
+    }
+    debug_assert_eq!(e.pending, 0);
     rpc_at[code.len()] = e.code.len() as u32;
     // Falling off the end of the code returns like the stack loop's
     // `ip >= code.len()` exit; also the landing pad for end-of-code jump
-    // targets, so pc can never overrun.
+    // targets, so pc can never overrun. Costs one unit: the stack loop
+    // charges at its head BEFORE the `ip >= len` return check.
     e.code.push(ROp::RetCompletion);
+    e.costs.push(1);
     // Remap branch targets from stack ips to rpcs.
     for op in &mut e.code {
         if let ROp::PushTryHandler { catch, finally, .. } = op {
@@ -1084,8 +1166,10 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
             holder: std::cell::RefCell::new(None),
         })
         .collect();
+    debug_assert_eq!(e.code.len(), e.costs.len());
     Some(RegProto {
         code: e.code,
+        costs: e.costs.into_boxed_slice(),
         num_regs: num_regs as u16,
         ic,
     })
@@ -1177,13 +1261,46 @@ impl Emitter {
     fn push_op(&mut self, op: ROp) {
         self.last_def = None;
         self.code.push(op);
+        self.costs.push(0);
     }
 
     /// Emit an op whose single `dst` produced the new virtual-stack top
     /// (arming the `StoreLocal` rewrite peephole).
     fn push_def(&mut self, op: ROp) {
         self.code.push(op);
+        self.costs.push(0);
         self.last_def = Some(self.code.len() - 1);
+    }
+
+    /// Attach one emission window's stack-op units up to and including its
+    /// semantic anchor (`anchor_units`, defaulting to all `consumed`) to the
+    /// FIRST anchor op it emitted (see [`rop_budget_pure`]); trailing pure
+    /// window units re-enter `pending`. An all-pure emission accumulates
+    /// all of its units into `pending` for the next anchor.
+    fn assign_cost(&mut self, start: usize, consumed: u32) {
+        let anchor_units = self.anchor_units.take().unwrap_or(consumed);
+        for i in start..self.code.len() {
+            if !rop_budget_pure(&self.code[i]) {
+                debug_assert!((1..=consumed).contains(&anchor_units));
+                self.costs[i] = self.pending + anchor_units;
+                self.pending = consumed - anchor_units;
+                return;
+            }
+        }
+        self.pending += consumed;
+    }
+
+    /// Sink accumulated pure units into a [`ROp::Charge`] — required before
+    /// a control-flow join reached by fall-through, so every path into the
+    /// join has charged exactly its own units.
+    fn sink_pending(&mut self) {
+        if self.pending > 0 {
+            let n = self.pending;
+            self.pending = 0;
+            self.push_op(ROp::Charge);
+            let i = self.code.len() - 1;
+            self.costs[i] = n;
+        }
     }
 
     /// Register that currently holds the value of `entries[pos]`, emitting a
@@ -1687,6 +1804,12 @@ impl Emitter {
                             Entry::Temp => Entry::Temp,
                             other => other,
                         });
+                        // Budget anchor: the window's observable op is the
+                        // `GetProp` at unit 2 of [Dup, GetProp, Swap] — the
+                        // trailing pure `Swap` unit re-enters `pending`, so
+                        // a getter still runs when the stack tier would
+                        // have died exactly AT the Swap.
+                        self.anchor_units = Some(2);
                         return Some((true, 3));
                     }
                 }
