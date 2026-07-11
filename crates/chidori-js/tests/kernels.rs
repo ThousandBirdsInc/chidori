@@ -14,7 +14,7 @@
 
 use std::rc::Rc;
 
-use chidori_js::bytecode::{Const, FuncProto, Op};
+use chidori_js::bytecode::{Const, FuncProto, KOp, Op};
 use chidori_js::compiler::{compile_script, compile_script_kernels};
 use chidori_js::{Engine, Value};
 
@@ -500,6 +500,27 @@ const CORPUS: &[&str] = &[
     "function h2(n) { return n <= 0 ? 0 : Math.max(n % 7, h2(n - 1)); } console.log(h2(40));",
     // Captured numeric upvalue inside a recursive const arrow.
     "const LIM = 3; const f2 = (n) => (n <= LIM ? n : f2(n - 2) + 1); console.log(f2(21));",
+    // ---- pinned-string charCodeAt/length (KOp::StrLen / KOp::CharCodeAt) ----
+    // The canonical tokenizer hash loop over a flat ASCII string.
+    "const s = \"hello world, kernel strings!\"; let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) % 1000000007; } console.log(h);",
+    // Rope-built accumulator (flattened once at kernel entry).
+    "let s = \"\"; for (let i = 0; i < 200; i++) s += \"ab\"; let h = 0; for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); console.log(h, s.length);",
+    // ToIntegerOrInfinity edges computed in-kernel: negative, OOB, NaN,
+    // fractional, negative-fraction indices.
+    "const s = \"abc\"; let out = \"\"; for (let i = -2; i < 6; i++) out += s.charCodeAt(i + 0.5) + \",\"; console.log(out, s.charCodeAt(NaN));",
+    // Non-ASCII receiver: the entry guard declines, the loop runs generic.
+    "const s = \"héllo wörld\"; let h = 0; for (let i = 0; i < s.length; i++) h = h * 3 + s.charCodeAt(i); console.log(h, s.length);",
+    // Astral (surrogate pair) receiver: WTF-16 code units via the generic path.
+    "const s = \"x𝒳y\"; let h = 0; for (let i = 0; i < s.length; i++) h = h * 7 + s.charCodeAt(i); console.log(h, s.length);",
+    // Monkeypatched charCodeAt: canonical check declines, the patch runs.
+    "const orig = String.prototype.charCodeAt; String.prototype.charCodeAt = function () { return 42; }; const s = \"abcdef\"; let h = 0; for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); String.prototype.charCodeAt = orig; console.log(h);",
+    // String local reassigned between activations (re-guarded each entry).
+    "let t = \"abc\"; let h = 0; for (let r = 0; r < 3; r++) { for (let i = 0; i < t.length; i++) h += t.charCodeAt(i); t = t + \"z\"; } console.log(h);",
+    // Non-string in the local: guard declines to the generic path (TypeError
+    // class behavior must be identical).
+    "let s = \"ok\"; let h = 0; for (let r = 0; r < 2; r++) { for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); s = \"next\"; } console.log(h);",
+    // charCodeAt result feeding arithmetic, compares, and a stored boolean.
+    "const s = \"mixed13chars\"; let digits = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); const isd = c >= 48 && c <= 57; if (isd) digits++; } console.log(digits);",
 ];
 
 #[test]
@@ -964,4 +985,113 @@ fn op_budget_identical_with_kernels() {
             );
         }
     }
+}
+
+/// The cleanup/fusion pipeline actually produces the new superinstructions
+/// (const-propagated K-forms, the fused loop-header test, and the fused
+/// element-load accumulations) on the canonical shapes — pins the
+/// masked-window round's dispatch counts.
+#[test]
+fn kernel_superinstructions_fire() {
+    fn kernel_ops(src: &str) -> Vec<KOp> {
+        fn collect(p: &FuncProto, out: &mut Vec<KOp>) {
+            for k in &p.kernels {
+                out.extend(k.code.iter().copied());
+            }
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    collect(f, out);
+                }
+            }
+        }
+        let proto = compile_script(src).expect("compiles");
+        let mut out = Vec::new();
+        collect(&proto, &mut out);
+        out
+    }
+    // `i < a.length` header: one fused LenBrCmp dispatch.
+    let ops = kernel_ops(
+        "function f(a) { let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } return s; }",
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::LenBrCmp { .. })),
+        "length header must fuse: {ops:?}"
+    );
+    // `s += a[i]`: one fused LoadElemAdd dispatch.
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::LoadElemAdd { .. })),
+        "element accumulation must fuse: {ops:?}"
+    );
+    // Constant operands reach the immediate forms: no materialized `Const`
+    // feeding an `Arith`/`BrCmp` survives in the canonical modular loop.
+    let ops = kernel_ops(
+        "function f(n) { let s = 0; for (let i = 0; i < n; i++) { s += (i * 7919) % 10007; } return s; }",
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, KOp::ArithK { .. } | KOp::ArithKAdd { .. })),
+        "constant arithmetic must use K-forms: {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(op, KOp::Const { .. })),
+        "no stranded Const feeding const-propagated ops: {ops:?}"
+    );
+}
+
+/// The masked-window executors run kernels correctly at the register-count
+/// CAP boundary (KWIN registers is the translation limit; a body needing
+/// more must decline and stay generic — never corrupt).
+#[test]
+fn kernel_register_cap() {
+    // Many distinct live locals in one loop body push the register count up;
+    // whether or not this kernelizes, the RESULT must be exact.
+    let mut body = String::new();
+    let mut sum = String::new();
+    for i in 0..24 {
+        body.push_str(&format!("let v{i} = i + {i}; "));
+        sum.push_str(&format!("+ v{i} "));
+    }
+    let src = format!(
+        "let s = 0; for (let i = 0; i < 100; i++) {{ {body} s = (s {sum}) % 1000003; }} console.log(s);"
+    );
+    let (threw_on, con_on, err_on) = run(&src, true);
+    let (threw_off, con_off, err_off) = run(&src, false);
+    assert_eq!(
+        (threw_on, &con_on, &err_on),
+        (threw_off, &con_off, &err_off),
+        "cap-boundary loop must behave identically"
+    );
+}
+
+/// The canonical charCodeAt scan loop actually kernelizes with the
+/// pinned-string ops (pins the string tier).
+#[test]
+fn char_code_loops_get_kernels() {
+    fn kernel_ops(src: &str) -> Vec<KOp> {
+        fn collect(p: &FuncProto, out: &mut Vec<KOp>) {
+            for k in &p.kernels {
+                out.extend(k.code.iter().copied());
+            }
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    collect(f, out);
+                }
+            }
+        }
+        let proto = compile_script(src).expect("compiles");
+        let mut out = Vec::new();
+        collect(&proto, &mut out);
+        out
+    }
+    let ops = kernel_ops(
+        "function f(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) % 1000000007; } return h; }",
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::CharCodeAt { .. })),
+        "charCodeAt scan must kernelize: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::StrLen { .. })),
+        "string length must use StrLen: {ops:?}"
+    );
 }

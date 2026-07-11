@@ -138,23 +138,37 @@ pub fn kernelize(mut code: Vec<Op>, consts: &[Const]) -> (Vec<Op>, Vec<Kernel>) 
         // succeeded installs the kernel. (Discovery is monotone over a
         // bounded set, so the cap is belt-and-braces.)
         let mut oslots: Vec<u32> = Vec::new();
+        let mut sslots: Vec<u32> = Vec::new();
         let mut bools: Vec<u32> = Vec::new();
         let mut installed: Option<Kernel> = None;
         for _ in 0..6 {
-            let (k, d_obj, d_bool) = translate(
+            let (k, d_obj, d_bool, d_str) = translate(
                 &code[start..=end],
                 start as u32,
                 consts,
                 &kernels,
                 &oslots,
+                &sslots,
                 &bools,
                 false,
                 None,
                 false,
             );
             let mut grew = false;
+            // A string discovery WINS over a same-local array-base guess: a
+            // `.length` read alone looks like an array, but a `charCodeAt`
+            // call is string-specific. (If the local genuinely holds an
+            // array, the string entry guard declines and the loop runs
+            // generically — same failure mode either way.)
+            for st in d_str {
+                if !sslots.contains(&st) {
+                    oslots.retain(|&o| o != st);
+                    sslots.push(st);
+                    grew = true;
+                }
+            }
             for o in d_obj {
-                if !oslots.contains(&o) {
+                if !oslots.contains(&o) && !sslots.contains(&o) {
                     oslots.push(o);
                     grew = true;
                 }
@@ -217,18 +231,19 @@ pub fn kernelize_function(
         // reject outright (element access can't run frameless).
         let mut bools: Vec<u32> = Vec::new();
         for _ in 0..6 {
-            let (k, d_obj, d_bool) = translate(
+            let (k, d_obj, d_bool, d_str) = translate(
                 code,
                 0,
                 consts,
                 inner,
+                &[],
                 &[],
                 &bools,
                 true,
                 self_name,
                 ret_bool,
             );
-            if !d_obj.is_empty() {
+            if !d_obj.is_empty() || !d_str.is_empty() {
                 return None;
             }
             let mut grew = false;
@@ -339,6 +354,12 @@ enum VE {
     MathObj,
     /// A kernel-supported `Math` method, from `GetProp` on [`VE::MathObj`].
     MathFn(KMath),
+    /// A pinned STRING base: string slot index (loop mode; see
+    /// [`Kernel::sslots`]).
+    Str(u16),
+    /// The (entry-guarded canonical) `charCodeAt` method loaded off a
+    /// string base — the compiler's method-call prologue.
+    CharCodeFn(u16),
     /// The value `undefined`, from `LoadUndefined`. Exists only transiently
     /// within a basic block: its ONLY legal consumer is a store to a local
     /// that is provably re-stored before any read (the compiler's
@@ -401,6 +422,9 @@ struct Xlate<'a> {
     rec_globals: Vec<Box<str>>,
     /// Locals designated as array bases (phase 2) — empty in phase 1.
     oslot_locals: &'a [u32],
+    /// Locals designated as STRING bases (fixpoint-discovered from
+    /// `charCodeAt` usage) — empty until discovered.
+    sslot_locals: &'a [u32],
     /// Locals statically typed BOOLEAN (fixpoint-discovered from stores).
     bool_locals: &'a [u32],
     kops: Vec<KOp>,
@@ -422,6 +446,11 @@ struct Xlate<'a> {
     local_reg: Vec<(KSlot, u16)>,
     /// boolean locals: (frame-local index, register from BOOL_BASE).
     bool_reg: Vec<(u32, u16)>,
+    /// locals observed as STRING bases (from `charCodeAt` over a clean
+    /// local origin); fed back by the fixpoint driver like `discovered`.
+    discovered_strs: Vec<u32>,
+    /// Whether the region calls `charCodeAt` (entry guard checks canonical).
+    uses_char_code: bool,
     /// phase 1: locals observed as array bases (with clean origins).
     discovered: Vec<u32>,
     /// locals observed receiving BOOLEAN stores (fixpoint feedback).
@@ -466,11 +495,12 @@ fn translate(
     consts: &[Const],
     inner: &[Kernel],
     oslot_locals: &[u32],
+    sslot_locals: &[u32],
     bool_locals: &[u32],
     fn_mode: bool,
     self_name: Option<&str>,
     self_ret_bool: bool,
-) -> (Option<Kernel>, Vec<u32>, Vec<u32>) {
+) -> (Option<Kernel>, Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut is_target = vec![false; region.len()];
     for op in region {
         for t in op_targets(op) {
@@ -492,6 +522,7 @@ fn translate(
         self_refs: Vec::new(),
         rec_globals: Vec::new(),
         oslot_locals,
+        sslot_locals,
         bool_locals,
         kops: Vec::new(),
         kpc: vec![u16::MAX; region.len()],
@@ -503,6 +534,8 @@ fn translate(
         bool_reg: Vec::new(),
         discovered: Vec::new(),
         discovered_bools: Vec::new(),
+        discovered_strs: Vec::new(),
+        uses_char_code: false,
         origins: Vec::new(),
         versions: std::collections::HashMap::new(),
         vstack: Vec::new(),
@@ -521,7 +554,8 @@ fn translate(
     let kernel = translate_inner(&mut x);
     let d_obj = std::mem::take(&mut x.discovered);
     let d_bool = std::mem::take(&mut x.discovered_bools);
-    (kernel, d_obj, d_bool)
+    let d_str = std::mem::take(&mut x.discovered_strs);
+    (kernel, d_obj, d_bool, d_str)
 }
 
 fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
@@ -710,7 +744,11 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *idx = remap(*idx);
                 *val = remap(*val);
             }
-            KOp::LoadLen { dst, .. } => *dst = remap(*dst),
+            KOp::LoadLen { dst, .. } | KOp::StrLen { dst, .. } => *dst = remap(*dst),
+            KOp::CharCodeAt { dst, idx, .. } => {
+                *dst = remap(*dst);
+                *idx = remap(*idx);
+            }
             KOp::LoadProp { dst, .. } => *dst = remap(*dst),
             KOp::StoreProp { src, .. } => *src = remap(*src),
             KOp::CallKernel { dst, base, .. } => {
@@ -733,7 +771,13 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
             }
             KOp::Br { .. } | KOp::Exit { .. } => {}
             // Fusion (`fuse_kops`) runs after this remap.
-            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+            KOp::Mov2 { .. }
+            | KOp::ArithAdd { .. }
+            | KOp::ArithKAdd { .. }
+            | KOp::AddKBr { .. }
+            | KOp::LenBrCmp { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. } => {
                 unreachable!("fused op before fusion")
             }
         }
@@ -751,6 +795,8 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     VE::MathFn(k) => KShapeSlot::MathFn(*k),
                     VE::ArrayPushFn(_) => KShapeSlot::ArrayPushFn,
                     VE::ArrayPopFn(_) => KShapeSlot::ArrayPopFn,
+                    VE::Str(sl) => KShapeSlot::Str(*sl),
+                    VE::CharCodeFn(_) => KShapeSlot::CharCodeFn,
                     VE::Undef | VE::Opaque | VE::SelfFn(_) => {
                         unreachable!("undef/opaque/self never crosses block boundaries")
                     }
@@ -849,7 +895,11 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         .kops
         .iter()
         .any(|op| matches!(op, KOp::StoreElem { .. } | KOp::ArrayPush { .. }));
-    let loads_len = x.kops.iter().any(|op| matches!(op, KOp::LoadLen { .. }));
+    // `LenBrCmp` is a fused `LoadLen` — the entry guard must see it too.
+    let loads_len = x
+        .kops
+        .iter()
+        .any(|op| matches!(op, KOp::LoadLen { .. } | KOp::LenBrCmp { .. }));
     // fn mode: recursion descriptor from the recorded self/extern references
     // (`kernelize_function` fills `ret_bool`/`args_used` and verifies the
     // recursive constraints).
@@ -861,6 +911,13 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
             globals: std::mem::take(&mut x.rec_globals).into_boxed_slice(),
         }))
     };
+    // The executors run registers in fixed [`crate::bytecode::KWIN`]-slot
+    // windows with masked (bounds-check-free) indexing; a kernel needing more
+    // registers declines translation and the region stays generic. No
+    // observed kernel comes near the cap (all ≤ 10 registers).
+    if (prop_base + n_props) as usize > crate::bytecode::KWIN {
+        return None;
+    }
     Some(Kernel {
         stores_elems,
         loads_len,
@@ -870,6 +927,8 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         locals: locals.into_boxed_slice(),
         bool_locals: bool_locals.into_boxed_slice(),
         oslots: x.oslot_locals.to_vec().into_boxed_slice(),
+        sslots: x.sslot_locals.to_vec().into_boxed_slice(),
+        uses_char_code: x.uses_char_code,
         shapes: shapes.into_boxed_slice(),
         math_used: std::mem::take(&mut x.math_used).into_boxed_slice(),
         props_used: std::mem::take(&mut x.props_used).into_boxed_slice(),
@@ -910,8 +969,14 @@ fn map_targets(op: &mut KOp, mut f: impl FnMut(u16) -> u16) {
         KOp::LoadElem { bail, .. }
         | KOp::StoreElem { bail, .. }
         | KOp::LoadLen { bail, .. }
+        | KOp::LoadElemAdd { bail, .. }
+        | KOp::LoadElemArith { bail, .. }
         | KOp::ArrayPush { bail, .. }
         | KOp::ArrayPop { bail, .. } => *bail = f(*bail),
+        KOp::LenBrCmp { bail, target, .. } => {
+            *bail = f(*bail);
+            *target = f(*target);
+        }
         _ => {}
     }
 }
@@ -956,6 +1021,85 @@ fn fuse_kops(kops: &mut [KOp]) {
                 k: *k,
                 target: *target,
             }),
+            (
+                KOp::ArithK { kind, dst, a, k },
+                KOp::Add {
+                    dst: d2,
+                    a: a2,
+                    b: b2,
+                },
+            ) => Some(KOp::ArithKAdd {
+                kind: *kind,
+                dst: *dst,
+                a: *a,
+                k: *k,
+                d2: *d2,
+                a2: *a2,
+                b2: *b2,
+            }),
+            (
+                KOp::LoadLen { dst, obj, bail },
+                KOp::BrCmp {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                },
+            ) => Some(KOp::LenBrCmp {
+                dst: *dst,
+                obj: *obj,
+                bail: *bail,
+                cmp: *cmp,
+                a: *a,
+                b: *b,
+                if_true: *if_true,
+                target: *target,
+            }),
+            (
+                KOp::LoadElem {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                },
+                KOp::Add {
+                    dst: d2,
+                    a: a2,
+                    b: b2,
+                },
+            ) => Some(KOp::LoadElemAdd {
+                dst: *dst,
+                obj: *obj,
+                idx: *idx,
+                bail: *bail,
+                d2: *d2,
+                a2: *a2,
+                b2: *b2,
+            }),
+            (
+                KOp::LoadElem {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                },
+                KOp::Arith {
+                    kind,
+                    dst: d2,
+                    a: a2,
+                    b: b2,
+                },
+            ) => Some(KOp::LoadElemArith {
+                dst: *dst,
+                obj: *obj,
+                idx: *idx,
+                bail: *bail,
+                kind: *kind,
+                d2: *d2,
+                a2: *a2,
+                b2: *b2,
+            }),
             _ => None,
         };
         if let Some(f) = fused {
@@ -983,16 +1127,188 @@ fn cleanup_kops(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_re
     if n_regs > 128 {
         return;
     }
-    // Alternate the two transforms to a fixpoint: propagation exposes dead
+    // Alternate the transforms to a fixpoint: propagation exposes dead
     // copies; deletion shortens chains for the next round. Each round
     // strictly reduces rewrites+ops, so this terminates quickly.
     loop {
         let mut changed = copy_prop_kops(kops);
+        changed |= const_prop_kops(kops);
         changed |= dce_movs(kops, always_live, upvalue_uses, n_regs);
         if !changed {
             break;
         }
     }
+}
+
+/// Mirror `cmp` across an operand swap: `cmp(k, b) == mirror(cmp)(b, k)`.
+fn mirror_cmp(cmp: CmpOp) -> CmpOp {
+    match cmp {
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Ge => CmpOp::Le,
+        CmpOp::Eq | CmpOp::Ne | CmpOp::StrictEq | CmpOp::StrictNe => cmp,
+    }
+}
+
+/// Forward CONSTANT propagation within basic blocks (same block discipline
+/// as `copy_prop_kops`): after `Const { dst, k }`, ops reading `dst` as an
+/// operand rewrite to their immediate (`*K`) forms — `Add` → `AddK`,
+/// `Arith` → `ArithK` (right operand, or either for the commutative kinds),
+/// `BrCmp` → `BrCmpK` (mirroring the comparison when the constant is on the
+/// left), `Mov` → `Const`. The rewritten op computes the identical value
+/// through the identical helper (`number_arith_raw(a, k, kind)` — the K
+/// forms simply carry the operand inline), so results are bit-identical;
+/// `dce_movs` then deletes the dead `Const` defs.
+fn const_prop_kops(kops: &mut [KOp]) -> bool {
+    let n = kops.len();
+    let mut label = vec![false; n];
+    let mut preds = vec![0u32; n];
+    for (j, op) in kops.iter_mut().enumerate() {
+        let falls = !matches!(op, KOp::Br { .. } | KOp::Ret { .. } | KOp::Exit { .. });
+        if falls && j + 1 < n {
+            preds[j + 1] += 1;
+        }
+        map_targets(op, |t| {
+            label[t as usize] = true;
+            preds[t as usize] += 1;
+            t
+        });
+    }
+    let mut konst: Vec<Option<f64>> = vec![None; 1 + kops.iter().fold(0, max_reg) as usize];
+    let mut snapshots: Vec<Option<Vec<Option<f64>>>> = vec![None; n];
+    let mut changed = false;
+    for (i, op) in kops.iter_mut().enumerate() {
+        if label[i] {
+            match snapshots[i].take() {
+                Some(s) => konst = s,
+                None => konst.iter_mut().for_each(|e| *e = None),
+            }
+        }
+        // Rewrite reads of known-constant registers to immediate forms.
+        match *op {
+            KOp::Mov { dst, src } => {
+                if let Some(k) = konst[src as usize] {
+                    *op = KOp::Const { dst, k };
+                    changed = true;
+                }
+            }
+            KOp::Add { dst, a, b } => {
+                if let Some(k) = konst[b as usize] {
+                    *op = KOp::AddK { dst, a, k };
+                    changed = true;
+                } else if let Some(k) = konst[a as usize] {
+                    *op = KOp::AddK { dst, a: b, k };
+                    changed = true;
+                }
+            }
+            KOp::Arith { kind, dst, a, b } => {
+                let commutative = matches!(
+                    kind,
+                    crate::exec::ArithKind::Mul
+                        | crate::exec::ArithKind::BitAnd
+                        | crate::exec::ArithKind::BitOr
+                        | crate::exec::ArithKind::BitXor
+                );
+                if let Some(k) = konst[b as usize] {
+                    *op = KOp::ArithK { kind, dst, a, k };
+                    changed = true;
+                } else if commutative {
+                    if let Some(k) = konst[a as usize] {
+                        *op = KOp::ArithK { kind, dst, a: b, k };
+                        changed = true;
+                    }
+                }
+            }
+            KOp::BrCmp {
+                cmp,
+                a,
+                b,
+                if_true,
+                target,
+            } => {
+                if let Some(k) = konst[b as usize] {
+                    *op = KOp::BrCmpK {
+                        cmp,
+                        a,
+                        k,
+                        if_true,
+                        target,
+                    };
+                    changed = true;
+                } else if let Some(k) = konst[a as usize] {
+                    *op = KOp::BrCmpK {
+                        cmp: mirror_cmp(cmp),
+                        a: b,
+                        k,
+                        if_true,
+                        target,
+                    };
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+        // Update the constant map: a `Const` def records; any other def
+        // kills. (No aliasing exists — these are plain registers.)
+        match op {
+            KOp::Const { dst, k } => konst[*dst as usize] = Some(*k),
+            KOp::Mov { dst, .. }
+            | KOp::Add { dst, .. }
+            | KOp::AddK { dst, .. }
+            | KOp::Arith { dst, .. }
+            | KOp::ArithK { dst, .. }
+            | KOp::Neg { dst, .. }
+            | KOp::BitNot { dst, .. }
+            | KOp::BoolNot { dst, .. }
+            | KOp::CmpSet { dst, .. }
+            | KOp::Math1 { dst, .. }
+            | KOp::Math2 { dst, .. }
+            | KOp::LoadElem { dst, .. }
+            | KOp::LoadLen { dst, .. }
+            | KOp::StrLen { dst, .. }
+            | KOp::CharCodeAt { dst, .. }
+            | KOp::LoadProp { dst, .. }
+            | KOp::ArrayPush { dst, .. }
+            | KOp::ArrayPop { dst, .. }
+            | KOp::CallKernel { dst, .. }
+            | KOp::SelfCall { dst, .. } => konst[*dst as usize] = None,
+            KOp::Br { .. }
+            | KOp::BrCmp { .. }
+            | KOp::BrCmpK { .. }
+            | KOp::BrFalsy { .. }
+            | KOp::BrTruthy { .. }
+            | KOp::StoreElem { .. }
+            | KOp::StoreProp { .. }
+            | KOp::Ret { .. }
+            | KOp::Exit { .. } => {}
+            // Fusion (`fuse_kops`) runs after cleanup.
+            KOp::Mov2 { .. }
+            | KOp::ArithAdd { .. }
+            | KOp::ArithKAdd { .. }
+            | KOp::AddKBr { .. }
+            | KOp::LenBrCmp { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. } => {
+                unreachable!("fused op before fusion")
+            }
+        }
+        // Same forward-edge snapshot rule as `copy_prop_kops`.
+        let target = match op {
+            KOp::Br { target }
+            | KOp::BrCmp { target, .. }
+            | KOp::BrCmpK { target, .. }
+            | KOp::BrFalsy { target, .. }
+            | KOp::BrTruthy { target, .. } => Some(*target),
+            _ => None,
+        };
+        if let Some(t) = target {
+            if t as usize > i && preds[t as usize] == 1 {
+                snapshots[t as usize] = Some(konst.clone());
+            }
+        }
+    }
+    changed
 }
 
 /// Forward copy propagation within basic blocks: after `Mov d, s`, reads of
@@ -1104,7 +1420,13 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
                 resolve!(idx);
                 resolve!(val);
             }
-            KOp::LoadLen { dst, .. } | KOp::LoadProp { dst, .. } => kill!(*dst),
+            KOp::LoadLen { dst, .. } | KOp::StrLen { dst, .. } | KOp::LoadProp { dst, .. } => {
+                kill!(*dst)
+            }
+            KOp::CharCodeAt { dst, idx, .. } => {
+                resolve!(idx);
+                kill!(*dst);
+            }
             KOp::ArrayPush { dst, val, .. } => {
                 resolve!(val);
                 kill!(*dst);
@@ -1116,7 +1438,13 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
             KOp::CallKernel { dst, .. } | KOp::SelfCall { dst, .. } => kill!(*dst),
             KOp::Br { .. } | KOp::Exit { .. } => {}
             // Fusion (`fuse_kops`) runs after cleanup.
-            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+            KOp::Mov2 { .. }
+            | KOp::ArithAdd { .. }
+            | KOp::ArithKAdd { .. }
+            | KOp::AddKBr { .. }
+            | KOp::LenBrCmp { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. } => {
                 unreachable!("fused op before fusion")
             }
         }
@@ -1150,7 +1478,14 @@ fn max_reg(acc: u16, op: &KOp) -> u16 {
             see(*dst);
             see(*src);
         }
-        KOp::Const { dst, .. } | KOp::LoadLen { dst, .. } | KOp::LoadProp { dst, .. } => see(*dst),
+        KOp::Const { dst, .. }
+        | KOp::LoadLen { dst, .. }
+        | KOp::StrLen { dst, .. }
+        | KOp::LoadProp { dst, .. } => see(*dst),
+        KOp::CharCodeAt { dst, idx, .. } => {
+            see(*dst);
+            see(*idx);
+        }
         KOp::Add { dst, a, b }
         | KOp::Arith { dst, a, b, .. }
         | KOp::CmpSet { dst, a, b, .. }
@@ -1194,7 +1529,13 @@ fn max_reg(acc: u16, op: &KOp) -> u16 {
         }
         KOp::Br { .. } | KOp::Exit { .. } => {}
         // Fusion (`fuse_kops`) runs after cleanup.
-        KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+        KOp::Mov2 { .. }
+        | KOp::ArithAdd { .. }
+        | KOp::ArithKAdd { .. }
+        | KOp::AddKBr { .. }
+        | KOp::LenBrCmp { .. }
+        | KOp::LoadElemAdd { .. }
+        | KOp::LoadElemArith { .. } => {
             unreachable!("fused op before fusion")
         }
     }
@@ -1270,6 +1611,11 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
                 defs[i] = bit(*dst);
                 succ[i] = (true, Some(*bail));
             }
+            KOp::StrLen { dst, .. } => defs[i] = bit(*dst),
+            KOp::CharCodeAt { dst, idx, .. } => {
+                uses[i] = bit(*idx);
+                defs[i] = bit(*dst);
+            }
             KOp::ArrayPush { dst, val, bail, .. } => {
                 uses[i] = bit(*val);
                 defs[i] = bit(*dst);
@@ -1301,7 +1647,13 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
                 defs[i] = bit(*dst);
             }
             // Fusion (`fuse_kops`) runs after cleanup.
-            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+            KOp::Mov2 { .. }
+            | KOp::ArithAdd { .. }
+            | KOp::ArithKAdd { .. }
+            | KOp::AddKBr { .. }
+            | KOp::LenBrCmp { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. } => {
                 unreachable!("fused op before fusion")
             }
         }
@@ -1332,14 +1684,15 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
             break;
         }
     }
-    // A Mov is dead when nothing can observe its destination: not live on
-    // any path out, not written back / shape-referenced (always_live), or a
-    // self-move.
+    // A Mov (or a Const — const-propagation strands them) is dead when
+    // nothing can observe its destination: not live on any path out, not
+    // written back / shape-referenced (always_live), or a self-move.
     let dead: Vec<bool> = kops
         .iter()
         .enumerate()
         .map(|(i, op)| match op {
             KOp::Mov { dst, src } => *dst == *src || (live_out[i] | always_live) & bit(*dst) == 0,
+            KOp::Const { dst, .. } => (live_out[i] | always_live) & bit(*dst) == 0,
             _ => false,
         })
         .collect();
@@ -1389,6 +1742,7 @@ impl Xlate<'_> {
     /// rejects the region (some iteration would bail every time anyway).
     fn lreg(&mut self, l: u32) -> Option<u16> {
         if self.oslot_locals.contains(&l)
+            || self.sslot_locals.contains(&l)
             || self.bool_locals.contains(&l)
             || self.bool_reg.iter().any(|&(ll, _)| ll == l)
         {
@@ -1477,6 +1831,7 @@ impl Xlate<'_> {
             self.discovered_bools.push(l);
         }
         if self.oslot_locals.contains(&l)
+            || self.sslot_locals.contains(&l)
             || self.local_reg.iter().any(|&(sl, _)| sl == KSlot::Local(l))
         {
             return None;
@@ -1616,6 +1971,8 @@ impl Xlate<'_> {
             | VE::SelfFn(_)
             | VE::MathObj
             | VE::MathFn(_)
+            | VE::Str(_)
+            | VE::CharCodeFn(_)
             | VE::ArrayPushFn(_)
             | VE::ArrayPopFn(_) => None,
             VE::Num => {
@@ -1635,6 +1992,35 @@ impl Xlate<'_> {
                 };
                 Some(u16::try_from(s).ok()?)
             }
+        }
+    }
+
+    /// Resolve the entry at `depth_from_top` as a STRING BASE (loop mode).
+    /// Phase 1: a clean local origin records the local as a discovered
+    /// string base (the fixpoint driver feeds it back, sslot precedence over
+    /// a same-round array-base discovery). Phase 2: it must be `VE::Str`.
+    fn str_slot(&mut self, depth_from_top: usize) -> Option<u16> {
+        if self.fn_mode {
+            return None; // no sslot machinery in frameless kernels
+        }
+        let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
+        match self.vstack[p] {
+            VE::Str(s) => Some(s),
+            VE::Num => {
+                let (l, ver) = self.origins[p]?;
+                if *self.versions.get(&l).unwrap_or(&0) != ver {
+                    return None;
+                }
+                let s = match self.discovered_strs.iter().position(|&d| d == l) {
+                    Some(s) => s,
+                    None => {
+                        self.discovered_strs.push(l);
+                        self.discovered_strs.len() - 1
+                    }
+                };
+                Some(u16::try_from(s).ok()?)
+            }
+            _ => None,
         }
     }
 
@@ -1832,6 +2218,10 @@ impl Xlate<'_> {
                 if let Some(pos) = self.oslot_locals.iter().position(|&o| o == *l) {
                     // This local is an array base — push the object.
                     self.vstack.push(VE::Obj(pos as u16));
+                    self.origins.push(None);
+                } else if let Some(pos) = self.sslot_locals.iter().position(|&o| o == *l) {
+                    // A pinned string base.
+                    self.vstack.push(VE::Str(pos as u16));
                     self.origins.push(None);
                 } else if self.is_bool_local(*l) {
                     let src = self.blreg(*l)?;
@@ -2046,11 +2436,16 @@ impl Xlate<'_> {
                         self.vstack.push(VE::Obj(s));
                         self.origins.push(None);
                     }
+                    VE::Str(s) => {
+                        self.vstack.push(VE::Str(s));
+                        self.origins.push(None);
+                    }
                     VE::MathObj => {
                         self.vstack.push(VE::MathObj);
                         self.origins.push(None);
                     }
                     VE::MathFn(_)
+                    | VE::CharCodeFn(_)
                     | VE::Undef
                     | VE::Opaque
                     | VE::SelfFn(_)
@@ -2311,6 +2706,20 @@ impl Xlate<'_> {
                 // to this routing — the region then rejects at the
                 // consumer — which is acceptable for so method-shaped a
                 // name.
+                // `s.charCodeAt` (loop mode): route to the pinned-string
+                // machinery — the entry guard verifies the canonical method
+                // and the flat-ASCII receiver. An Ordinary object with a
+                // data property named "charCodeAt" loses its kernel to this
+                // routing (rejects at the consumer) — acceptable for so
+                // method-shaped a name.
+                if !self.fn_mode && key == "charCodeAt" {
+                    let sslot = self.str_slot(0)?;
+                    self.pop()?;
+                    self.vstack.push(VE::CharCodeFn(sslot));
+                    self.origins.push(None);
+                    self.uses_char_code = true;
+                    return Some(());
+                }
                 if !self.fn_mode && (key == "push" || key == "pop") {
                     let obj = self.base_slot(0)?;
                     self.pop()?;
@@ -2325,6 +2734,14 @@ impl Xlate<'_> {
                     return Some(());
                 }
                 if key == "length" {
+                    // A pinned STRING base's length: an activation constant
+                    // (immutable string, pinned local) — total, no bail.
+                    if let Some(VE::Str(sslot)) = self.vstack.last().copied() {
+                        self.pop()?;
+                        let dst = self.push_num()?;
+                        self.kops.push(K::StrLen { dst, str: sslot });
+                        return Some(());
+                    }
                     // Arrays: derived length, per-access checked, bailable.
                     let shape = self.vstack.clone();
                     let obj = self.base_slot(0)?;
@@ -2406,6 +2823,23 @@ impl Xlate<'_> {
                         argc: u16::try_from(n).ok()?,
                         callee,
                     });
+                    return Some(());
+                }
+                // `s.charCodeAt(i)`: the compiler's method-call pattern
+                // [.., CharCodeFn(s), Str(s), idx] with exactly one
+                // statically-Number argument. TOTAL on the entry-guarded
+                // flat-ASCII receiver — the index conversion and OOB NaN
+                // are computed exactly in-kernel, so no bail exists.
+                if let VE::CharCodeFn(sl) = *self.vstack.get(fn_pos)? {
+                    if n != 1 || !matches!(self.vstack.get(fn_pos + 1)?, VE::Str(s2) if *s2 == sl) {
+                        return None;
+                    }
+                    let idx = self.top_num_reg(0)?;
+                    self.pop()?; // arg
+                    self.pop()?; // this (the string)
+                    self.pop()?; // fn
+                    let dst = self.push_num()?;
+                    self.kops.push(K::CharCodeAt { dst, str: sl, idx });
                     return Some(());
                 }
                 // `a.push(x)`: the compiler's method-call pattern

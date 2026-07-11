@@ -17,13 +17,13 @@ impl Vm {
     pub fn new_promise(&self) -> JsObject {
         self.alloc(ObjectData::new(
             Some(self.realm.promise_proto.clone()),
-            Internal::Promise(PromiseData {
+            Internal::Promise(Box::new(PromiseData {
                 state: PromiseState::Pending,
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
                 handled: false,
                 host_id: None,
-            }),
+            })),
         ))
     }
 

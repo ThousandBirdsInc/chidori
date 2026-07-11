@@ -1152,7 +1152,7 @@ impl<'a> JsonParser<'a> {
         match self.bytes[self.pos] {
             b'{' => self.parse_object(vm),
             b'[' => self.parse_array(vm),
-            b'"' => Ok(Value::str(self.parse_string(vm)?)),
+            b'"' => Ok(Value::String(self.parse_string(vm)?)),
             b't' => self.parse_lit(vm, "true", Value::Bool(true)),
             b'f' => self.parse_lit(vm, "false", Value::Bool(false)),
             b'n' => self.parse_lit(vm, "null", Value::Null),
@@ -1218,7 +1218,7 @@ impl<'a> JsonParser<'a> {
             .map(Value::Number)
             .map_err(|_| vm.throw_syntax("Invalid number in JSON"))
     }
-    fn parse_string(&mut self, vm: &mut Vm) -> Result<String, Value> {
+    fn parse_string(&mut self, vm: &mut Vm) -> Result<JsString, Value> {
         self.pos += 1; // opening quote
                        // Fast path: a string with no escapes and no control characters —
                        // the overwhelmingly common case — is ONE slice copy instead of
@@ -1230,7 +1230,9 @@ impl<'a> JsonParser<'a> {
             match self.bytes[i] {
                 b'"' => {
                     self.pos = i + 1;
-                    return Ok(self.src[start..i].to_string());
+                    // One allocation: straight from the source slice into the
+                    // Rc backing (the old String round-trip copied twice).
+                    return Ok(JsString::new(&self.src[start..i]));
                 }
                 b'\\' | 0x00..=0x1f => break,
                 _ => i += 1,
@@ -1245,7 +1247,7 @@ impl<'a> JsonParser<'a> {
             match c {
                 b'"' => {
                     self.pos += 1;
-                    return Ok(s);
+                    return Ok(JsString::from(s));
                 }
                 b'\\' => {
                     self.pos += 1;
@@ -1352,8 +1354,11 @@ impl<'a> JsonParser<'a> {
         Ok(Value::Object(vm.new_array(elems)))
     }
     /// An object key: the unescaped fast path is interned by source slice
-    /// (see the `keys` field); anything needing escape processing falls back
-    /// to the general string parser. `self.pos` is on the opening quote.
+    /// (see the `keys` field) and, across parses, through the Vm-level
+    /// `json_keys` cache (same-shaped documents parsed repeatedly reuse one
+    /// `Rc<str>` per distinct key — the poll/roundtrip pattern); anything
+    /// needing escape processing falls back to the general string parser.
+    /// `self.pos` is on the opening quote.
     fn parse_key(&mut self, vm: &mut Vm) -> Result<PropertyKey, Value> {
         let start = self.pos + 1;
         let mut i = start;
@@ -1365,7 +1370,18 @@ impl<'a> JsonParser<'a> {
                     if let Some(k) = self.keys.get(s) {
                         return Ok(k.clone());
                     }
-                    let k = PropertyKey::str(s);
+                    let k = if let Some(k) = vm.json_keys.get(s) {
+                        k.clone()
+                    } else {
+                        let k = PropertyKey::str(s);
+                        // Bounded: a pathological stream of distinct keys
+                        // resets the cache rather than growing it.
+                        if vm.json_keys.len() >= 4096 {
+                            vm.json_keys.clear();
+                        }
+                        vm.json_keys.insert(s.into(), k.clone());
+                        k
+                    };
                     self.keys.insert(s, k.clone());
                     return Ok(k);
                 }
@@ -1373,7 +1389,7 @@ impl<'a> JsonParser<'a> {
                 _ => i += 1,
             }
         }
-        Ok(PropertyKey::str(self.parse_string(vm)?))
+        Ok(PropertyKey::Str(self.parse_string(vm)?))
     }
 
     fn parse_object(&mut self, vm: &mut Vm) -> Result<Value, Value> {
@@ -1396,7 +1412,15 @@ impl<'a> JsonParser<'a> {
             }
             self.pos += 1;
             let v = self.parse_value(vm)?;
-            obj.borrow_mut().props.insert(key, Property::data(v));
+            {
+                let mut b = obj.borrow_mut();
+                // One up-front table allocation covers the common ≤8-member
+                // object instead of the 0→3→7 growth (two allocs + a rehash).
+                if b.props.capacity() == 0 {
+                    b.props.reserve(8);
+                }
+                b.props.insert(key, Property::data(v));
+            }
             self.skip_ws();
             if self.pos >= self.bytes.len() {
                 return Err(vm.throw_syntax("Unexpected end of JSON input"));

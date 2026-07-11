@@ -1345,6 +1345,218 @@ whole reg corpus; the 18-case for-in differential vs Node; Test262 gate
 green — now running the register tier under the runner's budget for the
 first time, i.e. 40k+ conformance tests newly executing the tier.
 
+## 6.12 Masked kernel windows, kernel const-prop + fusion round 2, and
+object-literal templates (landed 2026-07-11)
+
+A fresh callgrind review of the post-§6.11 profiles found three structural
+costs, attacked in one round. All safe Rust, zero new dependencies, RESULT
+checksums byte-identical across the suite (cross-checked against node/bun by
+the benchmark harness).
+
+1. **Masked fixed register windows (`bytecode::KWIN = 32`).** Every kernel
+   executor indexed its register file through `Vec<f64>` slice indexing —
+   and the resulting bounds checks were **12–17% of every kernel-owned
+   workload** (they never predict away: the panic branch sits in the hot
+   dispatch loop). Registers now live in fixed `[f64; KWIN]` WINDOWS indexed
+   as `regs[(r as usize) & KWIN_MASK]` — translation caps every kernel at
+   KWIN registers (observed max: 10) so the mask is an identity on valid
+   indices that PROVES the access in-bounds; the compiler drops the check
+   and the panic branch entirely, zero `unsafe`. Loop kernels run one window
+   (pinned-callee windows at KWIN strides above it, re-split per
+   `CallKernel`); plain function kernels run one stack-allocated window (no
+   pool traffic at all); the recursive executor strides windows at KWIN with
+   a member-level/window-level loop split so same-kernel calls re-derive
+   only the window view, never the member tables.
+2. **Kernel const-propagation + fusion round 2** (`const_prop_kops`, three
+   new superinstructions). The loop translator materialized constants that
+   fed two-register ops (`(i*7919) % 10007` ran `Const` + `Arith` where
+   `ArithK` exists), so cleanup gained a forward const-prop pass (same
+   block discipline as `copy_prop_kops`): `Add`/`Arith`/`BrCmp` operands
+   that are known constants rewrite to their `*K` immediate forms
+   (mirroring the comparison when the constant is on the left; only
+   commutative kinds swap `Arith` operands), `Mov`-of-constant becomes
+   `Const`, and dead `Const` defs die in DCE (extended past `Mov`s). Fusion
+   gained the shapes the array_sum dump showed dominating: `LenBrCmp` (the
+   `i < a.length` header test — LoadLen + BrCmp in one dispatch, with the
+   LoadLen entry-guard scan taught to see the fused form), `LoadElemAdd`
+   (`s += a[i]`), `LoadElemArith` (the dot-product second load feeding its
+   multiply), and `ArithKAdd` (`s += a <op> K` after const-prop). The
+   canonical `s += a[i]` loop: 8 dispatches per iteration → 5. En route,
+   the `i.fract() == 0.0` integrality probe in every element fast path
+   (kernel and interpreter) became a cast round-trip (`dense_index`) —
+   `fract` lowers to a libm `trunc` CALL on baseline x86-64, ~3% of
+   array-heavy workloads.
+3. **Object-literal templates** (`Op::NewObjectTpl`,
+   `FuncProto::obj_tpls`). mixed_helpers spent ~12% (inclusive) in
+   `define_own_property` + `IndexMap::insert_full`: every `{ id: …, name:
+   …, … }` evaluation re-hashed and re-inserted every key through the full
+   spec descriptor path — on a fresh ordinary extensible object, where
+   none of that machinery can observe anything or fail. The compiler now
+   detects all-static-data-key literals (≥2 distinct plain keys; computed
+   keys, accessors, methods, spread, `__proto__`, and duplicates keep the
+   generic path), pre-builds the property map ONCE at compile time, and
+   instantiation CLONES it (bucket layout included — no hashing, no
+   growth-rehash, no descriptor validation) and writes the evaluated
+   values into slots `0..N`. Value expressions still evaluate in exact
+   source order (static keys have no evaluation step, and the object
+   cannot be observed mid-literal — no binding exists and every
+   template-eligible property is plain data). Both tiers execute it
+   (`ROp::NewObjectTpl` mirrors `NewArray`'s canonical window; budget cost
+   is its exact 1 stack unit); kernel regions decline it as before. A
+   side benefit: all objects from one site share one insertion layout, so
+   the key-verified property ICs hit consistently.
+4. **Smaller wins along the way**: `op_add` gained a String⊕Number fast
+   path (both operands already primitive: format the number's digits
+   straight into the once-allocated result buffer via
+   `push_number_string` — the exact digits `to_js_string` produces —
+   skipping two intermediate allocations per `+`; restricted below the
+   rope threshold so big accumulators keep the O(1) rope path);
+   `JSON.parse` interns object keys across parses (Vm-level bounded
+   cache — repeated same-shaped documents reuse one `Rc<str>` per key)
+   and pre-sizes each object's property map (one table allocation instead
+   of the 0→3→7 growth); `js_mod`'s integer fast path also dropped its
+   libm `trunc` calls.
+
+### 6.12.1 Measured (callgrind, whole workload, deterministic)
+
+Baseline = the branch point, same toolchain (rustc 1.97), same container;
+RESULT checksums byte-identical on every workload:
+
+| workload | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| array_sum | 1.948 G | 1.522 G | **−21.8%** |
+| mixed_helpers | 2.953 G | 2.324 G | **−21.3%** |
+| string_build | 118.1 M | 94.0 M | **−20.4%** |
+| typed_array | 521.0 M | 429.4 M | **−17.6%** |
+| property_access | 247.4 M | 204.4 M | **−17.4%** |
+| arith_loop | 382.3 M | 322.3 M | **−15.7%** |
+| array_push_sum | 282.0 M | 240.0 M | −14.9% |
+| closures | 378.4 M | 326.4 M | −13.7% |
+| mutual_recursion | 1.097 G | 958.9 M | −12.6% |
+| array_hof | 340.2 M | 327.4 M | −3.8% |
+| sort | 2.051 G | 1.992 G | −2.9% |
+| string_scan | 355.3 M | 351.4 M | −1.1% |
+| json_roundtrip | 1.191 G | 1.186 G | −0.4% |
+| fib_recursive | 676.5 M | 695.3 M | +2.8% ¹ |
+
+Geomean across the suite: **−12%** instructions; −15 to −22% on the
+kernel-owned and object/string-glue workloads the round targeted.
+
+¹ fib runs the recursive windowed executor, where the window-loop
+restructure costs a few instructions per call/return crossing against the
+masking savings inside the (tiny, ~10-op) activations — the member/window
+loop split recovered most of an initial +19%; the residual is the price
+the other recursion shapes' wins ride on (mutual_recursion −12.6%).
+
+Wall-clock under the RECOMMENDED (PGO) build — interleaved best-of-7 A/B,
+both sides PGO'd on the same corpus, same idle container (plain-release
+wall on two workloads swung the OTHER way purely from fat-LTO code layout;
+cachegrind showed the new binary better on every simulated metric while
+plain-release wall read slower — exactly the layout sensitivity that made
+PGO the recommended benchmark build, and why callgrind stays the
+load-bearing gate):
+
+| workload | PGO before | PGO after | Δ |
+| --- | ---: | ---: | ---: |
+| array_sum | 201 ms | 138 ms | **−31%** |
+| property_access | 29 ms | 20 ms | **−31%** |
+| typed_array | 56 ms | 42 ms | **−25%** |
+| arith_loop | 38 ms | 29 ms | **−24%** |
+| mixed_helpers | 307 ms | 240 ms | **−22%** |
+| mutual_recursion | 93 ms | 80 ms | −14% |
+| array_push_sum / closures | 38 / 32 ms | 33 / 28 ms | −13% |
+| string_build | 18 ms | 16 ms | −11% |
+| string_scan / array_hof / sort / json | — | — | 0 to −5% |
+| fib_recursive | 58 ms | 62 ms | +7% |
+
+### 6.12.2 What the profiles say now
+
+- **json_roundtrip barely moved (−0.4%)**: its cost is diffuse allocator
+  traffic (~20% malloc/free) across parse-side ObjectData/array/string
+  construction and teardown — per-key and per-table tweaks are rounding
+  errors against one `Rc<RefCell<ObjectData>>` + map + value allocations
+  per node. The structural answer is an ObjectData pool or arena (needs a
+  recycle point for Rc-dropped objects) — tracked as the next
+  allocation-side lever.
+- **mixed_helpers (the "real agent glue" proxy)** is now dominated by the
+  register tier's own dispatch (~15%), `Value` drop glue (~8%), and the
+  remaining allocator share (~10%) — the object-literal define path and
+  the string `+` machinery have left the top ranks. Further movement needs
+  either reg-tier superinstructions or a smaller `Value`.
+- **sort / array_hof** remain comparator-call-ceremony bound around the
+  prepared-kernel paths; **string_scan** is `charCodeAt` loop glue the
+  register tier already carries.
+
+**Gates:** full suites for both crates green (chidori-js 129 incl. the new
+`obj_tpl.rs` template structural+behavior tests and kernels structural pins
+for `LenBrCmp`/`LoadElemAdd`/K-form const-prop; record→replay byte-identity
+unchanged); kernels + reg differential corpora and 300-case fuzzes green —
+the kernels corpus caught a real bug during development (the fused
+`LenBrCmp` escaped the typed-array `length`-shadow entry guard scan, fixed
+by teaching the guard the fused form); Test262 gate green (0 regressions,
+99.11%); clippy clean across the workspace.
+
+## 6.13 Pinned-string kernels (charCodeAt/length) + allocation diet
+(landed 2026-07-11, follow-up round)
+
+Round 2 on the §6.12 baseline: the biggest remaining per-workload gap with a
+clear shape was string_scan (~6× behind bun — the tokenizer idiom
+`for (i = 0; i < s.length; i++) s.charCodeAt(i)`, §6.5.1 candidate (a),
+unlocked by §6.7's O(1) ASCII accessors), plus a first pass at the
+allocation costs that dominate json_roundtrip.
+
+1. **Pinned STRING bases in loop kernels** (`Kernel::sslots`,
+   `KOp::StrLen`, `KOp::CharCodeAt`). A local used as `s.charCodeAt(i)` /
+   `s.length` inside a kernel region is discovered (fixpoint, like array
+   bases; string discovery WINS over a same-local array-base guess) and
+   PINNED: the entry guard requires a FLAT ASCII string — flattening a
+   rope-built accumulator once, cached in the rope node — and, for
+   `charCodeAt`, the canonical `String.prototype.charCodeAt` resolution
+   (pinned at install like `Array.prototype.push`; a monkeypatched method
+   runs generically, observably). Both ops are then TOTAL — no bail path
+   exists: strings are immutable and the local is pinned, so `StrLen` is an
+   activation constant, and `CharCodeAt` computes ToIntegerOrInfinity
+   (NaN→0, truncate-toward-zero via saturating casts — no libm) and the
+   out-of-range NaN exactly as the builtin does. Non-ASCII/WTF-8 receivers
+   decline the activation into the generic loop.
+2. **Allocation diet**: `Internal::Promise`/`Internal::ModuleNamespace`
+   carried the enum's largest payloads inline (104/72 bytes) — boxing the
+   two cold variants shrinks `Internal` 104→64 and **every `ObjectData`
+   184→144 bytes** (~20% less memory traffic per object allocation,
+   json_roundtrip's dominant cost). JSON string values now parse straight
+   from the source slice into the `Rc` backing (one allocation instead of
+   the String round-trip's two).
+3. Not taken: a `Vec<[f64; KWIN]>` window pool for the recursive executor
+   measured WORSE on instructions than §6.12's slice+`try_into` windows
+   (fib 695→713 M) and was reverted — fib's residual +2.8% stands as the
+   accepted price of the recursion tier's masked windows. An ObjectData
+   pool/arena (the real json lever) needs a recycle point for Rc-dropped
+   objects — a GC-design change, still tracked.
+
+### 6.13.1 Measured (callgrind, whole workload; wall best-of-5 plain release)
+
+| workload | §6.12 baseline | after | Δ instructions | wall |
+| --- | ---: | ---: | ---: | ---: |
+| string_scan | 351.4 M | 145.2 M | **−58.7%** | 46 → 21 ms |
+| json_roundtrip | 1.186 G | 1.176 G | −0.8% | 165 → 144 ms |
+| mixed_helpers | 2.324 G | 2.318 G | −0.3% | 315 → 273 ms |
+| fib_recursive | 695.3 M | 683.2 M | −1.7% | — |
+| string_build / others | — | — | unchanged | — |
+
+The wall movement beyond the instruction deltas on json/mixed is the
+allocation diet (smaller objects, one less copy per parsed string) — cache
+effects callgrind cannot see; plain-release layout noise caveats (§6.12)
+apply, but the direction is consistent across repeated interleaved runs.
+
+**Gates:** kernels differential corpus grew 9 pinned-string programs
+(rope-built receivers, ToIntegerOrInfinity edges incl. NaN/fractional/
+negative/OOB indices, non-ASCII and astral receivers declining to generic,
+monkeypatched `charCodeAt` observed, mid-program reassignment re-guarded,
+results feeding arithmetic/booleans) plus a structural pin
+(`char_code_loops_get_kernels`); a 7-case differential vs Node 22
+byte-identical; full suites green for both crates; Test262 gate green
+(0 regressions); clippy clean.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

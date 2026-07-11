@@ -344,6 +344,17 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
             Ok(Value::Number(f64::NAN))
         }
     });
+    // Pin the canonical `charCodeAt` for the kernel `CharCodeAt` entry
+    // guard (identity check + bail-shape reconstruction), exactly like
+    // `Array.prototype.push`.
+    let ccode = proto
+        .borrow()
+        .props
+        .get(&PropertyKey::str("charCodeAt"))
+        .and_then(|p| p.value().cloned());
+    if let Some(Value::Object(o)) = ccode {
+        vm.realm.string_char_code_at = Some(o);
+    }
     vm.define_method(proto, "codePointAt", 1, |vm, this, args| {
         let s = jsstr_this(vm, &this)?;
         let i = to_integer_or_infinity(vm, &arg(args, 0))?;
