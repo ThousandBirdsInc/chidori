@@ -1,7 +1,7 @@
 name: JS benchmarks
 
 # Runs the chidori-js cross-runtime benchmark suite (chidori-js vs Node.js vs
-# Bun, wall-clock + peak memory) plus the in-process heap-utilization bench
+# Bun vs CPython, wall-clock + peak memory) plus the in-process heap-utilization bench
 # (`cargo bench -p chidori-js --bench memory`) on PRs that touch the engine,
 # and posts the results tables as a single sticky comment on the PR (updated
 # in place on each run, not re-posted).
@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   benchmark:
-    name: chidori-js vs Node vs Bun
+    name: chidori-js vs Node vs Bun vs CPython
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +46,13 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      # The runner image ships a python3, but pin explicitly so the cpython
+      # column doesn't silently vanish (the harness skips missing runtimes)
+      # or drift across image updates.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       # GNU time gives the harness exact peak-RSS (ru_maxrss) for the memory
       # table. Best-effort: without it the harness falls back to polling

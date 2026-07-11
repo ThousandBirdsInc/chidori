@@ -16,8 +16,8 @@
 //! Run with: `cargo bench -p chidori-js`
 //!
 //! These isolate chidori-js's own hot paths in-process. For a cross-runtime
-//! comparison of the same workloads against Node.js and Bun, see the harness in
-//! `benchmarks/` (`node crates/chidori-js/benchmarks/run.mjs`).
+//! comparison of the same workloads against Node.js, Bun, and CPython, see the
+//! harness in `benchmarks/` (`node crates/chidori-js/benchmarks/run.mjs`).
 
 use std::rc::Rc;
 use std::time::Duration;

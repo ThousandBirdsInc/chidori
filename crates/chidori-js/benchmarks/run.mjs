@@ -2,11 +2,12 @@
 // Cross-runtime benchmark harness for the chidori-js JavaScript engine.
 //
 // Runs each workload in `workloads/` as a standalone script under chidori-js,
-// Node.js, and Bun, measuring subprocess wall-clock time and peak memory
-// (max RSS). The same `.js` file is fed to all three runtimes and every
-// workload prints a single `RESULT=...` line, so the harness can confirm the
-// runtimes agree before trusting the numbers (a fast-but-wrong engine is not
-// a faster engine).
+// Node.js, Bun, and CPython, measuring subprocess wall-clock time and peak
+// memory (max RSS). The same `.js` file is fed to the three JS runtimes;
+// CPython runs the workload's hand-ported `.py` twin. Every workload prints a
+// single `RESULT=...` line, so the harness can confirm all runtimes —
+// including the cross-language port — agree before trusting the numbers (a
+// fast-but-wrong engine is not a faster engine).
 //
 // Each runtime pays a fixed process-startup cost (binary load + realm setup).
 // We measure that separately with `workloads/startup.js` and subtract it to
@@ -19,7 +20,7 @@
 //   --runs N            timed runs per workload (default 5)
 //   --warmup N          untimed warmup runs per workload (default 1)
 //   --filter SUBSTR     only run workloads whose name contains SUBSTR
-//   --runtimes LIST     comma-separated subset of {chidori,node,bun}
+//   --runtimes LIST     comma-separated subset of {chidori,node,bun,cpython}
 //   --chidori-bin PATH  path to the chidori `run` example binary
 //   --no-build          do not `cargo build` the chidori binary first
 //   --json PATH         also write the full results as JSON to PATH
@@ -93,14 +94,14 @@ function printHelp() {
   // The banner comment at the top of this file is the canonical help text.
   console.log(
     [
-      "Cross-runtime benchmark harness for chidori-js (vs Node.js and Bun).",
+      "Cross-runtime benchmark harness for chidori-js (vs Node.js, Bun, and CPython).",
       "",
       "Usage: node benchmarks/run.mjs [options]",
       "",
       "  --runs N            timed runs per workload (default 5)",
       "  --warmup N          untimed warmup runs per workload (default 1)",
       "  --filter SUBSTR     only run workloads whose name contains SUBSTR",
-      "  --runtimes LIST     comma-separated subset of {chidori,node,bun}",
+      "  --runtimes LIST     comma-separated subset of {chidori,node,bun,cpython}",
       "  --chidori-bin PATH  path to the chidori `run` example binary",
       "  --no-build          do not cargo build the chidori binary first",
       "  --json PATH         also write the full results as JSON to PATH",
@@ -155,15 +156,21 @@ function resolveChidoriBin(opts) {
 }
 
 function discoverRuntimes(opts) {
-  const names = opts.runtimes ?? ["chidori", "node", "bun"];
+  const names = opts.runtimes ?? ["chidori", "node", "bun", "cpython"];
   // Resolve each requested runtime lazily so excluding chidori doesn't force a
-  // Rust build, and a missing optional runtime (bun) is skipped, not fatal.
+  // Rust build, and a missing optional runtime (bun, cpython) is skipped, not
+  // fatal. `ext` selects the workload file: the JS runtimes share the same
+  // `.js` source; cpython runs the workload's hand-ported `.py` twin.
   const resolvers = {
-    chidori: () => ({ name: "chidori", cmd: resolveChidoriBin(opts), args: [] }),
-    node: () => ({ name: "node", cmd: process.execPath, args: [] }),
+    chidori: () => ({ name: "chidori", cmd: resolveChidoriBin(opts), args: [], ext: ".js" }),
+    node: () => ({ name: "node", cmd: process.execPath, args: [], ext: ".js" }),
     bun: () => {
       const bun = whichSync("bun");
-      return bun ? { name: "bun", cmd: bun, args: [] } : null;
+      return bun ? { name: "bun", cmd: bun, args: [], ext: ".js" } : null;
+    },
+    cpython: () => {
+      const py = whichSync("python3") || whichSync("python");
+      return py ? { name: "cpython", cmd: py, args: [], ext: ".py" } : null;
     },
   };
 
@@ -466,13 +473,16 @@ const MARKDOWN_MARKER = "<!-- chidori-js-benchmarks -->";
 // Render the results as a Markdown report (used for the PR comment).
 function renderMarkdown(workloads, runtimes, baselines, opts, mem) {
   const rtNames = runtimes.map((r) => r.name);
+  const RT_LABELS = { chidori: "chidori-js", node: "Node.js", bun: "Bun", cpython: "CPython" };
+  const rtLabels = rtNames.map((n) => `**${RT_LABELS[n] ?? n}**`);
   const lines = [];
   lines.push(MARKDOWN_MARKER);
   lines.push("## chidori-js cross-runtime benchmarks");
   lines.push("");
   lines.push(
-    `Same JS workloads run under **chidori-js**, **Node.js**, and **Bun** ` +
-      `(${opts.runs} timed run(s) + ${opts.warmup} warmup each, median reported). ` +
+    `Same workloads run under ${rtLabels.join(", ")} ` +
+      `(${opts.runs} timed run(s) + ${opts.warmup} warmup each, median reported; ` +
+      `CPython runs each workload's hand-ported .py twin). ` +
       `All workloads cross-checked to produce identical results.`,
   );
   lines.push("");
@@ -539,7 +549,8 @@ function renderMarkdown(workloads, runtimes, baselines, opts, mem) {
   lines.push(
     "<sub>Numbers are machine- and load-dependent (shared CI runner) — read them " +
       "as ratios, not absolutes. chidori-js is an interpreter, so it trails the " +
-      "V8/JSC JITs on compute but starts far faster and in far less memory. " +
+      "V8/JSC JITs on compute but starts far faster and in far less memory; " +
+      "CPython (also an interpreter) is the like-for-like reference point. " +
       "A ⚠️ marks a workload whose result disagreed across runtimes.</sub>",
   );
   return lines.join("\n") + "\n";
@@ -577,11 +588,12 @@ async function main() {
 
   // Startup baseline per runtime (median of a few extra runs — it's cheap).
   // With memory on, also probe startup peak RSS: the runtime's floor
-  // footprint before any workload allocates.
+  // footprint before any workload allocates. Each runtime probes its own
+  // startup file (startup.js / startup.py).
   const baselines = {};
   const startupRss = {};
-  const startupFile = join(WORKLOAD_DIR, "startup.js");
   for (const rt of runtimes) {
+    const startupFile = join(WORKLOAD_DIR, "startup" + rt.ext);
     const { median } = await timeWorkload(rt, startupFile, Math.max(opts.runs, 5), 1);
     baselines[rt.name] = median;
     if (memStrategy) {
@@ -592,13 +604,21 @@ async function main() {
   const workloads = [];
   let mismatches = 0;
   for (const f of files) {
-    const file = join(WORKLOAD_DIR, f);
     const name = f.replace(/\.js$/, "");
     process.stderr.write(`  ${name} ... `);
     const byRuntime = {};
     const rssByRuntime = {};
     const results = new Set();
+    const skipped = [];
     for (const rt of runtimes) {
+      // The JS runtimes share the workload's .js source; cpython runs its .py
+      // twin. A workload without a port for some runtime gets a — cell rather
+      // than failing the whole suite.
+      const file = join(WORKLOAD_DIR, name + rt.ext);
+      if (!existsSync(file)) {
+        skipped.push(rt.name);
+        continue;
+      }
       const r = await timeWorkload(rt, file, opts.runs, opts.warmup);
       byRuntime[rt.name] = r;
       if (memStrategy) {
@@ -611,8 +631,12 @@ async function main() {
       mismatches++;
       process.stderr.write("RESULT MISMATCH\n");
       for (const rt of runtimes) {
-        process.stderr.write(`      ${rt.name}: ${byRuntime[rt.name].result}\n`);
+        if (byRuntime[rt.name]) {
+          process.stderr.write(`      ${rt.name}: ${byRuntime[rt.name].result}\n`);
+        }
       }
+    } else if (skipped.length > 0) {
+      process.stderr.write(`ok (no port for: ${skipped.join(", ")})\n`);
     } else {
       process.stderr.write("ok\n");
     }
