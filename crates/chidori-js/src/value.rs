@@ -72,7 +72,7 @@ struct Rope {
 /// Minimum combined size before `concat` builds a rope node instead of
 /// copying. Below this, an eager copy is cheaper than the node + eventual
 /// flatten bookkeeping, and short-string behavior stays exactly as before.
-const ROPE_MIN_BYTES: usize = 64;
+pub(crate) const ROPE_MIN_BYTES: usize = 64;
 
 /// Sentinel for a `Repr::Utf8` whose code-unit count has not been computed
 /// yet. Safe: [`MAX_STRING_LEN`] (16M units) keeps every real count far below
@@ -303,6 +303,15 @@ impl JsString {
             Repr::Wtf8(w) => JsString::new(&*w.lossy),
         }
     }
+    /// The borrowed UTF-8 view IF this is a plain (non-rope, well-formed)
+    /// string — O(1), never flattens a rope. `None` for ropes and WTF-8.
+    pub fn as_flat_utf8(&self) -> Option<&str> {
+        match &self.0 {
+            Repr::Utf8(s, _) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Concatenate, preserving code units. Two well-formed strings concatenate
     /// as plain UTF-8; otherwise we route through code units so a high+low
     /// surrogate straddling the boundary re-pairs into one astral code point.

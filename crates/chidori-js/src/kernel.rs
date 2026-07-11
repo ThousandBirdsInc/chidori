@@ -733,7 +733,13 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
             }
             KOp::Br { .. } | KOp::Exit { .. } => {}
             // Fusion (`fuse_kops`) runs after this remap.
-            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+            KOp::Mov2 { .. }
+            | KOp::ArithAdd { .. }
+            | KOp::ArithKAdd { .. }
+            | KOp::AddKBr { .. }
+            | KOp::LenBrCmp { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. } => {
                 unreachable!("fused op before fusion")
             }
         }
@@ -849,7 +855,11 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         .kops
         .iter()
         .any(|op| matches!(op, KOp::StoreElem { .. } | KOp::ArrayPush { .. }));
-    let loads_len = x.kops.iter().any(|op| matches!(op, KOp::LoadLen { .. }));
+    // `LenBrCmp` is a fused `LoadLen` — the entry guard must see it too.
+    let loads_len = x
+        .kops
+        .iter()
+        .any(|op| matches!(op, KOp::LoadLen { .. } | KOp::LenBrCmp { .. }));
     // fn mode: recursion descriptor from the recorded self/extern references
     // (`kernelize_function` fills `ret_bool`/`args_used` and verifies the
     // recursive constraints).
@@ -861,6 +871,13 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
             globals: std::mem::take(&mut x.rec_globals).into_boxed_slice(),
         }))
     };
+    // The executors run registers in fixed [`crate::bytecode::KWIN`]-slot
+    // windows with masked (bounds-check-free) indexing; a kernel needing more
+    // registers declines translation and the region stays generic. No
+    // observed kernel comes near the cap (all ≤ 10 registers).
+    if (prop_base + n_props) as usize > crate::bytecode::KWIN {
+        return None;
+    }
     Some(Kernel {
         stores_elems,
         loads_len,
@@ -910,8 +927,14 @@ fn map_targets(op: &mut KOp, mut f: impl FnMut(u16) -> u16) {
         KOp::LoadElem { bail, .. }
         | KOp::StoreElem { bail, .. }
         | KOp::LoadLen { bail, .. }
+        | KOp::LoadElemAdd { bail, .. }
+        | KOp::LoadElemArith { bail, .. }
         | KOp::ArrayPush { bail, .. }
         | KOp::ArrayPop { bail, .. } => *bail = f(*bail),
+        KOp::LenBrCmp { bail, target, .. } => {
+            *bail = f(*bail);
+            *target = f(*target);
+        }
         _ => {}
     }
 }
@@ -956,6 +979,85 @@ fn fuse_kops(kops: &mut [KOp]) {
                 k: *k,
                 target: *target,
             }),
+            (
+                KOp::ArithK { kind, dst, a, k },
+                KOp::Add {
+                    dst: d2,
+                    a: a2,
+                    b: b2,
+                },
+            ) => Some(KOp::ArithKAdd {
+                kind: *kind,
+                dst: *dst,
+                a: *a,
+                k: *k,
+                d2: *d2,
+                a2: *a2,
+                b2: *b2,
+            }),
+            (
+                KOp::LoadLen { dst, obj, bail },
+                KOp::BrCmp {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                },
+            ) => Some(KOp::LenBrCmp {
+                dst: *dst,
+                obj: *obj,
+                bail: *bail,
+                cmp: *cmp,
+                a: *a,
+                b: *b,
+                if_true: *if_true,
+                target: *target,
+            }),
+            (
+                KOp::LoadElem {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                },
+                KOp::Add {
+                    dst: d2,
+                    a: a2,
+                    b: b2,
+                },
+            ) => Some(KOp::LoadElemAdd {
+                dst: *dst,
+                obj: *obj,
+                idx: *idx,
+                bail: *bail,
+                d2: *d2,
+                a2: *a2,
+                b2: *b2,
+            }),
+            (
+                KOp::LoadElem {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                },
+                KOp::Arith {
+                    kind,
+                    dst: d2,
+                    a: a2,
+                    b: b2,
+                },
+            ) => Some(KOp::LoadElemArith {
+                dst: *dst,
+                obj: *obj,
+                idx: *idx,
+                bail: *bail,
+                kind: *kind,
+                d2: *d2,
+                a2: *a2,
+                b2: *b2,
+            }),
             _ => None,
         };
         if let Some(f) = fused {
@@ -983,16 +1085,186 @@ fn cleanup_kops(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_re
     if n_regs > 128 {
         return;
     }
-    // Alternate the two transforms to a fixpoint: propagation exposes dead
+    // Alternate the transforms to a fixpoint: propagation exposes dead
     // copies; deletion shortens chains for the next round. Each round
     // strictly reduces rewrites+ops, so this terminates quickly.
     loop {
         let mut changed = copy_prop_kops(kops);
+        changed |= const_prop_kops(kops);
         changed |= dce_movs(kops, always_live, upvalue_uses, n_regs);
         if !changed {
             break;
         }
     }
+}
+
+/// Mirror `cmp` across an operand swap: `cmp(k, b) == mirror(cmp)(b, k)`.
+fn mirror_cmp(cmp: CmpOp) -> CmpOp {
+    match cmp {
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Ge => CmpOp::Le,
+        CmpOp::Eq | CmpOp::Ne | CmpOp::StrictEq | CmpOp::StrictNe => cmp,
+    }
+}
+
+/// Forward CONSTANT propagation within basic blocks (same block discipline
+/// as `copy_prop_kops`): after `Const { dst, k }`, ops reading `dst` as an
+/// operand rewrite to their immediate (`*K`) forms — `Add` → `AddK`,
+/// `Arith` → `ArithK` (right operand, or either for the commutative kinds),
+/// `BrCmp` → `BrCmpK` (mirroring the comparison when the constant is on the
+/// left), `Mov` → `Const`. The rewritten op computes the identical value
+/// through the identical helper (`number_arith_raw(a, k, kind)` — the K
+/// forms simply carry the operand inline), so results are bit-identical;
+/// `dce_movs` then deletes the dead `Const` defs.
+fn const_prop_kops(kops: &mut [KOp]) -> bool {
+    let n = kops.len();
+    let mut label = vec![false; n];
+    let mut preds = vec![0u32; n];
+    for (j, op) in kops.iter_mut().enumerate() {
+        let falls = !matches!(op, KOp::Br { .. } | KOp::Ret { .. } | KOp::Exit { .. });
+        if falls && j + 1 < n {
+            preds[j + 1] += 1;
+        }
+        map_targets(op, |t| {
+            label[t as usize] = true;
+            preds[t as usize] += 1;
+            t
+        });
+    }
+    let mut konst: Vec<Option<f64>> = vec![None; 1 + kops.iter().fold(0, max_reg) as usize];
+    let mut snapshots: Vec<Option<Vec<Option<f64>>>> = vec![None; n];
+    let mut changed = false;
+    for (i, op) in kops.iter_mut().enumerate() {
+        if label[i] {
+            match snapshots[i].take() {
+                Some(s) => konst = s,
+                None => konst.iter_mut().for_each(|e| *e = None),
+            }
+        }
+        // Rewrite reads of known-constant registers to immediate forms.
+        match *op {
+            KOp::Mov { dst, src } => {
+                if let Some(k) = konst[src as usize] {
+                    *op = KOp::Const { dst, k };
+                    changed = true;
+                }
+            }
+            KOp::Add { dst, a, b } => {
+                if let Some(k) = konst[b as usize] {
+                    *op = KOp::AddK { dst, a, k };
+                    changed = true;
+                } else if let Some(k) = konst[a as usize] {
+                    *op = KOp::AddK { dst, a: b, k };
+                    changed = true;
+                }
+            }
+            KOp::Arith { kind, dst, a, b } => {
+                let commutative = matches!(
+                    kind,
+                    crate::exec::ArithKind::Mul
+                        | crate::exec::ArithKind::BitAnd
+                        | crate::exec::ArithKind::BitOr
+                        | crate::exec::ArithKind::BitXor
+                );
+                if let Some(k) = konst[b as usize] {
+                    *op = KOp::ArithK { kind, dst, a, k };
+                    changed = true;
+                } else if commutative {
+                    if let Some(k) = konst[a as usize] {
+                        *op = KOp::ArithK { kind, dst, a: b, k };
+                        changed = true;
+                    }
+                }
+            }
+            KOp::BrCmp {
+                cmp,
+                a,
+                b,
+                if_true,
+                target,
+            } => {
+                if let Some(k) = konst[b as usize] {
+                    *op = KOp::BrCmpK {
+                        cmp,
+                        a,
+                        k,
+                        if_true,
+                        target,
+                    };
+                    changed = true;
+                } else if let Some(k) = konst[a as usize] {
+                    *op = KOp::BrCmpK {
+                        cmp: mirror_cmp(cmp),
+                        a: b,
+                        k,
+                        if_true,
+                        target,
+                    };
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+        // Update the constant map: a `Const` def records; any other def
+        // kills. (No aliasing exists — these are plain registers.)
+        match op {
+            KOp::Const { dst, k } => konst[*dst as usize] = Some(*k),
+            KOp::Mov { dst, .. }
+            | KOp::Add { dst, .. }
+            | KOp::AddK { dst, .. }
+            | KOp::Arith { dst, .. }
+            | KOp::ArithK { dst, .. }
+            | KOp::Neg { dst, .. }
+            | KOp::BitNot { dst, .. }
+            | KOp::BoolNot { dst, .. }
+            | KOp::CmpSet { dst, .. }
+            | KOp::Math1 { dst, .. }
+            | KOp::Math2 { dst, .. }
+            | KOp::LoadElem { dst, .. }
+            | KOp::LoadLen { dst, .. }
+            | KOp::LoadProp { dst, .. }
+            | KOp::ArrayPush { dst, .. }
+            | KOp::ArrayPop { dst, .. }
+            | KOp::CallKernel { dst, .. }
+            | KOp::SelfCall { dst, .. } => konst[*dst as usize] = None,
+            KOp::Br { .. }
+            | KOp::BrCmp { .. }
+            | KOp::BrCmpK { .. }
+            | KOp::BrFalsy { .. }
+            | KOp::BrTruthy { .. }
+            | KOp::StoreElem { .. }
+            | KOp::StoreProp { .. }
+            | KOp::Ret { .. }
+            | KOp::Exit { .. } => {}
+            // Fusion (`fuse_kops`) runs after cleanup.
+            KOp::Mov2 { .. }
+            | KOp::ArithAdd { .. }
+            | KOp::ArithKAdd { .. }
+            | KOp::AddKBr { .. }
+            | KOp::LenBrCmp { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. } => {
+                unreachable!("fused op before fusion")
+            }
+        }
+        // Same forward-edge snapshot rule as `copy_prop_kops`.
+        let target = match op {
+            KOp::Br { target }
+            | KOp::BrCmp { target, .. }
+            | KOp::BrCmpK { target, .. }
+            | KOp::BrFalsy { target, .. }
+            | KOp::BrTruthy { target, .. } => Some(*target),
+            _ => None,
+        };
+        if let Some(t) = target {
+            if t as usize > i && preds[t as usize] == 1 {
+                snapshots[t as usize] = Some(konst.clone());
+            }
+        }
+    }
+    changed
 }
 
 /// Forward copy propagation within basic blocks: after `Mov d, s`, reads of
@@ -1116,7 +1388,13 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
             KOp::CallKernel { dst, .. } | KOp::SelfCall { dst, .. } => kill!(*dst),
             KOp::Br { .. } | KOp::Exit { .. } => {}
             // Fusion (`fuse_kops`) runs after cleanup.
-            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+            KOp::Mov2 { .. }
+            | KOp::ArithAdd { .. }
+            | KOp::ArithKAdd { .. }
+            | KOp::AddKBr { .. }
+            | KOp::LenBrCmp { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. } => {
                 unreachable!("fused op before fusion")
             }
         }
@@ -1194,7 +1472,13 @@ fn max_reg(acc: u16, op: &KOp) -> u16 {
         }
         KOp::Br { .. } | KOp::Exit { .. } => {}
         // Fusion (`fuse_kops`) runs after cleanup.
-        KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+        KOp::Mov2 { .. }
+        | KOp::ArithAdd { .. }
+        | KOp::ArithKAdd { .. }
+        | KOp::AddKBr { .. }
+        | KOp::LenBrCmp { .. }
+        | KOp::LoadElemAdd { .. }
+        | KOp::LoadElemArith { .. } => {
             unreachable!("fused op before fusion")
         }
     }
@@ -1301,7 +1585,13 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
                 defs[i] = bit(*dst);
             }
             // Fusion (`fuse_kops`) runs after cleanup.
-            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+            KOp::Mov2 { .. }
+            | KOp::ArithAdd { .. }
+            | KOp::ArithKAdd { .. }
+            | KOp::AddKBr { .. }
+            | KOp::LenBrCmp { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. } => {
                 unreachable!("fused op before fusion")
             }
         }
@@ -1332,14 +1622,15 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
             break;
         }
     }
-    // A Mov is dead when nothing can observe its destination: not live on
-    // any path out, not written back / shape-referenced (always_live), or a
-    // self-move.
+    // A Mov (or a Const — const-propagation strands them) is dead when
+    // nothing can observe its destination: not live on any path out, not
+    // written back / shape-referenced (always_live), or a self-move.
     let dead: Vec<bool> = kops
         .iter()
         .enumerate()
         .map(|(i, op)| match op {
             KOp::Mov { dst, src } => *dst == *src || (live_out[i] | always_live) & bit(*dst) == 0,
+            KOp::Const { dst, .. } => (live_out[i] | always_live) & bit(*dst) == 0,
             _ => false,
         })
         .collect();

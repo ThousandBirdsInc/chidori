@@ -1352,8 +1352,11 @@ impl<'a> JsonParser<'a> {
         Ok(Value::Object(vm.new_array(elems)))
     }
     /// An object key: the unescaped fast path is interned by source slice
-    /// (see the `keys` field); anything needing escape processing falls back
-    /// to the general string parser. `self.pos` is on the opening quote.
+    /// (see the `keys` field) and, across parses, through the Vm-level
+    /// `json_keys` cache (same-shaped documents parsed repeatedly reuse one
+    /// `Rc<str>` per distinct key — the poll/roundtrip pattern); anything
+    /// needing escape processing falls back to the general string parser.
+    /// `self.pos` is on the opening quote.
     fn parse_key(&mut self, vm: &mut Vm) -> Result<PropertyKey, Value> {
         let start = self.pos + 1;
         let mut i = start;
@@ -1365,7 +1368,18 @@ impl<'a> JsonParser<'a> {
                     if let Some(k) = self.keys.get(s) {
                         return Ok(k.clone());
                     }
-                    let k = PropertyKey::str(s);
+                    let k = if let Some(k) = vm.json_keys.get(s) {
+                        k.clone()
+                    } else {
+                        let k = PropertyKey::str(s);
+                        // Bounded: a pathological stream of distinct keys
+                        // resets the cache rather than growing it.
+                        if vm.json_keys.len() >= 4096 {
+                            vm.json_keys.clear();
+                        }
+                        vm.json_keys.insert(s.into(), k.clone());
+                        k
+                    };
                     self.keys.insert(s, k.clone());
                     return Ok(k);
                 }
@@ -1396,7 +1410,15 @@ impl<'a> JsonParser<'a> {
             }
             self.pos += 1;
             let v = self.parse_value(vm)?;
-            obj.borrow_mut().props.insert(key, Property::data(v));
+            {
+                let mut b = obj.borrow_mut();
+                // One up-front table allocation covers the common ≤8-member
+                // object instead of the 0→3→7 growth (two allocs + a rehash).
+                if b.props.capacity() == 0 {
+                    b.props.reserve(8);
+                }
+                b.props.insert(key, Property::data(v));
+            }
             self.skip_ws();
             if self.pos >= self.bytes.len() {
                 return Err(vm.throw_syntax("Unexpected end of JSON input"));

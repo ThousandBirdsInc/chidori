@@ -368,6 +368,17 @@ pub struct Vm {
     /// Pooled (caller, return-pc, dst, window) stack for
     /// `run_fn_kernel_rec`; parked empty.
     pub(crate) rec_calls: Vec<(u8, u16, u16, u32)>,
+    /// Cross-parse JSON object-key intern cache: repeated `JSON.parse` of
+    /// same-shaped documents (the poll/roundtrip pattern) reuses one
+    /// `Rc<str>` per distinct key instead of allocating it per parse. Pure
+    /// perf: only the ALLOCATION IDENTITY of key strings is shared — content,
+    /// insertion order, and everything observable are unchanged. Bounded
+    /// (cleared at capacity), never serialized.
+    pub(crate) json_keys: std::collections::HashMap<
+        Box<str>,
+        crate::value::PropertyKey,
+        std::hash::BuildHasherDefault<crate::fxhash::FxHasher>,
+    >,
 }
 
 impl Default for Vm {
@@ -412,6 +423,7 @@ impl Vm {
             kernel_callees: Vec::new(),
             rec_families: Vec::new(),
             rec_calls: Vec::new(),
+            json_keys: std::collections::HashMap::default(),
             dummy_bf: Rc::new(BytecodeFunction {
                 proto: Rc::new(crate::bytecode::FuncProto::empty(
                     "",
@@ -459,6 +471,30 @@ impl Vm {
 
     pub fn new_object(&self) -> JsObject {
         self.alloc_ordinary(Some(self.realm.object_proto.clone()))
+    }
+
+    /// Instantiate an object-literal TEMPLATE (see [`crate::bytecode::Op::NewObjectTpl`]):
+    /// clone the pre-built property map (bucket layout included — no hashing,
+    /// no growth) and overwrite slots `0..N` with the evaluated values in
+    /// source order. Identical to `new_object()` + N× CreateDataProperty on
+    /// a fresh ordinary extensible object, where nothing user-visible can
+    /// intervene or fail.
+    pub fn new_object_from_tpl(
+        &self,
+        tpl: &crate::bytecode::ObjTemplate,
+        values: impl Iterator<Item = Value>,
+    ) -> JsObject {
+        let mut map = tpl.map.clone();
+        for (i, v) in values.enumerate() {
+            let (_, p) = map.get_index_mut(i).expect("template arity");
+            p.kind = PropertyKind::Data {
+                value: v,
+                writable: true,
+            };
+        }
+        let mut data = ObjectData::new(Some(self.realm.object_proto.clone()), Internal::Ordinary);
+        data.props = map;
+        self.alloc(data)
     }
 
     pub fn new_object_proto(&self, proto: Option<JsObject>) -> JsObject {

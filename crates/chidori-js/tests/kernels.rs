@@ -14,7 +14,7 @@
 
 use std::rc::Rc;
 
-use chidori_js::bytecode::{Const, FuncProto, Op};
+use chidori_js::bytecode::{Const, FuncProto, KOp, Op};
 use chidori_js::compiler::{compile_script, compile_script_kernels};
 use chidori_js::{Engine, Value};
 
@@ -964,4 +964,80 @@ fn op_budget_identical_with_kernels() {
             );
         }
     }
+}
+
+/// The cleanup/fusion pipeline actually produces the new superinstructions
+/// (const-propagated K-forms, the fused loop-header test, and the fused
+/// element-load accumulations) on the canonical shapes — pins the
+/// masked-window round's dispatch counts.
+#[test]
+fn kernel_superinstructions_fire() {
+    fn kernel_ops(src: &str) -> Vec<KOp> {
+        fn collect(p: &FuncProto, out: &mut Vec<KOp>) {
+            for k in &p.kernels {
+                out.extend(k.code.iter().copied());
+            }
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    collect(f, out);
+                }
+            }
+        }
+        let proto = compile_script(src).expect("compiles");
+        let mut out = Vec::new();
+        collect(&proto, &mut out);
+        out
+    }
+    // `i < a.length` header: one fused LenBrCmp dispatch.
+    let ops = kernel_ops(
+        "function f(a) { let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } return s; }",
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::LenBrCmp { .. })),
+        "length header must fuse: {ops:?}"
+    );
+    // `s += a[i]`: one fused LoadElemAdd dispatch.
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::LoadElemAdd { .. })),
+        "element accumulation must fuse: {ops:?}"
+    );
+    // Constant operands reach the immediate forms: no materialized `Const`
+    // feeding an `Arith`/`BrCmp` survives in the canonical modular loop.
+    let ops = kernel_ops(
+        "function f(n) { let s = 0; for (let i = 0; i < n; i++) { s += (i * 7919) % 10007; } return s; }",
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, KOp::ArithK { .. } | KOp::ArithKAdd { .. })),
+        "constant arithmetic must use K-forms: {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(op, KOp::Const { .. })),
+        "no stranded Const feeding const-propagated ops: {ops:?}"
+    );
+}
+
+/// The masked-window executors run kernels correctly at the register-count
+/// CAP boundary (KWIN registers is the translation limit; a body needing
+/// more must decline and stay generic — never corrupt).
+#[test]
+fn kernel_register_cap() {
+    // Many distinct live locals in one loop body push the register count up;
+    // whether or not this kernelizes, the RESULT must be exact.
+    let mut body = String::new();
+    let mut sum = String::new();
+    for i in 0..24 {
+        body.push_str(&format!("let v{i} = i + {i}; "));
+        sum.push_str(&format!("+ v{i} "));
+    }
+    let src = format!(
+        "let s = 0; for (let i = 0; i < 100; i++) {{ {body} s = (s {sum}) % 1000003; }} console.log(s);"
+    );
+    let (threw_on, con_on, err_on) = run(&src, true);
+    let (threw_off, con_off, err_off) = run(&src, false);
+    assert_eq!(
+        (threw_on, &con_on, &err_on),
+        (threw_off, &con_off, &err_off),
+        "cap-boundary loop must behave identically"
+    );
 }

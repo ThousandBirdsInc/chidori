@@ -708,6 +708,8 @@ struct FnCtx {
     inherit_home: bool,
     /// Tagged-template literals compiled in this function (see `FuncProto`).
     templates: Vec<TemplateParts>,
+    /// Object-literal templates (see [`crate::bytecode::ObjTemplate`]).
+    obj_tpls: Vec<std::rc::Rc<crate::bytecode::ObjTemplate>>,
 }
 
 impl FnCtx {
@@ -746,6 +748,7 @@ impl FnCtx {
             stable_cells: Vec::new(),
             inherit_home: false,
             templates: Vec::new(),
+            obj_tpls: Vec::new(),
             home_super: false,
             eval_scopes: Vec::new(),
         }
@@ -1912,6 +1915,7 @@ impl Compiler {
             this_cell: fc.this_cell,
             inherit_home: fc.inherit_home,
             templates: fc.templates,
+            obj_tpls: fc.obj_tpls,
         }
     }
 
@@ -3851,7 +3855,65 @@ impl Compiler {
         Ok(())
     }
 
+    /// Try to compile `o` as a TEMPLATE literal (see [`Op::NewObjectTpl`]):
+    /// every property a plain (non-computed, non-method, non-accessor,
+    /// non-spread, non-`__proto__`) data property with a distinct static
+    /// string key. Returns the template index, or `None` when any property
+    /// needs the generic `DefineField` path.
+    fn try_object_template(&mut self, o: &ObjectExpression) -> Option<u32> {
+        if o.properties.len() < 2 {
+            return None;
+        }
+        let mut names: Vec<String> = Vec::with_capacity(o.properties.len());
+        for prop in &o.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                return None;
+            };
+            if p.computed || p.method || !matches!(p.kind, PropertyKind::Init) {
+                return None;
+            }
+            let name = property_key_name(&p.key);
+            // Plain `__proto__: v` is a [[Prototype]] SET, not a property
+            // definition; duplicate keys keep later-wins semantics on the
+            // generic path.
+            if name == "__proto__" && !p.shorthand || names.contains(&name) {
+                return None;
+            }
+            names.push(name);
+        }
+        let mut map = crate::fxhash::FxIndexMap::default();
+        map.reserve(names.len());
+        for name in &names {
+            map.insert(
+                crate::value::PropertyKey::Str(crate::value::JsString::from(name.as_str())),
+                crate::value::Property::data(crate::value::Value::Undefined),
+            );
+        }
+        let fc = self.fns.last_mut().expect("fn ctx");
+        fc.obj_tpls
+            .push(std::rc::Rc::new(crate::bytecode::ObjTemplate { map }));
+        Some((fc.obj_tpls.len() - 1) as u32)
+    }
+
     fn compile_object(&mut self, o: &ObjectExpression) -> R {
+        if let Some(idx) = self.try_object_template(o) {
+            // All-static-data-key literal: evaluate the values in source
+            // order (identical order and side effects to the generic path —
+            // static keys have no evaluation step), then instantiate from
+            // the pre-built template in one op.
+            for prop in &o.properties {
+                let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                    unreachable!("template eligibility excluded spreads")
+                };
+                let name = property_key_name(&p.key);
+                self.compile_named_expr(&p.value, &name)?;
+            }
+            self.emit(Op::NewObjectTpl {
+                idx,
+                n: o.properties.len() as u32,
+            });
+            return Ok(());
+        }
         self.emit(Op::NewObject);
         // Duplicate plain `__proto__: v` definitions are an early SyntaxError
         // (computed/shorthand/method forms don't count).

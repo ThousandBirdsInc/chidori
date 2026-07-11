@@ -195,6 +195,29 @@ pub struct FuncProto {
     /// at runtime by `(this proto's pointer, index)` — the spec's per-Parse
     /// Node template cache (a shared proto is the same Parse Node).
     pub templates: Vec<TemplateParts>,
+    /// Object-literal templates for [`Op::NewObjectTpl`]: each carries the
+    /// literal's static keys and a pre-built property map (placeholder
+    /// `undefined` values) that instantiation CLONES instead of re-hashing
+    /// and re-inserting every key per evaluation.
+    pub obj_tpls: Vec<std::rc::Rc<ObjTemplate>>,
+}
+
+/// Compile-time template for an all-static-data-key object literal (see
+/// [`Op::NewObjectTpl`]). `map` holds every key inserted in source order with
+/// a placeholder `undefined` data property (writable/enumerable/configurable
+/// — exactly what `CreateDataProperty` defines); instantiation clones the map
+/// (bucket layout included — no hashing) and overwrites slots `0..N` with the
+/// evaluated values.
+pub struct ObjTemplate {
+    pub map: crate::fxhash::FxIndexMap<crate::value::PropertyKey, crate::value::Property>,
+}
+
+impl std::fmt::Debug for ObjTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.map.keys().map(|k| format!("{k:?}")))
+            .finish()
+    }
 }
 
 /// One inline-cache entry (see [`FuncProto::ic`]). `own_slot` indexes the
@@ -236,6 +259,7 @@ impl FuncProto {
             this_cell: None,
             inherit_home: false,
             templates: Vec::new(),
+            obj_tpls: Vec::new(),
         }
     }
 }
@@ -613,6 +637,21 @@ pub enum Op {
 
     // ---- objects / arrays ----
     NewObject,
+    /// Instantiate an all-static-data-key object literal from the pre-built
+    /// template at [`FuncProto::obj_tpls`]\[payload\]: pops the template's N
+    /// values (pushed in source order) and pushes the object. The template's
+    /// property map is CLONED (no hashing, no growth rehash, no per-key
+    /// descriptor validation — the compiler proved every key a distinct
+    /// static string data property on a fresh ordinary extensible object,
+    /// where `CreateDataPropertyOrThrow` cannot observe anything and cannot
+    /// fail) and the popped values are written into slots `0..N` in order —
+    /// the exact map the generic `NewObject` + N×`DefineField` sequence
+    /// builds, at a fraction of the cost. `n` is the key count (kept in the
+    /// op so stack-effect tables need no template lookup).
+    NewObjectTpl {
+        idx: u32,
+        n: u32,
+    },
     NewArray(u32), // number of initial elements popped
     /// Push the cached, frozen template object for tagged-template literal
     /// `index` (into the function's `templates`): `[] -> [templateObject]`.
@@ -941,6 +980,18 @@ pub enum Op {
 // Typed loop kernels
 // =============================================================================
 
+/// Fixed size of one kernel register WINDOW. Translation declines any kernel
+/// needing more than `KWIN` registers (every observed kernel uses ≤ 10), so
+/// the executors can hold registers in a `&mut [f64; KWIN]` and index it as
+/// `regs[(r as usize) & KWIN_MASK]` — the mask proves the index in-bounds to
+/// the compiler, eliminating the per-access bounds check (measured at 12–17%
+/// of kernel-owned workloads) with zero `unsafe`. Translation guarantees every
+/// register index is `< n_regs ≤ KWIN`, so the mask never changes a valid
+/// index; it only removes the panic branch.
+pub const KWIN: usize = 32;
+/// `KWIN - 1`, the index mask (KWIN is a power of two).
+pub const KWIN_MASK: usize = KWIN - 1;
+
 /// The kernel register machine's instruction set: unboxed `f64` registers, no
 /// operand stack, no heap values. Produced by `kernel.rs` from an eligible
 /// loop region's bytecode; executed by `Vm::run_kernel`. `target` fields index
@@ -999,6 +1050,56 @@ pub enum KOp {
         a: u16,
         k: f64,
         target: u16,
+    },
+    /// SUPERINSTRUCTION: `ArithK` followed by `Add` — the `s += a <op> K`
+    /// accumulation shape after const-propagation folded the constant.
+    ArithKAdd {
+        kind: crate::exec::ArithKind,
+        dst: u16,
+        a: u16,
+        k: f64,
+        d2: u16,
+        a2: u16,
+        b2: u16,
+    },
+    /// SUPERINSTRUCTION: `LoadLen` followed by `BrCmp` — the `i < a.length`
+    /// loop header test in one dispatch. Element/length semantics (and the
+    /// `bail` edge) are exactly [`KOp::LoadLen`]'s; the compare-and-branch is
+    /// exactly [`KOp::BrCmp`]'s.
+    LenBrCmp {
+        dst: u16,
+        obj: u16,
+        bail: u16,
+        cmp: CmpOp,
+        a: u16,
+        b: u16,
+        if_true: bool,
+        target: u16,
+    },
+    /// SUPERINSTRUCTION: `LoadElem` followed by `Add` — the `s += a[i]`
+    /// accumulation shape. Element semantics (and the `bail` edge) are
+    /// exactly [`KOp::LoadElem`]'s.
+    LoadElemAdd {
+        dst: u16,
+        obj: u16,
+        idx: u16,
+        bail: u16,
+        d2: u16,
+        a2: u16,
+        b2: u16,
+    },
+    /// SUPERINSTRUCTION: `LoadElem` followed by `Arith` — the
+    /// `d += a[i] * b[i]` dot-product shape's second load feeding its
+    /// multiply (which the `(Arith, Add)` fusion then folds separately).
+    LoadElemArith {
+        dst: u16,
+        obj: u16,
+        idx: u16,
+        bail: u16,
+        kind: crate::exec::ArithKind,
+        d2: u16,
+        a2: u16,
+        b2: u16,
     },
     /// unconditional jump
     Br { target: u16 },

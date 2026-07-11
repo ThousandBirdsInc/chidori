@@ -505,6 +505,14 @@ pub enum ROp {
         at: u16,
         n: u16,
     },
+    /// Object-literal template instantiation ([`Op::NewObjectTpl`]): values
+    /// move out of canonical registers `at..at+n`.
+    NewObjectTpl {
+        dst: u16,
+        at: u16,
+        n: u16,
+        tpl: u32,
+    },
     ArraySpread {
         arr: u16,
         src: u16,
@@ -636,6 +644,7 @@ fn effect(op: &Op) -> Option<(u32, u32)> {
         Dup => (0, 1),
         Swap | Rot3 => (0, 0),
         NewObject | GetTemplateObject(_) | NewRegExp { .. } | Closure(_) => (0, 1),
+        NewObjectTpl { n, .. } => (*n, 1),
         NewArray(n) | ConcatStrings(n) => (*n, 1),
         ArraySpread | ObjectSpread => (2, 1),
         CopyDataPropertiesExcept(n) => (*n + 2, 1),
@@ -1235,6 +1244,7 @@ fn rop_set_dst(op: &mut ROp, new_dst: u16) -> bool {
         | ROp::Closure { dst, .. }
         | ROp::NewObject { dst }
         | ROp::NewArray { dst, .. }
+        | ROp::NewObjectTpl { dst, .. }
         | ROp::GetTemplateObject { dst, .. }
         | ROp::NewRegExp { dst, .. }
         | ROp::ConcatStrings { dst, .. }
@@ -1862,6 +1872,23 @@ impl Emitter {
                     dst,
                     at,
                     n: n as u16,
+                });
+                self.push_temp();
+            }
+            NewObjectTpl { idx, n } => {
+                let n = *n as usize;
+                let base = self.entries.len() - n;
+                for pos in base..self.entries.len() {
+                    self.canonicalize(pos);
+                }
+                let at = self.canon(base);
+                self.entries.truncate(base);
+                let dst = self.dst();
+                self.push_def(ROp::NewObjectTpl {
+                    dst,
+                    at,
+                    n: n as u16,
+                    tpl: *idx,
                 });
                 self.push_temp();
             }
