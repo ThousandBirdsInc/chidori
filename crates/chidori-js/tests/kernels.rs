@@ -322,6 +322,42 @@ const CORPUS: &[&str] = &[
     "'use strict'; function f(a, b) { return a * b; } console.log(f(6, 7));",
     // Boolean ARGUMENT declines (guard is Number-only) — generic coercion.
     "const f = (a, b) => a - b; console.log(f(true, 1), f(5, false));",
+    // ---- upvalue-WRITING function kernels (buffered cell writes) ----
+    // The PRNG idiom (the sort workload's `rnd`): write a captured cell,
+    // return it. Cell state must advance identically call over call.
+    "let seed = 123456789; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; } let s = 0; for (let i = 0; i < 50; i++) s = (s + rnd()) >>> 0; console.log(s, seed);",
+    // Generic code reads the cell BETWEEN kernel calls (per-call flush).
+    "let acc = 0; const bump = x => { acc = acc + x; return acc; }; bump(1); const mid = acc; bump(2); console.log(mid, acc);",
+    // Two kernels sharing one cell: each entry re-reads the other's flush.
+    "let s = 10; const inc = () => { s = s + 1; return s; }; const dec = () => { s = s - 2; return s; }; console.log(inc(), dec(), inc(), s);",
+    // Conditional store: the skipped path leaves the cell untouched (the
+    // flush writes the entry snapshot back — same value, unobservable).
+    "let hi = 0; const f = x => { if (x > 10) hi = x; return hi; }; console.log(f(5), f(20), f(7), hi);",
+    // Write-only cell (no read in the body).
+    "let last = -1; const f = x => { last = x * 2; return x; }; f(3); f(4); console.log(last);",
+    // Store then read-back within the body (register forwarding).
+    "let t = 1; const f = x => { t = t * x; return t + t; }; console.log(f(3), f(5), t);",
+    // Self-assignment (a dead store — the flush is value-identical anyway).
+    "let v = 7; const f = x => { v = v; return v + x; }; console.log(f(1), v);",
+    // -0 and NaN round through the cell bit-exactly.
+    "let z = 0; const f = x => { z = x * -0; return 1 / z; }; console.log(f(5), f(-5), Object.is(z, -0));",
+    "let n = 0; const f = x => { n = n + x; return n; }; f(NaN); console.log(n === n, typeof n);",
+    // Non-Number stores decline (the generic path must store the actual
+    // boolean/undefined — a flushed Number would change typeof).
+    "let b = 0; const f = x => { b = x > 0; return 1; }; console.log(f(5), b, typeof b);",
+    "let u = 0; const f = x => { u = undefined; return x; }; console.log(f(1), u, typeof u);",
+    // TDZ at call time: the cell isn't a Number yet — the guard declines and
+    // the generic path throws the spec ReferenceError.
+    "try { const f = () => { w = 1; return w; }; f(); let w; } catch (e) { console.log('tdz', e instanceof ReferenceError); }",
+    // A cell-writing COMPARATOR: the prepared sort path declines per-sort,
+    // results and the final call-count cell state stay exact.
+    "let calls = 0; const a = [5,3,8,1]; a.sort((x, y) => { calls = calls + 1; return x - y; }); console.log(a.join(','), calls > 0);",
+    // A cell-writing HOF callback (prepared map path declines per-run).
+    "let sum = 0; console.log([1,2,3,4].map(x => { sum = sum + x; return sum; }).join(','), sum);",
+    // Cell-writing SELF-RECURSION declines the recursion tier, stays exact.
+    "let depth = 0; function down(n) { depth = depth + 1; return n <= 0 ? depth : down(n - 1); } console.log(down(5), depth);",
+    // A cell-writing callee inside a hot numeric LOOP (the fill idiom).
+    "let seed2 = 42; function r2() { seed2 = (seed2 * 31 + 7) % 1000003; return seed2; } const arr = new Array(20); for (let i = 0; i < 20; i++) arr[i] = r2(); console.log(arr[0], arr[19], seed2);",
     // ---- self-recursive function kernels (SelfCall) ----
     // The canonical fib shape (global function declaration).
     "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } console.log(fib(15), fib(0), fib(1));",
@@ -680,6 +716,56 @@ fn tiny_functions_get_fn_kernels() {
             0,
             "expected NO function kernel in {src:?}"
         );
+    }
+}
+
+/// Cell-writing scalar bodies (the PRNG idiom) get a function kernel with
+/// `uv_writes` populated; non-Number stores and cell-writing recursion stay
+/// generic (pins the upvalue write-back shape).
+#[test]
+fn cell_writing_functions_get_fn_kernels() {
+    /// (fn kernels found, of which with non-empty uv_writes, of which rec)
+    fn scan(p: &FuncProto) -> (usize, usize, usize) {
+        let mut t = match &p.fn_kernel {
+            Some(k) => (
+                1,
+                usize::from(!k.uv_writes.is_empty()),
+                usize::from(k.rec.is_some()),
+            ),
+            None => (0, 0, 0),
+        };
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                let s = scan(f);
+                t = (t.0 + s.0, t.1 + s.1, t.2 + s.2);
+            }
+        }
+        t
+    }
+    // The PRNG idiom kernelizes WITH a recorded cell write.
+    for src in [
+        "let seed = 1; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; }",
+        "let acc = 0; const f = x => { acc = acc + x; return acc; };",
+        "let hi = 0; const f = x => { if (x > 10) hi = x; return hi; };",
+    ] {
+        let (kernels, writing, rec) = scan(&compile_script(src).expect("compiles"));
+        assert!(
+            kernels >= 1 && writing >= 1 && rec == 0,
+            "expected a non-recursive cell-writing fn kernel in {src:?}"
+        );
+    }
+    // Non-Number stores and cell-writing recursion stay generic.
+    for src in [
+        // Boolean store: a flushed Number would change typeof.
+        "let b = 0; const f = x => { b = x > 0; return 1; };",
+        // Undefined store: unrepresentable in a register.
+        "let u = 0; const f = x => { u = undefined; return x; };",
+        // Self-recursion + cell write: the recursion tier's entry resolution
+        // treats cells as activation constants.
+        "let d = 0; function f(n) { d = d + 1; return n <= 0 ? d : f(n - 1); }",
+    ] {
+        let (kernels, _, _) = scan(&compile_script(src).expect("compiles"));
+        assert_eq!(kernels, 0, "expected NO fn kernel in {src:?}");
     }
 }
 

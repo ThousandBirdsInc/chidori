@@ -1557,6 +1557,82 @@ results feeding arithmetic/booleans) plus a structural pin
 byte-identical; full suites green for both crates; Test262 gate green
 (0 regressions); clippy clean.
 
+## 6.14 Cell-writing function kernels (landed 2026-07-11): the PRNG idiom
+
+Motivated by the CPython benchmark column: on the `sort` workload chidori
+trailed every other runtime, and phase isolation showed the sort itself was
+already at Bun parity (§6.5's prepared f64 comparator) — the deficit was the
+LCG **fill loop**, 300k calls to
+`function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; }`
+at ~370 ns each. `rnd` declined the function-kernel tier for exactly one op:
+`StoreUpvalueChecked` (function kernels were pure — "nothing inside a kernel
+can write globals or cells"). A function that mutates captured state through
+a cell is the PRNG/accumulator/counter idiom, common in exactly the glue
+code the fn-kernel tier targets.
+
+1. **Translation** (`kernel.rs`): fn mode now accepts
+   `StoreUpvalue`/`StoreUpvalueChecked` of a NUMBER — the value moves into
+   the upvalue's register (later loads read the same register), and the
+   kernel records the write in `Kernel::uv_writes` (`(register, upvalue)`
+   pairs). Written registers join the always-live set so the completion
+   flush's source survives DCE. The Checked form's TDZ test is statically
+   satisfied: the entry guard already requires the cell to hold a Number
+   (a TDZ'd cell declines to the generic path, which raises the spec
+   ReferenceError). Non-Number stores (boolean/undefined — the flush would
+   change the cell's observable type) and loop-mode upvalue stores keep
+   declining.
+2. **Execution** (`run_fn_kernel`): written cells buffer in registers for
+   the whole frameless call — nothing else can run mid-kernel — and flush
+   back as `Value::Number` on BOTH completions (return and the interrupt
+   unwind, mirroring the loop kernels' local write-back), so the cell holds
+   exactly the generic write-through path's state; a conditionally-skipped
+   store flushes the entry snapshot back (same value, unobservable). A
+   belt-and-braces entry check declines if a written cell aliases another
+   captured cell. Both helpers live out of line so write-free kernels' hot
+   paths are untouched.
+3. **Tier boundaries**: non-empty `uv_writes` declines the recursion tier
+   (its family resolution and cache treat cells as activation constants —
+   checked at translation for self-recursion and at `build_rec_family` for
+   non-recursive helpers pulled into a family), the prepared-callback paths
+   (sort/HOF: they snapshot upvalues once per run), and the loop-kernel
+   pinned-callee guard (one snapshot per activation). Those shapes run
+   generically, exactly as before.
+
+### 6.14.1 Measured (callgrind, whole workload; wall interleaved 6-run median)
+
+| workload | before | after | Δ instructions | wall |
+| --- | ---: | ---: | ---: | ---: |
+| sort | 1.992 G | 1.554 G | **−22.0%** | 232 → 179 ms |
+| sort fill phase only | 1.107 G | 657 M | −40.6% | 166 → 85 ms |
+| 300k bare `rnd()` calls | 976 M | 526 M | −46.1% | 118 → 69 ms |
+| fib_recursive | 683.2 M | 694.0 M | +1.6% | 65 → 64 ms |
+| mutual_recursion | 940.2 M | 958.8 M | +2.0% | 79 → 81 ms |
+| array_hof / others | — | — | ±0.1% | — |
+
+Per-call cost of the PRNG shape drops ~370 → ~210 ns (the remaining cost is
+the generic caller loop: `LoadGlobal; Call` dispatch around the frameless
+body). On the cross-runtime suite the sort row goes from slowest-of-four to
+ahead of Node and CPython (~1.5× Bun, from 2.0×). The fib/mutual instruction
+upticks are the §6.13-class fat-LTO layout shift (their wall is flat, and
+neither workload executes any new code on its hot path); the residual
+stands as accepted noise, same as §6.13's window-pool revert.
+
+**What's next here:** the fill loop itself still runs generic bytecode — a
+loop kernel can't contain a call to a GLOBAL callee (pinned callees are
+local-held only, and cell-writing callees decline the pinned path). Extending
+`KOp::CallKernel` to entry-guarded global callees with per-call flush would
+kernelize the entire fill loop (the inlined-LCG equivalent measured 26 ms
+total, another ~3× on this phase).
+
+**Gates:** kernels differential corpus grew 16 cell-writing programs (PRNG,
+shared cells across two kernels, conditional/write-only/self-assign stores,
+-0/NaN round-trips, boolean/undefined stores declining, call-time TDZ
+throwing generically, cell-writing comparator/HOF-callback/self-recursion
+declining their tiers, the fill idiom) plus a structural pin
+(`cell_writing_functions_get_fn_kernels`); benchmark suite cross-checks
+green (all four runtimes agree on every workload); full suites green;
+clippy clean.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

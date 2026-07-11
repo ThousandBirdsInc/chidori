@@ -24,8 +24,8 @@ fn dump(proto: &chidori_js::bytecode::FuncProto, depth: usize, kernels: bool) {
         }
         if let Some(k) = &proto.fn_kernel {
             println!(
-                "{pad}  fn kernel: n_regs={} locals={:?}",
-                k.n_regs, k.locals
+                "{pad}  fn kernel: n_regs={} locals={:?} uv_writes={:?}",
+                k.n_regs, k.locals, k.uv_writes
             );
             for (i, op) in k.code.iter().enumerate() {
                 println!("{pad}    {i:4}  {op:?}");

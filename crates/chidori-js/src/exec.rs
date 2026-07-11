@@ -841,9 +841,12 @@ impl Vm {
                         ok = false;
                         break;
                     };
-                    // Number-returning, non-recursive, fully-supplied args,
-                    // canonical Math, Number upvalues — else stay generic.
+                    // Number-returning, non-recursive, no upvalue writes
+                    // (this path snapshots upvalues ONCE per activation and
+                    // never flushes), fully-supplied args, canonical Math,
+                    // Number upvalues — else stay generic.
                     let ck_ok = ck.rec.is_none()
+                        && ck.uv_writes.is_empty()
                         && ck
                             .code
                             .iter()
@@ -1556,8 +1559,10 @@ impl Vm {
     /// runs in unboxed registers with no frame at all. `None` = the entry
     /// guard declined (an op budget installed — per-op counts are observable;
     /// a trace sink active — it must see an enter/exit per call; a consumed
-    /// argument or captured upvalue not a `Number`; a monkeypatched `Math`) —
-    /// the caller proceeds down the ordinary frame path. `Some` is the call's
+    /// argument or captured upvalue not a `Number`; a monkeypatched `Math`;
+    /// a written cell aliasing another captured cell) — the caller proceeds
+    /// down the ordinary frame path. Cells the body writes (`uv_writes`)
+    /// buffer in registers and flush back on completion. `Some` is the call's
     /// exact result, bit-identical to the generic path by the loop-kernel
     /// argument (shared numeric cores, an op set closed over numbers, typed
     /// returns). Callers have already applied the depth guard, so the
@@ -1598,13 +1603,23 @@ impl Vm {
         if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
             return None;
         }
+        // Written cells (`uv_writes`) buffer in their registers and flush on
+        // completion (out-of-line: most kernels have no writes, and keeping
+        // this function small protects the LTO inlining of the hot paths).
+        if !k.uv_writes.is_empty() && uv_write_cells_alias(k, bf) {
+            return None;
+        }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
-        match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll) {
+        let ret = exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll);
+        if !k.uv_writes.is_empty() {
+            flush_uv_writes(k, bf, &regs);
+        }
+        match ret {
             Some(ret) => Some(Ok(ret)),
             None => {
-                // Interrupted on a back-edge: registers are pure scratch,
-                // nothing to write back on the unwind.
+                // Interrupted on a back-edge: latch the zero budget so a JS
+                // catch cannot resume execution.
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
             }
@@ -1627,8 +1642,10 @@ impl Vm {
     ///   matching the entry kernel's and every call site supplying at least
     ///   the resolved callee's consumed arguments.
     ///
-    /// Nothing inside a kernel can write globals or cells, so the entry
-    /// resolution holds for the whole activation. Depth mirrors the
+    /// Nothing inside a RECURSIVE kernel can write globals or cells
+    /// (upvalue-writing kernels decline this tier at translation and at
+    /// family resolution), so the entry resolution holds for the whole
+    /// activation. Depth mirrors the
     /// interpreter's limit; on overflow the activation is ABANDONED and
     /// `None` returned — sound because kernels are pure (registers only),
     /// and the caller's generic rerun then raises the spec RangeError from
@@ -2109,6 +2126,14 @@ impl Vm {
             }
             let f = funcs[wl].clone();
             let k = f.proto.fn_kernel.as_ref()?;
+            // No member may write cells: the windowed executor snapshots
+            // upvalues once per member and the family cache treats them as
+            // activation constants. (Recursive members can't have writes —
+            // translation declines — but a NON-recursive helper pulled in as
+            // a call target can.)
+            if !k.uv_writes.is_empty() {
+                return None;
+            }
             // Every member's Ret type must match the entry kernel's: a
             // mismatched value would land in a caller register of the wrong
             // static type. (Also rejects mixed-type non-recursive members.)
@@ -2309,7 +2334,10 @@ impl Vm {
         }
         {
             let k = bf.proto.fn_kernel.as_ref()?;
-            if k.rec.is_some() {
+            // No upvalue writes: the prepared paths snapshot upvalues per
+            // call (or once per sort) and never flush, so a cell-writing
+            // callback falls back to the generic `Vm::call` per element.
+            if k.rec.is_some() || !k.uv_writes.is_empty() {
                 return None;
             }
         }
@@ -7755,6 +7783,36 @@ fn writeback_kernel_props(
             )) => *value = Value::Number(regs[prop_base + i]),
             _ => unreachable!("kernel prop slot invariant"),
         }
+    }
+}
+
+/// Belt-and-braces alias check for a cell-writing function kernel
+/// ([`crate::bytecode::Kernel::uv_writes`]): distinct upvalue indices are
+/// distinct bindings by construction, but the buffered writes must never be
+/// able to diverge from the generic write-through order, so a written cell
+/// aliasing any other captured cell declines the call. Out of line to keep
+/// `run_fn_kernel` small (write-free kernels skip it entirely).
+#[inline(never)]
+fn uv_write_cells_alias(k: &crate::bytecode::Kernel, bf: &BytecodeFunction) -> bool {
+    k.uv_writes.iter().any(|&(_, u)| {
+        let cell = &bf.upvalues[u as usize];
+        k.locals.iter().any(|slot| {
+            matches!(slot, crate::bytecode::KSlot::Upvalue(u2)
+                if *u2 != u && Rc::ptr_eq(cell, &bf.upvalues[*u2 as usize]))
+        })
+    })
+}
+
+/// Flush a cell-writing kernel's written registers back to their cells, on
+/// BOTH completions. On return this is the generic path's final cell state.
+/// On an interrupt the registers hold every completed store (an upvalue
+/// register is written only by translated stores), so the flush leaves
+/// exactly the generic prefix state at that poll point — the same contract
+/// as the loop kernels' local write-back on the interrupt unwind.
+#[inline(never)]
+fn flush_uv_writes(k: &crate::bytecode::Kernel, bf: &BytecodeFunction, regs: &[f64; KWIN]) {
+    for &(r, u) in k.uv_writes.iter() {
+        *bf.upvalues[u as usize].borrow_mut() = Value::Number(regs[usize::from(r) & KWIN_MASK]);
     }
 }
 
