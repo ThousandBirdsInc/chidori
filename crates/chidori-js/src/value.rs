@@ -312,6 +312,17 @@ impl JsString {
         }
     }
 
+    /// The flat UTF-8 view of a well-formed string, FLATTENING a rope on
+    /// first use (the copy is cached in the rope node, so repeated calls —
+    /// a kernel's per-access reads — are O(1)). `None` for WTF-8 strings.
+    pub fn flatten_utf8(&self) -> Option<&str> {
+        match &self.0 {
+            Repr::Utf8(s, _) => Some(s),
+            Repr::Rope(_) => Some(self.as_str()),
+            Repr::Wtf8(_) => None,
+        }
+    }
+
     /// Concatenate, preserving code units. Two well-formed strings concatenate
     /// as plain UTF-8; otherwise we route through code units so a high+low
     /// surrogate straddling the boundary re-pairs into one astral code point.
@@ -978,7 +989,10 @@ pub enum Internal {
     /// expose collection and remain unsupported (determinism contract).
     WeakMap(crate::fxhash::FxIndexMap<MapKey, Value>),
     WeakSet(crate::fxhash::FxIndexMap<MapKey, ()>),
-    Promise(crate::vm::PromiseData),
+    /// Boxed: `PromiseData` is the largest inline payload (104 bytes) and
+    /// promises are allocation-rare next to plain objects — boxing it (and
+    /// `NamespaceData`) shrinks EVERY `ObjectData` by ~32 bytes.
+    Promise(Box<crate::vm::PromiseData>),
     Generator(crate::vm::GeneratorData),
     Date(f64),
     /// The `arguments` exotic object. For a MAPPED one (sloppy, simple
@@ -1002,7 +1016,7 @@ pub enum Internal {
     /// `import()` result): null prototype, non-extensible, exports exposed as
     /// live {writable:true, enumerable:true, configurable:false} data
     /// properties whose [[Set]] always fails and whose [[Delete]] refuses.
-    ModuleNamespace(NamespaceData),
+    ModuleNamespace(Box<NamespaceData>),
     /// A `Temporal.*` object. The spec arithmetic lives in `temporal_rs`; the
     /// slot holds the immutable backing value (no JS references, so the GC
     /// treats it as a leaf).

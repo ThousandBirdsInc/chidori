@@ -368,6 +368,10 @@ pub struct Vm {
     /// Pooled (caller, return-pc, dst, window) stack for
     /// `run_fn_kernel_rec`; parked empty.
     pub(crate) rec_calls: Vec<(u8, u16, u16, u32)>,
+    /// Pinned STRING bases for the active loop-kernel activation (mirrors
+    /// `kernel_objs`); cleared after every activation so the pool never
+    /// extends a string's lifetime.
+    pub(crate) kernel_strs: Vec<crate::value::JsString>,
     /// Cross-parse JSON object-key intern cache: repeated `JSON.parse` of
     /// same-shaped documents (the poll/roundtrip pattern) reuses one
     /// `Rc<str>` per distinct key instead of allocating it per parse. Pure
@@ -423,6 +427,7 @@ impl Vm {
             kernel_callees: Vec::new(),
             rec_families: Vec::new(),
             rec_calls: Vec::new(),
+            kernel_strs: Vec::new(),
             json_keys: std::collections::HashMap::default(),
             dummy_bf: Rc::new(BytecodeFunction {
                 proto: Rc::new(crate::bytecode::FuncProto::empty(

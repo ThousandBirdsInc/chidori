@@ -1152,7 +1152,7 @@ impl<'a> JsonParser<'a> {
         match self.bytes[self.pos] {
             b'{' => self.parse_object(vm),
             b'[' => self.parse_array(vm),
-            b'"' => Ok(Value::str(self.parse_string(vm)?)),
+            b'"' => Ok(Value::String(self.parse_string(vm)?)),
             b't' => self.parse_lit(vm, "true", Value::Bool(true)),
             b'f' => self.parse_lit(vm, "false", Value::Bool(false)),
             b'n' => self.parse_lit(vm, "null", Value::Null),
@@ -1218,7 +1218,7 @@ impl<'a> JsonParser<'a> {
             .map(Value::Number)
             .map_err(|_| vm.throw_syntax("Invalid number in JSON"))
     }
-    fn parse_string(&mut self, vm: &mut Vm) -> Result<String, Value> {
+    fn parse_string(&mut self, vm: &mut Vm) -> Result<JsString, Value> {
         self.pos += 1; // opening quote
                        // Fast path: a string with no escapes and no control characters —
                        // the overwhelmingly common case — is ONE slice copy instead of
@@ -1230,7 +1230,9 @@ impl<'a> JsonParser<'a> {
             match self.bytes[i] {
                 b'"' => {
                     self.pos = i + 1;
-                    return Ok(self.src[start..i].to_string());
+                    // One allocation: straight from the source slice into the
+                    // Rc backing (the old String round-trip copied twice).
+                    return Ok(JsString::new(&self.src[start..i]));
                 }
                 b'\\' | 0x00..=0x1f => break,
                 _ => i += 1,
@@ -1245,7 +1247,7 @@ impl<'a> JsonParser<'a> {
             match c {
                 b'"' => {
                     self.pos += 1;
-                    return Ok(s);
+                    return Ok(JsString::from(s));
                 }
                 b'\\' => {
                     self.pos += 1;
@@ -1387,7 +1389,7 @@ impl<'a> JsonParser<'a> {
                 _ => i += 1,
             }
         }
-        Ok(PropertyKey::str(self.parse_string(vm)?))
+        Ok(PropertyKey::Str(self.parse_string(vm)?))
     }
 
     fn parse_object(&mut self, vm: &mut Vm) -> Result<Value, Value> {

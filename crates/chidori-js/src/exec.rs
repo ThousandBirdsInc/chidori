@@ -487,6 +487,29 @@ impl Vm {
         )
     }
 
+    /// `KOp::CharCodeAt` entry guard: `String.prototype.charCodeAt` must
+    /// still be a plain data property holding the canonical builtin (a
+    /// patched/replaced/accessor'd method must run generically, observably).
+    /// A string primitive receiver can carry no own shadow, and nothing
+    /// inside a kernel can write props, so one entry check covers the
+    /// activation.
+    fn kernel_char_code_ok(&self) -> bool {
+        let Some(canon) = &self.realm.string_char_code_at else {
+            return false;
+        };
+        matches!(
+            self.realm
+                .string_proto
+                .borrow()
+                .props
+                .get(&crate::value::StrKeyRef("charCodeAt")),
+            Some(Property {
+                kind: PropertyKind::Data { value: Value::Object(o), .. },
+                ..
+            }) if o.ptr_eq(canon)
+        )
+    }
+
     /// Execute the typed loop kernel at `Op::LoopKernel(idx)` (see
     /// `kernel.rs` for the model). Runs only when per-op accounting is off
     /// (no op budget), every mapped numeric local holds a `Number`, and every
@@ -557,6 +580,24 @@ impl Vm {
             if !matches!(frame.locals[l as usize], Value::Object(_)) {
                 return self.step(frame, &k.fallback);
             }
+        }
+        // Pinned STRING bases: each sslot local must hold a FLAT ASCII string
+        // (unit == byte, so `StrLen`/`CharCodeAt` are O(1) and total); a
+        // `charCodeAt` region additionally needs the canonical method
+        // resolution. Checked before any pooled state is taken; the strings
+        // themselves are cached below alongside the object bases.
+        for &l in k.sslots.iter() {
+            let ok = matches!(
+                &frame.locals[l as usize],
+                Value::String(st)
+                    if matches!(st.flatten_utf8(), Some(f) if f.len() == st.len_utf16())
+            );
+            if !ok {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        if k.uses_char_code && !self.kernel_char_code_ok() {
+            return self.step(frame, &k.fallback);
         }
         // A `StoreElem` may CREATE an element (hole fill / exact append), and
         // the spec's OrdinarySet consults the prototype chain when the own
@@ -737,6 +778,14 @@ impl Vm {
                 objs.push(o.clone());
             }
         }
+        // Pinned strings (validated above; immutable, so no re-checks exist).
+        let mut sstrs = std::mem::take(&mut self.kernel_strs);
+        sstrs.clear();
+        for &l in k.sslots.iter() {
+            if let Value::String(st) = &frame.locals[l as usize] {
+                sstrs.push(st.clone());
+            }
+        }
         // Prop registers (the tail of the register file): load each resolved
         // slot's current value. The guard above proved every one a Number.
         if !k.props_used.is_empty() {
@@ -822,6 +871,8 @@ impl Vm {
                 self.kernel_regs = regs;
                 objs.clear();
                 self.kernel_objs = objs;
+                sstrs.clear();
+                self.kernel_strs = sstrs;
                 self.kernel_prop_slots = prop_slots;
                 callee_bfs.clear();
                 self.kernel_callees = callee_bfs;
@@ -884,6 +935,8 @@ impl Vm {
                                     self.kernel_regs = regs;
                                     objs.clear();
                                     self.kernel_objs = objs;
+                                    sstrs.clear();
+                                    self.kernel_strs = sstrs;
                                     self.kernel_prop_slots = prop_slots;
                                     callee_bfs.clear();
                                     self.kernel_callees = callee_bfs;
@@ -1365,6 +1418,27 @@ impl Vm {
                     );
                     pc += 1;
                 }
+                // Pinned-string reads: TOTAL on the entry-guarded flat-ASCII
+                // string (unit == byte). `StrLen` is an activation constant;
+                // `CharCodeAt` computes ToIntegerOrInfinity (NaN→0, truncate
+                // toward zero, saturating casts) and the out-of-range NaN
+                // exactly — no bail exists.
+                KOp::StrLen { dst, str } => {
+                    w[dst as usize & KWIN_MASK] = sstrs[str as usize].len_utf16() as f64;
+                }
+                KOp::CharCodeAt { dst, str, idx } => {
+                    let i = w[idx as usize & KWIN_MASK];
+                    let bytes = sstrs[str as usize]
+                        .flatten_utf8()
+                        .expect("entry-guarded flat ASCII")
+                        .as_bytes();
+                    let p = if i.is_nan() { 0i64 } else { i as i64 };
+                    w[dst as usize & KWIN_MASK] =
+                        match usize::try_from(p).ok().and_then(|p| bytes.get(p)) {
+                            Some(&b) => b as f64,
+                            None => f64::NAN,
+                        };
+                }
                 // A pinned-closure call: copy the arguments into the
                 // callee's window and run its (guarded) kernel inline.
                 KOp::CallKernel {
@@ -1404,6 +1478,8 @@ impl Vm {
                         self.kernel_regs = regs;
                         objs.clear();
                         self.kernel_objs = objs;
+                        sstrs.clear();
+                        self.kernel_strs = sstrs;
                         self.kernel_prop_slots = prop_slots;
                         callee_bfs.clear();
                         self.kernel_callees = callee_bfs;
@@ -1457,11 +1533,19 @@ impl Vm {
                 crate::bytecode::KShapeSlot::ArrayPopFn => frame.stack.push(Value::Object(
                     self.realm.array_pop.clone().expect("guarded"),
                 )),
+                crate::bytecode::KShapeSlot::Str(sl) => {
+                    frame.stack.push(Value::String(sstrs[*sl as usize].clone()))
+                }
+                crate::bytecode::KShapeSlot::CharCodeFn => frame.stack.push(Value::Object(
+                    self.realm.string_char_code_at.clone().expect("guarded"),
+                )),
             }
         }
         self.kernel_regs = regs;
         objs.clear();
         self.kernel_objs = objs;
+        sstrs.clear();
+        self.kernel_strs = sstrs;
         self.kernel_prop_slots = prop_slots;
         callee_bfs.clear();
         self.kernel_callees = callee_bfs;
@@ -1829,6 +1913,8 @@ impl Vm {
                         | KOp::LoadElem { .. }
                         | KOp::StoreElem { .. }
                         | KOp::LoadLen { .. }
+                        | KOp::StrLen { .. }
+                        | KOp::CharCodeAt { .. }
                         | KOp::LoadElemAdd { .. }
                         | KOp::LoadElemArith { .. }
                         | KOp::LenBrCmp { .. }
@@ -7858,6 +7944,8 @@ fn exec_fn_kernel_code(
             | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
+            | KOp::StrLen { .. }
+            | KOp::CharCodeAt { .. }
             | KOp::LoadElemAdd { .. }
             | KOp::LoadElemArith { .. }
             | KOp::LenBrCmp { .. }
@@ -8048,6 +8136,8 @@ fn run_callee_window(
             | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
+            | KOp::StrLen { .. }
+            | KOp::CharCodeAt { .. }
             | KOp::LoadElemAdd { .. }
             | KOp::LoadElemArith { .. }
             | KOp::LenBrCmp { .. }

@@ -1088,6 +1088,18 @@ pub enum KOp {
         a2: u16,
         b2: u16,
     },
+    /// `regs[dst] = <utf16 length>` of the pinned STRING in string slot
+    /// `str`. TOTAL (no bail): the entry guard proved the slot holds a flat
+    /// ASCII string, strings are immutable, and the local is pinned — the
+    /// length is an activation constant.
+    StrLen { dst: u16, str: u16 },
+    /// `regs[dst] = charCodeAt(regs[idx])` over the pinned ASCII string in
+    /// string slot `str`. TOTAL (no bail): the index conversion
+    /// (ToIntegerOrInfinity — NaN→0, truncate toward zero, saturating) and
+    /// the out-of-range NaN result are computed exactly in-kernel; the entry
+    /// guard proved the receiver a flat ASCII string (unit == byte) and the
+    /// canonical `String.prototype.charCodeAt` resolution.
+    CharCodeAt { dst: u16, str: u16, idx: u16 },
     /// SUPERINSTRUCTION: `LoadElem` followed by `Arith` — the
     /// `d += a[i] * b[i]` dot-product shape's second load feeding its
     /// multiply (which the `(Arith, Add)` fusion then folds separately).
@@ -1351,6 +1363,11 @@ pub enum KShapeSlot {
     Obj(u16),
     MathObj,
     MathFn(KMath),
+    /// The pinned string in string slot `s` (cached at kernel entry).
+    Str(u16),
+    /// The canonical `String.prototype.charCodeAt` function object (entry
+    /// guard proved the live resolution IS the canonical — like `MathFn`).
+    CharCodeFn,
 }
 
 /// The `Math` methods the loop kernels can execute directly. Every kind maps
@@ -1461,6 +1478,15 @@ pub struct Kernel {
     /// guard requires each to hold an object; per-access checks do the rest.
     /// Disjoint from `locals`, and never stored to inside the region.
     pub oslots: Box<[u32]>,
+    /// `frame.locals` indices of STRING BASES (`s` in `s.charCodeAt(i)` /
+    /// `s.length`): string slot `n` caches that local's `JsString` at kernel
+    /// entry. The guard requires each to hold a FLAT ASCII string (unit ==
+    /// byte, so every read is O(1)); strings are immutable and the local is
+    /// pinned, so no per-access re-checks exist. Disjoint from `locals`.
+    pub sslots: Box<[u32]>,
+    /// Whether the region calls `charCodeAt` (the entry guard then
+    /// identity-checks the canonical `String.prototype.charCodeAt`).
+    pub uses_char_code: bool,
     /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
     pub shapes: Box<[Box<[KShapeSlot]>]>,
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),

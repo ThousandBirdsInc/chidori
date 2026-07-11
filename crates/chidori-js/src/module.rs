@@ -542,9 +542,9 @@ impl Vm {
         // (filled below by the outermost call) instead of recursing forever.
         let obj = self.alloc(crate::value::ObjectData::new(
             None,
-            crate::value::Internal::ModuleNamespace(crate::value::NamespaceData {
+            crate::value::Internal::ModuleNamespace(Box::new(crate::value::NamespaceData {
                 exports: indexmap::IndexMap::new(),
-            }),
+            })),
         ));
         module.borrow_mut().namespace = Some(Value::Object(obj.clone()));
         let mut names = self.exported_names(registry, module, &mut HashSet::new())?;

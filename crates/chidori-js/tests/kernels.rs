@@ -500,6 +500,27 @@ const CORPUS: &[&str] = &[
     "function h2(n) { return n <= 0 ? 0 : Math.max(n % 7, h2(n - 1)); } console.log(h2(40));",
     // Captured numeric upvalue inside a recursive const arrow.
     "const LIM = 3; const f2 = (n) => (n <= LIM ? n : f2(n - 2) + 1); console.log(f2(21));",
+    // ---- pinned-string charCodeAt/length (KOp::StrLen / KOp::CharCodeAt) ----
+    // The canonical tokenizer hash loop over a flat ASCII string.
+    "const s = \"hello world, kernel strings!\"; let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) % 1000000007; } console.log(h);",
+    // Rope-built accumulator (flattened once at kernel entry).
+    "let s = \"\"; for (let i = 0; i < 200; i++) s += \"ab\"; let h = 0; for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); console.log(h, s.length);",
+    // ToIntegerOrInfinity edges computed in-kernel: negative, OOB, NaN,
+    // fractional, negative-fraction indices.
+    "const s = \"abc\"; let out = \"\"; for (let i = -2; i < 6; i++) out += s.charCodeAt(i + 0.5) + \",\"; console.log(out, s.charCodeAt(NaN));",
+    // Non-ASCII receiver: the entry guard declines, the loop runs generic.
+    "const s = \"héllo wörld\"; let h = 0; for (let i = 0; i < s.length; i++) h = h * 3 + s.charCodeAt(i); console.log(h, s.length);",
+    // Astral (surrogate pair) receiver: WTF-16 code units via the generic path.
+    "const s = \"x𝒳y\"; let h = 0; for (let i = 0; i < s.length; i++) h = h * 7 + s.charCodeAt(i); console.log(h, s.length);",
+    // Monkeypatched charCodeAt: canonical check declines, the patch runs.
+    "const orig = String.prototype.charCodeAt; String.prototype.charCodeAt = function () { return 42; }; const s = \"abcdef\"; let h = 0; for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); String.prototype.charCodeAt = orig; console.log(h);",
+    // String local reassigned between activations (re-guarded each entry).
+    "let t = \"abc\"; let h = 0; for (let r = 0; r < 3; r++) { for (let i = 0; i < t.length; i++) h += t.charCodeAt(i); t = t + \"z\"; } console.log(h);",
+    // Non-string in the local: guard declines to the generic path (TypeError
+    // class behavior must be identical).
+    "let s = \"ok\"; let h = 0; for (let r = 0; r < 2; r++) { for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); s = \"next\"; } console.log(h);",
+    // charCodeAt result feeding arithmetic, compares, and a stored boolean.
+    "const s = \"mixed13chars\"; let digits = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); const isd = c >= 48 && c <= 57; if (isd) digits++; } console.log(digits);",
 ];
 
 #[test]
@@ -1039,5 +1060,38 @@ fn kernel_register_cap() {
         (threw_on, &con_on, &err_on),
         (threw_off, &con_off, &err_off),
         "cap-boundary loop must behave identically"
+    );
+}
+
+/// The canonical charCodeAt scan loop actually kernelizes with the
+/// pinned-string ops (pins the string tier).
+#[test]
+fn char_code_loops_get_kernels() {
+    fn kernel_ops(src: &str) -> Vec<KOp> {
+        fn collect(p: &FuncProto, out: &mut Vec<KOp>) {
+            for k in &p.kernels {
+                out.extend(k.code.iter().copied());
+            }
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    collect(f, out);
+                }
+            }
+        }
+        let proto = compile_script(src).expect("compiles");
+        let mut out = Vec::new();
+        collect(&proto, &mut out);
+        out
+    }
+    let ops = kernel_ops(
+        "function f(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) % 1000000007; } return h; }",
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::CharCodeAt { .. })),
+        "charCodeAt scan must kernelize: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::StrLen { .. })),
+        "string length must use StrLen: {ops:?}"
     );
 }

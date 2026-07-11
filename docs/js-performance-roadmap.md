@@ -1496,6 +1496,67 @@ the kernels corpus caught a real bug during development (the fused
 by teaching the guard the fused form); Test262 gate green (0 regressions,
 99.11%); clippy clean across the workspace.
 
+## 6.13 Pinned-string kernels (charCodeAt/length) + allocation diet
+(landed 2026-07-11, follow-up round)
+
+Round 2 on the §6.12 baseline: the biggest remaining per-workload gap with a
+clear shape was string_scan (~6× behind bun — the tokenizer idiom
+`for (i = 0; i < s.length; i++) s.charCodeAt(i)`, §6.5.1 candidate (a),
+unlocked by §6.7's O(1) ASCII accessors), plus a first pass at the
+allocation costs that dominate json_roundtrip.
+
+1. **Pinned STRING bases in loop kernels** (`Kernel::sslots`,
+   `KOp::StrLen`, `KOp::CharCodeAt`). A local used as `s.charCodeAt(i)` /
+   `s.length` inside a kernel region is discovered (fixpoint, like array
+   bases; string discovery WINS over a same-local array-base guess) and
+   PINNED: the entry guard requires a FLAT ASCII string — flattening a
+   rope-built accumulator once, cached in the rope node — and, for
+   `charCodeAt`, the canonical `String.prototype.charCodeAt` resolution
+   (pinned at install like `Array.prototype.push`; a monkeypatched method
+   runs generically, observably). Both ops are then TOTAL — no bail path
+   exists: strings are immutable and the local is pinned, so `StrLen` is an
+   activation constant, and `CharCodeAt` computes ToIntegerOrInfinity
+   (NaN→0, truncate-toward-zero via saturating casts — no libm) and the
+   out-of-range NaN exactly as the builtin does. Non-ASCII/WTF-8 receivers
+   decline the activation into the generic loop.
+2. **Allocation diet**: `Internal::Promise`/`Internal::ModuleNamespace`
+   carried the enum's largest payloads inline (104/72 bytes) — boxing the
+   two cold variants shrinks `Internal` 104→64 and **every `ObjectData`
+   184→144 bytes** (~20% less memory traffic per object allocation,
+   json_roundtrip's dominant cost). JSON string values now parse straight
+   from the source slice into the `Rc` backing (one allocation instead of
+   the String round-trip's two).
+3. Not taken: a `Vec<[f64; KWIN]>` window pool for the recursive executor
+   measured WORSE on instructions than §6.12's slice+`try_into` windows
+   (fib 695→713 M) and was reverted — fib's residual +2.8% stands as the
+   accepted price of the recursion tier's masked windows. An ObjectData
+   pool/arena (the real json lever) needs a recycle point for Rc-dropped
+   objects — a GC-design change, still tracked.
+
+### 6.13.1 Measured (callgrind, whole workload; wall best-of-5 plain release)
+
+| workload | §6.12 baseline | after | Δ instructions | wall |
+| --- | ---: | ---: | ---: | ---: |
+| string_scan | 351.4 M | 145.2 M | **−58.7%** | 46 → 21 ms |
+| json_roundtrip | 1.186 G | 1.176 G | −0.8% | 165 → 144 ms |
+| mixed_helpers | 2.324 G | 2.318 G | −0.3% | 315 → 273 ms |
+| fib_recursive | 695.3 M | 683.2 M | −1.7% | — |
+| string_build / others | — | — | unchanged | — |
+
+The wall movement beyond the instruction deltas on json/mixed is the
+allocation diet (smaller objects, one less copy per parsed string) — cache
+effects callgrind cannot see; plain-release layout noise caveats (§6.12)
+apply, but the direction is consistent across repeated interleaved runs.
+
+**Gates:** kernels differential corpus grew 9 pinned-string programs
+(rope-built receivers, ToIntegerOrInfinity edges incl. NaN/fractional/
+negative/OOB indices, non-ASCII and astral receivers declining to generic,
+monkeypatched `charCodeAt` observed, mid-program reassignment re-guarded,
+results feeding arithmetic/booleans) plus a structural pin
+(`char_code_loops_get_kernels`); a 7-case differential vs Node 22
+byte-identical; full suites green for both crates; Test262 gate green
+(0 regressions); clippy clean.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —
