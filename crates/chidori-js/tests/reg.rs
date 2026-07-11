@@ -56,6 +56,12 @@ const CORPUS: &[&str] = &[
     "const obj = { v: 2, m() { return this.v; }, chain() { return this.m() + this.m(); } }; console.log(obj.chain());",
     // Swap without the fusion window (computed method key).
     "const k = 'm'; const o2 = { m(v) { return v * 2; } }; console.log(o2[k](21));",
+    // ZERO-arg call whose argument window starts one past every touched
+    // register (Test262 S13.2.2_A10 shape): `at` may exceed `num_regs`, so
+    // the executor must not slice `locals[at..at]` (pre-existing panic,
+    // masked while budgeted runs took the stack tier).
+    "function FACTORY() { this.id = 0; this.func = function () { return 5; }; this.id = this.func(); } \
+     console.log(new FACTORY().id);",
     // Deeply nested call expressions (argument ranges stay contiguous).
     "function add(a, b) { return a + b; } console.log(add(add(1, add(2, 3)), add(add(4, 5), 6)));",
 
@@ -297,10 +303,11 @@ fn reg_depth_overflow_matches_stack() {
         .expect("no panic");
 }
 
-/// An installed op budget must keep per-stack-op accounting EXACT: the
-/// register tier declines and the budgeted run terminates with the same
-/// uncatchable RangeError either way — including for call-heavy programs
-/// whose callees carry register programs.
+/// An installed op budget must keep per-stack-op accounting EXACT. The
+/// register tier now runs UNDER the budget (`RegProto::costs` charges each
+/// register op its exact stack-op units), so a budgeted run terminates with
+/// the same uncatchable RangeError and the same drain on both compiles —
+/// including for call-heavy programs whose callees carry register programs.
 #[test]
 fn op_budget_stays_exact_with_reg_protos() {
     let src =
@@ -322,6 +329,105 @@ fn op_budget_stays_exact_with_reg_protos() {
         // Identical budget consumption on both compiles: the remaining
         // budget after the abort must match exactly.
         assert_eq!(engine.vm.op_budget, Some(0), "budget drained (regs={regs})");
+    }
+}
+
+/// THE budget gate for the register tier: for EVERY budget value from 0 to
+/// past the program's total cost, a budgeted run must be observably
+/// IDENTICAL on both compiles — same console output, same completion
+/// (success or error message), same remaining budget. This pins both the
+/// exact-drain property (completed runs, the tail of the sweep) and the
+/// exhaustion BOUNDARY: the uncatchable throw fires between the same two
+/// observable effects on both tiers, including inside the fused
+/// `Dup; GetProp; Swap` method-call window, whose logging getter must run
+/// iff the stack tier's per-op check would have reached the `GetProp` —
+/// even when the budget dies exactly at the window's trailing `Swap`.
+#[test]
+fn op_budget_sweep_differential() {
+    let src = r#"
+        function tag(x) { console.log("t" + x); return x; }
+        const o = {
+            n: 40,
+            get m() { console.log("getter"); return function () { return this.n; }; },
+        };
+        let s = 0;
+        for (let i = 0; i < 4; i++) {
+            s += i % 2 ? tag(i) : i;
+            console.log("i" + i + ":" + s);
+        }
+        s += o.m();
+        const t = s > 3 ? "hi" : "lo";
+        try { null.x; } catch (e) { console.log("caught"); }
+        console.log("end:" + t + s);
+    "#;
+    let protos = [
+        Rc::new(compile_script_regs(src, false).expect("compiles")),
+        Rc::new(compile_script_regs(src, true).expect("compiles")),
+    ];
+    let run_budgeted = |proto: &Rc<FuncProto>, k: u64| {
+        let mut engine = Engine::new();
+        engine.vm.op_budget = Some(k);
+        let func = engine.vm.make_closure(proto.clone(), Vec::new());
+        let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
+        let err = match res {
+            Ok(_) => String::new(),
+            Err(e) => engine.vm.error_to_string(&e),
+        };
+        (engine.console().to_vec(), err, engine.vm.op_budget)
+    };
+    // Total cost measured on the stack tier; the sweep's tail (k >= total)
+    // asserts completed runs drain identically.
+    let big = 1_000_000u64;
+    let (_, err, left) = run_budgeted(&protos[0], big);
+    assert!(err.is_empty(), "must complete under a large budget: {err}");
+    let total = big - left.expect("budget still installed");
+    assert!(total > 50 && total < 10_000, "sane sweep bound: {total}");
+    for k in 0..=total + 2 {
+        let stack = run_budgeted(&protos[0], k);
+        let reg = run_budgeted(&protos[1], k);
+        assert_eq!(stack, reg, "budget {k} diverged");
+    }
+}
+
+/// Budget differential over the WHOLE corpus at strategic budget values
+/// (start, midpoints, and the exhaustion/completion boundary): every
+/// translated op shape must charge exactly. A full 0..=total sweep per
+/// program would dominate CI time; the boundary probes catch per-op cost
+/// errors (they shift `total`) and the midpoints catch divergent
+/// exhaustion behavior.
+#[test]
+fn op_budget_corpus_differential() {
+    for src in CORPUS {
+        let protos = [
+            Rc::new(compile_script_regs(src, false).expect("compiles")),
+            Rc::new(compile_script_regs(src, true).expect("compiles")),
+        ];
+        let run_budgeted = |proto: &Rc<FuncProto>, k: u64| {
+            let mut engine = Engine::new();
+            engine.vm.op_budget = Some(k);
+            let func = engine.vm.make_closure(proto.clone(), Vec::new());
+            let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
+            let _ = engine.vm.run_jobs_until_blocked();
+            let err = match res {
+                Ok(_) => String::new(),
+                Err(e) => engine.vm.error_to_string(&e),
+            };
+            (engine.console().to_vec(), err, engine.vm.op_budget)
+        };
+        let big = 50_000_000u64;
+        let (_, _, left) = run_budgeted(&protos[0], big);
+        let total = big - left.expect("budget still installed");
+        let mut probes = vec![0, 1, 2, total / 3, total / 2, 2 * total / 3];
+        for d in 0..=4 {
+            probes.push((total + 2).saturating_sub(d));
+        }
+        probes.sort_unstable();
+        probes.dedup();
+        for k in probes {
+            let stack = run_budgeted(&protos[0], k);
+            let reg = run_budgeted(&protos[1], k);
+            assert_eq!(stack, reg, "budget {k} diverged on: {src}");
+        }
     }
 }
 

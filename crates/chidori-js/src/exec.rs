@@ -59,6 +59,55 @@ enum Ctl {
     GeneratorStart,
 }
 
+/// One slot-verified global identity check for a cached [`RecFamily`]:
+/// `globals.props` slot `slot` must still carry `key` as a plain data
+/// property holding the very closure `funcs[func]`. Insertion slots are
+/// stable under value writes and appends, so a hit costs an indexed read +
+/// two pointer compares — no hashing; a restructured table or a rebound
+/// name fails the key/identity match and the family re-resolves from
+/// scratch (today's full path).
+pub(crate) struct RecGlobalCheck {
+    key: PropertyKey,
+    slot: u32,
+    func: u8,
+}
+
+/// A resolved recursion FAMILY for the windowed recursive-kernel executor
+/// ([`Vm::run_fn_kernel_rec`]), cached on the Vm keyed by the entry
+/// closure's identity (`funcs[0]`). Everything here is a pure function of
+/// the member closures (immutable protos) plus the recorded identity
+/// checks, so a validated hit skips resolution entirely: the per-activation
+/// cost drops from half a dozen table allocations + O(code) scans per
+/// member to O(members) pointer compares. Holding member closures alive
+/// across activations is the same retention class as the prototype-holder
+/// inline caches ([`crate::bytecode::IcEntry`]); the cache is bounded and
+/// eviction is only ever a perf event, never observable.
+pub(crate) struct RecFamily {
+    /// The family members; `funcs[0]` is the entry closure (cache key).
+    funcs: Vec<Rc<BytecodeFunction>>,
+    /// `callee_map[j][c]` = `funcs` index for member `j`'s `SelfCall`
+    /// callee `c` (`c = 0` is `j` itself; `c = 1 + i` is `rec.globals[i]`).
+    callee_map: Vec<Vec<u8>>,
+    /// Per-member register-window size.
+    n_regs: Vec<usize>,
+    /// Per-member (register, argument index) entry loads.
+    arg_slots: Vec<Vec<(usize, usize)>>,
+    /// Per-member (register, upvalue index, snapshot) — the VALUE is
+    /// refreshed on every activation (cells can change between calls, never
+    /// during one).
+    uv_snaps: Vec<Vec<(usize, u32, f64)>>,
+    /// Every global binding the family's guard depends on.
+    global_checks: Vec<RecGlobalCheck>,
+    /// (member, upvalue index) self-references: the cell must hold that
+    /// member's own closure.
+    upval_self_checks: Vec<(u8, u32)>,
+    /// Members whose kernels use `Math` intrinsics (canonicals re-verified
+    /// per activation).
+    math_members: Vec<u8>,
+    /// The family's uniform `Ret` register type.
+    ret_bool: bool,
+}
+
 impl Vm {
     // =====================================================================
     // Calling
@@ -647,9 +696,15 @@ impl Vm {
         // kernels never nest at runtime). The base objects are pinned for the
         // whole activation — sound because stores to base LOCALS inside the
         // region are rejected at translation.
+        // The buffer is GROW-ONLY across activations: stale values from a
+        // previous activation are unreadable by construction (every mapped
+        // slot is loaded below; stack-temp registers are written before any
+        // read by the virtual-stack discipline), so re-zeroing would be pure
+        // memset tax.
         let mut regs = std::mem::take(&mut self.kernel_regs);
-        regs.clear();
-        regs.resize(k.n_regs as usize, 0.0);
+        if regs.len() < k.n_regs as usize {
+            regs.resize(k.n_regs as usize, 0.0);
+        }
         for (r, slot) in k.locals.iter().enumerate() {
             let v = match slot {
                 crate::bytecode::KSlot::Local(l) => frame.locals[*l as usize].clone(),
@@ -768,8 +823,11 @@ impl Vm {
             }
             // Extend the register file with the callee windows and load each
             // window's upvalue snapshot ONCE (identities are pinned; callee
-            // code never writes an upvalue register).
-            regs.resize(win, 0.0);
+            // code never writes an upvalue register). Grow-only: the buffer
+            // may already be longer than this activation needs.
+            if regs.len() < win {
+                regs.resize(win, 0.0);
+            }
             for (bf, wb) in callee_bfs.iter() {
                 let ck = bf.proto.fn_kernel.as_ref().expect("guarded");
                 for (r, slot) in ck.locals.iter().enumerate() {
@@ -1249,9 +1307,13 @@ impl Vm {
         if k.rec.is_some() {
             return self.run_fn_kernel_rec(bf, args);
         }
+        // Grow-only across activations (see `run_kernel_op_impl`): stale
+        // values are unreadable — args/upvalues load below, internal locals
+        // are store-before-read by translation proof.
         let mut regs = std::mem::take(&mut self.kernel_regs);
-        regs.clear();
-        regs.resize(k.n_regs as usize, 0.0);
+        if regs.len() < k.n_regs as usize {
+            regs.resize(k.n_regs as usize, 0.0);
+        }
         for (r, slot) in k.locals.iter().enumerate() {
             match slot {
                 crate::bytecode::KSlot::Arg(a) => match args.get(*a as usize) {
@@ -1317,6 +1379,16 @@ impl Vm {
     /// `None` returned — sound because kernels are pure (registers only),
     /// and the caller's generic rerun then raises the spec RangeError from
     /// the exact frame it belongs to.
+    ///
+    /// The resolved family is CACHED ([`RecFamily`], keyed by the entry
+    /// closure's identity): resolution allocates half a dozen tables and
+    /// walks every member's code, which dominated shallow recursions
+    /// (isEven-class) when paid per outer call. A hit re-verifies only the
+    /// dynamic facts — recorded global slots (key-verified, no hashing),
+    /// upvalue self-cells, canonical `Math` — and re-snapshots upvalue
+    /// values; any failure drops the entry and re-resolves from scratch,
+    /// which is exactly the uncached behavior. Hit or miss is therefore
+    /// unobservable: same declines, same results.
     fn run_fn_kernel_rec(
         &mut self,
         bf: &Rc<BytecodeFunction>,
@@ -1324,187 +1396,70 @@ impl Vm {
     ) -> Option<Result<Value, Value>> {
         let k0 = bf.proto.fn_kernel.as_ref()?;
         k0.rec.as_deref()?;
-        let ret_bool = k0.ret_bool;
 
-        // --- Resolve the recursion family (funcs[0] = the invoked closure).
-        let mut funcs: Vec<Rc<BytecodeFunction>> = vec![bf.clone()];
-        // callee_map[j][c] = funcs index for member j's SelfCall callee c
-        // (c = 0 is j itself; c = 1 + i is j's rec.globals[i]).
-        let mut callee_map: Vec<Vec<u8>> = Vec::new();
-        let mut wl = 0usize;
-        while wl < funcs.len() {
-            if funcs.len() > 8 {
-                return None;
-            }
-            let f = funcs[wl].clone();
-            let k = f.proto.fn_kernel.as_ref()?;
-            // Every member's Ret type must match the entry kernel's: a
-            // mismatched value would land in a caller register of the wrong
-            // static type. (Also rejects mixed-type non-recursive members.)
-            if k.code
-                .iter()
-                .any(|op| matches!(op, KOp::Ret { boolean, .. } if *boolean != ret_bool))
-            {
-                return None;
-            }
-            // Self references must hold for THIS member's closure.
-            if let Some(rec) = k.rec.as_deref() {
-                for r in rec.self_refs.iter() {
-                    let ok = match r {
-                        crate::bytecode::SelfRefKind::Global(name) => {
-                            let g = self.realm.global.borrow();
-                            matches!(
-                                g.props.get(&PropertyKey::str(name)),
-                                Some(Property {
-                                    kind: PropertyKind::Data { value: Value::Object(o), .. },
-                                    ..
-                                }) if matches!(
-                                    &o.borrow().internal,
-                                    Internal::Function(FunctionInner::Bytecode(bf2))
-                                        if Rc::ptr_eq(bf2, &f)
-                                )
-                            )
-                        }
-                        crate::bytecode::SelfRefKind::Upvalue(u) => {
-                            let cell = f.upvalues.get(*u as usize)?;
-                            matches!(
-                                &*cell.borrow(),
-                                Value::Object(o) if matches!(
-                                    &o.borrow().internal,
-                                    Internal::Function(FunctionInner::Bytecode(bf2))
-                                        if Rc::ptr_eq(bf2, &f)
-                                )
-                            )
-                        }
-                    };
-                    if !ok {
-                        return None;
-                    }
-                }
-            }
-            if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
-                return None;
-            }
-            // Resolve this member's mutual-recursion partners.
-            let mut cmap: Vec<u8> = vec![wl as u8];
-            if let Some(rec) = k.rec.as_deref() {
-                for name in rec.globals.iter() {
-                    let bf2 = {
-                        let g = self.realm.global.borrow();
-                        match g.props.get(&PropertyKey::str(name)) {
-                            Some(Property {
-                                kind:
-                                    PropertyKind::Data {
-                                        value: Value::Object(o),
-                                        ..
-                                    },
-                                ..
-                            }) => match &o.borrow().internal {
-                                Internal::Function(FunctionInner::Bytecode(bf2))
-                                    if !bf2.is_class_ctor
-                                        && !bf2.proto.kind.is_generator()
-                                        && !bf2.proto.kind.is_async() =>
-                                {
-                                    bf2.clone()
-                                }
-                                _ => return None,
-                            },
-                            _ => return None,
-                        }
-                    };
-                    bf2.proto.fn_kernel.as_ref()?;
-                    let idx = match funcs.iter().position(|x| Rc::ptr_eq(x, &bf2)) {
-                        Some(i) => i,
-                        None => {
-                            funcs.push(bf2);
-                            funcs.len() - 1
-                        }
-                    };
-                    cmap.push(u8::try_from(idx).ok()?);
-                }
-            }
-            callee_map.push(cmap);
-            wl += 1;
-        }
+        let fam = match self.take_rec_family(bf) {
+            Some(f) => f,
+            None => self.build_rec_family(bf)?,
+        };
+        let ret_bool = fam.ret_bool;
 
-        // --- Per-member tables: code, window size, arg slots, upvalue
-        // snapshots (a member's upvalue cells are activation constants:
-        // nothing inside a kernel can write a cell). Then cross-check every
-        // call site's argc against its RESOLVED callee's consumption.
-        let n = funcs.len();
-        let mut n_regs: Vec<usize> = Vec::with_capacity(n);
-        let mut arg_slots: Vec<Vec<(usize, usize)>> = Vec::with_capacity(n);
-        let mut uv_snaps: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
-        for f in funcs.iter() {
-            let k = f.proto.fn_kernel.as_ref()?;
-            n_regs.push(k.n_regs as usize);
-            let mut aslots = Vec::new();
-            let mut uvs = Vec::new();
-            for (r, slot) in k.locals.iter().enumerate() {
-                match slot {
-                    crate::bytecode::KSlot::Arg(a) => aslots.push((r, *a as usize)),
-                    crate::bytecode::KSlot::Upvalue(u) => {
-                        match &*f.upvalues.get(*u as usize)?.borrow() {
-                            Value::Number(v) => uvs.push((r, *v)),
-                            _ => return None,
-                        }
-                    }
-                    crate::bytecode::KSlot::Local(_) => {}
-                }
-            }
-            arg_slots.push(aslots);
-            uv_snaps.push(uvs);
-        }
-        for (j, f) in funcs.iter().enumerate() {
-            let k = f.proto.fn_kernel.as_ref()?;
-            for op in k.code.iter() {
-                if let KOp::SelfCall { argc, callee, .. } = op {
-                    let t = *callee_map[j].get(*callee as usize)? as usize;
-                    let tk = funcs[t].proto.fn_kernel.as_ref()?;
-                    if u32::from(*argc) < tk.args_used {
-                        return None;
-                    }
-                }
-            }
-        }
-        let codes: Vec<&[KOp]> = funcs
-            .iter()
-            .map(|f| &f.proto.fn_kernel.as_ref().expect("resolved above").code[..])
-            .collect();
-
-        // --- Window 0: the invoked member's arguments and upvalues.
+        // --- Window 0: the invoked member's arguments and upvalues. The
+        // buffer is GROW-ONLY across activations: a deep recursion leaves it
+        // at its high-water length, so the next outer call's window pushes
+        // (`SelfCall`'s conditional resize) stop paying a zero-fill per
+        // window — which was ~11% of the mutual-recursion workload. Stale
+        // values are unreadable: args/upvalues are written here, locals are
+        // store-before-read by translation proof.
         let mut regs = std::mem::take(&mut self.kernel_regs);
-        regs.clear();
-        regs.resize(n_regs[0], 0.0);
-        for &(r, a) in &arg_slots[0] {
+        if regs.len() < fam.n_regs[0] {
+            regs.resize(fam.n_regs[0], 0.0);
+        }
+        for &(r, a) in &fam.arg_slots[0] {
             match args.get(a) {
                 Some(Value::Number(v)) => regs[r] = *v,
                 _ => {
                     self.kernel_regs = regs;
+                    self.park_rec_family(fam);
                     return None;
                 }
             }
         }
-        for &(r, v) in &uv_snaps[0] {
+        for &(r, _, v) in &fam.uv_snaps[0] {
             regs[r] = v;
+        }
+
+        /// How the windowed loop below exited; the single tail then parks
+        /// the pooled buffers + family exactly once on every path.
+        enum RecOut {
+            Done(Value),
+            Interrupted,
+            Abandon,
         }
 
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
-        // (caller member, return pc, dst register, caller window base).
-        let mut calls: Vec<(u8, u16, u16, u32)> = Vec::new();
+        // (caller member, return pc, dst register, caller window base) —
+        // pooled on the Vm so a deep recursion allocates its stack once per
+        // Vm, not once per outer call.
+        let mut calls = std::mem::take(&mut self.rec_calls);
+        debug_assert!(calls.is_empty());
         let mut cur = 0usize;
         let mut base = 0usize;
         let mut pc = 0usize;
-        let ret = 'outer: loop {
-            let code = codes[cur];
+        let out = 'outer: loop {
+            let code: &[KOp] = &fam.funcs[cur]
+                .proto
+                .fn_kernel
+                .as_ref()
+                .expect("resolved family")
+                .code;
             // Hoist the CURRENT member's tables: a same-kernel self-call
             // (fib-class recursion, the overwhelming case) must not pay
             // per-call indexed loads through the family tables.
-            let cur_map = &callee_map[cur][..];
-            let cur_args = &arg_slots[cur][..];
-            let cur_uvs = &uv_snaps[cur][..];
-            let cur_nregs = n_regs[cur];
+            let cur_map = &fam.callee_map[cur][..];
+            let cur_args = &fam.arg_slots[cur][..];
+            let cur_uvs = &fam.uv_snaps[cur][..];
+            let cur_nregs = fam.n_regs[cur];
             loop {
                 macro_rules! poll_interrupt {
                     () => {{
@@ -1512,9 +1467,7 @@ impl Vm {
                         if poll & 0xFF == 0 {
                             if let Some(flag) = &interrupt {
                                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                    self.kernel_regs = regs;
-                                    self.op_budget = Some(0);
-                                    return Some(Err(self.throw_range("execution interrupted")));
+                                    break 'outer RecOut::Interrupted;
                                 }
                             }
                         }
@@ -1648,8 +1601,7 @@ impl Vm {
                         // rerun then recurses to the same depth and raises
                         // the RangeError.
                         if self.call_depth + calls.len() + 1 > self.max_call_depth {
-                            self.kernel_regs = regs;
-                            return None;
+                            break 'outer RecOut::Abandon;
                         }
                         poll_interrupt!();
                         let t = cur_map[callee as usize] as usize;
@@ -1669,7 +1621,7 @@ impl Vm {
                             for &(r, a) in cur_args {
                                 regs[new_base + r] = regs[base + abase as usize + a];
                             }
-                            for &(r, v) in cur_uvs {
+                            for &(r, _, v) in cur_uvs {
                                 regs[new_base + r] = v;
                             }
                             calls.push((cur as u8, pc as u16 + 1, dst, base as u32));
@@ -1677,13 +1629,13 @@ impl Vm {
                             pc = 0;
                             continue;
                         }
-                        if regs.len() < new_base + n_regs[t] {
-                            regs.resize(new_base + n_regs[t], 0.0);
+                        if regs.len() < new_base + fam.n_regs[t] {
+                            regs.resize(new_base + fam.n_regs[t], 0.0);
                         }
-                        for &(r, a) in &arg_slots[t] {
+                        for &(r, a) in &fam.arg_slots[t] {
                             regs[new_base + r] = regs[base + abase as usize + a];
                         }
-                        for &(r, v) in &uv_snaps[t] {
+                        for &(r, _, v) in &fam.uv_snaps[t] {
                             regs[new_base + r] = v;
                         }
                         calls.push((cur as u8, pc as u16 + 1, dst, base as u32));
@@ -1711,11 +1663,11 @@ impl Vm {
                                 continue;
                             }
                             None => {
-                                break 'outer if ret_bool {
+                                break 'outer RecOut::Done(if ret_bool {
                                     Value::Bool(v != 0.0)
                                 } else {
                                     Value::Number(v)
-                                }
+                                })
                             }
                         }
                     }
@@ -1733,7 +1685,303 @@ impl Vm {
             }
         };
         self.kernel_regs = regs;
-        Some(Ok(ret))
+        calls.clear();
+        self.rec_calls = calls;
+        self.park_rec_family(fam);
+        match out {
+            RecOut::Done(v) => Some(Ok(v)),
+            RecOut::Abandon => None,
+            RecOut::Interrupted => {
+                self.op_budget = Some(0);
+                Some(Err(self.throw_range("execution interrupted")))
+            }
+        }
+    }
+
+    /// Take a cached, VALIDATED family for entry closure `bf`, or `None`
+    /// (miss, or a dynamic check failed — the entry is dropped and the
+    /// caller re-resolves, which is the uncached path and may itself
+    /// decline).
+    fn take_rec_family(&mut self, bf: &Rc<BytecodeFunction>) -> Option<RecFamily> {
+        let i = self
+            .rec_families
+            .iter()
+            .position(|f| Rc::ptr_eq(&f.funcs[0], bf))?;
+        let mut fam = self.rec_families.swap_remove(i);
+        if self.validate_rec_family(&mut fam) {
+            Some(fam)
+        } else {
+            None
+        }
+    }
+
+    /// Re-verify a cached family's DYNAMIC facts and refresh its upvalue
+    /// snapshots. Static facts (kernel presence, Ret types, argc coverage,
+    /// window sizes) live on immutable protos pinned by the identity checks,
+    /// so they never need re-checking.
+    fn validate_rec_family(&self, fam: &mut RecFamily) -> bool {
+        {
+            let g = self.realm.global.borrow();
+            for c in fam.global_checks.iter() {
+                let ok = matches!(
+                    g.props.get_index(c.slot as usize),
+                    Some((
+                        k,
+                        Property {
+                            kind: PropertyKind::Data { value: Value::Object(o), .. },
+                            ..
+                        },
+                    )) if *k == c.key && matches!(
+                        &o.borrow().internal,
+                        Internal::Function(FunctionInner::Bytecode(bf2))
+                            if Rc::ptr_eq(bf2, &fam.funcs[c.func as usize])
+                    )
+                );
+                if !ok {
+                    return false;
+                }
+            }
+        }
+        for &(m, u) in fam.upval_self_checks.iter() {
+            let f = &fam.funcs[m as usize];
+            let ok = matches!(
+                &*f.upvalues[u as usize].borrow(),
+                Value::Object(o) if matches!(
+                    &o.borrow().internal,
+                    Internal::Function(FunctionInner::Bytecode(bf2))
+                        if Rc::ptr_eq(bf2, f)
+                )
+            );
+            if !ok {
+                return false;
+            }
+        }
+        for &m in fam.math_members.iter() {
+            let k = fam.funcs[m as usize]
+                .proto
+                .fn_kernel
+                .as_ref()
+                .expect("family member");
+            if !self.kernel_math_ok(&k.math_used) {
+                return false;
+            }
+        }
+        // Refresh upvalue snapshots: cells can change BETWEEN activations
+        // (never during one — kernels contain no calls).
+        let RecFamily {
+            funcs, uv_snaps, ..
+        } = fam;
+        for (f, uvs) in funcs.iter().zip(uv_snaps.iter_mut()) {
+            for (_, u, v) in uvs.iter_mut() {
+                match &*f.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => *v = *n,
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// Park a family back in the cache (MRU at the tail, bounded). Eviction
+    /// only ever costs the evicted entry a re-resolution on its next call.
+    fn park_rec_family(&mut self, fam: RecFamily) {
+        const REC_FAMILY_CACHE_CAP: usize = 8;
+        if self.rec_families.len() >= REC_FAMILY_CACHE_CAP {
+            self.rec_families.remove(0);
+        }
+        self.rec_families.push(fam);
+    }
+
+    /// Resolve the recursion family for entry closure `bf` from scratch
+    /// (`funcs[0]` = `bf`), recording the identity checks a cache hit will
+    /// re-verify. `None` = the family declines kernelization (this
+    /// activation runs generically); nothing is cached on decline.
+    fn build_rec_family(&self, bf: &Rc<BytecodeFunction>) -> Option<RecFamily> {
+        let ret_bool = bf.proto.fn_kernel.as_ref()?.ret_bool;
+        let mut funcs: Vec<Rc<BytecodeFunction>> = vec![bf.clone()];
+        // callee_map[j][c] = funcs index for member j's SelfCall callee c
+        // (c = 0 is j itself; c = 1 + i is j's rec.globals[i]).
+        let mut callee_map: Vec<Vec<u8>> = Vec::new();
+        let mut global_checks: Vec<RecGlobalCheck> = Vec::new();
+        let mut upval_self_checks: Vec<(u8, u32)> = Vec::new();
+        let mut math_members: Vec<u8> = Vec::new();
+        let mut wl = 0usize;
+        while wl < funcs.len() {
+            if funcs.len() > 8 {
+                return None;
+            }
+            let f = funcs[wl].clone();
+            let k = f.proto.fn_kernel.as_ref()?;
+            // Every member's Ret type must match the entry kernel's: a
+            // mismatched value would land in a caller register of the wrong
+            // static type. (Also rejects mixed-type non-recursive members.)
+            if k.code
+                .iter()
+                .any(|op| matches!(op, KOp::Ret { boolean, .. } if *boolean != ret_bool))
+            {
+                return None;
+            }
+            // Self references must hold for THIS member's closure.
+            if let Some(rec) = k.rec.as_deref() {
+                for r in rec.self_refs.iter() {
+                    match r {
+                        crate::bytecode::SelfRefKind::Global(name) => {
+                            let g = self.realm.global.borrow();
+                            match g.props.get_full(&PropertyKey::str(name)) {
+                                Some((
+                                    slot,
+                                    key,
+                                    Property {
+                                        kind:
+                                            PropertyKind::Data {
+                                                value: Value::Object(o),
+                                                ..
+                                            },
+                                        ..
+                                    },
+                                )) if matches!(
+                                    &o.borrow().internal,
+                                    Internal::Function(FunctionInner::Bytecode(bf2))
+                                        if Rc::ptr_eq(bf2, &f)
+                                ) =>
+                                {
+                                    global_checks.push(RecGlobalCheck {
+                                        // The MAP's key, so validation's
+                                        // equality hits the Rc fast path.
+                                        key: key.clone(),
+                                        slot: u32::try_from(slot).ok()?,
+                                        func: wl as u8,
+                                    });
+                                }
+                                _ => return None,
+                            }
+                        }
+                        crate::bytecode::SelfRefKind::Upvalue(u) => {
+                            let cell = f.upvalues.get(*u as usize)?;
+                            let ok = matches!(
+                                &*cell.borrow(),
+                                Value::Object(o) if matches!(
+                                    &o.borrow().internal,
+                                    Internal::Function(FunctionInner::Bytecode(bf2))
+                                        if Rc::ptr_eq(bf2, &f)
+                                )
+                            );
+                            if !ok {
+                                return None;
+                            }
+                            upval_self_checks.push((wl as u8, *u));
+                        }
+                    }
+                }
+            }
+            if !k.math_used.is_empty() {
+                if !self.kernel_math_ok(&k.math_used) {
+                    return None;
+                }
+                math_members.push(wl as u8);
+            }
+            // Resolve this member's mutual-recursion partners.
+            let mut cmap: Vec<u8> = vec![wl as u8];
+            if let Some(rec) = k.rec.as_deref() {
+                for name in rec.globals.iter() {
+                    let (bf2, slot, key) = {
+                        let g = self.realm.global.borrow();
+                        match g.props.get_full(&PropertyKey::str(name)) {
+                            Some((
+                                slot,
+                                key,
+                                Property {
+                                    kind:
+                                        PropertyKind::Data {
+                                            value: Value::Object(o),
+                                            ..
+                                        },
+                                    ..
+                                },
+                            )) => match &o.borrow().internal {
+                                Internal::Function(FunctionInner::Bytecode(bf2))
+                                    if !bf2.is_class_ctor
+                                        && !bf2.proto.kind.is_generator()
+                                        && !bf2.proto.kind.is_async() =>
+                                {
+                                    (bf2.clone(), slot, key.clone())
+                                }
+                                _ => return None,
+                            },
+                            _ => return None,
+                        }
+                    };
+                    bf2.proto.fn_kernel.as_ref()?;
+                    let idx = match funcs.iter().position(|x| Rc::ptr_eq(x, &bf2)) {
+                        Some(i) => i,
+                        None => {
+                            funcs.push(bf2);
+                            funcs.len() - 1
+                        }
+                    };
+                    global_checks.push(RecGlobalCheck {
+                        key,
+                        slot: u32::try_from(slot).ok()?,
+                        func: idx as u8,
+                    });
+                    cmap.push(u8::try_from(idx).ok()?);
+                }
+            }
+            callee_map.push(cmap);
+            wl += 1;
+        }
+
+        // --- Per-member tables: window size, arg slots, upvalue snapshots
+        // (a member's upvalue cells are activation constants: nothing inside
+        // a kernel can write a cell). Then cross-check every call site's
+        // argc against its RESOLVED callee's consumption.
+        let n = funcs.len();
+        let mut n_regs: Vec<usize> = Vec::with_capacity(n);
+        let mut arg_slots: Vec<Vec<(usize, usize)>> = Vec::with_capacity(n);
+        let mut uv_snaps: Vec<Vec<(usize, u32, f64)>> = Vec::with_capacity(n);
+        for f in funcs.iter() {
+            let k = f.proto.fn_kernel.as_ref()?;
+            n_regs.push(k.n_regs as usize);
+            let mut aslots = Vec::new();
+            let mut uvs = Vec::new();
+            for (r, slot) in k.locals.iter().enumerate() {
+                match slot {
+                    crate::bytecode::KSlot::Arg(a) => aslots.push((r, *a as usize)),
+                    crate::bytecode::KSlot::Upvalue(u) => {
+                        match &*f.upvalues.get(*u as usize)?.borrow() {
+                            Value::Number(v) => uvs.push((r, *u, *v)),
+                            _ => return None,
+                        }
+                    }
+                    crate::bytecode::KSlot::Local(_) => {}
+                }
+            }
+            arg_slots.push(aslots);
+            uv_snaps.push(uvs);
+        }
+        for (j, f) in funcs.iter().enumerate() {
+            let k = f.proto.fn_kernel.as_ref()?;
+            for op in k.code.iter() {
+                if let KOp::SelfCall { argc, callee, .. } = op {
+                    let t = *callee_map[j].get(*callee as usize)? as usize;
+                    let tk = funcs[t].proto.fn_kernel.as_ref()?;
+                    if u32::from(*argc) < tk.args_used {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(RecFamily {
+            funcs,
+            callee_map,
+            n_regs,
+            arg_slots,
+            uv_snaps,
+            global_checks,
+            upval_self_checks,
+            math_members,
+            ret_bool,
+        })
     }
 
     /// Prepare a callback for REPEATED calls from a native higher-order
@@ -2571,17 +2819,19 @@ impl Vm {
     /// decline register translation.
     pub fn run_frame(&mut self, frame: Box<Frame>) -> Flow {
         if let Some(reg) = &frame.func.proto.reg {
-            // The op budget demands EXACT per-stack-op accounting, so a
-            // budgeted run (the conformance runner, untrusted eval) stays on
-            // the generic path — the same rule the kernel tiers follow. The
-            // debug-assert documents the resumed-frame invariant.
+            // Budgeted runs (the production op budget, the conformance
+            // runner, untrusted eval) stay on the register tier too:
+            // `RegProto::costs` charges each register op its EXACT
+            // stack-op units, so the budget drains — and exhausts —
+            // identically on both tiers (gated by the budget-sweep
+            // differential in tests/reg.rs). The kernel tiers still decline
+            // under a budget. The debug-assert documents the resumed-frame
+            // invariant.
             debug_assert!(
                 frame.ip == 0 && frame.pending_throw.is_none() && frame.pending_return.is_none()
             );
-            if self.op_budget.is_none() {
-                let reg = reg.clone();
-                return self.run_reg_frame(frame, &reg);
-            }
+            let reg = reg.clone();
+            return self.run_reg_frame(frame, &reg);
         }
         self.run_stack_frame(frame)
     }
@@ -3862,22 +4112,39 @@ impl Vm {
         // Registers 0..num_locals are the localized bindings (already sized
         // by `init_frame`); the rest are the canonical operand slots.
         frame.locals.resize(reg.num_regs as usize, Value::Undefined);
-        // Cooperative cancellation: the same latch-and-throw protocol as the
-        // stack loop (which polls every 256 ops). The op BUDGET never applies
-        // here — `run_frame` routes budgeted runs to the stack tier.
-        let interruptible = self.interrupt.is_some();
+        // Budget + cooperative cancellation mirror the stack loop's
+        // `counting` protocol (one predicted branch when neither is
+        // installed). Each register op charges its EXACT stack-op units
+        // (`RegProto::costs`): the charge is hard-checked BEFORE the op —
+        // the budget-exceeded throw fires exactly where the stack loop's
+        // per-op check would have, and no op the stack tier would not have
+        // reached can run. Pure stack ops charge at the NEXT anchor on
+        // their path (see `RegProto::costs` for why that is exact).
+        let counting = self.op_budget.is_some() || self.interrupt.is_some();
+        let costs = &reg.costs[..];
         let mut poll: u32 = 0;
         let code = &reg.code[..];
         let num_locals = proto.num_locals as usize;
         let mut pc: usize = 0;
         loop {
-            if interruptible {
-                poll = poll.wrapping_add(1);
-                if poll & 0xFF == 0 {
-                    if let Some(flag) = &self.interrupt {
-                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                            self.op_budget = Some(0);
-                            done!(Flow::Throw(self.throw_range("execution interrupted")));
+            if counting {
+                if let Some(budget) = self.op_budget.as_mut() {
+                    let cost = u64::from(costs[pc]);
+                    if *budget < cost {
+                        *budget = 0;
+                        // Uncatchable so execution is guaranteed to terminate.
+                        done!(Flow::Throw(self.throw_range("execution budget exceeded")));
+                    }
+                    *budget -= cost;
+                }
+                if self.interrupt.is_some() {
+                    poll = poll.wrapping_add(1);
+                    if poll & 0xFF == 0 {
+                        if let Some(flag) = &self.interrupt {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                self.op_budget = Some(0);
+                                done!(Flow::Throw(self.throw_range("execution interrupted")));
+                            }
                         }
                     }
                 }
@@ -3939,6 +4206,9 @@ impl Vm {
                 };
             }
             match op {
+                // Pure budget landing: its units are charged by the loop
+                // head via the cost table; the op itself runs nothing.
+                ROp::Charge => {}
                 ROp::Mov { dst, src } => wr!(*dst, rd!(*src)),
                 ROp::Const { dst, idx } => wr!(*dst, self.const_val(&frame, *idx)),
                 ROp::Undef { dst } => wr!(*dst, Value::Undefined),
@@ -4243,7 +4513,15 @@ impl Vm {
                     argc,
                 } => {
                     let ctor_v = rd!(*ctor);
-                    let args = &frame.locals[*at as usize..(*at + *argc) as usize];
+                    // A ZERO-arg window's `at` may sit one past the register
+                    // file (nothing was ever materialized there, so the
+                    // emitter never grew it): slicing would panic on the
+                    // out-of-range START even though the range is empty.
+                    let args = if *argc == 0 {
+                        &[]
+                    } else {
+                        &frame.locals[*at as usize..(*at + *argc) as usize]
+                    };
                     let v = tryv!(self.construct(&ctor_v, args, &ctor_v));
                     wr!(*dst, v);
                 }
@@ -4726,11 +5004,17 @@ impl Vm {
             return Err(self.throw_range("Maximum call stack size exceeded"));
         }
         // Function kernel: run frameless straight off the caller's registers
-        // (the arguments sit contiguously at `at..at+argc`).
+        // (the arguments sit contiguously at `at..at+argc`). A ZERO-arg
+        // window's `at` may sit one past the register file — nothing was
+        // ever materialized there — so slicing it would panic on the
+        // out-of-range start even though the range is empty.
         if bf.proto.fn_kernel.is_some() {
-            if let Some(r) =
-                self.run_fn_kernel(&bf, &caller.locals[at as usize..(at + argc) as usize])
-            {
+            let args: &[Value] = if argc == 0 {
+                &[]
+            } else {
+                &caller.locals[at as usize..(at + argc) as usize]
+            };
+            if let Some(r) = self.run_fn_kernel(&bf, args) {
                 self.call_depth -= 1;
                 return r;
             }
