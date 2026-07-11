@@ -358,6 +358,39 @@ const CORPUS: &[&str] = &[
     "let depth = 0; function down(n) { depth = depth + 1; return n <= 0 ? depth : down(n - 1); } console.log(down(5), depth);",
     // A cell-writing callee inside a hot numeric LOOP (the fill idiom).
     "let seed2 = 42; function r2() { seed2 = (seed2 * 31 + 7) % 1000003; return seed2; } const arr = new Array(20); for (let i = 0; i < 20; i++) arr[i] = r2(); console.log(arr[0], arr[19], seed2);",
+    // ---- pinned GLOBAL callees in loop kernels ----
+    // Plain global callee with arguments, result consumed numerically.
+    "function twice(x) { return x * 2; } let s = 0; for (let i = 0; i < 40; i++) { s += twice(i) - 1; } console.log(s);",
+    // Two distinct global callees in one region.
+    "function inc(x) { return x + 1; } function sq(x) { return x * x; } let s = 0; for (let i = 0; i < 25; i++) { s += sq(inc(i)); } console.log(s);",
+    // The same global callee at two call sites (one window, min_argc).
+    "function h(a, b) { return a - b; } let s = 0; for (let i = 0; i < 20; i++) { s += h(i, 1) + h(2 * i, i); } console.log(s);",
+    // UNDER-supplied global callee: args_used > min_argc declines the
+    // activation; the generic loop computes the NaN coercions.
+    "function add(a, b) { return a + b; } let s = 0; for (let i = 0; i < 5; i++) { s += add(i); } console.log(s, s !== s);",
+    // REBINDING the global between loop executions: each activation
+    // re-guards, so run 2 must call the NEW closure.
+    "function r() { return 1; } function fill() { let s = 0; for (let i = 0; i < 10; i++) { s += r(); } return s; } console.log(fill()); globalThis.r = () => 5; console.log(fill());",
+    // Rebound to a NON-function mid-program: run 2 throws generically.
+    "var q = function () { return 2; }; function go() { let s = 0; for (let i = 0; i < 5; i++) { s += q(); } return s; } console.log(go()); q = 7; try { go(); } catch (e) { console.log('ok', e instanceof TypeError); }",
+    // ACCESSOR global: the guard declines (own DATA property only), and the
+    // generic loop calls the getter once per iteration — the count proves it.
+    "let gets = 0; Object.defineProperty(globalThis, 'gf', { get() { gets++; return () => 3; } }); let s = 0; for (let i = 0; i < 4; i++) { s += gf(); } console.log(s, gets);",
+    // Cell-writing GLOBAL callee where generic code reads the cell right
+    // after the loop (per-call flush must have landed the final state).
+    "let acc2 = 0; function step(x) { acc2 = acc2 + x; return acc2; } let last = 0; for (let i = 1; i <= 10; i++) { last = step(i); } console.log(last, acc2);",
+    // Cell-writing callee + a mid-loop BAIL (the store target goes
+    // string-tainted): the generic tail keeps calling the callee, so the
+    // cell must be current at the bail point.
+    "let n2 = 0; function bump() { n2 = n2 + 1; return n2; } let a = [0, 0, 0, 0, 0]; for (let i = 0; i < 5; i++) { if (i === 3) a = { 3: 0, 4: 0 }; a[i] = bump(); } console.log(a[4], n2);",
+    // The callee's written cell is ALSO read by generic code inside the
+    // loop-adjacent expression (loop kernel itself must not snapshot it).
+    "let c3 = 100; function dec3() { c3 = c3 - 1; return c3; } let s = 0; for (let i = 0; i < 6; i++) { s += dec3(); } console.log(s + c3);",
+    // ALIAS DECLINE: the caller's loop reads the same cell the callee
+    // writes (both capture `seed3` as an upvalue) — the caller's snapshot
+    // would go stale after the first flush, so the activation must stay
+    // generic and see every intermediate value.
+    "let seed3 = 1; function stir() { seed3 = seed3 * 3 + 1; return seed3; } function fill3() { let s = 0; for (let i = 0; i < 8; i++) { s += stir() + seed3; } return s; } console.log(fill3(), seed3);",
     // ---- self-recursive function kernels (SelfCall) ----
     // The canonical fib shape (global function declaration).
     "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } console.log(fib(15), fib(0), fib(1));",
@@ -717,6 +750,37 @@ fn tiny_functions_get_fn_kernels() {
             "expected NO function kernel in {src:?}"
         );
     }
+}
+
+/// The fill idiom — a numeric loop whose body calls a GLOBAL function —
+/// kernelizes as one loop kernel with a pinned global callee (pins the
+/// `KCalleeSrc::Global` shape).
+#[test]
+fn global_callee_loops_get_kernels() {
+    fn kernels_in(p: &FuncProto) -> usize {
+        let mut n = p.kernels.len();
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                n += kernels_in(f);
+            }
+        }
+        n
+    }
+    // The sort workload's fill loop: a cell-writing global callee.
+    let src = "let seed = 1; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; } const a = new Array(10); for (let i = 0; i < 10; i++) a[i] = rnd(); console.log(a[9]);";
+    let proto = compile_script(src).expect("compiles");
+    assert!(
+        kernels_in(&proto) >= 1,
+        "fill loop with a global callee must kernelize"
+    );
+    let has_call_kernel = proto
+        .kernels
+        .iter()
+        .any(|k| k.code.iter().any(|op| matches!(op, KOp::CallKernel { .. })));
+    assert!(
+        has_call_kernel,
+        "the fill loop's kernel must carry a CallKernel to the global callee"
+    );
 }
 
 /// Cell-writing scalar bodies (the PRNG idiom) get a function kernel with

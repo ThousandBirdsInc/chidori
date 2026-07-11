@@ -394,6 +394,16 @@ enum VE {
     /// ONLY legal consumer is a `Call` (which fuses to [`KOp::SelfCall`]
     /// with `callee` = the payload); everything else rejects.
     SelfFn(u16),
+    /// LOOP mode only: a speculative pinned GLOBAL callee —
+    /// `global_callee_names[i]`, from `LoadGlobal` of a non-`Math` name
+    /// (`rnd()` in a fill loop). The activation entry guard resolves the
+    /// name as an own DATA property of the global object holding a
+    /// kernel-carrying closure — the exact `LoadGlobal` fast path — and
+    /// declines otherwise. Its ONLY legal consumer is a `Call` under an
+    /// `undefined` this (fusing to [`KOp::CallKernel`]); everything else
+    /// rejects translation, which never loses a kernel that exists today
+    /// (non-Math globals previously rejected loop regions outright).
+    GlobalFn(u16),
     /// `a.push` on the array base in the oslot — speculative: the entry
     /// guard verifies the canonical `Array.prototype.push` still backs the
     /// `push` property of the canonical prototype, and the op re-checks the
@@ -490,9 +500,12 @@ struct Xlate<'a> {
     /// Named-property access classes over oslot bases (entry-resolved; see
     /// [`KProp`]). Deduplicated by (oslot, key); flags OR together.
     props_used: Vec<KProp>,
-    /// Pinned closure callees (loop mode; see [`KCallee`]): per oslot, the
+    /// Pinned closure callees (loop mode; see [`KCallee`]): per source, the
     /// smallest argc any call site supplies.
     callees: Vec<KCallee>,
+    /// LOOP mode: names speculated as pinned GLOBAL callees (the
+    /// [`VE::GlobalFn`] payload indexes this).
+    global_callee_names: Vec<Box<str>>,
     /// a compare op fused with its following conditional jump: skip that ip.
     absorbed: Option<usize>,
     max_stack: u16,
@@ -563,6 +576,7 @@ fn translate(
         uses_array_pop: false,
         props_used: Vec::new(),
         callees: Vec::new(),
+        global_callee_names: Vec::new(),
         absorbed: None,
         max_stack: 0,
     };
@@ -672,9 +686,9 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     for (kidx, resume_ip, shape) in exits {
         if shape
             .iter()
-            .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn(_)))
+            .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn(_) | VE::GlobalFn(_)))
         {
-            return None; // undefined/opaque/self never survives to an exit
+            return None; // undefined/opaque/self/global-callee never survives to an exit
         }
         let sidx = match shapes.iter().position(|s| *s == shape) {
             Some(p) => p as u16,
@@ -814,8 +828,10 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     VE::ArrayPopFn(_) => KShapeSlot::ArrayPopFn,
                     VE::Str(sl) => KShapeSlot::Str(*sl),
                     VE::CharCodeFn(_) => KShapeSlot::CharCodeFn,
-                    VE::Undef | VE::Opaque | VE::SelfFn(_) => {
-                        unreachable!("undef/opaque/self never crosses block boundaries")
+                    VE::Undef | VE::Opaque | VE::SelfFn(_) | VE::GlobalFn(_) => {
+                        unreachable!(
+                            "undef/opaque/self/global-callee never crosses block boundaries"
+                        )
                     }
                 })
                 .collect()
@@ -2007,6 +2023,7 @@ impl Xlate<'_> {
             | VE::Undef
             | VE::Opaque
             | VE::SelfFn(_)
+            | VE::GlobalFn(_)
             | VE::MathObj
             | VE::MathFn(_)
             | VE::Str(_)
@@ -2236,7 +2253,25 @@ impl Xlate<'_> {
                     };
                     self.vstack.push(VE::SelfFn(1 + idx as u16));
                 } else {
-                    return None;
+                    // LOOP mode: speculate a pinned GLOBAL callee (the fill
+                    // idiom `for (...) a[i] = rnd();`). Only a Call under an
+                    // `undefined` this can consume the entry, so a
+                    // mis-speculated non-callee global just fails
+                    // translation — exactly today's outcome.
+                    let idx = match self.global_callee_names.iter().position(|g| &**g == name) {
+                        Some(i) => i,
+                        None => {
+                            // Bounded like fn mode's rec_globals: a region
+                            // calling many distinct globals is not worth a
+                            // window per callee.
+                            if self.global_callee_names.len() >= 4 {
+                                return None;
+                            }
+                            self.global_callee_names.push(name.into());
+                            self.global_callee_names.len() - 1
+                        }
+                    };
+                    self.vstack.push(VE::GlobalFn(u16::try_from(idx).ok()?));
                 }
                 self.origins.push(None);
             }
@@ -2507,6 +2542,7 @@ impl Xlate<'_> {
                     | VE::Undef
                     | VE::Opaque
                     | VE::SelfFn(_)
+                    | VE::GlobalFn(_)
                     | VE::ArrayPushFn(_)
                     | VE::ArrayPopFn(_) => return None,
                 }
@@ -2944,9 +2980,10 @@ impl Xlate<'_> {
                     self.exits.push((kidx, self.base_ip + i as u32, shape));
                     return Some(());
                 }
-                // LOOP mode: a call of a PINNED closure — the callee is an
-                // object-typed local (oslot machinery, discovered exactly
-                // like an array base) under a plain `undefined` this.
+                // LOOP mode: a call of a PINNED closure under a plain
+                // `undefined` this — the callee is either an object-typed
+                // local (oslot machinery, discovered exactly like an array
+                // base) or a speculated GLOBAL binding ([`VE::GlobalFn`]).
                 // Arguments must be statically NUMBER registers: they copy
                 // raw into the callee kernel's guarded-Number arg registers.
                 if !self.fn_mode
@@ -2956,18 +2993,23 @@ impl Xlate<'_> {
                     for d in 0..n {
                         self.top_num_reg(d)?;
                     }
-                    let oslot = self.base_slot(n + 1)?;
+                    let source = match *self.vstack.get(fn_pos)? {
+                        VE::GlobalFn(g) => crate::bytecode::KCalleeSrc::Global(
+                            self.global_callee_names.get(g as usize)?.clone(),
+                        ),
+                        _ => crate::bytecode::KCalleeSrc::Oslot(self.base_slot(n + 1)?),
+                    };
                     let argc = u16::try_from(n).ok()?;
                     // `fslot` indexes the CALLEE table (parallel to the
                     // executor's per-activation window list), NOT the oslots.
-                    let fslot = match self.callees.iter().position(|c| c.oslot == oslot) {
+                    let fslot = match self.callees.iter().position(|c| c.source == source) {
                         Some(i) => {
                             self.callees[i].min_argc = self.callees[i].min_argc.min(argc);
                             i
                         }
                         None => {
                             self.callees.push(KCallee {
-                                oslot,
+                                source,
                                 min_argc: argc,
                             });
                             self.callees.len() - 1

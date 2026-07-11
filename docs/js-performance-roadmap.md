@@ -1622,7 +1622,7 @@ loop kernel can't contain a call to a GLOBAL callee (pinned callees are
 local-held only, and cell-writing callees decline the pinned path). Extending
 `KOp::CallKernel` to entry-guarded global callees with per-call flush would
 kernelize the entire fill loop (the inlined-LCG equivalent measured 26 ms
-total, another ~3× on this phase).
+total, another ~3× on this phase). **Landed as §6.15.**
 
 **Gates:** kernels differential corpus grew 16 cell-writing programs (PRNG,
 shared cells across two kernels, conditional/write-only/self-assign stores,
@@ -1632,6 +1632,79 @@ declining their tiers, the fill idiom) plus a structural pin
 (`cell_writing_functions_get_fn_kernels`); benchmark suite cross-checks
 green (all four runtimes agree on every workload); full suites green;
 clippy clean.
+
+## 6.15 Global pinned callees, cell-writing callee flush, and the
+default-sort key precompute (landed 2026-07-11, follow-up round)
+
+The two follow-ups §6.14 queued: kernelize the sort workload's fill loop
+END TO END, and fix the latent no-comparator `Array.prototype.sort` cliff
+(868 ms vs Bun's 129 ms on a 6×50k numeric sort — per-comparison ToString).
+
+1. **Pinned GLOBAL callees in loop kernels** ([`KCalleeSrc`]). `LoadGlobal`
+   of a non-`Math` name in a loop region now speculates a pinned callee
+   ([`VE::GlobalFn`]) — its only legal consumer is a `Call` under an
+   `undefined` this, fusing to the existing `KOp::CallKernel`, so a
+   mis-speculated non-callee global just fails translation (exactly
+   today's decline). The activation entry guard resolves the name the way
+   `LoadGlobal`'s fast path does — an own DATA property of the global
+   object holding a kernel-carrying closure — and declines
+   accessor/proto-inherited/missing bindings to the generic loop (which
+   then runs the getter per iteration / throws the ReferenceError
+   exactly per spec). The binding is an activation constant: nothing on
+   the kernel allowlist can rebind a global, and a `KProp` store aimed at
+   the same global-object property can't pass its holds-a-Number entry
+   check while this guard sees a closure.
+2. **Cell-writing callees in the pinned path.** §6.14's `uv_writes`
+   kernels are now admitted by the `CallKernel` guard: the callee window
+   still snapshots upvalues once per activation, the written register IS
+   the cell's live value across calls (nothing else can touch it
+   mid-loop), and the window flushes written cells back after EVERY call
+   — so a mid-loop bail (a store target going string-tainted) resumes the
+   generic loop against current cell state, and the interrupt unwind
+   keeps the generic-prefix contract. Cross-window aliasing (a written
+   cell captured by another callee window or snapshot by the caller
+   kernel's own upvalue registers) declines the activation — the
+   differential corpus pins the caller-reads-the-cell shape staying
+   generic.
+3. **Default-sort ToString precompute** (`sort_default_primitive`,
+   independent of the kernel tiers). The spec's default SortCompare
+   stringifies both operands per comparison — ~2·n·log n allocating
+   conversions. ToString of a Number/String/Bool/Null/BigInt is pure, so
+   an all-primitive snapshot now precomputes the n keys once and sorts an
+   index permutation with the IDENTICAL stable take-left merge — same
+   output element-for-element, no observable difference (objects keep the
+   exact per-comparison path: their toString/valueOf call order and count
+   are user-visible; a Symbol element still throws from the comparison).
+   All-ASCII keys (number-to-string output always is) compare as bytes
+   instead of UTF-16 code units.
+
+### 6.15.1 Measured (callgrind, whole workload; wall interleaved 7-run median)
+
+| workload | §6.14 baseline | after | Δ instructions | wall |
+| --- | ---: | ---: | ---: | ---: |
+| sort (benchmark workload) | 1.554 G | 1.144 G | **−26.3%** | 175 → 125 ms |
+| sort fill phase only | 669.1 M | 259.8 M | **−61.2%** | 85 → 33 ms |
+| default-sort probe (6×50k, no comparator) | 9.900 G | 1.618 G | **−83.7%** | 838 → 184 ms |
+| fib_recursive | 694.0 M | 694.0 M | ±0.0% | 64 → 66 ms |
+
+Cumulative on the sort benchmark row since §6.13: 1.992 G → 1.144 G
+instructions (−42.6%), 232 → 125 ms — on the cross-runtime suite chidori
+now posts the FASTEST execution-only sort of all four runtimes (Node
+~1.6×, Bun ~1.5×, CPython ~1.0–1.3× behind on the same box). The
+no-comparator cliff drops from 6.7× behind Bun to ~1.4×. fib is
+bit-identical this round (the §6.14 layout shift did not compound).
+
+**Gates:** kernels differential corpus grew 12 global-callee programs
+(args/two-callees/two-sites-min-argc, under-supplied args declining,
+rebinding between activations, rebound-to-non-function throwing, accessor
+global counting its per-iteration getter calls, cell-writing callee with
+post-loop reads, mid-loop bail with a live cell, caller-reads-cell alias
+decline) plus a structural pin (`global_callee_loops_get_kernels`); the
+default sort gained a smoke pin (`default_sort_precomputed_keys`:
+string-order numerics, mixed primitives, -0/NaN, stability, object and
+Symbol elements, UTF-16 astral order, toSorted) all verified against Node
+per case; benchmark suite cross-checks green on all four runtimes; full
+suites green; clippy and rustfmt clean.
 
 ## 7. References
 

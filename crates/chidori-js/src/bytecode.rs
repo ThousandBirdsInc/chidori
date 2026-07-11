@@ -1228,15 +1228,20 @@ pub enum KOp {
     /// `Op::SetProp` fast-path conditions). See [`KOp::LoadProp`] for why no
     /// per-access check is needed.
     StoreProp { prop: u16, src: u16 },
-    /// LOOP kernels only: call the PINNED CLOSURE in oslot
+    /// LOOP kernels only: call the PINNED CLOSURE of
     /// [`Kernel::callee_slots`]`[fslot]` — a plain bytecode function whose
     /// proto carries a (non-recursive, Number-returning) function kernel —
     /// by running that kernel's register program on a dedicated window above
     /// the caller's registers. The window's upvalue registers were loaded
-    /// ONCE at entry (the callee local is an oslot: in-region stores to it
-    /// reject, so the closure identity is pinned); per call only the `argc`
-    /// argument registers at `base..` copy in, and the callee's `Ret` value
-    /// copies out to `dst`. The entry guard verified everything a per-call
+    /// ONCE at entry (the callee resolution — an oslot local or a
+    /// global-object own data property, see [`KCalleeSrc`] — is an
+    /// activation constant, so the closure identity is pinned); per call
+    /// only the `argc` argument registers at `base..` copy in, and the
+    /// callee's `Ret` value copies out to `dst`. A cell-writing callee
+    /// ([`Kernel::uv_writes`]) additionally flushes its written registers
+    /// back to the cells after EVERY call, so a mid-loop bail resumes the
+    /// generic loop against current cell state; cross-window cell aliasing
+    /// declines at entry. The entry guard verified everything a per-call
     /// `run_fn_kernel` guard would (arguments are statically Numbers here),
     /// plus one depth check for the whole activation (the loop calls at a
     /// CONSTANT depth). No trace sink may be active (it would see an
@@ -1333,15 +1338,33 @@ pub struct KProp {
     pub store: bool,
 }
 
-/// One pinned CALLEE of a loop kernel (see [`KOp::CallKernel`]): the oslot
-/// local holding the closure, and the smallest `argc` any call site in the
+/// One pinned CALLEE of a loop kernel (see [`KOp::CallKernel`]): where the
+/// closure resolves from, and the smallest `argc` any call site in the
 /// region supplies — the entry guard requires the callee's function kernel
 /// to consume no argument index at or beyond it (a shorter call would need
 /// the generic `undefined` parameter).
 #[derive(Clone, Debug)]
 pub struct KCallee {
-    pub oslot: u16,
+    pub source: KCalleeSrc,
     pub min_argc: u16,
+}
+
+/// Where a pinned callee's closure lives. Both are activation constants: an
+/// oslot local is never stored to in-region, and nothing inside a kernel
+/// region can rebind a global — `StoreGlobal` is not on the allowlist, and
+/// a [`KProp`] store aimed at the same global-object property cannot pass
+/// its own holds-a-Number entry check while this guard sees a closure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KCalleeSrc {
+    /// The closure is held in this oslot local (discovered like an array
+    /// base; in-region stores to it reject).
+    Oslot(u16),
+    /// The closure is the value of a global-object OWN DATA property — the
+    /// exact fast path `LoadGlobal` takes for a top-level `function`
+    /// binding. Accessor, proto-inherited, and missing globals decline the
+    /// activation into the generic loop (which then resolves or throws
+    /// exactly as the spec says).
+    Global(Box<str>),
 }
 
 /// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
