@@ -9,6 +9,44 @@ queue, or worker fleet to provision.
 You make two decisions: **where the journal lives** and **where the process
 runs**. Everything else is the same everywhere.
 
+## The shape of every deployment
+
+However many users you serve and wherever the process runs, the structure is
+the same: many clients, one TLS front door, **one** `chidori serve` process
+per agent file, one state directory, and an optional durable mirror behind
+it.
+
+```mermaid
+flowchart LR
+    subgraph clients["Many users"]
+        u1["Browser / SDK"]
+        u2["Backend service"]
+        u3["curl / fetch"]
+    end
+
+    proxy["TLS proxy or platform ingress<br/>(terminates HTTPS, firewalls the port)"]
+
+    subgraph host["One machine — VM, container, or pod"]
+        server["chidori serve agent.ts<br/>the single writer for this agent's runs"]
+        state[(".chidori/<br/>journals · checkpoints ·<br/>detached-agent registry")]
+    end
+
+    mirror[("CHIDORI_RUN_STORE mirror<br/>sqlite · s3://bucket · DO relay")]
+
+    u1 --> proxy
+    u2 --> proxy
+    u3 --> proxy
+    proxy -->|"bearer CHIDORI_API_KEY"| server
+    server -->|"append effect journal<br/>(local primary, always)"| state
+    server -->|"copy of every write"| mirror
+    mirror -.->|"hydration: a fresh machine<br/>materializes runs on demand"| state
+```
+
+Concurrency for many users comes from *sessions inside* that one process
+(`CHIDORI_MAX_CONCURRENT_SESSIONS`), and durability comes from the journal
+and its mirror — not from running more copies of the process. That is what
+the three rules below encode.
+
 ## Three rules every deployment follows
 
 1. **All state is one directory.** Back up `.chidori/` — or mirror it with
@@ -215,11 +253,120 @@ serverless piece that exists is storage: the
 [Durable Object run store](../integrations/cloudflare-durable-objects/) is a
 Worker that runs only when a write or hydration read arrives.
 
+## Scaling to many users
+
+Scale in two moves, in this order:
+
+1. **Scale up** — a bigger machine and a higher
+   `CHIDORI_MAX_CONCURRENT_SESSIONS`. One process multiplexes many
+   concurrent runs; most deployments never need move 2.
+2. **Scale out by sharding on the agent file** — one server per agent, each
+   the single writer for its own runs, with its own state directory and its
+   own mirror prefix. The router in front routes by hostname or path; it
+   never balances between copies of the same agent.
+
+```mermaid
+flowchart TB
+    users["Many users"]
+    router["Reverse proxy<br/>routes by hostname or path — routing, not load balancing"]
+
+    users --> router
+
+    subgraph h1["support host — one instance"]
+        s1["chidori serve support.ts<br/>CHIDORI_MAX_CONCURRENT_SESSIONS=32"]
+        d1[(".chidori/")]
+        s1 --> d1
+    end
+
+    subgraph h2["billing host — one instance"]
+        s2["chidori serve billing.ts"]
+        d2[(".chidori/")]
+        s2 --> d2
+    end
+
+    subgraph h3["research host — one instance"]
+        s3["chidori serve research.ts"]
+        d3[(".chidori/")]
+        s3 --> d3
+    end
+
+    router -->|"support.example.com"| s1
+    router -->|"billing.example.com"| s2
+    router -->|"example.com/research"| s3
+
+    mirror[("one bucket, per-agent prefixes<br/>s3://runs/support · s3://runs/billing · s3://runs/research")]
+
+    d1 -->|"mirror every write"| mirror
+    d2 -->|"mirror every write"| mirror
+    d3 -->|"mirror every write"| mirror
+```
+
+Durability is unchanged by sharding: every shard keeps
+`CHIDORI_DURABILITY=strict` and its own mirror prefix, so losing any one
+host loses no acknowledged work — its replacement hydrates that agent's
+runs from the mirror while the other shards keep serving.
+
+What scaling out must **never** look like is replicas of the same agent
+behind a load balancer:
+
+```mermaid
+flowchart LR
+    classDef bad stroke:#cc0000,color:#cc0000,stroke-dasharray: 4 3
+
+    lb["✗ load balancer / autoscaler"]:::bad
+    r1["replica A of agent.ts"]:::bad
+    r2["replica B of agent.ts"]:::bad
+    j[("the same run's journal")]:::bad
+
+    lb --> r1
+    lb --> r2
+    r1 -->|"writer 1"| j
+    r2 -->|"writer 2"| j
+```
+
+A run has exactly one writer. Two replicas sharing a mirror means two
+processes appending to the same journal: requests for a run land on an
+instance that doesn't own it, and the writers race. Run leases make the
+loser stand down, but they are advisory on `fs` and `s3://` backends
+([when things fail](#when-things-fail)) — and even where they are enforced
+(`sqlite`, the Durable Object relay), the losing replica is dead weight
+that serves errors. Nothing routes a request to a run's owner;
+active–active is a documented non-goal
+([durable storage](./durable-storage.md)).
+
+One caveat as runs grow long rather than numerous: resuming a very long
+run replays its whole journal (fast and $0, but O(history) — see
+[resume performance](./resume-performance.md)).
+
 ## When things fail
 
 With `CHIDORI_DURABILITY=strict` and a remote mirror, every acknowledged
 side effect has a durable recording — so no failure below loses completed
-work:
+work. The two recovery paths look like this:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as chidori serve
+    participant J as .chidori/ (local journal)
+    participant M as Mirror (s3:// or relay)
+
+    U->>S: request — run executes
+    S->>J: append CallRecord
+    S->>M: mirrored write (strict: acked before the next effect)
+    S-->>U: result (gated on a durable journal)
+
+    Note over S,J: crash / eviction / redeploy
+    S->>J: read journal on restart
+    S->>S: replay to last safepoint, re-arm detached fleet
+    Note over U,S: run resumes where it stopped
+
+    Note over S,M: machine loss — fresh machine, same env
+    S->>M: hydrate(run_id) on first load
+    M-->>J: materialize the run directory
+    S->>S: replay, resume
+    Note over U,S: nothing restored by hand
+```
 
 - **Crash / eviction / redeploy** → supervisor restarts the process → runs
   resume by replay, fleet re-arms. Recovery time is a restart.
@@ -234,12 +381,6 @@ work:
   same mirror but *stopped*; promoting it is starting it. Active–active is
   not a supported mode — nothing routes requests to a run's owner (a
   documented non-goal in [durable storage](./durable-storage.md)).
-
-To grow capacity: bigger machine + `CHIDORI_MAX_CONCURRENT_SESSIONS` first;
-then shard — one server per agent, each with its own state directory and
-mirror prefix. Note that resuming a very long run replays its whole journal
-(fast and $0, but O(history) — see
-[resume performance](./resume-performance.md)).
 
 ## Production checklist
 
