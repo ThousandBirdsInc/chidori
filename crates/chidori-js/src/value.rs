@@ -908,11 +908,26 @@ impl Default for PropStorage {
     }
 }
 
+/// Chain length up to which shaped iteration steps positions in place
+/// (`key_at` per step: O(len²) parent hops total, ZERO allocation) rather
+/// than pre-collecting the key list. Stringify/own-keys enumerate every
+/// object per pass, so the per-object `Vec` was a measurable slice of
+/// `json_stringify`; the 2–8 key records that dominate stay alloc-free and
+/// genuinely wide objects pay one collect instead of O(len²) hops.
+const ITER_WALK_MAX: usize = 16;
+
 /// Iterator over own properties in insertion order, across both storage
 /// modes (see [`ObjectData::own_iter`]).
 pub enum OwnIter<'a> {
     Dict(indexmap::map::Iter<'a, PropertyKey, Property>),
+    /// Positional stepping over a short shaped chain (alloc-free).
     Shaped {
+        shape: &'a crate::shape::Shape,
+        slots: &'a [Property],
+        pos: u32,
+    },
+    /// Pre-collected keys for a wide shaped chain.
+    ShapedWide {
         keys: std::vec::IntoIter<&'a PropertyKey>,
         slots: std::slice::Iter<'a, Property>,
     },
@@ -924,13 +939,23 @@ impl<'a> Iterator for OwnIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             OwnIter::Dict(it) => it.next(),
-            OwnIter::Shaped { keys, slots } => Some((keys.next()?, slots.next()?)),
+            OwnIter::Shaped { shape, slots, pos } => {
+                let i = *pos as usize;
+                let prop = slots.get(i)?;
+                *pos += 1;
+                Some((shape.key_at(i as u32).expect("slot in range"), prop))
+            }
+            OwnIter::ShapedWide { keys, slots } => Some((keys.next()?, slots.next()?)),
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             OwnIter::Dict(it) => it.size_hint(),
-            OwnIter::Shaped { keys, .. } => keys.size_hint(),
+            OwnIter::Shaped { slots, pos, .. } => {
+                let n = slots.len().saturating_sub(*pos as usize);
+                (n, Some(n))
+            }
+            OwnIter::ShapedWide { keys, .. } => keys.size_hint(),
         }
     }
 }
@@ -941,7 +966,14 @@ impl ExactSizeIterator for OwnIter<'_> {}
 /// modes (see [`ObjectData::own_keys_iter`]).
 pub enum OwnKeys<'a> {
     Dict(indexmap::map::Keys<'a, PropertyKey, Property>),
-    Shaped(std::vec::IntoIter<&'a PropertyKey>),
+    /// Positional stepping over a short shaped chain (alloc-free).
+    Shaped {
+        shape: &'a crate::shape::Shape,
+        pos: u32,
+        len: u32,
+    },
+    /// Pre-collected keys for a wide shaped chain.
+    ShapedWide(std::vec::IntoIter<&'a PropertyKey>),
 }
 
 impl<'a> Iterator for OwnKeys<'a> {
@@ -950,13 +982,26 @@ impl<'a> Iterator for OwnKeys<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             OwnKeys::Dict(it) => it.next(),
-            OwnKeys::Shaped(it) => it.next(),
+            OwnKeys::Shaped { shape, pos, len } => {
+                if pos < len {
+                    let k = shape.key_at(*pos).expect("slot in range");
+                    *pos += 1;
+                    Some(k)
+                } else {
+                    None
+                }
+            }
+            OwnKeys::ShapedWide(it) => it.next(),
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             OwnKeys::Dict(it) => it.size_hint(),
-            OwnKeys::Shaped(it) => it.size_hint(),
+            OwnKeys::Shaped { pos, len, .. } => {
+                let n = (*len - *pos) as usize;
+                (n, Some(n))
+            }
+            OwnKeys::ShapedWide(it) => it.size_hint(),
         }
     }
 }
@@ -1260,7 +1305,14 @@ impl ObjectData {
     pub fn own_iter(&self) -> OwnIter<'_> {
         match &self.props {
             PropStorage::Dict(m) => OwnIter::Dict(m.iter()),
-            PropStorage::Shaped { shape, slots } => OwnIter::Shaped {
+            PropStorage::Shaped { shape, slots } if slots.len() <= ITER_WALK_MAX => {
+                OwnIter::Shaped {
+                    shape,
+                    slots,
+                    pos: 0,
+                }
+            }
+            PropStorage::Shaped { shape, slots } => OwnIter::ShapedWide {
                 keys: shape.keys_in_order().into_iter(),
                 slots: slots.iter(),
             },
@@ -1272,7 +1324,16 @@ impl ObjectData {
     pub fn own_keys_iter(&self) -> OwnKeys<'_> {
         match &self.props {
             PropStorage::Dict(m) => OwnKeys::Dict(m.keys()),
-            PropStorage::Shaped { shape, .. } => OwnKeys::Shaped(shape.keys_in_order().into_iter()),
+            PropStorage::Shaped { shape, slots } if slots.len() <= ITER_WALK_MAX => {
+                OwnKeys::Shaped {
+                    shape,
+                    pos: 0,
+                    len: slots.len() as u32,
+                }
+            }
+            PropStorage::Shaped { shape, .. } => {
+                OwnKeys::ShapedWide(shape.keys_in_order().into_iter())
+            }
         }
     }
 

@@ -32,6 +32,17 @@ use crate::value::PropertyKey;
 
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
+/// A shape node's outgoing transition edges (see [`Shape::transitions`]).
+#[derive(Default)]
+enum Transitions {
+    #[default]
+    None,
+    /// The common linear-chain case, inline (no table allocation).
+    One(PropertyKey, Weak<Shape>),
+    /// A branching node (two+ successors seen).
+    Many(FxHashMap<PropertyKey, Weak<Shape>>),
+}
+
 /// Chain length at and above which key lookup goes through the per-shape
 /// [`Shape::index`] table. Below it, walking the parent chain is cheaper
 /// than a hash for the 2–5 key objects that dominate real code.
@@ -53,13 +64,21 @@ pub struct Shape {
     key: PropertyKey,
     /// Slot index of `key` in the owning object's slot vector (== depth-1).
     slot: u32,
-    /// key → child shape for the next appended property. Lazily allocated
-    /// (most shapes have 0 or 1 transition); values are weak — see the
-    /// module docs.
-    transitions: RefCell<FxHashMap<PropertyKey, Weak<Shape>>>,
+    /// key → child shape for the next appended property; weak — see the
+    /// module docs. Inline up to one entry: almost every node sits on a
+    /// linear chain with exactly one successor, and the inline slot spares
+    /// it a heap-allocated table (realm setup alone builds thousands of
+    /// chain nodes).
+    transitions: RefCell<Transitions>,
     /// key → slot over the whole chain, built lazily once the chain is long
     /// enough that walking beats hashing no more (see [`INDEX_THRESHOLD`]).
     index: OnceCell<FxIndexMap<PropertyKey, u32>>,
+    /// Set by the first long-chain lookup on this shape; the index is built
+    /// on the SECOND. An object grown key-by-key visits each intermediate
+    /// shape exactly once (the pre-insert lookup), so eager building there
+    /// is O(n²) index churn for a singleton builder (realm setup measured
+    /// it); a shape that is looked up twice is stable enough to pay for.
+    index_armed: std::cell::Cell<bool>,
 }
 
 impl std::fmt::Debug for Shape {
@@ -75,8 +94,9 @@ impl Shape {
             parent: None,
             key: PropertyKey::Str(crate::value::JsString::new("")),
             slot: 0,
-            transitions: RefCell::new(FxHashMap::default()),
+            transitions: RefCell::new(Transitions::None),
             index: OnceCell::new(),
+            index_armed: std::cell::Cell::new(false),
         })
     }
 
@@ -109,7 +129,7 @@ impl Shape {
     where
         Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
     {
-        if self.len() >= INDEX_THRESHOLD {
+        if self.len() >= INDEX_THRESHOLD && self.index_armed.replace(true) {
             let index = self.index.get_or_init(|| {
                 let mut m = FxIndexMap::with_capacity_and_hasher(self.len(), Default::default());
                 let mut cur = self;
@@ -169,21 +189,60 @@ impl Shape {
     }
 
     /// The child shape appending `key`, memoized in the transition table.
+    // `PropertyKey` trips clippy's `mutable_key_type` via `JsString`'s
+    // interior length cache — a memoized DERIVED value; `Hash`/`Eq` read
+    // only the string bytes, so the key is stable (the engine's property
+    // maps use the same key type; the lint cannot see through `IndexMap`).
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "JsString's interior Cell caches a derived length; Hash/Eq use the immutable bytes"
+    )]
     pub fn transition(self: &Rc<Self>, key: PropertyKey) -> Rc<Shape> {
         let mut tr = self.transitions.borrow_mut();
-        if let Some(w) = tr.get(&key) {
-            if let Some(child) = w.upgrade() {
-                return child;
+        match &*tr {
+            Transitions::None => {}
+            Transitions::One(k, w) => {
+                if *k == key {
+                    if let Some(child) = w.upgrade() {
+                        return child;
+                    }
+                }
+            }
+            Transitions::Many(m) => {
+                if let Some(w) = m.get(&key) {
+                    if let Some(child) = w.upgrade() {
+                        return child;
+                    }
+                }
             }
         }
         let child = Rc::new(Shape {
             parent: Some(self.clone()),
             key: key.clone(),
             slot: self.len() as u32,
-            transitions: RefCell::new(FxHashMap::default()),
+            transitions: RefCell::new(Transitions::None),
             index: OnceCell::new(),
+            index_armed: std::cell::Cell::new(false),
         });
-        tr.insert(key, Rc::downgrade(&child));
+        let weak = Rc::downgrade(&child);
+        match &mut *tr {
+            Transitions::None => *tr = Transitions::One(key, weak),
+            Transitions::One(k, w) => {
+                if *k == key || w.strong_count() == 0 {
+                    // Same key (dead child re-minted) or a dead sibling:
+                    // reuse the inline slot.
+                    *tr = Transitions::One(key, weak);
+                } else {
+                    let mut m = FxHashMap::default();
+                    m.insert(k.clone(), w.clone());
+                    m.insert(key, weak);
+                    *tr = Transitions::Many(m);
+                }
+            }
+            Transitions::Many(m) => {
+                m.insert(key, weak);
+            }
+        }
         child
     }
 

@@ -252,11 +252,27 @@ to shrink the correctness surface rather than to chase speed:
    per-nesting-depth path (`Vec<Rc<Shape>>` per depth) so nested records
    don't clobber their parent's cursor mid-object.
 
-Phase-4 items still open: re-profile with callgrind to re-rank the
-remaining cost centers, and consider stringify-from-shape (serializing
-slots directly for all-plain-data records — deliberately skipped because
-the spec's per-key re-lookup during serialization is observable under
-mutating `toJSON`).
+**Measured (callgrind instruction counts, examples/shapebench, vs the
+fork point efb16a0):** `object_literals` −19%, `mixed_helpers` −5.8%,
+`for-in` over per-iteration records −3.8%, `JSON.parse` −1.9%,
+`json_roundtrip` −0.8%, `JSON.stringify` +1.7% — of which ~+0.5M
+instructions in every workload is one-time realm setup (intrinsic
+container objects now mint shape chains; ≈0.15 ms per `Engine::new`, and
+two rounds of tuning already halved it twice: an inline single-entry
+transition slot, and two-touch arming of the per-shape key index so
+grow-by-insert singletons never pay O(n²) index builds). The §4 1.3–1.6×
+json estimate did NOT materialize on this corpus: with Phase-0 interning
+and the pre-reserved parse maps already landed, per-record construction
+was a smaller slice of `json_roundtrip` than the 2026-07-06 table
+suggested, and stringify/parse inherent work dominates. The structural
+wins concentrate where construction actually dominates (object literals
+in loops, record-processing helpers).
+
+Phase-4 items still open: stringify-from-shape (serializing slots
+directly for all-plain-data records — deliberately skipped because the
+spec's per-key re-lookup during serialization is observable under
+mutating `toJSON`), and shrinking the residual realm-setup delta if
+`Engine::new` latency ever matters.
 
 ## 6. Relationship to register bytecode (§3.5 of the roadmap)
 
