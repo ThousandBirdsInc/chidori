@@ -1986,7 +1986,7 @@ impl Vm {
             if let Some(p) = b.proto.take() {
                 stack.push(p);
             }
-            for (_k, prop) in b.take_props_map() {
+            for prop in b.take_props_values() {
                 match prop.kind {
                     PropertyKind::Data { value, .. } => push_dispose_obj(value, &mut stack),
                     PropertyKind::Accessor { get, set } => {

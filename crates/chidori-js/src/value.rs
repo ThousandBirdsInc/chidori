@@ -1008,6 +1008,24 @@ impl<'a> Iterator for OwnKeys<'a> {
 
 impl ExactSizeIterator for OwnKeys<'_> {}
 
+/// Owning iterator over property values (see
+/// [`ObjectData::take_props_values`]).
+pub enum PropsIntoValues {
+    Dict(indexmap::map::IntoValues<PropertyKey, Property>),
+    Slots(std::vec::IntoIter<Property>),
+}
+
+impl Iterator for PropsIntoValues {
+    type Item = Property;
+    #[inline]
+    fn next(&mut self) -> Option<Property> {
+        match self {
+            PropsIntoValues::Dict(it) => it.next(),
+            PropsIntoValues::Slots(it) => it.next(),
+        }
+    }
+}
+
 pub struct ObjectData {
     pub proto: Option<JsObject>,
     /// The ordinary own-property storage. Private to this module: every other
@@ -1374,13 +1392,15 @@ impl ObjectData {
         self.props = PropStorage::Dict(map);
     }
 
-    /// Take the whole storage, leaving it empty (teardown / cycle breaking).
+    /// Take every own property VALUE, leaving the storage empty (teardown /
+    /// cycle breaking — the keys are not needed to break value edges, and a
+    /// shaped object must not pay a key-cloning dictionary materialization
+    /// just to be dropped).
     #[inline]
-    pub fn take_props_map(&mut self) -> crate::fxhash::FxIndexMap<PropertyKey, Property> {
-        self.demote();
+    pub fn take_props_values(&mut self) -> PropsIntoValues {
         match std::mem::take(&mut self.props) {
-            PropStorage::Dict(m) => m,
-            PropStorage::Shaped { .. } => unreachable!("demoted above"),
+            PropStorage::Dict(m) => PropsIntoValues::Dict(m.into_values()),
+            PropStorage::Shaped { slots, .. } => PropsIntoValues::Slots(slots.into_iter()),
         }
     }
     /// Does `props` hold a (reified) entry for the array index `idx`?
