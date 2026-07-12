@@ -383,6 +383,23 @@ pub enum ROp {
         if_true: bool,
         target: u32,
     },
+    /// Fused `typeof x ===/!== "<one of the eight typeof names>"` in branch
+    /// position — a direct type-tag test replacing the
+    /// `Unary{Typeof}; CmpBrK` pair: no typeof string materialized, no
+    /// `Value` clone/drop, no string comparison, no const load. Sound
+    /// because `typeof` is total and effect-free (dropping its intermediate
+    /// string is unobservable) and `Value::type_of` returns exactly these
+    /// eight statics, so content equality against such a literal is
+    /// `type_of(x) == tag` (loose `==` on two strings is strict). Literals
+    /// outside the eight names keep the generic compare. `br_on_eq` folds
+    /// the comparison kind and branch polarity: branch when
+    /// `(type_of == tag) == br_on_eq`.
+    TypeofBr {
+        src: u16,
+        tag: &'static str,
+        br_on_eq: bool,
+        target: u32,
+    },
 
     // ---- property access ----
     GetProp {
@@ -818,7 +835,10 @@ enum Entry {
     NewTarget,
 }
 
-struct Emitter {
+struct Emitter<'a> {
+    /// The function's const pool — read only by build-time fusions that
+    /// need a constant's value (the `TypeofBr` typeof-name check).
+    consts: &'a [crate::bytecode::Const],
     num_locals: u16,
     code: Vec<ROp>,
     entries: Vec<Entry>,
@@ -877,8 +897,10 @@ fn rop_budget_pure(op: &ROp) -> bool {
 
 /// Translate a function's final stack bytecode into a register program.
 /// Returns `None` when the function contains any op outside the translated
-/// subset, contains loop kernels, or exceeds the register budget.
-pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
+/// subset, contains loop kernels, or exceeds the register budget. `consts`
+/// is read only by build-time fusions that need a constant's VALUE (the
+/// `TypeofBr` typeof-name check).
+pub fn regify(code: &[Op], num_locals: u32, consts: &[crate::bytecode::Const]) -> Option<RegProto> {
     if code.is_empty() || num_locals > u16::MAX as u32 / 2 {
         return None;
     }
@@ -1074,6 +1096,7 @@ pub fn regify(code: &[Op], num_locals: u32) -> Option<RegProto> {
 
     // Phase 3: emission.
     let mut e = Emitter {
+        consts,
         num_locals: num_locals as u16,
         code: Vec::with_capacity(code.len()),
         entries: Vec::new(),
@@ -1197,6 +1220,7 @@ fn rop_target_mut(op: &mut ROp) -> Option<&mut u32> {
         | ROp::CmpBr { target, .. }
         | ROp::CmpBrK { target, .. }
         | ROp::CmpBrCellK { target, .. }
+        | ROp::TypeofBr { target, .. }
         | ROp::CompletionJump { target, .. } => Some(target),
         _ => None,
     }
@@ -1257,7 +1281,7 @@ fn rop_set_dst(op: &mut ROp, new_dst: u16) -> bool {
     }
 }
 
-impl Emitter {
+impl Emitter<'_> {
     fn canon(&self, depth: usize) -> u16 {
         self.num_locals + depth as u16
     }
@@ -2244,15 +2268,74 @@ impl Emitter {
                 };
                 match konst {
                     Some(k) => {
-                        let a = self.pop_reg();
-                        self.flush_all();
-                        self.push_op(ROp::CmpBrK {
-                            cmp: *cmp,
-                            a,
-                            konst: k,
-                            if_true,
-                            target: *target,
-                        });
+                        // `TypeofBr` fusion — the dispatch idiom
+                        // `typeof x === "number"`. Conditions: an equality
+                        // compare against a string literal that IS one of
+                        // the eight typeof names, whose left operand is the
+                        // Temp defined by the immediately preceding
+                        // `Unary{Typeof}` into this position's canonical
+                        // register (`code.last()` — any interleaving
+                        // materialization or flush would have emitted a
+                        // later op, and a consumed/aliased result would not
+                        // sit here as a Temp). The popped op's charge moves
+                        // to `pending` so the fused branch charges both
+                        // stack ops' units before the edge. A literal
+                        // outside the eight names (`typeof x === "Number"`)
+                        // keeps the generic compare — it is reachable but
+                        // cold.
+                        let eq_kind = matches!(cmp, CmpOp::StrictEq | CmpOp::Eq);
+                        let ne_kind = matches!(cmp, CmpOp::StrictNe | CmpOp::Ne);
+                        let tag = if eq_kind || ne_kind {
+                            match self.consts.get(k as usize) {
+                                Some(crate::bytecode::Const::String(s)) => {
+                                    crate::names::typeof_tag(s.as_str())
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let p = self.entries.len().wrapping_sub(1);
+                        let fusable = tag.is_some()
+                            && matches!(self.entries.last(), Some(Entry::Temp))
+                            && matches!(
+                                self.code.last(),
+                                Some(ROp::Unary { kind: RUnary::Typeof, dst, .. })
+                                    if *dst == self.canon(p)
+                            );
+                        if fusable {
+                            // The fused-away Unary becomes a `Charge`
+                            // carrying its already-assigned units, so a
+                            // budgeted run drains at exactly the stack
+                            // tier's points (deferring the units to the
+                            // branch would misattribute them across the
+                            // edge — the sweep differentials catch it).
+                            let unary_idx = self.code.len() - 1;
+                            let src = match self.code[unary_idx] {
+                                ROp::Unary { src, .. } => src,
+                                _ => unreachable!("checked above"),
+                            };
+                            self.code[unary_idx] = ROp::Charge;
+                            self.entries.pop();
+                            self.last_def = None;
+                            self.flush_all();
+                            self.push_op(ROp::TypeofBr {
+                                src,
+                                tag: tag.expect("checked above"),
+                                br_on_eq: if eq_kind { if_true } else { !if_true },
+                                target: *target,
+                            });
+                        } else {
+                            let a = self.pop_reg();
+                            self.flush_all();
+                            self.push_op(ROp::CmpBrK {
+                                cmp: *cmp,
+                                a,
+                                konst: k,
+                                if_true,
+                                target: *target,
+                            });
+                        }
                     }
                     None => {
                         let b = self.pop_reg();

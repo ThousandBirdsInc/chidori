@@ -4793,6 +4793,19 @@ impl Vm {
                         pc = *target as usize;
                     }
                 }
+                ROp::TypeofBr {
+                    src,
+                    tag,
+                    br_on_eq,
+                    target,
+                } => {
+                    // Total: `typeof` never throws, and the tag is one of
+                    // the eight statics `Value::type_of` returns, so this
+                    // is content equality of the unmaterialized compare.
+                    if (frame.locals[*src as usize].type_of() == *tag) == *br_on_eq {
+                        pc = *target as usize;
+                    }
+                }
                 ROp::CmpBrCellK {
                     cmp,
                     cell,
@@ -5359,7 +5372,9 @@ impl Vm {
                 }
             }
             ROp::ForInPop => {
-                frame.enumerators.pop();
+                if let Some((keys, _)) = frame.enumerators.pop() {
+                    self.park_forin_vec(keys);
+                }
             }
             _ => unreachable!("op handled inline in run_reg_frame: {op:?}"),
         }
@@ -6116,7 +6131,9 @@ impl Vm {
                 push!(Value::Bool(done));
             }
             Op::ForInPop => {
-                frame.enumerators.pop();
+                if let Some((keys, _)) = frame.enumerators.pop() {
+                    self.park_forin_vec(keys);
+                }
             }
             Op::ForInNext => {
                 let (k, more) = Self::for_in_next(frame);
@@ -7365,6 +7382,18 @@ impl Vm {
         // is by far the most common `+` in numeric code (loop counters, sums).
         if let (Value::Number(x), Value::Number(y)) = (&a, &b) {
             return Ok(Value::Number(x + y));
+        }
+        // Fast path: String + String. Both operands are already primitive —
+        // ToPrimitive and ToString are identities — so the result is their
+        // concatenation, with the same length cap and the same `concat` as
+        // the generic route below; skipped are two identity-clone
+        // ToPrimitive calls and two identity ToString round-trips (the glue
+        // idiom `label + ":" + v` pays this twice per join).
+        if let (Value::String(sa), Value::String(sb)) = (&a, &b) {
+            if sa.byte_len() + sb.byte_len() > crate::value::MAX_STRING_LEN {
+                return Err(self.throw_range("invalid string length"));
+            }
+            return Ok(Value::String(sa.concat(sb)));
         }
         // Fast path: a small plain string ⊕ a Number. Both operands are
         // already primitive (ToPrimitive is the identity) and the result is

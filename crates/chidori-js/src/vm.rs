@@ -368,6 +368,13 @@ pub struct Vm {
     /// Pooled (caller, return-pc, dst, window) stack for
     /// `run_fn_kernel_rec`; parked empty.
     pub(crate) rec_calls: Vec<(u8, u16, u16, u32)>,
+    /// Pooled key buffers for `for-in` enumerators (`for_in_keys`): a
+    /// glue-code loop that for-ins a fresh object per iteration otherwise
+    /// pays a malloc/free per loop entry just to hold the keys. Parked
+    /// CLEARED at `ForInPop` (best-effort: an unwound frame drops its
+    /// enumerators without parking — a pool miss, never a stale key). Pure
+    /// perf: only the buffer allocation is reused. Bounded.
+    pub(crate) forin_pool: Vec<Vec<crate::value::JsString>>,
     /// Pinned STRING bases for the active loop-kernel activation (mirrors
     /// `kernel_objs`); cleared after every activation so the pool never
     /// extends a string's lifetime.
@@ -427,6 +434,7 @@ impl Vm {
             kernel_callees: Vec::new(),
             rec_families: Vec::new(),
             rec_calls: Vec::new(),
+            forin_pool: Vec::new(),
             kernel_strs: Vec::new(),
             json_keys: std::collections::HashMap::default(),
             dummy_bf: Rc::new(BytecodeFunction {

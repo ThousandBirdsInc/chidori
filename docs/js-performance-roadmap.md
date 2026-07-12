@@ -1706,6 +1706,77 @@ Symbol elements, UTF-16 astral order, toSorted) all verified against Node
 per case; benchmark suite cross-checks green on all four runtimes; full
 suites green; clippy and rustfmt clean.
 
+## 6.16 Glue-code round: typeof-dispatch fusion, compile-scoped string
+interning, String+String add, for-in buffer pool (landed 2026-07-12)
+
+mixed_helpers ran ~2.3× slower than CPython (~255 vs ~112 ms execution) —
+by design the workload where every function declines the kernel tiers and
+the register interpreter carries everything. Phase isolation split its
+~255 ms into normalize/for-in ~120 ms, render/string-build ~66 ms, object
+allocation ~41 ms, buckets/classify ~38 ms; the profile showed no cliff,
+just the aggregate per-iteration tax (~38.6 k instructions each): dispatch
+~30%, `Value` drops + malloc ~13%, string equality ~4.5%, map hashing ~5%.
+This round took every bounded lever; the rest is the tracked
+arena/GC-design work.
+
+1. **`ROp::TypeofBr`** — the dispatch idiom `typeof v === "number"` fuses
+   at register-translation time into a direct type-tag test: no typeof
+   string materialized, no `Value` clone/drop, no string compare, no const
+   load. Build-time conditions: an equality compare (`===`/`!==`/`==`/
+   `!=`) K-folded against a string literal that IS one of the eight typeof
+   names, whose operand is the Temp defined by the immediately preceding
+   `Unary{Typeof}` (`code.last()` — any interleaving materialization would
+   have emitted a later op). The fused-away Unary becomes a `Charge`
+   carrying its already-assigned units, so budgeted runs drain at exactly
+   the stack tier's points — the first cut deferred those units across the
+   branch edge and the reg budget-sweep differential caught it precisely
+   (per-path charge divergence). Literals outside the eight names
+   (`typeof x === "Number"`) keep the generic compare.
+2. **Compile-scoped string interning** (`Compiler::str_intern`): one
+   `JsString` allocation per distinct string across a whole compilation —
+   const pools AND object-template keys — so a for-in key cloned out of an
+   instantiated template pointer-matches `k === "id"` literals and
+   property-name consts in any function of the program. The eight typeof
+   names route to the process-wide `names.rs` table instead, giving
+   unfused/stack-tier `typeof` compares the pointer fast path too.
+   Compile-scoped, so nothing is retained across programs.
+3. **`op_add` String+String fast path**: both operands already primitive —
+   ToPrimitive and ToString are identities — so concatenate directly under
+   the same length cap; skipped are two identity-clone ToPrimitive calls
+   and two ToString round-trips per join (`label + ":" + v` pays it
+   twice).
+4. **Pooled for-in key buffers** (`Vm::forin_pool`): a glue loop
+   for-inning a fresh object per iteration reused one buffer allocation
+   instead of a malloc/free per loop entry; parked cleared at `ForInPop`
+   (unwound frames just miss the pool).
+
+Evaluated and REJECTED: a for-in slot-carry for `rec[k]` re-hashing —
+the measured cost is ~1.7% of the row and soundness needs a generation
+counter on every `ObjectData`, undoing §6.13's size diet; the arena/GC
+recycle point remains the real allocation lever (drops + malloc still
+~12% after this round).
+
+### 6.16.1 Measured (callgrind, whole workload; wall interleaved medians)
+
+| workload | before | after | Δ instructions | wall |
+| --- | ---: | ---: | ---: | ---: |
+| mixed_helpers | 2.319 G | 1.996 G | **−13.9%** | 260 → 226 ms |
+| normalize/for-in phase probe | 1.504 G | ~1.26 G | −16% | 166 → 142 ms |
+| fib_recursive / sort / others | — | — | ±0.001% | unchanged |
+
+The row stays ~2× CPython (~227 vs ~116 ms execution on the same box) —
+CPython's dict iteration, type dispatch, and string concat are its own
+C-tuned native gait, and parity for chidori on this shape needs the
+ObjectData arena or a baseline-compile step, both tracked.
+
+**Gates:** reg differential corpus grew 7 typeof-dispatch programs (every
+tag × every value kind, negated/loose/literal-on-the-left forms, a
+non-typeof-name literal, non-branch consumers, the LoadGlobalTypeof path)
+plus a structural pin (`typeof_branches_fuse`, positive and negative);
+the reg budget sweep runs over the new corpus entries (and caught the
+first cost-model cut); full suites green; benchmark cross-checks green on
+all four runtimes; clippy and rustfmt clean.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

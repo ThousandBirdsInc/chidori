@@ -110,3 +110,41 @@ pub fn typeof_result(t: &'static str) -> JsString {
         _ => JsString::new(t),
     }
 }
+
+/// The interned typeof-name string for an arbitrary `&str`, or `None` when
+/// it is not one of the eight. Lets the compiler build `"number"`-class
+/// STRING CONSTANTS from the same allocation the interpreter's `typeof`
+/// results use, so an unfused `typeof x === "number"` confirms equality on
+/// the `JsString` pointer fast path instead of comparing bytes.
+pub fn typeof_name(s: &str) -> Option<JsString> {
+    Some(match s {
+        "undefined" => tof_undefined(),
+        "object" => tof_object(),
+        "boolean" => tof_boolean(),
+        "number" => tof_number(),
+        "string" => tof_string(),
+        "symbol" => tof_symbol(),
+        "function" => tof_function(),
+        "bigint" => tof_bigint(),
+        _ => return None,
+    })
+}
+
+/// The `&'static str` type tag matching an arbitrary string, when it is one
+/// of the eight `typeof` names — the compile-time half of the fused
+/// typeof-dispatch test (`ROp::TypeofBr`): `Value::type_of` returns exactly
+/// these statics, so content equality of a typeof result against such a
+/// literal is `type_of(v) == tag`.
+pub fn typeof_tag(s: &str) -> Option<&'static str> {
+    Some(match s {
+        "undefined" => "undefined",
+        "object" => "object",
+        "boolean" => "boolean",
+        "number" => "number",
+        "string" => "string",
+        "symbol" => "symbol",
+        "function" => "function",
+        "bigint" => "bigint",
+        _ => return None,
+    })
+}
