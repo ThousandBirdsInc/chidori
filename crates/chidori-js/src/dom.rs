@@ -1473,7 +1473,7 @@ fn remove_listener(dom: &Rc<RefCell<Dom>>, node: usize, ty: &str, handler: &Valu
 }
 
 fn define_accessor(target: &JsObject, name: &str, get: Value, set: Option<Value>) {
-    target.borrow_mut().props.insert(
+    target.borrow_mut().own_insert(
         PropertyKey::str(name),
         Property {
             kind: PropertyKind::Accessor {

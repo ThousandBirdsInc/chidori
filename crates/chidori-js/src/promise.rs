@@ -80,8 +80,7 @@ impl Vm {
                 .realm
                 .promise_proto
                 .borrow()
-                .props
-                .get(&StrKeyRef("then"))
+                .own_get(&StrKeyRef("then"))
                 .and_then(|p| p.value().cloned());
             let is_intrinsic_then = matches!(
                 (&then, &builtin_then),

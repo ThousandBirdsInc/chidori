@@ -122,8 +122,7 @@ impl Vm {
                 {
                     let mut b = o.borrow_mut();
                     for (k, val) in m {
-                        b.props
-                            .insert(PropertyKey::str(k), Property::data(self.json_to_value(val)));
+                        b.own_insert(PropertyKey::str(k), Property::data(self.json_to_value(val)));
                     }
                 }
                 Value::Object(o)

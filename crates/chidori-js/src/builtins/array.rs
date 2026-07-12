@@ -151,8 +151,7 @@ pub fn install(vm: &mut Vm) {
     for (name, slot) in [("push", 0), ("pop", 1)] {
         let f = proto
             .borrow()
-            .props
-            .get(&PropertyKey::str(name))
+            .own_get(&PropertyKey::str(name))
             .and_then(|p| p.value().cloned());
         if let Some(Value::Object(o)) = f {
             if slot == 0 {
@@ -261,7 +260,7 @@ fn has_get_elem(vm: &mut Vm, base: &Value, idx: f64) -> Result<Option<Value>, Va
         if let Value::Object(o) = base {
             let b = o.borrow();
             if let Internal::Array(arr) = &b.internal {
-                if b.props.is_empty() {
+                if b.own_is_empty() {
                     if let Some(v) = arr.get(idx as usize) {
                         if !matches!(v, Value::Hole) {
                             return Ok(Some(v.clone()));
@@ -304,7 +303,7 @@ fn set_elem(vm: &mut Vm, base: &Value, idx: f64, v: Value) -> Result<(), Value> 
     if idx >= 0.0 && idx <= u32::MAX as f64 {
         if let Value::Object(o) = base {
             let mut b = o.borrow_mut();
-            if b.props.is_empty() {
+            if b.own_is_empty() {
                 if let Internal::Array(arr) = &mut b.internal {
                     if let Some(slot) = arr.get_mut(idx as usize) {
                         if !matches!(slot, Value::Hole) {
@@ -365,7 +364,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         if let Value::Object(o) = &this {
             let start = {
                 let b = o.borrow();
-                if b.props.is_empty() && b.extensible {
+                if b.own_is_empty() && b.extensible {
                     match &b.internal {
                         Internal::Array(arr)
                             if arr.len() + args.len() <= crate::value::MAX_DENSE_ARRAY =>
@@ -413,7 +412,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // prototype chain), as does an empty array's length write-back.
         if let Value::Object(o) = &this {
             let mut b = o.borrow_mut();
-            if b.props.is_empty() && b.extensible {
+            if b.own_is_empty() && b.extensible {
                 if let Internal::Array(arr) = &mut b.internal {
                     match arr.last() {
                         Some(v) if !matches!(v, Value::Hole) => {
@@ -1161,7 +1160,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let dense_ok = {
             let b = o.borrow();
             matches!(b.internal, Internal::Array(_))
-                && !b.props.keys().any(|k| k.array_index().is_some())
+                && !b.own_keys_iter().any(|k| k.array_index().is_some())
                 && matches!(&b.internal, Internal::Array(a) if !a.iter().any(|v| matches!(v, Value::Hole)))
         };
         if dense_ok {
@@ -1464,12 +1463,11 @@ fn install_unscopables(vm: &mut Vm, proto: &JsObject) {
             "toSpliced",
             "values",
         ] {
-            b.props
-                .insert(PropertyKey::str(name), Property::data(Value::Bool(true)));
+            b.own_insert(PropertyKey::str(name), Property::data(Value::Bool(true)));
         }
     }
     let sym = vm.realm.symbol_unscopables.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(sym),
         Property {
             kind: PropertyKind::Data {
@@ -1897,7 +1895,7 @@ fn install_iterator_protos(vm: &mut Vm) {
             };
             vm.builtin_iterator_next(&o)
         });
-        proto.borrow_mut().props.insert(
+        proto.borrow_mut().own_insert(
             PropertyKey::str("next"),
             Property::builtin(Value::Object(next_fn.clone())),
         );
@@ -1907,7 +1905,7 @@ fn install_iterator_protos(vm: &mut Vm) {
         // %XIteratorPrototype%[@@toStringTag] — non-writable, non-enumerable,
         // configurable.
         let sym = vm.realm.symbol_to_string_tag.clone();
-        proto.borrow_mut().props.insert(
+        proto.borrow_mut().own_insert(
             PropertyKey::Sym(sym),
             Property {
                 kind: PropertyKind::Data {

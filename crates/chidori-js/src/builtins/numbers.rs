@@ -708,7 +708,7 @@ fn install_math(vm: &mut Vm) {
 
     // Math[Symbol.toStringTag] = "Math" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    math.borrow_mut().props.insert(
+    math.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -730,8 +730,7 @@ fn install_math(vm: &mut Vm) {
         .map(|k| {
             match math
                 .borrow()
-                .props
-                .get(&PropertyKey::str(k.name()))
+                .own_get(&PropertyKey::str(k.name()))
                 .and_then(|p| p.value().cloned())
             {
                 Some(Value::Object(o)) => o,
@@ -908,8 +907,7 @@ fn install_json(vm: &mut Vm) {
             let holder = vm.new_object();
             holder
                 .borrow_mut()
-                .props
-                .insert(PropertyKey::str(""), Property::data(v));
+                .own_insert(PropertyKey::str(""), Property::data(v));
             return json_revive(vm, &holder, "", &reviver);
         }
         Ok(v)
@@ -932,8 +930,7 @@ fn install_json(vm: &mut Vm) {
         let holder = vm.new_object();
         holder
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str(""), Property::data(value));
+            .own_insert(PropertyKey::str(""), Property::data(value));
         let mut out = String::with_capacity(128);
         let root_key = JsString::from("");
         if json_stringify(
@@ -951,7 +948,7 @@ fn install_json(vm: &mut Vm) {
     });
     // JSON[Symbol.toStringTag] = "JSON" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    json.borrow_mut().props.insert(
+    json.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -1416,10 +1413,10 @@ impl<'a> JsonParser<'a> {
                 let mut b = obj.borrow_mut();
                 // One up-front table allocation covers the common ≤8-member
                 // object instead of the 0→3→7 growth (two allocs + a rehash).
-                if b.props.capacity() == 0 {
-                    b.props.reserve(8);
+                if b.own_capacity() == 0 {
+                    b.own_reserve(8);
                 }
-                b.props.insert(key, Property::data(v));
+                b.own_insert(key, Property::data(v));
             }
             self.skip_ws();
             if self.pos >= self.bytes.len() {

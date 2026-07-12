@@ -774,15 +774,13 @@ pub fn protos_allow_index_create(proto: Option<JsObject>, idx: u32, count: u32) 
             // String character slots, mapped Arguments, …) own their [[Set]].
             _ => return false,
         }
-        if !b.props.is_empty() {
-            if b.props.contains_key(&StrKeyRef(first)) {
+        if !b.own_is_empty() {
+            if b.own_contains_key(&StrKeyRef(first)) {
                 return false;
             }
             for j in 1..count {
                 let mut buf = [0u8; 10];
-                if b.props
-                    .contains_key(&StrKeyRef(fmt_index(idx + j, &mut buf)))
-                {
+                if b.own_contains_key(&StrKeyRef(fmt_index(idx + j, &mut buf))) {
                     return false;
                 }
             }
@@ -810,7 +808,7 @@ pub fn protos_allow_any_index_create(start: &JsObject) -> bool {
             Internal::Ordinary | Internal::Array(_) => {}
             _ => return false,
         }
-        if !b.props.is_empty() && b.props.keys().any(|k| k.array_index().is_some()) {
+        if !b.own_is_empty() && b.own_keys_iter().any(|k| k.array_index().is_some()) {
             return false;
         }
         let next = b.proto.clone();
@@ -885,7 +883,11 @@ impl Property {
 
 pub struct ObjectData {
     pub proto: Option<JsObject>,
-    pub props: crate::fxhash::FxIndexMap<PropertyKey, Property>,
+    /// The ordinary own-property storage. Private to this module: every other
+    /// part of the engine goes through the `own_*` accessor API below, so the
+    /// backing representation can change (see `PropStorage`) without touching
+    /// the 300+ call sites again.
+    props: crate::fxhash::FxIndexMap<PropertyKey, Property>,
     pub extensible: bool,
     pub internal: Internal,
     /// The spec `[[PrivateElements]]` list, keyed by [`PrivateName::id`].
@@ -908,16 +910,164 @@ impl ObjectData {
     pub fn private_get(&self, id: u64) -> Option<&PrivateElement> {
         self.privates.as_ref().and_then(|p| p.get(&id))
     }
+
+    // =====================================================================
+    // Own-property accessor API (see docs/js-object-shapes-design.md §4,
+    // Phase 1). This is the ONLY way the rest of the engine touches the
+    // ordinary own-property storage; the map itself is module-private.
+    //
+    // The API mirrors `IndexMap`'s surface deliberately: the inline caches
+    // and the kernel prop machinery depend on stable insertion-order slot
+    // indices (`own_get_full` hands them out, `own_get_index[_mut]` uses
+    // them), and probes are generic over `Equivalent<PropertyKey>` so the
+    // alloc-free `StrKeyRef` guards keep working unchanged.
+    // =====================================================================
+
+    /// The own property for `key`, if present.
+    #[inline]
+    pub fn own_get<Q>(&self, key: &Q) -> Option<&Property>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        self.props.get(key)
+    }
+
+    /// Mutable access to the own property for `key`, if present.
+    #[inline]
+    pub fn own_get_mut<Q>(&mut self, key: &Q) -> Option<&mut Property>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        self.props.get_mut(key)
+    }
+
+    /// The own property for `key` with its insertion-order slot index (the
+    /// index the inline caches and kernel prop localization cache; it is
+    /// stable for the property's lifetime).
+    #[inline]
+    pub fn own_get_full<Q>(&self, key: &Q) -> Option<(usize, &PropertyKey, &Property)>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        self.props.get_full(key)
+    }
+
+    /// Mutable variant of [`Self::own_get_full`].
+    #[inline]
+    pub fn own_get_full_mut<Q>(&mut self, key: &Q) -> Option<(usize, &PropertyKey, &mut Property)>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        self.props.get_full_mut(key)
+    }
+
+    /// Whether an own property for `key` exists.
+    #[inline]
+    pub fn own_contains_key<Q>(&self, key: &Q) -> bool
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        self.props.contains_key(key)
+    }
+
+    /// Insert (or replace, preserving insertion order) the own property for
+    /// `key`, returning the previous property if any — `IndexMap::insert`
+    /// semantics. Spec checks (extensibility, writability) are the CALLER's
+    /// job, exactly as with the raw map.
+    #[inline]
+    pub fn own_insert(&mut self, key: PropertyKey, prop: Property) -> Option<Property> {
+        self.props.insert(key, prop)
+    }
+
+    /// Remove the own property for `key`, preserving the insertion order of
+    /// the remaining properties (`shift_remove` semantics — enumeration
+    /// order is observable).
+    #[inline]
+    pub fn own_remove<Q>(&mut self, key: &Q) -> Option<Property>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        self.props.shift_remove(key)
+    }
+
+    /// The own property at insertion-order slot `i` (IC/kernel verification:
+    /// callers compare the returned key against the expected one).
+    #[inline]
+    pub fn own_get_index(&self, i: usize) -> Option<(&PropertyKey, &Property)> {
+        self.props.get_index(i)
+    }
+
+    /// Mutable variant of [`Self::own_get_index`].
+    #[inline]
+    pub fn own_get_index_mut(&mut self, i: usize) -> Option<(&PropertyKey, &mut Property)> {
+        self.props.get_index_mut(i)
+    }
+
+    /// Number of own properties in the ordinary storage.
+    #[inline]
+    pub fn own_len(&self) -> usize {
+        self.props.len()
+    }
+
+    /// `true` when the ordinary own-property storage is empty — the guard
+    /// every dense-array/exotic fast path checks ("nothing reified can
+    /// shadow").
+    #[inline]
+    pub fn own_is_empty(&self) -> bool {
+        self.props.is_empty()
+    }
+
+    /// Iterate own properties in insertion order.
+    #[inline]
+    pub fn own_iter(&self) -> indexmap::map::Iter<'_, PropertyKey, Property> {
+        self.props.iter()
+    }
+
+    /// Iterate own property keys in insertion order.
+    #[inline]
+    pub fn own_keys_iter(&self) -> indexmap::map::Keys<'_, PropertyKey, Property> {
+        self.props.keys()
+    }
+
+    /// Pre-size the storage for `n` additional properties.
+    #[inline]
+    pub fn own_reserve(&mut self, n: usize) {
+        self.props.reserve(n);
+    }
+
+    /// Allocated capacity of the storage (0 ⇔ nothing allocated yet).
+    #[inline]
+    pub fn own_capacity(&self) -> usize {
+        self.props.capacity()
+    }
+
+    /// Drop every own property (GC edge-clearing).
+    #[inline]
+    pub fn own_clear(&mut self) {
+        self.props.clear();
+    }
+
+    /// Replace the whole storage with a pre-built map (object-literal
+    /// template instantiation).
+    #[inline]
+    pub fn set_props_map(&mut self, map: crate::fxhash::FxIndexMap<PropertyKey, Property>) {
+        self.props = map;
+    }
+
+    /// Take the whole storage, leaving it empty (teardown / cycle breaking).
+    #[inline]
+    pub fn take_props_map(&mut self) -> crate::fxhash::FxIndexMap<PropertyKey, Property> {
+        std::mem::take(&mut self.props)
+    }
     /// Does `props` hold a (reified) entry for the array index `idx`?
     /// Alloc-free: the index is formatted into a stack buffer and probed via
     /// [`StrKeyRef`], so hot fast-path guards can call this per element.
     pub fn has_index_prop(&self, idx: u32) -> bool {
-        if self.props.is_empty() {
+        if self.own_is_empty() {
             return false;
         }
         let mut buf = [0u8; 10];
-        self.props
-            .contains_key(&StrKeyRef(fmt_index(idx, &mut buf)))
+        self.own_contains_key(&StrKeyRef(fmt_index(idx, &mut buf)))
     }
     /// Append a private element; `false` (no insert) when `id` is already
     /// present — the caller's duplicate-initialization TypeError.

@@ -803,18 +803,17 @@ impl Vm {
                     let d = self.new_object();
                     {
                         let mut b = d.borrow_mut();
-                        b.props
-                            .insert(PropertyKey::str("value"), Property::data(value.clone()));
+                        b.own_insert(PropertyKey::str("value"), Property::data(value.clone()));
                         if existing.is_undefined() {
-                            b.props.insert(
+                            b.own_insert(
                                 PropertyKey::str("writable"),
                                 Property::data(Value::Bool(true)),
                             );
-                            b.props.insert(
+                            b.own_insert(
                                 PropertyKey::str("enumerable"),
                                 Property::data(Value::Bool(true)),
                             );
-                            b.props.insert(
+                            b.own_insert(
                                 PropertyKey::str("configurable"),
                                 Property::data(Value::Bool(true)),
                             );
@@ -961,11 +960,11 @@ pub fn install(vm: &mut Vm) {
         let result = vm.new_object();
         {
             let mut b = result.borrow_mut();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("proxy"),
                 Property::data(Value::Object(proxy)),
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("revoke"),
                 Property::data(Value::Object(revoke)),
             );

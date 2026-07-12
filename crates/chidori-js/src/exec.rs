@@ -410,7 +410,7 @@ impl Vm {
         let Some(canon) = &self.realm.ta_length_getter else {
             return false;
         };
-        if !o.borrow().props.is_empty() {
+        if !o.borrow().own_is_empty() {
             return false;
         }
         let key = crate::value::StrKeyRef("length");
@@ -421,7 +421,7 @@ impl Vm {
         for _ in 0..4 {
             let Some(p) = cur else { break };
             let b = p.borrow();
-            if let Some(prop) = b.props.get(&key) {
+            if let Some(prop) = b.own_get(&key) {
                 return matches!(
                     &prop.kind,
                     PropertyKind::Accessor { get: Some(Value::Object(g)), .. }
@@ -445,7 +445,7 @@ impl Vm {
         {
             let g = self.realm.global.borrow();
             let math_ok = matches!(
-                g.props.get(&crate::value::StrKeyRef("Math")),
+                g.own_get(&crate::value::StrKeyRef("Math")),
                 Some(Property {
                     kind: PropertyKind::Data { value: Value::Object(o), .. },
                     ..
@@ -458,7 +458,7 @@ impl Vm {
         let mb = canon.borrow();
         used.iter().all(|k| {
             matches!(
-                mb.props.get(&crate::value::StrKeyRef(k.name())),
+                mb.own_get(&crate::value::StrKeyRef(k.name())),
                 Some(Property {
                     kind: PropertyKind::Data { value: Value::Object(o), .. },
                     ..
@@ -479,7 +479,7 @@ impl Vm {
             return false;
         };
         matches!(
-            self.realm.array_proto.borrow().props.get(&crate::value::StrKeyRef(name)),
+            self.realm.array_proto.borrow().own_get(&crate::value::StrKeyRef(name)),
             Some(Property {
                 kind: PropertyKind::Data { value: Value::Object(o), .. },
                 ..
@@ -501,8 +501,7 @@ impl Vm {
             self.realm
                 .string_proto
                 .borrow()
-                .props
-                .get(&crate::value::StrKeyRef("charCodeAt")),
+                .own_get(&crate::value::StrKeyRef("charCodeAt")),
             Some(Property {
                 kind: PropertyKind::Data { value: Value::Object(o), .. },
                 ..
@@ -675,7 +674,7 @@ impl Vm {
                 let ok = if let Value::Object(o) = &frame.locals[k.oslots[obj as usize] as usize] {
                     let b = o.borrow();
                     matches!(b.internal, Internal::Array(_))
-                        && b.props.is_empty()
+                        && b.own_is_empty()
                         && b.extensible
                         && b.proto
                             .as_ref()
@@ -717,7 +716,7 @@ impl Vm {
                             kind: PropertyKind::Data { value, writable },
                             ..
                         },
-                    )) = b.props.get_full(&PropertyKey::str(&p.key))
+                    )) = b.own_get_full(&PropertyKey::str(&p.key))
                     {
                         if matches!(value, Value::Number(_)) && (!p.store || *writable) {
                             let id = (o.ptr_id(), idx as u32);
@@ -792,7 +791,7 @@ impl Vm {
             let prop_base = k.n_regs as usize - k.props_used.len();
             for (i, p) in k.props_used.iter().enumerate() {
                 let b = objs[p.oslot as usize].borrow();
-                match b.props.get_index(prop_slots[i] as usize) {
+                match b.own_get_index(prop_slots[i] as usize) {
                     Some((
                         _,
                         Property {
@@ -1021,7 +1020,7 @@ impl Vm {
                     if let Some(iu) = dense_index(i) {
                         let b = objs[obj as usize].borrow();
                         match &b.internal {
-                            Internal::Array(arr) if b.props.is_empty() => {
+                            Internal::Array(arr) if b.own_is_empty() => {
                                 if let Some(Value::Number(n)) = arr.get(iu) {
                                     w[dst as usize & KWIN_MASK] = *n;
                                     ok = true;
@@ -1067,7 +1066,7 @@ impl Vm {
                     let mut ok = false;
                     {
                         let mut b = objs[obj as usize].borrow_mut();
-                        if b.props.is_empty()
+                        if b.own_is_empty()
                             && b.extensible
                             && b.proto
                                 .as_ref()
@@ -1094,7 +1093,7 @@ impl Vm {
                     let mut ok = false;
                     {
                         let mut b = objs[obj as usize].borrow_mut();
-                        if b.props.is_empty() && b.extensible {
+                        if b.own_is_empty() && b.extensible {
                             if let Internal::Array(arr) = &mut b.internal {
                                 if let Some(Value::Number(n)) = arr.last() {
                                     w[dst as usize & KWIN_MASK] = *n;
@@ -1128,7 +1127,7 @@ impl Vm {
                     if let Some(iu) = dense_index(i) {
                         let mut b = objs[obj as usize].borrow_mut();
                         let extensible = b.extensible;
-                        let props_empty = b.props.is_empty();
+                        let props_empty = b.own_is_empty();
                         match &mut b.internal {
                             Internal::Array(arr) if props_empty => {
                                 match arr.get_mut(iu) {
@@ -1219,7 +1218,7 @@ impl Vm {
                     {
                         let b = objs[obj as usize].borrow();
                         match &b.internal {
-                            Internal::Array(arr) if b.props.is_empty() => {
+                            Internal::Array(arr) if b.own_is_empty() => {
                                 w[dst as usize & KWIN_MASK] = arr.len() as f64;
                                 ok = true;
                             }
@@ -1304,7 +1303,7 @@ impl Vm {
                     {
                         let b = objs[obj as usize].borrow();
                         match &b.internal {
-                            Internal::Array(arr) if b.props.is_empty() => {
+                            Internal::Array(arr) if b.own_is_empty() => {
                                 w[dst as usize & KWIN_MASK] = arr.len() as f64;
                                 ok = true;
                             }
@@ -1342,7 +1341,7 @@ impl Vm {
                     if let Some(iu) = dense_index(i) {
                         let b = objs[obj as usize].borrow();
                         match &b.internal {
-                            Internal::Array(arr) if b.props.is_empty() => {
+                            Internal::Array(arr) if b.own_is_empty() => {
                                 if let Some(Value::Number(n)) = arr.get(iu) {
                                     w[dst as usize & KWIN_MASK] = *n;
                                     ok = true;
@@ -1387,7 +1386,7 @@ impl Vm {
                     if let Some(iu) = dense_index(i) {
                         let b = objs[obj as usize].borrow();
                         match &b.internal {
-                            Internal::Array(arr) if b.props.is_empty() => {
+                            Internal::Array(arr) if b.own_is_empty() => {
                                 if let Some(Value::Number(n)) = arr.get(iu) {
                                     w[dst as usize & KWIN_MASK] = *n;
                                     ok = true;
@@ -2021,7 +2020,7 @@ impl Vm {
             let g = self.realm.global.borrow();
             for c in fam.global_checks.iter() {
                 let ok = matches!(
-                    g.props.get_index(c.slot as usize),
+                    g.own_get_index(c.slot as usize),
                     Some((
                         k,
                         Property {
@@ -2124,7 +2123,7 @@ impl Vm {
                     match r {
                         crate::bytecode::SelfRefKind::Global(name) => {
                             let g = self.realm.global.borrow();
-                            match g.props.get_full(&PropertyKey::str(name)) {
+                            match g.own_get_full(&PropertyKey::str(name)) {
                                 Some((
                                     slot,
                                     key,
@@ -2183,7 +2182,7 @@ impl Vm {
                 for name in rec.globals.iter() {
                     let (bf2, slot, key) = {
                         let g = self.realm.global.borrow();
-                        match g.props.get_full(&PropertyKey::str(name)) {
+                        match g.own_get_full(&PropertyKey::str(name)) {
                             Some((
                                 slot,
                                 key,
@@ -2628,7 +2627,7 @@ impl Vm {
         {
             let mut b = o.borrow_mut();
             for (i, v) in frame.args.iter().enumerate() {
-                b.props.insert(
+                b.own_insert(
                     PropertyKey::from_index(i as u32),
                     Property {
                         kind: PropertyKind::Data {
@@ -2640,7 +2639,7 @@ impl Vm {
                     },
                 );
             }
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -2657,12 +2656,11 @@ impl Vm {
             .realm
             .array_proto
             .borrow()
-            .props
-            .get(&PropertyKey::str("values"))
+            .own_get(&PropertyKey::str("values"))
             .and_then(|p| p.value().cloned())
             .unwrap_or(Value::Undefined);
         let iter_key = PropertyKey::Sym(self.realm.symbol_iterator.clone());
-        o.borrow_mut().props.insert(
+        o.borrow_mut().own_insert(
             iter_key,
             Property {
                 kind: PropertyKind::Data {
@@ -2704,8 +2702,7 @@ impl Vm {
             }
         };
         o.borrow_mut()
-            .props
-            .insert(PropertyKey::str("callee"), callee);
+            .own_insert(PropertyKey::str("callee"), callee);
         Value::Object(o)
     }
 
@@ -3347,7 +3344,7 @@ impl Vm {
                     let key = PropertyKey::str(name);
                     let (present, extensible) = {
                         let b = g.borrow();
-                        (b.props.contains_key(&key), b.extensible)
+                        (b.own_contains_key(&key), b.extensible)
                     };
                     if !present {
                         if !extensible {
@@ -3358,8 +3355,7 @@ impl Vm {
                         // global var is deletable (configurable), unlike a
                         // script-level one.
                         g.borrow_mut()
-                            .props
-                            .insert(key, Property::data(Value::Undefined));
+                            .own_insert(key, Property::data(Value::Undefined));
                     }
                 } else {
                     // Function-scope eval var: lives on the caller frame's
@@ -3375,10 +3371,10 @@ impl Vm {
                         }
                     };
                     let key = PropertyKey::str(name);
-                    if !ev.borrow().props.contains_key(&key) {
+                    if !ev.borrow().own_contains_key(&key) {
                         let mut p = Property::data(Value::Undefined);
                         p.enumerable = true;
-                        ev.borrow_mut().props.insert(key, p);
+                        ev.borrow_mut().own_insert(key, p);
                     }
                 }
             }
@@ -3545,7 +3541,7 @@ impl Vm {
                 // answered directly from the dense Vec, mirroring
                 // `get_from_object`'s array arm (a reified `length` can
                 // only live in `props`, which is empty here).
-                if is_arr && b.props.is_empty() && name.as_str() == "length" {
+                if is_arr && b.own_is_empty() && name.as_str() == "length" {
                     if let Internal::Array(a) = &b.internal {
                         return Ok(Value::Number(a.len() as f64));
                     }
@@ -3557,7 +3553,7 @@ impl Vm {
                     // Own-property hit: never touches the holder cell.
                     if is_ord {
                         if let Some((PropertyKey::Str(k), prop)) =
-                            b.props.get_index(ic.own_slot.get() as usize)
+                            b.own_get_index(ic.own_slot.get() as usize)
                         {
                             if let PropertyKind::Data { value, .. } = &prop.kind {
                                 if k == &name {
@@ -3570,13 +3566,13 @@ impl Vm {
                     // Proto hit: valid only when the receiver has no
                     // own props (nothing can shadow) and its CURRENT
                     // direct proto is the cached holder.
-                    if b.props.is_empty() {
+                    if b.own_is_empty() {
                         let holder = ic.holder.borrow();
                         if let Some(h) = &*holder {
                             if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
                                 let hb = h.borrow();
                                 if let Some((PropertyKey::Str(k), prop)) =
-                                    hb.props.get_index(ic.proto_slot.get() as usize)
+                                    hb.own_get_index(ic.proto_slot.get() as usize)
                                 {
                                     if let PropertyKind::Data { value, .. } = &prop.kind {
                                         if k == &name {
@@ -3593,7 +3589,7 @@ impl Vm {
                     // props can shadow.
                     let key = PropertyKey::Str(name.clone());
                     if is_ord {
-                        if let Some((idx, _, prop)) = b.props.get_full(&key) {
+                        if let Some((idx, _, prop)) = b.own_get_full(&key) {
                             if let PropertyKind::Data { value, .. } = &prop.kind {
                                 ic.own_slot.set(idx as u32);
                                 let v = value.clone();
@@ -3601,13 +3597,13 @@ impl Vm {
                             }
                         }
                     }
-                    if b.props.is_empty() {
+                    if b.own_is_empty() {
                         if let Some(p) = &b.proto {
                             let pb = p.borrow();
                             if matches!(pb.internal, Internal::Ordinary)
                                 || matches!(pb.internal, Internal::Array(_))
                             {
-                                if let Some((idx, _, prop)) = pb.props.get_full(&key) {
+                                if let Some((idx, _, prop)) = pb.own_get_full(&key) {
                                     if let PropertyKind::Data { value, .. } = &prop.kind {
                                         ic.proto_slot.set(idx as u32);
                                         let v = value.clone();
@@ -3651,7 +3647,7 @@ impl Vm {
                 let mut b = o.borrow_mut();
                 if matches!(b.internal, Internal::Ordinary) {
                     if let Some((PropertyKey::Str(k), prop)) =
-                        b.props.get_index_mut(ic.own_slot.get() as usize)
+                        b.own_get_index_mut(ic.own_slot.get() as usize)
                     {
                         if k == &name {
                             if let PropertyKind::Data {
@@ -3665,7 +3661,7 @@ impl Vm {
                         }
                     }
                     let key = PropertyKey::Str(name.clone());
-                    if let Some((idx, _, prop)) = b.props.get_full_mut(&key) {
+                    if let Some((idx, _, prop)) = b.own_get_full_mut(&key) {
                         if let PropertyKind::Data {
                             value: slot,
                             writable: true,
@@ -3699,7 +3695,7 @@ impl Vm {
             if let Some(iu) = dense_index(*n) {
                 let b = o.borrow();
                 if let Internal::Array(arr) = &b.internal {
-                    if b.props.is_empty() {
+                    if b.own_is_empty() {
                         if let Some(v) = arr.get(iu) {
                             if !matches!(v, Value::Hole) {
                                 let v = v.clone();
@@ -3760,7 +3756,7 @@ impl Vm {
                 let mut creates = None;
                 {
                     let mut b = o.borrow_mut();
-                    if b.props.is_empty() {
+                    if b.own_is_empty() {
                         let extensible = b.extensible;
                         if let Internal::Array(arr) = &mut b.internal {
                             match arr.get_mut(i) {
@@ -3822,8 +3818,7 @@ impl Vm {
         // indexed load plus a pointer-equality key check, no hashing.
         if let Some(ic) = ic {
             let b = g.borrow();
-            if let Some((PropertyKey::Str(k), prop)) = b.props.get_index(ic.own_slot.get() as usize)
-            {
+            if let Some((PropertyKey::Str(k), prop)) = b.own_get_index(ic.own_slot.get() as usize) {
                 if let PropertyKind::Data { value, .. } = &prop.kind {
                     if k == &name {
                         let v = value.clone();
@@ -3839,7 +3834,7 @@ impl Vm {
         // the inline cache with the slot it finds.
         let fast = {
             let b = g.borrow();
-            match b.props.get_full(&key) {
+            match b.own_get_full(&key) {
                 Some((
                     idx,
                     _,
@@ -3957,7 +3952,7 @@ impl Vm {
         let key = PropertyKey::Str(name.clone());
         let (present, extensible) = {
             let b = g.borrow();
-            (b.props.contains_key(&key), b.extensible)
+            (b.own_contains_key(&key), b.extensible)
         };
         if !present {
             // CanDeclareGlobalVar/Function: needs an extensible global.
@@ -3966,7 +3961,7 @@ impl Vm {
             }
             // CreateGlobalVarBinding(N, D): writable, enumerable;
             // configurable only for eval-created bindings.
-            g.borrow_mut().props.insert(
+            g.borrow_mut().own_insert(
                 key,
                 Property {
                     kind: PropertyKind::Data {
@@ -3991,7 +3986,7 @@ impl Vm {
         // absent, on a non-extensible global) the declaration fails.
         let definable = {
             let b = g.borrow();
-            match b.props.get(&key) {
+            match b.own_get(&key) {
                 None => b.extensible,
                 Some(p) => {
                     p.configurable
@@ -4022,14 +4017,14 @@ impl Vm {
         // is just assigned the new value.
         let redefine = {
             let b = g.borrow();
-            match b.props.get(&key) {
+            match b.own_get(&key) {
                 None => true,
                 Some(p) => p.configurable,
             }
         };
         let mut b = g.borrow_mut();
         if redefine {
-            b.props.insert(
+            b.own_insert(
                 key,
                 Property {
                     kind: PropertyKind::Data {
@@ -4040,7 +4035,7 @@ impl Vm {
                     configurable: deletable,
                 },
             );
-        } else if let Some(p) = b.props.get_mut(&key) {
+        } else if let Some(p) = b.own_get_mut(&key) {
             if let PropertyKind::Data { value: slot, .. } = &mut p.kind {
                 *slot = value;
             }
@@ -4076,7 +4071,7 @@ impl Vm {
         // template object, which is itself frozen (spec
         // GetTemplateObject / TemplateString integrity).
         crate::builtins::fundamental::set_integrity_level(self, &raw_arr, true)?;
-        arr.borrow_mut().props.insert(
+        arr.borrow_mut().own_insert(
             PropertyKey::str("raw"),
             Property {
                 kind: PropertyKind::Data {
@@ -4128,7 +4123,7 @@ impl Vm {
                 // key — e.g. a computed static "prototype" — is a TypeError).
                 self.check_redefinable(obj, &key)?;
                 if let Value::Object(o) = obj {
-                    o.borrow_mut().props.insert(key, Property::builtin(value));
+                    o.borrow_mut().own_insert(key, Property::builtin(value));
                 }
             }
             DefKind::Getter => {
@@ -4166,11 +4161,11 @@ impl Vm {
             if let Value::Object(s) = src {
                 for k in self.enumerable_own_keys_dyn(s)? {
                     let val = self.get_prop(src, &k)?;
-                    t.borrow_mut().props.insert(k, Property::data(val));
+                    t.borrow_mut().own_insert(k, Property::data(val));
                 }
             } else if let Value::String(st) = src {
                 for (i, c) in st.as_str().chars().enumerate() {
-                    t.borrow_mut().props.insert(
+                    t.borrow_mut().own_insert(
                         PropertyKey::from_index(i as u32),
                         Property::data(Value::str(c.to_string())),
                     );
@@ -4195,7 +4190,7 @@ impl Vm {
                 // not observe a [[GetOwnProperty]]/[[Get]] for them.
                 for k in self.enumerable_own_keys_excluding(s, excluded)? {
                     let val = self.get_prop(src, &k)?;
-                    t.borrow_mut().props.insert(k, Property::data(val));
+                    t.borrow_mut().own_insert(k, Property::data(val));
                 }
             } else if let Value::String(st) = src {
                 // A primitive-string source contributes its index keys.
@@ -4205,8 +4200,7 @@ impl Vm {
                         continue;
                     }
                     t.borrow_mut()
-                        .props
-                        .insert(k, Property::data(Value::str(c.to_string())));
+                        .own_insert(k, Property::data(Value::str(c.to_string())));
                 }
             }
         }
@@ -4234,7 +4228,7 @@ impl Vm {
                 } else {
                     format!("{} {}", prefix.as_str(), base)
                 };
-                f.borrow_mut().props.insert(
+                f.borrow_mut().own_insert(
                     PropertyKey::str("name"),
                     Property {
                         kind: PropertyKind::Data {
@@ -7029,7 +7023,7 @@ impl Vm {
         loop {
             let proto = {
                 let b = cur.borrow();
-                if b.props.contains_key(key) {
+                if b.own_contains_key(key) {
                     return true;
                 }
                 b.proto.clone()
@@ -7083,7 +7077,7 @@ impl Vm {
     /// definitions (`static ['prototype']() {}` must throw, not overwrite).
     fn check_redefinable(&mut self, obj: &Value, key: &PropertyKey) -> Result<(), Value> {
         if let Value::Object(o) = obj {
-            let non_config = o.borrow().props.get(key).is_some_and(|p| !p.configurable);
+            let non_config = o.borrow().own_get(key).is_some_and(|p| !p.configurable);
             if non_config {
                 return Err(self.throw_type(&format!("Cannot redefine property: {key:?}")));
             }
@@ -7132,7 +7126,7 @@ impl Vm {
     ) {
         if let Value::Object(o) = obj {
             let mut b = o.borrow_mut();
-            match b.props.get_mut(&key) {
+            match b.own_get_mut(&key) {
                 Some(Property {
                     kind: PropertyKind::Accessor { get: g, set: s },
                     ..
@@ -7145,7 +7139,7 @@ impl Vm {
                     }
                 }
                 _ => {
-                    b.props.insert(
+                    b.own_insert(
                         key,
                         Property {
                             kind: PropertyKind::Accessor { get, set },
@@ -7197,7 +7191,7 @@ impl Vm {
         ));
         {
             let mut b = obj.borrow_mut();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -7208,7 +7202,7 @@ impl Vm {
                     configurable: true,
                 },
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("name"),
                 Property {
                     kind: PropertyKind::Data {
@@ -7226,11 +7220,11 @@ impl Vm {
             FuncKind::Normal | FuncKind::ClassCtor | FuncKind::DerivedCtor
         ) {
             let proto_obj = self.new_object();
-            proto_obj.borrow_mut().props.insert(
+            proto_obj.borrow_mut().own_insert(
                 PropertyKey::str("constructor"),
                 Property::builtin(Value::Object(obj.clone())),
             );
-            obj.borrow_mut().props.insert(
+            obj.borrow_mut().own_insert(
                 PropertyKey::str("prototype"),
                 Property {
                     kind: PropertyKind::Data {
@@ -7260,7 +7254,7 @@ impl Vm {
                 self.realm.generator_proto.clone()
             };
             let proto_obj = self.alloc_ordinary(Some(instance_proto));
-            obj.borrow_mut().props.insert(
+            obj.borrow_mut().own_insert(
                 PropertyKey::str("prototype"),
                 Property {
                     kind: PropertyKind::Data {
@@ -7745,7 +7739,7 @@ fn writeback_kernel_props(
             continue;
         }
         let mut b = objs[p.oslot as usize].borrow_mut();
-        match b.props.get_index_mut(prop_slots[i] as usize) {
+        match b.own_get_index_mut(prop_slots[i] as usize) {
             Some((
                 _,
                 Property {

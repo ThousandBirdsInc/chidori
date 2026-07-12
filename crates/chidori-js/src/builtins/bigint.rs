@@ -65,7 +65,7 @@ pub fn install(vm: &mut Vm) {
 
     // BigInt.prototype[Symbol.toStringTag] = "BigInt" (non-writable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {

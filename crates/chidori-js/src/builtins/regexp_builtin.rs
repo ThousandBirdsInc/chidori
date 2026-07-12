@@ -375,11 +375,7 @@ fn encode_for_regexp_escape(c: char) -> String {
 
 fn regexp_this(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
     match this {
-        Value::Object(o)
-            if o.borrow()
-                .props
-                .contains_key(&PropertyKey::str(REGEXP_MARK)) =>
-        {
+        Value::Object(o) if o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK)) => {
             Ok(o.clone())
         }
         _ => Err(vm.throw_type("Method RegExp.prototype called on incompatible receiver")),
@@ -467,11 +463,7 @@ fn regexp_exec_abstract(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value, 
         return Ok(result);
     }
     let o = match rx {
-        Value::Object(o)
-            if o.borrow()
-                .props
-                .contains_key(&PropertyKey::str(REGEXP_MARK)) =>
-        {
+        Value::Object(o) if o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK)) => {
             o.clone()
         }
         _ => return Err(vm.throw_type("Method RegExp.prototype called on incompatible receiver")),
@@ -648,7 +640,7 @@ fn make_regexp_string_iterator(
         }
         Ok(vm.make_iter_result(result, false))
     });
-    iter.borrow_mut().props.insert(
+    iter.borrow_mut().own_insert(
         PropertyKey::str("next"),
         Property::builtin(Value::Object(next)),
     );
@@ -901,7 +893,7 @@ pub fn build_match_array(
                     Some((s, e)) => Value::String(JsString::from_code_units(&units[s..e])),
                     None => Value::Undefined,
                 };
-                gb.props.insert(PropertyKey::str(name), Property::data(val));
+                gb.own_insert(PropertyKey::str(name), Property::data(val));
             }
         }
         Value::Object(obj)
@@ -932,16 +924,14 @@ pub fn build_match_array(
                     None => Value::Undefined,
                 };
                 obj.borrow_mut()
-                    .props
-                    .insert(PropertyKey::str(name), Property::data(val));
+                    .own_insert(PropertyKey::str(name), Property::data(val));
             }
             Value::Object(obj)
         };
         let idx_arr = vm.new_array(idx_elems);
         idx_arr
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str("groups"), Property::data(idx_groups));
+            .own_insert(PropertyKey::str("groups"), Property::data(idx_groups));
         Some(Value::Object(idx_arr))
     } else {
         None
@@ -949,19 +939,17 @@ pub fn build_match_array(
     let arr = vm.new_array(elems);
     {
         let mut b = arr.borrow_mut();
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("index"),
             Property::data(Value::Number(mat.start as f64)),
         );
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("input"),
             Property::data(Value::String(input.clone())),
         );
-        b.props
-            .insert(PropertyKey::str("groups"), Property::data(groups));
+        b.own_insert(PropertyKey::str("groups"), Property::data(groups));
         if let Some(indices) = indices {
-            b.props
-                .insert(PropertyKey::str("indices"), Property::data(indices));
+            b.own_insert(PropertyKey::str("indices"), Property::data(indices));
         }
     }
     Value::Object(arr)
@@ -982,11 +970,7 @@ fn define_string_getter(
 ) {
     let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
         let o = match &this {
-            Value::Object(o)
-                if o.borrow()
-                    .props
-                    .contains_key(&PropertyKey::str(REGEXP_MARK)) =>
-            {
+            Value::Object(o) if o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK)) => {
                 o.clone()
             }
             // RegExp.prototype itself reports the canonical empty source/flags.
@@ -1007,11 +991,7 @@ fn define_string_getter(
 fn define_flag_getter(vm: &mut Vm, proto: &JsObject, name: &str, flag: char) {
     let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
         let o = match &this {
-            Value::Object(o)
-                if o.borrow()
-                    .props
-                    .contains_key(&PropertyKey::str(REGEXP_MARK)) =>
-            {
+            Value::Object(o) if o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK)) => {
                 o.clone()
             }
             // RegExp.prototype itself is not a real RegExp: report undefined.
@@ -1029,7 +1009,7 @@ fn define_flag_getter(vm: &mut Vm, proto: &JsObject, name: &str, flag: char) {
 /// Insert a non-enumerable, configurable accessor property with the given
 /// getter and no setter.
 fn install_accessor(proto: &JsObject, name: &str, getter: JsObject) {
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str(name),
         Property {
             kind: PropertyKind::Accessor {

@@ -349,8 +349,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
     // `Array.prototype.push`.
     let ccode = proto
         .borrow()
-        .props
-        .get(&PropertyKey::str("charCodeAt"))
+        .own_get(&PropertyKey::str("charCodeAt"))
         .and_then(|p| p.value().cloned());
     if let Some(Value::Object(o)) = ccode {
         vm.realm.string_char_code_at = Some(o);
@@ -822,8 +821,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         .unwrap();
     proto
         .borrow_mut()
-        .props
-        .shift_remove(&PropertyKey::str("[Symbol.iterator]"));
+        .own_remove(&PropertyKey::str("[Symbol.iterator]"));
     vm.define_value_sym(proto, sym, it);
 }
 

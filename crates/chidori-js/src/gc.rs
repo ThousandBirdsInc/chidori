@@ -203,7 +203,7 @@ impl Vm {
 /// no longer keep anything else alive.
 pub(crate) fn clear_object_edges(o: &JsObject) {
     let mut b = o.borrow_mut();
-    b.props.clear();
+    b.own_clear();
     b.proto = None;
     b.internal = Internal::Ordinary;
     b.privates = None;
@@ -223,7 +223,7 @@ fn trace_object(
     if let Some(p) = &data.proto {
         f(p);
     }
-    for (_k, prop) in &data.props {
+    for (_k, prop) in data.own_iter() {
         trace_property(prop, f);
     }
     if let Some(privs) = &data.privates {

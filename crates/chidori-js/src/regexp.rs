@@ -1859,7 +1859,7 @@ impl Vm {
         {
             let mut b = o.borrow_mut();
             // Hidden brand marker.
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str(REGEXP_MARK),
                 Property {
                     kind: PropertyKind::Data {
@@ -1871,7 +1871,7 @@ impl Vm {
                 },
             );
             // Internal source/flags strings used by exec to re-parse per call.
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("[[Source]]"),
                 Property {
                     kind: PropertyKind::Data {
@@ -1882,7 +1882,7 @@ impl Vm {
                     configurable: false,
                 },
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("[[Flags]]"),
                 Property {
                     kind: PropertyKind::Data {
@@ -1894,7 +1894,7 @@ impl Vm {
                 },
             );
             // The writable lastIndex data property.
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("lastIndex"),
                 Property {
                     kind: PropertyKind::Data {
@@ -1913,10 +1913,7 @@ impl Vm {
 /// True if `v` is a RegExp object built by `make_regexp`.
 pub fn is_regexp(v: &Value) -> bool {
     if let Value::Object(o) = v {
-        return o
-            .borrow()
-            .props
-            .contains_key(&PropertyKey::str(REGEXP_MARK));
+        return o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK));
     }
     false
 }
@@ -1925,15 +1922,13 @@ pub fn is_regexp(v: &Value) -> bool {
 pub fn regexp_source_flags(o: &JsObject) -> (String, String) {
     let b = o.borrow();
     let source = b
-        .props
-        .get(&PropertyKey::str("[[Source]]"))
+        .own_get(&PropertyKey::str("[[Source]]"))
         .and_then(|p| p.value())
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     let flags = b
-        .props
-        .get(&PropertyKey::str("[[Flags]]"))
+        .own_get(&PropertyKey::str("[[Flags]]"))
         .and_then(|p| p.value())
         .and_then(|v| v.as_str())
         .unwrap_or("")

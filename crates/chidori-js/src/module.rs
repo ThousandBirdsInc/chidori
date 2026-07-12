@@ -568,7 +568,7 @@ impl Vm {
             // @@toStringTag = "Module" — non-writable, non-enumerable,
             // non-configurable (spec 28.3.1).
             let tag = self.realm.symbol_to_string_tag.clone();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::Sym(tag),
                 Property {
                     kind: crate::value::PropertyKind::Data {

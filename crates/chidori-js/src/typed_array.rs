@@ -191,7 +191,7 @@ impl Vm {
     /// shared brand. (A SharedArrayBuffer shares the `Internal::ArrayBuffer`
     /// byte storage; only the brand and prototype distinguish it.)
     pub fn is_shared_buffer(&self, o: &JsObject) -> bool {
-        o.borrow().props.contains_key(&PropertyKey::Sym(
+        o.borrow().own_contains_key(&PropertyKey::Sym(
             self.realm.symbol_array_buffer_shared.clone(),
         ))
     }
@@ -214,12 +214,12 @@ impl Vm {
                 enumerable: false,
                 configurable: false,
             };
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::Sym(self.realm.symbol_array_buffer_shared.clone()),
                 slot(Value::Bool(true)),
             );
             if let Some(m) = max {
-                b.props.insert(
+                b.own_insert(
                     PropertyKey::str(ARRAY_BUFFER_MAX_SLOT),
                     slot(Value::Number(m as f64)),
                 );

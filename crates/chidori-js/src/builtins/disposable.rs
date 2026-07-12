@@ -24,7 +24,7 @@ fn state_key(vm: &Vm) -> PropertyKey {
 fn stack_state(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
     if let Value::Object(o) = this {
         let key = state_key(vm);
-        let found = o.borrow().props.get(&key).and_then(|p| match &p.kind {
+        let found = o.borrow().own_get(&key).and_then(|p| match &p.kind {
             PropertyKind::Data {
                 value: Value::Object(arr),
                 ..
@@ -57,8 +57,7 @@ fn new_stack(vm: &mut Vm, proto: &JsObject) -> JsObject {
     let o = vm.alloc_ordinary(Some(proto.clone()));
     let key = state_key(vm);
     o.borrow_mut()
-        .props
-        .insert(key, Property::builtin(Value::Object(arr)));
+        .own_insert(key, Property::builtin(Value::Object(arr)));
     o
 }
 
@@ -211,8 +210,7 @@ fn install_one(vm: &mut Vm, is_async: bool) {
     let tag = vm.realm.symbol_to_string_tag.clone();
     proto
         .borrow_mut()
-        .props
-        .insert(PropertyKey::Sym(tag), Property::builtin(Value::str(name)));
+        .own_insert(PropertyKey::Sym(tag), Property::builtin(Value::str(name)));
 }
 
 /// Run the disposers in reverse, chaining failures into a SuppressedError.
@@ -264,12 +262,12 @@ fn install_sync_dispose(vm: &mut Vm, proto: &JsObject, dispose_sym: &JsSymbol) {
         run_disposers(vm, disposers)?;
         Ok(Value::Undefined)
     });
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("dispose"),
         Property::builtin(Value::Object(dispose.clone())),
     );
     // `[Symbol.dispose]` is the same function object as `dispose`.
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(dispose_sym.clone()),
         Property::builtin(Value::Object(dispose)),
     );
@@ -380,11 +378,11 @@ fn install_async_dispose(vm: &mut Vm, proto: &JsObject, dispose_sym: &JsSymbol) 
         }
         Ok(Value::Object(result))
     });
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("disposeAsync"),
         Property::builtin(Value::Object(dispose.clone())),
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(dispose_sym.clone()),
         Property::builtin(Value::Object(dispose)),
     );
