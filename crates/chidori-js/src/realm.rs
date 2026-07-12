@@ -129,6 +129,12 @@ pub struct Realm {
 
     /// Registry for `Symbol.for`.
     pub symbol_registry: indexmap::IndexMap<String, JsSymbol>,
+    /// The empty root of this realm's shape transition tree (see
+    /// [`crate::shape::Shape`]): every plain object born in this realm
+    /// starts here, so same-literal / same-record objects share key
+    /// layouts. Per-realm (not global) so shape identity checks stay
+    /// realm-local, mirroring the proto-identity inline caches.
+    pub shape_root: Rc<crate::shape::Shape>,
 }
 
 impl Realm {
@@ -259,6 +265,7 @@ impl Realm {
             symbol_intl_plural_rules: bare_symbol(19, "[[InitializedPluralRules]]"),
             symbol_intl_number_format: bare_symbol(20, "[[InitializedNumberFormat]]"),
             symbol_registry: indexmap::IndexMap::new(),
+            shape_root: crate::shape::Shape::new_root(),
         }
     }
 }

@@ -62,8 +62,11 @@ impl Vm {
     }
 
     /// Allocate (and register) a plain object with the given prototype.
+    /// Born SHAPED (docs/js-object-shapes-design.md §3): its key layout
+    /// lives in the realm's shared transition tree until a demoting edge
+    /// (delete, integer-key spam) reifies a private dictionary.
     pub fn alloc_ordinary(&self, proto: Option<JsObject>) -> JsObject {
-        self.alloc(ObjectData::new(proto, Internal::Ordinary))
+        self.alloc(ObjectData::new_shaped(proto, self.realm.shape_root.clone()))
     }
 
     /// Register an externally-created object with this VM's collector.

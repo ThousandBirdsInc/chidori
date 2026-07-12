@@ -881,13 +881,95 @@ impl Property {
     }
 }
 
+/// Ordinary own-property storage (see docs/js-object-shapes-design.md §3.1).
+///
+/// `Shaped` is the append-only common case: the [`Shape`] holds the shared,
+/// insertion-ordered key list and `slots[i]` holds the full [`Property`] for
+/// the key at chain depth `i`. Keeping whole `Property` values in the slots
+/// (rather than bare values) means attribute mutation and accessor
+/// properties need NO demotion — the shape encodes key ORDER only, so the
+/// only edges that demote are the order-destroying ones (`delete`) and
+/// integer-key spam (see [`Shape::can_append`]). `Dict` is today's map,
+/// verbatim: the battle-tested path every demoted object falls back to
+/// (objects never re-promote), and the birth mode for exotics/intrinsics.
+///
+/// Mode is unobservable: enumeration order is insertion order in both.
+pub(crate) enum PropStorage {
+    Shaped {
+        shape: Rc<crate::shape::Shape>,
+        slots: Vec<Property>,
+    },
+    Dict(crate::fxhash::FxIndexMap<PropertyKey, Property>),
+}
+
+impl Default for PropStorage {
+    fn default() -> Self {
+        PropStorage::Dict(crate::fxhash::FxIndexMap::default())
+    }
+}
+
+/// Iterator over own properties in insertion order, across both storage
+/// modes (see [`ObjectData::own_iter`]).
+pub enum OwnIter<'a> {
+    Dict(indexmap::map::Iter<'a, PropertyKey, Property>),
+    Shaped {
+        keys: std::vec::IntoIter<&'a PropertyKey>,
+        slots: std::slice::Iter<'a, Property>,
+    },
+}
+
+impl<'a> Iterator for OwnIter<'a> {
+    type Item = (&'a PropertyKey, &'a Property);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            OwnIter::Dict(it) => it.next(),
+            OwnIter::Shaped { keys, slots } => Some((keys.next()?, slots.next()?)),
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            OwnIter::Dict(it) => it.size_hint(),
+            OwnIter::Shaped { keys, .. } => keys.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for OwnIter<'_> {}
+
+/// Iterator over own property keys in insertion order, across both storage
+/// modes (see [`ObjectData::own_keys_iter`]).
+pub enum OwnKeys<'a> {
+    Dict(indexmap::map::Keys<'a, PropertyKey, Property>),
+    Shaped(std::vec::IntoIter<&'a PropertyKey>),
+}
+
+impl<'a> Iterator for OwnKeys<'a> {
+    type Item = &'a PropertyKey;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            OwnKeys::Dict(it) => it.next(),
+            OwnKeys::Shaped(it) => it.next(),
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            OwnKeys::Dict(it) => it.size_hint(),
+            OwnKeys::Shaped(it) => it.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for OwnKeys<'_> {}
+
 pub struct ObjectData {
     pub proto: Option<JsObject>,
     /// The ordinary own-property storage. Private to this module: every other
     /// part of the engine goes through the `own_*` accessor API below, so the
-    /// backing representation can change (see `PropStorage`) without touching
-    /// the 300+ call sites again.
-    props: crate::fxhash::FxIndexMap<PropertyKey, Property>,
+    /// backing representation can vary (shaped vs dictionary) without the
+    /// 300+ call sites knowing.
+    props: PropStorage,
     pub extensible: bool,
     pub internal: Internal,
     /// The spec `[[PrivateElements]]` list, keyed by [`PrivateName::id`].
@@ -901,14 +983,54 @@ impl ObjectData {
     pub fn new(proto: Option<JsObject>, internal: Internal) -> Self {
         ObjectData {
             proto,
-            props: crate::fxhash::FxIndexMap::default(),
+            props: PropStorage::default(),
             extensible: true,
             internal,
             privates: None,
         }
     }
+
+    /// A plain object born in shaped mode: `root` is the realm's empty root
+    /// shape. Costs nothing until the first insert (no table, no slot vec
+    /// allocation).
+    pub fn new_shaped(proto: Option<JsObject>, root: Rc<crate::shape::Shape>) -> Self {
+        ObjectData {
+            proto,
+            props: PropStorage::Shaped {
+                shape: root,
+                slots: Vec::new(),
+            },
+            extensible: true,
+            internal: Internal::Ordinary,
+            privates: None,
+        }
+    }
+
     pub fn private_get(&self, id: u64) -> Option<&PrivateElement> {
         self.privates.as_ref().and_then(|p| p.get(&id))
+    }
+
+    /// Demote to dictionary mode: materialize the map from the shape chain +
+    /// slots, preserving insertion order. One-way — a demoted object never
+    /// re-promotes (docs §3.4). Idempotent; returns the map for follow-up
+    /// mutation.
+    fn demote(&mut self) -> &mut crate::fxhash::FxIndexMap<PropertyKey, Property> {
+        if matches!(self.props, PropStorage::Shaped { .. }) {
+            if let PropStorage::Shaped { shape, slots } = std::mem::take(&mut self.props) {
+                let mut map = crate::fxhash::FxIndexMap::with_capacity_and_hasher(
+                    slots.len() + 1,
+                    Default::default(),
+                );
+                for (k, p) in shape.keys_in_order().into_iter().zip(slots) {
+                    map.insert(k.clone(), p);
+                }
+                self.props = PropStorage::Dict(map);
+            }
+        }
+        match &mut self.props {
+            PropStorage::Dict(m) => m,
+            PropStorage::Shaped { .. } => unreachable!("just demoted"),
+        }
     }
 
     // =====================================================================
@@ -929,7 +1051,12 @@ impl ObjectData {
     where
         Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
     {
-        self.props.get(key)
+        match &self.props {
+            PropStorage::Dict(m) => m.get(key),
+            PropStorage::Shaped { shape, slots } => {
+                shape.lookup(key).map(|slot| &slots[slot as usize])
+            }
+        }
     }
 
     /// Mutable access to the own property for `key`, if present.
@@ -938,7 +1065,12 @@ impl ObjectData {
     where
         Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
     {
-        self.props.get_mut(key)
+        match &mut self.props {
+            PropStorage::Dict(m) => m.get_mut(key),
+            PropStorage::Shaped { shape, slots } => {
+                shape.lookup(key).map(|slot| &mut slots[slot as usize])
+            }
+        }
     }
 
     /// The own property for `key` with its insertion-order slot index (the
@@ -949,7 +1081,13 @@ impl ObjectData {
     where
         Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
     {
-        self.props.get_full(key)
+        match &self.props {
+            PropStorage::Dict(m) => m.get_full(key),
+            PropStorage::Shaped { shape, slots } => {
+                let (slot, k) = shape.lookup_full(key)?;
+                Some((slot as usize, k, &slots[slot as usize]))
+            }
+        }
     }
 
     /// Mutable variant of [`Self::own_get_full`].
@@ -958,7 +1096,13 @@ impl ObjectData {
     where
         Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
     {
-        self.props.get_full_mut(key)
+        match &mut self.props {
+            PropStorage::Dict(m) => m.get_full_mut(key),
+            PropStorage::Shaped { shape, slots } => {
+                let (slot, k) = shape.lookup_full(key)?;
+                Some((slot as usize, k, &mut slots[slot as usize]))
+            }
+        }
     }
 
     /// Whether an own property for `key` exists.
@@ -967,7 +1111,10 @@ impl ObjectData {
     where
         Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
     {
-        self.props.contains_key(key)
+        match &self.props {
+            PropStorage::Dict(m) => m.contains_key(key),
+            PropStorage::Shaped { shape, .. } => shape.lookup(key).is_some(),
+        }
     }
 
     /// Insert (or replace, preserving insertion order) the own property for
@@ -976,7 +1123,25 @@ impl ObjectData {
     /// job, exactly as with the raw map.
     #[inline]
     pub fn own_insert(&mut self, key: PropertyKey, prop: Property) -> Option<Property> {
-        self.props.insert(key, prop)
+        match &mut self.props {
+            PropStorage::Dict(m) => return m.insert(key, prop),
+            PropStorage::Shaped { shape, slots } => {
+                if let Some(slot) = shape.lookup(&key) {
+                    // Replacing at an existing key keeps slot order in both
+                    // modes; the shape is unchanged.
+                    return Some(std::mem::replace(&mut slots[slot as usize], prop));
+                }
+                if crate::shape::Shape::can_append(&key, slots.len()) {
+                    let next = shape.transition(key);
+                    *shape = next;
+                    slots.push(prop);
+                    return None;
+                }
+            }
+        }
+        // Shaped, but the key must not join the transition tree
+        // (integer-index spam): fall to dictionary mode.
+        self.demote().insert(key, prop)
     }
 
     /// Remove the own property for `key`, preserving the insertion order of
@@ -987,26 +1152,47 @@ impl ObjectData {
     where
         Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
     {
-        self.props.shift_remove(key)
+        if let PropStorage::Shaped { shape, .. } = &self.props {
+            // Deleting an absent key changes nothing: stay shaped. A hit
+            // shifts the slot indices of everything after it — the one edge
+            // shapes cannot represent — so demote first (docs §3.4).
+            shape.lookup(key)?;
+            self.demote();
+        }
+        match &mut self.props {
+            PropStorage::Dict(m) => m.shift_remove(key),
+            PropStorage::Shaped { .. } => unreachable!("demoted above"),
+        }
     }
 
     /// The own property at insertion-order slot `i` (IC/kernel verification:
     /// callers compare the returned key against the expected one).
     #[inline]
     pub fn own_get_index(&self, i: usize) -> Option<(&PropertyKey, &Property)> {
-        self.props.get_index(i)
+        match &self.props {
+            PropStorage::Dict(m) => m.get_index(i),
+            PropStorage::Shaped { shape, slots } => Some((shape.key_at(i as u32)?, slots.get(i)?)),
+        }
     }
 
     /// Mutable variant of [`Self::own_get_index`].
     #[inline]
     pub fn own_get_index_mut(&mut self, i: usize) -> Option<(&PropertyKey, &mut Property)> {
-        self.props.get_index_mut(i)
+        match &mut self.props {
+            PropStorage::Dict(m) => m.get_index_mut(i),
+            PropStorage::Shaped { shape, slots } => {
+                Some((shape.key_at(i as u32)?, slots.get_mut(i)?))
+            }
+        }
     }
 
     /// Number of own properties in the ordinary storage.
     #[inline]
     pub fn own_len(&self) -> usize {
-        self.props.len()
+        match &self.props {
+            PropStorage::Dict(m) => m.len(),
+            PropStorage::Shaped { slots, .. } => slots.len(),
+        }
     }
 
     /// `true` when the ordinary own-property storage is empty — the guard
@@ -1014,50 +1200,78 @@ impl ObjectData {
     /// shadow").
     #[inline]
     pub fn own_is_empty(&self) -> bool {
-        self.props.is_empty()
+        match &self.props {
+            PropStorage::Dict(m) => m.is_empty(),
+            PropStorage::Shaped { slots, .. } => slots.is_empty(),
+        }
     }
 
     /// Iterate own properties in insertion order.
     #[inline]
-    pub fn own_iter(&self) -> indexmap::map::Iter<'_, PropertyKey, Property> {
-        self.props.iter()
+    pub fn own_iter(&self) -> OwnIter<'_> {
+        match &self.props {
+            PropStorage::Dict(m) => OwnIter::Dict(m.iter()),
+            PropStorage::Shaped { shape, slots } => OwnIter::Shaped {
+                keys: shape.keys_in_order().into_iter(),
+                slots: slots.iter(),
+            },
+        }
     }
 
     /// Iterate own property keys in insertion order.
     #[inline]
-    pub fn own_keys_iter(&self) -> indexmap::map::Keys<'_, PropertyKey, Property> {
-        self.props.keys()
+    pub fn own_keys_iter(&self) -> OwnKeys<'_> {
+        match &self.props {
+            PropStorage::Dict(m) => OwnKeys::Dict(m.keys()),
+            PropStorage::Shaped { shape, .. } => OwnKeys::Shaped(shape.keys_in_order().into_iter()),
+        }
     }
 
     /// Pre-size the storage for `n` additional properties.
     #[inline]
     pub fn own_reserve(&mut self, n: usize) {
-        self.props.reserve(n);
+        match &mut self.props {
+            PropStorage::Dict(m) => m.reserve(n),
+            PropStorage::Shaped { slots, .. } => slots.reserve(n),
+        }
     }
 
     /// Allocated capacity of the storage (0 ⇔ nothing allocated yet).
     #[inline]
     pub fn own_capacity(&self) -> usize {
-        self.props.capacity()
+        match &self.props {
+            PropStorage::Dict(m) => m.capacity(),
+            PropStorage::Shaped { slots, .. } => slots.capacity(),
+        }
     }
 
     /// Drop every own property (GC edge-clearing).
     #[inline]
     pub fn own_clear(&mut self) {
-        self.props.clear();
+        match &mut self.props {
+            PropStorage::Dict(m) => m.clear(),
+            PropStorage::Shaped { shape, slots } => {
+                slots.clear();
+                *shape = shape.root();
+            }
+        }
     }
 
     /// Replace the whole storage with a pre-built map (object-literal
     /// template instantiation).
     #[inline]
     pub fn set_props_map(&mut self, map: crate::fxhash::FxIndexMap<PropertyKey, Property>) {
-        self.props = map;
+        self.props = PropStorage::Dict(map);
     }
 
     /// Take the whole storage, leaving it empty (teardown / cycle breaking).
     #[inline]
     pub fn take_props_map(&mut self) -> crate::fxhash::FxIndexMap<PropertyKey, Property> {
-        std::mem::take(&mut self.props)
+        self.demote();
+        match std::mem::take(&mut self.props) {
+            PropStorage::Dict(m) => m,
+            PropStorage::Shaped { .. } => unreachable!("demoted above"),
+        }
     }
     /// Does `props` hold a (reified) entry for the array index `idx`?
     /// Alloc-free: the index is formatted into a stack buffer and probed via
