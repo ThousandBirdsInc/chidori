@@ -62,6 +62,12 @@ pub struct Shape {
     index: OnceCell<FxIndexMap<PropertyKey, u32>>,
 }
 
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.keys_in_order()).finish()
+    }
+}
+
 impl Shape {
     /// The empty root of a transition tree (one per realm, held by `Realm`).
     pub fn new_root() -> Rc<Shape> {
@@ -179,6 +185,28 @@ impl Shape {
         });
         tr.insert(key, Rc::downgrade(&child));
         child
+    }
+
+    /// `true` when this shape is exactly `parent` + `key` — the O(1) cursor
+    /// check of the JSON record-shape cache (parent pointer + key equality,
+    /// where interned keys hit the `Rc` fast path).
+    #[inline]
+    pub fn appends(&self, parent: &Rc<Shape>, key: &PropertyKey) -> bool {
+        self.parent.as_ref().is_some_and(|p| Rc::ptr_eq(p, parent)) && self.key == *key
+    }
+
+    /// The chain from the first appended key down to this shape (root
+    /// excluded), i.e. `path[i]` has `i + 1` properties.
+    pub fn path_from_root(self: &Rc<Self>) -> Vec<Rc<Shape>> {
+        let mut path = Vec::with_capacity(self.len());
+        let mut cur = self.clone();
+        while cur.parent.is_some() {
+            path.push(cur.clone());
+            let p = cur.parent.clone().expect("checked");
+            cur = p;
+        }
+        path.reverse();
+        path
     }
 
     /// Whether appending `key` to a shaped object with `len` properties

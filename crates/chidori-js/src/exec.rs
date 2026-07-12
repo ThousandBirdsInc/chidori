@@ -3552,13 +3552,32 @@ impl Vm {
                 if (is_ord || is_arr) && plain_key {
                     // Own-property hit: never touches the holder cell.
                     if is_ord {
-                        if let Some((PropertyKey::Str(k), prop)) =
-                            b.own_get_index(ic.own_slot.get() as usize)
-                        {
-                            if let PropertyKind::Data { value, .. } = &prop.kind {
-                                if k == &name {
+                        // Shape-verified hit (docs §3.3): one `Rc::ptr_eq`
+                        // replaces the key compare + probe — shape identity
+                        // pins the key at every slot; only the property KIND
+                        // can differ (attributes live per-object), checked
+                        // as before. Dictionary-mode receivers keep the
+                        // key-verified slot hint unchanged.
+                        let shape_ok = match (b.own_shape(), &*ic.own_shape.borrow()) {
+                            (Some(s), Some(c)) => Rc::ptr_eq(c, s),
+                            _ => false,
+                        };
+                        if shape_ok {
+                            if let Some(prop) = b.own_prop_at(ic.own_slot.get() as usize) {
+                                if let PropertyKind::Data { value, .. } = &prop.kind {
                                     let v = value.clone();
                                     return Ok(v);
+                                }
+                            }
+                        } else if b.own_shape().is_none() {
+                            if let Some((PropertyKey::Str(k), prop)) =
+                                b.own_get_index(ic.own_slot.get() as usize)
+                            {
+                                if let PropertyKind::Data { value, .. } = &prop.kind {
+                                    if k == &name {
+                                        let v = value.clone();
+                                        return Ok(v);
+                                    }
                                 }
                             }
                         }
@@ -3571,13 +3590,30 @@ impl Vm {
                         if let Some(h) = &*holder {
                             if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
                                 let hb = h.borrow();
-                                if let Some((PropertyKey::Str(k), prop)) =
-                                    hb.own_get_index(ic.proto_slot.get() as usize)
-                                {
-                                    if let PropertyKind::Data { value, .. } = &prop.kind {
-                                        if k == &name {
+                                // Holder identity is already verified; a
+                                // shape-verified slot replaces the key
+                                // compare when the holder is shaped.
+                                let shape_ok = match (hb.own_shape(), &*ic.proto_shape.borrow()) {
+                                    (Some(s), Some(c)) => Rc::ptr_eq(c, s),
+                                    _ => false,
+                                };
+                                if shape_ok {
+                                    if let Some(prop) = hb.own_prop_at(ic.proto_slot.get() as usize)
+                                    {
+                                        if let PropertyKind::Data { value, .. } = &prop.kind {
                                             let v = value.clone();
                                             return Ok(v);
+                                        }
+                                    }
+                                } else if hb.own_shape().is_none() {
+                                    if let Some((PropertyKey::Str(k), prop)) =
+                                        hb.own_get_index(ic.proto_slot.get() as usize)
+                                    {
+                                        if let PropertyKind::Data { value, .. } = &prop.kind {
+                                            if k == &name {
+                                                let v = value.clone();
+                                                return Ok(v);
+                                            }
                                         }
                                     }
                                 }
@@ -3593,6 +3629,7 @@ impl Vm {
                             if let PropertyKind::Data { value, .. } = &prop.kind {
                                 ic.own_slot.set(idx as u32);
                                 let v = value.clone();
+                                *ic.own_shape.borrow_mut() = b.own_shape().cloned();
                                 return Ok(v);
                             }
                         }
@@ -3608,6 +3645,7 @@ impl Vm {
                                         ic.proto_slot.set(idx as u32);
                                         let v = value.clone();
                                         let holder_obj = p.clone();
+                                        *ic.proto_shape.borrow_mut() = pb.own_shape().cloned();
                                         drop(pb);
                                         *ic.holder.borrow_mut() = Some(holder_obj);
                                         return Ok(v);
@@ -3646,10 +3684,14 @@ impl Vm {
             if let Some(ic) = ic {
                 let mut b = o.borrow_mut();
                 if matches!(b.internal, Internal::Ordinary) {
-                    if let Some((PropertyKey::Str(k), prop)) =
-                        b.own_get_index_mut(ic.own_slot.get() as usize)
-                    {
-                        if k == &name {
+                    // Shape-verified write (docs §3.3): pointer compare, then
+                    // the same writable-data-kind check as before.
+                    let shape_ok = match (b.own_shape(), &*ic.own_shape.borrow()) {
+                        (Some(s), Some(c)) => Rc::ptr_eq(c, s),
+                        _ => false,
+                    };
+                    if shape_ok {
+                        if let Some(prop) = b.own_prop_at_mut(ic.own_slot.get() as usize) {
                             if let PropertyKind::Data {
                                 value: slot,
                                 writable: true,
@@ -3659,8 +3701,24 @@ impl Vm {
                                 return Ok(value);
                             }
                         }
+                    } else if b.own_shape().is_none() {
+                        if let Some((PropertyKey::Str(k), prop)) =
+                            b.own_get_index_mut(ic.own_slot.get() as usize)
+                        {
+                            if k == &name {
+                                if let PropertyKind::Data {
+                                    value: slot,
+                                    writable: true,
+                                } = &mut prop.kind
+                                {
+                                    *slot = value.clone();
+                                    return Ok(value);
+                                }
+                            }
+                        }
                     }
                     let key = PropertyKey::Str(name.clone());
+                    let new_shape = b.own_shape().cloned();
                     if let Some((idx, _, prop)) = b.own_get_full_mut(&key) {
                         if let PropertyKind::Data {
                             value: slot,
@@ -3668,6 +3726,7 @@ impl Vm {
                         } = &mut prop.kind
                         {
                             ic.own_slot.set(idx as u32);
+                            *ic.own_shape.borrow_mut() = new_shape;
                             *slot = value.clone();
                             return Ok(value);
                         }

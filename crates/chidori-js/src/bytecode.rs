@@ -210,6 +210,14 @@ pub struct FuncProto {
 /// evaluated values.
 pub struct ObjTemplate {
     pub map: crate::fxhash::FxIndexMap<crate::value::PropertyKey, crate::value::Property>,
+    /// Memoized (realm root, leaf) shape pair for this literal site: after
+    /// the first instantiation in a realm, building the object is ONE slot
+    /// vec allocation + N value writes under the cached leaf shape — no
+    /// hashing, no transition walk (docs/js-object-shapes-design.md §3.3).
+    /// The root is stored to verify the cache belongs to the CURRENT realm
+    /// (a `FuncProto` may be shared across realms by the source cache);
+    /// a mismatch just recomputes. Never serialized, never observable.
+    pub shape_cache: std::cell::RefCell<Option<(Rc<crate::shape::Shape>, Rc<crate::shape::Shape>)>>,
 }
 
 impl std::fmt::Debug for ObjTemplate {
@@ -229,6 +237,13 @@ pub struct IcEntry {
     pub own_slot: std::cell::Cell<u32>,
     pub proto_slot: std::cell::Cell<u32>,
     pub holder: std::cell::RefCell<Option<crate::value::JsObject>>,
+    /// The receiver's shape when `own_slot` was resolved (`None` when it was
+    /// in dictionary mode). A pointer-identical CURRENT shape upgrades the
+    /// hit check to one `Rc::ptr_eq` — no key compare, no probe. Holds the
+    /// shape strongly: an IC pins at most one small key chain per site.
+    pub own_shape: std::cell::RefCell<Option<Rc<crate::shape::Shape>>>,
+    /// As `own_shape`, for the prototype holder's `proto_slot`.
+    pub proto_shape: std::cell::RefCell<Option<Rc<crate::shape::Shape>>>,
 }
 
 impl FuncProto {

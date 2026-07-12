@@ -489,17 +489,31 @@ impl Vm {
         tpl: &crate::bytecode::ObjTemplate,
         values: impl Iterator<Item = Value>,
     ) -> JsObject {
-        let mut map = tpl.map.clone();
-        for (i, v) in values.enumerate() {
-            let (_, p) = map.get_index_mut(i).expect("template arity");
-            p.kind = PropertyKind::Data {
-                value: v,
-                writable: true,
-            };
-        }
-        let mut data = ObjectData::new(Some(self.realm.object_proto.clone()), Internal::Ordinary);
-        data.set_props_map(map);
-        self.alloc(data)
+        // Resolve (and memoize) this literal site's leaf shape in the
+        // current realm: after warm-up, instantiation is one slot-vec
+        // allocation + N value writes — no hashing, no per-key inserts.
+        let shape = {
+            let mut cache = tpl.shape_cache.borrow_mut();
+            match &*cache {
+                Some((root, leaf)) if Rc::ptr_eq(root, &self.realm.shape_root) => leaf.clone(),
+                _ => {
+                    let mut leaf = self.realm.shape_root.clone();
+                    for k in tpl.map.keys() {
+                        leaf = leaf.transition(k.clone());
+                    }
+                    *cache = Some((self.realm.shape_root.clone(), leaf.clone()));
+                    leaf
+                }
+            }
+        };
+        let mut slots = Vec::with_capacity(tpl.map.len());
+        slots.extend(values.map(Property::data));
+        debug_assert_eq!(slots.len(), tpl.map.len(), "template arity");
+        self.alloc(ObjectData::new_shaped_with(
+            Some(self.realm.object_proto.clone()),
+            shape,
+            slots,
+        ))
     }
 
     pub fn new_object_proto(&self, proto: Option<JsObject>) -> JsObject {

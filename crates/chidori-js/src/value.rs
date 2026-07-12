@@ -1006,6 +1006,24 @@ impl ObjectData {
         }
     }
 
+    /// A plain object born shaped at a KNOWN shape with its slots pre-built
+    /// (object-literal template instantiation). `slots.len()` must equal
+    /// `shape.len()`.
+    pub fn new_shaped_with(
+        proto: Option<JsObject>,
+        shape: Rc<crate::shape::Shape>,
+        slots: Vec<Property>,
+    ) -> Self {
+        debug_assert_eq!(slots.len(), shape.len());
+        ObjectData {
+            proto,
+            props: PropStorage::Shaped { shape, slots },
+            extensible: true,
+            internal: Internal::Ordinary,
+            privates: None,
+        }
+    }
+
     pub fn private_get(&self, id: u64) -> Option<&PrivateElement> {
         self.privates.as_ref().and_then(|p| p.get(&id))
     }
@@ -1162,6 +1180,37 @@ impl ObjectData {
         match &mut self.props {
             PropStorage::Dict(m) => m.shift_remove(key),
             PropStorage::Shaped { .. } => unreachable!("demoted above"),
+        }
+    }
+
+    /// The current shape, when the storage is shaped (`None` in dictionary
+    /// mode). Shape identity (`Rc::ptr_eq`) pins the whole key layout — the
+    /// basis of the (shape, slot) inline caches (docs §3.3).
+    #[inline]
+    pub fn own_shape(&self) -> Option<&Rc<crate::shape::Shape>> {
+        match &self.props {
+            PropStorage::Shaped { shape, .. } => Some(shape),
+            PropStorage::Dict(_) => None,
+        }
+    }
+
+    /// The property at slot `i` WITHOUT retrieving its key — for
+    /// shape-verified cache hits, where shape identity already pins the key
+    /// at every slot.
+    #[inline]
+    pub fn own_prop_at(&self, i: usize) -> Option<&Property> {
+        match &self.props {
+            PropStorage::Shaped { slots, .. } => slots.get(i),
+            PropStorage::Dict(m) => m.get_index(i).map(|(_, p)| p),
+        }
+    }
+
+    /// Mutable variant of [`Self::own_prop_at`].
+    #[inline]
+    pub fn own_prop_at_mut(&mut self, i: usize) -> Option<&mut Property> {
+        match &mut self.props {
+            PropStorage::Shaped { slots, .. } => slots.get_mut(i),
+            PropStorage::Dict(m) => m.get_index_mut(i).map(|(_, p)| p),
         }
     }
 
