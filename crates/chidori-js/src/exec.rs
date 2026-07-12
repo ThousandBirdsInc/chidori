@@ -842,7 +842,7 @@ impl Vm {
                         // the spec says.
                         crate::bytecode::KCalleeSrc::Global(name) => {
                             let g = self.realm.global.borrow();
-                            match g.props.get(&PropertyKey::str(name)) {
+                            match g.own_get(&PropertyKey::str(name)) {
                                 Some(Property {
                                     kind:
                                         PropertyKind::Data {
