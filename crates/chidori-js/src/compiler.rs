@@ -1916,6 +1916,8 @@ impl Compiler {
                     own_slot: std::cell::Cell::new(u32::MAX),
                     proto_slot: std::cell::Cell::new(u32::MAX),
                     holder: std::cell::RefCell::new(None),
+                    own_shape: std::cell::RefCell::new(None),
+                    proto_shape: std::cell::RefCell::new(None),
                 })
                 .collect(),
             code,
@@ -3923,7 +3925,10 @@ impl Compiler {
         }
         let fc = self.fns.last_mut().expect("fn ctx");
         fc.obj_tpls
-            .push(std::rc::Rc::new(crate::bytecode::ObjTemplate { map }));
+            .push(std::rc::Rc::new(crate::bytecode::ObjTemplate {
+                map,
+                shape_cache: Default::default(),
+            }));
         Some((fc.obj_tpls.len() - 1) as u32)
     }
 

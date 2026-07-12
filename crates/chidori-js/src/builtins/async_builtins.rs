@@ -79,7 +79,7 @@ fn install_promise(vm: &mut Vm) {
     // Promise.prototype[Symbol.toStringTag] = "Promise" (non-writable,
     // non-enumerable, configurable) when the engine has Symbol.toStringTag.
     let to_string_tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(to_string_tag),
         Property {
             kind: PropertyKind::Data {
@@ -426,11 +426,11 @@ fn perform_promise_all_settled(
                     let o = vm.new_object();
                     {
                         let mut b = o.borrow_mut();
-                        b.props.insert(
+                        b.own_insert(
                             PropertyKey::str("status"),
                             Property::data(Value::str(status)),
                         );
-                        b.props.insert(PropertyKey::str(key), Property::data(v));
+                        b.own_insert(PropertyKey::str(key), Property::data(v));
                     }
                     Value::Object(o)
                 };
@@ -594,11 +594,11 @@ fn make_aggregate_error(vm: &mut Vm, errors: Vec<Value>) -> Value {
     if let Value::Object(o) = &agg {
         let arr = vm.new_array(errors);
         let mut b = o.borrow_mut();
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("errors"),
             Property::data(Value::Object(arr)),
         );
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("name"),
             Property::builtin(Value::str("AggregateError")),
         );

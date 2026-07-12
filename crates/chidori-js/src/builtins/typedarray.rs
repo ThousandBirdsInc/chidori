@@ -85,7 +85,7 @@ use crate::typed_array::ARRAY_BUFFER_MAX_SLOT as AB_MAX;
 
 /// The resizable max for a buffer, or `None` when it is fixed-length.
 fn ab_max_byte_length(o: &JsObject) -> Option<usize> {
-    match o.borrow().props.get(&PropertyKey::str(AB_MAX)) {
+    match o.borrow().own_get(&PropertyKey::str(AB_MAX)) {
         Some(Property {
             kind:
                 PropertyKind::Data {
@@ -130,7 +130,7 @@ fn ab_transfer(
     }
     if preserve_resizable {
         if let Some(m) = max {
-            new_buf.borrow_mut().props.insert(
+            new_buf.borrow_mut().own_insert(
                 PropertyKey::str(AB_MAX),
                 Property {
                     kind: PropertyKind::Data {
@@ -166,7 +166,7 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
                     if len > max {
                         return Err(vm.throw_range("ArrayBuffer length exceeds maxByteLength"));
                     }
-                    buf.borrow_mut().props.insert(
+                    buf.borrow_mut().own_insert(
                         PropertyKey::str(AB_MAX),
                         Property {
                             kind: PropertyKind::Data {
@@ -364,7 +364,7 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
 
     // ArrayBuffer.prototype[Symbol.toStringTag] = "ArrayBuffer"
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -551,7 +551,7 @@ fn install_shared_array_buffer(vm: &mut Vm, species: &JsSymbol) {
 
     // SharedArrayBuffer.prototype[Symbol.toStringTag] = "SharedArrayBuffer"
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -722,7 +722,7 @@ fn ta_species_create(vm: &mut Vm, exemplar: &JsObject, args: &[Value]) -> Result
     // time), not whatever `prototype.constructor` currently holds.
     let base = vm.realm.typed_array_proto.clone();
     let ckey = PropertyKey::str(format!("__ctor_{}", kind.name()));
-    let default_ctor = match base.borrow().props.get(&ckey).and_then(|p| p.value()) {
+    let default_ctor = match base.borrow().own_get(&ckey).and_then(|p| p.value()) {
         Some(v) => v.clone(),
         None => Value::Undefined,
     };
@@ -757,7 +757,7 @@ fn install_typed_array_base(vm: &mut Vm, species: &JsSymbol) -> JsObject {
         |vm, _t, _a| Err(vm.throw_type("Abstract class TypedArray not directly constructable")),
     );
     // Wire %TypedArray%.prototype <-> %TypedArray% without exposing a global.
-    ta_ctor.borrow_mut().props.insert(
+    ta_ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -768,7 +768,7 @@ fn install_typed_array_base(vm: &mut Vm, species: &JsSymbol) -> JsObject {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ta_ctor.clone())),
     );
@@ -1627,15 +1627,13 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         .realm
         .array_proto
         .borrow()
-        .props
-        .get(&PropertyKey::str("toString"))
+        .own_get(&PropertyKey::str("toString"))
         .and_then(|p| p.value().cloned());
     match array_to_string {
         Some(f) => {
             proto
                 .borrow_mut()
-                .props
-                .insert(PropertyKey::str("toString"), Property::builtin(f));
+                .own_insert(PropertyKey::str("toString"), Property::builtin(f));
         }
         None => {
             vm.define_method(proto, "toString", 0, |vm, this, _a| {
@@ -1859,7 +1857,7 @@ fn default_numeric_compare(a: f64, b: f64) -> i32 {
 fn per_kind_proto(vm: &mut Vm, kind: TAKind) -> JsObject {
     let key = PropertyKey::str(format!("__proto_{}", kind.name()));
     let base = vm.realm.typed_array_proto.clone();
-    if let Some(p) = base.borrow().props.get(&key) {
+    if let Some(p) = base.borrow().own_get(&key) {
         if let Some(Value::Object(o)) = p.value() {
             return o.clone();
         }
@@ -1867,8 +1865,7 @@ fn per_kind_proto(vm: &mut Vm, kind: TAKind) -> JsObject {
     // Should have been installed by install_kind_ctors; create a bare fallback.
     let proto = vm.alloc_ordinary(Some(base.clone()));
     base.borrow_mut()
-        .props
-        .insert(key, Property::builtin(Value::Object(proto.clone())));
+        .own_insert(key, Property::builtin(Value::Object(proto.clone())));
     proto
 }
 
@@ -1881,8 +1878,7 @@ fn install_kind_ctors(vm: &mut Vm, ta_ctor: &JsObject) {
         let key = PropertyKey::str(format!("__proto_{}", kind.name()));
         ta_proto
             .borrow_mut()
-            .props
-            .insert(key, Property::builtin(Value::Object(proto.clone())));
+            .own_insert(key, Property::builtin(Value::Object(proto.clone())));
 
         let bytes_per = kind.bytes() as f64;
         let name = kind.name();
@@ -1935,13 +1931,12 @@ fn install_kind_ctors(vm: &mut Vm, ta_ctor: &JsObject) {
         let ckey = PropertyKey::str(format!("__ctor_{}", kind.name()));
         ta_proto
             .borrow_mut()
-            .props
-            .insert(ckey, Property::builtin(Value::Object(ctor.clone())));
+            .own_insert(ckey, Property::builtin(Value::Object(ctor.clone())));
 
         // BYTES_PER_ELEMENT on both ctor and prototype (non-writable,
         // non-enumerable, non-configurable).
         for target in [&ctor, &proto] {
-            target.borrow_mut().props.insert(
+            target.borrow_mut().own_insert(
                 PropertyKey::str("BYTES_PER_ELEMENT"),
                 Property {
                     kind: PropertyKind::Data {
@@ -2259,7 +2254,7 @@ fn install_data_view(vm: &mut Vm) {
 
     // [Symbol.toStringTag] = "DataView"
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -3055,7 +3050,7 @@ fn install_atomics(vm: &mut Vm) {
 
     // Atomics[Symbol.toStringTag] = "Atomics" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    atomics.borrow_mut().props.insert(
+    atomics.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {

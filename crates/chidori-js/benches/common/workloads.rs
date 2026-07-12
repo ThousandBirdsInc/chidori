@@ -52,6 +52,19 @@ pub const WORKLOADS: &[(&str, &str)] = &[
         "string_scan",
         "(function(){ let s = ''; for (let i = 0; i < 512; i++) s += String.fromCharCode(97 + (i % 26)); let h = 0; for (let r = 0; r < 40; r++) { for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) % 1000000007; } } return h; })()",
     ),
+    // JSON stringify+parse round-trips over a nested record — the shapes
+    // workload (docs/js-object-shapes-design.md §1): per-record construction
+    // (shared shape + one slot vec), key interning, enumeration.
+    (
+        "json_roundtrip",
+        "(function(){ const obj = { id: 0, name: 'widget', tags: ['a', 'b', 'c'], nested: { x: 1, y: 2, z: { deep: true, items: [1, 2, 3, 4, 5] } } }; let acc = 0; for (let i = 0; i < 2000; i++) { obj.id = i; const back = JSON.parse(JSON.stringify(obj)); acc = (acc + back.id + back.nested.z.items[i % 5]) % 1000003; } return acc; })()",
+    ),
+    // Same-shape object literals allocated per iteration (the closures-
+    // workload record pattern): literal-site shape cache + shaped birth.
+    (
+        "object_literals",
+        "(function(){ let s = 0; for (let i = 0; i < 20000; i++) { const p = { x: i, y: i * 2, tag: 'pt' }; s = (s + p.x + p.y) % 1000003; } return s; })()",
+    ),
     // Typed-array element traffic (fill, dot product, in-place transform).
     // Same shape as the dense-array workloads but over Float64Array, which the
     // loop kernels do not yet accept as a base.

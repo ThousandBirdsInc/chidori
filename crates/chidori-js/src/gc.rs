@@ -62,8 +62,11 @@ impl Vm {
     }
 
     /// Allocate (and register) a plain object with the given prototype.
+    /// Born SHAPED (docs/js-object-shapes-design.md §3): its key layout
+    /// lives in the realm's shared transition tree until a demoting edge
+    /// (delete, integer-key spam) reifies a private dictionary.
     pub fn alloc_ordinary(&self, proto: Option<JsObject>) -> JsObject {
-        self.alloc(ObjectData::new(proto, Internal::Ordinary))
+        self.alloc(ObjectData::new_shaped(proto, self.realm.shape_root.clone()))
     }
 
     /// Register an externally-created object with this VM's collector.
@@ -203,7 +206,7 @@ impl Vm {
 /// no longer keep anything else alive.
 pub(crate) fn clear_object_edges(o: &JsObject) {
     let mut b = o.borrow_mut();
-    b.props.clear();
+    b.own_clear();
     b.proto = None;
     b.internal = Internal::Ordinary;
     b.privates = None;
@@ -223,7 +226,7 @@ fn trace_object(
     if let Some(p) = &data.proto {
         f(p);
     }
-    for (_k, prop) in &data.props {
+    for (_k, prop) in data.own_iter() {
         trace_property(prop, f);
     }
     if let Some(privs) = &data.privates {

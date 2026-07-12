@@ -34,6 +34,7 @@ pub mod realm;
 pub mod reg;
 pub mod regexp;
 pub mod replay;
+pub mod shape;
 pub mod trace;
 pub mod typed_array;
 mod unicode_tables;

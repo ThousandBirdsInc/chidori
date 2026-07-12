@@ -105,7 +105,7 @@ impl Vm {
         let sym = self.realm.symbol_iterator.clone();
         let key = PropertyKey::Sym(sym);
         let b = o.borrow();
-        if b.props.contains_key(&key) {
+        if b.own_contains_key(&key) {
             return false;
         }
         match &b.proto {
@@ -126,11 +126,9 @@ impl Vm {
     pub fn make_iter_result(&self, value: Value, done: bool) -> Value {
         let o = self.new_object();
         o.borrow_mut()
-            .props
-            .insert(crate::names::key_value(), Property::data(value));
+            .own_insert(crate::names::key_value(), Property::data(value));
         o.borrow_mut()
-            .props
-            .insert(crate::names::key_done(), Property::data(Value::Bool(done)));
+            .own_insert(crate::names::key_done(), Property::data(Value::Bool(done)));
         Value::Object(o)
     }
 
@@ -512,7 +510,7 @@ impl Vm {
             if !matches!(b.internal, Internal::Ordinary) {
                 return false;
             }
-            for (k, p) in b.props.iter() {
+            for (k, p) in b.own_iter() {
                 if let PropertyKey::Str(s) = k {
                     // Internal-slot keys are non-enumerable by contract, so
                     // `p.enumerable` alone excludes them, as on the generic
@@ -561,7 +559,7 @@ impl Vm {
                 }
                 _ => {}
             }
-            for (k, p) in b.props.iter() {
+            for (k, p) in b.own_iter() {
                 if p.enumerable && matches!(k, PropertyKey::Str(_)) {
                     return false;
                 }

@@ -767,7 +767,7 @@ fn define_size_getter(vm: &mut Vm, proto: &JsObject, is_map: bool) {
 /// Install a non-enumerable, non-writable, configurable `Symbol.toStringTag`.
 fn define_to_string_tag(vm: &mut Vm, proto: &JsObject, tag: &str) {
     let sym = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(sym),
         Property {
             kind: PropertyKind::Data {

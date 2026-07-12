@@ -36,7 +36,7 @@ pub fn install(vm: &mut Vm) {
 
     // Intl[Symbol.toStringTag] = "Intl" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    intl.borrow_mut().props.insert(
+    intl.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -127,7 +127,7 @@ fn to_length(vm: &mut Vm, v: &Value) -> Result<u64, Value> {
 /// True when `v` is an object carrying the `[[InitializedLocale]]` brand.
 fn is_locale(vm: &Vm, v: &Value) -> bool {
     matches!(v, Value::Object(o)
-        if o.borrow().props.contains_key(&PropertyKey::Sym(vm.realm.symbol_intl_locale.clone())))
+        if o.borrow().own_contains_key(&PropertyKey::Sym(vm.realm.symbol_intl_locale.clone())))
 }
 
 /// The stored `[[Locale]]` canonical tag of an Intl.Locale, if `v` is one.
@@ -135,8 +135,7 @@ fn locale_internal(vm: &Vm, v: &Value) -> Option<String> {
     let Value::Object(o) = v else { return None };
     match o
         .borrow()
-        .props
-        .get(&PropertyKey::Sym(vm.realm.symbol_intl_locale.clone()))
+        .own_get(&PropertyKey::Sym(vm.realm.symbol_intl_locale.clone()))
     {
         Some(Property {
             kind:
@@ -163,7 +162,7 @@ fn locale_of(vm: &mut Vm, this: &Value) -> Result<Locale, Value> {
 /// canonical `tag` string.
 fn new_locale_object(vm: &Vm, tag: String, proto: &JsObject) -> Value {
     let o = vm.alloc(ObjectData::new(Some(proto.clone()), Internal::Ordinary));
-    o.borrow_mut().props.insert(
+    o.borrow_mut().own_insert(
         PropertyKey::Sym(vm.realm.symbol_intl_locale.clone()),
         Property {
             kind: PropertyKind::Data {
@@ -333,7 +332,7 @@ fn install_locale(vm: &mut Vm, intl: &JsObject) {
 
     // Intl.Locale.prototype (non-writable, non-enumerable, non-configurable) and
     // its back-reference.
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -344,7 +343,7 @@ fn install_locale(vm: &mut Vm, intl: &JsObject) {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ctor.clone())),
     );
@@ -425,7 +424,7 @@ fn install_locale(vm: &mut Vm, intl: &JsObject) {
 
     // Intl.Locale.prototype[Symbol.toStringTag] = "Intl.Locale"
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -437,7 +436,7 @@ fn install_locale(vm: &mut Vm, intl: &JsObject) {
         },
     );
 
-    intl.borrow_mut().props.insert(
+    intl.borrow_mut().own_insert(
         PropertyKey::str("Locale"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -485,7 +484,7 @@ fn coerce_options(vm: &mut Vm, options: Value) -> Result<Value, Value> {
 /// Insert an enumerable, writable, configurable data property (the
 /// `CreateDataPropertyOrThrow` used to build a `resolvedOptions` result).
 fn data_prop(target: &JsObject, key: &str, value: Value) {
-    target.borrow_mut().props.insert(
+    target.borrow_mut().own_insert(
         PropertyKey::str(key),
         Property {
             kind: PropertyKind::Data {
@@ -589,7 +588,7 @@ fn set_digit_options(
 
 /// Read a string field of the internal PluralRules record.
 fn rec_str(rec: &JsObject, key: &str) -> String {
-    match rec.borrow().props.get(&PropertyKey::str(key)) {
+    match rec.borrow().own_get(&PropertyKey::str(key)) {
         Some(Property {
             kind:
                 PropertyKind::Data {
@@ -604,7 +603,7 @@ fn rec_str(rec: &JsObject, key: &str) -> String {
 
 /// Read a numeric field of the internal PluralRules record (`None` if absent).
 fn rec_num(rec: &JsObject, key: &str) -> Option<u32> {
-    match rec.borrow().props.get(&PropertyKey::str(key)) {
+    match rec.borrow().own_get(&PropertyKey::str(key)) {
         Some(Property {
             kind:
                 PropertyKind::Data {
@@ -622,8 +621,7 @@ fn plural_record(vm: &Vm, this: &Value) -> Option<JsObject> {
     let Value::Object(o) = this else { return None };
     match o
         .borrow()
-        .props
-        .get(&PropertyKey::Sym(vm.realm.symbol_intl_plural_rules.clone()))
+        .own_get(&PropertyKey::Sym(vm.realm.symbol_intl_plural_rules.clone()))
     {
         Some(Property {
             kind:
@@ -769,7 +767,7 @@ fn construct_plural_rules(vm: &mut Vm, args: &[Value], proto: &JsObject) -> Resu
     {
         let mut b = rec.borrow_mut();
         let mut put = |k: &str, v: Value| {
-            b.props.insert(PropertyKey::str(k), Property::builtin(v));
+            b.own_insert(PropertyKey::str(k), Property::builtin(v));
         };
         put("locale", Value::str(locale));
         put("type", Value::str(typ));
@@ -797,7 +795,7 @@ fn construct_plural_rules(vm: &mut Vm, args: &[Value], proto: &JsObject) -> Resu
     }
 
     let o = vm.alloc(ObjectData::new(Some(proto.clone()), Internal::Ordinary));
-    o.borrow_mut().props.insert(
+    o.borrow_mut().own_insert(
         PropertyKey::Sym(vm.realm.symbol_intl_plural_rules.clone()),
         Property {
             kind: PropertyKind::Data {
@@ -820,7 +818,7 @@ fn install_plural_rules(vm: &mut Vm, intl: &JsObject) {
         |vm, _t, _a| Err(vm.throw_type("Constructor Intl.PluralRules requires 'new'")),
         move |vm, _this, args| construct_plural_rules(vm, args, &ctor_proto),
     );
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -831,7 +829,7 @@ fn install_plural_rules(vm: &mut Vm, intl: &JsObject) {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ctor.clone())),
     );
@@ -950,7 +948,7 @@ fn install_plural_rules(vm: &mut Vm, intl: &JsObject) {
 
     // Intl.PluralRules.prototype[Symbol.toStringTag] = "Intl.PluralRules"
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -962,7 +960,7 @@ fn install_plural_rules(vm: &mut Vm, intl: &JsObject) {
         },
     );
 
-    intl.borrow_mut().props.insert(
+    intl.borrow_mut().own_insert(
         PropertyKey::str("PluralRules"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -978,7 +976,7 @@ use icu_decimal::DecimalFormatter;
 /// The internal record object of an Intl.NumberFormat receiver, if `this` is one.
 fn nf_record(vm: &Vm, this: &Value) -> Option<JsObject> {
     let Value::Object(o) = this else { return None };
-    match o.borrow().props.get(&PropertyKey::Sym(
+    match o.borrow().own_get(&PropertyKey::Sym(
         vm.realm.symbol_intl_number_format.clone(),
     )) {
         Some(Property {
@@ -1415,7 +1413,7 @@ fn construct_number_format(vm: &mut Vm, args: &[Value], proto: &JsObject) -> Res
     {
         let mut b = rec.borrow_mut();
         let mut put = |k: &str, v: Value| {
-            b.props.insert(PropertyKey::str(k), Property::builtin(v));
+            b.own_insert(PropertyKey::str(k), Property::builtin(v));
         };
         put("locale", Value::str(locale));
         if let Some(nu) = &numbering_system {
@@ -1458,7 +1456,7 @@ fn construct_number_format(vm: &mut Vm, args: &[Value], proto: &JsObject) -> Res
     }
 
     let o = vm.alloc(ObjectData::new(Some(proto.clone()), Internal::Ordinary));
-    o.borrow_mut().props.insert(
+    o.borrow_mut().own_insert(
         PropertyKey::Sym(vm.realm.symbol_intl_number_format.clone()),
         Property {
             kind: PropertyKind::Data {
@@ -1510,7 +1508,7 @@ fn install_number_format(vm: &mut Vm, intl: &JsObject) {
         move |vm, _t, args| construct_number_format(vm, args, &call_proto),
         move |vm, _this, args| construct_number_format(vm, args, &ctor_proto),
     );
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -1521,7 +1519,7 @@ fn install_number_format(vm: &mut Vm, intl: &JsObject) {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ctor.clone())),
     );
@@ -1540,8 +1538,7 @@ fn install_number_format(vm: &mut Vm, intl: &JsObject) {
         })?;
         let cached = rec
             .borrow()
-            .props
-            .get(&PropertyKey::str("boundFormat"))
+            .own_get(&PropertyKey::str("boundFormat"))
             .and_then(|p| match &p.kind {
                 PropertyKind::Data { value, .. } => Some(value.clone()),
                 _ => None,
@@ -1554,7 +1551,7 @@ fn install_number_format(vm: &mut Vm, intl: &JsObject) {
             let n = nf_input(vm, &arg(args, 0))?;
             Ok(Value::str(nf_format(&bound_rec, n)))
         });
-        rec.borrow_mut().props.insert(
+        rec.borrow_mut().own_insert(
             PropertyKey::str("boundFormat"),
             Property::builtin(Value::Object(bound.clone())),
         );
@@ -1649,7 +1646,7 @@ fn install_number_format(vm: &mut Vm, intl: &JsObject) {
     // call it as a method, which the data method above satisfies.)
 
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -1661,7 +1658,7 @@ fn install_number_format(vm: &mut Vm, intl: &JsObject) {
         },
     );
 
-    intl.borrow_mut().props.insert(
+    intl.borrow_mut().own_insert(
         PropertyKey::str("NumberFormat"),
         Property::builtin(Value::Object(ctor)),
     );

@@ -29,7 +29,7 @@ impl Vm {
         // itself (spec EvaluateGeneratorBody / OrdinaryCreateFromConstructor).
         let proto = {
             let own = func_obj.borrow();
-            match own.props.get(&PropertyKey::str("prototype")) {
+            match own.own_get(&PropertyKey::str("prototype")) {
                 Some(Property {
                     kind:
                         PropertyKind::Data {

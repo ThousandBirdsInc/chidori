@@ -1196,6 +1196,8 @@ pub fn regify(code: &[Op], num_locals: u32, consts: &[crate::bytecode::Const]) -
             own_slot: std::cell::Cell::new(u32::MAX),
             proto_slot: std::cell::Cell::new(u32::MAX),
             holder: std::cell::RefCell::new(None),
+            own_shape: std::cell::RefCell::new(None),
+            proto_shape: std::cell::RefCell::new(None),
         })
         .collect();
     debug_assert_eq!(e.code.len(), e.costs.len());

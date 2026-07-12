@@ -1160,7 +1160,7 @@ pub fn install(vm: &mut Vm) {
     {
         // Symbol.toPrimitive is non-enumerable, non-writable, configurable.
         let mut b = proto.borrow_mut();
-        b.props.insert(
+        b.own_insert(
             PropertyKey::Sym(to_primitive_sym),
             Property {
                 kind: PropertyKind::Data {

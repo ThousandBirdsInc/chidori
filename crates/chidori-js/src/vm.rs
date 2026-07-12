@@ -497,17 +497,31 @@ impl Vm {
         tpl: &crate::bytecode::ObjTemplate,
         values: impl Iterator<Item = Value>,
     ) -> JsObject {
-        let mut map = tpl.map.clone();
-        for (i, v) in values.enumerate() {
-            let (_, p) = map.get_index_mut(i).expect("template arity");
-            p.kind = PropertyKind::Data {
-                value: v,
-                writable: true,
-            };
-        }
-        let mut data = ObjectData::new(Some(self.realm.object_proto.clone()), Internal::Ordinary);
-        data.props = map;
-        self.alloc(data)
+        // Resolve (and memoize) this literal site's leaf shape in the
+        // current realm: after warm-up, instantiation is one slot-vec
+        // allocation + N value writes — no hashing, no per-key inserts.
+        let shape = {
+            let mut cache = tpl.shape_cache.borrow_mut();
+            match &*cache {
+                Some((root, leaf)) if Rc::ptr_eq(root, &self.realm.shape_root) => leaf.clone(),
+                _ => {
+                    let mut leaf = self.realm.shape_root.clone();
+                    for k in tpl.map.keys() {
+                        leaf = leaf.transition(k.clone());
+                    }
+                    *cache = Some((self.realm.shape_root.clone(), leaf.clone()));
+                    leaf
+                }
+            }
+        };
+        let mut slots = Vec::with_capacity(tpl.map.len());
+        slots.extend(values.map(Property::data));
+        debug_assert_eq!(slots.len(), tpl.map.len(), "template arity");
+        self.alloc(ObjectData::new_shaped_with(
+            Some(self.realm.object_proto.clone()),
+            shape,
+            slots,
+        ))
     }
 
     pub fn new_object_proto(&self, proto: Option<JsObject>) -> JsObject {
@@ -527,7 +541,7 @@ impl Vm {
             Some(self.realm.string_proto.clone()),
             Internal::StringObj(s),
         ));
-        o.borrow_mut().props.insert(
+        o.borrow_mut().own_insert(
             PropertyKey::str("length"),
             Property {
                 kind: PropertyKind::Data {
@@ -560,7 +574,7 @@ impl Vm {
         ));
         {
             let mut b = obj.borrow_mut();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -571,7 +585,7 @@ impl Vm {
                     configurable: true,
                 },
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("name"),
                 Property {
                     kind: PropertyKind::Data {
@@ -606,7 +620,7 @@ impl Vm {
         ));
         {
             let mut b = obj.borrow_mut();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -617,7 +631,7 @@ impl Vm {
                     configurable: true,
                 },
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("name"),
                 Property {
                     kind: PropertyKind::Data {
@@ -635,7 +649,7 @@ impl Vm {
     /// Wire `ctor.prototype = proto` (non-enumerable) and `proto.constructor =
     /// ctor` (non-enumerable), then bind `ctor` as a global of the given name.
     pub fn install_ctor(&self, name: &str, ctor: &JsObject, proto: &JsObject) {
-        ctor.borrow_mut().props.insert(
+        ctor.borrow_mut().own_insert(
             PropertyKey::str("prototype"),
             Property {
                 kind: PropertyKind::Data {
@@ -646,7 +660,7 @@ impl Vm {
                 configurable: false,
             },
         );
-        proto.borrow_mut().props.insert(
+        proto.borrow_mut().own_insert(
             PropertyKey::str("constructor"),
             Property::builtin(Value::Object(ctor.clone())),
         );
@@ -664,30 +678,26 @@ impl Vm {
         let f = self.new_native(name, length, func);
         target
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str(name), Property::builtin(Value::Object(f)));
+            .own_insert(PropertyKey::str(name), Property::builtin(Value::Object(f)));
     }
 
     pub fn define_value(&self, target: &JsObject, name: &str, value: Value) {
         target
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str(name), Property::builtin(value));
+            .own_insert(PropertyKey::str(name), Property::builtin(value));
     }
 
     /// Define a frozen constant (non-writable, non-enumerable, non-configurable).
     pub fn define_constant(&self, target: &JsObject, name: &str, value: Value) {
         target
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str(name), Property::frozen(value));
+            .own_insert(PropertyKey::str(name), Property::frozen(value));
     }
 
     pub fn define_value_sym(&self, target: &JsObject, key: JsSymbol, value: Value) {
         target
             .borrow_mut()
-            .props
-            .insert(PropertyKey::Sym(key), Property::builtin(value));
+            .own_insert(PropertyKey::Sym(key), Property::builtin(value));
     }
 
     // ---------------------------------------------------------------------
@@ -704,11 +714,11 @@ impl Vm {
             ErrorKind::Uri => &self.realm.uri_error_proto,
         };
         let obj = self.alloc(ObjectData::new(Some(proto.clone()), Internal::Error));
-        obj.borrow_mut().props.insert(
+        obj.borrow_mut().own_insert(
             PropertyKey::str("message"),
             Property::builtin(Value::str(message)),
         );
-        obj.borrow_mut().props.insert(
+        obj.borrow_mut().own_insert(
             PropertyKey::str("stack"),
             Property::builtin(Value::str(format!("{}: {}", kind.name(), message))),
         );
@@ -989,7 +999,7 @@ impl Vm {
         if let Value::Object(o) = base {
             let b = o.borrow();
             if let Internal::Array(arr) = &b.internal {
-                if b.props.is_empty() {
+                if b.own_is_empty() {
                     if let Some(v) = arr.get(idx as usize) {
                         if !matches!(v, Value::Hole) {
                             return Ok(v.clone());
@@ -1092,7 +1102,7 @@ impl Vm {
         // Ordinary own-property resolution shared by every (non-exotic) level.
         // A reified `props` entry shadows any dense array/string element.
         let ordinary = |b: &ObjectData| -> Step {
-            match b.props.get(key) {
+            match b.own_get(key) {
                 Some(prop) => match &prop.kind {
                     PropertyKind::Data { value, .. } => Step::Value(value.clone()),
                     PropertyKind::Accessor { get, .. } => match get {
@@ -1132,7 +1142,7 @@ impl Vm {
                     // parameter CELL, not the stale `props` value.
                     Internal::Arguments(map) => {
                         let aliased = key.array_index().and_then(|idx| {
-                            if b.props.contains_key(key) {
+                            if b.own_contains_key(key) {
                                 map.get(idx as usize).and_then(|c| c.clone())
                             } else {
                                 None
@@ -1148,13 +1158,13 @@ impl Vm {
                     // an absent index (climb the chain → undefined).
                     Internal::Array(arr) => {
                         if let Some("length") = key.as_str() {
-                            if b.props.contains_key(key) {
+                            if b.own_contains_key(key) {
                                 ordinary(&b)
                             } else {
                                 Step::Value(Value::Number(arr.len() as f64))
                             }
                         } else if let Some(idx) = key.array_index() {
-                            if b.props.contains_key(key) {
+                            if b.own_contains_key(key) {
                                 ordinary(&b)
                             } else {
                                 match arr.get(idx as usize) {
@@ -1335,7 +1345,7 @@ impl Vm {
             }
             let accessor = {
                 let b = cur.borrow();
-                match b.props.get(key) {
+                match b.own_get(key) {
                     Some(Property {
                         kind: PropertyKind::Accessor { set, .. },
                         ..
@@ -1438,7 +1448,7 @@ impl Vm {
         // CELL too (the ordinary props entry below stays in sync).
         if let Internal::Arguments(map) = &b.internal {
             if let Some(idx) = key.array_index() {
-                if b.props.contains_key(key) {
+                if b.own_contains_key(key) {
                     if let Some(Some(cell)) = map.get(idx as usize) {
                         *cell.borrow_mut() = value.clone();
                     }
@@ -1448,11 +1458,11 @@ impl Vm {
         // Array exotic write. A reified `props` entry for an index/length shadows
         // the dense store, so route the write through the ordinary props path
         // below (which honours its writable flag) when such an entry exists.
-        let has_props_entry = b.props.contains_key(key);
+        let has_props_entry = b.own_contains_key(key);
         let extensible = b.extensible;
         // A non-writable `length` marker blocks index writes past the end.
         let len_not_writable = matches!(
-            b.props.get(&PropertyKey::str("length")),
+            b.own_get(&PropertyKey::str("length")),
             Some(Property {
                 kind: PropertyKind::Data {
                     writable: false,
@@ -1520,7 +1530,7 @@ impl Vm {
                 }
             }
         }
-        match b.props.get_mut(key) {
+        match b.own_get_mut(key) {
             Some(p) => match &mut p.kind {
                 PropertyKind::Data {
                     value: slot,
@@ -1545,7 +1555,7 @@ impl Vm {
                     }
                     return Ok(());
                 }
-                b.props.insert(key.clone(), Property::data(value));
+                b.own_insert(key.clone(), Property::data(value));
             }
         }
         Ok(())
@@ -1578,7 +1588,7 @@ impl Vm {
         let mut b = obj.borrow_mut();
         // A reified `props` entry for an index shadows the dense slot; honour its
         // configurable flag and fall through to the ordinary delete below.
-        let has_props_entry = b.props.contains_key(key);
+        let has_props_entry = b.own_contains_key(key);
         if !has_props_entry {
             if let Internal::Array(arr) = &mut b.internal {
                 if let Some(idx) = key.array_index() {
@@ -1609,10 +1619,10 @@ impl Vm {
                 _ => {}
             }
         }
-        match b.props.get(key) {
+        match b.own_get(key) {
             Some(p) if !p.configurable => Ok(false),
             Some(_) => {
-                b.props.shift_remove(key);
+                b.own_remove(key);
                 // Removing a reified array-index override exposes the stale dense
                 // slot it shadowed; clear it so the deleted index reads as a hole.
                 if let Internal::Array(arr) = &mut b.internal {
@@ -1657,7 +1667,7 @@ impl Vm {
             }
             let (has, proto) = {
                 let b = cur.borrow();
-                let mut has = b.props.contains_key(key);
+                let mut has = b.own_contains_key(key);
                 // Module Namespace exotic [[HasProperty]]: export names are
                 // present (symbols consult the ordinary props above).
                 if let Internal::ModuleNamespace(ns) = &b.internal {
@@ -1759,7 +1769,7 @@ impl Vm {
         // before the other string keys — unless it has already been reified
         // into `props` (e.g. by freeze/seal, where the props loop emits it).
         if matches!(b.internal, Internal::Array(_) | Internal::StringObj(_))
-            && !b.props.contains_key(&PropertyKey::str("length"))
+            && !b.own_contains_key(&PropertyKey::str("length"))
         {
             str_keys.push(PropertyKey::str("length"));
         }
@@ -1770,7 +1780,7 @@ impl Vm {
                 str_keys.push(PropertyKey::Str(name.clone()));
             }
         }
-        for k in b.props.keys() {
+        for k in b.own_keys_iter() {
             // Engine-internal slots (a buffer's `[[ArrayBufferMaxByteLength]]`,
             // the SharedArrayBuffer brand) are not real properties: they never
             // surface through `[[OwnPropertyKeys]]`.
@@ -1843,7 +1853,7 @@ impl Vm {
                 }
             } else {
                 let b = o.borrow();
-                match b.props.get(&k) {
+                match b.own_get(&k) {
                     Some(p) => p.enumerable,
                     None => match &b.internal {
                         Internal::Array(arr) => k
@@ -1882,7 +1892,7 @@ impl Vm {
             });
         }
         let b = obj.borrow();
-        Ok(match b.props.get(key) {
+        Ok(match b.own_get(key) {
             Some(p) => p.enumerable,
             None => match &b.internal {
                 Internal::Array(arr) => key
@@ -1908,7 +1918,7 @@ impl Vm {
             if let PropertyKey::Str(s) = &k {
                 // A reified `props` entry shadows the exotic index slot, so its
                 // enumerable flag wins over the implicit dense-element default.
-                let enumerable = match b.props.get(&k) {
+                let enumerable = match b.own_get(&k) {
                     Some(p) => p.enumerable,
                     None => match &b.internal {
                         Internal::Array(_) if k.array_index().is_some() => true,
@@ -1984,7 +1994,7 @@ impl Vm {
             if let Some(p) = b.proto.take() {
                 stack.push(p);
             }
-            for (_k, prop) in std::mem::take(&mut b.props) {
+            for prop in b.take_props_values() {
                 match prop.kind {
                     PropertyKind::Data { value, .. } => push_dispose_obj(value, &mut stack),
                     PropertyKind::Accessor { get, set } => {
