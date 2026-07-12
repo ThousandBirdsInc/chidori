@@ -1579,12 +1579,108 @@ fn merge_sort(vm: &mut Vm, items: &mut [Value], cmp: &Value, has_cmp: bool) -> R
             }
         }
     }
+    // Default (no-comparator) SortCompare over an ALL-PRIMITIVE snapshot:
+    // ToString of a Number/String/Bool/Null/BigInt is pure — no user code,
+    // no throw — so the string keys can be computed ONCE per element
+    // (n conversions) instead of twice per comparison (~2·n·log n, each
+    // allocating). The permutation is computed by the IDENTICAL stable
+    // merge recursion over precomputed keys, so the result is bit-identical
+    // to the per-comparison path. Objects (toString/valueOf run user code,
+    // observable in call order and count) and Symbols (must throw
+    // TypeError from the comparison) keep the exact spec sequence below.
+    if !has_cmp
+        && items.iter().all(|v| {
+            matches!(
+                v,
+                Value::Number(_)
+                    | Value::String(_)
+                    | Value::Bool(_)
+                    | Value::Null
+                    | Value::BigInt(_)
+            )
+        })
+    {
+        return sort_default_primitive(vm, items);
+    }
     // One scratch buffer for the whole sort (max use: the larger half) instead
     // of two fresh Vec clones per recursion node — the naive version's
     // malloc/free + refcount churn was a measurable slice of sort-heavy runs.
     let mut aux: Vec<Value> = Vec::with_capacity(items.len() / 2 + 1);
     let n = items.len();
     merge_sort_range(vm, items, &mut aux, 0, n, cmp, has_cmp, &mut prep)
+}
+
+/// Default-comparator sort of an all-primitive snapshot by precomputed
+/// ToString keys (see the call site in [`merge_sort`] for why this is
+/// unobservable). The index-permutation merge mirrors `merge_sort_range`'s
+/// recursion and take-left-on-ties merge exactly, so equal keys keep their
+/// original relative order and the output matches the generic path
+/// element-for-element. When every key is ASCII (the overwhelming case —
+/// number-to-string output always is), the UTF-16 code-unit comparison
+/// collapses to a byte comparison.
+fn sort_default_primitive(vm: &mut Vm, items: &mut [Value]) -> Result<(), Value> {
+    let n = items.len();
+    let mut keys: Vec<JsString> = Vec::with_capacity(n);
+    for v in items.iter() {
+        keys.push(vm.to_js_string(v)?);
+    }
+    let all_ascii = keys.iter().all(|k| k.as_str().is_ascii());
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    let mut aux: Vec<u32> = Vec::with_capacity(n / 2 + 1);
+    fn rec(
+        idx: &mut [u32],
+        aux: &mut Vec<u32>,
+        lo: usize,
+        hi: usize,
+        keys: &[JsString],
+        ascii: bool,
+    ) {
+        let n = hi - lo;
+        if n <= 1 {
+            return;
+        }
+        let mid = lo + n / 2;
+        rec(idx, aux, lo, mid, keys, ascii);
+        rec(idx, aux, mid, hi, keys, ascii);
+        aux.clear();
+        aux.extend_from_slice(&idx[lo..mid]);
+        let (mut i, mut j, mut k) = (0, mid, lo);
+        while i < aux.len() && j < hi {
+            let (a, b) = (&keys[aux[i] as usize], &keys[idx[j] as usize]);
+            let order = if ascii {
+                match a.as_str().as_bytes().cmp(b.as_str().as_bytes()) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }
+            } else {
+                utf16_cmp(a.as_str(), b.as_str())
+            };
+            if order <= 0 {
+                idx[k] = aux[i];
+                i += 1;
+            } else {
+                idx[k] = idx[j];
+                j += 1;
+            }
+            k += 1;
+        }
+        while i < aux.len() {
+            idx[k] = aux[i];
+            i += 1;
+            k += 1;
+        }
+    }
+    rec(&mut idx, &mut aux, 0, n, &keys, all_ascii);
+    // Apply the permutation: every value moves exactly once.
+    let sorted: Vec<Value> = idx
+        .iter()
+        .map(|&i| std::mem::replace(&mut items[i as usize], Value::Undefined))
+        .collect();
+    for (slot, v) in items.iter_mut().zip(sorted) {
+        *slot = v;
+    }
+    Ok(())
 }
 
 /// [`merge_sort_range`] over raw `f64`s for the all-Number/kernel-comparator

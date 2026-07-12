@@ -786,6 +786,15 @@ struct ClassPrivCtx {
 
 struct Compiler {
     fns: Vec<FnCtx>,
+    /// One `JsString` allocation per distinct string across the WHOLE
+    /// compilation (const pools, object-template keys): identical names in
+    /// different functions then share an `Rc`, so runtime equality — a
+    /// for-in key against a compare literal, a property probe against a
+    /// template-built map — confirms on `JsString`'s pointer fast path
+    /// instead of comparing bytes. Compile-scoped (dropped with the
+    /// Compiler), so nothing is retained across programs; content is
+    /// unchanged, only allocation identity is shared.
+    str_intern: std::collections::HashMap<Box<str>, JsString>,
     /// The toplevel being compiled is global EVAL code (indirect eval), not a
     /// script: `return` is illegal and global var bindings are deletable.
     toplevel_is_eval: bool,
@@ -849,6 +858,7 @@ impl Compiler {
     fn new() -> Compiler {
         Compiler {
             fns: Vec::new(),
+            str_intern: std::collections::HashMap::new(),
             toplevel_is_eval: false,
             class_privs: Vec::new(),
             next_class_id: 0,
@@ -947,8 +957,26 @@ impl Compiler {
         (c.consts.len() - 1) as u32
     }
 
+    /// The compile-scoped interned `JsString` for `s` (see
+    /// [`Compiler::str_intern`]). The eight typeof names route to the
+    /// process-wide table in `names.rs` instead, so `typeof x === "number"`
+    /// compares pointer-equal against the interpreter's interned typeof
+    /// results.
+    fn interned(&mut self, s: &str) -> JsString {
+        if let Some(js) = crate::names::typeof_name(s) {
+            return js;
+        }
+        if let Some(js) = self.str_intern.get(s) {
+            return js.clone();
+        }
+        let js = JsString::new(s);
+        self.str_intern.insert(s.into(), js.clone());
+        js
+    }
+
     fn str_const(&mut self, s: &str) -> u32 {
-        self.intern_str(JsString::new(s))
+        let js = self.interned(s);
+        self.intern_str(js)
     }
 
     fn load_str(&mut self, s: &str) {
@@ -1872,7 +1900,7 @@ impl Compiler {
         // functions), as does anything with try/finally handlers, `with`/
         // direct-eval machinery, suspension, or super/private class wiring.
         let reg = if self.regify {
-            crate::reg::regify(&code, loc.num_locals).map(std::rc::Rc::new)
+            crate::reg::regify(&code, loc.num_locals, &fc.consts).map(std::rc::Rc::new)
         } else {
             None
         };
@@ -3881,11 +3909,15 @@ impl Compiler {
             }
             names.push(name);
         }
+        // Keys go through the compile-scoped interner: a for-in key cloned
+        // out of an instantiated template then pointer-matches compare
+        // literals and property-name consts built anywhere in this program.
+        let keys: Vec<crate::value::JsString> = names.iter().map(|n| self.interned(n)).collect();
         let mut map = crate::fxhash::FxIndexMap::default();
         map.reserve(names.len());
-        for name in &names {
+        for key in keys {
             map.insert(
-                crate::value::PropertyKey::Str(crate::value::JsString::from(name.as_str())),
+                crate::value::PropertyKey::Str(key),
                 crate::value::Property::data(crate::value::Value::Undefined),
             );
         }

@@ -1228,15 +1228,20 @@ pub enum KOp {
     /// `Op::SetProp` fast-path conditions). See [`KOp::LoadProp`] for why no
     /// per-access check is needed.
     StoreProp { prop: u16, src: u16 },
-    /// LOOP kernels only: call the PINNED CLOSURE in oslot
+    /// LOOP kernels only: call the PINNED CLOSURE of
     /// [`Kernel::callee_slots`]`[fslot]` — a plain bytecode function whose
     /// proto carries a (non-recursive, Number-returning) function kernel —
     /// by running that kernel's register program on a dedicated window above
     /// the caller's registers. The window's upvalue registers were loaded
-    /// ONCE at entry (the callee local is an oslot: in-region stores to it
-    /// reject, so the closure identity is pinned); per call only the `argc`
-    /// argument registers at `base..` copy in, and the callee's `Ret` value
-    /// copies out to `dst`. The entry guard verified everything a per-call
+    /// ONCE at entry (the callee resolution — an oslot local or a
+    /// global-object own data property, see [`KCalleeSrc`] — is an
+    /// activation constant, so the closure identity is pinned); per call
+    /// only the `argc` argument registers at `base..` copy in, and the
+    /// callee's `Ret` value copies out to `dst`. A cell-writing callee
+    /// ([`Kernel::uv_writes`]) additionally flushes its written registers
+    /// back to the cells after EVERY call, so a mid-loop bail resumes the
+    /// generic loop against current cell state; cross-window cell aliasing
+    /// declines at entry. The entry guard verified everything a per-call
     /// `run_fn_kernel` guard would (arguments are statically Numbers here),
     /// plus one depth check for the whole activation (the loop calls at a
     /// CONSTANT depth). No trace sink may be active (it would see an
@@ -1333,15 +1338,33 @@ pub struct KProp {
     pub store: bool,
 }
 
-/// One pinned CALLEE of a loop kernel (see [`KOp::CallKernel`]): the oslot
-/// local holding the closure, and the smallest `argc` any call site in the
+/// One pinned CALLEE of a loop kernel (see [`KOp::CallKernel`]): where the
+/// closure resolves from, and the smallest `argc` any call site in the
 /// region supplies — the entry guard requires the callee's function kernel
 /// to consume no argument index at or beyond it (a shorter call would need
 /// the generic `undefined` parameter).
 #[derive(Clone, Debug)]
 pub struct KCallee {
-    pub oslot: u16,
+    pub source: KCalleeSrc,
     pub min_argc: u16,
+}
+
+/// Where a pinned callee's closure lives. Both are activation constants: an
+/// oslot local is never stored to in-region, and nothing inside a kernel
+/// region can rebind a global — `StoreGlobal` is not on the allowlist, and
+/// a [`KProp`] store aimed at the same global-object property cannot pass
+/// its own holds-a-Number entry check while this guard sees a closure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KCalleeSrc {
+    /// The closure is held in this oslot local (discovered like an array
+    /// base; in-region stores to it reject).
+    Oslot(u16),
+    /// The closure is the value of a global-object OWN DATA property — the
+    /// exact fast path `LoadGlobal` takes for a top-level `function`
+    /// binding. Accessor, proto-inherited, and missing globals decline the
+    /// activation into the generic loop (which then resolves or throws
+    /// exactly as the spec says).
+    Global(Box<str>),
 }
 
 /// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
@@ -1457,10 +1480,12 @@ impl KMath {
 pub struct Kernel {
     pub code: Box<[KOp]>,
     /// Numeric slots mirrored into registers `0..locals.len()`: frame locals
-    /// (read/write) and UPVALUES (read-only snapshots — no call can run
-    /// inside a kernel, so nothing can write a captured cell mid-activation;
-    /// in-region upvalue WRITES reject at translation). The guard requires
-    /// `Value::Number` in every one; only `Local` slots write back.
+    /// (read/write) and UPVALUES (snapshots — no call can run inside a
+    /// kernel, so nothing else can write a captured cell mid-activation).
+    /// The guard requires `Value::Number` in every one; `Local` slots write
+    /// back in loop kernels, and upvalue slots listed in [`Kernel::uv_writes`]
+    /// flush back in function kernels. Loop-kernel regions still reject
+    /// in-region upvalue writes at translation.
     ///
     /// FUNCTION kernels additionally use `Arg` slots (read-only; the guard
     /// requires the argument present and a `Number`), and their `Local` slots
@@ -1519,6 +1544,22 @@ pub struct Kernel {
     /// call sites are checked against the RESOLVED callee's value by the
     /// entry guard.
     pub args_used: u32,
+    /// NON-RECURSIVE FUNCTION kernels: captured upvalue cells the body
+    /// WRITES, as `(register, upvalue index)` pairs (the register is the
+    /// cell's `locals` slot). The cell's value lives in the register for the
+    /// whole frameless call — nothing else can run mid-kernel — and is
+    /// flushed back as `Value::Number` on every completion (return AND the
+    /// interrupt unwind), so the cell holds exactly what the generic
+    /// write-through path would leave. A conditionally-skipped store flushes
+    /// the entry snapshot back: same value, unobservable (plain cells, no
+    /// setters). Only `Number` stores translate — a boolean/undefined store
+    /// would change the cell's type vs. the generic path and declines.
+    /// Non-empty `uv_writes` declines the recursion tier (its entry
+    /// resolution assumes cells are activation constants), the prepared
+    /// callback paths, and the loop-kernel pinned-callee guard — those run
+    /// many calls per guard and snapshot upvalues once. Always empty for
+    /// loop kernels.
+    pub uv_writes: Box<[(u16, u32)]>,
     /// Whether the code contains a [`KOp::StoreElem`]. A store may CREATE an
     /// element (hole fill / exact append), and the spec's OrdinarySet
     /// consults the prototype chain when the own property is absent — so the

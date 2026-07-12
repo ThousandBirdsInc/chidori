@@ -338,3 +338,48 @@ fn console_output() {
         "{ a: 1, b: 'two' }"
     );
 }
+
+#[test]
+fn default_sort_precomputed_keys() {
+    // The all-primitive default sort takes the precomputed-ToString-keys
+    // fast path (`sort_default_primitive`); these pin that its results are
+    // exactly the spec's per-comparison SortCompare order.
+    // Numbers sort as STRINGS under the default comparator.
+    assert_eq!(run("[10, 9, 100, 1].sort().join(',')"), "1,10,100,9");
+    // Mixed primitives: numeric strings interleave with numbers; booleans
+    // and null stringify for the SORT (null lands between "false" and
+    // "true") — join() then renders the null element as "" per spec.
+    assert_eq!(
+        run(r#"[10, "9", 2, true, null, "abc", false].sort().join('|')"#),
+        "10|2|9|abc|false||true"
+    );
+    // -0 stringifies as "0" and holds its slot; NaN sorts as "NaN".
+    assert_eq!(
+        run("const a=[-0, NaN, 0, 1]; a.sort(); (Object.is(a[0],-0)) + ',' + a.join(',')"),
+        "true,0,0,1,NaN"
+    );
+    // Stability: equal keys keep original order (indices via epsilon tags).
+    assert_eq!(
+        run(
+            r#"const a=[{k:"b",i:0},{k:"a",i:1},{k:"b",i:2}].map(o=>o); const s=["b","a","b"]; const t=[0,1,2]; const z=t.map((i)=>({toString(){return s[i];}, i})); z.sort(); z.map(o=>o.i).join(',')"#
+        ),
+        "1,0,2"
+    );
+    // An OBJECT element keeps the per-comparison path (its toString runs
+    // user code) — order still correct.
+    assert_eq!(
+        run(r#"const o={toString(){return "5";}}; [7,o,3,"4"].sort().map(String).join(',')"#),
+        "3,4,5,7"
+    );
+    // A Symbol element throws TypeError (never silently stringified).
+    assert!(run("[Symbol(), 1].sort()").contains("TypeError"));
+    // Undefineds sort to the end without entering the key path.
+    assert_eq!(
+        run("[undefined, 2, 10, undefined, 1].sort().map(String).join(',')"),
+        "1,10,2,undefined,undefined"
+    );
+    // Non-ASCII keys: UTF-16 code-unit order (astral pairs before U+E000+).
+    assert_eq!(run(r#"["￿", "a", "𐀀"].sort().join(',')"#), "a,𐀀,￿");
+    // toSorted shares the same path.
+    assert_eq!(run("[3,20,1].toSorted().join(',')"), "1,20,3");
+}

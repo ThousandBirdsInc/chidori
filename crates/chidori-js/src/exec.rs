@@ -810,27 +810,57 @@ impl Vm {
         }
         // Pinned closure callees (`KOp::CallKernel`): ONE guard per
         // activation covers everything the per-call `run_fn_kernel` guard
-        // would check — the callee object is an oslot (in-region stores to
-        // it reject), so its identity, kernel, upvalue types and the Math
-        // canonicals cannot change while the loop runs. Loop calls happen at
-        // one constant depth, so a single depth check suffices; a trace sink
-        // declines (it must see an enter/exit per call).
+        // would check — the callee resolution (an oslot local that in-region
+        // stores reject, or a global-object own data property that nothing
+        // in-region can rebind), so its identity, kernel, upvalue types and
+        // the Math canonicals cannot change while the loop runs. Loop calls
+        // happen at one constant depth, so a single depth check suffices; a
+        // trace sink declines (it must see an enter/exit per call).
         let mut callee_bfs = std::mem::take(&mut self.kernel_callees);
         callee_bfs.clear();
         if CALLEES {
             let mut ok = self.trace_sink.is_none() && self.call_depth < self.max_call_depth;
             let mut win = KWIN;
+            let mut any_uv_writes = false;
             if ok {
                 for c in k.callee_slots.iter() {
-                    let bf = {
-                        let b = objs[c.oslot as usize].borrow();
-                        match &b.internal {
-                            Internal::Function(FunctionInner::Bytecode(bf))
-                                if !bf.is_class_ctor =>
-                            {
-                                Some(bf.clone())
+                    let bf = match &c.source {
+                        crate::bytecode::KCalleeSrc::Oslot(oslot) => {
+                            let b = objs[*oslot as usize].borrow();
+                            match &b.internal {
+                                Internal::Function(FunctionInner::Bytecode(bf))
+                                    if !bf.is_class_ctor =>
+                                {
+                                    Some(bf.clone())
+                                }
+                                _ => None,
                             }
-                            _ => None,
+                        }
+                        // The `LoadGlobal` fast path: an own DATA property
+                        // of the global object. Accessor / proto-inherited /
+                        // missing globals decline — the generic loop then
+                        // resolves (or throws the ReferenceError) exactly as
+                        // the spec says.
+                        crate::bytecode::KCalleeSrc::Global(name) => {
+                            let g = self.realm.global.borrow();
+                            match g.props.get(&PropertyKey::str(name)) {
+                                Some(Property {
+                                    kind:
+                                        PropertyKind::Data {
+                                            value: Value::Object(o),
+                                            ..
+                                        },
+                                    ..
+                                }) => match &o.borrow().internal {
+                                    Internal::Function(FunctionInner::Bytecode(bf))
+                                        if !bf.is_class_ctor =>
+                                    {
+                                        Some(bf.clone())
+                                    }
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
                         }
                     };
                     let Some(bf) = bf else {
@@ -843,6 +873,9 @@ impl Vm {
                     };
                     // Number-returning, non-recursive, fully-supplied args,
                     // canonical Math, Number upvalues — else stay generic.
+                    // Cell-writing callees are admitted (their windows flush
+                    // written cells back per call) unless a written cell
+                    // aliases another of the callee's own captured cells.
                     let ck_ok = ck.rec.is_none()
                         && ck
                             .code
@@ -858,14 +891,24 @@ impl Vm {
                                 matches!(*bf.upvalues[*u as usize].borrow(), Value::Number(_))
                             }
                             _ => true,
-                        });
+                        })
+                        && (ck.uv_writes.is_empty() || !uv_write_cells_alias(ck, &bf));
                     if !ck_ok {
                         ok = false;
                         break;
                     }
+                    any_uv_writes |= !ck.uv_writes.is_empty();
                     callee_bfs.push((bf, win as u32));
                     win += KWIN;
                 }
+            }
+            // Cross-window aliasing: a cell one callee WRITES must not be
+            // captured by any other callee window (their once-per-activation
+            // snapshots would go stale) or snapshot by the caller kernel's
+            // own upvalue registers. Distinct bindings are distinct cells,
+            // so this only fires when the same closure/cell is pinned twice.
+            if ok && any_uv_writes {
+                ok = !callee_cell_writes_alias(&callee_bfs, k, &frame.func.upvalues);
             }
             if !ok {
                 self.kernel_regs = regs;
@@ -1460,7 +1503,18 @@ impl Vm {
                             cw[r & KWIN_MASK] = w[(base as usize + *a as usize) & KWIN_MASK];
                         }
                     }
-                    if let Some(ret) = run_callee_window(cw, ck, &interrupt, &mut poll) {
+                    let ret = run_callee_window(cw, ck, &interrupt, &mut poll);
+                    // A cell-writing callee flushes after EVERY call (return
+                    // or interrupt): the cell must be current before any
+                    // subsequent op that can bail to the generic loop, whose
+                    // remaining iterations call the callee generically. The
+                    // register persists in the pinned window, so no reload
+                    // is needed — nothing else can write the cell mid-loop
+                    // (cross-window aliasing declined at entry).
+                    if !ck.uv_writes.is_empty() {
+                        flush_uv_writes(ck, bf, cw);
+                    }
+                    if let Some(ret) = ret {
                         w[dst as usize & KWIN_MASK] = ret;
                     } else {
                         // Interrupted on a callee back-edge: the same
@@ -1556,8 +1610,10 @@ impl Vm {
     /// runs in unboxed registers with no frame at all. `None` = the entry
     /// guard declined (an op budget installed — per-op counts are observable;
     /// a trace sink active — it must see an enter/exit per call; a consumed
-    /// argument or captured upvalue not a `Number`; a monkeypatched `Math`) —
-    /// the caller proceeds down the ordinary frame path. `Some` is the call's
+    /// argument or captured upvalue not a `Number`; a monkeypatched `Math`;
+    /// a written cell aliasing another captured cell) — the caller proceeds
+    /// down the ordinary frame path. Cells the body writes (`uv_writes`)
+    /// buffer in registers and flush back on completion. `Some` is the call's
     /// exact result, bit-identical to the generic path by the loop-kernel
     /// argument (shared numeric cores, an op set closed over numbers, typed
     /// returns). Callers have already applied the depth guard, so the
@@ -1598,13 +1654,23 @@ impl Vm {
         if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
             return None;
         }
+        // Written cells (`uv_writes`) buffer in their registers and flush on
+        // completion (out-of-line: most kernels have no writes, and keeping
+        // this function small protects the LTO inlining of the hot paths).
+        if !k.uv_writes.is_empty() && uv_write_cells_alias(k, bf) {
+            return None;
+        }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
-        match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll) {
+        let ret = exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll);
+        if !k.uv_writes.is_empty() {
+            flush_uv_writes(k, bf, &regs);
+        }
+        match ret {
             Some(ret) => Some(Ok(ret)),
             None => {
-                // Interrupted on a back-edge: registers are pure scratch,
-                // nothing to write back on the unwind.
+                // Interrupted on a back-edge: latch the zero budget so a JS
+                // catch cannot resume execution.
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
             }
@@ -1627,8 +1693,10 @@ impl Vm {
     ///   matching the entry kernel's and every call site supplying at least
     ///   the resolved callee's consumed arguments.
     ///
-    /// Nothing inside a kernel can write globals or cells, so the entry
-    /// resolution holds for the whole activation. Depth mirrors the
+    /// Nothing inside a RECURSIVE kernel can write globals or cells
+    /// (upvalue-writing kernels decline this tier at translation and at
+    /// family resolution), so the entry resolution holds for the whole
+    /// activation. Depth mirrors the
     /// interpreter's limit; on overflow the activation is ABANDONED and
     /// `None` returned — sound because kernels are pure (registers only),
     /// and the caller's generic rerun then raises the spec RangeError from
@@ -2109,6 +2177,14 @@ impl Vm {
             }
             let f = funcs[wl].clone();
             let k = f.proto.fn_kernel.as_ref()?;
+            // No member may write cells: the windowed executor snapshots
+            // upvalues once per member and the family cache treats them as
+            // activation constants. (Recursive members can't have writes —
+            // translation declines — but a NON-recursive helper pulled in as
+            // a call target can.)
+            if !k.uv_writes.is_empty() {
+                return None;
+            }
             // Every member's Ret type must match the entry kernel's: a
             // mismatched value would land in a caller register of the wrong
             // static type. (Also rejects mixed-type non-recursive members.)
@@ -2309,7 +2385,10 @@ impl Vm {
         }
         {
             let k = bf.proto.fn_kernel.as_ref()?;
-            if k.rec.is_some() {
+            // No upvalue writes: the prepared paths snapshot upvalues per
+            // call (or once per sort) and never flush, so a cell-writing
+            // callback falls back to the generic `Vm::call` per element.
+            if k.rec.is_some() || !k.uv_writes.is_empty() {
                 return None;
             }
         }
@@ -4714,6 +4793,19 @@ impl Vm {
                         pc = *target as usize;
                     }
                 }
+                ROp::TypeofBr {
+                    src,
+                    tag,
+                    br_on_eq,
+                    target,
+                } => {
+                    // Total: `typeof` never throws, and the tag is one of
+                    // the eight statics `Value::type_of` returns, so this
+                    // is content equality of the unmaterialized compare.
+                    if (frame.locals[*src as usize].type_of() == *tag) == *br_on_eq {
+                        pc = *target as usize;
+                    }
+                }
                 ROp::CmpBrCellK {
                     cmp,
                     cell,
@@ -5280,7 +5372,9 @@ impl Vm {
                 }
             }
             ROp::ForInPop => {
-                frame.enumerators.pop();
+                if let Some((keys, _)) = frame.enumerators.pop() {
+                    self.park_forin_vec(keys);
+                }
             }
             _ => unreachable!("op handled inline in run_reg_frame: {op:?}"),
         }
@@ -6037,7 +6131,9 @@ impl Vm {
                 push!(Value::Bool(done));
             }
             Op::ForInPop => {
-                frame.enumerators.pop();
+                if let Some((keys, _)) = frame.enumerators.pop() {
+                    self.park_forin_vec(keys);
+                }
             }
             Op::ForInNext => {
                 let (k, more) = Self::for_in_next(frame);
@@ -7287,6 +7383,18 @@ impl Vm {
         if let (Value::Number(x), Value::Number(y)) = (&a, &b) {
             return Ok(Value::Number(x + y));
         }
+        // Fast path: String + String. Both operands are already primitive —
+        // ToPrimitive and ToString are identities — so the result is their
+        // concatenation, with the same length cap and the same `concat` as
+        // the generic route below; skipped are two identity-clone
+        // ToPrimitive calls and two identity ToString round-trips (the glue
+        // idiom `label + ":" + v` pays this twice per join).
+        if let (Value::String(sa), Value::String(sb)) = (&a, &b) {
+            if sa.byte_len() + sb.byte_len() > crate::value::MAX_STRING_LEN {
+                return Err(self.throw_range("invalid string length"));
+            }
+            return Ok(Value::String(sa.concat(sb)));
+        }
         // Fast path: a small plain string ⊕ a Number. Both operands are
         // already primitive (ToPrimitive is the identity) and the result is
         // the concatenation with the number's decimal form —
@@ -7756,6 +7864,81 @@ fn writeback_kernel_props(
             _ => unreachable!("kernel prop slot invariant"),
         }
     }
+}
+
+/// Belt-and-braces alias check for a cell-writing function kernel
+/// ([`crate::bytecode::Kernel::uv_writes`]): distinct upvalue indices are
+/// distinct bindings by construction, but the buffered writes must never be
+/// able to diverge from the generic write-through order, so a written cell
+/// aliasing any other captured cell declines the call. Out of line to keep
+/// `run_fn_kernel` small (write-free kernels skip it entirely).
+#[inline(never)]
+fn uv_write_cells_alias(k: &crate::bytecode::Kernel, bf: &BytecodeFunction) -> bool {
+    k.uv_writes.iter().any(|&(_, u)| {
+        let cell = &bf.upvalues[u as usize];
+        k.locals.iter().any(|slot| {
+            matches!(slot, crate::bytecode::KSlot::Upvalue(u2)
+                if *u2 != u && Rc::ptr_eq(cell, &bf.upvalues[*u2 as usize]))
+        })
+    })
+}
+
+/// Flush a cell-writing kernel's written registers back to their cells, on
+/// BOTH completions. On return this is the generic path's final cell state.
+/// On an interrupt the registers hold every completed store (an upvalue
+/// register is written only by translated stores), so the flush leaves
+/// exactly the generic prefix state at that poll point — the same contract
+/// as the loop kernels' local write-back on the interrupt unwind.
+#[inline(never)]
+fn flush_uv_writes(k: &crate::bytecode::Kernel, bf: &BytecodeFunction, regs: &[f64; KWIN]) {
+    for &(r, u) in k.uv_writes.iter() {
+        *bf.upvalues[u as usize].borrow_mut() = Value::Number(regs[usize::from(r) & KWIN_MASK]);
+    }
+}
+
+/// Cross-window alias check for the pinned-callee path when any callee
+/// writes cells: a written cell captured by ANOTHER callee window (whose
+/// upvalue snapshot loads once per activation) or by the CALLER kernel's
+/// own upvalue registers would go stale after the first flush, so any such
+/// overlap declines the activation. Distinct bindings are distinct cells —
+/// this only fires when the same closure (or a shared captured binding) is
+/// pinned more than once. Out of line: write-free activations never call it.
+#[inline(never)]
+fn callee_cell_writes_alias(
+    callee_bfs: &[(Rc<BytecodeFunction>, u32)],
+    caller: &crate::bytecode::Kernel,
+    caller_upvalues: &[Rc<RefCell<Value>>],
+) -> bool {
+    for (i, (bf, _)) in callee_bfs.iter().enumerate() {
+        let ck = bf.proto.fn_kernel.as_ref().expect("guarded");
+        for &(_, u) in ck.uv_writes.iter() {
+            let cell = &bf.upvalues[u as usize];
+            // The caller kernel's own upvalue snapshots.
+            for slot in caller.locals.iter() {
+                if let crate::bytecode::KSlot::Upvalue(cu) = slot {
+                    if Rc::ptr_eq(cell, &caller_upvalues[*cu as usize]) {
+                        return true;
+                    }
+                }
+            }
+            // Every OTHER callee window's captured cells (the same callee's
+            // own aliases were declined per-callee at entry).
+            for (j, (bf2, _)) in callee_bfs.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let ck2 = bf2.proto.fn_kernel.as_ref().expect("guarded");
+                for slot in ck2.locals.iter() {
+                    if let crate::bytecode::KSlot::Upvalue(u2) = slot {
+                        if Rc::ptr_eq(cell, &bf2.upvalues[*u2 as usize]) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Execute a plain (non-recursive, frameless) FUNCTION kernel body over

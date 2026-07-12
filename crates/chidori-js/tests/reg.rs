@@ -181,6 +181,21 @@ const CORPUS: &[&str] = &[
     "class HI { static [Symbol.hasInstance](v) { return v === 42; } } console.log(42 instanceof HI, 41 instanceof HI);",
     // typeof on every kind.
     "console.log(typeof 1, typeof 's', typeof true, typeof undefined, typeof null, typeof {}, typeof [], typeof (() => 0), typeof Symbol(), typeof 1n);",
+    // ---- typeof-dispatch branches (the TypeofBr fusion) ----
+    // Every tag in branch position, against a value of every kind.
+    "function tf(v) { if (typeof v === 'number') return 'n'; if (typeof v === 'string') return 's'; if (typeof v === 'boolean') return 'b'; if (typeof v === 'undefined') return 'u'; if (typeof v === 'object') return 'o'; if (typeof v === 'function') return 'f'; if (typeof v === 'symbol') return 'y'; if (typeof v === 'bigint') return 'g'; return '?'; } console.log([1, 'x', true, undefined, null, {}, [], tf, Symbol(), 9n].map(tf).join(''));",
+    // Negated and loose forms; literal on the left is NOT the fused shape
+    // (Typeof lands as the K-fold operand) — must still agree.
+    "const nn = (v) => typeof v !== 'number'; const lo = (v) => typeof v == 'string'; console.log(nn(1), nn('a'), lo('a'), lo(1), 'number' === typeof 5, 'x' === typeof 5);",
+    // A literal OUTSIDE the eight names stays a generic (false) compare.
+    "const w = (v) => typeof v === 'Number' || typeof v === 'numbre'; console.log(w(1), w('Number'));",
+    // typeof result flowing into a NON-branch consumer (no fusion: stored,
+    // concatenated, returned).
+    "const t = typeof 42; const u = t + '!'; console.log(t, u, (typeof 'a').length);",
+    // typeof in a ternary chain (the mixed_helpers normalize shape).
+    "function dis(v) { return typeof v === 'number' ? v + 1 : typeof v === 'string' ? v + '!' : 'other'; } console.log(dis(1), dis('a'), dis(true));",
+    // typeof of an UNDECLARED global (LoadGlobalTypeof path, unfused).
+    "console.log(typeof totally_undeclared === 'undefined', typeof totally_undeclared !== 'undefined');",
     // String building via += (rope path through op_add).
     "let sb2 = ''; for (let i = 0; i < 50; i++) sb2 += 'ab'; console.log(sb2.length, sb2.slice(0, 4), sb2.charCodeAt(99));",
 
@@ -438,6 +453,44 @@ fn walk_protos(p: &FuncProto, f: &mut impl FnMut(&FuncProto)) {
             walk_protos(nested, f);
         }
     }
+}
+
+/// The typeof-dispatch idiom compiles to the fused [`chidori_js::reg::ROp::TypeofBr`]
+/// (no typeof string materialized, no compare) — and near-miss shapes do not.
+#[test]
+fn typeof_branches_fuse() {
+    use chidori_js::reg::ROp;
+    fn count_ops(p: &FuncProto, pred: &dyn Fn(&ROp) -> bool) -> usize {
+        let mut n = 0;
+        walk_protos(p, &mut |p| {
+            if let Some(reg) = &p.reg {
+                n += reg.code.iter().filter(|op| pred(op)).count();
+            }
+        });
+        n
+    }
+    // The mixed_helpers normalize shape: both dispatches fuse.
+    let proto = compile_script_regs(
+        "function f(v) { if (typeof v === 'number') return 1; else if (typeof v !== 'string') return 2; return 3; }",
+        true,
+    )
+    .expect("compiles");
+    assert_eq!(
+        count_ops(&proto, &|op| matches!(op, ROp::TypeofBr { .. })),
+        2,
+        "typeof-dispatch branches must fuse to TypeofBr"
+    );
+    // A literal outside the eight names must NOT fuse (generic compare).
+    let proto = compile_script_regs(
+        "function g(v) { if (typeof v === 'Number') return 1; return 2; }",
+        true,
+    )
+    .expect("compiles");
+    assert_eq!(
+        count_ops(&proto, &|op| matches!(op, ROp::TypeofBr { .. })),
+        0,
+        "non-typeof-name literals must stay generic"
+    );
 }
 
 /// Structural pins: the canonical shapes MUST carry register programs, and

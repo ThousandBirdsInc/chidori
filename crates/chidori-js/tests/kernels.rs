@@ -322,6 +322,75 @@ const CORPUS: &[&str] = &[
     "'use strict'; function f(a, b) { return a * b; } console.log(f(6, 7));",
     // Boolean ARGUMENT declines (guard is Number-only) — generic coercion.
     "const f = (a, b) => a - b; console.log(f(true, 1), f(5, false));",
+    // ---- upvalue-WRITING function kernels (buffered cell writes) ----
+    // The PRNG idiom (the sort workload's `rnd`): write a captured cell,
+    // return it. Cell state must advance identically call over call.
+    "let seed = 123456789; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; } let s = 0; for (let i = 0; i < 50; i++) s = (s + rnd()) >>> 0; console.log(s, seed);",
+    // Generic code reads the cell BETWEEN kernel calls (per-call flush).
+    "let acc = 0; const bump = x => { acc = acc + x; return acc; }; bump(1); const mid = acc; bump(2); console.log(mid, acc);",
+    // Two kernels sharing one cell: each entry re-reads the other's flush.
+    "let s = 10; const inc = () => { s = s + 1; return s; }; const dec = () => { s = s - 2; return s; }; console.log(inc(), dec(), inc(), s);",
+    // Conditional store: the skipped path leaves the cell untouched (the
+    // flush writes the entry snapshot back — same value, unobservable).
+    "let hi = 0; const f = x => { if (x > 10) hi = x; return hi; }; console.log(f(5), f(20), f(7), hi);",
+    // Write-only cell (no read in the body).
+    "let last = -1; const f = x => { last = x * 2; return x; }; f(3); f(4); console.log(last);",
+    // Store then read-back within the body (register forwarding).
+    "let t = 1; const f = x => { t = t * x; return t + t; }; console.log(f(3), f(5), t);",
+    // Self-assignment (a dead store — the flush is value-identical anyway).
+    "let v = 7; const f = x => { v = v; return v + x; }; console.log(f(1), v);",
+    // -0 and NaN round through the cell bit-exactly.
+    "let z = 0; const f = x => { z = x * -0; return 1 / z; }; console.log(f(5), f(-5), Object.is(z, -0));",
+    "let n = 0; const f = x => { n = n + x; return n; }; f(NaN); console.log(n === n, typeof n);",
+    // Non-Number stores decline (the generic path must store the actual
+    // boolean/undefined — a flushed Number would change typeof).
+    "let b = 0; const f = x => { b = x > 0; return 1; }; console.log(f(5), b, typeof b);",
+    "let u = 0; const f = x => { u = undefined; return x; }; console.log(f(1), u, typeof u);",
+    // TDZ at call time: the cell isn't a Number yet — the guard declines and
+    // the generic path throws the spec ReferenceError.
+    "try { const f = () => { w = 1; return w; }; f(); let w; } catch (e) { console.log('tdz', e instanceof ReferenceError); }",
+    // A cell-writing COMPARATOR: the prepared sort path declines per-sort,
+    // results and the final call-count cell state stay exact.
+    "let calls = 0; const a = [5,3,8,1]; a.sort((x, y) => { calls = calls + 1; return x - y; }); console.log(a.join(','), calls > 0);",
+    // A cell-writing HOF callback (prepared map path declines per-run).
+    "let sum = 0; console.log([1,2,3,4].map(x => { sum = sum + x; return sum; }).join(','), sum);",
+    // Cell-writing SELF-RECURSION declines the recursion tier, stays exact.
+    "let depth = 0; function down(n) { depth = depth + 1; return n <= 0 ? depth : down(n - 1); } console.log(down(5), depth);",
+    // A cell-writing callee inside a hot numeric LOOP (the fill idiom).
+    "let seed2 = 42; function r2() { seed2 = (seed2 * 31 + 7) % 1000003; return seed2; } const arr = new Array(20); for (let i = 0; i < 20; i++) arr[i] = r2(); console.log(arr[0], arr[19], seed2);",
+    // ---- pinned GLOBAL callees in loop kernels ----
+    // Plain global callee with arguments, result consumed numerically.
+    "function twice(x) { return x * 2; } let s = 0; for (let i = 0; i < 40; i++) { s += twice(i) - 1; } console.log(s);",
+    // Two distinct global callees in one region.
+    "function inc(x) { return x + 1; } function sq(x) { return x * x; } let s = 0; for (let i = 0; i < 25; i++) { s += sq(inc(i)); } console.log(s);",
+    // The same global callee at two call sites (one window, min_argc).
+    "function h(a, b) { return a - b; } let s = 0; for (let i = 0; i < 20; i++) { s += h(i, 1) + h(2 * i, i); } console.log(s);",
+    // UNDER-supplied global callee: args_used > min_argc declines the
+    // activation; the generic loop computes the NaN coercions.
+    "function add(a, b) { return a + b; } let s = 0; for (let i = 0; i < 5; i++) { s += add(i); } console.log(s, s !== s);",
+    // REBINDING the global between loop executions: each activation
+    // re-guards, so run 2 must call the NEW closure.
+    "function r() { return 1; } function fill() { let s = 0; for (let i = 0; i < 10; i++) { s += r(); } return s; } console.log(fill()); globalThis.r = () => 5; console.log(fill());",
+    // Rebound to a NON-function mid-program: run 2 throws generically.
+    "var q = function () { return 2; }; function go() { let s = 0; for (let i = 0; i < 5; i++) { s += q(); } return s; } console.log(go()); q = 7; try { go(); } catch (e) { console.log('ok', e instanceof TypeError); }",
+    // ACCESSOR global: the guard declines (own DATA property only), and the
+    // generic loop calls the getter once per iteration — the count proves it.
+    "let gets = 0; Object.defineProperty(globalThis, 'gf', { get() { gets++; return () => 3; } }); let s = 0; for (let i = 0; i < 4; i++) { s += gf(); } console.log(s, gets);",
+    // Cell-writing GLOBAL callee where generic code reads the cell right
+    // after the loop (per-call flush must have landed the final state).
+    "let acc2 = 0; function step(x) { acc2 = acc2 + x; return acc2; } let last = 0; for (let i = 1; i <= 10; i++) { last = step(i); } console.log(last, acc2);",
+    // Cell-writing callee + a mid-loop BAIL (the store target goes
+    // string-tainted): the generic tail keeps calling the callee, so the
+    // cell must be current at the bail point.
+    "let n2 = 0; function bump() { n2 = n2 + 1; return n2; } let a = [0, 0, 0, 0, 0]; for (let i = 0; i < 5; i++) { if (i === 3) a = { 3: 0, 4: 0 }; a[i] = bump(); } console.log(a[4], n2);",
+    // The callee's written cell is ALSO read by generic code inside the
+    // loop-adjacent expression (loop kernel itself must not snapshot it).
+    "let c3 = 100; function dec3() { c3 = c3 - 1; return c3; } let s = 0; for (let i = 0; i < 6; i++) { s += dec3(); } console.log(s + c3);",
+    // ALIAS DECLINE: the caller's loop reads the same cell the callee
+    // writes (both capture `seed3` as an upvalue) — the caller's snapshot
+    // would go stale after the first flush, so the activation must stay
+    // generic and see every intermediate value.
+    "let seed3 = 1; function stir() { seed3 = seed3 * 3 + 1; return seed3; } function fill3() { let s = 0; for (let i = 0; i < 8; i++) { s += stir() + seed3; } return s; } console.log(fill3(), seed3);",
     // ---- self-recursive function kernels (SelfCall) ----
     // The canonical fib shape (global function declaration).
     "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } console.log(fib(15), fib(0), fib(1));",
@@ -680,6 +749,87 @@ fn tiny_functions_get_fn_kernels() {
             0,
             "expected NO function kernel in {src:?}"
         );
+    }
+}
+
+/// The fill idiom — a numeric loop whose body calls a GLOBAL function —
+/// kernelizes as one loop kernel with a pinned global callee (pins the
+/// `KCalleeSrc::Global` shape).
+#[test]
+fn global_callee_loops_get_kernels() {
+    fn kernels_in(p: &FuncProto) -> usize {
+        let mut n = p.kernels.len();
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                n += kernels_in(f);
+            }
+        }
+        n
+    }
+    // The sort workload's fill loop: a cell-writing global callee.
+    let src = "let seed = 1; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; } const a = new Array(10); for (let i = 0; i < 10; i++) a[i] = rnd(); console.log(a[9]);";
+    let proto = compile_script(src).expect("compiles");
+    assert!(
+        kernels_in(&proto) >= 1,
+        "fill loop with a global callee must kernelize"
+    );
+    let has_call_kernel = proto
+        .kernels
+        .iter()
+        .any(|k| k.code.iter().any(|op| matches!(op, KOp::CallKernel { .. })));
+    assert!(
+        has_call_kernel,
+        "the fill loop's kernel must carry a CallKernel to the global callee"
+    );
+}
+
+/// Cell-writing scalar bodies (the PRNG idiom) get a function kernel with
+/// `uv_writes` populated; non-Number stores and cell-writing recursion stay
+/// generic (pins the upvalue write-back shape).
+#[test]
+fn cell_writing_functions_get_fn_kernels() {
+    /// (fn kernels found, of which with non-empty uv_writes, of which rec)
+    fn scan(p: &FuncProto) -> (usize, usize, usize) {
+        let mut t = match &p.fn_kernel {
+            Some(k) => (
+                1,
+                usize::from(!k.uv_writes.is_empty()),
+                usize::from(k.rec.is_some()),
+            ),
+            None => (0, 0, 0),
+        };
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                let s = scan(f);
+                t = (t.0 + s.0, t.1 + s.1, t.2 + s.2);
+            }
+        }
+        t
+    }
+    // The PRNG idiom kernelizes WITH a recorded cell write.
+    for src in [
+        "let seed = 1; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; }",
+        "let acc = 0; const f = x => { acc = acc + x; return acc; };",
+        "let hi = 0; const f = x => { if (x > 10) hi = x; return hi; };",
+    ] {
+        let (kernels, writing, rec) = scan(&compile_script(src).expect("compiles"));
+        assert!(
+            kernels >= 1 && writing >= 1 && rec == 0,
+            "expected a non-recursive cell-writing fn kernel in {src:?}"
+        );
+    }
+    // Non-Number stores and cell-writing recursion stay generic.
+    for src in [
+        // Boolean store: a flushed Number would change typeof.
+        "let b = 0; const f = x => { b = x > 0; return 1; };",
+        // Undefined store: unrepresentable in a register.
+        "let u = 0; const f = x => { u = undefined; return x; };",
+        // Self-recursion + cell write: the recursion tier's entry resolution
+        // treats cells as activation constants.
+        "let d = 0; function f(n) { d = d + 1; return n <= 0 ? d : f(n - 1); }",
+    ] {
+        let (kernels, _, _) = scan(&compile_script(src).expect("compiles"));
+        assert_eq!(kernels, 0, "expected NO fn kernel in {src:?}");
     }
 }
 

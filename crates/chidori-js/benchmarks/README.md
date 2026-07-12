@@ -1,13 +1,24 @@
 # chidori-js cross-runtime benchmarks
 
-A suite that runs the **same JavaScript workloads** under three runtimes and
-compares wall-clock execution time and peak memory (max RSS):
+A suite that runs the **same workloads** under four runtimes and compares
+wall-clock execution time and peak memory (max RSS):
 
 | runtime    | what it is                                                            |
 | ---------- | --------------------------------------------------------------------- |
 | `chidori`  | the pure-Rust `chidori-js` engine (via the `run` example binary)      |
 | `node`     | Node.js (V8)                                                          |
 | `bun`      | Bun (JavaScriptCore)                                                  |
+| `cpython`  | CPython (`python3`), running each workload's hand-ported `.py` twin   |
+
+The three JS runtimes execute the identical `.js` file. CPython executes a
+line-by-line Python port of the same workload (`workloads/<name>.py`) that
+must print the **same `RESULT=` value** — see
+[Adding a workload](#adding-a-workload). Node and Bun answer "how far are we
+from the JITs people ship?"; CPython answers the like-for-like question "is
+chidori-js in the right ballpark *for an interpreter*?" — it's the
+reference-grade bytecode interpreter with the same execution model
+(no JIT), so it is the fairest available yardstick for interpreter-tier
+performance.
 
 This sits alongside two in-process benchmarks over the same workload corpus:
 the [`benches/execution.rs`](../benches/execution.rs) criterion
@@ -32,8 +43,9 @@ node crates/chidori-js/benchmarks/run.mjs --quick
 node crates/chidori-js/benchmarks/run.mjs --filter fib --runs 15 --json out.json
 ```
 
-Node.js is required to run the harness. Bun is optional — if `bun` isn't on
-`PATH` it is skipped with a warning. The chidori binary is built automatically
+Node.js is required to run the harness. Bun and CPython are optional — if
+`bun` (or `python3`/`python`) isn't on `PATH` that runtime is skipped with a
+warning. The chidori binary is built automatically
 unless you pass `--no-build` (and point at a prebuilt binary via `--chidori-bin`
 or `$CHIDORI_RUN_BIN`).
 
@@ -41,12 +53,12 @@ or `$CHIDORI_RUN_BIN`).
 
 ```
 Execution-only time (subprocess wall-clock minus startup baseline)
-Startup baselines: chidori 3.4ms  node 33.8ms  bun 9.8ms
+Startup baselines: chidori 3.4ms  node 33.8ms  bun 9.8ms  cpython 17.8ms
 
-workload             chidori         node          bun    fastest
------------------------------------------------------------------
-arith_loop       727.1ms 167.0x   7.2ms 1.6x        4.4ms        bun
-fib_recursive    2.15s 228.4x  11.8ms 1.3x        9.4ms        bun
+workload             chidori         node          bun      cpython    fastest
+-------------------------------------------------------------------------------
+arith_loop       727.1ms 167.0x   7.2ms 1.6x        4.4ms  156.7ms 35.6x        bun
+fib_recursive    2.15s 228.4x  11.8ms 1.3x        9.4ms  136.7ms 14.5x        bun
 ...
 ```
 
@@ -135,13 +147,24 @@ Every workload prints exactly one `RESULT=<value>` line. The harness extracts it
 from each runtime's stdout and **asserts all runtimes produced the same value**
 before reporting timings — a fast-but-wrong engine is not a faster engine. If any
 workload disagrees the row is flagged and the process exits non-zero. The
-`sort` workload seeds a deterministic LCG so all three runtimes sort identical
+`sort` workload seeds a deterministic LCG so all runtimes sort identical
 input and must agree on the checksum.
+
+The cross-check spans languages: the Python twins must print the identical
+`RESULT=` string, which also keeps the ports honest — a `.py` file that
+"simplifies" the workload into different math gets caught immediately. Where
+JS double semantics leak into the result (the `sort` LCG overflows 2^53
+before truncating; the `array_sum`/`typed_array` checksums accumulate near
+2^53), the Python twin reproduces the IEEE-double rounding explicitly rather
+than silently computing a different (exact) value — each such spot carries a
+comment in the `.py` file.
 
 ## Workloads
 
-Each file in `workloads/` is plain ES that runs unmodified on all three runtimes
-and mirrors (scaled up) an `execution.rs` micro-benchmark where one exists:
+Each `.js` file in `workloads/` is plain ES that runs unmodified on the three
+JS runtimes and mirrors (scaled up) an `execution.rs` micro-benchmark where
+one exists. Each has a `.py` twin for CPython that follows the same shape
+loop-for-loop (indexed loops stay indexed loops, closures stay closures):
 
 | workload          | exercises                                                       |
 | ----------------- | -------------------------------------------------------------- |
@@ -154,7 +177,7 @@ and mirrors (scaled up) an `execution.rs` micro-benchmark where one exists:
 | `closures`        | closure capture + higher-order calls in a loop                 |
 | `json_roundtrip`  | `JSON.stringify` / `JSON.parse` over a nested object           |
 | `sort`            | `Array.prototype.sort` with a comparator                       |
-| `startup.js`      | near-empty script — used only for the startup baseline         |
+| `startup.js/.py`  | near-empty script — used only for the startup baseline         |
 
 Iteration counts are tuned so each workload takes a meaningful-but-bounded time
 on the chidori-js interpreter (~0.2–2s); on the JITs they finish in single-digit
@@ -169,7 +192,21 @@ constant at the top of a workload file — they're deliberately one-liners.
 2. End it with `console.log("RESULT=" + <deterministic value>)` so the harness
    can cross-check correctness. Avoid `Date.now()`, `Math.random()`, or anything
    else that varies between runs or runtimes in the reported value.
-3. Run `node run.mjs --filter <name>` and confirm it reports `ok` (not a
+3. Add the `<name>.py` twin: the same algorithm, ported line-for-line, ending
+   with `print("RESULT=" + str(<value>))`. Watch the two classic
+   cross-language traps:
+   - **Number formatting** — JS prints integer-valued doubles without a
+     decimal point; wrap float results in `int(...)` before printing.
+   - **Double semantics** — JS numbers are IEEE doubles. If any value in the
+     `RESULT=` chain can exceed 2^53 (or relies on `|0`/`>>>` wrapping),
+     Python's exact ints will diverge; reproduce the rounding with float math
+     and explicit `% 2**32`-style wraps as `sort.py` / `typed_array.py` do.
+     Easiest is to keep results comfortably below 2^53.
+
+   If a workload genuinely has no sensible Python analog, skipping the twin is
+   allowed — the harness prints a `—` for cpython on that row instead of
+   failing — but the default expectation is that every workload has one.
+4. Run `node run.mjs --filter <name>` and confirm it reports `ok` (not a
    `RESULT MISMATCH`).
 
 ## Caveats
@@ -178,6 +215,11 @@ constant at the top of a workload file — they're deliberately one-liners.
   ratios on a quiet machine, not as a leaderboard. The sample table above is
   illustrative.
 - This measures whole-script subprocess runs, so it captures parse + compile +
-  execute, not steady-state JIT throughput. For chidori-js (an interpreter) that
-  is representative; for V8/JSC it understates peak throughput on long-running
-  code because much of the run is spent warming up.
+  execute, not steady-state JIT throughput. For chidori-js and CPython
+  (interpreters) that is representative; for V8/JSC it understates peak
+  throughput on long-running code because much of the run is spent warming up.
+- The CPython column is a cross-*language* comparison: the ports follow the JS
+  shape loop-for-loop, but each runtime still plays to its own strengths
+  (CPython's in-place `str +=` realloc, comparator-free `list.sort`, C-level
+  `json`). Read it as "interpreter-class ballpark", not a strict language
+  shootout — the per-file comments note where the port had to deviate and why.

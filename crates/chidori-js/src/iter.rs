@@ -401,11 +401,16 @@ impl Vm {
     }
 
     /// Collect enumerable string keys across the prototype chain for `for-in`,
-    /// in deterministic order, de-duplicated, skipping shadowed keys.
+    /// in deterministic order, de-duplicated, skipping shadowed keys. The
+    /// returned buffer comes from the Vm's `forin_pool` (`ForInPop` parks it
+    /// back) — a glue loop for-inning a fresh object per iteration reuses
+    /// one allocation instead of a malloc/free per loop entry.
     pub fn for_in_keys(&mut self, v: &Value) -> Result<Vec<JsString>, Value> {
+        let mut out = self.forin_pool.pop().unwrap_or_default();
+        debug_assert!(out.is_empty());
         let obj = match v {
             Value::Object(o) => o.clone(),
-            Value::Undefined | Value::Null => return Ok(Vec::new()),
+            Value::Undefined | Value::Null => return Ok(out),
             _ => self.to_object(v)?,
         };
         // FAST PATH — the overwhelmingly common shape: an ORDINARY receiver
@@ -417,10 +422,10 @@ impl Vm {
         // ~14% of glue-shaped workloads) are skipped entirely. Anything
         // else — proxy, exotic index sources, an enumerable proto key —
         // falls back to the generic walk below, unchanged.
-        if let Some(out) = self.for_in_keys_fast(&obj) {
+        if self.for_in_keys_fast(&obj, &mut out) {
             return Ok(out);
         }
-        let mut out: Vec<JsString> = Vec::new();
+        out.clear();
         // Dedup by `JsString` (an insert clones an `Rc`, not the bytes) under
         // the deterministic Fx hasher — the std SipHash `HashSet<String>` it
         // replaces paid a fresh `String` per key per chain level.
@@ -478,16 +483,26 @@ impl Vm {
         Ok(out)
     }
 
-    /// `for_in_keys`' allocation-free fast path. `Some(keys)` iff the
-    /// receiver is an ordinary object and NO prototype-chain level
-    /// contributes an enumerable string key — then the receiver's own
-    /// enumerable string keys (index-likes sorted first, per
-    /// `[[OwnPropertyKeys]]`) ARE the for-in keys, no shadow set needed.
-    /// `None` = use the generic walk; the split is decided by the same
-    /// facts that walk reads, so both produce identical keys where this
-    /// path applies.
-    fn for_in_keys_fast(&self, obj: &JsObject) -> Option<Vec<JsString>> {
-        let mut out: Vec<JsString> = Vec::new();
+    /// Park a for-in enumerator's key buffer back in the pool (cleared —
+    /// the pool never extends a key's lifetime past the `ForInPop` that
+    /// parked it). Capacity-less buffers (empty enumerations that never
+    /// grew) and a full pool just drop.
+    pub(crate) fn park_forin_vec(&mut self, mut keys: Vec<JsString>) {
+        keys.clear();
+        if self.forin_pool.len() < 8 && keys.capacity() > 0 {
+            self.forin_pool.push(keys);
+        }
+    }
+
+    /// `for_in_keys`' allocation-free fast path, filling the caller's
+    /// (pooled) buffer. `true` iff the receiver is an ordinary object and NO
+    /// prototype-chain level contributes an enumerable string key — then
+    /// the receiver's own enumerable string keys (index-likes sorted first,
+    /// per `[[OwnPropertyKeys]]`) ARE the for-in keys, no shadow set
+    /// needed. `false` = use the generic walk (the caller clears the
+    /// buffer); the split is decided by the same facts that walk reads, so
+    /// both produce identical keys where this path applies.
+    fn for_in_keys_fast(&self, obj: &JsObject, out: &mut Vec<JsString>) -> bool {
         let mut ints: Vec<u32> = Vec::new();
         let proto = {
             let b = obj.borrow();
@@ -495,7 +510,7 @@ impl Vm {
             // string indices, typed arrays, proxies, namespace exports)
             // synthesize own keys that live outside `props`.
             if !matches!(b.internal, Internal::Ordinary) {
-                return None;
+                return false;
             }
             for (k, p) in b.props.iter() {
                 if let PropertyKey::Str(s) = k {
@@ -524,8 +539,8 @@ impl Vm {
                     PropertyKey::Sym(_) => unreachable!("index keys are strings"),
                 }
             }
-            merged.append(&mut out);
-            out = merged;
+            merged.append(out);
+            std::mem::swap(out, &mut merged);
         }
         // The rest of the chain must contribute NOTHING: no enumerable
         // string key in `props`, and no internal that synthesizes own
@@ -538,23 +553,23 @@ impl Vm {
                 Internal::Proxy(_)
                 | Internal::StringObj(_)
                 | Internal::TypedArray(_)
-                | Internal::ModuleNamespace(_) => return None,
+                | Internal::ModuleNamespace(_) => return false,
                 // An EMPTY dense array (Array.prototype!) contributes only
                 // its non-enumerable `length`; any element is enumerable.
                 Internal::Array(arr) if arr.iter().any(|v| !matches!(v, Value::Hole)) => {
-                    return None;
+                    return false;
                 }
                 _ => {}
             }
             for (k, p) in b.props.iter() {
                 if p.enumerable && matches!(k, PropertyKey::Str(_)) {
-                    return None;
+                    return false;
                 }
             }
             let next = b.proto.clone();
             drop(b);
             cur = next;
         }
-        Some(out)
+        true
     }
 }

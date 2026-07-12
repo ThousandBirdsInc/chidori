@@ -2,11 +2,15 @@
 //! register programs (docs/js-performance-roadmap.md §6.5).
 //!
 //! The same translator also compiles FUNCTION kernels
-//! ([`kernelize_function`]): a tiny pure-scalar body — a sort comparator, a
-//! `map`/`filter`/`reduce` callback — becomes a register program the call
-//! paths execute FRAMELESS when its per-call entry guard passes (arguments
-//! present and `Number`s, upvalues `Number`s, no op budget, no trace sink);
-//! any guard failure takes the ordinary frame path. See `Vm::run_fn_kernel`.
+//! ([`kernelize_function`]): a tiny scalar body — a sort comparator, a
+//! `map`/`filter`/`reduce` callback, a `seed = …; return seed` PRNG step —
+//! becomes a register program the call paths execute FRAMELESS when its
+//! per-call entry guard passes (arguments present and `Number`s, upvalues
+//! `Number`s, no op budget, no trace sink); any guard failure takes the
+//! ordinary frame path. Non-recursive bodies may WRITE captured cells: the
+//! value buffers in the cell's register (nothing else can run mid-kernel)
+//! and flushes back on completion ([`crate::bytecode::Kernel::uv_writes`]).
+//! See `Vm::run_fn_kernel`.
 //!
 //! ## Why
 //!
@@ -269,7 +273,16 @@ pub fn kernelize_function(
                     .max()
                     .unwrap_or(0);
                 if k.rec.is_some() {
-                    // RECURSIVE kernel. Every SELF-call must supply every
+                    // RECURSIVE kernel. Upvalue writes decline outright: the
+                    // recursion tier's entry resolution (and its cached
+                    // family's upvalue snapshots) treat cells as activation
+                    // constants — a self-call chain interleaving cell writes
+                    // would need per-window flushes to stay observably
+                    // generic. The write-back shape is non-recursive-only.
+                    if !k.uv_writes.is_empty() {
+                        return None;
+                    }
+                    // Every SELF-call must supply every
                     // argument the body consumes (a short call would need
                     // the generic `undefined` parameter; mutual-recursion
                     // call sites are checked against the RESOLVED callee by
@@ -381,6 +394,16 @@ enum VE {
     /// ONLY legal consumer is a `Call` (which fuses to [`KOp::SelfCall`]
     /// with `callee` = the payload); everything else rejects.
     SelfFn(u16),
+    /// LOOP mode only: a speculative pinned GLOBAL callee —
+    /// `global_callee_names[i]`, from `LoadGlobal` of a non-`Math` name
+    /// (`rnd()` in a fill loop). The activation entry guard resolves the
+    /// name as an own DATA property of the global object holding a
+    /// kernel-carrying closure — the exact `LoadGlobal` fast path — and
+    /// declines otherwise. Its ONLY legal consumer is a `Call` under an
+    /// `undefined` this (fusing to [`KOp::CallKernel`]); everything else
+    /// rejects translation, which never loses a kernel that exists today
+    /// (non-Math globals previously rejected loop regions outright).
+    GlobalFn(u16),
     /// `a.push` on the array base in the oslot — speculative: the entry
     /// guard verifies the canonical `Array.prototype.push` still backs the
     /// `push` property of the canonical prototype, and the op re-checks the
@@ -446,6 +469,9 @@ struct Xlate<'a> {
     local_reg: Vec<(KSlot, u16)>,
     /// boolean locals: (frame-local index, register from BOOL_BASE).
     bool_reg: Vec<(u32, u16)>,
+    /// fn mode: upvalue indices the body STORES to (their registers flush
+    /// back to the cells on completion — see [`Kernel::uv_writes`]).
+    uv_writes: Vec<u32>,
     /// locals observed as STRING bases (from `charCodeAt` over a clean
     /// local origin); fed back by the fixpoint driver like `discovered`.
     discovered_strs: Vec<u32>,
@@ -474,9 +500,12 @@ struct Xlate<'a> {
     /// Named-property access classes over oslot bases (entry-resolved; see
     /// [`KProp`]). Deduplicated by (oslot, key); flags OR together.
     props_used: Vec<KProp>,
-    /// Pinned closure callees (loop mode; see [`KCallee`]): per oslot, the
+    /// Pinned closure callees (loop mode; see [`KCallee`]): per source, the
     /// smallest argc any call site supplies.
     callees: Vec<KCallee>,
+    /// LOOP mode: names speculated as pinned GLOBAL callees (the
+    /// [`VE::GlobalFn`] payload indexes this).
+    global_callee_names: Vec<Box<str>>,
     /// a compare op fused with its following conditional jump: skip that ip.
     absorbed: Option<usize>,
     max_stack: u16,
@@ -532,6 +561,7 @@ fn translate(
         is_target,
         local_reg: Vec::new(),
         bool_reg: Vec::new(),
+        uv_writes: Vec::new(),
         discovered: Vec::new(),
         discovered_bools: Vec::new(),
         discovered_strs: Vec::new(),
@@ -546,6 +576,7 @@ fn translate(
         uses_array_pop: false,
         props_used: Vec::new(),
         callees: Vec::new(),
+        global_callee_names: Vec::new(),
         absorbed: None,
         max_stack: 0,
     };
@@ -655,9 +686,9 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     for (kidx, resume_ip, shape) in exits {
         if shape
             .iter()
-            .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn(_)))
+            .any(|e| matches!(e, VE::Undef | VE::Opaque | VE::SelfFn(_) | VE::GlobalFn(_)))
         {
-            return None; // undefined/opaque/self never survives to an exit
+            return None; // undefined/opaque/self/global-callee never survives to an exit
         }
         let sidx = match shapes.iter().position(|s| *s == shape) {
             Some(p) => p as u16,
@@ -797,8 +828,10 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     VE::ArrayPopFn(_) => KShapeSlot::ArrayPopFn,
                     VE::Str(sl) => KShapeSlot::Str(*sl),
                     VE::CharCodeFn(_) => KShapeSlot::CharCodeFn,
-                    VE::Undef | VE::Opaque | VE::SelfFn(_) => {
-                        unreachable!("undef/opaque/self never crosses block boundaries")
+                    VE::Undef | VE::Opaque | VE::SelfFn(_) | VE::GlobalFn(_) => {
+                        unreachable!(
+                            "undef/opaque/self/global-callee never crosses block boundaries"
+                        )
                     }
                 })
                 .collect()
@@ -809,6 +842,18 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     for &(sl, r) in &x.local_reg {
         locals[r as usize] = sl;
     }
+    // fn mode: written upvalue slots, as (register, upvalue index) — the
+    // runtime flushes these registers back to the cells on completion.
+    // Numeric-local registers are identity under the remap above, so the
+    // `locals` position IS the runtime register.
+    let uv_writes: Vec<(u16, u32)> = locals
+        .iter()
+        .enumerate()
+        .filter_map(|(r, sl)| match sl {
+            KSlot::Upvalue(u) if x.uv_writes.contains(u) => Some((r as u16, *u)),
+            _ => None,
+        })
+        .collect();
     let mut bool_locals: Vec<u32> = vec![0; n_bools as usize];
     for &(l, r) in &x.bool_reg {
         bool_locals[(r - BOOL_BASE) as usize] = l;
@@ -860,6 +905,11 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     if matches!(slot, KSlot::Upvalue(_)) {
                         upvalue_uses |= 1 << r;
                     }
+                }
+                // Written upvalue registers are observed by the completion
+                // flush — their stores are never dead.
+                for &(r, _) in &uv_writes {
+                    always_live |= 1 << r;
                 }
             } else {
                 for (r, slot) in locals.iter().enumerate() {
@@ -937,6 +987,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         rec,
         ret_bool: false, // `kernelize_function` fills for recursive kernels
         args_used: 0,    // `kernelize_function` fills for fn kernels
+        uv_writes: uv_writes.into_boxed_slice(),
         fallback: Box::new(Op::Nop), // caller stores the real header op
     })
 }
@@ -1760,9 +1811,12 @@ impl Xlate<'_> {
         Some(r)
     }
 
-    /// Register snapshotting captured upvalue cell `u` (read-only: nothing
-    /// can write the cell during a kernel — regions contain no calls — and
-    /// in-region upvalue writes are not on the allowlist).
+    /// Register snapshotting captured upvalue cell `u`. Nothing but the
+    /// kernel itself can write the cell during an activation (regions
+    /// contain no calls), so the register IS the cell's live value: loop
+    /// mode keeps it read-only (upvalue stores are not on the loop
+    /// allowlist), fn mode additionally routes `StoreUpvalue*` through it
+    /// and flushes written registers back on completion (`uv_writes`).
     fn uvreg(&mut self, u: u32) -> Option<u16> {
         let slot = KSlot::Upvalue(u);
         if let Some(&(_, r)) = self.local_reg.iter().find(|(sl, _)| *sl == slot) {
@@ -1969,6 +2023,7 @@ impl Xlate<'_> {
             | VE::Undef
             | VE::Opaque
             | VE::SelfFn(_)
+            | VE::GlobalFn(_)
             | VE::MathObj
             | VE::MathFn(_)
             | VE::Str(_)
@@ -2198,7 +2253,25 @@ impl Xlate<'_> {
                     };
                     self.vstack.push(VE::SelfFn(1 + idx as u16));
                 } else {
-                    return None;
+                    // LOOP mode: speculate a pinned GLOBAL callee (the fill
+                    // idiom `for (...) a[i] = rnd();`). Only a Call under an
+                    // `undefined` this can consume the entry, so a
+                    // mis-speculated non-callee global just fails
+                    // translation — exactly today's outcome.
+                    let idx = match self.global_callee_names.iter().position(|g| &**g == name) {
+                        Some(i) => i,
+                        None => {
+                            // Bounded like fn mode's rec_globals: a region
+                            // calling many distinct globals is not worth a
+                            // window per callee.
+                            if self.global_callee_names.len() >= 4 {
+                                return None;
+                            }
+                            self.global_callee_names.push(name.into());
+                            self.global_callee_names.len() - 1
+                        }
+                    };
+                    self.vstack.push(VE::GlobalFn(u16::try_from(idx).ok()?));
                 }
                 self.origins.push(None);
             }
@@ -2326,6 +2399,26 @@ impl Xlate<'_> {
                     }
                 }
             }
+            // fn mode: a captured cell WRITE. The upvalue's register becomes
+            // the cell's live value for the rest of the body (later
+            // `LoadUpvalue`s read the same register), and the runtime
+            // flushes written registers back to their cells on completion.
+            // The entry guard already requires the cell to hold a Number, so
+            // the Checked form's TDZ test is statically satisfied (a TDZ'd
+            // cell declines at the guard and throws on the generic path).
+            // Only Number stores translate: the flush materializes
+            // `Value::Number`, so a boolean/undefined store would change the
+            // cell's observable type vs. the generic path — those decline
+            // (via `pop_num` / the catch-all). Loop mode keeps rejecting
+            // upvalue stores entirely (write-back there covers locals only).
+            Op::StoreUpvalue(u) | Op::StoreUpvalueChecked(u) if self.fn_mode => {
+                let dst = self.uvreg(*u)?;
+                let src = self.pop_num()?;
+                self.kops.push(K::Mov { dst, src });
+                if !self.uv_writes.contains(u) {
+                    self.uv_writes.push(*u);
+                }
+            }
             // A block-scoped declaration's TDZ marker: writes `Uninitialized`
             // to the slot. Elidable exactly like the dead `undefined` store —
             // the local must be provably re-stored before anything can read
@@ -2449,6 +2542,7 @@ impl Xlate<'_> {
                     | VE::Undef
                     | VE::Opaque
                     | VE::SelfFn(_)
+                    | VE::GlobalFn(_)
                     | VE::ArrayPushFn(_)
                     | VE::ArrayPopFn(_) => return None,
                 }
@@ -2886,9 +2980,10 @@ impl Xlate<'_> {
                     self.exits.push((kidx, self.base_ip + i as u32, shape));
                     return Some(());
                 }
-                // LOOP mode: a call of a PINNED closure — the callee is an
-                // object-typed local (oslot machinery, discovered exactly
-                // like an array base) under a plain `undefined` this.
+                // LOOP mode: a call of a PINNED closure under a plain
+                // `undefined` this — the callee is either an object-typed
+                // local (oslot machinery, discovered exactly like an array
+                // base) or a speculated GLOBAL binding ([`VE::GlobalFn`]).
                 // Arguments must be statically NUMBER registers: they copy
                 // raw into the callee kernel's guarded-Number arg registers.
                 if !self.fn_mode
@@ -2898,18 +2993,23 @@ impl Xlate<'_> {
                     for d in 0..n {
                         self.top_num_reg(d)?;
                     }
-                    let oslot = self.base_slot(n + 1)?;
+                    let source = match *self.vstack.get(fn_pos)? {
+                        VE::GlobalFn(g) => crate::bytecode::KCalleeSrc::Global(
+                            self.global_callee_names.get(g as usize)?.clone(),
+                        ),
+                        _ => crate::bytecode::KCalleeSrc::Oslot(self.base_slot(n + 1)?),
+                    };
                     let argc = u16::try_from(n).ok()?;
                     // `fslot` indexes the CALLEE table (parallel to the
                     // executor's per-activation window list), NOT the oslots.
-                    let fslot = match self.callees.iter().position(|c| c.oslot == oslot) {
+                    let fslot = match self.callees.iter().position(|c| c.source == source) {
                         Some(i) => {
                             self.callees[i].min_argc = self.callees[i].min_argc.min(argc);
                             i
                         }
                         None => {
                             self.callees.push(KCallee {
-                                oslot,
+                                source,
                                 min_argc: argc,
                             });
                             self.callees.len() - 1
