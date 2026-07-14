@@ -15,6 +15,27 @@ export type AgentJson =
 
 export type JsonObject = { [key: string]: AgentJson };
 
+/**
+ * Structured fields for `chidori.log`. Values are JSON; `undefined` entries are
+ * accepted (and simply dropped on serialization) so optional data can be logged
+ * without `?? null` dances.
+ */
+export type LogFields = { [key: string]: AgentJson | undefined };
+
+/**
+ * What an agent handler may return: JSON, except object members may be
+ * `undefined` (they are dropped when the output is serialized). This is what
+ * lets outcome shapes with optional fields — {@link BranchOutcome},
+ * {@link ActorOutcome} — be returned from an agent without `?? null` dances.
+ */
+export type AgentOutput =
+  | null
+  | boolean
+  | number
+  | string
+  | AgentOutput[]
+  | { [key: string]: AgentOutput | undefined };
+
 export interface JsonSchema {
   type?: "object" | "array" | "string" | "number" | "integer" | "boolean" | "null";
   description?: string;
@@ -62,7 +83,9 @@ export interface PromptOptions {
 export interface LlmResponseJson {
   content: string;
   blocks: AgentJson[];
-  toolCalls: { id: string; name: string; input: AgentJson }[];
+  /** Tool-use requests from the model. `input` is always a JSON object, so it
+   * can be passed straight to `chidori.tool(call.name, call.input)`. */
+  toolCalls: { id: string; name: string; input: JsonObject }[];
   stopReason: string;
   inputTokens: number;
   outputTokens: number;
@@ -148,11 +171,13 @@ export interface Context {
   estimateTokens(): number;
 }
 
-/** One recorded exchange in a {@link Conversation} transcript. */
-export interface ConversationTurn {
+/** One recorded exchange in a {@link Conversation} transcript. A type alias
+ * (not an interface) so transcripts stay assignable to {@link AgentJson} and
+ * can be returned as agent output directly. */
+export type ConversationTurn = {
   role: "user" | "assistant";
   text: string;
-}
+};
 
 /** Options for `chidori.conversation()`. */
 export interface ConversationOptions {
@@ -250,12 +275,15 @@ export interface InputOptions {
  * Who delivered a signal. `kind` distinguishes a human participant from a peer
  * agent; `id` is the participant identity; `runId` is set when an agent sends
  * (its own run id), so agent-to-agent coordination is attributable in the trace.
+ *
+ * A type alias (not an interface) so it stays assignable to {@link AgentJson} —
+ * senders routinely flow into `chidori.log` fields and agent outputs.
  */
-export interface SignalSender {
+export type SignalSender = {
   kind: "human" | "agent";
   id: string;
   runId?: string;
-}
+};
 
 /**
  * A named message delivered into a run mid-flight (`docs/signals.md`). The
@@ -263,13 +291,13 @@ export interface SignalSender {
  * `{ name, payload, from }` at an agent-declared listen point. Every signal is
  * recorded in the call log, so the multiplayer session replays deterministically.
  */
-export interface Signal<T = AgentJson> {
+export type Signal<T = AgentJson> = {
   name: string;
   payload: T;
   from: SignalSender;
   /** Never set on a delivered signal — the discriminant against {@link SignalTimeout}, so `if (result.timedOut)` narrows. */
   timedOut?: undefined;
-}
+};
 
 export interface SignalOptions {
   /**
@@ -287,12 +315,12 @@ export interface SignalOptions {
  * rejecting (`docs/signals.md`). `name` is the single awaited name, or `null`
  * for a multi-name fan-in listen.
  */
-export interface SignalTimeout {
+export type SignalTimeout = {
   name: string | null;
   payload: null;
   from: null;
   timedOut: true;
-}
+};
 
 export interface ParallelOptions {
   concurrency?: number;
@@ -314,8 +342,9 @@ export interface BranchVariant {
 
 export type BranchStatus = "completed" | "paused" | "failed";
 
-/** The result of one branch sub-run, returned for comparison (not merged). */
-export interface BranchOutcome<T extends AgentJson = AgentJson> {
+/** The result of one branch sub-run, returned for comparison (not merged).
+ * A type alias so outcomes can flow straight into agent output. */
+export type BranchOutcome<T extends AgentJson = AgentJson> = {
   label: string;
   /**
    * `<parent run id>-op<branch seq>-branch-<k>` — identifies the branch
@@ -330,7 +359,7 @@ export interface BranchOutcome<T extends AgentJson = AgentJson> {
   pendingPrompt?: string;
   /** The failure message, when `status` is `"failed"`. */
   error?: string;
-}
+};
 
 export interface BranchOptions {
   /**
@@ -378,8 +407,9 @@ export interface SpawnActorOptions {
 /** How an actor's supervision loop settled. */
 export type ActorOutcomeStatus = "completed" | "failed" | "paused" | "stopped";
 
-/** The settlement `actors.join()`/`actors.stop()` resolve to. */
-export interface ActorOutcome<T extends AgentJson = AgentJson> {
+/** The settlement `actors.join()`/`actors.stop()` resolve to.
+ * A type alias so outcomes can flow straight into agent output. */
+export type ActorOutcome<T extends AgentJson = AgentJson> = {
   pid: string;
   status: ActorOutcomeStatus;
   /** The actor's return value, when `status` is `"completed"`. */
@@ -390,20 +420,20 @@ export interface ActorOutcome<T extends AgentJson = AgentJson> {
   pendingPrompt?: string;
   /** How many supervised restarts the actor consumed. */
   restarts: number;
-}
+};
 
 /**
  * What a `join`/`stop` with `timeoutMs` resolves to when the deadline passes
  * before the actor settles: a snapshot, not a settlement — nothing merged,
  * join again later. Discriminate with `outcome.status === "running"`.
  */
-export interface ActorStillRunning {
+export type ActorStillRunning = {
   pid: string;
   status: "running";
   restarts: number;
-}
+};
 
-export interface ActorStatus {
+export type ActorStatus = {
   pid: string;
   status: ActorOutcomeStatus | "running" | "waiting" | "unknown";
   restarts?: number;
@@ -411,17 +441,17 @@ export interface ActorStatus {
   mailbox?: number;
   /** The listen-point names a `"waiting"` actor is parked on. */
   waitingFor?: string[];
-}
+};
 
 /** A message consumed from a mailbox. */
-export interface ActorMessage<T = AgentJson> {
+export type ActorMessage<T = AgentJson> = {
   name: string;
   payload: T;
   /** Sender identity: `id` is the sending actor's pid, or `"run"`. */
   from: SignalSender;
   /** Never set on a delivered message — the discriminant against {@link SignalTimeout}. */
   timedOut?: undefined;
-}
+};
 
 export interface ReceiveOptions {
   /** Resolve to the `{ timedOut: true }` sentinel after this many ms. */
@@ -530,8 +560,9 @@ export type DetachedAgentStatus =
   | "failed"
   | "stopped";
 
-/** The snapshot `agents.status()`/`agents.join()` resolve to. */
-export interface DetachedAgentOutcome<T extends AgentJson = AgentJson> {
+/** The snapshot `agents.status()`/`agents.join()` resolve to.
+ * A type alias so outcomes can flow straight into agent output. */
+export type DetachedAgentOutcome<T extends AgentJson = AgentJson> = {
   name: string;
   runId: string;
   status: DetachedAgentStatus;
@@ -542,7 +573,7 @@ export interface DetachedAgentOutcome<T extends AgentJson = AgentJson> {
   waitingFor?: string[] | null;
   /** The alarm deadline, when the current wait carries one (ISO timestamp). */
   deadline?: string | null;
-}
+};
 
 /**
  * A detached agent's handle — same sugar as {@link ActorHandle}, addressed by
@@ -793,7 +824,7 @@ export interface Chidori {
   /** In-VM control-flow helpers (`parallel`, `retry`, `tryCall`) — pure JS, never recorded. */
   util: ChidoriUtil;
   template(pathOrText: string, vars?: JsonObject, options?: TemplateOptions): Promise<string>;
-  log(message: string, fields?: JsonObject): Promise<void>;
+  log(message: string, fields?: LogFields): Promise<void>;
   /** The persistent, namespaced key-value store. */
   memory: MemoryStore;
   /** The journaled agent-run application-data store (generative-UI runs). */
@@ -805,7 +836,7 @@ export interface Chidori {
   mark(label?: string, data?: AgentJson): Promise<void>;
 }
 
-export type AgentFunction<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson> = (
+export type AgentFunction<TInput extends AgentJson = JsonObject, TOutput extends AgentOutput = AgentOutput> = (
   input: TInput,
 ) => TOutput | Promise<TOutput>;
 
@@ -851,7 +882,7 @@ export const chidori: Chidori = new Proxy({} as Chidori, {
  * run(async (input) => ({ greeting: `hello ${input.name}` }));
  * ```
  */
-export function run<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson>(
+export function run<TInput extends AgentJson = JsonObject, TOutput extends AgentOutput = AgentOutput>(
   handler: AgentFunction<TInput, TOutput>,
 ): void {
   void handler;

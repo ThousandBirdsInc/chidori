@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
 /**
  * Durable pause / resume — human-in-the-loop across process restarts.
@@ -14,7 +14,7 @@ import type { Chidori } from "chidori:agent";
  *   const s = await client.run({ order: "A-1007" });   // -> status "paused"
  *   const done = await client.resume(s.id, "approve");  // -> status "completed"
  */
-export async function agent(input: { order?: string }, chidori: Chidori) {
+run(async (input: { order?: string }) => {
   const order = input.order ?? "A-1007";
 
   // Pretend this came from an orders service; kept inline to stay offline.
@@ -33,4 +33,4 @@ export async function agent(input: { order?: string }, chidori: Chidori) {
   }
 
   return { order, status: "denied" };
-}
+});

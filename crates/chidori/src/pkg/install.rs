@@ -82,6 +82,16 @@ pub fn cmd_add(dir: &Path, specs: &[String], dev: bool) -> Result<()> {
         println!("+ {name}@{version}");
     }
     report(&resolution, &stats, started);
+
+    // The install itself is pure data movement, so an incompatible package
+    // (CJS-only, native addon, non-allowlisted builtins) "succeeds" here and
+    // only explodes on first import. Surface that now instead.
+    for (name, _) in &requested {
+        let pkg_dir = dir.join("node_modules").join(name);
+        for warning in super::compat::check_package_compat(name, &pkg_dir) {
+            eprintln!("warning: {warning}");
+        }
+    }
     Ok(())
 }
 

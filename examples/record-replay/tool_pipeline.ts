@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
 /**
  * Deterministic fan-out + a durable artifact.
@@ -13,10 +13,7 @@ import type { Chidori } from "chidori:agent";
  * `chidori.workspace.write(...)` and run with CHIDORI_WORKSPACE_ROOT set to a
  * directory — see the README.)
  */
-export async function agent(
-  input: { city?: string; currency?: string },
-  chidori: Chidori,
-) {
+run(async (input: { city?: string; currency?: string }) => {
   const city = input.city ?? "Berlin";
   const currency = input.currency ?? "EUR";
 
@@ -45,4 +42,4 @@ export async function agent(
   await chidori.memory.set(`briefing:${city}`, { city, currency, briefing });
 
   return { city, currency, briefing };
-}
+});

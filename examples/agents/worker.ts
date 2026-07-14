@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run, type AgentJson, type JsonObject } from "chidori:agent";
 
 /**
  * An autonomous "worker" agent: it loops — think, call a tool, observe the
@@ -15,10 +15,7 @@ import type { Chidori } from "chidori:agent";
  *     --input task="Reverse the word 'chidori' and tell me the result." \
  *     --tools examples/tools
  */
-export async function agent(
-  input: { task: string; maxSteps?: number },
-  chidori: Chidori,
-) {
+run(async (input: { task: string; maxSteps?: number }) => {
   const maxSteps = input.maxSteps ?? 8;
 
   let ctx = chidori
@@ -31,7 +28,7 @@ export async function agent(
     .tools(["reverse"]) // tool names discovered from the --tools directory
     .user(input.task);
 
-  const steps: { tool: string; input: unknown; result: unknown }[] = [];
+  const steps: { tool: string; input: JsonObject; result: AgentJson }[] = [];
 
   for (let step = 0; step < maxSteps; step++) {
     const { response, context } = await ctx.respond({ type: "final" });
@@ -51,4 +48,4 @@ export async function agent(
   }
 
   return { answer: "(stopped: reached maxSteps without finishing)", steps };
-}
+});

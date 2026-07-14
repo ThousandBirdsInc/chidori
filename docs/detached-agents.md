@@ -29,14 +29,16 @@ run(async () => {
 ```ts
 // services/inbox-triager.ts — hibernates between emails, holding no thread
 // and no VM; an alarm compacts state daily even with no traffic.
-export async function agent() {
+import { chidori, run } from "chidori:agent";
+
+run(async () => {
   const triaged = [];
   while (true) {
     const msg = await chidori.signal("email");     // hibernate point
     const result = await chidori.prompt(`Triage: ${JSON.stringify(msg.payload)}`);
     triaged.push({ email: msg.payload, result });
   }
-}
+});
 ```
 
 ## The model

@@ -1,6 +1,6 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { topic: string }, chidori: Chidori) {
+run(async (input: { topic: string }) => {
   const drafts = await chidori.util.parallel(
     [
       async () =>
@@ -18,4 +18,4 @@ export async function agent(input: { topic: string }, chidori: Chidori) {
   );
 
   return { drafts };
-}
+});

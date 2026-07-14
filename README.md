@@ -182,18 +182,19 @@ assistant) and `--template worker` (an autonomous tool-using loop); omit
 
 ### 2. Write your own agent
 
-An agent is just an exported `agent` function. Every model call is a recorded
-host call:
+An agent is a plain TypeScript file: import the `chidori` host object and the
+`run` definer from the virtual `chidori:agent` module and register your handler.
+Every model call is a recorded host call:
 
 ```ts
 // summarizer.ts
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { document: string }, chidori: Chidori) {
+run(async (input: { document: string }) => {
   const summary = await chidori.prompt("Summarize in 3 bullets:\n" + input.document);
   const actionItems = await chidori.prompt("Extract action items:\n" + summary);
   return { summary, actionItems };
-}
+});
 ```
 
 That's a complete, durable agent. Both prompts are recorded; replay returns them
@@ -286,8 +287,10 @@ human-in-the-loop pause/resume loop — see
 - **npm packages without Node** — `chidori add zod` installs straight from the
   npm registry into a content-addressed cache (SHA-512 verified, hardlinked
   `node_modules`, merge-friendly JSONL lockfile, no install scripts ever), and
-  agents just `import { z } from "zod"`. See [package
-  management](./docs/package-management.md).
+  agents just `import { z } from "zod"`. The engine is not Node, so the
+  compatible set is pure-ESM, native-free packages using only the shimmed
+  builtins — `chidori add` warns when a package falls outside it. See
+  [package management](./docs/package-management.md#compatibility).
 
 Agents reach all of this through a fixed set of host functions on the `chidori`
 object — see [**Core concepts**](./docs/core-concepts.md) for the full list and

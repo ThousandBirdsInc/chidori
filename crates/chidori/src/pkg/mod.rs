@@ -24,6 +24,7 @@
 //!   attack vector. Packages needing native builds don't apply here — agent
 //!   code runs on chidori's embedded engine.
 
+pub mod compat;
 pub mod install;
 pub mod layout;
 pub mod lockfile;

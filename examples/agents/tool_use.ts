@@ -1,6 +1,6 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { query: string }, chidori: Chidori) {
+run(async (input: { query: string }) => {
   const result = await chidori.tool("web_search", { query: input.query });
   return { result };
-}
+});

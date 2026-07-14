@@ -45,6 +45,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Typecheck examples against the SDK types
+        run: |
+          npx tsc -p ../../examples
+          npx tsc -p ../../examples/record-replay
+
       - name: Build package
         run: npm run build
 
@@ -65,6 +70,9 @@ jobs:
 
       - name: Build chidori binary
         run: cargo build
+
+      - name: Run Python SDK client unit tests
+        run: python -m unittest sdk/python/tests/test_client_http.py
 
       - name: Run Python SDK integration tests
         run: python -m unittest sdk/python/tests/test_session_api.py

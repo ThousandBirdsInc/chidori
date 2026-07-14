@@ -18,6 +18,6 @@ run(async () => {
   }
   return {
     statuses: outcomes.map((o) => o.status),
-    shards: outcomes.map((o) => o.output),
+    shards: outcomes.map((o) => o.output ?? null),
   };
 });

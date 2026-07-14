@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
 /**
  * Deterministic non-determinism — reproducible ids, clocks, and choices.
@@ -14,7 +14,7 @@ import type { Chidori } from "chidori:agent";
  * a tool. This example uses an explicit tool so the recorded value is obvious in
  * the call log.)
  */
-export async function agent(input: { prefix?: string }, chidori: Chidori) {
+run(async (input: { prefix?: string }) => {
   const minted = await chidori.tool<{ prefix: string }, { id: string; epochMs: number }>("mint_id", {
     prefix: input.prefix ?? "run",
   });
@@ -25,4 +25,4 @@ export async function agent(input: { prefix?: string }, chidori: Chidori) {
   await chidori.memory.set("identity", { id: minted.id, lane });
 
   return { runId: minted.id, startedAt: minted.epochMs, lane };
-}
+});

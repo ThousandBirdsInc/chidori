@@ -45,7 +45,8 @@ Expected output:
 
 What this demonstrates:
 
-- `examples/agents/hello.ts` exports `agent(input, chidori)`.
+- `examples/agents/hello.ts` imports `{ chidori, run }` from `chidori:agent`
+  and registers its handler with `run(async (input) => …)`.
 - The agent calls `chidori.log(...)`, so the runtime records a host call.
 - The agent returns plain JSON, which is what CLI, server, and SDK users receive.
 - A checkpoint is written under `examples/agents/.chidori/runs/<run_id>/` for

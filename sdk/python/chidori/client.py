@@ -3,12 +3,85 @@
 from __future__ import annotations
 
 import json
+import socket
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
 import urllib.request
 import urllib.error
+
+
+class AgentClientError(RuntimeError):
+    """Base class for every error the SDK raises.
+
+    Subclasses ``RuntimeError`` so existing ``except RuntimeError`` handlers
+    keep working.
+    """
+
+
+class HttpError(AgentClientError):
+    """A non-2xx HTTP response.
+
+    Carries the parsed ``status`` so callers can distinguish the server's
+    documented semantics — e.g. for ``AgentClient.signal``: 400 (empty name),
+    404 (unknown session), 409 (terminal run) — instead of string-matching
+    the message.
+    """
+
+    def __init__(
+        self,
+        method: str,
+        path: str,
+        status: int,
+        body: str,
+        detail: str | None = None,
+    ) -> None:
+        self.method = method
+        self.path = path
+        self.status = status
+        self.body = body
+        #: The server's ``error`` field, when the body was ``{"error": ...}``.
+        self.detail = detail
+        suffix = f": {detail if detail is not None else body}" if (detail or body) else ""
+        super().__init__(f"{method} {path} failed: HTTP {status}{suffix}")
+
+    @classmethod
+    def from_http_error(cls, method: str, path: str, e: urllib.error.HTTPError) -> "HttpError":
+        body = e.read().decode(errors="replace") if e.fp else ""
+        detail: str | None = None
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+                detail = parsed["error"]
+        except json.JSONDecodeError:
+            pass
+        return cls(method, path, e.code, body, detail)
+
+
+class TimeoutError(AgentClientError):  # noqa: A001 - deliberate, scoped to this package
+    """The request exceeded the client's ``timeout_seconds`` without completing."""
+
+    def __init__(self, method: str, path: str, timeout_seconds: float) -> None:
+        self.method = method
+        self.path = path
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"{method} {path} timed out after {timeout_seconds}s")
+
+
+class ConnectionError(AgentClientError):  # noqa: A001 - deliberate, scoped to this package
+    """The request never produced an HTTP response (refused, reset, DNS, ...)."""
+
+    def __init__(self, method: str, path: str, reason: object) -> None:
+        self.method = method
+        self.path = path
+        self.reason = reason
+        super().__init__(f"{method} {path} failed: {reason}")
+
+
+#: Response statuses worth retrying on idempotent requests.
+_RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 
 
 @dataclass
@@ -150,8 +223,36 @@ class AgentClient:
         assert s1.output == s2.output  # same result, zero LLM calls
     """
 
-    def __init__(self, base_url: str = "http://localhost:8080"):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8080",
+        *,
+        timeout_seconds: float = 300.0,
+        retries: int = 2,
+        retry_delay_seconds: float = 0.25,
+    ):
+        """Create a client.
+
+        ``timeout_seconds`` bounds each request (0 disables it). The default is
+        generous — 5 minutes — because ``run()`` executes the whole agent
+        before responding, but finite so a hung server raises ``TimeoutError``
+        instead of blocking forever. For ``stream()`` it covers connection
+        establishment, not the open event stream.
+
+        ``retries`` applies to idempotent GET requests only, retried on
+        connection errors, timeouts, and 429/502/503/504 responses with
+        exponential backoff starting at ``retry_delay_seconds``. POSTs are
+        never retried — ``run``/``resume``/``signal`` are not idempotent, and
+        a blind retry could execute an agent twice.
+
+        Failures raise typed errors (all subclassing ``AgentClientError``,
+        itself a ``RuntimeError``): ``HttpError`` with a ``.status`` for
+        non-2xx responses, ``TimeoutError``, or ``ConnectionError``.
+        """
         self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.retries = retries
+        self.retry_delay_seconds = retry_delay_seconds
 
     def health(self) -> dict:
         """Check server health."""
@@ -374,11 +475,24 @@ class AgentClient:
             },
             method="POST",
         )
+        # The timeout covers connection establishment; once the stream is
+        # open the socket timeout is cleared so a healthy run may idle
+        # between events indefinitely.
         try:
-            resp = urllib.request.urlopen(req)
+            resp = urllib.request.urlopen(req, timeout=self._urlopen_timeout())
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode() if e.fp else ""
-            raise RuntimeError(f"HTTP {e.code}: {err_body}") from e
+            raise HttpError.from_http_error("POST", "/sessions/stream", e) from e
+        except socket.timeout as e:
+            raise TimeoutError("POST", "/sessions/stream", self.timeout_seconds) from e
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, socket.timeout):
+                raise TimeoutError("POST", "/sessions/stream", self.timeout_seconds) from e
+            raise ConnectionError("POST", "/sessions/stream", e.reason) from e
+        try:
+            sock = resp.fp.raw._sock  # noqa: SLF001 - stdlib http response internals
+            sock.settimeout(None)
+        except AttributeError:
+            pass  # non-CPython layout; keep the connect timeout for reads too
 
         # Minimal SSE parser: accumulate `event:` and `data:` lines until a
         # blank line, then yield the decoded frame. Good enough for the
@@ -423,27 +537,56 @@ class AgentClient:
     # -- HTTP helpers --
 
     def _get(self, path: str) -> dict:
-        url = self.base_url + path
-        req = urllib.request.Request(url)
-        try:
-            with urllib.request.urlopen(req) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            raise RuntimeError(f"HTTP {e.code}: {body}") from e
+        # GETs are idempotent: retry connection failures, timeouts, and
+        # retryable statuses with exponential backoff.
+        return self._request("GET", path, retries=self.retries)[1]
 
     def _post(self, path: str, body: dict) -> dict:
         return self._post_with_status(path, body)[1]
 
     def _post_with_status(self, path: str, body: dict) -> tuple[int, dict]:
+        # POSTs are never retried: run/resume/signal are not idempotent.
+        return self._request("POST", path, body=body, retries=0)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        retries: int = 0,
+    ) -> tuple[int, dict]:
+        """One HTTP exchange with timeout and (for idempotent requests) retries.
+
+        Returns ``(status, parsed_json)``; raises ``HttpError``,
+        ``TimeoutError``, or ``ConnectionError`` otherwise.
+        """
         url = self.base_url + path
-        data = json.dumps(body).encode()
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}
-        )
-        try:
-            with urllib.request.urlopen(req) as resp:
-                return resp.status, json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            raise RuntimeError(f"HTTP {e.code}: {body}") from e
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        for attempt in range(retries + 1):
+            if attempt:
+                time.sleep(self.retry_delay_seconds * 2 ** (attempt - 1))
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=self._urlopen_timeout()) as resp:
+                    return resp.status, json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                err: AgentClientError = HttpError.from_http_error(method, path, e)
+                if err.status not in _RETRYABLE_STATUS or attempt == retries:
+                    raise err from e
+            except socket.timeout as e:
+                err = TimeoutError(method, path, self.timeout_seconds)
+                if attempt == retries:
+                    raise err from e
+            except urllib.error.URLError as e:
+                if isinstance(e.reason, socket.timeout):
+                    err = TimeoutError(method, path, self.timeout_seconds)
+                else:
+                    err = ConnectionError(method, path, e.reason)
+                if attempt == retries:
+                    raise err from e
+        raise AssertionError("unreachable: the retry loop returns or raises")
+
+    def _urlopen_timeout(self) -> float | None:
+        """`urlopen`'s socket timeout; `timeout_seconds == 0` disables it."""
+        return self.timeout_seconds if self.timeout_seconds > 0 else None

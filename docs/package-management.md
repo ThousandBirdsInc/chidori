@@ -77,13 +77,14 @@ hashes, so the tree rebuilds from the store alone.
 Installed packages import the way they would under node or bun:
 
 ```ts
+import { run } from "chidori:agent";
 import { z } from "zod";
 import ms from "ms";
 
-export default async function agent(input: { minutes: number }) {
+run(async (input: { minutes: number }) => {
   const schema = z.object({ minutes: z.number() });
   return { human: ms(schema.parse(input).minutes * 60_000, { long: true }) };
-}
+});
 ```
 
 The module loader resolves bare specifiers through the full Node ESM
@@ -97,6 +98,38 @@ export — enough for classics like `ms` or UMD single-file bundles. A CJS file
 that calls `require()` throws with a clear message; prefer packages that ship
 an ESM build (most modern ones do). JSON subpath imports resolve to a default
 export.
+
+## Compatibility
+
+Chidori's embedded engine is **not Node**, and "no Node required" cuts both
+ways: a package that works under `node` is not automatically compatible. The
+three cliffs, concretely:
+
+1. **CommonJS is leaf-only.** ESM builds load fully. A CommonJS file loads
+   only if it never calls `require()` at runtime (the wrapper turns its
+   `module.exports` into the default export). Any runtime `require()` throws —
+   at *import time*, not install time.
+2. **Node builtins are a small allowlist.** The runtime shims exactly:
+   `process`, `buffer`, `util`, `fs`, `fs/promises`, `crypto`, `http`,
+   `https`, `path`, `path/posix`, `events`, `url`, `assert`,
+   `assert/strict`, `os`. Anything else — `net`, `stream`, `child_process`,
+   `worker_threads`, `zlib`, `tls`, `vm`, … — is not provided, and importing
+   it fails with an allowlist error. (Networking is `fetch` plus the
+   `node:http`/`node:https` client shims, all captured for replay.)
+3. **No native addons.** There is no node-gyp build step (lifecycle scripts
+   never run) and no way to load a `.node` binary. Packages that depend on
+   `node-gyp-build`, `prebuild-install`, `bindings`, etc. cannot work, even
+   when the install "succeeds".
+
+In short: **pure-ESM, native-free, allowlist-respecting packages work**; the
+rest fail at first import. Because installs are pure data movement, `chidori
+add` can't make an incompatible package fail to install — instead it scans
+each added package for these three cliffs and prints a `warning:` when it
+finds one (no ESM build, native-addon markers, imports of unprovided
+builtins). The scan is a bounded heuristic: it can miss dynamically computed
+specifiers, so a quiet `add` is strong — not perfect — evidence of
+compatibility. `chidori check agent.ts` (or just running the agent) gives the
+definitive answer, since the module graph resolves eagerly.
 
 ## Out of scope (v1) and why
 

@@ -1,6 +1,6 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { topic: string }, chidori: Chidori) {
+run(async (input: { topic: string }) => {
   const progress = await chidori.prompt(
     "In one sentence, say what work is starting for: " + input.topic,
     { type: "progress", maxTokens: 80 },
@@ -37,4 +37,4 @@ export async function agent(input: { topic: string }, chidori: Chidori) {
   );
 
   return { progress, drafts, subagent, final };
-}
+});

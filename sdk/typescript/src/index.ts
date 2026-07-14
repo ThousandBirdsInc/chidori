@@ -17,6 +17,7 @@ export type {
   ActorStillRunning,
   AgentFunction,
   AgentJson,
+  AgentOutput,
   AppData,
   BranchOptions,
   BranchOutcome,
@@ -41,6 +42,7 @@ export type {
   JsonObject,
   JsonSchema,
   LlmResponseJson,
+  LogFields,
   MapSetSnapshotPolicy,
   MemoryStore,
   ParallelOptions,
@@ -358,6 +360,96 @@ export type StreamEvent =
     }
   | { type: "done"; id: string; status: SessionStatus; output?: Json; error?: string };
 
+/** Base class for every error the SDK throws. `catch (e) { if (e instanceof
+ * AgentClientError) ... }` covers HTTP failures, timeouts, and connection
+ * errors alike. */
+export class AgentClientError extends Error {}
+
+/**
+ * A non-2xx HTTP response. Carries the parsed `status` so callers can
+ * distinguish the server's documented semantics — e.g. for `client.signal`:
+ * 400 (empty name), 404 (unknown session), 409 (terminal run) — instead of
+ * string-matching the message.
+ */
+export class HttpError extends AgentClientError {
+  constructor(
+    /** HTTP method of the failed request. */
+    readonly method: string,
+    /** Request path relative to the base URL. */
+    readonly path: string,
+    /** HTTP status code (400, 404, 409, 500, ...). */
+    readonly status: number,
+    /** Raw response body text (may be empty). */
+    readonly body: string,
+    /** The server's `error` field, when the body was `{ "error": ... }`. */
+    readonly detail: string | null = null,
+  ) {
+    super(`${method} ${path} failed: HTTP ${status}${detail || body ? `: ${detail ?? body}` : ""}`);
+    this.name = "HttpError";
+  }
+
+  static async fromResponse(method: string, path: string, resp: Response): Promise<HttpError> {
+    const body = await resp.text().catch(() => "");
+    let detail: string | null = null;
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown };
+      if (typeof parsed.error === "string") detail = parsed.error;
+    } catch {
+      // not JSON — leave detail null
+    }
+    return new HttpError(method, path, resp.status, body, detail);
+  }
+}
+
+/** The request exceeded the client's `timeoutMs` without completing. */
+export class TimeoutError extends AgentClientError {
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`${method} ${path} timed out after ${timeoutMs}ms`);
+    this.name = "TimeoutError";
+  }
+}
+
+/** The request never produced an HTTP response (refused, reset, DNS, ...). */
+export class ConnectionError extends AgentClientError {
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    cause: unknown,
+  ) {
+    super(`${method} ${path} failed: ${cause instanceof Error ? cause.message : String(cause)}`, {
+      cause,
+    });
+    this.name = "ConnectionError";
+  }
+}
+
+/** Response statuses worth retrying on idempotent requests. */
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+
+export interface AgentClientOptions {
+  /**
+   * Per-request timeout in milliseconds; `0` disables it. Defaults to
+   * 300 000 (5 minutes) — generous because `run()` executes the whole agent
+   * before responding, but finite so a hung server surfaces as a
+   * `TimeoutError` instead of blocking forever. For `stream()` the timeout
+   * covers connection establishment only, never an open event stream.
+   */
+  timeoutMs?: number;
+  /**
+   * How many times to retry **idempotent GET requests** after a connection
+   * error, timeout, or retryable status (429/502/503/504). Defaults to 2.
+   * POST requests are never retried — `run`/`resume`/`signal` are not
+   * idempotent, and a blind retry could execute an agent twice.
+   */
+  retries?: number;
+  /** Base delay between retries in milliseconds, doubling per attempt (default 250). */
+  retryDelayMs?: number;
+}
+
 /**
  * HTTP client for an `chidori serve` instance.
  *
@@ -369,12 +461,23 @@ export type StreamEvent =
  * const cp = await session.checkpoint();
  * const replayed = await client.replay(cp);  // zero LLM calls
  * ```
+ *
+ * Failures throw typed errors (all extending {@link AgentClientError}):
+ * {@link HttpError} with a `.status` for non-2xx responses,
+ * {@link TimeoutError} after `timeoutMs`, {@link ConnectionError} when no
+ * response arrived at all.
  */
 export class AgentClient {
   readonly baseUrl: string;
+  readonly timeoutMs: number;
+  readonly retries: number;
+  readonly retryDelayMs: number;
 
-  constructor(baseUrl: string = "http://localhost:8080") {
+  constructor(baseUrl: string = "http://localhost:8080", options: AgentClientOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.timeoutMs = options.timeoutMs ?? 300_000;
+    this.retries = options.retries ?? 2;
+    this.retryDelayMs = options.retryDelayMs ?? 250;
   }
 
   async health(): Promise<Json> {
@@ -496,13 +599,29 @@ export class AgentClient {
    * progress streams separately from final-answer streams.
    */
   async *stream(input: Json): AsyncGenerator<StreamEvent, void, void> {
-    const resp = await fetch(`${this.baseUrl}/sessions/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ input }),
-    });
+    // The timeout covers connection establishment (until response headers
+    // arrive), not the open event stream — a healthy run may stream for a
+    // long time between events.
+    const controller = new AbortController();
+    const timer =
+      this.timeoutMs > 0 ? setTimeout(() => controller.abort(), this.timeoutMs) : null;
+    let resp: Response;
+    try {
+      resp = await fetch(`${this.baseUrl}/sessions/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        body: JSON.stringify({ input }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      throw controller.signal.aborted
+        ? new TimeoutError("POST", "/sessions/stream", this.timeoutMs)
+        : new ConnectionError("POST", "/sessions/stream", err);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
     if (!resp.ok || !resp.body) {
-      throw new Error(`stream request failed: ${resp.status}`);
+      throw await HttpError.fromResponse("POST", "/sessions/stream", resp);
     }
 
     // Minimal SSE parser — just enough for the events our server emits.
@@ -543,8 +662,9 @@ export class AgentClient {
   }
 
   private async getJSON(path: string): Promise<unknown> {
-    const resp = await fetch(this.baseUrl + path);
-    if (!resp.ok) throw await httpError(resp);
+    // GETs are idempotent: retry connection failures, timeouts, and
+    // retryable statuses with exponential backoff.
+    const resp = await this.request("GET", path, undefined, this.retries);
     return await resp.json();
   }
 
@@ -556,19 +676,68 @@ export class AgentClient {
     path: string,
     body: unknown,
   ): Promise<{ status: number; data: Record<string, unknown> }> {
-    const resp = await fetch(this.baseUrl + path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) throw await httpError(resp);
+    // POSTs are never retried: run/resume/signal are not idempotent.
+    const resp = await this.request("POST", path, body, 0);
     return { status: resp.status, data: (await resp.json()) as Record<string, unknown> };
+  }
+
+  /**
+   * One HTTP exchange with timeout and (for idempotent requests) retries.
+   * Resolves with a 2xx `Response`; throws {@link HttpError},
+   * {@link TimeoutError}, or {@link ConnectionError} otherwise.
+   */
+  private async request(
+    method: "GET" | "POST",
+    path: string,
+    body: unknown,
+    retries: number,
+  ): Promise<Response> {
+    let lastError: AgentClientError | null = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (attempt > 0) {
+        await sleep(this.retryDelayMs * 2 ** (attempt - 1));
+      }
+      const controller = new AbortController();
+      const timer =
+        this.timeoutMs > 0 ? setTimeout(() => controller.abort(), this.timeoutMs) : null;
+      try {
+        let resp: Response;
+        try {
+          resp = await fetch(this.baseUrl + path, {
+            method,
+            signal: controller.signal,
+            ...(body !== undefined
+              ? {
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(body),
+                }
+              : {}),
+          });
+        } catch (err) {
+          throw controller.signal.aborted
+            ? new TimeoutError(method, path, this.timeoutMs)
+            : new ConnectionError(method, path, err);
+        }
+        if (!resp.ok) throw await HttpError.fromResponse(method, path, resp);
+        return resp;
+      } catch (err) {
+        const retryable =
+          err instanceof TimeoutError ||
+          err instanceof ConnectionError ||
+          (err instanceof HttpError && RETRYABLE_STATUS.has(err.status));
+        if (!retryable || attempt === retries) throw err;
+        lastError = err as AgentClientError;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+    // Unreachable: the loop either returns or throws on the last attempt.
+    throw lastError ?? new ConnectionError(method, path, "retries exhausted");
   }
 }
 
-async function httpError(resp: Response): Promise<Error> {
-  const text = await resp.text().catch(() => "");
-  return new Error(`HTTP ${resp.status}: ${text}`);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseSseFrame(frame: string): StreamEvent | null {
