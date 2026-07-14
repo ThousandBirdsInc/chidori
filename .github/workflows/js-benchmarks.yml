@@ -50,7 +50,7 @@ jobs:
       # The runner image ships a python3, but pin explicitly so the cpython
       # column doesn't silently vanish (the harness skips missing runtimes)
       # or drift across image updates.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
