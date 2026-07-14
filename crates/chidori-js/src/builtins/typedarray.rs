@@ -1784,7 +1784,13 @@ fn ta_compare(
                             0.0
                         }
                     }
-                    _ => unreachable!("fn kernels return Number or Bool"),
+                    // Tier bug: throw a catchable internal error rather than
+                    // aborting the process.
+                    _ => {
+                        return Err(vm.throw_internal(
+                            "function kernel returned a non-Number, non-Bool value",
+                        ))
+                    }
                 };
                 return Ok(if n < 0.0 {
                     -1

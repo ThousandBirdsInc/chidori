@@ -758,7 +758,14 @@ impl Vm {
                 crate::bytecode::KSlot::Upvalue(u) => {
                     frame.func.upvalues[*u as usize].borrow().clone()
                 }
-                crate::bytecode::KSlot::Arg(_) => unreachable!("declined by the guard"),
+                // Function-kernel-only slot the entry guard declines. One
+                // slipping through is a translator bug — nothing has executed
+                // yet, so deopt to the fallback bytecode instead of aborting.
+                crate::bytecode::KSlot::Arg(_) => {
+                    self.kernel_regs = regs;
+                    self.kernel_prop_slots = prop_slots;
+                    return self.step(frame, &k.fallback);
+                }
             };
             if let Value::Number(n) = v {
                 regs[r] = n;
@@ -790,20 +797,38 @@ impl Vm {
         if !k.props_used.is_empty() {
             let prop_base = k.n_regs as usize - k.props_used.len();
             for (i, p) in k.props_used.iter().enumerate() {
-                let b = objs[p.oslot as usize].borrow();
-                match b.own_get_index(prop_slots[i] as usize) {
-                    Some((
-                        _,
-                        Property {
-                            kind:
-                                PropertyKind::Data {
-                                    value: Value::Number(n),
-                                    ..
-                                },
-                            ..
-                        },
-                    )) => regs[prop_base + i] = *n,
-                    _ => unreachable!("kernel prop slot invariant"),
+                let loaded = {
+                    let b = objs[p.oslot as usize].borrow();
+                    match b.own_get_index(prop_slots[i] as usize) {
+                        Some((
+                            _,
+                            Property {
+                                kind:
+                                    PropertyKind::Data {
+                                        value: Value::Number(n),
+                                        ..
+                                    },
+                                ..
+                            },
+                        )) => Some(*n),
+                        _ => None,
+                    }
+                };
+                match loaded {
+                    Some(n) => regs[prop_base + i] = n,
+                    // The entry guard just resolved this slot to a Number
+                    // data property; a miss is a tier bug. Nothing has
+                    // executed yet — deopt to the fallback bytecode instead
+                    // of aborting the process.
+                    None => {
+                        self.kernel_regs = regs;
+                        objs.clear();
+                        self.kernel_objs = objs;
+                        sstrs.clear();
+                        self.kernel_strs = sstrs;
+                        self.kernel_prop_slots = prop_slots;
+                        return self.step(frame, &k.fallback);
+                    }
                 }
             }
         }
@@ -950,6 +975,34 @@ impl Vm {
         let code = &k.code;
         let mut pc = 0usize;
         let (resume_ip, shape) = loop {
+            // Latch-and-unwind for ops the translator promised this loop
+            // never contains — a TIER BUG, but one that must stay inside the
+            // sandbox: write the (valid, Number/Bool) register state back,
+            // restore the pooled buffers, and throw a catchable internal
+            // error instead of aborting the host process.
+            macro_rules! kernel_internal_error {
+                ($msg:expr) => {{
+                    for (r, slot) in k.locals.iter().enumerate() {
+                        if let crate::bytecode::KSlot::Local(l) = slot {
+                            frame.locals[*l as usize] = Value::Number(w[r & KWIN_MASK]);
+                        }
+                    }
+                    for (j, &l) in k.bool_locals.iter().enumerate() {
+                        frame.locals[l as usize] =
+                            Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
+                    }
+                    writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
+                    self.kernel_regs = regs;
+                    objs.clear();
+                    self.kernel_objs = objs;
+                    sstrs.clear();
+                    self.kernel_strs = sstrs;
+                    self.kernel_prop_slots = prop_slots;
+                    callee_bfs.clear();
+                    self.kernel_callees = callee_bfs;
+                    return Err(self.throw_internal($msg));
+                }};
+            }
             // Taken branches funnel through here so back-edges can poll the
             // cooperative interrupt flag at the interpreter's cadence.
             macro_rules! branch {
@@ -1284,7 +1337,7 @@ impl Vm {
                 // register Mov at kernel build; the slots live only in the
                 // entry load and the exit/unwind write-back now.
                 KOp::LoadProp { .. } | KOp::StoreProp { .. } => {
-                    unreachable!("prop op survived kernel build")
+                    kernel_internal_error!("prop op survived kernel build")
                 }
                 KOp::Mov2 { d1, s1, d2, s2 } => {
                     w[d1 as usize & KWIN_MASK] = w[s1 as usize & KWIN_MASK];
@@ -1513,39 +1566,49 @@ impl Vm {
                     if !ck.uv_writes.is_empty() {
                         flush_uv_writes(ck, bf, cw);
                     }
-                    if let Some(ret) = ret {
-                        w[dst as usize & KWIN_MASK] = ret;
-                    } else {
-                        // Interrupted on a callee back-edge: the same
-                        // latch-and-unwind as an interrupted caller edge.
-                        for (r, slot) in k.locals.iter().enumerate() {
-                            if let crate::bytecode::KSlot::Local(l) = slot {
-                                frame.locals[*l as usize] = Value::Number(w[r & KWIN_MASK]);
+                    match ret {
+                        CalleeOut::Ret(ret) => {
+                            w[dst as usize & KWIN_MASK] = ret;
+                        }
+                        CalleeOut::BadOp => {
+                            kernel_internal_error!("unsupported op in a callee kernel")
+                        }
+                        CalleeOut::Interrupted => {
+                            // Interrupted on a callee back-edge: the same
+                            // latch-and-unwind as an interrupted caller edge.
+                            for (r, slot) in k.locals.iter().enumerate() {
+                                if let crate::bytecode::KSlot::Local(l) = slot {
+                                    frame.locals[*l as usize] = Value::Number(w[r & KWIN_MASK]);
+                                }
                             }
+                            for (j, &l) in k.bool_locals.iter().enumerate() {
+                                frame.locals[l as usize] =
+                                    Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
+                            }
+                            writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
+                            self.kernel_regs = regs;
+                            objs.clear();
+                            self.kernel_objs = objs;
+                            sstrs.clear();
+                            self.kernel_strs = sstrs;
+                            self.kernel_prop_slots = prop_slots;
+                            callee_bfs.clear();
+                            self.kernel_callees = callee_bfs;
+                            self.op_budget = Some(0);
+                            return Err(self.throw_range("execution interrupted"));
                         }
-                        for (j, &l) in k.bool_locals.iter().enumerate() {
-                            frame.locals[l as usize] =
-                                Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
-                        }
-                        writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
-                        self.kernel_regs = regs;
-                        objs.clear();
-                        self.kernel_objs = objs;
-                        sstrs.clear();
-                        self.kernel_strs = sstrs;
-                        self.kernel_prop_slots = prop_slots;
-                        callee_bfs.clear();
-                        self.kernel_callees = callee_bfs;
-                        self.op_budget = Some(0);
-                        return Err(self.throw_range("execution interrupted"));
                     }
                 }
                 KOp::Exit { resume_ip, shape } => break (resume_ip, shape),
                 // Plain instantiation: a kernel without callee_slots never
                 // contains CallKernel (translator invariant).
-                KOp::CallKernel { .. } => unreachable!("CallKernel in a plain kernel loop"),
+                KOp::CallKernel { .. } => {
+                    kernel_internal_error!("CallKernel in a plain kernel loop")
+                }
                 // Function-kernel-only ops; loop translation never emits them.
-                KOp::Ret { .. } | KOp::SelfCall { .. } => unreachable!("fn op in a loop kernel"),
+                KOp::Ret { .. } | KOp::SelfCall { .. } => {
+                    kernel_internal_error!("fn op in a loop kernel")
+                }
             }
             pc += 1;
         };
@@ -1661,18 +1724,26 @@ impl Vm {
         }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
-        let ret = exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll);
-        if !k.uv_writes.is_empty() {
-            flush_uv_writes(k, bf, &regs);
-        }
-        match ret {
-            Some(ret) => Some(Ok(ret)),
-            None => {
+        match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll) {
+            FnKernelOut::Ret(ret) => {
+                if !k.uv_writes.is_empty() {
+                    flush_uv_writes(k, bf, &regs);
+                }
+                Some(Ok(ret))
+            }
+            FnKernelOut::Interrupted => {
+                if !k.uv_writes.is_empty() {
+                    flush_uv_writes(k, bf, &regs);
+                }
                 // Interrupted on a back-edge: latch the zero budget so a JS
                 // catch cannot resume execution.
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
             }
+            // Tier bug (an op fn-mode translation never emits). The kernel is
+            // pure and nothing was flushed, so declining to the generic call
+            // path re-runs the function with correct semantics.
+            FnKernelOut::BadOp => None,
         }
     }
 
@@ -1975,6 +2046,11 @@ impl Vm {
                                 v: w[src as usize & KWIN_MASK],
                             };
                         }
+                        // Ops rec-mode translation promised it never emits —
+                        // a tier bug. Recursive kernels are PURE (registers
+                        // only), so abandoning the activation is safe and the
+                        // generic rerun produces the correct result; never a
+                        // process abort.
                         KOp::ArrayPush { .. }
                         | KOp::ArrayPop { .. }
                         | KOp::LoadElem { .. }
@@ -1988,7 +2064,7 @@ impl Vm {
                         | KOp::LoadProp { .. }
                         | KOp::StoreProp { .. }
                         | KOp::CallKernel { .. }
-                        | KOp::Exit { .. } => unreachable!("bail op in a function kernel"),
+                        | KOp::Exit { .. } => break 'outer RecOut::Abandon,
                     }
                     pc += 1;
                 };
@@ -2458,13 +2534,16 @@ impl Vm {
             }
         }
         match exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll) {
-            Some(v) => Some(Ok(v)),
-            None => {
+            FnKernelOut::Ret(v) => Some(Ok(v)),
+            FnKernelOut::Interrupted => {
                 // Same latch-and-unwind as an interrupted kernel back-edge:
                 // zero the budget so a JS catch cannot resume execution.
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
             }
+            // Tier bug; the kernel is pure, so declining re-runs the callback
+            // generically with correct semantics.
+            FnKernelOut::BadOp => None,
         }
     }
 
@@ -2538,21 +2617,30 @@ impl Vm {
         };
         let k = p.bf.proto.fn_kernel.as_ref().expect("prepared");
         let ret = if interrupted {
-            None
+            FnKernelOut::Interrupted
         } else {
             exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll)
         };
         match ret {
-            Some(Value::Number(n)) => Ok(if n < 0.0 {
+            FnKernelOut::Ret(Value::Number(n)) => Ok(if n < 0.0 {
                 -1
             } else if n > 0.0 {
                 1
             } else {
                 0
             }),
-            Some(Value::Bool(b)) => Ok(if b { 1 } else { 0 }),
-            Some(_) => unreachable!("fn kernels return Number or Bool"),
-            None => {
+            FnKernelOut::Ret(Value::Bool(b)) => Ok(if b { 1 } else { 0 }),
+            // Tier bugs (a non-Number/Bool return, or an op fn-mode
+            // translation never emits). The primed sort loop has no generic
+            // per-call fallback, so surface a catchable internal error rather
+            // than aborting the process.
+            FnKernelOut::Ret(_) => {
+                Err(self.throw_internal("function kernel returned a non-Number, non-Bool value"))
+            }
+            FnKernelOut::BadOp => {
+                Err(self.throw_internal("unsupported op in a primed comparator kernel"))
+            }
+            FnKernelOut::Interrupted => {
                 self.op_budget = Some(0);
                 Err(self.throw_range("execution interrupted"))
             }
@@ -5429,7 +5517,11 @@ impl Vm {
                     self.park_forin_vec(keys);
                 }
             }
-            _ => unreachable!("op handled inline in run_reg_frame: {op:?}"),
+            // Every ROp is either handled above or inline in run_reg_frame's
+            // dispatch loop. Reaching here means the register-tier translator
+            // emitted an op this helper doesn't know — a tier bug that must
+            // stay inside the sandbox as a catchable error, not abort the host.
+            _ => return Err(self.throw_internal(&format!("unhandled op in run_reg_frame: {op:?}"))),
         }
         let _ = reg;
         Ok(())
@@ -7137,7 +7229,11 @@ impl Vm {
                 let it = self.get_async_iterator(&v)?;
                 push!(it);
             }
-            _ => unreachable!("op handled inline in step: {op:?}"),
+            // Every op is either handled above or inline in the caller's
+            // dispatch loop. Reaching here means the compiler emitted an op
+            // this interpreter doesn't know — a tier bug that must stay
+            // inside the sandbox as a catchable error, not abort the host.
+            _ => return Err(self.throw_internal(&format!("unhandled op in step: {op:?}"))),
         }
         Ok(Ctl::Next)
     }
@@ -7914,7 +8010,16 @@ fn writeback_kernel_props(
                     ..
                 },
             )) => *value = Value::Number(regs[prop_base + i]),
-            _ => unreachable!("kernel prop slot invariant"),
+            // The entry guard pinned this slot to a Number data property and
+            // nothing in-region can restructure a property map; a mismatch is
+            // a tier bug. Land the value on the right property by KEY instead
+            // of aborting the process — best-effort, but never silent loss.
+            _ => {
+                b.own_insert(
+                    PropertyKey::str(&p.key),
+                    Property::data(Value::Number(regs[prop_base + i])),
+                );
+            }
         }
     }
 }
@@ -7994,18 +8099,30 @@ fn callee_cell_writes_alias(
     false
 }
 
+/// Outcome of a frameless function-kernel body ([`exec_fn_kernel_code`] /
+/// [`run_callee_window`]). `BadOp` reports an op fn-mode translation promised
+/// it never emits — a TIER BUG, but one the caller can survive: function
+/// kernels are pure (registers only; cell flushes happen after the executor
+/// returns), so a caller with a generic path re-runs there, and one without
+/// throws a catchable internal error. Never a process abort.
+enum FnKernelOut {
+    Ret(Value),
+    Interrupted,
+    BadOp,
+}
+
 /// Execute a plain (non-recursive, frameless) FUNCTION kernel body over
 /// `regs`, returning the call's result — `Value::Number`, or `Value::Bool`
 /// for a boolean-typed `Ret`. Shared by the per-call [`Vm::run_fn_kernel`]
 /// entry and the prepared-callback path ([`Vm::exec_prepared_kernel`]).
-/// Returns `None` when the cooperative interrupt flag latched on a back-edge
-/// poll — the caller owns the budget-zeroing unwind.
+/// Returns `Interrupted` when the cooperative interrupt flag latched on a
+/// back-edge poll — the caller owns the budget-zeroing unwind.
 fn exec_fn_kernel_code(
     code: &[KOp],
     regs: &mut [f64; KWIN],
     interrupt: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     poll: &mut u32,
-) -> Option<Value> {
+) -> FnKernelOut {
     let mut pc = 0usize;
     loop {
         macro_rules! branch {
@@ -8016,7 +8133,7 @@ fn exec_fn_kernel_code(
                     if *poll & 0xFF == 0 {
                         if let Some(flag) = interrupt {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                return None;
+                                return FnKernelOut::Interrupted;
                             }
                         }
                     }
@@ -8166,7 +8283,7 @@ fn exec_fn_kernel_code(
                 pc += 1;
             }
             KOp::Ret { src, boolean } => {
-                return Some(if boolean {
+                return FnKernelOut::Ret(if boolean {
                     Value::Bool(regs[src as usize & KWIN_MASK] != 0.0)
                 } else {
                     Value::Number(regs[src as usize & KWIN_MASK])
@@ -8175,6 +8292,8 @@ fn exec_fn_kernel_code(
             // A frameless kernel has no bytecode frame to bail into;
             // fn-mode translation rejects anything needing one. A
             // SelfCall implies `self_global`, dispatched by the caller.
+            // Meeting one anyway is a translator bug — report it so the
+            // caller can fall back or throw, instead of aborting the process.
             KOp::ArrayPush { .. }
             | KOp::ArrayPop { .. }
             | KOp::LoadElem { .. }
@@ -8189,21 +8308,30 @@ fn exec_fn_kernel_code(
             | KOp::StoreProp { .. }
             | KOp::Exit { .. }
             | KOp::CallKernel { .. }
-            | KOp::SelfCall { .. } => unreachable!("bail op in a function kernel"),
+            | KOp::SelfCall { .. } => return FnKernelOut::BadOp,
         }
         pc += 1;
     }
 }
 
+/// Outcome of a pinned-callee kernel window run (see [`FnKernelOut`] for the
+/// `BadOp` rationale).
+enum CalleeOut {
+    Ret(f64),
+    Interrupted,
+    BadOp,
+}
+
 /// Run a pinned-callee kernel over its own fixed window. Returns the callee's
 /// `Ret` value (Number-only — the caller guard rejected boolean returns), or
-/// `None` when the cooperative interrupt flag latched on a back-edge poll.
+/// `Interrupted` when the cooperative interrupt flag latched on a back-edge
+/// poll.
 fn run_callee_window(
     regs: &mut [f64; KWIN],
     ck: &crate::bytecode::Kernel,
     interrupt: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     poll: &mut u32,
-) -> Option<f64> {
+) -> CalleeOut {
     let code = &ck.code;
     let mut pc = 0usize;
     loop {
@@ -8215,7 +8343,7 @@ fn run_callee_window(
                     if *poll & 0xFF == 0 {
                         if let Some(flag) = interrupt {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                return None;
+                                return CalleeOut::Interrupted;
                             }
                         }
                     }
@@ -8363,10 +8491,12 @@ fn run_callee_window(
                 pc += 1;
             }
             KOp::Ret { src, boolean: _ } => {
-                return Some(regs[src as usize & KWIN_MASK]);
+                return CalleeOut::Ret(regs[src as usize & KWIN_MASK]);
             }
             // Impossible in a guarded callee: no bails, no exits, no
-            // recursion, no nested closure calls.
+            // recursion, no nested closure calls. Meeting one is a tier bug;
+            // report it (the caller throws a catchable internal error)
+            // instead of aborting the process.
             KOp::ArrayPush { .. }
             | KOp::ArrayPop { .. }
             | KOp::LoadElem { .. }
@@ -8381,7 +8511,7 @@ fn run_callee_window(
             | KOp::StoreProp { .. }
             | KOp::Exit { .. }
             | KOp::SelfCall { .. }
-            | KOp::CallKernel { .. } => unreachable!("unsupported op in a callee kernel"),
+            | KOp::CallKernel { .. } => return CalleeOut::BadOp,
         }
         pc += 1;
     }
