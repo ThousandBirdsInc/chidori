@@ -414,8 +414,9 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &JsString) -> Result<
     }
 
     // For a sticky regexp the matcher itself enforces a match exactly at
-    // `start`; for plain/global it scans forward from `start`.
-    let m = regex_exec(&source, &flags, &units, start);
+    // `start`; for plain/global it scans forward from `start`. A blown match
+    // budget is a catchable error — never a silent "no match".
+    let m = regex_exec(&source, &flags, &units, start).map_err(|e| vm.throw_range(e.message()))?;
     match m {
         None => {
             if global || sticky {
