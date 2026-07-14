@@ -590,7 +590,7 @@ dependencies = [
  "icu_plurals",
  "indexmap 2.14.0",
  "mimalloc",
- "num-bigint",
+ "num-bigint 0.5.1",
  "num-integer",
  "num-traits",
  "oxc",
@@ -2099,9 +2099,19 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.6"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -2402,7 +2412,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f803b86d86fd830075a6a7f7b84c59e93131367738c55b4e7526669eeb0cc70"
 dependencies = [
  "cow-utils",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-traits",
  "oxc_allocator",
  "oxc_ast",
@@ -2436,7 +2446,7 @@ dependencies = [
  "bitflags",
  "cow-utils",
  "memchr",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-traits",
  "oxc_allocator",
  "oxc_ast",
