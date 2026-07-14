@@ -29,7 +29,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check the version train
         run: |
@@ -51,7 +51,7 @@ jobs:
       run:
         working-directory: sdk/typescript
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
@@ -98,7 +98,7 @@ jobs:
       contents: read
       id-token: write # PyPI trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -130,7 +130,7 @@ jobs:
       contents: read
       id-token: write # crates.io trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rust-toolchain.toml pins stable; install it up front so the first
       # cargo invocation in publish.sh doesn't pay the auto-fetch.
@@ -197,7 +197,7 @@ jobs:
             os: ubuntu-22.04-arm
             pgo: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -238,7 +238,7 @@ jobs:
     permissions:
       contents: write # create the release + upload assets
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history so --generate-notes finds the prior tag
 

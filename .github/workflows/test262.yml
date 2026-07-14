@@ -45,7 +45,7 @@ jobs:
       TEST262_SHARD_TOTAL: 4
       TEST262_SHARD_INDEX: ${{ matrix.shard }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
