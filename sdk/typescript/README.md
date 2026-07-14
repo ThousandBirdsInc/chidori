@@ -125,6 +125,44 @@ if (isSignalQueued(result)) {
 
 See the top-level `sdk/python/chidori` for the Python equivalent.
 
+## Timeouts, retries, and errors
+
+Every request is bounded by `timeoutMs` (default 300 000 — generous because
+`run()` executes the whole agent before responding; pass `0` to disable).
+Idempotent GETs are retried `retries` times (default 2, exponential backoff
+from `retryDelayMs`) on connection errors, timeouts, and 429/502/503/504
+responses. POSTs are **never** retried — `run`/`resume`/`signal` are not
+idempotent. For `stream()` the timeout covers connection establishment only,
+never the open event stream.
+
+```ts
+const client = new AgentClient("http://localhost:8080", { timeoutMs: 60_000, retries: 3 });
+```
+
+Failures throw typed errors, all extending `AgentClientError`:
+
+```ts
+import { AgentClientError, ConnectionError, HttpError, TimeoutError } from "@1kbirds/chidori";
+
+try {
+  await client.signal(sessionId, { name: "review", payload: { decision: "approve" } });
+} catch (err) {
+  if (err instanceof HttpError) {
+    // err.status distinguishes the documented semantics:
+    // 400 empty name, 404 unknown session, 409 terminal run
+    if (err.status === 409) console.log("run already finished:", err.detail);
+  } else if (err instanceof TimeoutError) {
+    // server hung past timeoutMs
+  } else if (err instanceof ConnectionError) {
+    // nothing listening / connection refused
+  }
+}
+```
+
+`HttpError` carries `.status`, the raw `.body`, and `.detail` (the server's
+`error` field when the body was JSON), so status handling never string-matches
+messages.
+
 ## Snapshot-aware checkpoints
 
 `Checkpoint` contains the replay call log plus optional `snapshotManifest`

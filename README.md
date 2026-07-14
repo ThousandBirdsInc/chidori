@@ -287,8 +287,10 @@ human-in-the-loop pause/resume loop — see
 - **npm packages without Node** — `chidori add zod` installs straight from the
   npm registry into a content-addressed cache (SHA-512 verified, hardlinked
   `node_modules`, merge-friendly JSONL lockfile, no install scripts ever), and
-  agents just `import { z } from "zod"`. See [package
-  management](./docs/package-management.md).
+  agents just `import { z } from "zod"`. The engine is not Node, so the
+  compatible set is pure-ESM, native-free packages using only the shimmed
+  builtins — `chidori add` warns when a package falls outside it. See
+  [package management](./docs/package-management.md#compatibility).
 
 Agents reach all of this through a fixed set of host functions on the `chidori`
 object — see [**Core concepts**](./docs/core-concepts.md) for the full list and

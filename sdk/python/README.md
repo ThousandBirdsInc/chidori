@@ -94,9 +94,49 @@ Mirrors the TypeScript SDK (`sdk/typescript/`) method-for-method. See the
 top-level `examples/sdk_demo.py` for a longer walkthrough and
 `docs/running-modes.md` for the HTTP session API this client wraps.
 
+## Timeouts, retries, and errors
+
+Every request is bounded by `timeout_seconds` (default 300 — generous because
+`run()` executes the whole agent before responding; pass `0` to disable).
+Idempotent GETs are retried `retries` times (default 2, exponential backoff
+from `retry_delay_seconds`) on connection errors, timeouts, and 429/502/503/504
+responses. POSTs are **never** retried — `run`/`resume`/`signal` are not
+idempotent. For `stream()` the timeout covers connection establishment only.
+
+```python
+client = AgentClient("http://localhost:8080", timeout_seconds=60, retries=3)
+```
+
+Failures raise typed exceptions, all subclassing `AgentClientError` (itself a
+`RuntimeError`, so existing handlers keep working):
+
+```python
+from chidori import AgentClientError, ConnectionError, HttpError, TimeoutError
+
+try:
+    client.signal(session_id, "review", payload={"decision": "approve"})
+except HttpError as e:
+    if e.status == 404:   # unknown session
+        ...
+    elif e.status == 409:  # run already terminal
+        ...
+    else:
+        raise
+except TimeoutError:
+    ...  # server hung past timeout_seconds
+except ConnectionError:
+    ...  # nothing listening / connection refused
+```
+
+`HttpError` carries `.status`, the raw `.body`, and `.detail` (the server's
+`error` field when the body was JSON), so the documented 400/404/409 semantics
+are distinguishable without string-matching messages.
+
 ## Testing
 
 ```bash
+python3 -m unittest sdk/python/tests/test_client_http.py -v   # HTTP layer: errors/timeout/retry (no binary needed)
+
 cargo build                     # make sure target/debug/chidori is up to date
 python3 -m unittest sdk/python/tests/test_session_api.py -v
 ```
