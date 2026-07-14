@@ -1,0 +1,54 @@
+# cargo-deny configuration — dependency scanning for the Rust workspace.
+# Run locally with `cargo deny check`; CI runs it on every PR and on a weekly
+# schedule (.github/workflows/security.yml) so new RustSec advisories surface
+# even when the tree is quiet.
+
+[graph]
+all-features = true
+
+# RustSec advisory database: vulnerabilities, unmaintained crates, yanked
+# versions. A finding here fails CI; put a temporary, dated `ignore` entry
+# here (with a reason) if a fix genuinely can't land yet.
+[advisories]
+yanked = "deny"
+ignore = [
+    # async-std is discontinued but still a transitive dependency of the
+    # pinned opentelemetry_sdk 0.27 (via its rt-tokio feature graph). Drops
+    # out when the opentelemetry stack is upgraded past 0.27.
+    { id = "RUSTSEC-2025-0052", reason = "async-std via opentelemetry_sdk 0.27; revisit on otel upgrade" },
+]
+
+[bans]
+# Duplicate crate versions bloat builds and multiply audit surface, but the
+# ecosystem makes some duplication unavoidable — warn, don't fail.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace-internal `path = "..."` dependencies of unpublished crates (e.g.
+# test262-runner → chidori-js) carry no version and are fine; the wildcard
+# ban is about registry dependencies.
+allow-wildcard-paths = true
+
+# Everything must come from crates.io — no git dependencies, no alternate
+# registries. This is already true today; deny keeps it that way.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
+
+[licenses]
+# The workspace itself is Apache-2.0. This allowlist covers the licenses of
+# the current dependency tree; extend it deliberately when a new dependency
+# brings a new (compatible) license in.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8

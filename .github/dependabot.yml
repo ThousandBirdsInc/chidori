@@ -1,0 +1,38 @@
+# Automated dependency update PRs. Security updates always open immediately;
+# routine version bumps arrive weekly and grouped, so the noise stays low.
+version: 2
+updates:
+  # Rust workspace (448 transitive crates — the main supply-chain surface).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # CI workflow actions (checkout, setup-node, publish actions, ...).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # TypeScript SDK (published to npm as @1kbirds/chidori).
+  - package-ecosystem: npm
+    directory: /sdk/typescript
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Python SDK (published to PyPI as chidori).
+  - package-ecosystem: pip
+    directory: /sdk/python
+    schedule:
+      interval: weekly

@@ -284,7 +284,14 @@ in-engine `CHIDORI_JS_DEADLINE_MS`.
 
 Because brokering means the child needs *no* outward capability on any platform,
 even a coarse per-OS sandbox is meaningfully strong — there is nothing wired for
-it to abuse. Each layer is **best-effort**: a layer that cannot be applied (older
+it to abuse. Note the flip side: brokered `http` executes in the *parent*, with
+the parent's network reach, so the OS sandbox alone is no defense against
+server-side request forgery. That is the SSRF guard's job (`runtime::ssrf`):
+the parent refuses `http` destinations that resolve to non-public addresses
+(loopback, RFC 1918, the 169.254.169.254 cloud-metadata range, and their IPv6
+equivalents), checked at DNS-resolution time and on every redirect hop, with
+`CHIDORI_HTTP_ALLOW_HOSTS` as the deliberate allowlist.
+Each layer is **best-effort**: a layer that cannot be applied (older
 kernel, rootless container) logs a skip note and degrades rather than breaking
 the run. Set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to **fail closed** if the
 platform's core layer (seccomp on Linux, Seatbelt on macOS) cannot be applied.

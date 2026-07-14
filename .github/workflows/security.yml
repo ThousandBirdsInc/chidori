@@ -1,0 +1,50 @@
+name: Security
+
+# Dependency scanning for the Rust workspace via cargo-deny (RustSec
+# advisories, license allowlist, duplicate/wildcard bans, crates.io-only
+# sources — see deny.toml). Runs on pushes and PRs that touch the dependency
+# graph, plus a weekly schedule so new advisories surface even when the tree
+# is quiet. Dependabot (.github/dependabot.yml) handles the update PRs;
+# npm audit covers the TypeScript SDK's lockfile.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories, bans, licenses, sources)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: stable
+          command: check advisories bans licenses sources
+
+  npm-audit:
+    name: npm audit (TypeScript SDK)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high

@@ -72,6 +72,17 @@ CHIDORI_RUN_STORE=sqlite            # journal mirror — see table below
 CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't recorded
 ```
 
+- **API-key rotation:** `CHIDORI_API_KEY` accepts a comma-separated list, so
+  a key rotates without a hard cutover — set `new-key,old-key`, roll every
+  client to the new key, then drop the old one. Comparison is constant-time.
+- **SSRF guard:** the `http`/`fetch` effect refuses destinations that resolve
+  to non-public addresses (loopback, RFC 1918, link-local/cloud-metadata,
+  CGNAT, and their IPv6 equivalents), checked at DNS-resolution time and on
+  every redirect hop, so agents can't pivot into `169.254.169.254` or
+  internal services. To let agents reach specific internal hosts, set
+  `CHIDORI_HTTP_ALLOW_HOSTS` (comma-separated hostnames, IPs, or CIDRs, e.g.
+  `localhost,10.2.0.0/16`); the single value `*` disables the guard.
+
 - **TLS:** the server speaks plain HTTP on `0.0.0.0:<port>`. Put a reverse
   proxy or the platform's TLS in front, and firewall the port.
 - **Policy:** `chidori serve` is **deny-by-default** — gated effects (`fetch`,
@@ -386,6 +397,8 @@ sequenceDiagram
 
 - [ ] `CHIDORI_API_KEY` set; port reachable only through a TLS proxy
 - [ ] Policy configured (`CHIDORI_POLICY_FILE`, or a deliberate `--trusted`)
+- [ ] `CHIDORI_HTTP_ALLOW_HOSTS` limited to the internal hosts agents truly
+      need (never `*` in production)
 - [ ] `CHIDORI_DB_PATH` set so sessions survive restarts
 - [ ] `CHIDORI_RUN_STORE` chosen; `s3://` if the machine is ephemeral
 - [ ] `CHIDORI_DURABILITY=strict`

@@ -30,9 +30,29 @@ pub enum Integrity {
     Sha1(Vec<u8>),
 }
 
+/// Env var opting in to the collision-broken SHA-1 `shasum` fallback for
+/// packages that publish no `sha512` integrity (pre-2017 publishes).
+pub const ALLOW_SHA1_ENV: &str = "CHIDORI_PKG_ALLOW_SHA1";
+
 impl Integrity {
     /// Prefer the SRI `integrity` field, fall back to the legacy shasum.
+    ///
+    /// SHA-1 has had practical collision attacks since 2017 (SHAttered), so
+    /// the shasum fallback is refused unless `CHIDORI_PKG_ALLOW_SHA1=1`
+    /// explicitly opts in — installing a legacy package then still verifies
+    /// against the shasum rather than nothing at all.
     pub fn from_dist(integrity: Option<&str>, shasum: Option<&str>) -> Result<Self> {
+        let allow_sha1 = std::env::var(ALLOW_SHA1_ENV).is_ok_and(|v| v.trim() == "1");
+        Self::from_dist_with_options(integrity, shasum, allow_sha1)
+    }
+
+    /// [`Integrity::from_dist`] with the SHA-1 opt-in as an explicit argument,
+    /// so tests can exercise both modes without racing on process env.
+    pub fn from_dist_with_options(
+        integrity: Option<&str>,
+        shasum: Option<&str>,
+        allow_sha1: bool,
+    ) -> Result<Self> {
         if let Some(sri) = integrity {
             // SRI allows space-separated alternatives; take the strongest
             // sha512 entry if present.
@@ -49,6 +69,13 @@ impl Integrity {
             }
         }
         if let Some(hex_sum) = shasum {
+            if !allow_sha1 {
+                bail!(
+                    "registry entry publishes only a SHA-1 shasum, which is \
+                     collision-broken and refused by default; set {ALLOW_SHA1_ENV}=1 \
+                     to install this legacy package anyway"
+                );
+            }
             let digest = hex::decode(hex_sum.trim()).context("decoding sha1 shasum")?;
             if digest.len() != 20 {
                 bail!("sha1 shasum has wrong digest length");
@@ -331,19 +358,42 @@ mod tests {
     }
 
     #[test]
-    fn integrity_prefers_sha512_and_falls_back_to_shasum() {
+    fn integrity_prefers_sha512_and_falls_back_to_shasum_when_opted_in() {
         let sri = format!(
             "sha512-{}",
             base64::engine::general_purpose::STANDARD.encode([7u8; 64])
         );
-        match Integrity::from_dist(Some(&sri), Some("aa".repeat(20).as_str())).unwrap() {
+        match Integrity::from_dist_with_options(Some(&sri), Some("aa".repeat(20).as_str()), false)
+            .unwrap()
+        {
             Integrity::Sha512(d) => assert_eq!(d, vec![7u8; 64]),
             other => panic!("expected sha512, got {other:?}"),
         }
-        match Integrity::from_dist(None, Some("ab".repeat(20).as_str())).unwrap() {
+        match Integrity::from_dist_with_options(None, Some("ab".repeat(20).as_str()), true).unwrap()
+        {
             Integrity::Sha1(d) => assert_eq!(d.len(), 20),
             other => panic!("expected sha1, got {other:?}"),
         }
-        assert!(Integrity::from_dist(None, None).is_err());
+        assert!(Integrity::from_dist_with_options(None, None, true).is_err());
+    }
+
+    #[test]
+    fn integrity_refuses_sha1_only_dist_by_default() {
+        let err = Integrity::from_dist_with_options(None, Some("ab".repeat(20).as_str()), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SHA-1"), "{err}");
+        assert!(err.contains(ALLOW_SHA1_ENV), "{err}");
+        // A dist with a usable sha512 entry is unaffected by the gate.
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode([9u8; 64])
+        );
+        assert!(Integrity::from_dist_with_options(
+            Some(&sri),
+            Some("ab".repeat(20).as_str()),
+            false
+        )
+        .is_ok());
     }
 }
