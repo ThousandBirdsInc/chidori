@@ -64,7 +64,7 @@ futures = "0.3"
 tokio-stream = "0.1"
 async-stream = "0.3"
 sha2 = "0.10"
-sha1 = "0.10"
+sha1 = "0.11"
 # Constant-time comparison for API-key checks (already in-tree via `digest`).
 subtle = "2"
 hmac = "0.12"
