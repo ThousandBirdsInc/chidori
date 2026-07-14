@@ -219,8 +219,7 @@ fn mapped_arguments_cell_counted_once_keeps_host_held_object() {
     // Host-held object: its ONLY in-heap references flow through the doomed
     // cycle's shared cell.
     let x = e.eval("({ keep: 'me' })").unwrap();
-    e.vm
-        .call(build, Value::Undefined, std::slice::from_ref(&x))
+    e.vm.call(build, Value::Undefined, std::slice::from_ref(&x))
         .unwrap();
 
     let swept = e.vm.collect_cycles();
