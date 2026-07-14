@@ -1,4 +1,6 @@
-export async function agent(input: { url: string; payload?: { [key: string]: unknown } }, _chidori: unknown) {
+import { run, type JsonObject } from "chidori:agent";
+
+run(async (input: { url: string; payload?: JsonObject }) => {
   // `fetch` is the runtime's captured networking surface: this POST is
   // policy-gated, pausable for approval, and recorded for deterministic replay,
   // exactly like any network call a dependency would make under the hood.
@@ -11,4 +13,4 @@ export async function agent(input: { url: string; payload?: { [key: string]: unk
     status: response.status,
     body: await response.json(),
   };
-}
+});

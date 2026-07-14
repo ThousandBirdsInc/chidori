@@ -45,6 +45,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Typecheck examples against the SDK types
+        run: |
+          npx tsc -p ../../examples
+          npx tsc -p ../../examples/record-replay
+
       - name: Build package
         run: npm run build
 

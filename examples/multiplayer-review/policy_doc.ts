@@ -1,4 +1,4 @@
-import type { Chidori, Signal } from "chidori:agent";
+import { chidori, run, type Signal } from "chidori:agent";
 
 /**
  * Multiplayer policy-doc drafting agent (the worked example in docs/signals.md).
@@ -36,13 +36,13 @@ type Brief = { topic?: string; audience?: string; priority?: string; scope?: str
 type Review = { decision: "approve" | "changes"; notes: string };
 type Steer = { priority?: string; scope?: string };
 
-export async function agent(input: Brief, chidori: Chidori) {
+run(async (input: Brief) => {
   let brief: Brief = {
     topic: input.topic ?? "data-retention policy",
     audience: input.audience ?? "all staff",
   };
 
-  let draft = await writeDraft(chidori, brief); // "expensive": stands in for LLM + retrieval
+  let draft = await writeDraft(brief); // "expensive": stands in for LLM + retrieval
   let round = 0;
 
   while (true) {
@@ -76,23 +76,18 @@ export async function agent(input: Brief, chidori: Chidori) {
       brief = { ...brief, ...steer.payload }; // re-scope without restarting
     }
 
-    draft = await revise(chidori, draft, review.payload.notes, brief);
+    draft = await revise(draft, review.payload.notes, brief);
   }
-}
+});
 
 /** Stand-in for the expensive drafting step (LLM + retrieval). Local + offline. */
-async function writeDraft(chidori: Chidori, brief: Brief): Promise<string> {
+async function writeDraft(brief: Brief): Promise<string> {
   await chidori.log("writing draft", { topic: brief.topic, scope: brief.scope });
   return `# ${brief.topic} (for ${brief.audience})\n\nInitial draft body.`;
 }
 
 /** Stand-in for the revision step. Appends the reviewer's notes to the draft. */
-async function revise(
-  chidori: Chidori,
-  draft: string,
-  notes: string,
-  brief: Brief,
-): Promise<string> {
+async function revise(draft: string, notes: string, brief: Brief): Promise<string> {
   await chidori.log("revising draft", { notes, scope: brief.scope });
   return `${draft}\n\n## Revision\nAddressed: ${notes}`;
 }

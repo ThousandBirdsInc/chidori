@@ -10,8 +10,8 @@
     "types": [],
     "baseUrl": ".",
     "paths": {
-      "chidori": ["../../sdk/typescript/src/index.ts"],
-      "chidori/agent": ["../../sdk/typescript/src/agent.ts"]
+      "chidori:agent": ["../../sdk/typescript/src/agent.ts"],
+      "@1kbirds/chidori": ["../../sdk/typescript/src/index.ts"]
     }
   },
   "include": ["*.ts", "tools/*.ts"]

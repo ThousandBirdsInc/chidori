@@ -82,7 +82,7 @@ run(async (input: Input) => {
   }
 
   await chidori.log(`pipeline '${pipeline}' complete`, { stages, totalReviewed });
-  return { pipeline, status: "completed", totalReviewed, journal };
+  return { pipeline, status: "completed", stoppedAt: null, totalReviewed, journal };
 });
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {

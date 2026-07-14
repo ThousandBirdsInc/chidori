@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
 /**
  * Resilient retries with a reproducible history.
@@ -16,7 +16,7 @@ type FetchResult = {
   value?: { flag: boolean };
 };
 
-export async function agent(input: { maxAttempts?: number }, chidori: Chidori) {
+run(async (input: { maxAttempts?: number }) => {
   const maxAttempts = input.maxAttempts ?? 5;
   const attempts: string[] = [];
   let value: FetchResult["value"] | null = null;
@@ -35,4 +35,4 @@ export async function agent(input: { maxAttempts?: number }, chidori: Chidori) {
   }
 
   return { attempts, value, succeeded: value !== null };
-}
+});

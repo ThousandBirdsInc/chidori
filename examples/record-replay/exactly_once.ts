@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
 /**
  * Exactly-once side effects — the core durability guarantee for agents.
@@ -13,7 +13,7 @@ import type { Chidori } from "chidori:agent";
  *   chidori trace <run-id>            # see the recorded tool calls
  *   chidori resume examples/record-replay/exactly_once.ts <run-id>   # no re-send
  */
-export async function agent(input: { name?: string }, chidori: Chidori) {
+run(async (input: { name?: string }) => {
   const name = input.name ?? "Ada";
 
   const ticket = await chidori.tool<{ subject: string }, { id: string }>("open_ticket", {
@@ -29,4 +29,4 @@ export async function agent(input: { name?: string }, chidori: Chidori) {
   await chidori.memory.set("onboarding", { ticket: ticket.id, email: email.id });
 
   return { ticket: ticket.id, emailId: email.id, delivered: email.delivered };
-}
+});

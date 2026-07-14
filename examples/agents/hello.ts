@@ -1,7 +1,7 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { name?: string }, chidori: Chidori) {
+run(async (input: { name?: string }) => {
   const name = input.name ?? "world";
   await chidori.log("Saying hello", { name });
   return { greeting: `Hello, ${name}!` };
-}
+});

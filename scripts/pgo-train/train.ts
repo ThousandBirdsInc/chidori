@@ -7,9 +7,9 @@
 // host-effect boundary). Deterministic and fully offline: no LLM calls, no
 // tools, no timers. Sizes are scaled so the whole run stays around a second —
 // PGO needs branch *frequencies*, not a long benchmark.
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(_input: Record<string, never>, chidori: Chidori) {
+run(async () => {
   const checksums: Record<string, number> = {};
 
   // arith_loop: integer/double mix in a tight loop.
@@ -97,4 +97,4 @@ export async function agent(_input: Record<string, never>, chidori: Chidori) {
   // One host-effect round trip so the journal/effect boundary is in profile.
   await chidori.log("pgo training checksums", checksums);
   return checksums;
-}
+});

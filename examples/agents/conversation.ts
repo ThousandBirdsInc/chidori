@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
 /**
  * A multi-turn conversational agent — the "chat assistant" shape — built on
@@ -20,10 +20,7 @@ import type { Chidori } from "chidori:agent";
  *   under `chidori serve`; type "exit" or "quit" to end):
  *     chidori run examples/agents/conversation.ts
  */
-export async function agent(
-  input: { system?: string; messages?: string[] },
-  chidori: Chidori,
-) {
+run(async (input: { system?: string; messages?: string[] }) => {
   const chat = chidori.conversation({
     system:
       input.system ??
@@ -52,4 +49,4 @@ export async function agent(
   });
 
   return { turns: chat.length, transcript };
-}
+});

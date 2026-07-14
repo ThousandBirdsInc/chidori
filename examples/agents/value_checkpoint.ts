@@ -9,9 +9,9 @@
 //
 // The run pauses on `input()`; resume it and the "index" step is served from
 // the journal instead of being recomputed. See docs/value-checkpoints.md.
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { docs?: number }, chidori: Chidori) {
+run(async (input: { docs?: number }) => {
   const docs = input.docs ?? 1000;
 
   // Expensive, deterministic, effect-free — exactly what a step is for.
@@ -33,4 +33,4 @@ export async function agent(input: { docs?: number }, chidori: Chidori) {
   const answer = await chidori.input("Publish the index?");
 
   return { published: answer === "yes", docs: index.docs, shards: index.shards };
-}
+});

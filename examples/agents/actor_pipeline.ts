@@ -33,7 +33,7 @@ run(async () => {
   for (const worker of workers) {
     await worker.send("finish", null);
     const outcome = await worker.join();
-    summaries.push(outcome.output);
+    summaries.push(outcome.output ?? null);
   }
 
   results.sort((a, b) => a.n - b.n);

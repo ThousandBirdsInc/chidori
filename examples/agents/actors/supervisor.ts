@@ -29,7 +29,7 @@ run(async (input: { tasks: number[]; workers: number }) => {
   const summaries = [];
   for (const worker of pool) {
     await worker.send("finish", null);
-    summaries.push((await worker.join()).output);
+    summaries.push((await worker.join()).output ?? null);
   }
   results.sort((a, b) => a.n - b.n);
   return { results, summaries };

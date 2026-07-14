@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
 /**
  * Strategy B: write a flowing draft straight from the research, no outline.
@@ -8,8 +8,8 @@ import type { Chidori } from "chidori:agent";
 
 type BranchInput = { topic: string; research: string };
 
-export async function agent(input: BranchInput, chidori: Chidori) {
+run(async (input: BranchInput) => {
   await chidori.log("draft-direct: writing straight through");
   const draft = `# ${input.topic}\n\nIn short: ${input.research}. Told as one continuous narrative.`;
   return { strategy: "draft-direct", draft };
-}
+});
