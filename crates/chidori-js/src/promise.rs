@@ -328,6 +328,11 @@ impl Vm {
         while let Some(task) = self.microtasks.pop_front() {
             self.run_microtask(task);
         }
+        // The queue is drained and no JS frame is on the Rust stack — the
+        // natural quiescence point for automatic cycle collection. Without
+        // this, a long-lived VM with continuous churn leaks every cycle it
+        // creates unless the host calls collect_cycles by hand.
+        self.maybe_collect_cycles();
         if let Some((id, _)) = self.pending_host.first() {
             return RunOutcome::BlockedOnHost(*id);
         }

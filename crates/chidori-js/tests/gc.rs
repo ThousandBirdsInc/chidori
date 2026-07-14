@@ -157,6 +157,191 @@ fn live_count_bounded_under_churn() {
     }
 }
 
+/// Automatic collection: a long-lived engine that keeps creating garbage
+/// cycles must stay bounded WITHOUT the host ever calling `collect_cycles` —
+/// the allocation-count trigger fires at the end-of-drain quiescence point.
+#[test]
+fn auto_collection_bounds_cycle_churn_without_manual_calls() {
+    let mut e = Engine::new();
+    let mut max_live = 0usize;
+    for _ in 0..8 {
+        e.eval(
+            r#"
+            (function () {
+              for (let i = 0; i < 3000; i++) {
+                const o = { i };
+                o.self = o;
+                o.fn = () => o;
+              }
+            })();
+            "#,
+        )
+        .unwrap();
+        max_live = max_live.max(e.vm.gc_tracked_live());
+    }
+    // 8 rounds x 3000 cycles x ~3 objects each ≈ 72k allocations. Unbounded
+    // leak would keep them all live; the auto trigger must keep the peak to
+    // roughly one inter-collection window.
+    assert!(
+        max_live < 40_000,
+        "auto GC failed to bound cycle churn: peak live {max_live}"
+    );
+}
+
+/// A mapped-arguments slot ALIASES the frame's parameter binding cell. The
+/// collector must count that shared cell's inner reference ONCE, not once per
+/// holder: double-subtracting it absorbs a genuine host reference in the
+/// accounting, so a host-held object that is otherwise reachable only through
+/// a doomed cycle would be treated as garbage and have its edges cleared — a
+/// use-after-free-equivalent silent corruption.
+#[test]
+fn mapped_arguments_cell_counted_once_keeps_host_held_object() {
+    let mut e = Engine::new();
+    // `build(x)` parks x's binding cell in BOTH a suspended generator frame
+    // and the mapped arguments object, then orphans the whole cycle.
+    let build = e
+        .eval(
+            r#"
+            (function build(x) {
+              function* g(a) {
+                const args = arguments;   // mapped: args[0] aliases a's cell
+                const self = { args };
+                yield self;
+                return a;
+              }
+              let it = g(x);
+              let self = it.next().value;
+              self.gen = it;              // orphaned cycle: gen -> frame -> self -> gen
+            })
+            "#,
+        )
+        .unwrap();
+    // Host-held object: its ONLY in-heap references flow through the doomed
+    // cycle's shared cell.
+    let x = e.eval("({ keep: 'me' })").unwrap();
+    e.vm
+        .call(build, Value::Undefined, std::slice::from_ref(&x))
+        .unwrap();
+
+    let swept = e.vm.collect_cycles();
+    assert!(swept > 0, "the orphaned generator cycle should be swept");
+
+    // The host-held object must have survived with its properties intact.
+    let getkeep = e.eval("(function (o) { return o.keep })").unwrap();
+    let v = e.vm.call(getkeep, Value::Undefined, &[x]).unwrap();
+    assert!(
+        matches!(&v, Value::String(s) if s.as_str() == "me"),
+        "host-held object was corrupted by the sweep: {v:?}"
+    );
+}
+
+/// WeakMap entries must not keep their keys alive: once nothing else can
+/// reach the key, collection reclaims key and value and prunes the entry.
+#[test]
+fn weakmap_does_not_keep_keys_alive() {
+    let mut e = Engine::new();
+    e.eval(
+        r#"
+        globalThis.wm = new WeakMap();
+        globalThis.kept = { tag: 'kept' };
+        wm.set(kept, { payload: 'for-kept' });
+        (function () {
+          for (let i = 0; i < 100; i++) {
+            wm.set({ i }, { big: 'value-' + i });   // keys die at loop exit
+          }
+        })();
+        "#,
+    )
+    .unwrap();
+    let before = e.vm.gc_tracked_live();
+    let swept = e.vm.collect_cycles();
+    // 100 dead keys + 100 values must go; the strongly-reachable key stays.
+    assert!(swept >= 200, "expected weak entries reclaimed, got {swept}");
+    let after = e.vm.gc_tracked_live();
+    assert!(
+        after < before,
+        "live count should drop: {before} -> {after}"
+    );
+    let v = e.eval("wm.get(kept).payload").unwrap();
+    assert!(
+        matches!(&v, Value::String(s) if s.as_str() == "for-kept"),
+        "{v:?}"
+    );
+}
+
+/// WeakSet membership must not keep its members alive.
+#[test]
+fn weakset_does_not_keep_members_alive() {
+    let mut e = Engine::new();
+    e.eval(
+        r#"
+        globalThis.ws = new WeakSet();
+        globalThis.kept = { tag: 'kept' };
+        ws.add(kept);
+        (function () {
+          for (let i = 0; i < 100; i++) ws.add({ i });
+        })();
+        "#,
+    )
+    .unwrap();
+    let swept = e.vm.collect_cycles();
+    assert!(swept >= 100, "expected weak members reclaimed, got {swept}");
+    let v = e.eval("ws.has(kept)").unwrap();
+    assert!(matches!(v, Value::Bool(true)), "{v:?}");
+}
+
+/// Ephemeron semantics: a WeakMap value is kept alive by a live key, even
+/// when the ONLY path to the value is through the WeakMap — and chains of
+/// such entries (value of one is key of the next) resolve to fixpoint.
+#[test]
+fn weakmap_values_live_iff_keys_live() {
+    let mut e = Engine::new();
+    e.eval(
+        r#"
+        globalThis.wm = new WeakMap();
+        globalThis.k1 = { tag: 'k1' };
+        const v1 = { tag: 'v1' };        // reachable ONLY through wm entry
+        wm.set(k1, v1);
+        wm.set(v1, { tag: 'v2' });       // chain: v1 alive => v2 alive
+        "#,
+    )
+    .unwrap();
+    e.vm.collect_cycles();
+    let v = e.eval("wm.get(wm.get(k1)).tag").unwrap();
+    assert!(
+        matches!(&v, Value::String(s) if s.as_str() == "v2"),
+        "{v:?}"
+    );
+    // Now drop the root key: the whole chain becomes collectable.
+    e.eval("globalThis.k1 = null").unwrap();
+    let swept = e.vm.collect_cycles();
+    assert!(swept >= 3, "chain should be reclaimed, got {swept}");
+}
+
+/// The classic weak cycle: value references its own key. A strong map leaks
+/// it; a WeakMap entry whose key is otherwise unreachable must be collected.
+#[test]
+fn weakmap_key_value_cycle_is_collected() {
+    let mut e = Engine::new();
+    e.eval(
+        r#"
+        globalThis.wm = new WeakMap();
+        (function () {
+          for (let i = 0; i < 50; i++) {
+            const key = { i };
+            wm.set(key, { backref: key });  // value -> key cycle through the entry
+          }
+        })();
+        "#,
+    )
+    .unwrap();
+    let swept = e.vm.collect_cycles();
+    assert!(
+        swept >= 100,
+        "key<->value cycles should be reclaimed, got {swept}"
+    );
+}
+
 /// `dispose` reclaims ORPHANED cycles too (ones no longer connected to the
 /// realm roots), which the old realm-walk teardown missed.
 #[test]

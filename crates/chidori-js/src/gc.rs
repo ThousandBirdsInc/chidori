@@ -37,6 +37,14 @@
 //! once. Cells the HOST also holds (module export cells) must be registered
 //! in `Vm::gc_cell_roots`; their contents are then rooted unconditionally.
 //!
+//! WeakMap/WeakSet edges are the deliberate exception to the invariant: they
+//! are subtracted in step 2 (their `Rc`s are strong and must be explained, or
+//! a weakly-held object would masquerade as a root forever) but NOT traversed
+//! in step 3 — that is what makes them weak. WeakMap values get ephemeron
+//! treatment instead (marked iff their key is marked, iterated to fixpoint),
+//! and the sweep prunes entries whose key died, so a live WeakMap never
+//! retains a dead key's entry.
+//!
 //! `collect_cycles` only runs at quiescence (no JS frames on the Rust stack,
 //! empty microtask queue): queued `Microtask::Job` closures capture objects
 //! invisibly, and an executing frame lives on the native stack where we
@@ -49,6 +57,12 @@ use std::rc::Rc;
 
 use crate::value::{FunctionInner, Internal, JsObject, ObjectData, Property, PropertyKind, Value};
 use crate::vm::{Completion, Frame, GeneratorState, PromiseState, Reaction, Vm};
+
+/// Minimum allocations between automatic collections. The auto threshold is
+/// re-armed to `max(GC_AUTO_FLOOR, live)` after every collection, so a scan
+/// (which is O(live)) happens at most once per that many allocations —
+/// amortized O(1) work per allocation regardless of heap size.
+pub(crate) const GC_AUTO_FLOOR: usize = 8192;
 
 impl Vm {
     /// Allocate (and register) an object owned by this VM. All engine
@@ -71,6 +85,8 @@ impl Vm {
 
     /// Register an externally-created object with this VM's collector.
     pub fn track_object(&self, o: &JsObject) {
+        self.gc_allocs_since_collect
+            .set(self.gc_allocs_since_collect.get() + 1);
         let mut reg = self.all_objects.borrow_mut();
         reg.push(Rc::downgrade(&o.0));
         // Amortized compaction: prune dead weak entries when the registry
@@ -88,6 +104,22 @@ impl Vm {
             .iter()
             .filter(|w| w.strong_count() > 0)
             .count()
+    }
+
+    /// Run [`Vm::collect_cycles`] if automatic collection is enabled and
+    /// enough allocation has happened since the last collection. Hosts hit
+    /// this from the natural quiescence points (end of a job drain), so a
+    /// long-lived VM reclaims its garbage cycles without anyone remembering
+    /// to call `collect_cycles` by hand. Cheap when the trigger hasn't fired
+    /// (two `Cell` reads).
+    pub fn maybe_collect_cycles(&mut self) -> usize {
+        if !self.gc_auto || self.gc_allocs_since_collect.get() < self.gc_auto_threshold.get() {
+            return 0;
+        }
+        if self.call_depth > 0 || !self.microtasks.is_empty() {
+            return 0;
+        }
+        self.collect_cycles()
     }
 
     /// Collect unreachable reference cycles. Returns the number of objects
@@ -138,6 +170,10 @@ impl Vm {
                 &o.borrow(),
                 &mut seen_cells,
                 &mut seen_frames,
+                // Weak edges ARE subtracted: a key/value held only by a
+                // WeakMap/WeakSet must not look externally referenced, or it
+                // could never be collected (weak refs would act strong).
+                true,
                 &mut |t: &JsObject| {
                     if let Some(&i) = index.get(&t.ptr_id()) {
                         gc_refs[i] -= 1;
@@ -168,28 +204,87 @@ impl Vm {
         }
         let mut mark_cells: HashSet<usize> = HashSet::new();
         let mut mark_frames: HashSet<usize> = HashSet::new();
-        while let Some(o) = work.pop() {
-            if !visited.insert(o.ptr_id()) {
-                continue;
+        // Ephemeron worklist: `(key ptr, value)` for every entry of every
+        // LIVE WeakMap whose key is an object. The value is marked only once
+        // its key is marked (spec ephemeron semantics: a WeakMap entry keeps
+        // its value alive iff something else keeps the key alive). Weak edges
+        // are never traversed directly — that's what makes them weak.
+        let mut ephemerons: Vec<(usize, Value)> = Vec::new();
+        loop {
+            while let Some(o) = work.pop() {
+                if !visited.insert(o.ptr_id()) {
+                    continue;
+                }
+                let mut found: Vec<JsObject> = Vec::new();
+                let b = o.borrow();
+                trace_object(
+                    &b,
+                    &mut mark_cells,
+                    &mut mark_frames,
+                    false,
+                    &mut |t: &JsObject| found.push(t.clone()),
+                );
+                if let Internal::WeakMap(m) = &b.internal {
+                    for (k, v) in m {
+                        match &k.0 {
+                            Value::Object(ko) => ephemerons.push((ko.ptr_id(), v.clone())),
+                            // Non-object keys (e.g. symbols) have no traced
+                            // liveness; treat the entry's value as strong.
+                            _ => {
+                                if let Value::Object(vo) = v {
+                                    found.push(vo.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                work.extend(found);
             }
-            let mut found: Vec<JsObject> = Vec::new();
-            trace_object(
-                &o.borrow(),
-                &mut mark_cells,
-                &mut mark_frames,
-                &mut |t: &JsObject| found.push(t.clone()),
-            );
-            work.extend(found);
+            // Activate ephemerons whose keys got marked; loop until fixpoint
+            // (an activated value can mark another WeakMap, whose entries can
+            // activate further ephemerons).
+            let mut progressed = false;
+            ephemerons.retain(|(kp, v)| {
+                if visited.contains(kp) {
+                    if let Value::Object(vo) = v {
+                        work.push(vo.clone());
+                    }
+                    progressed = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            if !progressed && work.is_empty() {
+                break;
+            }
         }
         let marked: Vec<bool> = live.iter().map(|o| visited.contains(&o.ptr_id())).collect();
 
         // Pass 4: sweep — clear every unmarked object's outgoing edges so the
-        // cycle collapses and Rc reclamation frees the subgraph.
+        // cycle collapses and Rc reclamation frees the subgraph. Surviving
+        // WeakMaps/WeakSets additionally drop every entry whose key object is
+        // dead (registered but unmarked): the key is unreachable, so the
+        // entry can never be queried again — spec says it goes away.
+        let key_alive = |v: &Value| match v {
+            Value::Object(ko) => {
+                let id = ko.ptr_id();
+                !index.contains_key(&id) || visited.contains(&id)
+            }
+            _ => true,
+        };
         let mut swept = 0usize;
         for (i, o) in live.iter().enumerate() {
             if !marked[i] {
                 clear_object_edges(o);
                 swept += 1;
+                continue;
+            }
+            let mut b = o.borrow_mut();
+            match &mut b.internal {
+                Internal::WeakMap(m) => m.retain(|k, _| key_alive(&k.0)),
+                Internal::WeakSet(s) => s.retain(|k, _| key_alive(&k.0)),
+                _ => {}
             }
         }
         if swept > 0 {
@@ -197,6 +292,11 @@ impl Vm {
             reg.retain(|w| w.strong_count() > 0);
             self.gc_compact_at.set((reg.len() * 2).max(1 << 12));
         }
+        // Re-arm the automatic trigger: next auto-collection after at least
+        // max(floor, live-now) further allocations (see GC_AUTO_FLOOR).
+        self.gc_allocs_since_collect.set(0);
+        self.gc_auto_threshold
+            .set(self.all_objects.borrow().len().max(GC_AUTO_FLOOR));
         swept
     }
 }
@@ -217,10 +317,17 @@ pub(crate) fn clear_object_edges(o: &JsObject) {
 /// `Rc` containers that can be SHARED between objects (binding cells and the
 /// async-resume frame slot), whose inner references must be counted once
 /// globally, not once per holder.
+///
+/// `weak_edges` selects how WeakMap/WeakSet entries are treated. The
+/// accounting pass passes `true` (their `Rc`s are still strong refs that must
+/// be explained, or weakly-held objects would look like roots); the mark pass
+/// passes `false` and handles WeakMap values separately with ephemeron
+/// semantics (see `collect_cycles`).
 fn trace_object(
     data: &ObjectData,
     seen_cells: &mut HashSet<usize>,
     seen_frames: &mut HashSet<usize>,
+    weak_edges: bool,
     f: &mut dyn FnMut(&JsObject),
 ) {
     if let Some(p) = &data.proto {
@@ -251,15 +358,30 @@ fn trace_object(
                 trace_value(x, f);
             }
         }
-        Internal::Map(m) | Internal::WeakMap(m) => {
+        Internal::Map(m) => {
             for (k, v) in m {
                 trace_value(&k.0, f);
                 trace_value(v, f);
             }
         }
-        Internal::Set(s) | Internal::WeakSet(s) => {
+        Internal::Set(s) => {
             for (k, _) in s {
                 trace_value(&k.0, f);
+            }
+        }
+        Internal::WeakMap(m) => {
+            if weak_edges {
+                for (k, v) in m {
+                    trace_value(&k.0, f);
+                    trace_value(v, f);
+                }
+            }
+        }
+        Internal::WeakSet(s) => {
+            if weak_edges {
+                for (k, _) in s {
+                    trace_value(&k.0, f);
+                }
             }
         }
         Internal::TypedArray(t) => f(&t.buffer),
@@ -322,9 +444,15 @@ fn trace_object(
                 f(&req.result);
             }
         }
+        // Mapped-arguments slots ALIAS the frame's parameter binding cells
+        // (see `make_arguments_object`), so they need the same shared-cell
+        // dedup frames get: a cell holds ONE strong ref to its inner object no
+        // matter how many holders share it. Tracing it once per holder would
+        // double-subtract in the accounting pass and could make a live object
+        // look like garbage — a use-after-free-equivalent sweep.
         Internal::Arguments(map) => {
             for cell in map.iter().flatten() {
-                trace_value(&cell.borrow(), f);
+                trace_cell(cell, seen_cells, f);
             }
         }
         Internal::Ordinary
