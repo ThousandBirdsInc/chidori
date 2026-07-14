@@ -75,8 +75,8 @@ struct Rope {
 pub(crate) const ROPE_MIN_BYTES: usize = 64;
 
 /// Sentinel for a `Repr::Utf8` whose code-unit count has not been computed
-/// yet. Safe: [`MAX_STRING_LEN`] (16M units) keeps every real count far below
-/// `u32::MAX`.
+/// yet. Safe: [`MAX_STRING_LEN`] (2^28 units) keeps every real count far
+/// below `u32::MAX`.
 const UNITS_UNKNOWN: u32 = u32::MAX;
 
 /// A fresh `Utf8` arm with its unit count not yet computed. O(1) — callers on
@@ -706,14 +706,22 @@ impl fmt::Debug for PropertyKey {
 }
 
 /// Upper bound on eager dense-array allocation. Beyond this, length operations
-/// throw `RangeError` rather than allocating (we use dense storage, not sparse).
-pub const MAX_DENSE_ARRAY: usize = 1_000_000;
+/// throw `RangeError` rather than allocating (we use dense storage, not
+/// sparse). Sized to match V8's fast-array ceiling (32M elements — beyond it
+/// V8 switches to dictionary mode, which we don't have): real programs like
+/// `new Array(2e6)` or `a[2_000_000] = x` must succeed, while a hostile
+/// `new Array(2**32 - 1)` still fails loudly (~768 MiB at 24-byte slots is
+/// the worst case a script can demand per allocation).
+pub const MAX_DENSE_ARRAY: usize = 1 << 25; // 33.5M elements
 
 /// Upper bound on a single eager string allocation (`repeat`, `padStart`/
-/// `padEnd`, …). Beyond this, those builtins throw `RangeError` *before*
-/// allocating, so a hostile/conformance input (`"a".repeat(2**33)`) cannot OOM
-/// the process. Well above any legitimate string a program builds.
-pub const MAX_STRING_LEN: usize = 1 << 24; // 16M code units
+/// `padEnd`, concatenation, …). Beyond this, those operations throw
+/// `RangeError` *before* allocating, so a hostile/conformance input
+/// (`"a".repeat(2**33)`, a doubling loop) cannot OOM the process. Sized near
+/// V8's own string ceiling (2^29 - 24 units) so legitimate large strings —
+/// multi-hundred-MB JSON payloads, log accumulations — succeed; the unit
+/// count also must stay far below `u32::MAX` (see `UNITS_UNKNOWN`).
+pub const MAX_STRING_LEN: usize = 1 << 28; // 268M code units
 
 /// Canonical numeric index per spec `CanonicalNumericIndexString` restricted to
 /// array indices (used for ordering and array fast-paths).

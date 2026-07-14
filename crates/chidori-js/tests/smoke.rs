@@ -27,6 +27,22 @@ fn arithmetic() {
 }
 
 #[test]
+fn realistic_large_allocations_succeed() {
+    // Sizes that real (agent-generated) JS produces must not trip the
+    // engine's DoS caps: production engines handle all of these.
+    assert_eq!(run("const a = []; a[2_000_000] = 'x'; a.length"), "2000001");
+    assert_eq!(run("new Array(2_000_000).length"), "2000000");
+    assert_eq!(
+        run("new Array(2_000_000).fill(1).reduce((s, x) => s + x, 0)"),
+        "2000000"
+    );
+    assert_eq!(run("'x'.repeat(20_000_000).length"), "20000000");
+    // The caps still exist for hostile sizes — and throw catchably.
+    let out = run("try { new Array(2**31) } catch (e) { e instanceof RangeError }");
+    assert_eq!(out, "true");
+}
+
+#[test]
 fn string_growth_is_bounded() {
     // A doubling loop must hit the string-length cap and throw RangeError rather
     // than allocating without bound (sandbox heap-DoS guard). Both the `+`
