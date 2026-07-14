@@ -2254,7 +2254,9 @@ mod tests {
         use std::io::{Read, Write};
 
         // A one-shot local HTTP server so the request goes through the real
-        // captured networking host op (`__chidori_http`) end to end.
+        // captured networking host op (`__chidori_http`) end to end. Loopback
+        // must be trusted explicitly — the SSRF guard blocks it by default.
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {

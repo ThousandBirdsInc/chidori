@@ -3,6 +3,7 @@ name = "test262-runner"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license.workspace = true
 # oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
 description = "Run the official Test262 ECMAScript conformance suite against chidori's pure-Rust JS engine, the same suite Bun and Node measure language conformance with."

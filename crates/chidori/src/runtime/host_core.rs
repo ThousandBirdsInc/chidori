@@ -1328,7 +1328,17 @@ fn http_client() -> Result<reqwest::Client> {
     // `gzip(true)` (with the reqwest `gzip` feature) sends Accept-Encoding
     // and transparently decompresses gzipped response bodies, so tools get
     // readable text instead of a binary blob.
-    let built = reqwest::Client::builder().gzip(true).build()?;
+    //
+    // The SSRF guard is baked into the client: the guarded DNS resolver
+    // filters non-public addresses at resolution time (so DNS rebinding and
+    // redirect hops are covered by the same check the connector dials from),
+    // and the redirect policy re-validates each hop's scheme and IP-literal
+    // host. See `runtime::ssrf`.
+    let built = reqwest::Client::builder()
+        .gzip(true)
+        .dns_resolver(crate::runtime::ssrf::dns_resolver())
+        .redirect(crate::runtime::ssrf::redirect_policy())
+        .build()?;
     Ok(CLIENT.get_or_init(|| built).clone())
 }
 
@@ -1370,6 +1380,24 @@ fn rewrite_to_override(
         parsed.path(),
         query
     ))
+}
+
+/// Render an error with its full source chain. reqwest's `Display` truncates
+/// the chain (a blocked destination shows up as just "error sending request"),
+/// but the guest needs the root cause — e.g. the SSRF guard's policy message —
+/// to act on the failure.
+fn error_chain_string(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !rendered.contains(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        source = cause.source();
+    }
+    rendered
 }
 
 pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<Value> {
@@ -1426,6 +1454,15 @@ fn execute_app_data_with_config(
         .filter(|value| !value.is_null())
         .cloned()
         .unwrap_or_else(|| json!([]));
+
+    // The endpoint is host-injected config (typically loopback agent-builder),
+    // so exempt its host from the SSRF guard before issuing the request.
+    if let Some(host) = url::Url::parse(&cfg.endpoint)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+    {
+        crate::runtime::ssrf::trust_host(&host);
+    }
 
     // The bearer is a placeholder; the secret broker substitutes the real
     // per-run token inside `execute_http`, locked to the endpoint's host.
@@ -1504,6 +1541,14 @@ fn execute_http_with_secrets(
     // substitute into a mock request (and in test mode none are injected
     // anyway). See app-agent-builder docs/design/mock-integrations-test-mode.md.
     if let Some(rewritten) = apply_base_url_override(&url) {
+        // The rewrite target is host-injected config (the loopback mock
+        // gateway), so exempt it from the SSRF guard before requesting.
+        if let Some(host) = url::Url::parse(&rewritten)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        {
+            crate::runtime::ssrf::trust_host(&host);
+        }
         url = rewritten;
     }
 
@@ -1547,6 +1592,15 @@ fn execute_http_with_secrets(
                 }
             }
         }
+    }
+
+    // SSRF pre-flight: reject non-http(s) schemes and blocked IP-literal
+    // destinations up front with a policy error (hostname destinations are
+    // checked by the guarded resolver at connect time, against the exact
+    // addresses the connector dials — see `runtime::ssrf`). An unparseable
+    // URL is left for reqwest to reject with its usual builder error.
+    if let Ok(parsed) = url::Url::parse(&url) {
+        crate::runtime::ssrf::preflight(&parsed).map_err(|message| anyhow::anyhow!(message))?;
     }
 
     let caller_set_user_agent = headers
@@ -1612,13 +1666,13 @@ fn execute_http_with_secrets(
             Ok(resp) => resp,
             Err(err) => {
                 if err.is_builder() {
-                    return Err(anyhow::anyhow!(secrets.redact(&err.to_string())));
+                    return Err(anyhow::anyhow!(secrets.redact(&error_chain_string(&err))));
                 }
                 return Ok(json!({
                     "status": 0,
                     "headers": {},
                     "body": null,
-                    "error": secrets.redact(&err.to_string()),
+                    "error": secrets.redact(&error_chain_string(&err)),
                 }));
             }
         };
@@ -1671,6 +1725,9 @@ mod tests {
     /// address so the test can point `AppDataConfig::endpoint` at it.
     fn canned_http_endpoint(status: &'static str, body: &'static str) -> std::net::SocketAddr {
         use std::io::{Read, Write};
+        // Tests exercise the real http effect against loopback fixtures, which
+        // the SSRF guard would otherwise block.
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -2142,6 +2199,7 @@ mod tests {
 
     #[test]
     fn execute_http_returns_status_zero_for_transport_error() {
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let tokio_rt = tokio::runtime::Runtime::new().unwrap();
         let result = execute_http(
             &tokio_rt,
@@ -2165,6 +2223,9 @@ mod tests {
     /// surface a transport error.
     async fn one_shot_http_capture() -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Tests exercise the real http effect against loopback fixtures, which
+        // the SSRF guard would otherwise block.
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}/ua-check");
@@ -2356,6 +2417,7 @@ mod tests {
     #[test]
     fn execute_http_redacts_echoed_secret_from_response() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let tokio_rt = tokio::runtime::Runtime::new().unwrap();
         let (url, server) = tokio_rt.block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2392,6 +2454,74 @@ mod tests {
             json!("[REDACTED:LOCAL_API_KEY]"),
             "response headers must be redacted"
         );
+    }
+
+    #[test]
+    fn execute_http_blocks_metadata_ip_literal() {
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let err = execute_http(
+            &tokio_rt,
+            &json!({ "url": "http://169.254.169.254/latest/meta-data/", "method": "GET" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("SSRF protection"), "{err}");
+        assert!(err.contains("CHIDORI_HTTP_ALLOW_HOSTS"), "{err}");
+    }
+
+    #[test]
+    fn execute_http_blocks_hostname_resolving_to_loopback() {
+        // `localhost` resolves to a loopback address; the guarded resolver
+        // must refuse it even though `127.0.0.1` is trusted by other tests
+        // under its own (distinct) host key.
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let result = execute_http(
+            &tokio_rt,
+            &json!({ "url": "http://localhost:9/ssrf-check", "method": "GET" }),
+        )
+        .unwrap();
+        assert_eq!(result["status"], json!(0));
+        let err = result["error"].as_str().unwrap_or_default();
+        assert!(err.contains("SSRF protection"), "{err}");
+    }
+
+    #[test]
+    fn execute_http_blocks_redirect_to_private_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        crate::runtime::ssrf::trust_host("127.0.0.1");
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let url = tokio_rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://10.0.0.1/internal\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            });
+            format!("http://{addr}/redirect")
+        });
+        let result = execute_http(&tokio_rt, &json!({ "url": url, "method": "GET" })).unwrap();
+        assert_eq!(result["status"], json!(0));
+        let err = result["error"].as_str().unwrap_or_default();
+        assert!(err.contains("SSRF protection"), "{err}");
+    }
+
+    #[test]
+    fn execute_http_rejects_non_http_scheme() {
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let err = execute_http(
+            &tokio_rt,
+            &json!({ "url": "file:///etc/passwd", "method": "GET" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("scheme"), "{err}");
     }
 
     #[test]

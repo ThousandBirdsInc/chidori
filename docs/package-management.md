@@ -14,9 +14,11 @@ package managers like bun and pnpm fast:
   filesystems). Warm installs are offline and take milliseconds — the smoke
   benchmark installs a 3-package tree in ~1ms warm vs ~250ms cold.
 - **SHA-512 verification.** Every tarball is checked against the registry's
-  `sha512` subresource integrity (legacy `sha1` shasum for pre-2017 publishes)
-  before it can enter the store. Hashing and extraction run on blocking worker
-  threads, off the download path.
+  `sha512` subresource integrity before it can enter the store. Packages that
+  publish only a legacy `sha1` shasum (pre-2017 publishes) are refused by
+  default — SHA-1 is collision-broken — unless `CHIDORI_PKG_ALLOW_SHA1=1`
+  explicitly opts in. Hashing and extraction run on blocking worker threads,
+  off the download path.
 - **Sorted JSONL lockfile.** `chidori.lock.jsonl` holds one JSON object per
   line, strictly sorted (name, then semver). Two branches adding different
   dependencies touch disjoint lines, so git merges apply cleanly instead of

@@ -13,9 +13,10 @@
 //!   `node_modules` by hardlinking (copy fallback). Warm installs touch no
 //!   network and duplicate no file contents.
 //! - **Integrity verification**: every tarball is verified against the
-//!   registry's `sha512` integrity (or legacy `sha1` shasum) before it enters
-//!   the store. Hashing runs on blocking worker threads, off the async
-//!   download path.
+//!   registry's `sha512` integrity before it enters the store. The legacy
+//!   `sha1` shasum (pre-2017 publishes) is collision-broken and refused
+//!   unless `CHIDORI_PKG_ALLOW_SHA1=1` opts in. Hashing runs on blocking
+//!   worker threads, off the async download path.
 //! - **Sorted JSONL lockfile** (`chidori.lock.jsonl`): one JSON object per
 //!   line, strictly sorted, so concurrent dependency changes merge in git
 //!   without conflict churn.

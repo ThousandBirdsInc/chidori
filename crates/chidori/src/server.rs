@@ -796,6 +796,10 @@ pub async fn serve(
 /// request to carry a matching `Authorization: Bearer …` header. Health
 /// stays open so container orchestrators can probe without a key.
 ///
+/// `CHIDORI_API_KEY` accepts a comma-separated list of keys so a key can be
+/// rotated without a hard cutover: set `new-key,old-key`, roll every client
+/// to the new key, then drop the old one from the list.
+///
 /// When the env var is unset the middleware is a no-op, so the default
 /// local-dev experience is unchanged.
 async fn auth_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
@@ -809,7 +813,7 @@ async fn auth_middleware(req: Request<axum::body::Body>, next: Next) -> Response
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == format!("Bearer {}", expected))
+        .map(|v| bearer_token_matches(v, &expected))
         .unwrap_or(false);
     if ok {
         next.run(req).await
@@ -821,6 +825,31 @@ async fn auth_middleware(req: Request<axum::body::Body>, next: Next) -> Response
         )
             .into_response()
     }
+}
+
+/// Compare the `Authorization` header value against every configured API key
+/// in constant time. A plain `==` short-circuits on the first differing byte,
+/// which turns the comparison into a timing oracle an attacker can use to
+/// recover the key byte-by-byte; `subtle::ConstantTimeEq` examines every byte
+/// regardless of where the mismatch is. (Equal-length inputs are required for
+/// `ct_eq`; a length mismatch only reveals the key's length, not its bytes.)
+///
+/// `raw_keys` is the comma-separated `CHIDORI_API_KEY` value; every key is
+/// checked — never early-returned — so accepted and rejected requests do the
+/// same amount of comparison work.
+fn bearer_token_matches(header_value: &str, raw_keys: &str) -> bool {
+    use subtle::ConstantTimeEq as _;
+
+    let mut ok = false;
+    for key in raw_keys.split(',') {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let expected = format!("Bearer {key}");
+        ok |= bool::from(expected.as_bytes().ct_eq(header_value.as_bytes()));
+    }
+    ok
 }
 
 /// Build a CORS layer from `CHIDORI_CORS_ORIGINS`:
@@ -2971,6 +3000,28 @@ mod tests {
     use super::*;
     use crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE;
     use axum::body;
+
+    #[test]
+    fn bearer_token_matches_single_key() {
+        assert!(bearer_token_matches("Bearer sekrit", "sekrit"));
+        assert!(!bearer_token_matches("Bearer wrong", "sekrit"));
+        assert!(!bearer_token_matches("Bearer sekrit-longer", "sekrit"));
+        assert!(!bearer_token_matches("Bearer sekri", "sekrit"));
+        assert!(!bearer_token_matches("sekrit", "sekrit")); // missing scheme
+        assert!(!bearer_token_matches("bearer sekrit", "sekrit")); // scheme is case-sensitive
+    }
+
+    #[test]
+    fn bearer_token_matches_rotating_key_list() {
+        // During rotation both the new and the old key are accepted.
+        assert!(bearer_token_matches("Bearer new-key", "new-key,old-key"));
+        assert!(bearer_token_matches("Bearer old-key", "new-key,old-key"));
+        assert!(!bearer_token_matches("Bearer other", "new-key,old-key"));
+        // Whitespace around entries and empty entries are tolerated.
+        assert!(bearer_token_matches("Bearer k2", " k1 , k2 ,"));
+        // An empty list entry never matches an empty credential.
+        assert!(!bearer_token_matches("Bearer ", ","));
+    }
 
     fn test_run_base(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4()));

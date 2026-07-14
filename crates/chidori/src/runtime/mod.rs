@@ -21,6 +21,8 @@ pub mod prompt_cache;
 pub mod rust_engine;
 pub mod secret_env;
 pub mod snapshot;
+/// SSRF guard for the guest-facing `http`/`fetch` host effect.
+pub mod ssrf;
 /// Pluggable persistence for the durable run artifact (journal + blobs).
 pub mod store;
 /// S3-compatible blob backend for the run store (S3 / R2 / GCS / MinIO).
