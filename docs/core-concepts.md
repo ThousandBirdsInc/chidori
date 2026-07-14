@@ -1,10 +1,12 @@
 # Core concepts: agents & host functions
 
-An agent is a `.ts` file that exports an async `agent(input, chidori)` function.
-The runtime provides a fixed set of **host functions** for side effects through
-the `chidori` object — agents never touch the outside world directly, so the
-runtime sees and records everything. See [`llm.txt`](../llm.txt) for the full
-API reference.
+An agent is a `.ts` file that imports `{ chidori, run }` from the virtual
+`chidori:agent` module and registers its handler with `run(async (input) => …)`.
+(The legacy form — an exported async `agent(input, chidori)` function — is still
+accepted.) The runtime provides a fixed set of **host functions** for side
+effects through the `chidori` object — agents never touch the outside world
+directly, so the runtime sees and records everything. See
+[`llm.txt`](../llm.txt) for the full API reference.
 
 ## Host functions
 

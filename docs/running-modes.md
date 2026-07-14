@@ -65,12 +65,9 @@ An agent can handle incoming HTTP events:
 
 ```ts
 // agents/webhook.ts
-import type { Chidori } from "chidori:agent";
+import { run, type JsonObject } from "chidori:agent";
 
-export async function agent(
-  input: { url: string; payload?: Record<string, unknown> },
-  chidori: Chidori,
-) {
+run(async (input: { url: string; payload?: JsonObject }) => {
   // `fetch` is the runtime's captured networking surface — policy-gated,
   // pausable for approval, and recorded for replay.
   const response = await fetch(input.url, {
@@ -79,7 +76,7 @@ export async function agent(
     body: JSON.stringify(input.payload ?? { source: "chidori" }),
   });
   return { status: response.status, body: await response.json() };
-}
+});
 ```
 
 ```bash

@@ -182,18 +182,19 @@ assistant) and `--template worker` (an autonomous tool-using loop); omit
 
 ### 2. Write your own agent
 
-An agent is just an exported `agent` function. Every model call is a recorded
-host call:
+An agent is a plain TypeScript file: import the `chidori` host object and the
+`run` definer from the virtual `chidori:agent` module and register your handler.
+Every model call is a recorded host call:
 
 ```ts
 // summarizer.ts
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { document: string }, chidori: Chidori) {
+run(async (input: { document: string }) => {
   const summary = await chidori.prompt("Summarize in 3 bullets:\n" + input.document);
   const actionItems = await chidori.prompt("Extract action items:\n" + summary);
   return { summary, actionItems };
-}
+});
 ```
 
 That's a complete, durable agent. Both prompts are recorded; replay returns them

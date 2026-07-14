@@ -10,25 +10,26 @@ and tools.
 
 ## Agent Shape
 
-An agent is a `.ts` file that exports `agent(input, chidori)`:
+An agent is a `.ts` file that imports `{ chidori, run }` from the virtual
+`chidori:agent` module and registers its handler with `run(...)`:
 
 ```ts
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { document: string }, chidori: Chidori) {
+run(async (input: { document: string }) => {
   const summary = await chidori.prompt(
     "Summarize in three bullets:\n\n" + input.document,
     { type: "final" },
   );
   return { summary };
-}
+});
 ```
 
 Rules:
 
-- Export `async function agent(input, chidori)`, or import `{ run }` from
-  `chidori:agent` and call `run(handler)` — the `agent` export is the fallback
-  entrypoint when `run(...)` wasn't called.
+- Import `{ chidori, run }` from `chidori:agent` and call `run(handler)` at the
+  top level. (Legacy fallback: `export async function agent(input, chidori)`
+  is still accepted when `run(...)` wasn't called.)
 - Return JSON-compatible values only.
 - Use `chidori.*` for LLMs, tools, input, signals, memory, templates, workspace
   files, and logging. HTTP goes through the standard `fetch`, which the runtime

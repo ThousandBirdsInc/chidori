@@ -102,7 +102,7 @@ Point the driver elsewhere with `--url`, or override the input with
 ### (optional) Typecheck the agents against the SDK types
 
 ```bash
-npx -y typescript@5.4 tsc -p examples/record-replay
+npx -y -p typescript@5.4 tsc -p examples/record-replay
 ```
 
 The detailed walkthroughs for each layer — including the modify-and-resume and

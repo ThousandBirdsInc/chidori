@@ -36,13 +36,29 @@ npm run build
 ### Authoring agents and tools
 
 Agent and tool files run *inside* the Chidori runtime, not as a normal Node
-program. They get their authoring types — and the `chidori`/`run` globals — from
-the **virtual** module `chidori:agent`:
+program. They import their authoring surface — the `chidori` host object, the
+`run` definer, and every authoring type — from the **virtual** module
+`chidori:agent`:
 
 ```ts
 /// <reference types="@1kbirds/chidori/agent-env" />
-import type { Chidori, ToolDefinition } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
+
+run(async (input: { document: string }) => {
+  const summary = await chidori.prompt("Summarize:\n" + input.document);
+  return { summary };
+});
 ```
+
+(Tool files import `type { ToolDefinition }` from the same module. The legacy
+agent form — `export async function agent(input, chidori)` — is still accepted.)
+
+So there are exactly **two** specifiers, with different jobs:
+
+| Specifier | What it is | Where it's used |
+|---|---|---|
+| `chidori:agent` | Virtual module the runtime injects | Inside agent/tool files |
+| `@1kbirds/chidori` | This npm package (HTTP client + the ambient types for `chidori:agent`) | In your Node/browser app |
 
 There is no installable package behind `chidori:agent`; it is a URL-style scheme
 (like `node:fs`) that the runtime strips and injects at execution time, so the

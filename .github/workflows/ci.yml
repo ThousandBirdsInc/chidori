@@ -71,5 +71,8 @@ jobs:
       - name: Build chidori binary
         run: cargo build
 
+      - name: Run Python SDK client unit tests
+        run: python -m unittest sdk/python/tests/test_client_http.py
+
       - name: Run Python SDK integration tests
         run: python -m unittest sdk/python/tests/test_session_api.py

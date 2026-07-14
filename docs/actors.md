@@ -177,7 +177,9 @@ policy:
 
 ```ts
 // supervisor.ts — spawned by the run, supervises its own worker pool.
-export async function agent(input: { shards: string[] }) {
+import { chidori, run } from "chidori:agent";
+
+run(async (input: { shards: string[] }) => {
   const workers = [];
   for (const shard of input.shards) {
     workers.push(await chidori.actors.spawn("worker.ts", { shard }, {
@@ -191,7 +193,7 @@ export async function agent(input: { shards: string[] }) {
     results.push(outcome.output);
   }
   return { results };
-}
+});
 ```
 
 The tree rules:

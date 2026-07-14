@@ -77,13 +77,14 @@ hashes, so the tree rebuilds from the store alone.
 Installed packages import the way they would under node or bun:
 
 ```ts
+import { run } from "chidori:agent";
 import { z } from "zod";
 import ms from "ms";
 
-export default async function agent(input: { minutes: number }) {
+run(async (input: { minutes: number }) => {
   const schema = z.object({ minutes: z.number() });
   return { human: ms(schema.parse(input).minutes * 60_000, { long: true }) };
-}
+});
 ```
 
 The module loader resolves bare specifiers through the full Node ESM

@@ -13,12 +13,9 @@ use anyhow::{bail, Context, Result};
 /// (written to `agent.ts`) and the fileless `chidori chat` (written to a temp
 /// file). Driven mode (a fixed `messages` list) is how `chidori chat` feeds each
 /// turn; with no messages it reads the terminal interactively.
-pub const CHAT_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
+pub const CHAT_AGENT_SRC: &str = r#"import { chidori, run } from "chidori:agent";
 
-export async function agent(
-  input: { messages?: string[]; system?: string; model?: string; tools?: string[] },
-  chidori: Chidori,
-) {
+run(async (input: { messages?: string[]; system?: string; model?: string; tools?: string[] }) => {
   const chat = chidori.conversation({
     system: input.system ?? "You are a helpful, concise assistant.",
     model: input.model || undefined,
@@ -38,7 +35,7 @@ export async function agent(
   // Interactive mode: read each turn from the terminal. Type "exit" to end.
   const transcript = await chat.loop({ prompt: "you>" });
   return { transcript };
-}
+});
 "#;
 
 const CHAT_README: &str = r#"# Chidori chat agent
@@ -83,7 +80,7 @@ skip the env var entirely.
 /// (scoped to this project — the agent can only see files placed here) plus the
 /// conversation + replay model. The only thing sent to the model is the user's
 /// question and these scaffolded docs; nothing else on the machine is touched.
-const DOCS_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
+const DOCS_AGENT_SRC: &str = r#"import { chidori, run } from "chidori:agent";
 
 /**
  * Chat with the Chidori docs.
@@ -93,10 +90,7 @@ const DOCS_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
  * agent can only ever read files you put here — and the only data sent to the
  * model is your question plus these docs.
  */
-export async function agent(
-  input: { messages?: string[]; model?: string },
-  chidori: Chidori,
-) {
+run(async (input: { messages?: string[]; model?: string }) => {
   // Load the local docs corpus. workspace.list/read are recorded host calls,
   // so re-running this agent replays them for free (no disk re-read on replay).
   const entries = await chidori.workspace.list();
@@ -132,7 +126,7 @@ export async function agent(
   // Interactive mode: ask the docs anything. Type "exit" to quit.
   const transcript = await chat.loop({ prompt: "ask the docs>" });
   return { transcript };
-}
+});
 "#;
 
 const DOCS_README: &str = r#"# Chat with the Chidori docs
@@ -206,18 +200,20 @@ Either way the `chidori` binary lands on your PATH. Check it with
 
 ## Writing an agent
 
-An agent is a TypeScript file that exports an `agent` function taking the run
-input and the `chidori` host object:
+An agent is a TypeScript file that imports the `chidori` host object and the
+`run` definer from the virtual `chidori:agent` module, then registers its
+handler with `run(...)`:
 
-    import type { Chidori } from "chidori:agent";
+    import { chidori, run } from "chidori:agent";
 
-    export async function agent(input: { document: string }, chidori: Chidori) {
+    run(async (input: { document: string }) => {
       const summary = await chidori.prompt("Summarize:\n" + input.document);
       return { summary };
-    }
+    });
 
 That is a complete, durable agent. The prompt is recorded; replay returns it for
-free.
+free. (The older style — `export async function agent(input, chidori)` — is
+still accepted for existing files.)
 
 ## What a host call is
 
@@ -386,7 +382,7 @@ const CHAT: Template = Template {
 // Inlined rather than include_str!'d from examples/ so the crate packages
 // self-contained for crates.io (examples/ lives outside the package root).
 // Mirrors examples/agents/worker.ts and examples/tools/reverse.ts.
-const WORKER_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
+const WORKER_AGENT_SRC: &str = r#"import { chidori, run, type AgentJson, type JsonObject } from "chidori:agent";
 
 /**
  * An autonomous "worker" agent: it loops — think, call a tool, observe the
@@ -403,10 +399,7 @@ const WORKER_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
  *     --input task="Reverse the word 'chidori' and tell me the result." \
  *     --tools examples/tools
  */
-export async function agent(
-  input: { task: string; maxSteps?: number },
-  chidori: Chidori,
-) {
+run(async (input: { task: string; maxSteps?: number }) => {
   const maxSteps = input.maxSteps ?? 8;
 
   let ctx = chidori
@@ -419,7 +412,7 @@ export async function agent(
     .tools(["reverse"]) // tool names discovered from the --tools directory
     .user(input.task);
 
-  const steps: { tool: string; input: unknown; result: unknown }[] = [];
+  const steps: { tool: string; input: JsonObject; result: AgentJson }[] = [];
 
   for (let step = 0; step < maxSteps; step++) {
     const { response, context } = await ctx.respond({ type: "final" });
@@ -439,7 +432,7 @@ export async function agent(
   }
 
   return { answer: "(stopped: reached maxSteps without finishing)", steps };
-}
+});
 "#;
 
 const REVERSE_TOOL_SRC: &str = r#"import type { ToolDefinition } from "chidori:agent";

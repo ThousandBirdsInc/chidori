@@ -360,12 +360,9 @@ laid out once as a cache-marked prefix; only the question and the growing Q&A
 tail change. Source: `examples/agents/context_qa.ts`.
 
 ```ts
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(
-  input: { corpus: string; questions: string[] },
-  chidori: Chidori,
-) {
+run(async (input: { corpus: string; questions: string[] }) => {
   // The stable head, built ONCE and frozen as a cacheable prefix.
   const base = chidori
     .context()
@@ -393,7 +390,7 @@ export async function agent(
   }
 
   return { answers };
-}
+});
 ```
 
 Run it:
