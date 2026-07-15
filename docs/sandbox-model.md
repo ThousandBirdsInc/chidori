@@ -291,10 +291,14 @@ the parent refuses `http` destinations that resolve to non-public addresses
 (loopback, RFC 1918, the 169.254.169.254 cloud-metadata range, and their IPv6
 equivalents), checked at DNS-resolution time and on every redirect hop, with
 `CHIDORI_HTTP_ALLOW_HOSTS` as the deliberate allowlist.
-Each layer is **best-effort**: a layer that cannot be applied (older
-kernel, rootless container) logs a skip note and degrades rather than breaking
-the run. Set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to **fail closed** if the
-platform's core layer (seccomp on Linux, Seatbelt on macOS) cannot be applied.
+The auxiliary layers (network namespace, Landlock) are **best-effort**: one
+that cannot be applied (older kernel, rootless container) logs a skip note and
+degrades rather than breaking the run. The platform's **core layer** (seccomp
+on Linux, Seatbelt on macOS) **fails closed by default**: if it cannot be
+applied, the run refuses with an actionable error instead of quietly executing
+with process separation only. Set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=0` to
+explicitly accept that degraded posture — the worker still announces the
+downgrade loudly on stderr.
 
 **Linux** (`apply_linux`), layered before seccomp so `unshare`/`landlock_*`
 remain legal:
@@ -323,8 +327,9 @@ remain legal:
   seccomp+Landlock pair. The feature's `unsafe` FFI (Seatbelt, `unshare`,
   `setrlimit`, `kill`) stays in the host-side `isolate/` module, out of the
   engine crate. (Type-checked on the Linux host but
-  runtime-unverified — no macOS CI host yet; the best-effort design degrades a
-  load failure to a logged skip.)
+  runtime-unverified — no macOS CI host yet; a load failure fails the run
+  closed by default, or degrades to a logged, loud downgrade under
+  `CHIDORI_ISOLATE_REQUIRE_SANDBOX=0`.)
 
 **Guarantee matrix:**
 
@@ -371,7 +376,7 @@ line describing the active posture. Isolation (process sandbox) and
 | Env var | Default | Effect |
 |---|---|---|
 | `CHIDORI_ISOLATE` | unset (on for the CLI on Unix; off for embedders) | `process` runs each agent in a confined child worker; `off` disables. Set by `--isolate` / `--no-isolate`. |
-| `CHIDORI_ISOLATE_REQUIRE_SANDBOX` | off | Fail the run closed if the platform's core confinement (seccomp/Seatbelt) can't be applied. |
+| `CHIDORI_ISOLATE_REQUIRE_SANDBOX` | **on** (on Linux/macOS) | Fail the run closed if the platform's core confinement (seccomp/Seatbelt) can't be applied. Set `0` to explicitly accept a degraded (process-separation-only) run; the downgrade is still announced on stderr. |
 | `CHIDORI_ISOLATE_DEADLINE_MS` | off | Parent-side wall-clock `SIGKILL` of a wedged worker. |
 | `CHIDORI_ISOLATE_CPU_SECS` | off | Hard `RLIMIT_CPU` ceiling on worker compute. |
 | `CHIDORI_ISOLATE_NOFILE` | 256 | `RLIMIT_NOFILE` (clamped to the inherited hard limit). |
@@ -576,9 +581,8 @@ If you intend to run code you do not trust on this engine today:
 3. Add OS isolation with `--isolate` (`chidori run --isolate`, `chidori serve
    --isolate`, or `CHIDORI_ISOLATE=process`): each run executes in a confined
    child process and brokers its effects back over a pipe, so a breakout has no
-   ambient process to land in. Layers are best-effort — set
-   `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed if the platform's core
-   confinement can't be applied. See
+   ambient process to land in. The run fails closed by default if the
+   platform's core confinement (seccomp/Seatbelt) can't be applied. See
    [OS-level isolation](#os-level-isolation-opt-in---isolate) for the full
    posture. (Running each agent in its own container is still complementary.)
 4. Keep `node:fs` on `FsPolicy::Captured` (the VFS) and avoid `workspace.*`.

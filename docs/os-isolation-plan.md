@@ -333,7 +333,8 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    namespace/mount, privilege-change, kernel-module/`bpf`/`perf_event_open`, and
    keyring syscalls). `apply_filter` sets `NO_NEW_PRIVS`, so it works rootless.
    Best-effort by default (degrades to brokering + rlimits where seccomp is
-   unavailable); `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` fails closed. A SIGSYS kill
+   unavailable — but only with the explicit `CHIDORI_ISOLATE_REQUIRE_SANDBOX=0`
+   opt-out; by default a missing seccomp core fails the run closed). A SIGSYS kill
    maps to a precise "blocked syscall (seccomp/SIGSYS)" error. Verified: a normal
    isolated run is unaffected (no false positives), and a worker probing
    `socket()` post-filter is killed (`isolate_limits::seccomp_blocks_a_denied_syscall`,
@@ -349,8 +350,9 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    access, leave reads for the C runtime; closes the `openat`-write surface
    seccomp leaves open, and unlike `RLIMIT_FSIZE` it spares inherited fds like a
    redirected `stderr`). Both best-effort with graceful skip + a `notes` log; a
-   single `SandboxOutcome` drives `REQUIRE_SANDBOX` (seccomp is the required
-   core) and the skip-aware self-tests (`isolate_limits::landlock_blocks_file_creation`).
+   single `SandboxOutcome` drives the default fail-closed gate (seccomp is the
+   required core; `CHIDORI_ISOLATE_REQUIRE_SANDBOX=0` waives it) and the
+   skip-aware self-tests (`isolate_limits::landlock_blocks_file_creation`).
    **Deferred:** cgroup v2 `memory.max` (needs delegation — the per-process heap
    watchdog from phase 2 is the graceful stand-in), rootless net-ns via an
    intermediate user namespace, and mount/pid namespaces.
@@ -360,13 +362,13 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    Chromium's renderer uses). The SBPL is **allow-default with targeted denies**
    (`(deny network*)` + `(deny file-write*)`) — the same posture as the Linux
    seccomp denylist + Landlock read-only, and low-risk: a brokered compute worker
-   still reads files and allocates freely. Best-effort with the same graceful-skip
-   contract; `SandboxOutcome::core_confined()` abstracts the per-OS "primary
-   layer" (seccomp on Linux, Seatbelt on macOS) for the `REQUIRE_SANDBOX` gate.
-   The FFI is type-checked on the Linux host (via `cargo check`, which doesn't
-   link) but **runtime-unverified** — no macOS host in this environment; the
-   best-effort design means a profile/load failure degrades to a logged skip
-   rather than breaking a run.
+   still reads files and allocates freely. `SandboxOutcome::core_confined()`
+   abstracts the per-OS "primary layer" (seccomp on Linux, Seatbelt on macOS)
+   for the fail-closed gate, which is **on by default** — a profile/load
+   failure fails the run unless the operator opts into a degraded run with
+   `CHIDORI_ISOLATE_REQUIRE_SANDBOX=0`. The FFI is type-checked on the Linux
+   host (via `cargo check`, which doesn't link) but **runtime-unverified** —
+   no macOS host in this environment.
 5. **Polish.** ✅ **Done (warm pool deliberately skipped)** — `--isolate` on both
    `chidori run` and `chidori serve` (and `CHIDORI_ISOLATE=process`); a startup
    `Isolation:` banner line describing the posture; and an `--untrusted`→isolation
@@ -385,7 +387,7 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
 | Env var | Default | Effect |
 |---|---|---|
 | `CHIDORI_ISOLATE` | unset (on for the CLI on Unix; off for embedders) | `process` runs each agent in a confined child worker. Set by `--isolate`. |
-| `CHIDORI_ISOLATE_REQUIRE_SANDBOX` | off | Fail the run closed if the platform's core confinement (seccomp/Seatbelt) can't be applied. |
+| `CHIDORI_ISOLATE_REQUIRE_SANDBOX` | **on** (on Linux/macOS) | Fail the run closed if the platform's core confinement (seccomp/Seatbelt) can't be applied. Set `0` to explicitly accept a degraded (process-separation-only) run; the downgrade is still announced on stderr. |
 | `CHIDORI_ISOLATE_DEADLINE_MS` | off | Parent-side wall-clock `SIGKILL` of a wedged worker. |
 | `CHIDORI_ISOLATE_CPU_SECS` | off | Hard `RLIMIT_CPU` ceiling on worker compute. |
 | `CHIDORI_ISOLATE_NOFILE` | 256 | `RLIMIT_NOFILE` (clamped to the inherited hard limit). |

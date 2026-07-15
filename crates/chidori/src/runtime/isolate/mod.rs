@@ -67,21 +67,22 @@ pub fn default_on_if_unset() {
 }
 
 /// A one-line, human-readable description of the isolation posture, for startup
-/// banners. Describes *intent*: the worker applies each layer best-effort and
-/// logs to stderr what actually stuck on this host.
+/// banners. Describes *intent*: the worker logs to stderr what actually stuck
+/// on this host. The platform's core layer (seccomp / Seatbelt) fails closed by
+/// default; the auxiliary layers are best-effort.
 pub fn describe() -> String {
     if !enabled() {
         return "off (agents run in-process; pass --isolate or unset CHIDORI_ISOLATE to sandbox)"
             .to_string();
     }
     let layers = if cfg!(target_os = "linux") {
-        "Linux: network namespace + Landlock + seccomp"
+        "Linux: network namespace + Landlock + seccomp; fails closed if seccomp can't apply"
     } else if cfg!(target_os = "macos") {
-        "macOS: Seatbelt profile"
+        "macOS: Seatbelt profile; fails closed if it can't apply"
     } else {
-        "no OS sandbox layer on this platform"
+        "no OS sandbox layer on this platform — process separation only"
     };
-    format!("on — process-per-run worker ({layers}; best-effort)")
+    format!("on — process-per-run worker ({layers})")
 }
 
 /// If untrusted code is being run without OS isolation, nudge the operator that

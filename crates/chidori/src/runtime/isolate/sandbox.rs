@@ -18,11 +18,12 @@
 //! the engine's watchdog thread needs them and a fork that cannot `exec` gains no
 //! new code — so the `exec*` denial is what actually forecloses code execution.
 
-/// What each best-effort confinement layer achieved for a worker. Layers that
-/// could not be applied (older kernel, rootless container, …) leave their flag
-/// `false` and append a human-readable reason to `notes`; the worker logs the
-/// notes and, under `CHIDORI_ISOLATE_REQUIRE_SANDBOX`, fails closed if the
-/// portable core (seccomp) did not apply.
+/// What each confinement layer achieved for a worker. Layers that could not be
+/// applied (older kernel, rootless container, …) leave their flag `false` and
+/// append a human-readable reason to `notes`; the worker logs the notes and
+/// **fails closed by default** if the platform's core layer (seccomp on Linux,
+/// Seatbelt on macOS) did not apply — `CHIDORI_ISOLATE_REQUIRE_SANDBOX=0` is
+/// the explicit opt-in to a degraded, loudly-announced run.
 #[derive(Debug, Default)]
 pub struct SandboxOutcome {
     /// The worker runs in its own (empty) network namespace (Linux).
@@ -40,9 +41,10 @@ pub struct SandboxOutcome {
 }
 
 impl SandboxOutcome {
-    /// Whether the platform's *primary* confinement is active — the gate for
-    /// `CHIDORI_ISOLATE_REQUIRE_SANDBOX` (seccomp on Linux, Seatbelt on macOS).
-    /// The namespace/Landlock layers are defense-in-depth on top of this.
+    /// Whether the platform's *primary* confinement is active (seccomp on
+    /// Linux, Seatbelt on macOS) — the fail-closed gate, applied by default and
+    /// waived only by `CHIDORI_ISOLATE_REQUIRE_SANDBOX=0`. The
+    /// namespace/Landlock layers are defense-in-depth on top of this.
     pub fn core_confined(&self) -> bool {
         #[cfg(target_os = "linux")]
         {

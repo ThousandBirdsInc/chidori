@@ -213,6 +213,69 @@ fn seatbelt_loads_and_enforces_on_macos() {
 }
 
 #[test]
+fn missing_core_sandbox_fails_closed_by_default() {
+    // If the platform's core confinement (seccomp on Linux, Seatbelt on macOS)
+    // cannot be applied, an isolated run must refuse — not quietly execute with
+    // process separation only. The test hook makes the worker report the core
+    // layer as unapplied so the gate is exercised on hosts where the sandbox
+    // genuinely installs.
+    let agent = write_agent(
+        "fail-closed",
+        r#"
+        import { run } from "chidori:agent";
+        run(async () => ({ ok: true }));
+        "#,
+    );
+    let out = run_isolated(&agent, &[("CHIDORI_ISOLATE_TEST_FORCE_UNCONFINED", "1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "run without core confinement should fail closed by default; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("fail closed") || stderr.contains("could not be applied"),
+        "error should explain the fail-closed refusal; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("CHIDORI_ISOLATE_REQUIRE_SANDBOX"),
+        "error should name the explicit opt-out; stderr={stderr}"
+    );
+    let _ = fs::remove_dir_all(agent.parent().unwrap());
+}
+
+#[test]
+fn degraded_run_needs_an_explicit_opt_out_and_stays_loud() {
+    // With CHIDORI_ISOLATE_REQUIRE_SANDBOX=0 the operator accepts a degraded
+    // run — it must succeed, but the downgrade must be announced on stderr.
+    let agent = write_agent(
+        "degraded",
+        r#"
+        import { run } from "chidori:agent";
+        run(async () => ({ ok: true }));
+        "#,
+    );
+    let out = run_isolated(
+        &agent,
+        &[
+            ("CHIDORI_ISOLATE_TEST_FORCE_UNCONFINED", "1"),
+            ("CHIDORI_ISOLATE_REQUIRE_SANDBOX", "0"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "opted-out degraded run should succeed; stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.contains("\"ok\""), "stdout missing result: {stdout}");
+    assert!(
+        stderr.contains("WARNING") && stderr.contains("WITHOUT"),
+        "degraded run must announce the downgrade loudly; stderr={stderr}"
+    );
+    let _ = fs::remove_dir_all(agent.parent().unwrap());
+}
+
+#[test]
 fn cpu_limit_terminates_a_busy_worker() {
     // With compute bounds disabled, a busy loop burns CPU until RLIMIT_CPU fires
     // (SIGXCPU), which the parent maps to a CPU-time error. No deadline set, so

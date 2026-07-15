@@ -101,9 +101,12 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   `CHIDORI_MAX_CONCURRENT_SESSIONS` (default 8) to cap parallel runs;
   `CHIDORI_SECRET_ENV` to pass secrets as placeholder tokens the journal
   never sees. OS isolation (`CHIDORI_ISOLATE=process`) is the **default on
-  Unix**; opt out with `--no-isolate` / `CHIDORI_ISOLATE=off`. In containers,
-  set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed — the
-  network-namespace layer needs `CAP_SYS_ADMIN` and is skipped without it.
+  Unix**; opt out with `--no-isolate` / `CHIDORI_ISOLATE=off`. Runs **fail
+  closed by default** if the platform's core confinement (seccomp on Linux,
+  Seatbelt on macOS) can't be applied; set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=0`
+  only if you accept degraded (process-separation-only) runs. The
+  network-namespace layer is auxiliary — it needs `CAP_SYS_ADMIN` and is
+  skipped (with a logged note) in rootless containers without failing the run.
 
 ## Decision 1: where the journal lives
 
