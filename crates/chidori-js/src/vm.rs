@@ -288,6 +288,17 @@ pub struct Vm {
     /// Registry compaction threshold (dead weak entries are pruned when the
     /// registry length crosses it; doubled after each compaction).
     pub(crate) gc_compact_at: std::cell::Cell<usize>,
+    /// Objects allocated since the last cycle collection; drives the automatic
+    /// trigger in [`Vm::maybe_collect_cycles`].
+    pub(crate) gc_allocs_since_collect: std::cell::Cell<usize>,
+    /// Allocation count at which [`Vm::maybe_collect_cycles`] fires. Re-armed
+    /// after every collection to `max(floor, live)`, so collection work stays
+    /// amortized O(1) per allocation even as the live heap grows.
+    pub(crate) gc_auto_threshold: std::cell::Cell<usize>,
+    /// Automatic cycle collection at quiescence points (default ON). Without
+    /// it a long-lived VM that keeps creating cycles leaks unbounded unless
+    /// the host remembers to call `collect_cycles` itself.
+    pub gc_auto: bool,
     /// Value cells (`Rc<RefCell<Value>>`) held OUTSIDE the VM — e.g. a host's
     /// `ModuleRecord` cells — that also appear as closure upvalues inside it.
     /// `collect_cycles` treats their contents as roots; without registration,
@@ -422,6 +433,9 @@ impl Vm {
             dynamic_import: None,
             all_objects: std::cell::RefCell::new(Vec::new()),
             gc_compact_at: std::cell::Cell::new(1 << 12),
+            gc_allocs_since_collect: std::cell::Cell::new(0),
+            gc_auto_threshold: std::cell::Cell::new(crate::gc::GC_AUTO_FLOOR),
+            gc_auto: true,
             gc_cell_roots: Vec::new(),
             template_cache: std::collections::HashMap::new(),
             value_vec_pool: Vec::new(),
@@ -736,6 +750,15 @@ impl Vm {
     }
     pub fn throw_syntax(&self, msg: &str) -> Value {
         self.make_error(ErrorKind::Syntax, msg)
+    }
+    /// A catchable Error for "an execution tier reached a state it promised
+    /// was impossible" (an op the dispatcher doesn't handle, a kernel slot
+    /// that violates its build-time invariant, …). These used to be
+    /// `unreachable!` — a process abort with no recourse for the host. A bug
+    /// in a tier must stay inside the sandbox: throw a loud, catchable,
+    /// reportable error instead of taking the embedder down.
+    pub fn throw_internal(&self, msg: &str) -> Value {
+        self.make_error(ErrorKind::Error, &format!("internal engine error: {msg}"))
     }
 
     // ---------------------------------------------------------------------
