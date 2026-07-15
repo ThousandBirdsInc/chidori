@@ -1,9 +1,10 @@
 # Sandbox model of the chidori-js runtime
 
-> Two layers ship: the default **in-process** capability-confinement
-> sandbox, and an **opt-in OS-level isolation** mode (`--isolate`) that runs each
-> agent in a confined child process — see
-> [OS-level isolation](#os-level-isolation-opt-in---isolate). Known limitations
+> Two layers ship: the **in-process** capability-confinement sandbox, and an
+> **OS-level isolation** mode that runs each agent in a confined child
+> process — on by default for the `chidori` CLI on Unix, opt-in elsewhere
+> (`--isolate`) — see
+> [OS-level isolation](#os-level-isolation---isolate). Known limitations
 > are documented in [Current gaps](#current-gaps).
 > **Engine:** the pure-Rust `chidori-js` engine — the only JS engine in
 > the tree.
@@ -35,15 +36,16 @@ the host *does* inject (`http`, `workspace.*`). Those are real capabilities;
 whether granting them is "safe" depends entirely on whether the agent code is
 trusted.
 
-For that case there is an **opt-in OS-level isolation mode**
-(`--isolate` / `CHIDORI_ISOLATE=process`): each run executes in a disposable
+For that case there is an **OS-level isolation mode** — on by default for the
+CLI on Unix, opt-in for embedders and elsewhere (`--isolate` /
+`CHIDORI_ISOLATE=process`): each run executes in a disposable
 child process that holds *only* the JS engine and brokers every effect back to
 the trusted parent over a pipe. The child runs under a per-OS sandbox (Linux:
 empty network namespace + Landlock read-only filesystem + seccomp syscall
 denylist; macOS: a Seatbelt deny profile) plus a `setrlimit` floor and a
 parent-side deadline-kill — so even a total compromise of the interpreter has no
 ambient network, filesystem, or sibling-run to reach. See
-[OS-level isolation](#os-level-isolation-opt-in---isolate).
+[OS-level isolation](#os-level-isolation---isolate).
 
 ## Threat model
 
@@ -69,7 +71,7 @@ remaining distance.
 | Crash the host with a panic | ✅ Yes — `catch_unwind` boundary |
 | Abuse an injected powerful effect (`http`, `workspace`) | ✅ On the server (deny-by-default unless the operator opts out); ⚠️ on the bare CLI only if the operator gates it — see [gaps](#current-gaps) |
 | Starve co-tenant agents / exceed a per-agent memory quota | ✅ Per-run meter (thread-attributed; small cross-thread drift) — see [gaps](#current-gaps) |
-| Break out of the process / OS | ⚠️ Default: none (in-process). ✅ With `--isolate`: confined child process — seccomp/Seatbelt + netns/Landlock + rlimits — see [OS-level isolation](#os-level-isolation-opt-in---isolate) |
+| Break out of the process / OS | ✅ CLI on Unix (isolation on by default): confined child process — seccomp/Seatbelt + netns/Landlock + rlimits — see [OS-level isolation](#os-level-isolation---isolate). ⚠️ Embedders / `--no-isolate` / non-Unix: none (in-process) |
 
 ## Architecture: capability injection, not ambient authority
 
@@ -209,14 +211,15 @@ The same watchdog can enforce a wall-clock deadline, also via `vm.interrupt`.
 | Call depth | (compile constant) | 2,000 | — |
 | Regex steps | (compile constant) | 100,000 | — |
 
-## OS-level isolation (opt-in: `--isolate`)
+## OS-level isolation (`--isolate`)
 
-Everything above confines the *language* and bounds resources, but by default the
-VM runs **in-process** with the host: there is no OS boundary, so a hypothetical
-interpreter RCE would land in the host process. The `--isolate` mode adds that
-boundary. It is **off by default** (in-process stays the default for trusted
-local dev) and **additive** — agent code, the SDKs, the durable call log, and
-replay semantics are byte-for-byte unchanged (asserted by
+Everything above confines the *language* and bounds resources, but in-process
+the VM shares its address space with the host: there is no OS boundary, so a
+hypothetical interpreter RCE would land in the host process. Isolation adds
+that boundary. It is **on by default for the `chidori` CLI on Unix** (see
+[Enabling it](#enabling-it) — embedders and non-Unix platforms keep the
+historical opt-in) and **additive** — agent code, the SDKs, the durable call
+log, and replay semantics are byte-for-byte unchanged (asserted by
 `rust_engine::tests::isolated_run_matches_in_process_byte_for_byte`). The full
 design lives in [`docs/os-isolation-plan.md`](./os-isolation-plan.md); this
 is the operator-facing summary. Code: `crates/chidori/src/runtime/isolate/`.
@@ -408,7 +411,7 @@ resource-precision gaps.
    charged (the meter clamps at zero in the other direction). For a
    single-threaded VM run this drift is small; only true ownership accounting
    (charge at string/object allocation, credit on `Drop` inside the engine)
-   would eliminate it. **Under [`--isolate`](#os-level-isolation-opt-in---isolate) this
+   would eliminate it. **Under [`--isolate`](#os-level-isolation---isolate) this
    drift disappears**: each run is its own process, so the meter is a clean
    per-process measure with no cross-tenant attribution.
 
@@ -418,15 +421,17 @@ resource-precision gaps.
    unwinding. Bounded in practice because the per-op size caps mean no single
    opcode allocates more than ~16 MB, but it is not a hard instantaneous ceiling.
    A *hard*, kernel-enforced ceiling (cgroup v2 `memory.max`) under
-   [`--isolate`](#os-level-isolation-opt-in---isolate) is not yet wired — see
+   [`--isolate`](#os-level-isolation---isolate) is not yet wired — see
    gap #4.
 
-4. **OS-level isolation is opt-in, not the default.** By default the engine runs
-   in-process with the host — no seccomp, namespace, or separate-process boundary
-   — so the default posture is purely capability-confinement plus Rust memory
-   safety. The [`--isolate` mode](#os-level-isolation-opt-in---isolate)
-   *provides* that boundary, but the operator must enable it; in-process is
-   the default for trusted local dev. Sub-gaps within the isolated path:
+4. **OS-level isolation is default-on only for the CLI on Unix.** Embedders of
+   the library, `--no-isolate` runs, and non-Unix platforms run the engine
+   in-process with the host — no seccomp, namespace, or separate-process
+   boundary — so that posture is purely capability-confinement plus Rust
+   memory safety. The [`--isolate` mode](#os-level-isolation---isolate)
+   *provides* the boundary (and the `chidori` binary enables it by default on
+   Unix); everywhere else the operator must enable it. Sub-gaps within the
+   isolated path:
    - **No hard memory ceiling.** cgroup v2 `memory.max` needs delegation and
      is not yet wired; `RLIMIT_AS` is too blunt for a multi-threaded VM. The polled
      heap watchdog (cleaner per-process under isolation) is the stand-in.
@@ -452,7 +457,7 @@ resource-precision gaps.
    `crates/chidori-js/src/gc.rs`) but is not wired into the run loop, so
    within a run cycles accumulate until teardown. The per-run memory cap is
    the backstop for the bytes involved. **The
-   [`--isolate`](#os-level-isolation-opt-in---isolate) path sidesteps this
+   [`--isolate`](#os-level-isolation---isolate) path sidesteps this
    entirely**: the child process exits after one run (spawn-per-run, no warm
    pool), so no state — leaked or otherwise — survives across runs.
 
@@ -579,7 +584,7 @@ If you intend to run code you do not trust on this engine today:
    ambient process to land in. Layers are best-effort — set
    `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed if the platform's core
    confinement can't be applied. See
-   [OS-level isolation](#os-level-isolation-opt-in---isolate) for the full
+   [OS-level isolation](#os-level-isolation---isolate) for the full
    posture. (Running each agent in its own container is still complementary.)
 4. Keep `node:fs` on `FsPolicy::Captured` (the VFS) and avoid `workspace.*`.
 

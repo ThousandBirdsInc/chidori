@@ -27,3 +27,8 @@ Repository = "https://github.com/ThousandBirdsInc/chidori"
 
 [tool.setuptools.packages.find]
 include = ["chidori*"]
+
+# PEP 561: ship the `py.typed` marker so type checkers (mypy, pyright) consume
+# the package's inline annotations instead of treating it as untyped.
+[tool.setuptools.package-data]
+chidori = ["py.typed"]

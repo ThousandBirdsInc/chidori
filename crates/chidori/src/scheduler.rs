@@ -29,8 +29,11 @@ use crate::tools::ToolRegistry;
 /// branch worker threads. The interpreter recurses natively with the agent's
 /// JS call depth (`max_call_depth` = 2000 frames), which needs more headroom
 /// than tokio's 2 MiB default; on 64-bit the extra virtual space is only
-/// committed if actually touched.
-pub const JS_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+/// committed if actually touched. Sized by measurement: a debug build needs
+/// more than 32 MiB for the depth guard to fire its catchable RangeError
+/// before the native stack runs out (release frames are far smaller, but the
+/// reservation is virtual either way, so one generous constant serves both).
+pub const JS_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Build the process's tokio runtime. Exactly `tokio::runtime::Runtime::new()`
 /// plus [`JS_THREAD_STACK_BYTES`]-sized threads: agent JS executes on this
@@ -183,4 +186,36 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
 
     deps.session_store.put(&session)?;
     Ok(id)
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::JS_THREAD_STACK_BYTES;
+
+    /// A JS thread sized to [`JS_THREAD_STACK_BYTES`] must let the engine's
+    /// default call-depth guard fire its catchable `RangeError` on deep
+    /// recursion, rather than the native stack overflowing and aborting the
+    /// process (which is what a too-small stack did — see the constant's
+    /// rationale). Regression for `chidori run <deeply-recursive-agent>`.
+    #[test]
+    fn default_depth_recursion_throws_not_aborts() {
+        let outcome = std::thread::Builder::new()
+            .stack_size(JS_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let mut engine = chidori_js::Engine::new();
+                // Default max_call_depth (2000); unbounded recursion must hit
+                // the guard, not the stack.
+                engine
+                    .eval("function f(n){ return f(n + 1); } f(0)")
+                    .err()
+                    .unwrap_or_default()
+            })
+            .expect("spawn JS thread")
+            .join()
+            .expect("thread must return an error, not abort");
+        assert!(
+            outcome.contains("Maximum call stack size exceeded"),
+            "expected a catchable RangeError, got: {outcome}"
+        );
+    }
 }

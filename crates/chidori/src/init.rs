@@ -69,6 +69,10 @@ until it finishes. Tools live in `tools/`; a sample `reverse` tool is included.
       --input task="Reverse the word 'chidori' and tell me the result." \
       --tools tools
 
+Each tool call asks for a y/N approval at the terminal (the ask-by-default
+policy for running unfamiliar code). Add `--trusted` to skip the prompts —
+required when running non-interactively, where gated effects fail closed.
+
 Add your own tools under `tools/` and list their names in the agent's
 `.tools([...])` call. Set a provider key first (e.g. `ANTHROPIC_API_KEY` or
 `OPENAI_API_KEY`) — or just run `chidori model-login` to sign in with OpenRouter and
@@ -273,9 +277,11 @@ you want available in the agent's `.tools([...])` call, then invoke one with
 
 ## Running agents (CLI)
 
-- `chidori run <file.ts> [--input key=value] [--tools <dir>] [--trace] [--stream]`
+- `chidori run <file.ts> [--input key=value] [--tools <dir>] [--trusted] [--trace] [--stream]`
   — execute an agent. `--input` accepts `key=value` pairs or a JSON object;
-  `@file` loads a value from a file.
+  `@file` loads a value from a file. Powerful effects (tool calls, network,
+  workspace writes) ask for approval at the terminal by default; `--trusted`
+  skips the ask (required non-interactively, where gated effects fail closed).
 - `chidori chat [agent.ts]` — interactive REPL. With no file it chats with the
   model directly; with a file it drives the agent's `messages` input per turn.
 - `chidori demo` — interactive menu of example agents (several need no API key).
@@ -320,9 +326,13 @@ need no key at all.
 
 Agents run in a pure-Rust JavaScript sandbox — there is no raw shell or
 unfettered filesystem access. Effects that touch the outside world go through a
-policy layer. By default `chidori run` is permissive; `--untrusted` switches to
-deny-by-default (workspace reads allowed, writes and network denied unless
-approved). The workspace is always scoped to the project directory.
+policy layer. By default `chidori run` asks before powerful effects (tool
+calls, network, workspace writes) with a y/N prompt at the terminal; LLM
+prompts and pure compute never ask. Pass `--trusted` for the permissive
+allow-all behavior (needed for non-interactive runs, where gated effects fail
+closed), or `--untrusted` for deny-by-default (workspace reads allowed, writes
+and network denied outright). The workspace is always scoped to the project
+directory.
 "#;
 
 /// One file a template writes, relative to the target directory.

@@ -235,6 +235,14 @@ enum Commands {
         /// earlier point in its history (`docs/durable-storage.md`).
         #[arg(long)]
         until_seq: Option<u64>,
+
+        /// Edit-and-resume: proceed even though the agent source changed
+        /// since this run was recorded. Recorded calls replay positionally
+        /// against the edited code; an edit that touches already-replayed
+        /// calls fails loudly as a divergence, an edit past the pause point
+        /// resumes cleanly.
+        #[arg(long)]
+        allow_source_change: bool,
     },
 
     /// List a run's persisted `chidori.branch` sub-runs and their states.
@@ -372,7 +380,7 @@ fn main() {
     // The isolate worker speaks a binary frame protocol over stdout, so it must
     // short-circuit before any of the normal startup path can write there.
     if let Commands::RunWorker = cli.command {
-        std::process::exit(match crate::runtime::isolate::worker::run() {
+        std::process::exit(match on_js_stack(crate::runtime::isolate::worker::run) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("isolate worker error: {e}");
@@ -389,7 +397,60 @@ fn main() {
 
     // Commands that only do parsing/validation return exit code 2 on failure;
     // everything else returns 1. Success is 0.
-    let (result, parse_only) = match cli.command {
+    let (result, parse_only) = on_js_stack(move || dispatch_command(cli.command));
+
+    // Flush any buffered OTLP spans before the process exits. No-op when
+    // OTEL_EXPORTER_OTLP_ENDPOINT wasn't set.
+    crate::runtime::otel::shutdown_on_exit();
+
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            report_cli_error(&e);
+            std::process::exit(if parse_only { 2 } else { 1 });
+        }
+    }
+}
+
+/// Run `f` on a thread with [`scheduler::JS_THREAD_STACK_BYTES`] of stack.
+/// The interpreter recurses on the native stack (its depth guard allows 2000
+/// JS frames), and the default main-thread stack aborts the whole process on
+/// deep-but-legal recursion instead of letting the guard throw its catchable
+/// RangeError — so every command body (and the isolate worker, whose agent
+/// also runs on its process main thread) executes on one big-stack thread.
+/// One thread per process: the thread-local compile/transpile caches stay
+/// warm for the command's whole lifetime.
+fn on_js_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .name("chidori-cmd".to_string())
+        .stack_size(scheduler::JS_THREAD_STACK_BYTES)
+        .spawn(f)
+        .expect("spawning the command thread")
+        .join()
+        .expect("command thread panicked")
+}
+
+/// Dispatch one parsed CLI command to its handler, returning its result and
+/// whether it is a parse/validation-only command (exit code 2 on failure).
+fn dispatch_command(command: Commands) -> (Result<()>, bool) {
+    // Confine error-report source snippets to the entry agent's workspace root
+    // (see `rust_engine::read_project_source`): a run/check names a `.ts` file,
+    // whose workspace root is where its modules live.
+    let entry_file = match &command {
+        Commands::Run { file, .. }
+        | Commands::Check { file }
+        | Commands::Resume { file, .. }
+        | Commands::Serve { file, .. } => Some(file.clone()),
+        Commands::Chat { agent, .. } => agent.clone(),
+        _ => None,
+    };
+    if let Some(file) = entry_file {
+        crate::runtime::rust_engine::set_display_project_root(
+            crate::runtime::typescript::transpile::find_workspace_root(&file),
+        );
+    }
+
+    match command {
         Commands::Run {
             file,
             input,
@@ -458,7 +519,17 @@ fn main() {
             run_id,
             dir,
             until_seq,
-        } => (cmd_resume(&file, &run_id, dir.as_deref(), until_seq), false),
+            allow_source_change,
+        } => (
+            cmd_resume(
+                &file,
+                &run_id,
+                dir.as_deref(),
+                until_seq,
+                allow_source_change,
+            ),
+            false,
+        ),
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
         Commands::BranchResume {
             run_id,
@@ -496,19 +567,129 @@ fn main() {
                 false,
             )
         }
+    }
+}
+
+/// Print a failed command's error to stderr. An uncaught JavaScript exception
+/// (the `JavaScript exception:` framing from `runtime::rust_engine`, carrying
+/// the stack frames recorded on the thrown error's `.stack`, already remapped
+/// to original-source coordinates) renders through miette's graphical report
+/// handler — the same presentation TypeScript parse errors already get. The
+/// innermost frames that live in a readable source file additionally render
+/// as a labeled snippet of that file, one caret per frame, the way rustc
+/// points at code. Every other error keeps the plain anyhow context chain.
+/// This is presentation only: the compact `JavaScript exception: …` string is
+/// what the durable records, `--stream` events, and server responses carry.
+fn report_cli_error(e: &anyhow::Error) {
+    use crate::runtime::rust_engine::parse_stack_frame;
+    use oxc::diagnostics::{
+        GraphicalReportHandler, GraphicalTheme, LabeledSpan, NamedSource, OxcDiagnostic,
     };
 
-    // Flush any buffered OTLP spans before the process exits. No-op when
-    // OTEL_EXPORTER_OTLP_ENDPOINT wasn't set.
-    crate::runtime::otel::shutdown_on_exit();
+    let text = format!("{e:#}");
+    let Some(idx) = text.find("JavaScript exception: ") else {
+        eprintln!("Error: {text}");
+        return;
+    };
+    // `{:#}` prints outer contexts first, so everything before the marker is
+    // context ("resume refused: …") and everything after it is the thrown
+    // error's `Name: message` line plus the recorded `    at …` frames. The
+    // frames arrive in transpiled-bundle coordinates; remap them to the
+    // original TypeScript here, at the single display boundary.
+    let body = crate::runtime::rust_engine::remap_stack_frames(
+        &text[idx + "JavaScript exception: ".len()..],
+    );
+    let body = body.as_str();
+    let context = text[..idx].trim_end().trim_end_matches(':');
 
-    match result {
-        Ok(()) => std::process::exit(0),
-        Err(e) => {
-            eprintln!("Error: {e:#}");
-            std::process::exit(if parse_only { 2 } else { 1 });
+    // Snippet: the innermost frame with a readable file anchors it, and every
+    // frame in that same file becomes a labeled caret (capped so a deep
+    // same-file recursion stays readable).
+    const MAX_SNIPPET_LABELS: usize = 6;
+    let frames: Vec<_> = body.lines().skip(1).filter_map(parse_stack_frame).collect();
+    let snippet_source = frames.iter().find_map(|f| {
+        let file = f.file?;
+        // Confined to the project root — see `read_project_source`. A frame's
+        // file is agent-controlled (via `.stack`); never render a snippet of
+        // something outside the project the operator is running.
+        Some((
+            file,
+            crate::runtime::rust_engine::read_project_source(file)?,
+        ))
+    });
+    let mut diagnostic = OxcDiagnostic::error(body.to_string());
+    if let Some((file, source)) = &snippet_source {
+        let mut seen = std::collections::HashSet::new();
+        let labels: Vec<LabeledSpan> = frames
+            .iter()
+            .filter(|f| f.file == Some(file))
+            .filter_map(|f| {
+                let offset = byte_offset_of(source, f.line, f.col)?;
+                seen.insert(offset).then(|| {
+                    LabeledSpan::new(
+                        Some(format!("at {}", f.name)),
+                        offset,
+                        identifier_len_at(source, offset).max(1),
+                    )
+                })
+            })
+            .take(MAX_SNIPPET_LABELS)
+            .collect();
+        if !labels.is_empty() {
+            diagnostic = diagnostic.with_labels(labels);
         }
     }
+
+    let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
+    let mut rendered = String::new();
+    let ok = match snippet_source {
+        Some((file, source)) if diagnostic.labels.is_some() => {
+            let report = diagnostic.with_source_code(NamedSource::new(file, source));
+            handler
+                .render_report(&mut rendered, report.as_ref())
+                .is_ok()
+        }
+        _ => handler.render_report(&mut rendered, &diagnostic).is_ok(),
+    };
+    if !ok {
+        eprintln!("Error: {text}");
+        return;
+    }
+    if context.is_empty() {
+        eprintln!("Error: uncaught JavaScript exception{rendered}");
+    } else {
+        eprintln!("Error: {context}: uncaught JavaScript exception{rendered}");
+    }
+}
+
+/// Byte offset of a 1-based (line, character-column) position in `src`.
+fn byte_offset_of(src: &str, line: u32, col: u32) -> Option<usize> {
+    let mut offset = 0usize;
+    for (i, l) in src.split_inclusive('\n').enumerate() {
+        if i + 1 == line as usize {
+            let mut bytes = 0usize;
+            for (n, c) in l.chars().enumerate() {
+                if n + 1 >= col as usize {
+                    break;
+                }
+                bytes += c.len_utf8();
+            }
+            return Some(offset + bytes);
+        }
+        offset += l.len();
+    }
+    None
+}
+
+/// Length in bytes of the identifier starting at `offset` (0 when the byte
+/// there doesn't start one) — so a frame label underlines the function name
+/// it points at rather than a single character.
+fn identifier_len_at(src: &str, offset: usize) -> usize {
+    src[offset..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .map(char::len_utf8)
+        .sum()
 }
 
 struct DemoExample {
@@ -1304,6 +1485,7 @@ fn cmd_resume(
     run_id: &str,
     dir: Option<&std::path::Path>,
     until_seq: Option<u64>,
+    allow_source_change: bool,
 ) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
@@ -1348,9 +1530,14 @@ fn cmd_resume(
     // source fingerprints recorded in the run's snapshot manifest, exactly as
     // the server resume routes do, so cached results are never paired with
     // changed code. (Runs persisted before manifests existed skip with a
-    // warning.)
-    crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file)
-        .context("resume refused: the agent source no longer matches this run's checkpoint")?;
+    // warning; `--allow-source-change` is the edit-and-resume opt-in.)
+    crate::runtime::snapshot::validate_manifest_for_resume(
+        &run_base,
+        Some(run_id),
+        file,
+        allow_source_change,
+    )
+    .context("resume refused: the agent source no longer matches this run's checkpoint")?;
 
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
@@ -1369,7 +1556,7 @@ fn cmd_resume(
     eprintln!(
         "\nResumed from {} ({} calls replayed)",
         run_id,
-        result.call_log.total_duration_ms()
+        result.call_log.records().len()
     );
     Ok(())
 }

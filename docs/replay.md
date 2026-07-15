@@ -18,8 +18,15 @@ Replay is guarded, not best-effort:
 - **Source verification:** every resume surface (the server's resume/approve
   routes *and* `chidori resume`) verifies the agent's entry + module source
   fingerprints against the run's snapshot manifest before replaying, and
-  refuses on mismatch — cached results are never paired with changed code.
-  (Runs persisted before manifests existed skip with a warning.)
+  refuses on mismatch — cached results are never paired with changed code
+  *silently*. (Runs persisted before manifests existed skip with a warning.)
+- **Edit-and-resume is an explicit opt-in:** pass `--allow-source-change` to
+  `chidori resume` (or `"allow_source_change": true` on the server's
+  resume/signal/approve routes) to replay a recorded run against edited code.
+  The divergence checks below still guard the journaled prefix — an edit that
+  changes an already-recorded call fails loudly, an edit past the pause point
+  resumes cleanly. ABI/policy mismatches are environment drift, not edits,
+  and always refuse.
 - **Divergence checks compare arguments, not just names:** a replayed call
   must match the recorded call's function *and* arguments (the derived
   `request_digest` field is ignored). A completed async host operation whose

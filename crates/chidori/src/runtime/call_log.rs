@@ -84,7 +84,6 @@ impl CallLog {
         self.records.push(record);
     }
 
-    #[allow(dead_code)]
     pub fn records(&self) -> &[CallRecord] {
         &self.records
     }

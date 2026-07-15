@@ -449,6 +449,10 @@ class AgentClient:
             after every host function call (prompt, tool, http, ...)
           * `{"type": "prompt_start" | "prompt_delta" | "prompt_end", ...}`
             — emitted for labelled prompt progress streams
+          * `{"type": "paused", "id": ..., "status": "paused",
+            "pending_seq": ..., ...}` — emitted when the run parks at a
+            `chidori.signal(...)` listen point; deliver the signal (e.g.
+            `client.signal(...)`) and the stream continues
           * `{"type": "done", "id": ..., "status": ..., "output": ...}`
             — emitted once when the run finishes
 
@@ -516,6 +520,7 @@ class AgentClient:
                                 "prompt_start",
                                 "prompt_delta",
                                 "prompt_end",
+                                "paused",
                             }:
                                 decoded["type"] = event_name
                                 yield decoded

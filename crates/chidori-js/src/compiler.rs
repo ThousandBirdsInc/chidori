@@ -52,6 +52,74 @@ fn decode_lone_surrogates(value: &str) -> JsString {
     JsString::from_code_units(&units)
 }
 
+/// Byte offset of each line start in `src` (`[0]` is always 0). Backs
+/// [`Compiler::line_col_of`], the per-compiled-function position lookup: that
+/// path runs once per function of every compiled source (a vendored bundle
+/// has thousands), so it needs an indexed table rather than miette's
+/// scan-from-the-start `read_span` (which is linear per lookup and fine for
+/// the parse-error path below, where at most a few diagnostics render).
+fn line_starts(src: &str) -> Vec<u32> {
+    let mut starts = vec![0u32];
+    for (i, b) in src.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i as u32 + 1);
+        }
+    }
+    starts
+}
+
+/// 1-based (line, column) of byte `offset` in `src`, given its line-start
+/// table. Columns count characters, not bytes.
+fn line_col_at(src: &str, starts: &[u32], offset: u32) -> (u32, u32) {
+    let offset = offset.min(src.len() as u32);
+    let line = starts.partition_point(|&s| s <= offset).max(1);
+    let start = starts[line - 1] as usize;
+    let col = src
+        .get(start..offset as usize)
+        .map(|s| s.chars().count())
+        .unwrap_or(0) as u32
+        + 1;
+    (line as u32, col)
+}
+
+/// Render one oxc diagnostic with the 1-based line/column of its primary
+/// label — `Unexpected token (line 3, column 7)` — so a parse error points at
+/// its source position instead of leaving the user to hunt for it. The span
+/// is resolved by miette (the diagnostic toolkit oxc's errors are built on).
+/// `line_offset` shifts reported lines up by that many wrapper lines (direct
+/// eval compiles inside a synthetic wrapper), clamped at line 1.
+fn render_diagnostic(src: &str, e: &oxc::diagnostics::OxcDiagnostic, line_offset: u32) -> String {
+    use miette::SourceCode as _;
+    let msg = e.to_string();
+    let Some(offset) = e
+        .labels
+        .as_ref()
+        .and_then(|l| l.first())
+        .map(|l| l.offset())
+    else {
+        return msg;
+    };
+    let Ok(span) = src.read_span(&miette::SourceSpan::new(offset.into(), 0), 0, 0) else {
+        return msg;
+    };
+    let line = (span.line() as u32 + 1).saturating_sub(line_offset).max(1);
+    let col = span.column() as u32 + 1;
+    format!("{msg} (line {line}, column {col})")
+}
+
+/// Render a diagnostic list (each with its position) joined with `"; "`.
+fn render_diagnostics(
+    src: &str,
+    errors: &[oxc::diagnostics::OxcDiagnostic],
+    line_offset: u32,
+) -> String {
+    errors
+        .iter()
+        .map(|e| render_diagnostic(src, e, line_offset))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub fn compile_script(src: &str) -> Result<FuncProto, String> {
     compile_script_impl(src, false, true, true)
 }
@@ -118,13 +186,10 @@ pub fn compile_script_kernels(src: &str, kernels: bool) -> Result<FuncProto, Str
     let source_type = SourceType::script();
     let ret = Parser::new(&allocator, src, source_type).parse();
     if !ret.errors.is_empty() {
-        let msg = ret
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("SyntaxError: {msg}"));
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(src, &ret.errors, 0)
+        ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
@@ -133,11 +198,7 @@ pub fn compile_script_kernels(src: &str, kernels: bool) -> Result<FuncProto, Str
     if !sem.errors.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            sem.errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            render_diagnostics(src, &sem.errors, 0)
         ));
     }
     let mut c = Compiler::new();
@@ -161,13 +222,10 @@ pub fn compile_script_regs(src: &str, regs: bool) -> Result<FuncProto, String> {
     let source_type = SourceType::script();
     let ret = Parser::new(&allocator, src, source_type).parse();
     if !ret.errors.is_empty() {
-        let msg = ret
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("SyntaxError: {msg}"));
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(src, &ret.errors, 0)
+        ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
@@ -176,11 +234,7 @@ pub fn compile_script_regs(src: &str, regs: bool) -> Result<FuncProto, String> {
     if !sem.errors.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            sem.errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            render_diagnostics(src, &sem.errors, 0)
         ));
     }
     let mut c = Compiler::new();
@@ -218,13 +272,10 @@ fn compile_script_impl(
     let source_type = SourceType::script();
     let ret = Parser::new(&allocator, src, source_type).parse();
     if !ret.errors.is_empty() {
-        let msg = ret
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("SyntaxError: {msg}"));
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(src, &ret.errors, 0)
+        ));
     }
     let program = ret.program;
     // Semantic early-errors (duplicate lexical declarations, illegal `await`,
@@ -236,11 +287,7 @@ fn compile_script_impl(
     if !sem.errors.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            sem.errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            render_diagnostics(src, &sem.errors, 0)
         ));
     }
     let mut c = Compiler::new();
@@ -312,15 +359,18 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
         Wrap::Method => format!("({{ m(){{\n{strict_prefix}{src}\n}} }})"),
     };
     let source_type = SourceType::script();
+    // Positions are computed against the wrapped text, then shifted back by
+    // the wrapper's leading lines so they land on the user's eval source.
+    let wrapper_lines = match wrap {
+        Wrap::None => 0,
+        Wrap::Function | Wrap::Method => 1,
+    } + u32::from(desc.strict);
     let ret = Parser::new(&allocator, &wrapped, source_type).parse();
     if !ret.errors.is_empty() {
-        let msg = ret
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("SyntaxError: {msg}"));
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(&wrapped, &ret.errors, wrapper_lines)
+        ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
@@ -338,17 +388,18 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
     let sem_errors: Vec<String> = sem
         .errors
         .iter()
-        .map(|e| e.to_string())
-        .filter(|msg| {
+        .filter(|e| {
+            let msg = e.to_string();
             let name = msg
                 .strip_prefix("Private identifier '#")
                 .or_else(|| msg.strip_prefix("Private field '#"))
-                .and_then(|r| r.split('\'').next());
+                .and_then(|r| r.split('\'').next().map(str::to_string));
             match name {
-                Some(n) => !seeded.contains(n),
+                Some(n) => !seeded.contains(n.as_str()),
                 None => true,
             }
         })
+        .map(|e| render_diagnostic(&wrapped, e, wrapper_lines))
         .collect();
     if !sem_errors.is_empty() {
         return Err(format!("SyntaxError: {}", sem_errors.join("; ")));
@@ -527,18 +578,26 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
 /// top-level `this` is `undefined`, and top-level declarations are lexical cells
 /// (NOT global-object properties).
 pub fn compile_module(src: &str) -> Result<crate::module::CompiledModule, String> {
+    compile_module_labeled(src, None)
+}
+
+/// As [`compile_module`], with a source label — the module's registry key or
+/// file path — stamped on every compiled function so stack frames render as
+/// `at name (label:line:col)` and an embedder can resolve a frame back to a
+/// file.
+pub fn compile_module_labeled(
+    src: &str,
+    label: Option<&str>,
+) -> Result<crate::module::CompiledModule, String> {
     use crate::module::*;
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_module(true);
     let ret = Parser::new(&allocator, src, source_type).parse();
     if !ret.errors.is_empty() {
-        let msg = ret
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("SyntaxError: {msg}"));
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(src, &ret.errors, 0)
+        ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
@@ -547,16 +606,13 @@ pub fn compile_module(src: &str) -> Result<crate::module::CompiledModule, String
     if !sem.errors.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            sem.errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            render_diagnostics(src, &sem.errors, 0)
         ));
     }
     let mut c = Compiler::new();
     c.source = src.to_string();
     c.is_module = true;
+    c.source_label = label.map(Rc::from);
     let (proto, cell_of_name) = c.compile_module_toplevel(&program).map_err(|e| {
         if e.starts_with("SyntaxError") {
             e
@@ -710,6 +766,11 @@ struct FnCtx {
     templates: Vec<TemplateParts>,
     /// Object-literal templates (see [`crate::bytecode::ObjTemplate`]).
     obj_tpls: Vec<std::rc::Rc<crate::bytecode::ObjTemplate>>,
+    /// Byte offset of the function's definition site in `Compiler::source`
+    /// (the parameter list's span start). `None` for synthetic contexts
+    /// (toplevel scripts/modules, eval bodies, `%fieldinit`, …), which then
+    /// render in stack traces without a position.
+    source_start: Option<u32>,
 }
 
 impl FnCtx {
@@ -751,6 +812,7 @@ impl FnCtx {
             obj_tpls: Vec::new(),
             home_super: false,
             eval_scopes: Vec::new(),
+            source_start: None,
         }
     }
     fn alloc_cell(&mut self) -> u32 {
@@ -820,6 +882,14 @@ struct Compiler {
     /// for the word `arguments` — when absent, the per-call `arguments` object is
     /// not materialized (a hot-path win for the common case).
     source: String,
+    /// Byte offset of each line start in `source` (`[0]` is always 0). Built
+    /// lazily on the first function-position lookup (`line_col_of`), so
+    /// compilations that finish without one pay nothing.
+    line_starts: std::cell::OnceCell<Vec<u32>>,
+    /// Module key/path this compilation came from (see
+    /// [`compile_module_labeled`]) — stamped on every finished `FuncProto` so
+    /// stack frames can name their source.
+    source_label: Option<Rc<str>>,
     /// Escaping `var`/function names collected while compiling a SLOPPY
     /// direct-eval body (see `FnCtx::eval_sloppy`).
     eval_var_names: Vec<String>,
@@ -870,6 +940,8 @@ impl Compiler {
             module_requested: Vec::new(),
             is_module: false,
             source: String::new(),
+            line_starts: std::cell::OnceCell::new(),
+            source_label: None,
             eval_var_names: Vec::new(),
             pending_method: false,
             in_class_body: false,
@@ -879,6 +951,13 @@ impl Compiler {
             kernelize: !cfg!(feature = "op-histogram"),
             regify: !cfg!(feature = "op-histogram"),
         }
+    }
+
+    /// 1-based (line, column) of byte `offset` in `self.source`, via the
+    /// lazily built line-start table. Columns count characters, not bytes.
+    fn line_col_of(&self, offset: u32) -> (u32, u32) {
+        let starts = self.line_starts.get_or_init(|| line_starts(&self.source));
+        line_col_at(&self.source, starts, offset)
     }
 
     /// Whether the source region `[start, end)` mentions `arguments` (the word).
@@ -1569,6 +1648,10 @@ impl Compiler {
         fc.strict = true;
         fc.script_global = false;
         fc.is_toplevel = true;
+        // Anchor the module body at its first byte so a throw during module
+        // evaluation renders `at <module> (its/path.ts:1:1)` — naming WHICH
+        // module failed to import — instead of a bare `at <module>`.
+        fc.source_start = Some(0);
         fc.contains_eval = self.source.contains("eval");
         let module_has_eval = fc.contains_eval;
         self.fns.push(fc);
@@ -1904,6 +1987,12 @@ impl Compiler {
         } else {
             None
         };
+        // Definition-site position for stack traces (0 = unknown: synthetic
+        // contexts, or a Compiler driven without its source text).
+        let (source_line, source_col) = match fc.source_start {
+            Some(off) if !self.source.is_empty() => self.line_col_of(off),
+            _ => (0, 0),
+        };
         FuncProto {
             eval_scopes: fc.eval_scopes.clone(),
             name: fc.name,
@@ -1928,7 +2017,10 @@ impl Compiler {
             has_rest: fc.has_rest,
             upvalues: fc.upvalues,
             kind: fc.kind,
-            source_start: 0,
+            source_start: fc.source_start.unwrap_or(0),
+            source_line,
+            source_col,
+            source_label: self.source_label.clone(),
             uses_arguments: fc.uses_arguments,
             param_names: fc.param_names,
             mapped_param_cells: fc.mapped_param_cells,
@@ -5807,6 +5899,9 @@ impl Compiler {
         ctor_fields: Option<&[&PropertyDefinition]>,
     ) -> R {
         let mut fc = FnCtx::new(name.unwrap_or(""), kind);
+        // The parameter list's span start is the function's definition site —
+        // resolved to line/column in `finish` for error stack traces.
+        fc.source_start = Some(params.span.start);
         // A function defined inside a `with` block (directly or transitively)
         // resolves free identifiers against the captured with-scope chain.
         fc.enclosed_in_with = self

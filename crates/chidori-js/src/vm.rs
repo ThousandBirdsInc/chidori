@@ -739,6 +739,56 @@ impl Vm {
         Value::Object(obj)
     }
 
+    /// Append `proto`'s activation to the `.stack` of a propagating exception.
+    /// Called by `run_frame` as a throw unwinds out of a frame, so an uncaught
+    /// error accumulates one `    at name (line:col)` line per JS frame it
+    /// crossed, innermost first — a stack trace built entirely on the unwind
+    /// path (the happy path pays nothing). The position is the function's
+    /// *definition* site (the engine keeps no per-op line table). Only `Error`
+    /// objects whose `stack` is still a plain string are annotated, and frames
+    /// stop accumulating once the trace is `MAX_UNWIND_FRAMES` deep (a rethrow
+    /// loop must not grow the string unboundedly).
+    pub(crate) fn record_unwind_frame(&self, err: &Value, proto: &crate::bytecode::FuncProto) {
+        const MAX_UNWIND_FRAMES: usize = 32;
+        let Value::Object(o) = err else { return };
+        let mut b = o.borrow_mut();
+        if !matches!(b.internal, Internal::Error) {
+            return;
+        }
+        let Some(prop) = b.own_get_mut(&crate::value::StrKeyRef("stack")) else {
+            return;
+        };
+        let PropertyKind::Data { value, .. } = &mut prop.kind else {
+            return;
+        };
+        let Value::String(s) = &*value else { return };
+        let cur = s.as_str();
+        if cur.matches("\n    at ").count() >= MAX_UNWIND_FRAMES {
+            return;
+        }
+        let name: &str = if proto.name.is_empty() {
+            "<anonymous>"
+        } else {
+            &proto.name
+        };
+        let mut out = String::with_capacity(cur.len() + name.len() + 24);
+        out.push_str(cur);
+        out.push_str("\n    at ");
+        out.push_str(name);
+        if proto.source_line > 0 {
+            use std::fmt::Write;
+            match &proto.source_label {
+                Some(label) => {
+                    let _ = write!(out, " ({label}:{}:{})", proto.source_line, proto.source_col);
+                }
+                None => {
+                    let _ = write!(out, " ({}:{})", proto.source_line, proto.source_col);
+                }
+            }
+        }
+        *value = Value::str(out);
+    }
+
     pub fn throw_type(&self, msg: &str) -> Value {
         self.make_error(ErrorKind::Type, msg)
     }

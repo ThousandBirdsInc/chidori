@@ -52,6 +52,7 @@ chidori chat --system "You are a concise assistant." --model claude-sonnet
 chidori chat agents/chat.ts                 # chat through a conversational agent file
 chidori serve agents/webhook.ts --port 8080 --trusted
 chidori resume agents/my_agent.ts <run_id>  # replay a recorded run byte-for-byte with zero model calls (durable resume)
+chidori resume agents/my_agent.ts <run_id> --allow-source-change  # edit-and-resume: replay against edited code (divergence-checked)
 chidori trace <run_id>
 chidori snapshot <run_id>
 ```
@@ -611,10 +612,13 @@ chidori serve examples/agents/webhook.ts --port 8080 --trusted
 
 `chidori serve` is deny-by-default: without `--trusted` or explicit
 `CHIDORI_POLICY*` configuration, gated effects (network requests via
-`fetch`/`node:http`, workspace mutations) are refused under the built-in
-`untrusted` profile (read-only
-workspace introspection stays allowed). `--untrusted` forces that profile over
-any env configuration; `chidori run` keeps the permissive default.
+`fetch`/`node:http`, tool calls, workspace mutations) are refused under the
+built-in `untrusted` profile (read-only workspace introspection stays
+allowed). `--untrusted` forces that profile over any env configuration.
+`chidori run` is ask-by-default: gated effects prompt for a y/N approval at
+the terminal, and fail closed when no terminal is available (scripts, CI) —
+pass `--trusted` there for the permissive allow-all behavior. LLM prompts and
+pure compute are never gated.
 
 Session endpoints:
 
