@@ -67,7 +67,7 @@ the three rules below encode.
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY / LITELLM_API_URL
 CHIDORI_API_KEY=<long random>       # bearer auth on everything except GET /health
-CHIDORI_DB_PATH=.chidori/sessions.sqlite3   # session index; in-memory without it
+CHIDORI_DB_PATH=.chidori/sessions.sqlite3   # session index; this path is the default (`:memory:` opts out)
 CHIDORI_RUN_STORE=sqlite            # journal mirror — see table below
 CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't recorded
 ```
@@ -93,9 +93,10 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
 - **Optional:** `CHIDORI_CORS_ORIGINS` for browser callers;
   `CHIDORI_MAX_CONCURRENT_SESSIONS` (default 8) to cap parallel runs;
   `CHIDORI_SECRET_ENV` to pass secrets as placeholder tokens the journal
-  never sees; `CHIDORI_ISOLATE=process` to sandbox untrusted agent code (in
-  containers, set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed — the
-  network-namespace layer needs `CAP_SYS_ADMIN` and is skipped without it).
+  never sees. OS isolation (`CHIDORI_ISOLATE=process`) is the **default on
+  Unix**; opt out with `--no-isolate` / `CHIDORI_ISOLATE=off`. In containers,
+  set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed — the
+  network-namespace layer needs `CAP_SYS_ADMIN` and is skipped without it.
 
 ## Decision 1: where the journal lives
 
@@ -399,7 +400,7 @@ sequenceDiagram
 - [ ] Policy configured (`CHIDORI_POLICY_FILE`, or a deliberate `--trusted`)
 - [ ] `CHIDORI_HTTP_ALLOW_HOSTS` limited to the internal hosts agents truly
       need (never `*` in production)
-- [ ] `CHIDORI_DB_PATH` set so sessions survive restarts
+- [ ] `CHIDORI_DB_PATH` left at (or set to) a durable path — never `:memory:` in production
 - [ ] `CHIDORI_RUN_STORE` chosen; `s3://` if the machine is ephemeral
 - [ ] `CHIDORI_DURABILITY=strict`
 - [ ] `.chidori/` backed up, or a hydration drill done against the mirror

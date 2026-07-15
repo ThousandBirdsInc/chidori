@@ -202,6 +202,7 @@ fn cli_run_discovers_local_typescript_tool_directory_for_direct_tool_calls() {
         &[
             "run",
             agent.to_str().unwrap(),
+            "--trusted",
             "--input",
             r#"{"topic":"chidori"}"#,
         ],
@@ -289,6 +290,7 @@ fn cli_stream_workspace_binding_writes_real_disk_manifest() {
         &[
             "run",
             agent.to_str().unwrap(),
+            "--trusted",
             "--stream",
             "--input",
             r#"{}"#,
@@ -767,12 +769,125 @@ fn cli_run_typescript_agent_invokes_typescript_tool() {
     .unwrap();
 
     let output = run_chidori(
-        &["run", agent.to_str().unwrap(), "--input", r#"{"value": 7}"#],
+        &[
+            "run",
+            agent.to_str().unwrap(),
+            "--trusted",
+            "--input",
+            r#"{"value": 7}"#,
+        ],
         &dir,
     );
     assert_success(&output);
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["echoed"], 7);
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_run_default_posture_fails_closed_on_gated_effects_without_terminal() {
+    // With no policy configured, no --trusted, and no terminal to answer the
+    // approval prompt, a gated effect (tool call) must fail closed with an
+    // actionable message instead of running fully trusted.
+    let dir = temp_project("default-posture");
+    let tools_dir = dir.join("tools");
+    fs::create_dir_all(&tools_dir).unwrap();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                return await chidori.tool("echo", { value: 1 });
+            }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        tools_dir.join("echo.ts"),
+        r#"
+            export const tool = {
+                name: "echo",
+                description: "Echo a value.",
+                parameters: { type: "object", properties: {}, required: [] },
+            };
+            export async function run(args, chidori) {
+                return { echoed: args.value };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori(&["run", agent.to_str().unwrap()], &dir);
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires approval"),
+        "default posture should ask/deny, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--trusted"),
+        "denial should name the opt-out, got:\n{stderr}"
+    );
+
+    // The read-only workspace surface stays open without prompts.
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_resume_refuses_changed_agent_source() {
+    // `chidori resume` must verify the stored source fingerprints before
+    // replaying the journal, exactly like the server resume routes: replay is
+    // positional, so pairing cached results with changed code is a silent
+    // correctness hazard.
+    let dir = temp_project("resume-source-check");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("original", {});
+                return { version: 1 };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori(&["run", agent.to_str().unwrap()], &dir);
+    assert_success(&output);
+
+    let runs_dir = dir.join(".chidori").join("runs");
+    let run_id = fs::read_dir(&runs_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .into_string()
+        .unwrap();
+
+    // Unchanged source resumes fine.
+    let output = run_chidori(&["resume", agent.to_str().unwrap(), &run_id], &dir);
+    assert_success(&output);
+
+    // Changed source is refused with a source-mismatch error.
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("edited", {});
+                return { version: 2 };
+            }
+        "#,
+    )
+    .unwrap();
+    let output = run_chidori(&["resume", agent.to_str().unwrap(), &run_id], &dir);
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("source") && stderr.contains("mismatch"),
+        "expected a source mismatch refusal, got:\n{stderr}"
+    );
 
     fs::remove_dir_all(dir).ok();
 }

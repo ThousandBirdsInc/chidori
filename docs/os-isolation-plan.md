@@ -284,7 +284,9 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
 - **Off by default**; in-process stays the default for trusted local dev.
 - New worker subcommand `chidori __run-worker` (hidden), added to the clap
   `Commands` enum (`main.rs:44`); the parent `exec`s its own binary in this mode.
-- Opt-in: `--isolate` flag on `run`/`serve` and `CHIDORI_ISOLATE=process` (env).
+- Default-on for the CLI on Unix; `--no-isolate` / `CHIDORI_ISOLATE=off` opts
+  out, `--isolate` / `CHIDORI_ISOLATE=process` overrides an ambient `off`.
+  Embedders keep opt-in semantics (unset means off).
   Naturally pairs with `--untrusted` — consider having the `untrusted` /
   `supervised` policy profiles *imply* isolation when the platform supports it.
 - The server already runs each request under `tokio::task::spawn_blocking`
@@ -382,7 +384,7 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
 
 | Env var | Default | Effect |
 |---|---|---|
-| `CHIDORI_ISOLATE` | unset (off) | `process` runs each agent in a confined child worker. Set by `--isolate`. |
+| `CHIDORI_ISOLATE` | unset (on for the CLI on Unix; off for embedders) | `process` runs each agent in a confined child worker. Set by `--isolate`. |
 | `CHIDORI_ISOLATE_REQUIRE_SANDBOX` | off | Fail the run closed if the platform's core confinement (seccomp/Seatbelt) can't be applied. |
 | `CHIDORI_ISOLATE_DEADLINE_MS` | off | Parent-side wall-clock `SIGKILL` of a wedged worker. |
 | `CHIDORI_ISOLATE_CPU_SECS` | off | Hard `RLIMIT_CPU` ceiling on worker compute. |

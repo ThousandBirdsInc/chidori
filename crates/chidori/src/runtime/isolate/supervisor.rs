@@ -60,7 +60,9 @@ pub(crate) fn run_agent_isolated(
         .stderr(Stdio::inherit())
         // The child must not re-enter isolation (it runs the agent directly); make
         // that impossible regardless of how this process's env was configured.
-        .env_remove("CHIDORI_ISOLATE")
+        // Explicitly `off` (not unset) so nothing downstream can re-apply a
+        // default-on posture to the worker or its descendants.
+        .env("CHIDORI_ISOLATE", "off")
         .spawn()
         .with_context(|| format!("spawning isolate worker `{} __run-worker`", exe.display()))?;
 

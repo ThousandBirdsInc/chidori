@@ -613,12 +613,32 @@ impl HostBindingBackend {
                     });
                     return Err(PAUSE_MARKER.to_string());
                 }
-                Err(format!(
-                    "policy: `{}` requires approval{}. Set CHIDORI_POLICY_AUTO_APPROVE=1 to \
-                     auto-approve, or run through the server so the approval flow can pause.",
-                    target,
-                    reason.map(|r| format!(" - {}", r)).unwrap_or_default()
-                ))
+                // Bare CLI: ask the operator on the controlling terminal.
+                // Approvals are remembered per (target, args) for this run.
+                if let Some(approved) =
+                    crate::policy::prompt_operator_approval(target, args, reason.as_deref())
+                {
+                    if approved {
+                        policy_cache.lock().unwrap().approve(target, args);
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "policy: `{}` denied at the operator prompt",
+                        target
+                    ));
+                }
+                // Non-interactive and nothing to answer the prompt: fail closed.
+                // A policy-supplied reason already tells the operator how to
+                // relax the posture; otherwise fall back to the generic help.
+                Err(match reason {
+                    Some(r) => format!("policy: `{}` requires approval - {}", target, r),
+                    None => format!(
+                        "policy: `{}` requires approval. Approve interactively at a terminal, \
+                         set CHIDORI_POLICY_AUTO_APPROVE=1 to auto-approve, or run through the \
+                         server so the approval flow can pause.",
+                        target
+                    ),
+                })
             }
         }
     }

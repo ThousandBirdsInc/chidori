@@ -10,8 +10,11 @@
 //!   1. CHIDORI_POLICY_FILE — path to a JSON file
 //!   2. CHIDORI_POLICY — inline JSON string
 //!   3. CHIDORI_POLICY_PROFILE — name of a built-in profile (e.g. "untrusted")
-//!   4. default (AlwaysAllow for everything except shell, which keeps the
-//!      existing CHIDORI_SHELL_ALLOW semantics)
+//!   4. a per-surface default when nothing is configured: `chidori run` asks
+//!      before powerful effects ([`run_default_profile`], relaxed with
+//!      `--trusted`), `chidori serve` denies them ([`serve_default_profile`],
+//!      relaxed with `--trusted`). Shell keeps the existing
+//!      CHIDORI_SHELL_ALLOW semantics in every posture.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -230,11 +233,29 @@ pub fn serve_default_profile() -> PolicyConfig {
     cfg
 }
 
+/// The policy `chidori run` uses when the operator has not configured one and
+/// has not passed `--trusted`. Agents pulled from a registry or a repo are
+/// third-party code, so the out-of-the-box posture asks before every powerful
+/// effect (the `supervised` profile) instead of running fully trusted: on an
+/// interactive terminal the run pauses at a y/N prompt, and without a terminal
+/// the call fails closed with this reason telling the operator how to relax it.
+pub fn run_default_profile() -> PolicyConfig {
+    let mut cfg = supervised_profile();
+    cfg.default_reason = Some(
+        "chidori run asks before powerful effects by default: approve at the prompt, pass \
+         --trusted for the historical allow-all behavior, or configure CHIDORI_POLICY / \
+         CHIDORI_POLICY_FILE / CHIDORI_POLICY_PROFILE"
+            .to_string(),
+    );
+    cfg
+}
+
 /// Ask-by-default profile: identical allowlist to `untrusted`, but unmatched
 /// gated effects resolve to `AskBefore` — under the server's pause flow the
 /// run suspends as `awaiting_approval` and the operator decides per call
 /// (approvals are remembered per (target, args) for the session). On the bare
-/// CLI, where nothing can answer the prompt, the call errors instead.
+/// CLI the operator is prompted on the controlling terminal when one exists;
+/// otherwise the call errors.
 fn supervised_profile() -> PolicyConfig {
     PolicyConfig {
         rules: read_only_workspace_allowlist(),
@@ -256,6 +277,79 @@ fn read_only_workspace_allowlist() -> Vec<PolicyRule> {
         allow_read_only("workspace:read"),
         allow_read_only("workspace:manifest"),
     ]
+}
+
+/// Ask the operator on the controlling terminal whether an `AskBefore` call
+/// may proceed. Returns `Some(true/false)` when a terminal answered, `None`
+/// when no terminal is available — non-interactive runs must fail closed
+/// instead of assuming consent.
+///
+/// On Unix the prompt goes through `/dev/tty`, so it works even when stdin is
+/// piped input and stdout is a JSON stream (`run --stream`). When `/dev/tty`
+/// is unavailable (or off-Unix) it falls back to stderr + stdin, but only when
+/// both are terminals.
+pub fn prompt_operator_approval(target: &str, args: &Value, reason: Option<&str>) -> Option<bool> {
+    use std::io::Write;
+
+    let args_short: String = {
+        let s = serde_json::to_string(args).unwrap_or_default();
+        if s.chars().count() > 200 {
+            let mut t: String = s.chars().take(200).collect();
+            t.push('…');
+            t
+        } else {
+            s
+        }
+    };
+    let prompt = format!(
+        "chidori policy: agent requests `{}`{}\n  args: {}\nAllow (remembered for this run)? [y/N] ",
+        target,
+        reason.map(|r| format!(" — {r}")).unwrap_or_default(),
+        args_short
+    );
+
+    let parse_answer =
+        |line: &str| matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+
+    #[cfg(unix)]
+    {
+        use std::io::BufRead;
+        if let Ok(tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        {
+            let mut out = &tty;
+            if out
+                .write_all(prompt.as_bytes())
+                .and_then(|_| out.flush())
+                .is_ok()
+            {
+                let mut line = String::new();
+                if std::io::BufReader::new(&tty).read_line(&mut line).is_ok() {
+                    return Some(parse_answer(&line));
+                }
+            }
+        }
+    }
+
+    {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+            let mut err = std::io::stderr();
+            if err
+                .write_all(prompt.as_bytes())
+                .and_then(|_| err.flush())
+                .is_ok()
+            {
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_ok() {
+                    return Some(parse_answer(&line));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// True when `args` contains all keys/values in `pattern` (shallow for scalars,
@@ -449,8 +543,38 @@ mod tests {
     }
 
     #[test]
+    fn run_default_profile_asks_with_actionable_reason() {
+        let cfg = run_default_profile();
+        assert_eq!(cfg.default, Decision::AskBefore);
+
+        let (decision, reason) = cfg.decide("http", &json!({ "url": "https://example.com" }));
+        assert_eq!(decision, Decision::AskBefore);
+        let reason = reason.expect("run default carries a how-to-relax reason");
+        assert!(
+            reason.contains("--trusted"),
+            "reason should name the opt-out: {reason}"
+        );
+        assert!(
+            reason.contains("CHIDORI_POLICY"),
+            "reason should name the env config: {reason}"
+        );
+
+        // The read-only workspace allowlist stays open so agents can still
+        // introspect their sandbox without a prompt.
+        for target in ["workspace:list", "workspace:read", "workspace:manifest"] {
+            let (decision, _) = cfg.decide(target, &json!({}));
+            assert_eq!(
+                decision,
+                Decision::AlwaysAllow,
+                "{target} should be allowed"
+            );
+        }
+    }
+
+    #[test]
     fn default_profile_allows_everything() {
-        // The historical default must stay unchanged: no rules, AlwaysAllow fallback.
+        // The permissive posture (`--trusted`, or an explicit empty policy)
+        // must stay unchanged: no rules, AlwaysAllow fallback.
         let cfg = PolicyConfig::default();
         assert_eq!(cfg.default, Decision::AlwaysAllow);
         let (decision, _) = cfg.decide("http", &json!({ "url": "https://example.com" }));

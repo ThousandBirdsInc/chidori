@@ -150,11 +150,11 @@ Two complementary layers:
 
 1. **Per-op string cap (always on, in-engine).** `op_add` and `ConcatStrings`
    (template join) throw `RangeError` when a single concatenation would exceed
-   `MAX_STRING_LEN` (16M code units, `crates/chidori-js/src/value.rs`). This closes the
-   exponential `s += s` / `` s = `${s}${s}` `` OOM
+   `MAX_STRING_LEN` (2^28 = ~268M code units, `crates/chidori-js/src/value.rs`). This
+   closes the exponential `s += s` / `` s = `${s}${s}` `` OOM
    and matches the caps on `repeat`/`padStart`/`padEnd` and on
-   dense-array allocation (`MAX_DENSE_ARRAY` = 1M). With these caps, no *single*
-   opcode can allocate without bound.
+   dense-array allocation (`MAX_DENSE_ARRAY` = 2^25 = ~33.5M elements). With these
+   caps, no *single* opcode can allocate without bound.
 
 2. **Per-run live-heap ceiling (watchdog).** A `CountingAllocator`
    (`src/mem_guard.rs`) is installed as the binary's `#[global_allocator]`. Each
@@ -204,7 +204,7 @@ The same watchdog can enforce a wall-clock deadline, also via `vm.interrupt`.
 | Memory ceiling (MB, per-run meter) | `CHIDORI_JS_MEM_CAP_MB` | `4096` | `0` |
 | Memory watchdog poll interval (ms) | `CHIDORI_JS_MEM_POLL_MS` | `10` | — |
 | Wall-clock deadline (ms) | `CHIDORI_JS_DEADLINE_MS` | off | — |
-| String length | (compile constant) | 16M code units | — |
+| String length | (compile constant) | 2^28 (~268M) code units | — |
 | Dense array length | (compile constant) | 1,000,000 | — |
 | Call depth | (compile constant) | 2,000 | — |
 | Regex steps | (compile constant) | 100,000 | — |
@@ -356,16 +356,21 @@ a structured error frame from its `catch_unwind` boundary before exiting):
 
 ### Enabling it
 
-`--isolate` is accepted on both `chidori run` and `chidori serve` (equivalently
-`CHIDORI_ISOLATE=process`); the worker child always has the env var stripped so
-it never recursively re-isolates. The startup banner prints an `Isolation:` line
-describing the active posture. Isolation (process sandbox) and `--untrusted`
-(policy) are **orthogonal but composable** — running untrusted *without*
-isolation prints a nudge rather than silently changing behavior.
+Isolation is **on by default** for the CLI on Unix (Linux and macOS get an OS
+sandbox layer; other Unixes get process separation + rlimits): when
+`CHIDORI_ISOLATE` is unset, `chidori run`/`chidori serve` isolate each run.
+Opt out with `--no-isolate` or `CHIDORI_ISOLATE=off`; `--isolate` remains as an
+explicit override of an ambient `off`. Embedders of the library keep the
+historical opt-in behavior (unset means off) — only the `chidori` binary flips
+the default. The worker child always has the env var explicitly set to `off`
+so it never recursively re-isolates. The startup banner prints an `Isolation:`
+line describing the active posture. Isolation (process sandbox) and
+`--untrusted` (policy) are **orthogonal but composable** — running untrusted
+*without* isolation prints a nudge rather than silently changing behavior.
 
 | Env var | Default | Effect |
 |---|---|---|
-| `CHIDORI_ISOLATE` | unset (off) | `process` runs each agent in a confined child worker. Set by `--isolate`. |
+| `CHIDORI_ISOLATE` | unset (on for the CLI on Unix; off for embedders) | `process` runs each agent in a confined child worker; `off` disables. Set by `--isolate` / `--no-isolate`. |
 | `CHIDORI_ISOLATE_REQUIRE_SANDBOX` | off | Fail the run closed if the platform's core confinement (seccomp/Seatbelt) can't be applied. |
 | `CHIDORI_ISOLATE_DEADLINE_MS` | off | Parent-side wall-clock `SIGKILL` of a wedged worker. |
 | `CHIDORI_ISOLATE_CPU_SECS` | off | Hard `RLIMIT_CPU` ceiling on worker compute. |
@@ -434,7 +439,7 @@ resource-precision gaps.
      macOS CI host yet); it degrades to a logged skip on failure.
 
 5. **Container element counts beyond arrays are uncapped.** Arrays are bounded by
-   `MAX_DENSE_ARRAY` (1M), but `Map`/`Set`/object property counts are not
+   `MAX_DENSE_ARRAY` (2^25, ~33.5M), but `Map`/`Set`/object property counts are not
    individually capped. The memory ceiling (gap 2) is the backstop for the bytes
    they consume; there is no separate per-container element limit.
 

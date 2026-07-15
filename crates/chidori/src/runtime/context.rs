@@ -451,6 +451,28 @@ pub struct PendingApproval {
 /// distinguish it from a genuine failure.
 pub const PAUSE_MARKER: &str = "__CHIDORI_PAUSED_FOR_INPUT__";
 
+/// True when `CHIDORI_REPLAY_LAX=1`: argument-level replay divergences are
+/// downgraded to warnings that restore the historical best-effort behavior
+/// (serve the cached result on the sync path, silently re-execute live on the
+/// async host-operation path). Function-name and operation-kind mismatches
+/// remain fatal regardless.
+pub(crate) fn replay_lax() -> bool {
+    std::env::var("CHIDORI_REPLAY_LAX").ok().as_deref() == Some("1")
+}
+
+/// Render call args for a divergence message without flooding the error with
+/// a multi-kilobyte prompt payload.
+pub(crate) fn truncate_json_for_error(value: &serde_json::Value) -> String {
+    let s = serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string());
+    if s.chars().count() > 300 {
+        let mut t: String = s.chars().take(300).collect();
+        t.push('…');
+        t
+    } else {
+        s
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub model: String,
@@ -1005,27 +1027,59 @@ impl RuntimeContext {
     }
 
     /// Replay-cache lookup with divergence check. Returns:
-    ///   Ok(Some(record)) — cached and the cached record's function name
-    ///                      matches `expected_fn`. Safe to use.
+    ///   Ok(Some(record)) — cached, and the cached record's function name AND
+    ///                      arguments match the call the agent is making now.
+    ///                      Safe to use.
     ///   Ok(None)         — no cache hit; caller should execute live.
-    ///   Err(msg)         — cached, but the recorded function differs from
-    ///                      what the agent is calling now. The agent code
-    ///                      changed since the checkpoint was saved. The
-    ///                      engine should abort the replay with a clear error.
+    ///   Err(msg)         — cached, but the recorded call differs from what
+    ///                      the agent is calling now. The agent code (or its
+    ///                      inputs) changed since the checkpoint was saved.
+    ///                      The engine should abort the replay with a clear
+    ///                      error rather than pair cached results with
+    ///                      different code.
+    ///
+    /// A name mismatch is always fatal. An argument mismatch (same function,
+    /// different args — compared with the derived `request_digest` field
+    /// stripped, like the async host-operation path) is fatal by default and
+    /// downgraded to a warning under `CHIDORI_REPLAY_LAX=1`, which restores
+    /// the historical best-effort behavior of serving the cached result.
     pub fn try_replay_checked(
         &self,
         seq: u64,
         expected_fn: &str,
+        expected_args: &serde_json::Value,
     ) -> Result<Option<CallRecord>, String> {
         match self.try_replay(seq) {
             None => Ok(None),
-            Some(record) if record.function == expected_fn => Ok(Some(record)),
-            Some(record) => Err(format!(
+            Some(record) if record.function != expected_fn => Err(format!(
                 "Replay divergence at seq {}: checkpoint has `{}` but agent called `{}`. \
                  The agent code changed since the checkpoint was saved — \
                  re-run without replay to regenerate.",
                 seq, record.function, expected_fn
             )),
+            Some(record)
+                if !crate::runtime::snapshot::completed_args_match(&record.args, expected_args) =>
+            {
+                if replay_lax() {
+                    tracing::warn!(
+                        "replay divergence at seq {seq} tolerated (CHIDORI_REPLAY_LAX=1): \
+                         `{expected_fn}` was recorded with different arguments; \
+                         serving the cached result"
+                    );
+                    return Ok(Some(record));
+                }
+                Err(format!(
+                    "Replay divergence at seq {}: `{}` was recorded with arguments {} but the \
+                     agent now calls it with {}. The agent code (or its inputs) changed since \
+                     the checkpoint was saved — re-run without replay to regenerate, or set \
+                     CHIDORI_REPLAY_LAX=1 to tolerate argument drift and serve cached results.",
+                    seq,
+                    expected_fn,
+                    truncate_json_for_error(&record.args),
+                    truncate_json_for_error(expected_args)
+                ))
+            }
+            Some(record) => Ok(Some(record)),
         }
     }
 
@@ -1717,13 +1771,12 @@ impl RuntimeContext {
         &self,
         seq: u64,
         kind: PendingHostOperationKind,
-        args: &serde_json::Value,
     ) -> Option<HostPromiseRecord> {
         self.inner
             .lock()
             .unwrap()
             .host_promises
-            .completed_operation(seq, kind, args)
+            .completed_operation(seq, kind)
     }
 
     #[allow(dead_code)]

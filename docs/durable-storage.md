@@ -61,7 +61,10 @@ settle, a server-side delivery) fold the blobs into the table file and delete
 them; readers union both, per-op blobs winning by id. The per-op blob is what
 keeps the crash-between-resolve-and-record dedup guarantee: a resolved effect
 whose journal record never landed is still recognized on resume and not
-re-executed. The manifest's embedded copy of the table has the same freshness
+re-executed. Recognition requires the recorded arguments to match the
+re-executed call's (ignoring the derived `request_digest`); a mismatch is a
+hard replay-divergence error rather than a silent live re-execution
+(`CHIDORI_REPLAY_LAX=1` restores the old tolerate-and-re-execute behavior). The manifest's embedded copy of the table has the same freshness
 contract as `checkpoint.json` (compaction-time snapshot; runtime resume never
 reads it).
 

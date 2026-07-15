@@ -22,8 +22,15 @@ pub(crate) use supervisor::run_agent_isolated;
 /// Whether OS isolation is enabled for this process, controlled by the
 /// `CHIDORI_ISOLATE` environment variable. Any value other than the unset /
 /// empty / explicitly-falsey forms (`0`, `off`, `false`, `no`) turns it on;
-/// `process` is the canonical value. The worker child always has this unset (the
-/// supervisor strips it), so a worker never recursively re-isolates.
+/// `process` is the canonical value. The worker child always has this
+/// explicitly off (the supervisor sets `off`), so a worker never recursively
+/// re-isolates.
+///
+/// Embedders (and the test harness) see the historical opt-in behavior: unset
+/// means off. The `chidori` CLI flips the default at startup via
+/// [`default_on_if_unset`], so `run`/`serve` isolate out of the box on
+/// platforms with a worker sandbox and `--no-isolate` / `CHIDORI_ISOLATE=off`
+/// are the opt-outs.
 pub fn enabled() -> bool {
     match std::env::var("CHIDORI_ISOLATE") {
         Ok(v) => {
@@ -41,12 +48,31 @@ pub fn enable() {
     std::env::set_var("CHIDORI_ISOLATE", "process");
 }
 
+/// Explicitly turn OS isolation off (`--no-isolate`). Sets the falsey value
+/// rather than unsetting so the choice survives [`default_on_if_unset`] and is
+/// inherited by child processes.
+pub fn disable() {
+    std::env::set_var("CHIDORI_ISOLATE", "off");
+}
+
+/// Default-on isolation for the CLI: when the operator has expressed no
+/// preference (`CHIDORI_ISOLATE` unset), turn isolation on wherever the
+/// process-worker mechanism is supported (Unix; Linux and macOS additionally
+/// get an OS sandbox layer). Called once at `chidori` startup — an explicit
+/// env value, `--isolate`, or `--no-isolate` always wins.
+pub fn default_on_if_unset() {
+    if cfg!(unix) && std::env::var_os("CHIDORI_ISOLATE").is_none() {
+        enable();
+    }
+}
+
 /// A one-line, human-readable description of the isolation posture, for startup
 /// banners. Describes *intent*: the worker applies each layer best-effort and
 /// logs to stderr what actually stuck on this host.
 pub fn describe() -> String {
     if !enabled() {
-        return "off (agents run in-process)".to_string();
+        return "off (agents run in-process; pass --isolate or unset CHIDORI_ISOLATE to sandbox)"
+            .to_string();
     }
     let layers = if cfg!(target_os = "linux") {
         "Linux: network namespace + Landlock + seccomp"

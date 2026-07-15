@@ -319,3 +319,77 @@ fn shared_cached_proto_replays_are_independent_and_identical() {
     );
     assert_eq!(r1.journal_bytes(), journal);
 }
+
+// The journal has always pinned the bundle it was recorded against by content
+// hash; `restore` must actually check the pin so a changed bundle is
+// detectable (modify-and-resume stays legal — it is reported, not refused).
+#[test]
+fn restore_detects_changed_bundle() {
+    let mut rt = ReplayRuntime::record(BUNDLE, &["fetchValue", "report"]);
+    let mut handler =
+        |name: &str, _args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            match name {
+                "fetchValue" => Some(Ok(json!(1))),
+                _ => Some(Ok(json!(null))),
+            }
+        };
+    rt.drive(&mut handler).unwrap();
+    let journal = rt.journal_bytes();
+
+    // Same bundle: no change reported.
+    let same = ReplayRuntime::restore(BUNDLE, &journal, &["fetchValue", "report"]).unwrap();
+    assert!(!same.bundle_changed());
+
+    // Edited bundle: reported, even before any drive.
+    let edited = format!("{BUNDLE}\n// edited");
+    let changed = ReplayRuntime::restore(&edited, &journal, &["fetchValue", "report"]).unwrap();
+    assert!(changed.bundle_changed());
+}
+
+// An edit that keeps the effect ORDER but changes an already-executed call's
+// arguments used to replay silently (the positional check compared site+seq
+// only). The recorded result would answer a question the program no longer
+// asks — it must surface as a divergence.
+#[test]
+fn pre_frontier_arg_edit_diverges() {
+    let original = r#"
+        async function main() {
+            const a = await fetchValue('a');
+            report(a);
+        }
+        main();
+    "#;
+    let mut rt = ReplayRuntime::record(original, &["fetchValue", "report"]);
+    let mut handler =
+        |name: &str, _args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            match name {
+                "fetchValue" => Some(Ok(json!(10))),
+                _ => Some(Ok(json!(null))),
+            }
+        };
+    rt.drive(&mut handler).unwrap();
+    let journal = rt.journal_bytes();
+
+    // Pre-frontier edit: same effect at the same position, different argument.
+    let edited = r#"
+        async function main() {
+            const a = await fetchValue('DIFFERENT');
+            report(a);
+        }
+        main();
+    "#;
+    let mut rt2 = ReplayRuntime::restore(edited, &journal, &["fetchValue", "report"]).unwrap();
+    let mut replay_handler =
+        |_name: &str, _args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            Some(Ok(json!(null)))
+        };
+    let err = rt2.drive(&mut replay_handler).unwrap_err();
+    assert!(
+        err.contains("arguments") || err.contains("args"),
+        "expected an argument-divergence error, got: {err}"
+    );
+    assert!(
+        err.contains("bundle differs"),
+        "divergence should note the changed bundle, got: {err}"
+    );
+}

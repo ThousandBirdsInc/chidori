@@ -34,7 +34,7 @@ pub fn execute_durable_json_call_at_seq(
     live: impl FnOnce() -> Result<Value>,
 ) -> Result<Value> {
     if let Some(record) = ctx
-        .try_replay_checked(seq, function)
+        .try_replay_checked(seq, function, &args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         // A replayed call's `live()` is skipped. If it was a container (a tool
@@ -135,9 +135,34 @@ fn replay_completed_host_operation(
     kind: PendingHostOperationKind,
     args: &Value,
 ) -> Result<Option<Value>> {
-    let Some(record) = ctx.completed_host_operation(seq, kind, args) else {
+    let Some(record) = ctx.completed_host_operation(seq, kind) else {
         return Ok(None);
     };
+
+    // A completed operation exists at this (seq, kind) but was recorded with
+    // different arguments: the agent code (or its inputs) changed since the
+    // recording. Historically this silently fell through to a live
+    // re-execution of the side effect — surface it as a divergence instead,
+    // unless the operator explicitly opted into the lax behavior.
+    if !crate::runtime::snapshot::completed_args_match(&record.operation.args, args) {
+        if crate::runtime::context::replay_lax() {
+            tracing::warn!(
+                "replay divergence at seq {seq} tolerated (CHIDORI_REPLAY_LAX=1): completed \
+                 `{function}` was recorded with different arguments; re-executing live"
+            );
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "Replay divergence at seq {}: completed `{}` was recorded with arguments {} but the \
+             agent now calls it with {}. The agent code (or its inputs) changed since the \
+             checkpoint was saved — re-run without replay to regenerate, or set \
+             CHIDORI_REPLAY_LAX=1 to tolerate argument drift and re-execute the effect live.",
+            seq,
+            function,
+            crate::runtime::context::truncate_json_for_error(&record.operation.args),
+            crate::runtime::context::truncate_json_for_error(args)
+        );
+    }
 
     match record.state {
         HostPromiseState::Resolved {
@@ -219,8 +244,10 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow::anyhow!("input requires string prompt"))?
         .to_string();
     let seq = ctx.next_seq();
+    // Both the live paths and the server's synthetic resume record store the
+    // normalized `{"prompt"}` shape, so that is what divergence compares.
     if let Some(record) = ctx
-        .try_replay_checked(seq, "input")
+        .try_replay_checked(seq, "input", &json!({ "prompt": prompt }))
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -475,7 +502,7 @@ pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "signal")
+        .try_replay_checked(seq, "signal", &match_args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -557,7 +584,7 @@ pub fn execute_signal_any(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "signal_any")
+        .try_replay_checked(seq, "signal_any", &match_args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -639,7 +666,7 @@ pub fn execute_poll_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> 
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "poll_signal")
+        .try_replay_checked(seq, "poll_signal", &match_args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -720,7 +747,7 @@ pub fn execute_step_begin(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "step")
+        .try_replay_checked(seq, "step", &json!({ "name": name }))
         .map_err(|err| anyhow::anyhow!(err))?
     {
         let recorded_name = record
@@ -953,7 +980,7 @@ pub fn execute_prompt_text(
     apply_model_override(ctx, &mut request);
     let seq = ctx.next_seq();
     if let Some(record) = ctx
-        .try_replay_checked(seq, "prompt")
+        .try_replay_checked(seq, "prompt", &args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -1044,7 +1071,7 @@ pub fn execute_prompt_response(
     apply_model_override(ctx, &mut request);
     let seq = ctx.next_seq();
     if let Some(record) = ctx
-        .try_replay_checked(seq, "prompt")
+        .try_replay_checked(seq, "prompt", &args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return llm_response_from_json(&record.result).ok_or_else(|| {
@@ -1850,7 +1877,7 @@ mod tests {
             seq: 1,
             parent_seq: None,
             function: "template".to_string(),
-            args: json!({ "template": "ignored", "vars": {} }),
+            args: json!({ "template": "{{ value }}", "vars": {} }),
             result: json!("cached"),
             duration_ms: 1,
             token_usage: None,
@@ -1862,13 +1889,51 @@ mod tests {
         let result = execute_durable_json_call(
             &ctx,
             "template",
-            json!({ "template": "{{ broken", "vars": {} }),
+            json!({ "template": "{{ value }}", "vars": {} }),
             || anyhow::bail!("live path should not run"),
         )
         .unwrap();
 
         assert_eq!(result, json!("cached"));
         assert_eq!(ctx.call_log().into_records().len(), 1);
+    }
+
+    #[test]
+    fn durable_json_call_arg_mismatch_is_a_divergence_error() {
+        // Same function name, different args: historically the cached result
+        // was served anyway (the divergence check compared name only). That
+        // silently paired cached results with changed code — it must now be a
+        // hard replay-divergence error.
+        let replay = vec![CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "template".to_string(),
+            args: json!({ "template": "recorded", "vars": {} }),
+            result: json!("cached"),
+            duration_ms: 1,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        }];
+        let ctx = RuntimeContext::with_replay(replay);
+
+        let err = execute_durable_json_call(
+            &ctx,
+            "template",
+            json!({ "template": "changed", "vars": {} }),
+            || anyhow::bail!("live path should not run on divergence"),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("Replay divergence"),
+            "expected divergence error, got: {message}"
+        );
+        assert!(
+            message.contains("CHIDORI_REPLAY_LAX"),
+            "error should name the escape hatch, got: {message}"
+        );
     }
 
     #[test]
@@ -1959,17 +2024,61 @@ mod tests {
         );
 
         let replay_ctx = RuntimeContext::with_replay(records);
-        let replayed = execute_native_tool_call(
-            &replay_ctx,
-            &registry,
-            "echo",
-            json!({ "value": "different live args" }),
-        )
-        .unwrap();
+        let replayed =
+            execute_native_tool_call(&replay_ctx, &registry, "echo", json!({ "value": 42 }))
+                .unwrap();
 
         assert_eq!(replayed, json!({ "value": 42 }));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(replay_ctx.call_log().into_records().len(), 1);
+    }
+
+    #[test]
+    fn completed_host_operation_arg_mismatch_is_a_divergence_error() {
+        // A completed host operation exists at (seq, kind) but was recorded
+        // with different arguments. Historically this silently fell through to
+        // a live re-execution of the side effect — it must now surface as a
+        // replay-divergence error naming the escape hatch.
+        let recorded_args = json!({ "name": "echo", "kwargs": { "value": 42 } });
+        let records = vec![HostPromiseRecord {
+            operation: PendingHostOperation::new(
+                HostOperationId(1),
+                1,
+                PendingHostOperationKind::Tool,
+                recorded_args,
+            ),
+            state: HostPromiseState::Resolved {
+                value: json!({ "value": 42 }),
+                completed_at: Utc::now(),
+            },
+        }];
+        let ctx = RuntimeContext::with_replay_and_host_promises(Vec::new(), records);
+
+        let live_ran = std::cell::Cell::new(false);
+        let err = execute_durable_json_call(
+            &ctx,
+            "tool",
+            json!({ "name": "echo", "kwargs": { "value": 43 } }),
+            || {
+                live_ran.set(true);
+                Ok(json!({ "value": 43 }))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            !live_ran.get(),
+            "the side effect must not silently re-execute live on arg mismatch"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("Replay divergence"),
+            "expected divergence error, got: {message}"
+        );
+        assert!(
+            message.contains("CHIDORI_REPLAY_LAX"),
+            "error should name the escape hatch, got: {message}"
+        );
     }
 
     #[test]
