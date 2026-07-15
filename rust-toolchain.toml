@@ -1,11 +1,19 @@
 [toolchain]
-# Build on stable. The previous nightly pin existed only because
-# oxc_transformer 0.133 used `if let` match-arm guards, an unstable feature
-# (rust-lang/rust#51114) stabilized in Rust 1.95. With a stable toolchain >=
-# 1.95 the whole workspace compiles on stable, so the pin is now just a floor.
-# rustup auto-fetches the channel on first build, including inside the
-# rust:1-bookworm grpc image.
-channel = "stable"
+# Build on stable, pinned to the workspace floor. The previous nightly pin
+# existed only because oxc_transformer 0.133 used `if let` match-arm guards,
+# an unstable feature (rust-lang/rust#51114) stabilized in Rust 1.95.
+#
+# Pinned to a concrete release rather than "stable" so a first build cannot
+# fail late: bare "stable" resolves to whatever stable is already installed,
+# and on a machine with a pre-1.95 stable the build spends minutes
+# downloading (or, on older cargos, compiling) the whole dependency graph
+# before the `rust-version = "1.95"` check in the crate manifests finally
+# rejects the toolchain. With a concrete channel rustup auto-fetches a
+# compatible compiler up front instead, including inside the rust:1-bookworm
+# grpc image — and CI's clippy/rustfmt run against a known version instead of
+# drifting with the latest stable. Keep this >= the `rust-version` floor in
+# crates/*/Cargo.toml when bumping either.
+channel = "1.97"
 # Ensure `cargo fmt`/`cargo clippy` ship with the pinned channel: the
 # auto-fetched toolchain otherwise omits these components, which breaks the
 # CI "Check formatting" step (it runs against this pinned toolchain).

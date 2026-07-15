@@ -142,5 +142,54 @@ class HttpLayerTests(unittest.TestCase):
             silent.server_close()
 
 
+class _SseHandler(http.server.BaseHTTPRequestHandler):
+    """Emits a fixed SSE stream for `POST /sessions/stream`: one of every
+    event kind the server produces, so the parser's pass-through is pinned."""
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+        frames = [
+            ("call", {"seq": 1, "function": "prompt"}),
+            ("prompt_delta", {"label": "draft", "delta": "hi"}),
+            ("paused", {"id": "s-1", "status": "paused", "pending_seq": 2}),
+            ("done", {"id": "s-1", "status": "completed", "output": {"ok": True}}),
+        ]
+        body = "".join(
+            f"event: {name}\ndata: {json.dumps(payload)}\n\n" for name, payload in frames
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+class StreamParserTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = socketserver.TCPServer(("127.0.0.1", 0), _SseHandler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        port = cls.server.server_address[1]
+        cls.client = AgentClient(f"http://127.0.0.1:{port}", retries=0, timeout_seconds=5)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_stream_yields_every_event_kind_including_paused(self) -> None:
+        events = list(self.client.stream({"q": 1}))
+        self.assertEqual(
+            [e["type"] for e in events],
+            ["call", "prompt_delta", "paused", "done"],
+        )
+        paused = events[2]
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(paused["pending_seq"], 2)
+        self.assertEqual(events[3]["status"], "completed")
+
+
 if __name__ == "__main__":
     unittest.main()
