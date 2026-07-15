@@ -966,10 +966,20 @@ impl SnapshotManifest {
 /// `chidori resume` CLI) must call this first. Runs persisted before manifests
 /// existed (no readable manifest) are tolerated with a warning; every other
 /// mismatch is an error the caller should surface.
+///
+/// `allow_source_change` is the edit-and-resume opt-in (`--allow-source-change`
+/// on the CLI, `"allow_source_change": true` on the server routes): source and
+/// module fingerprint mismatches downgrade to a warning and the resume
+/// proceeds, relying on the replay engine's own edit-conflict policy — an edit
+/// that touches already-journaled calls is a fail-loud divergence error, while
+/// an edit past the replay frontier resumes cleanly (see
+/// `chidori_js::replay`). ABI and policy mismatches stay fatal either way:
+/// those are environment drift, not a deliberate edit.
 pub fn validate_manifest_for_resume(
     run_base: &Path,
     run_id: Option<&str>,
     agent_path: &Path,
+    allow_source_change: bool,
 ) -> Result<()> {
     let Some(run_id) = run_id else {
         return Ok(());
@@ -1016,13 +1026,28 @@ pub fn validate_manifest_for_resume(
             &expected_policy,
         )?
     };
-    manifest.ensure_resume_compatible(
-        &expected_abi,
-        &expected_policy,
-        &current_entry,
-        &current_modules,
-        &current_module_graph,
-    )
+    manifest.abi.ensure_compatible(&expected_abi)?;
+    manifest.policy.ensure_compatible(&expected_policy)?;
+    let sources = manifest
+        .ensure_sources_match(&current_entry)
+        .and_then(|()| manifest.ensure_modules_match(&current_modules))
+        .and_then(|()| manifest.ensure_module_graph_matches(&current_module_graph));
+    match sources {
+        Ok(()) => Ok(()),
+        Err(err) if allow_source_change => {
+            tracing::warn!(
+                "resume: agent source changed since run {run_id} was recorded; proceeding \
+                 because the caller opted in (allow_source_change) — replay will fail loudly \
+                 if the edit diverges from already-journaled calls: {err}"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err.context(
+            "the agent source changed since this run was recorded; edit-and-resume is \
+             opt-in — pass --allow-source-change (CLI) or \"allow_source_change\": true \
+             (server) to replay the recorded calls against the edited code",
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]

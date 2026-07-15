@@ -235,6 +235,14 @@ enum Commands {
         /// earlier point in its history (`docs/durable-storage.md`).
         #[arg(long)]
         until_seq: Option<u64>,
+
+        /// Edit-and-resume: proceed even though the agent source changed
+        /// since this run was recorded. Recorded calls replay positionally
+        /// against the edited code; an edit that touches already-replayed
+        /// calls fails loudly as a divergence, an edit past the pause point
+        /// resumes cleanly.
+        #[arg(long)]
+        allow_source_change: bool,
     },
 
     /// List a run's persisted `chidori.branch` sub-runs and their states.
@@ -458,7 +466,17 @@ fn main() {
             run_id,
             dir,
             until_seq,
-        } => (cmd_resume(&file, &run_id, dir.as_deref(), until_seq), false),
+            allow_source_change,
+        } => (
+            cmd_resume(
+                &file,
+                &run_id,
+                dir.as_deref(),
+                until_seq,
+                allow_source_change,
+            ),
+            false,
+        ),
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
         Commands::BranchResume {
             run_id,
@@ -1304,6 +1322,7 @@ fn cmd_resume(
     run_id: &str,
     dir: Option<&std::path::Path>,
     until_seq: Option<u64>,
+    allow_source_change: bool,
 ) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
@@ -1348,9 +1367,14 @@ fn cmd_resume(
     // source fingerprints recorded in the run's snapshot manifest, exactly as
     // the server resume routes do, so cached results are never paired with
     // changed code. (Runs persisted before manifests existed skip with a
-    // warning.)
-    crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file)
-        .context("resume refused: the agent source no longer matches this run's checkpoint")?;
+    // warning; `--allow-source-change` is the edit-and-resume opt-in.)
+    crate::runtime::snapshot::validate_manifest_for_resume(
+        &run_base,
+        Some(run_id),
+        file,
+        allow_source_change,
+    )
+    .context("resume refused: the agent source no longer matches this run's checkpoint")?;
 
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
@@ -1369,7 +1393,7 @@ fn cmd_resume(
     eprintln!(
         "\nResumed from {} ({} calls replayed)",
         run_id,
-        result.call_log.total_duration_ms()
+        result.call_log.records().len()
     );
     Ok(())
 }

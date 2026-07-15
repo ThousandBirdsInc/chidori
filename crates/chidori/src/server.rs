@@ -304,8 +304,14 @@ fn validate_snapshot_manifest_for_resume(
     run_base: &FsPath,
     run_id: Option<&str>,
     agent_path: &FsPath,
+    allow_source_change: bool,
 ) -> anyhow::Result<()> {
-    crate::runtime::snapshot::validate_manifest_for_resume(run_base, run_id, agent_path)
+    crate::runtime::snapshot::validate_manifest_for_resume(
+        run_base,
+        run_id,
+        agent_path,
+        allow_source_change,
+    )
 }
 
 enum HostPromiseCompletion {
@@ -2371,10 +2377,15 @@ async fn complete_pending_and_resume(
 }
 
 /// POST /sessions/:id/resume — supply a response to the agent's pending
-/// `input()` call and continue the run. Body: `{"response": "<string>"}`.
+/// `input()` call and continue the run. Body: `{"response": "<string>"}`,
+/// plus optional `"allow_source_change": true` — the edit-and-resume opt-in
+/// that lets the resume proceed when the agent source changed since the run
+/// was recorded (replay's divergence checks still guard the journaled calls).
 #[derive(Deserialize)]
 struct ResumeRequest {
     response: String,
+    #[serde(default)]
+    allow_source_change: bool,
 }
 
 async fn resume_session(
@@ -2462,6 +2473,7 @@ async fn resume_session(
         &state.run_base,
         original.run_id.as_deref(),
         &state.agent_path,
+        body.allow_source_change,
     ) {
         return (
             StatusCode::CONFLICT,
@@ -2524,6 +2536,10 @@ struct SignalRequest {
     payload: Value,
     #[serde(default)]
     from: Value,
+    /// Edit-and-resume opt-in: allow the signal-triggered resume even though
+    /// the agent source changed since the run was recorded.
+    #[serde(default)]
+    allow_source_change: bool,
 }
 
 async fn signal_session(
@@ -2629,6 +2645,7 @@ async fn signal_session(
             &state.run_base,
             original.run_id.as_deref(),
             &state.agent_path,
+            body.allow_source_change,
         ) {
             return (
                 StatusCode::CONFLICT,
@@ -2731,6 +2748,10 @@ struct ApproveRequest {
     /// "allow" or "deny". Defaults to "allow" for convenience.
     #[serde(default = "default_decision")]
     decision: String,
+    /// Edit-and-resume opt-in: allow the post-approval resume even though the
+    /// agent source changed since the run was recorded.
+    #[serde(default)]
+    allow_source_change: bool,
 }
 
 fn default_decision() -> String {
@@ -2779,6 +2800,7 @@ async fn approve_session(
         &state.run_base,
         original.run_id.as_deref(),
         &state.agent_path,
+        body.allow_source_change,
     ) {
         return (
             StatusCode::CONFLICT,
@@ -3569,6 +3591,7 @@ mod tests {
                 Path("session-1".to_string()),
                 Json(ResumeRequest {
                     response: "yes".to_string(),
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -3670,6 +3693,7 @@ mod tests {
                 Path("session-1".to_string()),
                 Json(ResumeRequest {
                     response: "yes".to_string(),
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -3776,6 +3800,7 @@ mod tests {
                 Path("session-1".to_string()),
                 Json(ResumeRequest {
                     response: "yes".to_string(),
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -3820,9 +3845,14 @@ mod tests {
         store.save(&manifest, b"snapshot-bytes", &[]).unwrap();
         std::fs::write(&agent_path, "export async function agent() { return 2; }").unwrap();
 
-        let err = validate_snapshot_manifest_for_resume(&run_base, Some(run_id), &agent_path)
-            .unwrap_err();
-        assert!(err.to_string().contains("runtime snapshot source mismatch"));
+        let err =
+            validate_snapshot_manifest_for_resume(&run_base, Some(run_id), &agent_path, false)
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("runtime snapshot source mismatch"));
+        // The refusal advertises the edit-and-resume opt-in…
+        assert!(format!("{err:#}").contains("allow-source-change"));
+        // …and opting in lets the same resume proceed.
+        validate_snapshot_manifest_for_resume(&run_base, Some(run_id), &agent_path, true).unwrap();
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -3873,11 +3903,10 @@ mod tests {
         ]);
         store.save(&manifest, b"snapshot-bytes", &[]).unwrap();
 
-        let err = validate_snapshot_manifest_for_resume(&run_base, Some(run_id), &agent_path)
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("runtime snapshot module graph mismatch"));
+        let err =
+            validate_snapshot_manifest_for_resume(&run_base, Some(run_id), &agent_path, false)
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("runtime snapshot module graph mismatch"));
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -3907,7 +3936,13 @@ mod tests {
         );
         store.save(&manifest, b"snapshot-bytes", &[]).unwrap();
 
-        let err = validate_snapshot_manifest_for_resume(&run_base, Some(run_id), &agent_path)
+        let err =
+            validate_snapshot_manifest_for_resume(&run_base, Some(run_id), &agent_path, false)
+                .unwrap_err();
+        assert!(err.to_string().contains("runtime snapshot ABI mismatch"));
+        // ABI drift is environment skew, not an edit: the edit-and-resume
+        // opt-in must NOT bypass it.
+        let err = validate_snapshot_manifest_for_resume(&run_base, Some(run_id), &agent_path, true)
             .unwrap_err();
         assert!(err.to_string().contains("runtime snapshot ABI mismatch"));
 
@@ -4242,6 +4277,7 @@ mod tests {
                 Path(id.to_string()),
                 Json(ResumeRequest {
                     response: response.to_string(),
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -4540,6 +4576,7 @@ mod tests {
                 Path(id),
                 Json(ApproveRequest {
                     decision: "deny".to_string(),
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -4625,6 +4662,7 @@ mod tests {
                 State(state.clone()),
                 Path("s-signal-1".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "decision": "approve" }),
                     from: json!({ "kind": "human", "id": "mara" }),
@@ -4679,6 +4717,7 @@ mod tests {
                 State(state.clone()),
                 Path("s-signal-2".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "decision": "changes" }),
                     from: json!({ "id": "bot" }),
@@ -4705,6 +4744,7 @@ mod tests {
                 Path("s-signal-2".to_string()),
                 Json(ResumeRequest {
                     response: "ada".to_string(),
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -4752,6 +4792,7 @@ mod tests {
                     name: "review".to_string(),
                     payload: Value::Null,
                     from: Value::Null,
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -4801,6 +4842,7 @@ mod tests {
                     name: "review".to_string(),
                     payload: payload.clone(),
                     from: from.clone(),
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -4834,6 +4876,7 @@ mod tests {
                     name: "review".to_string(),
                     payload: payload.clone(),
                     from: from.clone(),
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -4847,6 +4890,7 @@ mod tests {
                 Path("b".to_string()),
                 Json(ResumeRequest {
                     response: "go".to_string(),
+                    allow_source_change: false,
                 }),
             )
             .await,
@@ -4917,6 +4961,7 @@ mod tests {
                 State(state.clone()),
                 Path("tie".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "tag": "new-delivered" }),
                     from: json!({ "id": "live-sender" }),
@@ -4964,6 +5009,7 @@ mod tests {
                 State(state.clone()),
                 Path("two".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "round": 1 }),
                     from: json!({ "id": "r1" }),
@@ -4982,6 +5028,7 @@ mod tests {
                 State(state.clone()),
                 Path("two".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "round": 2 }),
                     from: json!({ "id": "r2" }),
@@ -5036,6 +5083,7 @@ mod tests {
                 State(state.clone()),
                 Path("replay-src".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "decision": "approve" }),
                     from: json!({ "id": "x" }),
@@ -5122,6 +5170,7 @@ mod tests {
                 State(state.clone()),
                 Path("any-1".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "steer".to_string(),
                     payload: json!({ "dir": "left" }),
                     from: json!({ "kind": "human", "id": "sam" }),
@@ -5230,6 +5279,7 @@ mod tests {
                 State(state.clone()),
                 Path("race-1".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "decision": "approve" }),
                     from: json!({ "id": "mara" }),
@@ -5339,6 +5389,7 @@ mod tests {
                 State(state.clone()),
                 Path("live-1".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "decision": "approve" }),
                     from: json!({ "kind": "human", "id": "mara" }),
@@ -5379,6 +5430,7 @@ mod tests {
                 State(state_b.clone()),
                 Path("durable-1".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "decision": "approve" }),
                     from: json!({ "kind": "human", "id": "mara" }),
@@ -5438,6 +5490,7 @@ mod tests {
                 State(state.clone()),
                 Path("live-2".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "steer".to_string(),
                     payload: json!({ "dir": "left" }),
                     from: json!({ "id": "sam" }),
@@ -5456,6 +5509,7 @@ mod tests {
                 State(state.clone()),
                 Path("live-2".to_string()),
                 Json(SignalRequest {
+                    allow_source_change: false,
                     name: "review".to_string(),
                     payload: json!({ "decision": "approve" }),
                     from: json!({ "id": "mara" }),
