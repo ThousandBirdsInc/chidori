@@ -531,14 +531,19 @@ fn main() {
 
 /// Print a failed command's error to stderr. An uncaught JavaScript exception
 /// (the `JavaScript exception:` framing from `runtime::rust_engine`, carrying
-/// the stack frames recorded on the thrown error's `.stack`) renders through
-/// miette's graphical report handler — the same presentation TypeScript parse
-/// errors already get — so runtime and compile-time failures read alike at
-/// the CLI. Every other error keeps the plain anyhow context chain. This is
-/// presentation only: the compact `JavaScript exception: …` string is what
-/// the durable records, `--stream` events, and server responses carry.
+/// the stack frames recorded on the thrown error's `.stack`, already remapped
+/// to original-source coordinates) renders through miette's graphical report
+/// handler — the same presentation TypeScript parse errors already get. The
+/// innermost frames that live in a readable source file additionally render
+/// as a labeled snippet of that file, one caret per frame, the way rustc
+/// points at code. Every other error keeps the plain anyhow context chain.
+/// This is presentation only: the compact `JavaScript exception: …` string is
+/// what the durable records, `--stream` events, and server responses carry.
 fn report_cli_error(e: &anyhow::Error) {
-    use oxc::diagnostics::{GraphicalReportHandler, GraphicalTheme, OxcDiagnostic};
+    use crate::runtime::rust_engine::parse_stack_frame;
+    use oxc::diagnostics::{
+        GraphicalReportHandler, GraphicalTheme, LabeledSpan, NamedSource, OxcDiagnostic,
+    };
 
     let text = format!("{e:#}");
     let Some(idx) = text.find("JavaScript exception: ") else {
@@ -550,12 +555,51 @@ fn report_cli_error(e: &anyhow::Error) {
     // error's `Name: message` line plus the recorded `    at …` frames.
     let body = &text[idx + "JavaScript exception: ".len()..];
     let context = text[..idx].trim_end().trim_end_matches(':');
-    let mut rendered = String::new();
+
+    // Snippet: the innermost frame with a readable file anchors it, and every
+    // frame in that same file becomes a labeled caret (capped so a deep
+    // same-file recursion stays readable).
+    const MAX_SNIPPET_LABELS: usize = 6;
+    let frames: Vec<_> = body.lines().skip(1).filter_map(parse_stack_frame).collect();
+    let snippet_source = frames.iter().find_map(|f| {
+        let file = f.file?;
+        Some((file, std::fs::read_to_string(file).ok()?))
+    });
+    let mut diagnostic = OxcDiagnostic::error(body.to_string());
+    if let Some((file, source)) = &snippet_source {
+        let mut seen = std::collections::HashSet::new();
+        let labels: Vec<LabeledSpan> = frames
+            .iter()
+            .filter(|f| f.file == Some(file))
+            .filter_map(|f| {
+                let offset = byte_offset_of(source, f.line, f.col)?;
+                seen.insert(offset).then(|| {
+                    LabeledSpan::new(
+                        Some(format!("at {}", f.name)),
+                        offset,
+                        identifier_len_at(source, offset).max(1),
+                    )
+                })
+            })
+            .take(MAX_SNIPPET_LABELS)
+            .collect();
+        if !labels.is_empty() {
+            diagnostic = diagnostic.with_labels(labels);
+        }
+    }
+
     let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
-    if handler
-        .render_report(&mut rendered, &OxcDiagnostic::error(body.to_string()))
-        .is_err()
-    {
+    let mut rendered = String::new();
+    let ok = match snippet_source {
+        Some((file, source)) if diagnostic.labels.is_some() => {
+            let report = diagnostic.with_source_code(NamedSource::new(file, source));
+            handler
+                .render_report(&mut rendered, report.as_ref())
+                .is_ok()
+        }
+        _ => handler.render_report(&mut rendered, &diagnostic).is_ok(),
+    };
+    if !ok {
         eprintln!("Error: {text}");
         return;
     }
@@ -564,6 +608,36 @@ fn report_cli_error(e: &anyhow::Error) {
     } else {
         eprintln!("Error: {context}: uncaught JavaScript exception{rendered}");
     }
+}
+
+/// Byte offset of a 1-based (line, character-column) position in `src`.
+fn byte_offset_of(src: &str, line: u32, col: u32) -> Option<usize> {
+    let mut offset = 0usize;
+    for (i, l) in src.split_inclusive('\n').enumerate() {
+        if i + 1 == line as usize {
+            let mut bytes = 0usize;
+            for (n, c) in l.chars().enumerate() {
+                if n + 1 >= col as usize {
+                    break;
+                }
+                bytes += c.len_utf8();
+            }
+            return Some(offset + bytes);
+        }
+        offset += l.len();
+    }
+    None
+}
+
+/// Length in bytes of the identifier starting at `offset` (0 when the byte
+/// there doesn't start one) — so a frame label underlines the function name
+/// it points at rather than a single character.
+fn identifier_len_at(src: &str, offset: usize) -> usize {
+    src[offset..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .map(char::len_utf8)
+        .sum()
 }
 
 struct DemoExample {

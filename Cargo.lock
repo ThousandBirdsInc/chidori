@@ -556,6 +556,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "oxc",
+ "oxc_sourcemap",
  "rand 0.8.6",
  "reqwest",
  "rusqlite",

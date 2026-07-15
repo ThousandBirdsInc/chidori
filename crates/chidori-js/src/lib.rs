@@ -978,7 +978,7 @@ impl Engine {
             if registry.modules.contains_key(&key) {
                 continue;
             }
-            let compiled = compiler::compile_module(&src)
+            let compiled = compiler::compile_module_labeled(&src, Some(&key))
                 .map_err(|e| format!("compiling module '{key}': {e}"))?;
             let cell_of_name = compiled.cell_of_name.clone();
             let requested = compiled.requested.clone();
@@ -1046,7 +1046,7 @@ impl Engine {
             if registry.modules.contains_key(&key) {
                 continue;
             }
-            let compiled = compiler::compile_module(&src)
+            let compiled = compiler::compile_module_labeled(&src, Some(&key))
                 .map_err(|e| format!("compiling module '{key}': {e}"))?;
             let cell_of_name = compiled.cell_of_name.clone();
             let requested = compiled.requested.clone();

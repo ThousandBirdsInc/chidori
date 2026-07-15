@@ -578,6 +578,17 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
 /// top-level `this` is `undefined`, and top-level declarations are lexical cells
 /// (NOT global-object properties).
 pub fn compile_module(src: &str) -> Result<crate::module::CompiledModule, String> {
+    compile_module_labeled(src, None)
+}
+
+/// As [`compile_module`], with a source label — the module's registry key or
+/// file path — stamped on every compiled function so stack frames render as
+/// `at name (label:line:col)` and an embedder can resolve a frame back to a
+/// file.
+pub fn compile_module_labeled(
+    src: &str,
+    label: Option<&str>,
+) -> Result<crate::module::CompiledModule, String> {
     use crate::module::*;
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_module(true);
@@ -601,6 +612,7 @@ pub fn compile_module(src: &str) -> Result<crate::module::CompiledModule, String
     let mut c = Compiler::new();
     c.source = src.to_string();
     c.is_module = true;
+    c.source_label = label.map(Rc::from);
     let (proto, cell_of_name) = c.compile_module_toplevel(&program).map_err(|e| {
         if e.starts_with("SyntaxError") {
             e
@@ -874,6 +886,10 @@ struct Compiler {
     /// lazily on the first function-position lookup (`line_col_of`), so
     /// compilations that finish without one pay nothing.
     line_starts: std::cell::OnceCell<Vec<u32>>,
+    /// Module key/path this compilation came from (see
+    /// [`compile_module_labeled`]) — stamped on every finished `FuncProto` so
+    /// stack frames can name their source.
+    source_label: Option<Rc<str>>,
     /// Escaping `var`/function names collected while compiling a SLOPPY
     /// direct-eval body (see `FnCtx::eval_sloppy`).
     eval_var_names: Vec<String>,
@@ -925,6 +941,7 @@ impl Compiler {
             is_module: false,
             source: String::new(),
             line_starts: std::cell::OnceCell::new(),
+            source_label: None,
             eval_var_names: Vec::new(),
             pending_method: false,
             in_class_body: false,
@@ -1999,6 +2016,7 @@ impl Compiler {
             source_start: fc.source_start.unwrap_or(0),
             source_line,
             source_col,
+            source_label: self.source_label.clone(),
             uses_arguments: fc.uses_arguments,
             param_names: fc.param_names,
             mapped_param_cells: fc.mapped_param_cells,

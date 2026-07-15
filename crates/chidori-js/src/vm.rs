@@ -777,7 +777,14 @@ impl Vm {
         out.push_str(name);
         if proto.source_line > 0 {
             use std::fmt::Write;
-            let _ = write!(out, " ({}:{})", proto.source_line, proto.source_col);
+            match &proto.source_label {
+                Some(label) => {
+                    let _ = write!(out, " ({label}:{}:{})", proto.source_line, proto.source_col);
+                }
+                None => {
+                    let _ = write!(out, " ({}:{})", proto.source_line, proto.source_col);
+                }
+            }
         }
         *value = Value::str(out);
     }

@@ -133,7 +133,7 @@ fn js_exception_message(err: &str) -> String {
         return err.to_string();
     }
     if err.contains("\n    at ") {
-        return format!("JavaScript exception: {err}");
+        return format!("JavaScript exception: {}", remap_stack_frames(err));
     }
     const ERROR_NAMES: &[&str] = &[
         "Error",
@@ -151,6 +151,87 @@ fn js_exception_message(err: &str) -> String {
         }
     }
     format!("JavaScript exception: {err}")
+}
+
+/// One parsed `    at name (file:line:col)` stack-frame line. `file` is the
+/// engine's module key — the real path for agent files, `node:x` for builtin
+/// shims — and is `None` for unlabeled frames (`at f (3:1)` / bare `at f`).
+pub(crate) struct StackFrame<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) file: Option<&'a str>,
+    pub(crate) line: u32,
+    pub(crate) col: u32,
+}
+
+/// Parse one frame line as rendered by `chidori_js`'s unwind recorder.
+pub(crate) fn parse_stack_frame(line: &str) -> Option<StackFrame<'_>> {
+    let rest = line.strip_prefix("    at ")?;
+    let open = rest.rfind(" (")?;
+    let name = &rest[..open];
+    let pos = rest[open + 2..].strip_suffix(')')?;
+    // Split from the right: `col`, `line`, then everything left (which may
+    // itself contain `:`, e.g. `node:fs` or a Windows drive) is the file.
+    let (rest_pos, col) = pos.rsplit_once(':')?;
+    let col: u32 = col.parse().ok()?;
+    match rest_pos.rsplit_once(':') {
+        Some((file, line)) => match line.parse::<u32>() {
+            Ok(line) => Some(StackFrame {
+                name,
+                file: Some(file),
+                line,
+                col,
+            }),
+            // `node:fs:3` style keys parse above; a non-numeric middle means
+            // the whole `rest_pos` was a lineless label — not a frame we know.
+            Err(_) => None,
+        },
+        None => rest_pos.parse::<u32>().ok().map(|line| StackFrame {
+            name,
+            file: None,
+            line,
+            col,
+        }),
+    }
+}
+
+/// Rewrite the `    at name (file:line:col)` frames of an uncaught-exception
+/// message from transpiled coordinates into positions in the original
+/// TypeScript, via each module's codegen source map (see
+/// `transpile::remap_to_original`). Frames whose file can't be read or
+/// remapped — `node:` shims, vendored modules, synthetic sources — pass
+/// through unchanged. Error path only: each distinct file re-runs the
+/// transpile pipeline once with map generation on.
+fn remap_stack_frames(err: &str) -> String {
+    use std::collections::HashMap;
+    let mut sources: HashMap<&str, Option<String>> = HashMap::new();
+    let mut out = String::with_capacity(err.len());
+    for (i, line) in err.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let remapped = parse_stack_frame(line).and_then(|frame| {
+            let file = frame.file?;
+            let source = sources
+                .entry(file)
+                .or_insert_with(|| std::fs::read_to_string(file).ok())
+                .as_deref()?;
+            let pos = crate::runtime::typescript::transpile::remap_to_original(
+                Path::new(file),
+                source,
+                frame.line,
+                frame.col,
+            )?;
+            Some(format!(
+                "    at {} ({file}:{}:{})",
+                frame.name, pos.line, pos.column
+            ))
+        });
+        match remapped {
+            Some(frame) => out.push_str(&frame),
+            None => out.push_str(line),
+        }
+    }
+    out
 }
 
 /// Run a nested TypeScript **tool** file natively on the rust engine (G4).
@@ -1056,6 +1137,50 @@ mod tests {
             .get("hash")
             .and_then(|v| v.as_str())
             .is_some_and(|h| h.len() == 64));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn uncaught_exception_frames_carry_original_source_positions() {
+        let dir = std::env::temp_dir().join(format!("chidori-frames-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        // The interface block only exists in the original TypeScript — the
+        // frames must still point at the original lines (validate on 6,
+        // lookup on 10), proving the source-map remap ran.
+        let src = "import { chidori, run } from \"chidori:agent\";\n\
+                   interface Row {\n\
+                   \x20 id: string;\n\
+                   }\n\n\
+                   function validate(row: Row): Row {\n\
+                   \x20 throw new TypeError(\"bad row: \" + row.id);\n\
+                   }\n\n\
+                   function lookup(row: Row): Row {\n\
+                   \x20 return validate(row);\n\
+                   }\n\n\
+                   run(async () => lookup({ id: \"x\" }));\n";
+        std::fs::write(&path, src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx, Arc::new(ToolRegistry::new()));
+        let err = run_agent(&path, src, &serde_json::json!({}), &backend)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.starts_with("JavaScript exception: TypeError: bad row: x"),
+            "frame-carrying errors keep the class name: {err}"
+        );
+        let path_str = path.to_string_lossy();
+        assert!(
+            err.contains(&format!("at validate ({path_str}:6:")),
+            "innermost frame remaps to the original definition line: {err}"
+        );
+        assert!(
+            err.contains(&format!("at lookup ({path_str}:10:")),
+            "caller frame remaps too: {err}"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
