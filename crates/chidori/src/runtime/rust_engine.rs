@@ -120,12 +120,20 @@ pub(crate) fn run_agent(
 /// Reframe a chidori-js entrypoint error so an uncaught JS exception surfaces
 /// as `JavaScript exception: <message>` — the shape the durable format, the
 /// host-call span tree, and the SDKs expect. chidori-js stringifies a thrown
-/// `Error` as `"<Name>: <message>"`; we strip the standard error-class prefix
-/// to recover the bare message and apply the host framing. Pause sentinels pass through untouched — they are control
-/// flow, not exceptions, and `engine.rs` / `host_core` detect them by substring.
+/// `Error` as `"<Name>: <message>"`; for the classic single-line shape we
+/// strip the standard error-class prefix to recover the bare message and
+/// apply the host framing. An error carrying stack frames (recorded on
+/// `.stack` during unwinding) keeps its class name: the multi-line shape is
+/// new, nothing parses its head line as a bare message, and `TypeError` vs
+/// `RangeError` is diagnostic signal the CLI report should show. Pause
+/// sentinels pass through untouched — they are control flow, not exceptions,
+/// and `engine.rs` / `host_core` detect them by substring.
 fn js_exception_message(err: &str) -> String {
     if err.contains(crate::runtime::context::PAUSE_MARKER) {
         return err.to_string();
+    }
+    if err.contains("\n    at ") {
+        return format!("JavaScript exception: {err}");
     }
     const ERROR_NAMES: &[&str] = &[
         "Error",

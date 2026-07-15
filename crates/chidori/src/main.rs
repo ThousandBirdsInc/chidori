@@ -523,9 +523,46 @@ fn main() {
     match result {
         Ok(()) => std::process::exit(0),
         Err(e) => {
-            eprintln!("Error: {e:#}");
+            report_cli_error(&e);
             std::process::exit(if parse_only { 2 } else { 1 });
         }
+    }
+}
+
+/// Print a failed command's error to stderr. An uncaught JavaScript exception
+/// (the `JavaScript exception:` framing from `runtime::rust_engine`, carrying
+/// the stack frames recorded on the thrown error's `.stack`) renders through
+/// miette's graphical report handler — the same presentation TypeScript parse
+/// errors already get — so runtime and compile-time failures read alike at
+/// the CLI. Every other error keeps the plain anyhow context chain. This is
+/// presentation only: the compact `JavaScript exception: …` string is what
+/// the durable records, `--stream` events, and server responses carry.
+fn report_cli_error(e: &anyhow::Error) {
+    use oxc::diagnostics::{GraphicalReportHandler, GraphicalTheme, OxcDiagnostic};
+
+    let text = format!("{e:#}");
+    let Some(idx) = text.find("JavaScript exception: ") else {
+        eprintln!("Error: {text}");
+        return;
+    };
+    // `{:#}` prints outer contexts first, so everything before the marker is
+    // context ("resume refused: …") and everything after it is the thrown
+    // error's `Name: message` line plus the recorded `    at …` frames.
+    let body = &text[idx + "JavaScript exception: ".len()..];
+    let context = text[..idx].trim_end().trim_end_matches(':');
+    let mut rendered = String::new();
+    let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
+    if handler
+        .render_report(&mut rendered, &OxcDiagnostic::error(body.to_string()))
+        .is_err()
+    {
+        eprintln!("Error: {text}");
+        return;
+    }
+    if context.is_empty() {
+        eprintln!("Error: uncaught JavaScript exception{rendered}");
+    } else {
+        eprintln!("Error: {context}: uncaught JavaScript exception{rendered}");
     }
 }
 
