@@ -9,7 +9,7 @@
 //! round-trip a self-describing blob of `{bundle, effects, journal}` rather than
 //! threading the bundle through the trait signature.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -117,6 +117,17 @@ pub(crate) fn run_agent(
     )
 }
 
+const ERROR_NAMES: &[&str] = &[
+    "Error",
+    "TypeError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "EvalError",
+    "URIError",
+    "AggregateError",
+];
+
 /// Reframe a chidori-js entrypoint error so an uncaught JS exception surfaces
 /// as `JavaScript exception: <message>` — the shape the durable format, the
 /// host-call span tree, and the SDKs expect. chidori-js stringifies a thrown
@@ -125,34 +136,96 @@ pub(crate) fn run_agent(
 /// apply the host framing. An error carrying stack frames (recorded on
 /// `.stack` during unwinding) keeps its class name: the multi-line shape is
 /// new, nothing parses its head line as a bare message, and `TypeError` vs
-/// `RangeError` is diagnostic signal the CLI report should show. Pause
-/// sentinels pass through untouched — they are control flow, not exceptions,
-/// and `engine.rs` / `host_core` detect them by substring.
+/// `RangeError` is diagnostic signal the CLI report should show.
+///
+/// Frames stay in their raw (transpiled-bundle) coordinates here; remapping to
+/// original TypeScript is a display concern applied ONCE at the human-facing
+/// boundary (`main::report_cli_error`, via [`remap_stack_frames`]). Doing it
+/// here instead would remap twice for nested execution — a tool/sub-agent
+/// error is framed by its own engine and then re-framed by the agent that
+/// awaited it — corrupting the already-remapped positions.
+///
+/// Idempotent: a nested error re-enters the awaiting engine as
+/// `Error: JavaScript exception: <inner>`, so an input already carrying this
+/// framing is collapsed rather than double-prefixed. Pause sentinels pass
+/// through untouched — control flow, not exceptions, detected by substring in
+/// `engine.rs` / `host_core`.
 fn js_exception_message(err: &str) -> String {
     if err.contains(crate::runtime::context::PAUSE_MARKER) {
         return err.to_string();
     }
-    if err.contains("\n    at ") {
-        return format!("JavaScript exception: {}", remap_stack_frames(err));
+    let (head, rest) = err.split_once('\n').unwrap_or((err, ""));
+    let bare = ERROR_NAMES
+        .iter()
+        .find_map(|n| head.strip_prefix(&format!("{n}: ")))
+        .unwrap_or(head);
+    // Already framed by a nested tool/sub-agent engine: collapse the layers so
+    // exactly one `JavaScript exception:` prefix survives, frames intact.
+    if let Some(inner) = bare.strip_prefix("JavaScript exception: ") {
+        return join_message(&format!("JavaScript exception: {inner}"), rest);
     }
-    const ERROR_NAMES: &[&str] = &[
-        "Error",
-        "TypeError",
-        "RangeError",
-        "ReferenceError",
-        "SyntaxError",
-        "EvalError",
-        "URIError",
-        "AggregateError",
-    ];
-    for name in ERROR_NAMES {
-        if let Some(rest) = err.strip_prefix(&format!("{name}: ")) {
-            return format!("JavaScript exception: {rest}");
-        }
+    if rest.is_empty() {
+        // Single line: strip the error class for the classic bare-message shape.
+        return format!("JavaScript exception: {bare}");
     }
+    // Frame-carrying: keep the class name (diagnostic signal for the report).
     format!("JavaScript exception: {err}")
 }
 
+/// Reattach a frame block (`rest`, everything after the first newline) to a
+/// rebuilt head line.
+fn join_message(head: &str, rest: &str) -> String {
+    if rest.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}\n{rest}")
+    }
+}
+
+thread_local! {
+    /// The directory tree stack-frame source reads are confined to (see
+    /// [`read_project_source`]). Set to the entry agent's workspace root at the
+    /// start of each JS-running CLI command; unset (falls back to the current
+    /// directory) in the library and tests that don't establish one.
+    static DISPLAY_PROJECT_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Confine stack-frame source reads to `root` (the entry agent's workspace
+/// root). Called once as a JS-running command starts, so error rendering can
+/// read the agent's own files — wherever on disk they live — while still
+/// refusing paths outside the project. See [`read_project_source`].
+#[allow(dead_code)] // Called from the `chidori` binary; dead in the lib-only build.
+pub(crate) fn set_display_project_root(root: PathBuf) {
+    DISPLAY_PROJECT_ROOT.with(|r| *r.borrow_mut() = Some(root));
+}
+
+/// Read a stack-frame's source file, but ONLY when it resolves inside the
+/// project (the entry agent's workspace root, or the current directory when no
+/// root was set). A frame's file comes from the thrown error's `.stack`, which
+/// agent code can overwrite with any string — an unconfined read would let a
+/// hostile agent dump an arbitrary file (`/etc/passwd`, an env-file) into the
+/// operator's terminal as a bogus "source snippet". Genuine engine frames name
+/// modules the run loaded, all under the workspace root, so they still
+/// resolve; `node:` shims and spoofed paths that escape the root do not.
+/// Returns `None` when the path is unreadable, escapes the root, or the root
+/// can't be determined.
+#[allow(dead_code)] // Used by the binary (main::report_cli_error) and tests.
+pub(crate) fn read_project_source(file: &str) -> Option<String> {
+    let root = DISPLAY_PROJECT_ROOT
+        .with(|r| r.borrow().clone())
+        .or_else(|| std::env::current_dir().ok())?
+        .canonicalize()
+        .ok()?;
+    let full = Path::new(file).canonicalize().ok()?;
+    full.starts_with(&root)
+        .then(|| std::fs::read_to_string(&full).ok())
+        .flatten()
+}
+
+// Used by the `chidori` binary (main::report_cli_error) and tests; the lib
+// target compiles the module tree without main.rs, so it sees these as dead.
+#[allow(dead_code)]
 /// One parsed `    at name (file:line:col)` stack-frame line. `file` is the
 /// engine's module key — the real path for agent files, `node:x` for builtin
 /// shims — and is `None` for unlabeled frames (`at f (3:1)` / bare `at f`).
@@ -163,6 +236,9 @@ pub(crate) struct StackFrame<'a> {
     pub(crate) col: u32,
 }
 
+// Used by the `chidori` binary (main::report_cli_error) and tests; the lib
+// target compiles the module tree without main.rs, so it sees these as dead.
+#[allow(dead_code)]
 /// Parse one frame line as rendered by `chidori_js`'s unwind recorder.
 pub(crate) fn parse_stack_frame(line: &str) -> Option<StackFrame<'_>> {
     let rest = line.strip_prefix("    at ")?;
@@ -194,14 +270,19 @@ pub(crate) fn parse_stack_frame(line: &str) -> Option<StackFrame<'_>> {
     }
 }
 
+// Used by the `chidori` binary (main::report_cli_error) and tests; the lib
+// target compiles the module tree without main.rs, so it sees these as dead.
+#[allow(dead_code)]
 /// Rewrite the `    at name (file:line:col)` frames of an uncaught-exception
 /// message from transpiled coordinates into positions in the original
 /// TypeScript, via each module's codegen source map (see
-/// `transpile::remap_to_original`). Frames whose file can't be read or
-/// remapped — `node:` shims, vendored modules, synthetic sources — pass
-/// through unchanged. Error path only: each distinct file re-runs the
-/// transpile pipeline once with map generation on.
-fn remap_stack_frames(err: &str) -> String {
+/// `transpile::remap_to_original`). Frames whose file can't be read (confined
+/// to the project root — see [`read_project_source`]) or remapped — `node:`
+/// shims, vendored modules, synthetic or agent-spoofed sources — pass through
+/// unchanged. Applied ONCE at the display boundary (the frames arrive here in
+/// uniform transpiled coordinates); error path only, so each distinct file
+/// re-runs the transpile pipeline once with map generation on.
+pub(crate) fn remap_stack_frames(err: &str) -> String {
     use std::collections::HashMap;
     let mut sources: HashMap<&str, Option<String>> = HashMap::new();
     let mut out = String::with_capacity(err.len());
@@ -213,7 +294,7 @@ fn remap_stack_frames(err: &str) -> String {
             let file = frame.file?;
             let source = sources
                 .entry(file)
-                .or_insert_with(|| std::fs::read_to_string(file).ok())
+                .or_insert_with(|| read_project_source(file))
                 .as_deref()?;
             let pos = crate::runtime::typescript::transpile::remap_to_original(
                 Path::new(file),
@@ -1014,6 +1095,99 @@ impl SnapshotCapableJsEngine for RustReplayEngine {
 }
 
 #[cfg(test)]
+mod frame_tests {
+    use super::{js_exception_message, parse_stack_frame, read_project_source};
+
+    #[test]
+    fn parses_labeled_and_bare_and_node_frames() {
+        let f = parse_stack_frame("    at validate (agent.ts:6:10)").unwrap();
+        assert_eq!(
+            (f.name, f.file, f.line, f.col),
+            ("validate", Some("agent.ts"), 6, 10)
+        );
+        // A `node:` key contains its own colon — the file must survive intact.
+        let n = parse_stack_frame("    at read (node:fs:3:5)").unwrap();
+        assert_eq!(
+            (n.name, n.file, n.line, n.col),
+            ("read", Some("node:fs"), 3, 5)
+        );
+        // Unlabeled position (plain script / eval): file is None.
+        let b = parse_stack_frame("    at f (3:1)").unwrap();
+        assert_eq!((b.name, b.file, b.line, b.col), ("f", None, 3, 1));
+        // A method-name with spaces (`get x`) keeps the whole name.
+        let g = parse_stack_frame("    at get missing (c.ts:2:7)").unwrap();
+        assert_eq!(g.name, "get missing");
+        // Non-frame lines are rejected.
+        assert!(parse_stack_frame("TypeError: boom").is_none());
+        assert!(parse_stack_frame("    at nope").is_none());
+    }
+
+    #[test]
+    fn single_line_error_strips_class_to_bare_message() {
+        assert_eq!(
+            js_exception_message("TypeError: x is not a function"),
+            "JavaScript exception: x is not a function"
+        );
+        // A thrown non-Error string has no class prefix; it is framed verbatim.
+        assert_eq!(
+            js_exception_message("plain string"),
+            "JavaScript exception: plain string"
+        );
+    }
+
+    #[test]
+    fn frame_carrying_error_keeps_class_name() {
+        let framed = js_exception_message("TypeError: boom\n    at f (a.ts:1:1)");
+        assert_eq!(
+            framed,
+            "JavaScript exception: TypeError: boom\n    at f (a.ts:1:1)"
+        );
+    }
+
+    #[test]
+    fn nested_framing_is_idempotent_not_double_prefixed() {
+        // A tool/sub-agent error re-enters the awaiting engine wrapped as
+        // `Error: JavaScript exception: <inner>` — collapse to one prefix,
+        // frames preserved in their raw coordinates (remap is display-time).
+        let nested = "Error: JavaScript exception: RangeError: division by zero\n\
+                      \x20   at run (tools/divide.ts:7:23)\n\
+                      \x20   at <anonymous> (agent.ts:2:5)";
+        let out = js_exception_message(nested);
+        assert_eq!(
+            out,
+            "JavaScript exception: RangeError: division by zero\n\
+             \x20   at run (tools/divide.ts:7:23)\n\
+             \x20   at <anonymous> (agent.ts:2:5)"
+        );
+        // Feeding the result back in is a fixed point.
+        assert_eq!(js_exception_message(&out), out);
+    }
+
+    #[test]
+    fn project_source_read_is_confined_to_the_project_root() {
+        use super::set_display_project_root;
+        // Establish an explicit root (thread-local; not cwd-dependent, so it
+        // survives test-thread reuse) with one file inside it.
+        let root = std::env::temp_dir().join(format!("chidori-confine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("agent.ts");
+        std::fs::write(&inside, "// hi\n").unwrap();
+        set_display_project_root(root.canonicalize().unwrap());
+
+        // A file inside the root resolves…
+        assert_eq!(
+            read_project_source(inside.to_str().unwrap()).as_deref(),
+            Some("// hi\n")
+        );
+        // …but an absolute path escaping the root (an agent-spoofed frame) is
+        // refused even though it exists and is readable.
+        assert!(read_project_source("/etc/hostname").is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -1167,19 +1341,38 @@ mod tests {
         let err = run_agent(&path, src, &serde_json::json!({}), &backend)
             .unwrap_err()
             .to_string();
+        // Confine snippet reads to this run's temp dir, as the CLI confines to
+        // the agent's workspace root.
+        super::set_display_project_root(dir.clone());
 
         assert!(
             err.starts_with("JavaScript exception: TypeError: bad row: x"),
             "frame-carrying errors keep the class name: {err}"
         );
         let path_str = path.to_string_lossy();
+        // The engine boundary carries raw (transpiled-bundle) frames with
+        // real file labels; remapping to original TypeScript is applied once
+        // at display. Both frames name the agent file with SOME position.
         assert!(
-            err.contains(&format!("at validate ({path_str}:6:")),
-            "innermost frame remaps to the original definition line: {err}"
+            err.contains(&format!("at validate ({path_str}:")),
+            "innermost frame is labeled with its module: {err}"
         );
         assert!(
-            err.contains(&format!("at lookup ({path_str}:10:")),
-            "caller frame remaps too: {err}"
+            err.contains(&format!("at lookup ({path_str}:")),
+            "caller frame is labeled too: {err}"
+        );
+
+        // Display-time remap lands both frames on their original definition
+        // lines (validate on 6, lookup on 10), past the interface block that
+        // only exists in the original TypeScript.
+        let remapped = remap_stack_frames(&err);
+        assert!(
+            remapped.contains(&format!("at validate ({path_str}:6:")),
+            "innermost frame remaps to the original definition line: {remapped}"
+        );
+        assert!(
+            remapped.contains(&format!("at lookup ({path_str}:10:")),
+            "caller frame remaps too: {remapped}"
         );
 
         let _ = std::fs::remove_dir_all(dir);

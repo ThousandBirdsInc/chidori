@@ -380,7 +380,7 @@ fn main() {
     // The isolate worker speaks a binary frame protocol over stdout, so it must
     // short-circuit before any of the normal startup path can write there.
     if let Commands::RunWorker = cli.command {
-        std::process::exit(match crate::runtime::isolate::worker::run() {
+        std::process::exit(match on_js_stack(crate::runtime::isolate::worker::run) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("isolate worker error: {e}");
@@ -397,7 +397,60 @@ fn main() {
 
     // Commands that only do parsing/validation return exit code 2 on failure;
     // everything else returns 1. Success is 0.
-    let (result, parse_only) = match cli.command {
+    let (result, parse_only) = on_js_stack(move || dispatch_command(cli.command));
+
+    // Flush any buffered OTLP spans before the process exits. No-op when
+    // OTEL_EXPORTER_OTLP_ENDPOINT wasn't set.
+    crate::runtime::otel::shutdown_on_exit();
+
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            report_cli_error(&e);
+            std::process::exit(if parse_only { 2 } else { 1 });
+        }
+    }
+}
+
+/// Run `f` on a thread with [`scheduler::JS_THREAD_STACK_BYTES`] of stack.
+/// The interpreter recurses on the native stack (its depth guard allows 2000
+/// JS frames), and the default main-thread stack aborts the whole process on
+/// deep-but-legal recursion instead of letting the guard throw its catchable
+/// RangeError — so every command body (and the isolate worker, whose agent
+/// also runs on its process main thread) executes on one big-stack thread.
+/// One thread per process: the thread-local compile/transpile caches stay
+/// warm for the command's whole lifetime.
+fn on_js_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .name("chidori-cmd".to_string())
+        .stack_size(scheduler::JS_THREAD_STACK_BYTES)
+        .spawn(f)
+        .expect("spawning the command thread")
+        .join()
+        .expect("command thread panicked")
+}
+
+/// Dispatch one parsed CLI command to its handler, returning its result and
+/// whether it is a parse/validation-only command (exit code 2 on failure).
+fn dispatch_command(command: Commands) -> (Result<()>, bool) {
+    // Confine error-report source snippets to the entry agent's workspace root
+    // (see `rust_engine::read_project_source`): a run/check names a `.ts` file,
+    // whose workspace root is where its modules live.
+    let entry_file = match &command {
+        Commands::Run { file, .. }
+        | Commands::Check { file }
+        | Commands::Resume { file, .. }
+        | Commands::Serve { file, .. } => Some(file.clone()),
+        Commands::Chat { agent, .. } => agent.clone(),
+        _ => None,
+    };
+    if let Some(file) = entry_file {
+        crate::runtime::rust_engine::set_display_project_root(
+            crate::runtime::typescript::transpile::find_workspace_root(&file),
+        );
+    }
+
+    match command {
         Commands::Run {
             file,
             input,
@@ -514,18 +567,6 @@ fn main() {
                 false,
             )
         }
-    };
-
-    // Flush any buffered OTLP spans before the process exits. No-op when
-    // OTEL_EXPORTER_OTLP_ENDPOINT wasn't set.
-    crate::runtime::otel::shutdown_on_exit();
-
-    match result {
-        Ok(()) => std::process::exit(0),
-        Err(e) => {
-            report_cli_error(&e);
-            std::process::exit(if parse_only { 2 } else { 1 });
-        }
     }
 }
 
@@ -552,8 +593,13 @@ fn report_cli_error(e: &anyhow::Error) {
     };
     // `{:#}` prints outer contexts first, so everything before the marker is
     // context ("resume refused: …") and everything after it is the thrown
-    // error's `Name: message` line plus the recorded `    at …` frames.
-    let body = &text[idx + "JavaScript exception: ".len()..];
+    // error's `Name: message` line plus the recorded `    at …` frames. The
+    // frames arrive in transpiled-bundle coordinates; remap them to the
+    // original TypeScript here, at the single display boundary.
+    let body = crate::runtime::rust_engine::remap_stack_frames(
+        &text[idx + "JavaScript exception: ".len()..],
+    );
+    let body = body.as_str();
     let context = text[..idx].trim_end().trim_end_matches(':');
 
     // Snippet: the innermost frame with a readable file anchors it, and every
@@ -563,7 +609,13 @@ fn report_cli_error(e: &anyhow::Error) {
     let frames: Vec<_> = body.lines().skip(1).filter_map(parse_stack_frame).collect();
     let snippet_source = frames.iter().find_map(|f| {
         let file = f.file?;
-        Some((file, std::fs::read_to_string(file).ok()?))
+        // Confined to the project root — see `read_project_source`. A frame's
+        // file is agent-controlled (via `.stack`); never render a snippet of
+        // something outside the project the operator is running.
+        Some((
+            file,
+            crate::runtime::rust_engine::read_project_source(file)?,
+        ))
     });
     let mut diagnostic = OxcDiagnostic::error(body.to_string());
     if let Some((file, source)) = &snippet_source {

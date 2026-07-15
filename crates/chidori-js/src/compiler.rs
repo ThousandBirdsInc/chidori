@@ -1648,6 +1648,10 @@ impl Compiler {
         fc.strict = true;
         fc.script_global = false;
         fc.is_toplevel = true;
+        // Anchor the module body at its first byte so a throw during module
+        // evaluation renders `at <module> (its/path.ts:1:1)` — naming WHICH
+        // module failed to import — instead of a bare `at <module>`.
+        fc.source_start = Some(0);
         fc.contains_eval = self.source.contains("eval");
         let module_has_eval = fc.contains_eval;
         self.fns.push(fc);
