@@ -27,8 +27,7 @@ use crate::runtime::engine::{Engine, RunResult};
 use crate::runtime::host_core::signal_timeout_sentinel;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation,
-    PendingHostOperationKind, RuntimePolicy, SnapshotAbi, SnapshotStore, SourceFingerprint,
-    PENDING_HOST_OPERATION_FILE,
+    PendingHostOperationKind, SnapshotStore, PENDING_HOST_OPERATION_FILE,
 };
 use crate::runtime::template::TemplateEngine;
 use crate::scheduler::{self, SchedulerDeps};
@@ -306,52 +305,7 @@ fn validate_snapshot_manifest_for_resume(
     run_id: Option<&str>,
     agent_path: &FsPath,
 ) -> anyhow::Result<()> {
-    let Some(run_id) = run_id else {
-        return Ok(());
-    };
-    let store = SnapshotStore::new(run_base.join(run_id));
-    let manifest = match store.load_manifest() {
-        Ok(manifest) => manifest,
-        Err(_) => return Ok(()),
-    };
-    let entry_source = std::fs::read_to_string(agent_path).map_err(|err| {
-        anyhow::anyhow!("reading resume source {}: {}", agent_path.display(), err)
-    })?;
-    let current_entry = SourceFingerprint::from_source(agent_path, &entry_source);
-    let expected_abi = SnapshotAbi::current("chidori-quickjs");
-    let expected_policy = RuntimePolicy::from_env_for_durable_run(run_id)?;
-    // One module walk yields both manifest views (fingerprints + graph), so
-    // each imported module is read from disk once per resume instead of twice
-    // (once for its fingerprint, again inside the graph walk). Manifests
-    // written before the graph existed fall back to fingerprinting exactly
-    // the paths they list.
-    let (current_modules, current_module_graph) = if manifest.module_graph.is_empty() {
-        let mut current_modules = Vec::with_capacity(manifest.modules.len());
-        for module in &manifest.modules {
-            let source = std::fs::read_to_string(&module.path).map_err(|err| {
-                anyhow::anyhow!(
-                    "reading resume module source {}: {}",
-                    module.path.display(),
-                    err
-                )
-            })?;
-            current_modules.push(SourceFingerprint::from_source(&module.path, &source));
-        }
-        (current_modules, Vec::new())
-    } else {
-        crate::runtime::typescript::module_graph::snapshot_modules(
-            agent_path,
-            &entry_source,
-            &expected_policy,
-        )?
-    };
-    manifest.ensure_resume_compatible(
-        &expected_abi,
-        &expected_policy,
-        &current_entry,
-        &current_modules,
-        &current_module_graph,
-    )
+    crate::runtime::snapshot::validate_manifest_for_resume(run_base, run_id, agent_path)
 }
 
 enum HostPromiseCompletion {
@@ -603,12 +557,12 @@ pub async fn serve(
     });
     let mcp_tools = Arc::new(mcp_tools);
 
-    let session_store = build_session_store();
-    let run_base = agent_path
+    let base_dir = agent_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
-        .join(".chidori")
-        .join("runs");
+        .to_path_buf();
+    let session_store = build_session_store(&base_dir)?;
+    let run_base = base_dir.join(".chidori").join("runs");
 
     let recipe_dir = std::env::var("CHIDORI_RECIPE_DIR").ok().map(PathBuf::from);
     let recipes = recipe_dir
@@ -2998,7 +2952,9 @@ async fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE;
+    use crate::runtime::snapshot::{
+        RuntimePolicy, SnapshotAbi, SourceFingerprint, HOST_PROMISE_TABLE_FILE,
+    };
     use axum::body;
 
     #[test]

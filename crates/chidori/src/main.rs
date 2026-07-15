@@ -89,15 +89,27 @@ enum Commands {
         /// gated effects (http, workspace mutations) are refused unless
         /// allowlisted. Equivalent to CHIDORI_POLICY_PROFILE=untrusted, but
         /// takes precedence over all CHIDORI_POLICY* env vars.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "trusted")]
         untrusted: bool,
+
+        /// Opt out of the ask-before-powerful-effects default: with no
+        /// CHIDORI_POLICY* configuration, gated effects (http, workspace
+        /// mutations, tools) run without prompts. Explicit CHIDORI_POLICY*
+        /// configuration still applies. Use for agents you wrote yourself.
+        #[arg(long)]
+        trusted: bool,
 
         /// Run the agent in an isolated child process, brokering its host
         /// effects back over a pipe (see docs/os-isolation-plan.md). Equivalent
-        /// to CHIDORI_ISOLATE=process. Phase 1: process separation + brokering;
-        /// per-OS syscall sandboxing lands in a later phase.
-        #[arg(long)]
+        /// to CHIDORI_ISOLATE=process. This is the default on Unix; the flag
+        /// remains as an explicit override of CHIDORI_ISOLATE=off.
+        #[arg(long, conflicts_with = "no_isolate")]
         isolate: bool,
+
+        /// Run the agent in-process, without the isolated worker sandbox.
+        /// Equivalent to CHIDORI_ISOLATE=off.
+        #[arg(long)]
+        no_isolate: bool,
     },
 
     /// Internal: the isolate worker. Runs one agent over a stdin/stdout frame
@@ -189,8 +201,12 @@ enum Commands {
         tools: Vec<PathBuf>,
 
         /// Run under the built-in deny-by-default `untrusted` policy profile.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "trusted")]
         untrusted: bool,
+
+        /// Opt out of the ask-before-powerful-effects default (see `run --trusted`).
+        #[arg(long)]
+        trusted: bool,
     },
 
     /// List all available tools
@@ -321,16 +337,23 @@ enum Commands {
 
         /// Opt out of the server's deny-by-default posture: with no
         /// CHIDORI_POLICY* configuration, gated effects (http, workspace
-        /// mutations) run without restriction, as `chidori run` does.
-        /// Explicit CHIDORI_POLICY* configuration still applies.
+        /// mutations) run without restriction. Explicit CHIDORI_POLICY*
+        /// configuration still applies.
         #[arg(long)]
         trusted: bool,
 
         /// Run each request in an isolated child process, brokering its host
         /// effects back over a pipe (see docs/os-isolation-plan.md). Equivalent
-        /// to CHIDORI_ISOLATE=process. Composes with --untrusted.
-        #[arg(long)]
+        /// to CHIDORI_ISOLATE=process. This is the default on Unix; the flag
+        /// remains as an explicit override of CHIDORI_ISOLATE=off. Composes
+        /// with --untrusted.
+        #[arg(long, conflicts_with = "no_isolate")]
         isolate: bool,
+
+        /// Serve requests in-process, without the isolated worker sandbox.
+        /// Equivalent to CHIDORI_ISOLATE=off.
+        #[arg(long)]
+        no_isolate: bool,
     },
 }
 
@@ -349,6 +372,12 @@ fn main() {
         });
     }
 
+    // OS isolation is default-on for the CLI on platforms with a worker
+    // sandbox: when CHIDORI_ISOLATE is unset, agent-running commands spawn a
+    // confined child process per run. Explicit env values and the
+    // --isolate/--no-isolate flags (handled per command below) always win.
+    crate::runtime::isolate::default_on_if_unset();
+
     // Commands that only do parsing/validation return exit code 2 on failure;
     // everything else returns 1. Success is 0.
     let (result, parse_only) = match cli.command {
@@ -360,18 +389,22 @@ fn main() {
             tools,
             stream,
             untrusted,
+            trusted,
             isolate,
+            no_isolate,
         } => {
             // `run_agent` reads this env var to decide whether to spawn a worker;
             // setting it here keeps the isolation decision in one place.
             if isolate {
                 crate::runtime::isolate::enable();
+            } else if no_isolate {
+                crate::runtime::isolate::disable();
             }
             crate::runtime::isolate::warn_if_untrusted_without_isolation(untrusted);
             let result = if stream {
-                cmd_run_stream(&file, &input, verbose, &tools, untrusted)
+                cmd_run_stream(&file, &input, verbose, &tools, untrusted, trusted)
             } else {
-                cmd_run(&file, &input, trace, verbose, &tools, untrusted)
+                cmd_run(&file, &input, trace, verbose, &tools, untrusted, trusted)
             };
             (result, false)
         }
@@ -403,8 +436,9 @@ fn main() {
             model,
             tools,
             untrusted,
+            trusted,
         } => (
-            cmd_chat(agent.as_deref(), system, model, &tools, untrusted),
+            cmd_chat(agent.as_deref(), system, model, &tools, untrusted, trusted),
             false,
         ),
         Commands::Check { file } => (cmd_check(&file), true),
@@ -440,9 +474,12 @@ fn main() {
             untrusted,
             trusted,
             isolate,
+            no_isolate,
         } => {
             if isolate {
                 crate::runtime::isolate::enable();
+            } else if no_isolate {
+                crate::runtime::isolate::disable();
             }
             (cmd_serve(&file, port, verbose, untrusted, trusted), false)
         }
@@ -613,10 +650,12 @@ fn cmd_demo() -> Result<()> {
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>();
             let tool_dirs = tools.iter().map(PathBuf::from).collect::<Vec<_>>();
+            // The demo runs the repo's own example agents on the developer's
+            // machine — the trusted posture, like `run --trusted`.
             if *stream {
-                cmd_run_stream(&file, &inputs, false, &tool_dirs, false)
+                cmd_run_stream(&file, &inputs, false, &tool_dirs, false, true)
             } else {
-                cmd_run(&file, &inputs, *trace, false, &tool_dirs, false)
+                cmd_run(&file, &inputs, *trace, false, &tool_dirs, false, true)
             }
         }
         DemoAction::Serve { file, port } => {
@@ -737,16 +776,27 @@ fn ensure_llm_provider_interactive() -> bool {
     }
 }
 
-/// Resolve the permission policy for a CLI invocation. `--untrusted` selects
-/// the built-in deny-by-default profile and wins over every CHIDORI_POLICY*
-/// env var (an explicit flag beats ambient configuration); otherwise the
-/// usual env-driven resolution applies.
-fn cli_policy(untrusted: bool) -> Arc<policy::PolicyConfig> {
+/// Resolve the permission policy for a CLI invocation. Precedence:
+///   1. `--untrusted` — deny-by-default, wins over all CHIDORI_POLICY* env
+///      (an explicit flag beats ambient configuration).
+///   2. `--trusted` — the historical permissive resolution: env-driven,
+///      allow-all when nothing is configured.
+///   3. Explicit, valid CHIDORI_POLICY* configuration — as configured.
+///   4. Nothing configured — ask-before-powerful-effects
+///      ([`policy::run_default_profile`]): the operator approves gated
+///      effects at a terminal prompt, and non-interactive runs fail closed
+///      with a reason naming `--trusted` and the env knobs.
+fn cli_policy(untrusted: bool, trusted: bool) -> Arc<policy::PolicyConfig> {
     if untrusted {
-        Arc::new(policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"))
-    } else {
-        policy::PolicyConfig::from_env()
+        return Arc::new(
+            policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
+        );
     }
+    if trusted {
+        return policy::PolicyConfig::from_env();
+    }
+    policy::PolicyConfig::from_env_configured()
+        .unwrap_or_else(|| Arc::new(policy::run_default_profile()))
 }
 
 /// Resolve the permission policy for `chidori serve`. Unlike `chidori run`
@@ -805,6 +855,7 @@ fn cmd_run(
     verbose: bool,
     extra_tool_dirs: &[PathBuf],
     untrusted: bool,
+    trusted: bool,
 ) -> Result<()> {
     // Set up tracing.
     if verbose {
@@ -838,7 +889,7 @@ fn cmd_run(
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
-        .with_policy(cli_policy(untrusted))
+        .with_policy(cli_policy(untrusted, trusted))
         .with_persist_base(base_dir.join(".chidori").join("runs"))
         .with_workspace_root(abs_dir(&base_dir));
 
@@ -905,6 +956,7 @@ fn cmd_run_stream(
     verbose: bool,
     extra_tool_dirs: &[PathBuf],
     untrusted: bool,
+    trusted: bool,
 ) -> Result<()> {
     use tokio::sync::mpsc;
 
@@ -934,7 +986,7 @@ fn cmd_run_stream(
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
-        .with_policy(cli_policy(untrusted));
+        .with_policy(cli_policy(untrusted, trusted));
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<crate::runtime::context::RuntimeEvent>();
 
@@ -1033,6 +1085,7 @@ fn cmd_chat(
     model: Option<String>,
     extra_tool_dirs: &[PathBuf],
     untrusted: bool,
+    trusted: bool,
 ) -> Result<()> {
     use crate::runtime::context::RuntimeEvent;
     use std::io::Write;
@@ -1077,7 +1130,7 @@ fn cmd_chat(
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
-        .with_policy(cli_policy(untrusted))
+        .with_policy(cli_policy(untrusted, trusted))
         .with_workspace_root(abs_dir(&base_dir));
 
     eprintln!("chidori chat — type a message and press enter. Type 'exit' or Ctrl-D to quit.");
@@ -1276,6 +1329,14 @@ fn cmd_resume(
     } else {
         Value::Object(Default::default())
     };
+
+    // Replay is positional: verify the agent code on disk still matches the
+    // source fingerprints recorded in the run's snapshot manifest, exactly as
+    // the server resume routes do, so cached results are never paired with
+    // changed code. (Runs persisted before manifests existed skip with a
+    // warning.)
+    crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file)
+        .context("resume refused: the agent source no longer matches this run's checkpoint")?;
 
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));

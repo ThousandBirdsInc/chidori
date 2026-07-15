@@ -439,16 +439,18 @@ impl HostPromiseTable {
             })
     }
 
+    /// The completed record at (seq, kind), if any. Args are NOT matched here:
+    /// the caller compares them via [`completed_args_match`] so a mismatch can
+    /// be surfaced as a replay divergence instead of silently discarding the
+    /// recorded completion (and re-executing the side effect live).
     pub fn completed_operation(
         &self,
         seq: u64,
         kind: PendingHostOperationKind,
-        args: &Value,
     ) -> Option<HostPromiseRecord> {
         self.records.values().find_map(|record| {
             if record.operation.seq == seq
                 && record.operation.kind == kind
-                && completed_args_match(&record.operation.args, args)
                 && !matches!(record.state, HostPromiseState::Pending)
             {
                 Some(record.clone())
@@ -514,7 +516,7 @@ pub fn load_host_promise_records(
 /// from the same inputs on resume) rather than identifying the operation, so a
 /// digest-scheme change between record and resume must not force a completed
 /// side effect to re-execute.
-fn completed_args_match(recorded: &Value, rebuilt: &Value) -> bool {
+pub(crate) fn completed_args_match(recorded: &Value, rebuilt: &Value) -> bool {
     if recorded == rebuilt {
         return true;
     }
@@ -955,6 +957,72 @@ impl SnapshotManifest {
         self.ensure_module_graph_matches(current_module_graph)?;
         Ok(())
     }
+}
+
+/// Verify the agent code on disk against the snapshot manifest recorded for
+/// `run_id` before a resume replays its journal. Replay is positional — a
+/// changed source file could silently pair cached results with different code
+/// — so every resume surface (the server's resume/approve routes AND the
+/// `chidori resume` CLI) must call this first. Runs persisted before manifests
+/// existed (no readable manifest) are tolerated with a warning; every other
+/// mismatch is an error the caller should surface.
+pub fn validate_manifest_for_resume(
+    run_base: &Path,
+    run_id: Option<&str>,
+    agent_path: &Path,
+) -> Result<()> {
+    let Some(run_id) = run_id else {
+        return Ok(());
+    };
+    let store = SnapshotStore::new(run_base.join(run_id));
+    let manifest = match store.load_manifest() {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            tracing::warn!(
+                "resume: no readable snapshot manifest for run {run_id} ({err}); \
+                 skipping source verification"
+            );
+            return Ok(());
+        }
+    };
+    let entry_source = std::fs::read_to_string(agent_path).map_err(|err| {
+        anyhow::anyhow!("reading resume source {}: {}", agent_path.display(), err)
+    })?;
+    let current_entry = SourceFingerprint::from_source(agent_path, &entry_source);
+    let expected_abi = SnapshotAbi::current("chidori-quickjs");
+    let expected_policy = RuntimePolicy::from_env_for_durable_run(run_id)?;
+    // One module walk yields both manifest views (fingerprints + graph), so
+    // each imported module is read from disk once per resume instead of twice
+    // (once for its fingerprint, again inside the graph walk). Manifests
+    // written before the graph existed fall back to fingerprinting exactly
+    // the paths they list.
+    let (current_modules, current_module_graph) = if manifest.module_graph.is_empty() {
+        let mut current_modules = Vec::with_capacity(manifest.modules.len());
+        for module in &manifest.modules {
+            let source = std::fs::read_to_string(&module.path).map_err(|err| {
+                anyhow::anyhow!(
+                    "reading resume module source {}: {}",
+                    module.path.display(),
+                    err
+                )
+            })?;
+            current_modules.push(SourceFingerprint::from_source(&module.path, &source));
+        }
+        (current_modules, Vec::new())
+    } else {
+        crate::runtime::typescript::module_graph::snapshot_modules(
+            agent_path,
+            &entry_source,
+            &expected_policy,
+        )?
+    };
+    manifest.ensure_resume_compatible(
+        &expected_abi,
+        &expected_policy,
+        &current_entry,
+        &current_modules,
+        &current_module_graph,
+    )
 }
 
 #[derive(Debug, Clone)]

@@ -634,8 +634,9 @@ Session endpoints:
 - `POST /sessions/{id}/replay`: replay from a call-log checkpoint.
 - `POST /sessions/stream`: run with SSE events.
 
-Use `CHIDORI_DB_PATH=/path/to/chidori.sqlite` to persist sessions across server
-restarts.
+Sessions persist across server restarts by default (SQLite at
+`.chidori/sessions.sqlite3` next to the agent). `CHIDORI_DB_PATH` overrides
+the path; `CHIDORI_DB_PATH=:memory:` opts out of durable sessions.
 
 ## TypeScript SDK
 

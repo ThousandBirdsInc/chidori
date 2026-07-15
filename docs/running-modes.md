@@ -41,8 +41,11 @@ chidori serve agents/my_agent.ts --port 8080
 The server is **deny-by-default**: unless you configure a policy
 (`CHIDORI_POLICY*` env vars) or pass `--trusted`, gated effects (network
 requests via `fetch`/`node:http`, workspace mutations) are refused — sessions
-arrive from callers you may not control. Local `chidori run` keeps the
-permissive default. See [`docs/sandbox-model.md`](./sandbox-model.md).
+arrive from callers you may not control. Local `chidori run` is
+**ask-by-default**: with nothing configured, gated effects pause for a y/N
+prompt on your terminal (and fail closed without one); pass `--trusted` for
+the permissive allow-all posture when running agents you wrote yourself. See
+[`docs/sandbox-model.md`](./sandbox-model.md).
 
 Exposes:
 - `GET  /health` — health check

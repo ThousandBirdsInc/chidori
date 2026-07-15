@@ -259,7 +259,106 @@ impl Vm {
                 break;
             }
         }
-        let marked: Vec<bool> = live.iter().map(|o| visited.contains(&o.ptr_id())).collect();
+        // The ephemeron worklist still holds strong `Value` clones of dead-key
+        // entry values; drop them so the verification pass below sees each
+        // candidate's true strong count. (The entries themselves are pruned
+        // from their WeakMaps by the sweep.)
+        drop(ephemerons);
+        let mut marked: Vec<bool> = live.iter().map(|o| visited.contains(&o.ptr_id())).collect();
+
+        // Pass 3.5: verify before destroying anything. The accounting above is
+        // only sound if every strong `Rc` edge between registered objects was
+        // subtracted exactly once — a shared interior container (binding cell,
+        // async frame slot, mapped-arguments slot) traced once per holder
+        // instead of once globally would over-subtract and can make a LIVE
+        // object look like garbage (a use-after-free-equivalent sweep; see the
+        // module doc). That invariant is maintained by hand, so check it here
+        // structurally: every sweep candidate's strong count must be exactly
+        // our snapshot handle plus the edges that can legitimately keep
+        // garbage alive — edges from other candidates, and weak-collection
+        // entries of surviving objects (subtracted in pass 2, deliberately
+        // never traversed in pass 3). Any other total means an unexplained (or
+        // over-explained) reference: sweeping would corrupt a live object, so
+        // rescue it — and everything reachable from it — instead. Rescue turns
+        // a memory-corruption bug into a bounded leak, and debug builds assert
+        // so the regression is caught in tests. Cost is one trace over the
+        // candidates only (plus live weak-collection entries), not the heap.
+        let mut in_edges: Vec<isize> = vec![0; live.len()];
+        {
+            let mut vseen_cells: HashSet<usize> = HashSet::new();
+            let mut vseen_frames: HashSet<usize> = HashSet::new();
+            let marked_view = &marked;
+            let index_view = &index;
+            let mut count_edge = |t: &JsObject| {
+                if let Some(&j) = index_view.get(&t.ptr_id()) {
+                    if !marked_view[j] {
+                        in_edges[j] += 1;
+                    }
+                }
+            };
+            for (i, o) in live.iter().enumerate() {
+                if !marked[i] {
+                    trace_object(
+                        &o.borrow(),
+                        &mut vseen_cells,
+                        &mut vseen_frames,
+                        true,
+                        &mut count_edge,
+                    );
+                } else {
+                    let b = o.borrow();
+                    match &b.internal {
+                        Internal::WeakMap(m) => {
+                            for (k, v) in m {
+                                trace_value(&k.0, &mut count_edge);
+                                trace_value(v, &mut count_edge);
+                            }
+                        }
+                        Internal::WeakSet(s) => {
+                            for (k, _) in s {
+                                trace_value(&k.0, &mut count_edge);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let mut rescue: Vec<JsObject> = live
+            .iter()
+            .enumerate()
+            .filter(|(i, o)| !marked[*i] && (Rc::strong_count(&o.0) as isize - 1) != in_edges[*i])
+            .map(|(_, o)| o.clone())
+            .collect();
+        if !rescue.is_empty() {
+            debug_assert!(
+                false,
+                "GC accounting mismatch: {} sweep candidate(s) have strong references the trace \
+                 did not explain (a shared interior Rc traced once per holder?); rescuing them \
+                 instead of sweeping",
+                rescue.len()
+            );
+            // Conservatively keep the mismatched objects and everything they
+            // reach — including through weak entries, since rescued weak
+            // collections never went through the ephemeron pass.
+            while let Some(o) = rescue.pop() {
+                if !visited.insert(o.ptr_id()) {
+                    continue;
+                }
+                let mut found: Vec<JsObject> = Vec::new();
+                trace_object(
+                    &o.borrow(),
+                    &mut mark_cells,
+                    &mut mark_frames,
+                    true,
+                    &mut |t: &JsObject| found.push(t.clone()),
+                );
+                rescue.extend(found);
+            }
+            for (i, o) in live.iter().enumerate() {
+                marked[i] = visited.contains(&o.ptr_id());
+            }
+        }
 
         // Pass 4: sweep — clear every unmarked object's outgoing edges so the
         // cycle collapses and Rc reclamation frees the subgraph. Surviving

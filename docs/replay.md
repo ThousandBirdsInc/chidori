@@ -13,6 +13,22 @@ outputs.
 2. **Checkpoint:** The call log is a JSON array — save it to disk, send it over the wire, commit it to git.
 3. **Replay:** Re-run the agent with the call log pre-loaded. Each host function call checks the log for its seq number — hit returns the cached result instantly, miss executes normally.
 
+Replay is guarded, not best-effort:
+
+- **Source verification:** every resume surface (the server's resume/approve
+  routes *and* `chidori resume`) verifies the agent's entry + module source
+  fingerprints against the run's snapshot manifest before replaying, and
+  refuses on mismatch — cached results are never paired with changed code.
+  (Runs persisted before manifests existed skip with a warning.)
+- **Divergence checks compare arguments, not just names:** a replayed call
+  must match the recorded call's function *and* arguments (the derived
+  `request_digest` field is ignored). A completed async host operation whose
+  recorded arguments differ from the re-executed call's is a hard divergence
+  error instead of a silent live re-execution of the side effect.
+- **Escape hatch:** `CHIDORI_REPLAY_LAX=1` downgrades argument-level
+  divergence to a warning (serving the cached result / re-executing live,
+  the historical behavior). Function-name mismatches are always fatal.
+
 This means you can:
 - **Debug without spending money:** save a failing session, replay locally with breakpoints.
 - **Run deterministic tests:** check in a checkpoint, assert the agent's behavior hasn't changed.
