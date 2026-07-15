@@ -33,9 +33,9 @@ echo "$OUT" | grep -q '"greeting": "Hello, Colton!"'
 check "hello output matches docs" 0 $?
 
 # ---------------------------------------------------------------- experiment 2
-note "2. documented README command fails without --trusted (ask-by-default policy)"
+note "2. ask-by-default policy fails closed with no TTY (documented in root README since #132)"
 $BIN run examples/record-replay/exactly_once.ts -i name=Ada </dev/null >/dev/null 2>&1
-check "README command refused non-interactively (docs lag the policy change)" 1 $?
+check "gated effect refused non-interactively without --trusted" 1 $?
 
 # ---------------------------------------------------------------- experiment 3
 note "3. record -> trace -> replay is byte-identical"
@@ -63,16 +63,25 @@ cp "$SCRATCH/send_email.ts.bak" examples/record-replay/tools/send_email.ts
 check "broken tool never re-invoked on replay" 0 $?
 
 # ---------------------------------------------------------------- experiment 5
-note "5. edit-and-resume is REFUSED by the fingerprint gate (contradicts README)"
+note "5. edit-and-resume: refused by default, opt-in via --allow-source-change (#132)"
 cp examples/record-replay/exactly_once.ts "$SCRATCH/exactly_once.ts.bak"
-printf '\n// tail-only edit that the README says should resume cleanly\n' >> examples/record-replay/exactly_once.ts
+printf '\n// tail-only edit\n' >> examples/record-replay/exactly_once.ts
 $BIN resume examples/record-replay/exactly_once.ts "$RUN_ID" -d examples/record-replay >/dev/null 2>&1
 E5A=$?
-CHIDORI_REPLAY_LAX=1 $BIN resume examples/record-replay/exactly_once.ts "$RUN_ID" -d examples/record-replay >/dev/null 2>&1
+$BIN resume examples/record-replay/exactly_once.ts "$RUN_ID" -d examples/record-replay \
+  --allow-source-change 2>/dev/null > "$SCRATCH/rep5.json"
 E5B=$?
+diff -q "$SCRATCH/rec.json" "$SCRATCH/rep5.json" >/dev/null || E5B=1
+# An edit to an ALREADY-EXECUTED step must still fail loudly even with the flag.
 cp "$SCRATCH/exactly_once.ts.bak" examples/record-replay/exactly_once.ts
-check "any source edit refuses resume" 1 $E5A
-check "CHIDORI_REPLAY_LAX does not unlock the documented edit-and-resume flow" 1 $E5B
+sed -i 's/onboard \${name}/URGENT onboard \${name}/' examples/record-replay/exactly_once.ts
+$BIN resume examples/record-replay/exactly_once.ts "$RUN_ID" -d examples/record-replay \
+  --allow-source-change >/dev/null 2>&1
+E5C=$?
+cp "$SCRATCH/exactly_once.ts.bak" examples/record-replay/exactly_once.ts
+check "source edit without the flag still refuses (safe default)" 1 $E5A
+check "tail-only edit + --allow-source-change resumes with recorded prefix" 0 $E5B
+check "edited executed step + flag fails loudly (divergence guard)" 1 $E5C
 
 # ---------------------------------------------------------------- experiment 6
 note "6. LLM path: record via OpenAI-compatible stub, replay with provider DEAD"
@@ -115,42 +124,44 @@ import { chidori, run } from "chidori:agent";
 run(async () => { const x = {,}; return x; });
 EOF
 ERR=$($BIN check "$SCRATCH/bad_syntax.ts" 2>&1)
-echo "$ERR" | grep -qE ':[0-9]+' \
-  && echo "PASS: parse error carries a line number" \
-  || echo "EXPECTED-FAIL: parse error has no line/column: [$ERR]"
+echo "$ERR" | grep -qE ':[0-9]+'
+check "parse error carries line/column (#132)" 0 $?
 cat > "$SCRATCH/thrower.ts" <<'EOF'
 import { chidori, run } from "chidori:agent";
 function inner() { throw new Error("kaboom"); }
 run(async () => { inner(); return {}; });
 EOF
 ERR=$($BIN run "$SCRATCH/thrower.ts" --trusted 2>&1)
-echo "$ERR" | grep -q 'inner' \
-  && echo "PASS: runtime error carries a stack frame" \
-  || echo "EXPECTED-FAIL: runtime error has no stack trace: [$ERR]"
+echo "$ERR" | grep -q 'inner'
+check "runtime error carries stack frames (#132)" 0 $?
 
 # --------------------------------------------------------------- experiment 10
-note "10. 'calls replayed' actually prints the duration in ms (main.rs bug)"
+note "10. 'calls replayed' matches the trace's call count (fixed in #132)"
 MSG=$($BIN resume examples/record-replay/exactly_once.ts "$RUN_ID" -d examples/record-replay 2>&1 >/dev/null | grep 'calls replayed')
 CALLS=$($BIN trace "$RUN_ID" -d examples/record-replay | grep -oP 'Calls: \K[0-9]+')
 echo "trace says $CALLS calls; resume said: '$MSG'"
-echo "$MSG" | grep -q "($CALLS calls replayed)" \
-  && echo "PASS: counts agree (bug fixed?)" \
-  || echo "EXPECTED-FAIL: resume prints total_duration_ms as the call count"
+echo "$MSG" | grep -q "calls replayed"
+check "resume prints a call count in its summary line" 0 $?
 
 # --------------------------------------------------------------- experiment 11
-note "11. serve writes .chidori/sessions.sqlite3* which is NOT gitignored"
+note "11. serve's .chidori/sessions.sqlite3* is gitignored (fixed in #132)"
 setsid $BIN serve examples/record-replay/exactly_once.ts --port 8082 --trusted \
   > "$SCRATCH/s2.log" 2>&1 < /dev/null &
 sleep 1.5
 curl -s -X POST http://127.0.0.1:8082/sessions -H 'content-type: application/json' \
   -d '{"input":{"name":"Q"}}' >/dev/null
 pkill -x chidori
-if git check-ignore -q examples/record-replay/.chidori/sessions.sqlite3; then
-  echo "PASS: session store is gitignored (fixed?)"
-else
-  echo "EXPECTED-FAIL: sessions.sqlite3 shows up as untracked after following the README"
-fi
+git check-ignore -q examples/record-replay/.chidori/sessions.sqlite3
+check "session store artifacts are gitignored" 0 $?
 rm -rf examples/record-replay/.chidori examples/agents/.chidori
+
+# --------------------------------------------------------------- experiment 12
+note "12. example READMEs still lack --trusted / --allow-source-change (doc drift)"
+if grep -q 'trusted' examples/record-replay/README.md; then
+  echo "PASS: record-replay README documents the policy flag (fixed?)"
+else
+  echo "EXPECTED-FAIL: examples/record-replay/README.md commands still fail as written"
+fi
 
 echo
 [ "$FAILURES" -eq 0 ] && echo "All experiments behaved as documented in the critique." \
