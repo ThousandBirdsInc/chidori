@@ -1,9 +1,32 @@
 # Experiment results — 2026-07-15
 
 Environment: Linux x86_64 container, Rust 1.97.0, Node 22.22.2, no LLM API
-keys. Binary built with `cargo build --release` at commit `9d8ca78`.
-Reproduce with `bash critique/experiments/run_experiments.sh` from the repo
-root.
+keys. Original run built at commit `9d8ca78`; re-test run built at `6ccbfb4`
+(#132). Reproduce with `bash critique/experiments/run_experiments.sh` from
+the repo root.
+
+## Re-test after #132 (baseline `6ccbfb4`, same day)
+
+The full suite passes against the rebuilt binary, with previously
+expected-failing experiments now asserting the fixed behavior:
+
+| # | What changed | Verified result |
+|---|--------------|-----------------|
+| 5 | `--allow-source-change` added to `chidori resume` (+ server routes) | Tail-only edit + flag → resumes, output byte-identical to the recorded run. Edit to an already-executed step + flag → loud divergence refusal. No flag → safe refusal unchanged. |
+| 9a | Parse errors carry spans | `chidori check` now prints a miette-style diagnostic with `file:line:col`, the offending source line, and a caret under the token. |
+| 9b | Runtime errors carry stack traces | `Error: kaboom` now prints `at inner (...thrower.ts:2:15)` etc. **Residual nit:** frames above the throwing frame use post-transpile line numbers (`outer` reported at `:5:15`, source line 3; the `run(...)` callback at `:8:11`, source line 4) — mapping is only correct for the first frame. |
+| 10 | `main.rs` count bug fixed | `(5 calls replayed)` now matches `trace`'s `Calls: 5` for the same run. |
+| 11 | `.gitignore` covers `**/.chidori/sessions.sqlite3*` | `git check-ignore` passes after a `serve` session; workflow no longer dirties the repo. |
+| 12 (new) | Example-README sweep | Still outstanding: `examples/record-replay/README.md` mentions neither `--trusted` nor `--allow-source-change`, so its commands still fail as written. |
+
+Also landed in #132 and confirmed from source/diff: `rust-toolchain.toml`
+pinned to `channel = "1.97"` (fixes the late first-build failure, experiment
+0), root README + getting-started now document the ask-by-default policy and
+`--trusted` (experiment 2's refusal is now documented behavior),
+`sandbox-model.md`'s isolation-default contradiction fixed, Python SDK ships
+`py.typed` and handles the `paused` SSE event (with new tests).
+
+## Original run (baseline `9d8ca78`)
 
 | # | Experiment | Result |
 |---|------------|--------|

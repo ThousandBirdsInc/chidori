@@ -1,12 +1,43 @@
 # Chidori project critique — code quality & end-user experience
 
-*Date: 2026-07-15 · Baseline: commit `9d8ca78` (v3.6.0) · Method: full-source
-review of all three crates and both SDKs, plus a hands-on experiment suite run
-as a first-time end user (no LLM API keys) on Linux x86_64.*
+*Date: 2026-07-15 · Original baseline: commit `9d8ca78` (v3.6.0) · **Revised
+same day against `6ccbfb4` (#132)** · Method: full-source review of all three
+crates and both SDKs, plus a hands-on experiment suite run as a first-time end
+user (no LLM API keys) on Linux x86_64.*
 
 Everything empirical in this document is reproducible:
 `bash critique/experiments/run_experiments.sh` (see
 [experiments/RESULTS.md](./experiments/RESULTS.md) for the full run log).
+
+## Revision note (post-#132)
+
+Hours after the original critique was written, #132 landed on main and
+resolved most of its top findings. Re-tested against a rebuilt binary at
+`6ccbfb4` — all confirmed empirically, not from the diff:
+
+| Original finding | Status at `6ccbfb4` |
+|---|---|
+| No stack traces / no parse line-column (friction #1) | **Fixed.** Runtime errors now print full frame stacks; parse errors print miette-style diagnostics with a source snippet and caret. One residual nit below. |
+| Edit-and-resume unreachable (friction #2) | **Fixed** — `chidori resume --allow-source-change` (and `"allow_source_change": true` on server routes), exactly the shape recommended. Verified: tail-only edit resumes with the recorded prefix; an edit to an already-executed step still fails loudly; without the flag the safe refusal stands. |
+| Docs lag ask-by-default policy (friction #3) | **Partially fixed.** Root README and getting-started now document `--trusted` and the fail-closed no-TTY behavior; `examples/record-replay/README.md` is still unswept (its commands still fail as written — experiment 12). |
+| First-build toolchain friction (friction #4) | **Fixed** — `rust-toolchain.toml` now pins `channel = "1.97"` with a comment explaining the late-failure mode this prevents. |
+| Duration printed as "calls replayed" (papercut) | **Fixed** — now prints the record count, which matches `trace`. |
+| `sessions.sqlite3*` not gitignored (papercut) | **Fixed.** |
+| Python `py.typed` missing + `paused` SSE event dropped (SDK seams) | **Fixed** — marker shipped, classifier added, `paused` documented and handled, with new tests. |
+
+Still open after #132: the example-README sweep (exp. 12), `approve`/`cancel`
+SDK methods, the god files, stringly-typed errors, `#![forbid(unsafe_code)]`,
+and one **new nit**: stack frames after the throwing frame carry
+post-transpile line numbers (`outer` reported at `:5` when it sits on line 3),
+so the source mapping is incomplete beyond the first frame.
+
+The turnaround itself is signal: the six findings fixed were precisely the
+cheap-to-fix seams the original verdict predicted they were, and the
+maintainer-responsiveness question raised in §3 now has an answer. With the
+DX layer repaired, the end-user experience is a straight **A**; the overall
+grade stays **A-** only on the structural debts (god files, stringly errors),
+which are real but not urgent. The original text below is preserved as
+written against `9d8ca78`, with per-finding status markers added.
 
 ---
 
@@ -118,6 +149,7 @@ showcase module.
    line/column** (`TypeScript parse error: Unexpected token`) even though oxc
    has spans. For a framework whose pitch is *debuggability*, this is the gap
    an agent author hits within the first ten minutes of writing real code.
+   *(Status: fixed in #132, verified — see revision note.)*
 2. **A headline documented feature is currently unreachable.**
    `examples/record-replay/README.md` §"Edit then resume" promises
    modify-and-resume with divergence checking; the fingerprint gate added in
@@ -125,19 +157,24 @@ showcase module.
    `chidori resume`, with no opt-in flag, and `CHIDORI_REPLAY_LAX` governs a
    different (now-unreachable-from-here) layer. The refusal message doesn't
    say how to do it on purpose.
+   *(Status: fixed in #132 via `--allow-source-change`, verified.)*
 3. **Docs lag the ask-by-default policy (#130).** Every `chidori run` command
    in the README, getting-started, and example READMEs fails when stdin isn't
    a TTY (CI, pipes, scripts) because none mention `--trusted` or a policy
    profile.
+   *(Status: partially fixed in #132 — root README and getting-started now
+   document it; example READMEs still unswept.)*
 4. **First-build friction:** stable Rust 1.94 fails late with a version
    resolution error; `rust-toolchain.toml` pins `channel = "stable"` which
    can't express the ≥1.95 floor it documents in a comment.
+   *(Status: fixed in #132 — pinned to `1.97`.)*
 5. **Papercuts:** `resume` prints the run *duration in ms* as "`N` calls
    replayed" (`main.rs:1372`); `serve`'s session store
    (`.chidori/sessions.sqlite3*`, also from #130) isn't gitignored, so the
    documented workflow dirties the repo; `trace` lists child calls above their
    parents; `serve --help` says "event dict" (Python-ism); the snapshot ABI
    label is still `"chidori-quickjs"`.
+   *(Status: first two fixed in #132; the cosmetic three remain.)*
 6. **SDK seams** (from the parallel SDK review): the Python package ships no
    `py.typed`, so its careful annotations are invisible to consumers'
    type-checkers; Python `stream()` silently drops the `paused` SSE event that
@@ -145,6 +182,8 @@ showcase module.
    exactly where signal-driven flows need it); no SDK method wraps
    `/approve` or `/cancel`; `docs/sandbox-model.md` contradicts itself (and
    the code) about whether OS isolation is default-on.
+   *(Status: `py.typed`, the `paused` event, and the sandbox-doc contradiction
+   fixed in #132; `approve`/`cancel` SDK methods still missing.)*
 
 ### A meta-observation
 
@@ -161,7 +200,7 @@ all of it.
 ## 3. How I feel about it
 
 Skeptical going in, won over by the end. "Durable, replayable agents on our
-own JS engine" reads like a pitch deck; three days of trying to break it says
+own JS engine" reads like a pitch deck; a day spent trying to break it says
 otherwise. The determinism claims are the most falsifiable claims a framework
 can make, and this one passes its own audit — including under sabotage. The
 engineering culture visible in the tree (honest benchmark tables that admit
@@ -174,28 +213,42 @@ What would make me hesitate to bet production work on it today: single-digit
 bus factor implied by the uniform authorial voice, the maintenance tax of a
 private JS engine chasing a moving spec, and the missing stack traces. What
 would make me bet anyway: every safety default is fail-closed, every claim I
-tested was true, and the worst bugs I could find in three days were a
-duration printed as a count and a stale README.
+tested was true, and the worst bugs I could find in a day of trying were a
+duration printed as a count and a stale README. (Post-#132 both of those are
+fixed, and "how fast does upstream respond" — the question this section
+couldn't answer — resolved in the project's favor the same afternoon.)
 
 ## 4. Top recommendations (highest leverage first)
 
-1. **Stack traces and parse spans.** Thread oxc spans into `check`/parse
-   errors and capture JS frames into `JavaScript exception:` messages. This is
-   the single biggest UX multiplier available.
-2. **Re-enable edit-and-resume behind an explicit flag**
-   (`chidori resume --allow-edited-source`, refusal message pointing to it),
-   restoring the documented workflow without weakening the safe default.
-3. **Sweep docs/examples for #130 fallout:** add `--trusted` (or a
-   policy-profile stanza) to every non-interactive command; fix
-   `sandbox-model.md`'s self-contradiction; gitignore
-   `**/.chidori/sessions.sqlite3*`.
-4. **Fix `main.rs:1372`** (`total_duration_ms()` printed as call count).
-5. **Ship `py.typed` + the Python `paused` SSE event**; add `approve`/`cancel`
-   to both SDKs.
-6. Then, at leisure: split `server.rs`/`exec.rs`, introduce typed error enums
+*Revised after #132 — the original list is preserved below it for the record.*
+
+**Remaining, post-#132:**
+
+1. **Finish the doc sweep in `examples/`**: add `--trusted` to the
+   `examples/record-replay/README.md` commands and point its "Edit then
+   resume" section at `--allow-source-change` (experiment 12 tracks this).
+2. **Complete the stack-trace source mapping**: frames after the throwing one
+   report post-transpile line numbers (`outer` at `:5` when it sits on line
+   3) — the last piece of the debuggability story #132 opened.
+3. **Add `approve()`/`cancel()` to both SDKs** — `run()`'s own docstring
+   points users at endpoints the SDKs can't call.
+4. Then, at leisure: split `server.rs`/`exec.rs`, introduce typed error enums
    at the host-call boundary, add `#![forbid(unsafe_code)]` to `chidori-js`,
-   and encode the ≥1.95 floor as `rust-version` in the workspace so old
-   toolchains fail fast with a clear message.
+   and clean the cosmetic trio (child-before-parent `trace` ordering, "event
+   dict" in `serve --help`, the `"chidori-quickjs"` ABI label).
+
+**Original list (as written at `9d8ca78`):**
+
+1. ~~**Stack traces and parse spans.**~~ *Done in #132.*
+2. ~~**Re-enable edit-and-resume behind an explicit flag.**~~ *Done in #132 as
+   `--allow-source-change`, including the server-route variant.*
+3. ~~**Sweep docs/examples for #130 fallout.**~~ *Mostly done in #132
+   (README, getting-started, sandbox-model.md, gitignore); examples/ remains.*
+4. ~~**Fix `main.rs:1372`.**~~ *Done in #132.*
+5. ~~**Ship `py.typed` + the Python `paused` SSE event.**~~ *Done in #132;
+   `approve`/`cancel` still open.*
+6. The structural items (god files, typed errors, `forbid(unsafe_code)`)
+   carry forward above; the toolchain floor landed in #132 as a `1.97` pin.
 
 ---
 
