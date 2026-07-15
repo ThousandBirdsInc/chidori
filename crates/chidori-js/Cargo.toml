@@ -36,6 +36,11 @@ mimalloc = ["dep:mimalloc"]
 [dependencies]
 # Front end only: we consume the oxc AST and write no lexer/parser of our own.
 oxc = { version = "0.133", features = ["semantic", "transformer", "codegen"] }
+# Span→line/column resolution for parse-error rendering (oxc diagnostics carry
+# miette labeled spans; `SourceCode::read_span` turns a byte offset into a
+# position). Core only — no report-rendering features. Already in the tree
+# transitively, so this adds no new crates.
+miette = { version = "7", default-features = false }
 # Deterministic, insertion-ordered property maps. Object/Map/Set iteration order
 # must be address-independent for replay to be correct (see determinism contract).
 indexmap = "2"

@@ -589,6 +589,7 @@ dependencies = [
  "icu_locale_core",
  "icu_plurals",
  "indexmap 2.14.0",
+ "miette",
  "mimalloc",
  "num-bigint 0.5.1",
  "num-integer",

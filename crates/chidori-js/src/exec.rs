@@ -3275,7 +3275,8 @@ impl Vm {
     /// stack path by construction: their protos contain suspension ops, which
     /// decline register translation.
     pub fn run_frame(&mut self, frame: Box<Frame>) -> Flow {
-        if let Some(reg) = &frame.func.proto.reg {
+        let proto = frame.func.proto.clone();
+        let flow = if let Some(reg) = &proto.reg {
             // Budgeted runs (the production op budget, the conformance
             // runner, untrusted eval) stay on the register tier too:
             // `RegProto::costs` charges each register op its EXACT
@@ -3288,9 +3289,17 @@ impl Vm {
                 frame.ip == 0 && frame.pending_throw.is_none() && frame.pending_return.is_none()
             );
             let reg = reg.clone();
-            return self.run_reg_frame(frame, &reg);
+            self.run_reg_frame(frame, &reg)
+        } else {
+            self.run_stack_frame(frame)
+        };
+        // A throw unwinding out of this activation records it on the error's
+        // `.stack`, so an uncaught error carries a real stack trace. Success
+        // pays only the `proto` Rc clone above.
+        if let Flow::Throw(e) = &flow {
+            self.record_unwind_frame(e, &proto);
         }
-        self.run_stack_frame(frame)
+        flow
     }
 
     fn run_stack_frame(&mut self, mut frame: Box<Frame>) -> Flow {

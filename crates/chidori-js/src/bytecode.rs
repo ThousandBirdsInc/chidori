@@ -135,6 +135,11 @@ pub struct FuncProto {
     pub kind: FuncKind,
     /// Source span for stack traces (start byte offset).
     pub source_start: u32,
+    /// 1-based line/column of the function's definition site in its source,
+    /// rendered in error stack traces (`at name (line:col)`). `0` = unknown
+    /// (synthetic protos, sources compiled without position tracking).
+    pub source_line: u32,
+    pub source_col: u32,
     /// Whether this function references `arguments`.
     pub uses_arguments: bool,
     /// Names of the positional params, for `arguments`/debug.
@@ -262,6 +267,8 @@ impl FuncProto {
             upvalues: Vec::new(),
             kind,
             source_start: 0,
+            source_line: 0,
+            source_col: 0,
             uses_arguments: false,
             param_names: Vec::new(),
             mapped_param_cells: Vec::new(),

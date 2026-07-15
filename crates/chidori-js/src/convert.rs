@@ -31,6 +31,34 @@ impl Vm {
         self.to_string_lossy(err)
     }
 
+    /// As [`Vm::error_to_string`], but when the thrown value carries frames
+    /// recorded during unwinding (see `Vm::record_unwind_frame`), append them —
+    /// multi-line `Name: message\n    at f (line:col)\n    at g (...)` output
+    /// for surfaces that show an uncaught error to a human. Values without
+    /// recorded frames render exactly as [`Vm::error_to_string`].
+    pub fn error_to_string_with_stack(&mut self, err: &Value) -> String {
+        let head = self.error_to_string(err);
+        if let Value::Object(o) = err {
+            let b = o.borrow();
+            if matches!(b.internal, Internal::Error) {
+                if let Some(prop) = b.own_get(&StrKeyRef("stack")) {
+                    if let PropertyKind::Data {
+                        value: Value::String(s),
+                        ..
+                    } = &prop.kind
+                    {
+                        if let Some(i) = s.as_str().find("\n    at ") {
+                            let mut out = head;
+                            out.push_str(&s.as_str()[i..]);
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        head
+    }
+
     /// Engine value → JSON (host boundary). Mirrors `JSON.stringify` semantics
     /// for plain data; functions/symbols/undefined become `null`.
     pub fn value_to_json(&mut self, v: &Value) -> Json {

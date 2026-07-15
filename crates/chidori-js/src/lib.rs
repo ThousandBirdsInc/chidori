@@ -930,7 +930,7 @@ impl Engine {
         registry.modules.insert(entry.to_string(), rec.clone());
         self.vm
             .run_module_graph(&registry, entry)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         // Entrypoint: whatever `run(...)` captured, else the named export.
         let handler = slot.borrow().clone().or_else(|| {
             cell_of_name
@@ -945,11 +945,11 @@ impl Engine {
         let ret = self
             .vm
             .call(handler, Value::Undefined, &[arg, chidori])
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         let settled = self
             .vm
             .settle(ret)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
 
@@ -1000,7 +1000,7 @@ impl Engine {
 
         self.vm
             .run_module_graph(&registry, entry_key)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
 
         let entry_rec = entry_rec.ok_or_else(|| "entry module was not loaded".to_string())?;
         let cell_of_name =
@@ -1019,11 +1019,11 @@ impl Engine {
         let ret = self
             .vm
             .call(handler, Value::Undefined, &[arg, chidori])
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         let settled = self
             .vm
             .settle(ret)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
 
@@ -1068,7 +1068,7 @@ impl Engine {
 
         self.vm
             .run_module_graph(&registry, entry_key)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
 
         let entry_rec = entry_rec.ok_or_else(|| "entry module was not loaded".to_string())?;
         let cell_of_name =
@@ -1080,7 +1080,7 @@ impl Engine {
         let settled = self
             .vm
             .settle(val)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
 }

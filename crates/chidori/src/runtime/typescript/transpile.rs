@@ -146,6 +146,32 @@ fn transpile_cache() -> &'static std::sync::Mutex<TranspileCache> {
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Render oxc diagnostics through miette's graphical report handler (the
+/// diagnostic toolkit oxc's errors are built on): each error shows its
+/// `file:line:column`, the offending source line, and a caret under the exact
+/// span — instead of a bare message that leaves the user hunting for the
+/// position. Unicode box-drawing, no ANSI color (output lands in error chains
+/// and logs, not always a terminal).
+fn render_diagnostics(
+    path: &Path,
+    source: &str,
+    errors: &[oxc::diagnostics::OxcDiagnostic],
+) -> String {
+    use oxc::diagnostics::{GraphicalReportHandler, GraphicalTheme, NamedSource};
+    let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
+    let mut out = String::new();
+    for err in errors {
+        let report = err
+            .clone()
+            .with_source_code(NamedSource::new(path.to_string_lossy(), source.to_string()));
+        if handler.render_report(&mut out, report.as_ref()).is_err() {
+            // Rendering is best-effort presentation; never mask the error itself.
+            out.push_str(&format!("\n{err}"));
+        }
+    }
+    out
+}
+
 /// The pure transpile pipeline (no import validation, no filesystem access).
 fn transpile_source(path: &Path, source: &str) -> Result<String> {
     // Treat input as TypeScript regardless of extension — agents may live in
@@ -155,15 +181,10 @@ fn transpile_source(path: &Path, source: &str) -> Result<String> {
 
     let parser_ret = Parser::new(&allocator, source, source_type).parse();
     if !parser_ret.errors.is_empty() {
-        let messages: Vec<String> = parser_ret
-            .errors
-            .iter()
-            .map(|err| err.to_string())
-            .collect();
         anyhow::bail!(
-            "{}: TypeScript parse error: {}",
+            "{}: TypeScript parse error:{}",
             path.display(),
-            messages.join("; ")
+            render_diagnostics(path, source, &parser_ret.errors)
         );
     }
     let mut program = parser_ret.program;
@@ -173,15 +194,10 @@ fn transpile_source(path: &Path, source: &str) -> Result<String> {
         .with_excess_capacity(2.0)
         .build(&program);
     if !semantic_ret.errors.is_empty() {
-        let messages: Vec<String> = semantic_ret
-            .errors
-            .iter()
-            .map(|err| err.to_string())
-            .collect();
         anyhow::bail!(
-            "{}: TypeScript semantic error: {}",
+            "{}: TypeScript semantic error:{}",
             path.display(),
-            messages.join("; ")
+            render_diagnostics(path, source, &semantic_ret.errors)
         );
     }
     let scoping = semantic_ret.semantic.into_scoping();
@@ -200,15 +216,10 @@ fn transpile_source(path: &Path, source: &str) -> Result<String> {
     let transformer_ret = Transformer::new(&allocator, path, &transform_options)
         .build_with_scoping(scoping, &mut program);
     if !transformer_ret.errors.is_empty() {
-        let messages: Vec<String> = transformer_ret
-            .errors
-            .iter()
-            .map(|err| err.to_string())
-            .collect();
         anyhow::bail!(
-            "{}: TypeScript transform error: {}",
+            "{}: TypeScript transform error:{}",
             path.display(),
-            messages.join("; ")
+            render_diagnostics(path, source, &transformer_ret.errors)
         );
     }
 
