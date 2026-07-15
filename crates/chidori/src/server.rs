@@ -528,6 +528,7 @@ pub async fn serve(
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
     agent_path: PathBuf,
+    host: String,
     port: u16,
     policy: Arc<PolicyConfig>,
     policy_posture: String,
@@ -646,6 +647,21 @@ pub async fn serve(
     }
 
     let auth_required = std::env::var("CHIDORI_API_KEY").is_ok();
+    let loopback = is_loopback_host(&host);
+    // Fail closed on the dangerous combination: a network-reachable bind with
+    // no authentication means anyone who can route to the port can execute
+    // agent code. The default bind is loopback, so this only trips when the
+    // operator explicitly asked for a wider bind without setting a key.
+    if !loopback && !auth_required && !allow_unauthenticated_from_env() {
+        anyhow::bail!(
+            "refusing to bind {host}:{port} without authentication: a non-loopback bind \
+             exposes this server — which executes agent code — to the network with no \
+             access control. Either set CHIDORI_API_KEY to require bearer auth, keep the \
+             default loopback bind (drop --host / CHIDORI_HOST), or set \
+             CHIDORI_ALLOW_UNAUTHENTICATED=1 if a reverse proxy or firewall in front of \
+             this server already controls access."
+        );
+    }
     let cors_layer = build_cors_layer();
 
     // ACP router owns its own state so session lookups go through the same
@@ -694,8 +710,14 @@ pub async fn serve(
         .layer(middleware::from_fn(auth_middleware))
         .layer(cors_layer);
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("{host}:{port}");
     eprintln!("Listening on http://{addr}");
+    if !loopback {
+        eprintln!(
+            "WARNING: non-loopback bind speaks plain HTTP (no TLS). Terminate TLS at a \
+             reverse proxy or platform ingress and firewall the port (docs/deployment.md)."
+        );
+    }
     eprintln!();
     eprintln!(
         "  Concurrency: max {} sessions, {}ms acquire timeout",
@@ -705,8 +727,11 @@ pub async fn serve(
         "  Auth:        {}",
         if auth_required {
             "REQUIRED (Authorization: Bearer $CHIDORI_API_KEY)"
+        } else if loopback {
+            "disabled (loopback bind; set CHIDORI_API_KEY to enable)"
         } else {
-            "disabled (set CHIDORI_API_KEY to enable)"
+            "DISABLED on a network-reachable bind (CHIDORI_ALLOW_UNAUTHENTICATED) — \
+             anyone who can reach the port can execute agents"
         }
     );
     eprintln!("  Policy:      {}", policy_posture);
@@ -804,6 +829,28 @@ fn bearer_token_matches(header_value: &str, raw_keys: &str) -> bool {
         ok |= bool::from(expected.as_bytes().ct_eq(header_value.as_bytes()));
     }
     ok
+}
+
+/// A bind host counts as loopback when it is the literal name `localhost` or
+/// parses to a loopback IP (`127.0.0.0/8`, `::1`). Anything else — including
+/// unresolvable hostnames — is treated as network-reachable, so the
+/// no-auth-on-a-reachable-bind refusal fails closed.
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// Explicit operator opt-out of the "non-loopback bind requires
+/// CHIDORI_API_KEY" refusal, for deployments where something in front of the
+/// server (reverse proxy auth, network policy, firewall) controls access.
+fn allow_unauthenticated_from_env() -> bool {
+    matches!(
+        std::env::var("CHIDORI_ALLOW_UNAUTHENTICATED").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
 }
 
 /// Build a CORS layer from `CHIDORI_CORS_ORIGINS`:
@@ -2977,6 +3024,22 @@ mod tests {
         assert!(bearer_token_matches("Bearer k2", " k1 , k2 ,"));
         // An empty list entry never matches an empty credential.
         assert!(!bearer_token_matches("Bearer ", ","));
+    }
+
+    #[test]
+    fn loopback_host_classification() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.0.0.2")); // whole 127.0.0.0/8 block
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("localhost"));
+        // Network-reachable binds — these require auth (or the explicit
+        // CHIDORI_ALLOW_UNAUTHENTICATED opt-out) at startup.
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("::"));
+        assert!(!is_loopback_host("10.0.0.5"));
+        // Unparseable hostnames fail closed: treated as network-reachable.
+        assert!(!is_loopback_host("my-host.internal"));
+        assert!(!is_loopback_host(""));
     }
 
     fn test_run_base(name: &str) -> PathBuf {

@@ -83,7 +83,14 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   `CHIDORI_HTTP_ALLOW_HOSTS` (comma-separated hostnames, IPs, or CIDRs, e.g.
   `localhost,10.2.0.0/16`); the single value `*` disables the guard.
 
-- **TLS:** the server speaks plain HTTP on `0.0.0.0:<port>`. Put a reverse
+- **Bind address:** the server binds loopback (`127.0.0.1:<port>`) by
+  default, so a fresh `chidori serve` is not reachable from the network. To
+  expose it — in a container, or to a proxy on another machine — pass
+  `--host 0.0.0.0` (or set `CHIDORI_HOST`). A non-loopback bind **requires
+  `CHIDORI_API_KEY`**; the server refuses to start otherwise. If access is
+  genuinely controlled in front of the server (reverse-proxy auth, network
+  policy), `CHIDORI_ALLOW_UNAUTHENTICATED=1` overrides the refusal.
+- **TLS:** the server speaks plain HTTP on whatever it binds. Put a reverse
   proxy or the platform's TLS in front, and firewall the port.
 - **Policy:** `chidori serve` is **deny-by-default** — gated effects (`fetch`,
   workspace mutations) are refused until you configure `CHIDORI_POLICY_FILE`
@@ -157,7 +164,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 COPY . .
 EXPOSE 8080
-CMD ["chidori", "serve", "agent.ts", "--port", "8080"]
+# --host 0.0.0.0 makes the port reachable from outside the container; the
+# server then requires CHIDORI_API_KEY at startup (set it in the env block).
+CMD ["chidori", "serve", "agent.ts", "--host", "0.0.0.0", "--port", "8080"]
 ```
 
 Pair it with an `s3://` mirror instead of a volume — hydration makes the
@@ -397,6 +406,9 @@ sequenceDiagram
 ## Production checklist
 
 - [ ] `CHIDORI_API_KEY` set; port reachable only through a TLS proxy
+- [ ] Bind address deliberate: loopback default for a same-host proxy, or
+      `--host 0.0.0.0` when the proxy/ingress is elsewhere (auth then
+      enforced at startup)
 - [ ] Policy configured (`CHIDORI_POLICY_FILE`, or a deliberate `--trusted`)
 - [ ] `CHIDORI_HTTP_ALLOW_HOSTS` limited to the internal hosts agents truly
       need (never `*` in production)

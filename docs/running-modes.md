@@ -47,6 +47,12 @@ prompt on your terminal (and fail closed without one); pass `--trusted` for
 the permissive allow-all posture when running agents you wrote yourself. See
 [`docs/sandbox-model.md`](./sandbox-model.md).
 
+It also binds **loopback only** (`127.0.0.1`) by default. To make it reachable
+from the network, pass `--host 0.0.0.0` (or set `CHIDORI_HOST`) — which
+requires `CHIDORI_API_KEY` to be set, since an exposed unauthenticated server
+would let anyone on the network execute agents. See
+[`docs/deployment.md`](./deployment.md).
+
 Exposes:
 - `GET  /health` — health check
 - `ANY  /*` — any request is passed to `agent(event)` as an event dict
