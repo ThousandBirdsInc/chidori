@@ -44,6 +44,12 @@ requests via `fetch`/`node:http`, workspace mutations) are refused — sessions
 arrive from callers you may not control. Local `chidori run` keeps the
 permissive default. See [`docs/sandbox-model.md`](./sandbox-model.md).
 
+It also binds **loopback only** (`127.0.0.1`) by default. To make it reachable
+from the network, pass `--host 0.0.0.0` (or set `CHIDORI_HOST`) — which
+requires `CHIDORI_API_KEY` to be set, since an exposed unauthenticated server
+would let anyone on the network execute agents. See
+[`docs/deployment.md`](./deployment.md).
+
 Exposes:
 - `GET  /health` — health check
 - `ANY  /*` — any request is passed to `agent(event)` as an event dict

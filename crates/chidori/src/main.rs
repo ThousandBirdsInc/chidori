@@ -304,6 +304,15 @@ enum Commands {
         #[arg(short, long, default_value = "8080")]
         port: u16,
 
+        /// Address to bind. Defaults to loopback (127.0.0.1) so the server —
+        /// which executes agent code — is not reachable from the network
+        /// unless you opt in. Pass `--host 0.0.0.0` (or set CHIDORI_HOST) to
+        /// expose it; a non-loopback bind requires CHIDORI_API_KEY to be set
+        /// unless CHIDORI_ALLOW_UNAUTHENTICATED=1 explicitly opts out. The
+        /// server speaks plain HTTP either way — terminate TLS in front of it.
+        #[arg(long)]
+        host: Option<String>,
+
         /// Print host function calls to stderr during execution
         #[arg(short, long)]
         verbose: bool,
@@ -436,6 +445,7 @@ fn main() {
         Commands::Serve {
             file,
             port,
+            host,
             verbose,
             untrusted,
             trusted,
@@ -444,7 +454,10 @@ fn main() {
             if isolate {
                 crate::runtime::isolate::enable();
             }
-            (cmd_serve(&file, port, verbose, untrusted, trusted), false)
+            (
+                cmd_serve(&file, host.as_deref(), port, verbose, untrusted, trusted),
+                false,
+            )
         }
     };
 
@@ -624,8 +637,9 @@ fn cmd_demo() -> Result<()> {
                 return Ok(());
             }
             // The demo serves the developer's own example agent on their own
-            // machine — the trusted posture, like `chidori run`.
-            cmd_serve(&PathBuf::from(file), *port, false, false, true)
+            // machine — the trusted posture, like `chidori run`, on the
+            // default loopback bind.
+            cmd_serve(&PathBuf::from(file), None, *port, false, false, true)
         }
     }
 }
@@ -1537,7 +1551,14 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(file: &Path, port: u16, verbose: bool, untrusted: bool, trusted: bool) -> Result<()> {
+fn cmd_serve(
+    file: &Path,
+    host: Option<&str>,
+    port: u16,
+    verbose: bool,
+    untrusted: bool,
+    trusted: bool,
+) -> Result<()> {
     if verbose {
         tracing_subscriber::fmt()
             .with_env_filter("info")
@@ -1569,12 +1590,21 @@ fn cmd_serve(file: &Path, port: u16, verbose: bool, untrusted: bool, trusted: bo
     // callers by policy but not by process, point at --isolate.
     crate::runtime::isolate::warn_if_untrusted_without_isolation(!trusted);
 
+    // Bind-address precedence: --host flag, then CHIDORI_HOST, then the safe
+    // loopback default (the server refuses non-loopback binds without auth —
+    // see server::serve).
+    let host = host
+        .map(str::to_owned)
+        .or_else(|| std::env::var("CHIDORI_HOST").ok())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
     let (policy, policy_posture) = serve_policy(untrusted, trusted);
     let tokio_rt = scheduler::new_tokio_runtime().context("Failed to create server runtime")?;
     tokio_rt.block_on(server::serve(
         providers,
         template_engine,
         file.to_path_buf(),
+        host,
         port,
         policy,
         policy_posture,

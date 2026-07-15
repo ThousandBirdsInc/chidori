@@ -188,6 +188,7 @@ Every model call is a recorded host call:
 
 ```ts
 // summarizer.ts
+/// <reference types="@1kbirds/chidori/agent-env" />
 import { chidori, run } from "chidori:agent";
 
 run(async (input: { document: string }) => {
@@ -199,6 +200,15 @@ run(async (input: { document: string }) => {
 
 That's a complete, durable agent. Both prompts are recorded; replay returns them
 for free.
+
+`chidori:agent` is a **virtual** module the runtime injects at execution time —
+there is no npm package behind it, so the runtime needs nothing installed. The
+`/// <reference …>` line is what gives your editor and `tsc` its types: they
+ship in the [`@1kbirds/chidori`](https://www.npmjs.com/package/@1kbirds/chidori)
+npm package (`npm install -D @1kbirds/chidori`, or add
+`"types": ["@1kbirds/chidori/agent-env"]` to your `tsconfig.json` instead of
+the per-file directive). See the
+[TypeScript SDK README](./sdk/typescript/README.md) for the full story.
 
 ### 3. Run it
 
