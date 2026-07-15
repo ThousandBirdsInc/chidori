@@ -223,6 +223,17 @@ chidori run summarizer.ts \
   --input document="Rust is a systems programming language..."
 ```
 
+`chidori run` **asks before powerful effects by default**: tool calls, network
+access (`chidori.fetch`), and workspace writes pause for a one-keypress
+approval at the terminal (LLM prompts and pure compute never ask). That's the
+safe default for running code you didn't write; for your own agents, in
+scripts, or in CI — where there is no terminal to ask at, so gated effects
+fail closed — pass `--trusted`:
+
+```bash
+chidori run my_agent.ts --trusted --tools tools
+```
+
 Re-run the same agent with `chidori resume summarizer.ts <run_id>` to replay it
 byte-for-byte with zero model calls (the run id is printed under
 `.chidori/runs/`).
@@ -246,6 +257,10 @@ chidori run examples/agents/hello.ts --input name=Colton  # no LLM calls
 chidori run examples/agents/tool_use.ts \
   --input query=chidori --tools examples/tools            # local TS tool, no LLM
 ```
+
+(The tool call in the second example is a gated effect: approve it at the
+prompt, or add `--trusted` to skip the ask — see
+[Running modes](./docs/running-modes.md).)
 
 For a guided walkthrough — inspecting a run, the demo picker, and the
 human-in-the-loop pause/resume loop — see

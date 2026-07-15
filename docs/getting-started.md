@@ -43,6 +43,13 @@ Expected output:
 }
 ```
 
+> **Approval prompts:** `chidori run` asks before *powerful* effects by
+> default — tool calls, network access, workspace writes — with a y/N prompt
+> at the terminal. (LLM prompts and pure compute, like this example, never
+> ask.) Running non-interactively — scripts, CI — there is no terminal to ask
+> at and gated effects fail closed: pass `--trusted` there, or configure a
+> policy. See [Running modes](./running-modes.md).
+
 What this demonstrates:
 
 - `examples/agents/hello.ts` imports `{ chidori, run }` from `chidori:agent`
