@@ -258,6 +258,14 @@ pub struct Vm {
     /// Wrapping counter so [`Vm::native_tick`] only polls the interrupt flag
     /// every 256 iterations (same cadence as the interpreter loop).
     pub(crate) native_poll: u32,
+    /// Source position (byte offset) of the op the currently-propagating
+    /// exception left its frame at. Written by the interpreter tiers at every
+    /// `Flow::Throw` exit, consumed (`take`n) by `run_frame` when it records
+    /// that frame on the error's `.stack` — so the innermost frame reports
+    /// its throw site and each outer frame its call site, not the function's
+    /// definition line. `None` between unwinds and for tiers/exits that carry
+    /// no position (which then fall back to the definition site).
+    pub(crate) throw_pos: Option<u32>,
     /// Module evaluation: when set, `run_frame` snapshots the final cell vector of
     /// the frame whose proto pointer matches, into `module_capture`. This lets the
     /// module linker recover a module's top-level binding cells (its live exports)
@@ -427,6 +435,7 @@ impl Vm {
             op_budget: None,
             interrupt: None,
             native_poll: 0,
+            throw_pos: None,
             module_capture_proto: None,
             module_capture: None,
             trace_sink: None,
@@ -743,12 +752,20 @@ impl Vm {
     /// Called by `run_frame` as a throw unwinds out of a frame, so an uncaught
     /// error accumulates one `    at name (line:col)` line per JS frame it
     /// crossed, innermost first — a stack trace built entirely on the unwind
-    /// path (the happy path pays nothing). The position is the function's
-    /// *definition* site (the engine keeps no per-op line table). Only `Error`
-    /// objects whose `stack` is still a plain string are annotated, and frames
-    /// stop accumulating once the trace is `MAX_UNWIND_FRAMES` deep (a rethrow
-    /// loop must not grow the string unboundedly).
-    pub(crate) fn record_unwind_frame(&self, err: &Value, proto: &crate::bytecode::FuncProto) {
+    /// path (the happy path pays nothing). `pos` is the source offset the
+    /// throw left the frame at (see [`Vm::throw_pos`]): the throwing statement
+    /// for the innermost frame, the active call site for outer frames. When
+    /// it is absent or the proto carries no source, the function's
+    /// *definition* site is the fallback. Only `Error` objects whose `stack`
+    /// is still a plain string are annotated, and frames stop accumulating
+    /// once the trace is `MAX_UNWIND_FRAMES` deep (a rethrow loop must not
+    /// grow the string unboundedly).
+    pub(crate) fn record_unwind_frame(
+        &self,
+        err: &Value,
+        proto: &crate::bytecode::FuncProto,
+        pos: Option<u32>,
+    ) {
         const MAX_UNWIND_FRAMES: usize = 32;
         let Value::Object(o) = err else { return };
         let mut b = o.borrow_mut();
@@ -771,18 +788,22 @@ impl Vm {
         } else {
             &proto.name
         };
+        let (line, col) = match (pos, &proto.source_info) {
+            (Some(off), Some(si)) => si.line_col_of(off),
+            _ => (proto.source_line, proto.source_col),
+        };
         let mut out = String::with_capacity(cur.len() + name.len() + 24);
         out.push_str(cur);
         out.push_str("\n    at ");
         out.push_str(name);
-        if proto.source_line > 0 {
+        if line > 0 {
             use std::fmt::Write;
             match &proto.source_label {
                 Some(label) => {
-                    let _ = write!(out, " ({label}:{}:{})", proto.source_line, proto.source_col);
+                    let _ = write!(out, " ({label}:{line}:{col})");
                 }
                 None => {
-                    let _ = write!(out, " ({}:{})", proto.source_line, proto.source_col);
+                    let _ = write!(out, " ({line}:{col})");
                 }
             }
         }

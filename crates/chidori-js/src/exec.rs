@@ -3295,9 +3295,13 @@ impl Vm {
         };
         // A throw unwinding out of this activation records it on the error's
         // `.stack`, so an uncaught error carries a real stack trace. Success
-        // pays only the `proto` Rc clone above.
+        // pays only the `proto` Rc clone above. The tier stashed the throw's
+        // source position in `throw_pos` on its way out; taking it here keeps
+        // it from leaking into an outer frame's record (an outer frame that
+        // misses its own set degrades to the definition-site fallback).
         if let Flow::Throw(e) = &flow {
-            self.record_unwind_frame(e, &proto);
+            let pos = self.throw_pos.take();
+            self.record_unwind_frame(e, &proto, pos);
         }
         flow
     }
@@ -3329,16 +3333,24 @@ impl Vm {
         // off the hot path. A resolved `Jump` just positions `frame.ip` and falls
         // into the loop. (Phase 1, docs/interpreter-optimization.md.)
         if let Some(e) = frame.pending_throw.take() {
+            // An injected rejection is delivered "at" the suspension point:
+            // `frame.ip` already points past the Await/Yield op, so the op
+            // before it is where this frame observes the throw.
+            let resume_at = frame.ip.saturating_sub(1);
             match self.do_completion(&mut frame, Completion::Throw(e)) {
                 Ok(Ctl::Jump(t)) => frame.ip = t,
                 Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
                 Ok(_) => unreachable!("throw completion yields jump or return"),
-                Err(e) => done!(Flow::Throw(e)),
+                Err(e) => {
+                    self.throw_pos = proto.pos_at(resume_at);
+                    done!(Flow::Throw(e))
+                }
             }
         } else if let Some(v) = frame.pending_return.take() {
             // Injected `.return(v)` on a suspended generator: dispatch a Return
             // completion so enclosing `finally` blocks run before the frame ends
             // (a `yield` in a finally re-suspends as a normal yield in the loop).
+            let resume_at = frame.ip.saturating_sub(1);
             match self.do_completion(&mut frame, Completion::Return(v)) {
                 Ok(Ctl::Jump(t)) => frame.ip = t,
                 Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
@@ -3347,7 +3359,10 @@ impl Vm {
                     Ok(Ctl::Jump(t)) => frame.ip = t,
                     Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
                     Ok(_) => unreachable!(),
-                    Err(e) => done!(Flow::Throw(e)),
+                    Err(e) => {
+                        self.throw_pos = proto.pos_at(resume_at);
+                        done!(Flow::Throw(e))
+                    }
                 },
             }
         }
@@ -3366,6 +3381,7 @@ impl Vm {
                 if let Some(budget) = self.op_budget.as_mut() {
                     if *budget == 0 {
                         // Uncatchable so execution is guaranteed to terminate.
+                        self.throw_pos = proto.pos_at(frame.ip);
                         done!(Flow::Throw(self.throw_range("execution budget exceeded")));
                     }
                     *budget -= 1;
@@ -3383,6 +3399,7 @@ impl Vm {
                         if let Some(flag) = &self.interrupt {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                                 self.op_budget = Some(0);
+                                self.throw_pos = proto.pos_at(frame.ip);
                                 done!(Flow::Throw(self.throw_range("execution interrupted")));
                             }
                         }
@@ -3451,7 +3468,13 @@ impl Vm {
                     }
                     Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
                     Ok(_) => unreachable!("throw completion yields jump or return"),
-                    Err(e) => done!(Flow::Throw(e)),
+                    Err(e) => {
+                        // Unhandled: the op at `ip` is where the throw left
+                        // this frame — the throw site itself, or the call op
+                        // a callee's throw propagated out of.
+                        self.throw_pos = proto.pos_at(ip);
+                        done!(Flow::Throw(e))
+                    }
                 },
             }
         }
@@ -4654,6 +4677,7 @@ impl Vm {
                     if *budget < cost {
                         *budget = 0;
                         // Uncatchable so execution is guaranteed to terminate.
+                        self.throw_pos = reg.pos.get(pc).copied();
                         done!(Flow::Throw(self.throw_range("execution budget exceeded")));
                     }
                     *budget -= cost;
@@ -4664,6 +4688,7 @@ impl Vm {
                         if let Some(flag) = &self.interrupt {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                                 self.op_budget = Some(0);
+                                self.throw_pos = reg.pos.get(pc).copied();
                                 done!(Flow::Throw(self.throw_range("execution interrupted")));
                             }
                         }
@@ -4705,7 +4730,12 @@ impl Vm {
                             continue;
                         }
                         Ok(RegCtl::Return(v)) => ret!(v),
-                        Err(e) => done!(Flow::Throw(e)),
+                        Err(e) => {
+                            // Unhandled throw: `pc` already advanced past the
+                            // op that raised (or propagated) it.
+                            self.throw_pos = reg.pos.get(pc - 1).copied();
+                            done!(Flow::Throw(e))
+                        }
                     }
                 }};
             }

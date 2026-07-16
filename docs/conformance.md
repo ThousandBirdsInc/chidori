@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 39824  fail 370  skip 7097  =>  99.08% of executed
+  pass 39837  fail 357  skip 7097  =>  99.11% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 39,824 | 370 | 7,097 | **99.08%** |
+| chidori pure-Rust engine, bare context | 39,837 | 357 | 7,097 | **99.11%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -248,7 +248,7 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the ~370 total). The counts
+The residual failures, by area (top clusters of the ~357 total). The counts
 shift as engine work lands — refresh from a `--json` report before targeting:
 
 | area | nature |

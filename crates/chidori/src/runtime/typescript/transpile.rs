@@ -345,6 +345,36 @@ pub fn remap_to_original(
     })
 }
 
+/// Byte offset of the first dynamic `import(...)` expression in `source`, or
+/// `None` if there is none — or if the source fails to parse (the transpile
+/// step owns parse-error reporting).
+fn find_dynamic_import(path: &Path, source: &str) -> Option<usize> {
+    use oxc::ast::ast::ImportExpression;
+    use oxc::ast_visit::Visit;
+
+    struct Finder {
+        first: Option<usize>,
+    }
+    impl<'a> Visit<'a> for Finder {
+        fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
+            // Visitation is in source order, so the first hit is the earliest.
+            if self.first.is_none() {
+                self.first = Some(it.span.start as usize);
+            }
+        }
+    }
+
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.errors.is_empty() {
+        return None;
+    }
+    let mut finder = Finder { first: None };
+    finder.visit_program(&parsed.program);
+    finder.first
+}
+
 pub fn validate_imports(
     path: &Path,
     source: &str,
@@ -353,14 +383,17 @@ pub fn validate_imports(
     let mut imports = Vec::new();
     let project_root = path.parent().unwrap_or_else(|| Path::new("."));
 
-    for (line_no, line) in source.lines().enumerate() {
-        if line.contains("import(") || line.contains("import (") {
-            anyhow::bail!(
-                "{}:{}: dynamic import is disabled in durable TypeScript agents",
-                path.display(),
-                line_no + 1
-            );
-        }
+    // Dynamic import is rejected from the AST, not a text scan: `import(` in a
+    // comment, a string literal, or an identifier ending in "import" must not
+    // fail the file. If the source doesn't parse, skip the check here — the
+    // transpile step reports parse errors with full diagnostics.
+    if let Some(span_start) = find_dynamic_import(path, source) {
+        let line_no = source[..span_start].bytes().filter(|&b| b == b'\n').count() + 1;
+        anyhow::bail!(
+            "{}:{}: dynamic import is disabled in durable TypeScript agents",
+            path.display(),
+            line_no
+        );
     }
 
     // Lazily construct the Node resolver only when needed — it touches the
@@ -620,6 +653,51 @@ fn normalize_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::runtime::snapshot::TypeScriptImportPolicy;
+
+    #[test]
+    fn dynamic_import_expression_is_rejected_with_its_line() {
+        let source = "const x = 1;\nconst mod = await import(\"./other.ts\");\n";
+        let err = validate_imports(
+            Path::new("/tmp/project/agent.ts"),
+            source,
+            TypeScriptImportPolicy::Relative,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dynamic import is disabled"), "{msg}");
+        assert!(msg.contains("agent.ts:2"), "line should be 2: {msg}");
+    }
+
+    #[test]
+    fn import_in_comment_string_or_identifier_is_not_dynamic_import() {
+        let source = r#"
+            // A comment mentioning import( must not fail the file.
+            const s = "also fine in a string: import(x)";
+            function reimport(v: string) { return v; }
+            const t = reimport(s);
+            export async function agent() { return { t }; }
+        "#;
+        let imports = validate_imports(
+            Path::new("/tmp/project/agent.ts"),
+            source,
+            TypeScriptImportPolicy::Relative,
+        )
+        .unwrap();
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn unparseable_source_defers_to_transpile_for_diagnostics() {
+        // A parse error must not be masked by (or misreported as) a dynamic-
+        // import rejection — transpile owns parse diagnostics.
+        let source = "const value = { a: 1, b: 2 ;\n";
+        assert!(validate_imports(
+            Path::new("/tmp/project/agent.ts"),
+            source,
+            TypeScriptImportPolicy::Relative,
+        )
+        .is_ok());
+    }
 
     #[test]
     fn transpile_strips_basic_type_syntax() {

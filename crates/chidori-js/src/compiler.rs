@@ -52,36 +52,6 @@ fn decode_lone_surrogates(value: &str) -> JsString {
     JsString::from_code_units(&units)
 }
 
-/// Byte offset of each line start in `src` (`[0]` is always 0). Backs
-/// [`Compiler::line_col_of`], the per-compiled-function position lookup: that
-/// path runs once per function of every compiled source (a vendored bundle
-/// has thousands), so it needs an indexed table rather than miette's
-/// scan-from-the-start `read_span` (which is linear per lookup and fine for
-/// the parse-error path below, where at most a few diagnostics render).
-fn line_starts(src: &str) -> Vec<u32> {
-    let mut starts = vec![0u32];
-    for (i, b) in src.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i as u32 + 1);
-        }
-    }
-    starts
-}
-
-/// 1-based (line, column) of byte `offset` in `src`, given its line-start
-/// table. Columns count characters, not bytes.
-fn line_col_at(src: &str, starts: &[u32], offset: u32) -> (u32, u32) {
-    let offset = offset.min(src.len() as u32);
-    let line = starts.partition_point(|&s| s <= offset).max(1);
-    let start = starts[line - 1] as usize;
-    let col = src
-        .get(start..offset as usize)
-        .map(|s| s.chars().count())
-        .unwrap_or(0) as u32
-        + 1;
-    (line as u32, col)
-}
-
 /// Render one oxc diagnostic with the 1-based line/column of its primary
 /// label — `Unexpected token (line 3, column 7)` — so a parse error points at
 /// its source position instead of leaving the user to hunt for it. The span
@@ -202,7 +172,7 @@ pub fn compile_script_kernels(src: &str, kernels: bool) -> Result<FuncProto, Str
         ));
     }
     let mut c = Compiler::new();
-    c.source = src.to_string();
+    c.source = Rc::from(src);
     c.kernelize = kernels;
     c.compile_toplevel(&program).map_err(|e| {
         if e.starts_with("SyntaxError") {
@@ -238,7 +208,7 @@ pub fn compile_script_regs(src: &str, regs: bool) -> Result<FuncProto, String> {
         ));
     }
     let mut c = Compiler::new();
-    c.source = src.to_string();
+    c.source = Rc::from(src);
     c.regify = regs;
     c.compile_toplevel(&program).map_err(|e| {
         if e.starts_with("SyntaxError") {
@@ -291,7 +261,7 @@ fn compile_script_impl(
         ));
     }
     let mut c = Compiler::new();
-    c.source = src.to_string();
+    c.source = Rc::from(src);
     c.toplevel_is_eval = as_eval;
     c.fuse = fuse;
     c.localize = localize;
@@ -446,7 +416,7 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
             .any(|d| d.directive.as_str() == "use strict");
 
     let mut c = Compiler::new();
-    c.source = wrapped.clone();
+    c.source = Rc::from(wrapped.as_str());
     // Seed the caller's enclosing class private scopes (outermost first) so
     // `this.#x` in the eval body resolves to the caller's storage keys; the
     // runtime names come from the caller frame's private environment chain.
@@ -610,7 +580,7 @@ pub fn compile_module_labeled(
         ));
     }
     let mut c = Compiler::new();
-    c.source = src.to_string();
+    c.source = Rc::from(src);
     c.is_module = true;
     c.source_label = label.map(Rc::from);
     let (proto, cell_of_name) = c.compile_module_toplevel(&program).map_err(|e| {
@@ -680,6 +650,15 @@ struct LoopCtx {
 
 struct FnCtx {
     code: Vec<Op>,
+    /// Per-op source position (byte offset), index-parallel to `code`: the
+    /// value of `cur_pos` when each op was emitted. Becomes
+    /// [`FuncProto::pos`] after the code-shortening passes remap it.
+    pos: Vec<u32>,
+    /// Source position stamped on ops as they are emitted. Advanced at every
+    /// statement start and again at each call/`new` site, so a frame's
+    /// current ip resolves to the executing statement (innermost frame) or
+    /// the active call (outer frames) rather than the definition site.
+    cur_pos: u32,
     consts: Vec<Const>,
     scopes: Vec<Scope>,
     num_cells: u32,
@@ -777,6 +756,8 @@ impl FnCtx {
     fn new(name: &str, kind: FuncKind) -> FnCtx {
         FnCtx {
             code: Vec::new(),
+            pos: Vec::new(),
+            cur_pos: 0,
             consts: Vec::new(),
             scopes: Vec::new(),
             num_cells: 0,
@@ -880,12 +861,18 @@ struct Compiler {
     is_module: bool,
     /// The full source text, so a function's body region can be cheaply scanned
     /// for the word `arguments` — when absent, the per-call `arguments` object is
-    /// not materialized (a hot-path win for the common case).
-    source: String,
-    /// Byte offset of each line start in `source` (`[0]` is always 0). Built
-    /// lazily on the first function-position lookup (`line_col_of`), so
-    /// compilations that finish without one pay nothing.
-    line_starts: std::cell::OnceCell<Vec<u32>>,
+    /// not materialized (a hot-path win for the common case). `Rc<str>` so the
+    /// per-proto [`SourceInfo`] shares it instead of copying it.
+    source: Rc<str>,
+    /// Shared source text + line-start index handed to every finished
+    /// `FuncProto` (see [`crate::bytecode::SourceInfo`]), so stack frames can
+    /// resolve their per-op position table on the error path. Built lazily on
+    /// the first position lookup / `finish`: the line-start scan runs once per
+    /// compiled source (a vendored bundle has thousands of functions), so it
+    /// needs an indexed table rather than miette's scan-from-the-start
+    /// `read_span` (which is linear per lookup and fine for the parse-error
+    /// path below, where at most a few diagnostics render).
+    source_info: std::cell::OnceCell<Rc<SourceInfo>>,
     /// Module key/path this compilation came from (see
     /// [`compile_module_labeled`]) — stamped on every finished `FuncProto` so
     /// stack frames can name their source.
@@ -939,8 +926,8 @@ impl Compiler {
             module_exports: Vec::new(),
             module_requested: Vec::new(),
             is_module: false,
-            source: String::new(),
-            line_starts: std::cell::OnceCell::new(),
+            source: Rc::from(""),
+            source_info: std::cell::OnceCell::new(),
             source_label: None,
             eval_var_names: Vec::new(),
             pending_method: false,
@@ -953,11 +940,16 @@ impl Compiler {
         }
     }
 
-    /// 1-based (line, column) of byte `offset` in `self.source`, via the
-    /// lazily built line-start table. Columns count characters, not bytes.
+    /// The compilation-wide shared [`SourceInfo`], built on first use.
+    fn source_info(&self) -> &Rc<SourceInfo> {
+        self.source_info
+            .get_or_init(|| Rc::new(SourceInfo::new(self.source.clone())))
+    }
+
+    /// 1-based (line, column) of byte `offset` in `self.source`. Columns count
+    /// characters, not bytes.
     fn line_col_of(&self, offset: u32) -> (u32, u32) {
-        let starts = self.line_starts.get_or_init(|| line_starts(&self.source));
-        line_col_at(&self.source, starts, offset)
+        self.source_info().line_col_of(offset)
     }
 
     /// Whether the source region `[start, end)` mentions `arguments` (the word).
@@ -991,8 +983,15 @@ impl Compiler {
 
     fn emit(&mut self, op: Op) -> usize {
         let c = self.cur();
+        c.pos.push(c.cur_pos);
         c.code.push(op);
         c.code.len() - 1
+    }
+
+    /// Stamp `offset` (a byte offset into the source) on the ops emitted from
+    /// here on, until the next statement/call advances it again.
+    fn set_pos(&mut self, offset: u32) {
+        self.cur().cur_pos = offset;
     }
 
     fn here(&mut self) -> u32 {
@@ -1914,7 +1913,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn finish(&self, fc: FnCtx) -> FuncProto {
+    fn finish(&self, mut fc: FnCtx) -> FuncProto {
+        // The per-op position table rides along with `code` through the
+        // passes below: localization and kernelization rewrite ops in place
+        // (lengths and indices unchanged), fusion shortens the code and
+        // remaps the table alongside its jump targets.
+        let pos = std::mem::take(&mut fc.pos);
+        debug_assert_eq!(pos.len(), fc.code.len());
         // Cells→locals localization (docs/js-performance-roadmap.md §3.2):
         // provably-uncaptured bindings move from heap cells to pooled
         // `frame.locals` slots. Runs BEFORE fusion so the fusion pass sees
@@ -1940,10 +1945,10 @@ impl Compiler {
         // Peephole op-fusion (Phase 2): every finished function — top-level and
         // nested — flows through here, so applying it once covers the whole
         // proto tree. Disabled only by the differential test.
-        let code = if self.fuse {
-            crate::fuse::fuse_code_fixpoint(loc.code)
+        let (code, pos) = if self.fuse {
+            crate::fuse::fuse_code_fixpoint(loc.code, pos)
         } else {
-            loc.code
+            (loc.code, pos)
         };
         // Typed loop kernels (docs/js-performance-roadmap.md §6.5): translate
         // eligible numeric loops into unboxed register programs. Runs LAST so
@@ -1983,15 +1988,22 @@ impl Compiler {
         // functions), as does anything with try/finally handlers, `with`/
         // direct-eval machinery, suspension, or super/private class wiring.
         let reg = if self.regify {
-            crate::reg::regify(&code, loc.num_locals, &fc.consts).map(std::rc::Rc::new)
+            crate::reg::regify(&code, loc.num_locals, &fc.consts, &pos).map(std::rc::Rc::new)
         } else {
             None
         };
         // Definition-site position for stack traces (0 = unknown: synthetic
-        // contexts, or a Compiler driven without its source text).
+        // contexts, or a Compiler driven without its source text) — the
+        // fallback when a frame has no per-op position to resolve.
         let (source_line, source_col) = match fc.source_start {
             Some(off) if !self.source.is_empty() => self.line_col_of(off),
             _ => (0, 0),
+        };
+        debug_assert_eq!(pos.len(), code.len());
+        let source_info = if self.source.is_empty() {
+            None
+        } else {
+            Some(self.source_info().clone())
         };
         FuncProto {
             eval_scopes: fc.eval_scopes.clone(),
@@ -2010,6 +2022,8 @@ impl Compiler {
                 })
                 .collect(),
             code,
+            pos: pos.into_boxed_slice(),
+            source_info,
             consts: fc.consts,
             num_locals: loc.num_locals,
             num_cells: fc.num_cells,
@@ -2369,6 +2383,11 @@ impl Compiler {
 
 impl Compiler {
     fn compile_stmt(&mut self, stmt: &Statement) -> R {
+        // Statement-level position tracking: every op compiled for this
+        // statement anchors at its start (call/`new` sites re-anchor more
+        // precisely below), so a throw reports the executing statement.
+        use oxc::span::GetSpan;
+        self.set_pos(stmt.span().start);
         match stmt {
             Statement::ExpressionStatement(e) => {
                 self.compile_expr(&e.expression)?;
@@ -4785,7 +4804,12 @@ impl Compiler {
     /// Compile arguments and emit the appropriate Call op. Stack has [func, this]
     /// already.
     fn finish_call(&mut self, c: &CallExpression) -> R {
-        match self.compile_args(&c.arguments)? {
+        let form = self.compile_args(&c.arguments)?;
+        // Anchor the call op at the call expression, not at whatever
+        // statement/nested call the argument ops last anchored: an error
+        // propagating out of the callee then reports this frame AT this call.
+        self.set_pos(c.span.start);
+        match form {
             ArgForm::Count(n) => {
                 self.emit(Op::Call(n));
             }
@@ -4834,6 +4858,7 @@ impl Compiler {
                 let e = a.as_expression().unwrap();
                 self.compile_expr(e)?;
             }
+            self.set_pos(n.span.start);
             self.emit(Op::New(n.arguments.len() as u32));
         } else {
             self.emit(Op::NewArray(0));
@@ -4849,6 +4874,7 @@ impl Compiler {
                     }
                 }
             }
+            self.set_pos(n.span.start);
             self.emit(Op::NewSpread);
         }
         Ok(())
@@ -5900,8 +5926,10 @@ impl Compiler {
     ) -> R {
         let mut fc = FnCtx::new(name.unwrap_or(""), kind);
         // The parameter list's span start is the function's definition site —
-        // resolved to line/column in `finish` for error stack traces.
+        // resolved to line/column in `finish` for error stack traces. Prologue
+        // ops emitted before the first body statement anchor there too.
         fc.source_start = Some(params.span.start);
+        fc.cur_pos = params.span.start;
         // A function defined inside a `with` block (directly or transitively)
         // resolves free identifiers against the captured with-scope chain.
         fc.enclosed_in_with = self

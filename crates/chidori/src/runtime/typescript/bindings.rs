@@ -12,7 +12,8 @@ use crate::providers::{
     ToolSchema,
 };
 use crate::runtime::call_log::CallRecord;
-use crate::runtime::context::{InputMode, PendingApproval, RuntimeContext, PAUSE_MARKER};
+use crate::runtime::context::{InputMode, PendingApproval, RuntimeContext};
+use crate::runtime::errors::RunInterrupt;
 use crate::runtime::host_core;
 use crate::runtime::snapshot::RuntimePolicy;
 use crate::runtime::template::TemplateEngine;
@@ -487,7 +488,10 @@ impl HostBindingBackend {
                     content: serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
                     is_error: false,
                 }),
-                Err(err) if err.contains(PAUSE_MARKER) => return Err(err),
+                // At this boundary the pause is already a wire string (the
+                // tool ran behind `Result<_, String>`); pass it through
+                // verbatim so it keeps unwinding into the VM.
+                Err(err) if RunInterrupt::from_message(&err).is_some() => return Err(err),
                 Err(err) => result_blocks.push(ContentBlock::ToolResult {
                     tool_use_id: call.id,
                     content: err,
@@ -623,7 +627,11 @@ impl HostBindingBackend {
                         args: args.clone(),
                         reason: reason.clone(),
                     });
-                    return Err(PAUSE_MARKER.to_string());
+                    // This error crosses into the VM as a plain string, so it
+                    // is raised in wire form (a Rust enum can't survive the
+                    // JS hop); the approval payload rides in the pending slot
+                    // set above.
+                    return Err(RunInterrupt::Approval.to_wire());
                 }
                 // Bare CLI: ask the operator on the controlling terminal.
                 // "y" is remembered per (target, args); "a" allows every

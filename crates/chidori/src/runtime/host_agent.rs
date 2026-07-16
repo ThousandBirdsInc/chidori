@@ -36,7 +36,8 @@ use crate::mcp::McpManager;
 use crate::policy::{PolicyCache, PolicyConfig};
 use crate::providers::ProviderRegistry;
 use crate::runtime::call_log::CallRecord;
-use crate::runtime::context::{PendingSignal, RuntimeContext, PAUSE_MARKER};
+use crate::runtime::context::{PendingSignal, RuntimeContext};
+use crate::runtime::errors::RunInterrupt;
 use crate::runtime::host_core;
 use crate::runtime::snapshot::{QueuedSignal, RuntimePolicy, SIGNAL_INBOX_FILE};
 use crate::runtime::store::RunStoreFactory;
@@ -1088,7 +1089,7 @@ enum IterationEnd {
 fn settle_iteration(result: anyhow::Result<Value>, ctx: &RuntimeContext) -> IterationEnd {
     match result {
         Ok(output) => IterationEnd::Completed(output),
-        Err(err) if err.to_string().contains(PAUSE_MARKER) => {
+        Err(err) if RunInterrupt::from_error(&err).is_some() => {
             if let Some(pending) = ctx.take_pending_signal() {
                 IterationEnd::WaitSignal(pending)
             } else if let Some(pending) = ctx.take_pending_input() {
