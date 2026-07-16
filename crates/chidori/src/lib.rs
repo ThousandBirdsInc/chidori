@@ -25,6 +25,7 @@ pub mod framework {
         ModelOverride, PendingApproval, PendingInput, RuntimeContext, RuntimeEvent,
     };
     pub use crate::runtime::engine::{Engine, RunResult};
+    pub use crate::runtime::errors::{RunErrorKind, RunInterrupt, PAUSE_MARKER};
     pub use crate::runtime::host_core::{
         execute_native_tool_call, execute_native_tool_call_at_seq,
     };

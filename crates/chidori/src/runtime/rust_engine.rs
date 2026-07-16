@@ -151,7 +151,7 @@ const ERROR_NAMES: &[&str] = &[
 /// through untouched — control flow, not exceptions, detected by substring in
 /// `engine.rs` / `host_core`.
 fn js_exception_message(err: &str) -> String {
-    if err.contains(crate::runtime::context::PAUSE_MARKER) {
+    if crate::runtime::errors::RunInterrupt::from_message(err).is_some() {
         return err.to_string();
     }
     let (head, rest) = err.split_once('\n').unwrap_or((err, ""));
@@ -801,7 +801,15 @@ pub(crate) fn run_module(
     // realm + agent object graph in a long-lived server process.
     engine.vm.dispose();
     match outcome {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!(js_exception_message(&e))),
+        // A pause sentinel that unwound through the VM is a stringified JS
+        // exception here — re-type it immediately so everything upstream can
+        // downcast to `RunInterrupt` instead of re-parsing the message.
+        Ok(result) => result.map_err(
+            |e| match crate::runtime::errors::RunInterrupt::from_message(&e) {
+                Some(interrupt) => anyhow::Error::new(interrupt),
+                None => anyhow::anyhow!(js_exception_message(&e)),
+            },
+        ),
         Err(panic) => Err(anyhow::anyhow!(
             "rust engine panicked: {}",
             panic_payload_message(panic.as_ref())

@@ -409,7 +409,22 @@ export default promises;
 // microtask, so listeners registered inside the response callback still fire.
 // `createHttpModule` is exported so `node:https` can reuse this implementation
 // with an `https:` default protocol.
-const HTTP_SHIM: &str = r#"
+//
+// Composed at first use rather than written as one literal: the shim's
+// error handler must recognize the pause sentinel by its marker text (the
+// sentinel reaches JS as a plain thrown string — see `runtime::errors`), and
+// splicing `PAUSE_MARKER` in keeps `errors.rs` the single home of that
+// marker's spelling.
+static HTTP_SHIM: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    [
+        HTTP_SHIM_HEAD,
+        crate::runtime::errors::PAUSE_MARKER,
+        HTTP_SHIM_TAIL,
+    ]
+    .concat()
+});
+
+const HTTP_SHIM_HEAD: &str = r#"
 class EventEmitter {
     constructor() { this._ev = {}; }
     on(type, cb) { (this._ev[type] = this._ev[type] || []).push(cb); return this; }
@@ -489,7 +504,9 @@ function createHttpModule(defaultProtocol) {
                 // Surface transport-style failures through the 'error' event, the
                 // node convention — but never swallow the pause sentinel, which
                 // must keep unwinding to the engine.
-                if (err && typeof err.message === "string" && err.message.indexOf("__CHIDORI_PAUSED_FOR_INPUT__") !== -1) {
+                if (err && typeof err.message === "string" && err.message.indexOf(""#;
+
+const HTTP_SHIM_TAIL: &str = r#"") !== -1) {
                     throw err;
                 }
                 const self = this;
@@ -1464,7 +1481,7 @@ pub fn shim_source(name: &str) -> Option<&'static str> {
         "fs" => Some(FS_SHIM),
         "fs/promises" => Some(FS_PROMISES_SHIM),
         "crypto" => Some(CRYPTO_SHIM),
-        "http" => Some(HTTP_SHIM),
+        "http" => Some(HTTP_SHIM.as_str()),
         "https" => Some(HTTPS_SHIM),
         "path" => Some(PATH_SHIM),
         "path/posix" => Some(PATH_POSIX_SHIM),

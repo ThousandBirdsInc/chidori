@@ -9,8 +9,8 @@ use crate::providers::{
 use crate::runtime::call_log::{CallRecord, TokenUsage};
 use crate::runtime::context::{
     ActorSignalWait, InputMode, PendingInput, PendingSignal, RuntimeContext, WarmInputWait,
-    PAUSE_MARKER,
 };
+use crate::runtime::errors::RunInterrupt;
 use crate::runtime::memory::execute_memory_action;
 use crate::runtime::snapshot::{HostPromiseState, PendingHostOperationKind};
 use crate::runtime::template::TemplateEngine;
@@ -102,10 +102,14 @@ pub fn execute_durable_json_call_at_seq(
             Ok(result)
         }
         Err(err) => {
-            let message = err.to_string();
-            if message.contains(PAUSE_MARKER) {
-                return Err(anyhow::anyhow!(message));
+            // A pause is control flow, not a failure: don't record or reject
+            // anything, just keep unwinding. Re-type it here so everything
+            // upstream can downcast — the interrupt may arrive as a plain
+            // string when the effect ran on the other side of the JS engine.
+            if let Some(interrupt) = RunInterrupt::from_error(&err) {
+                return Err(anyhow::Error::new(interrupt));
             }
+            let message = err.to_string();
             if let Some(id) = host_operation {
                 ctx.reject_host_operation(id, message.clone())?;
             }
@@ -339,7 +343,7 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
                 seq,
                 prompt: prompt.clone(),
             });
-            Err(anyhow::anyhow!("{PAUSE_MARKER}: {prompt}"))
+            Err(anyhow::Error::new(RunInterrupt::Input { prompt }))
         }
     }
 }
@@ -580,7 +584,7 @@ pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         timeout_ms: signal_timeout_ms(args),
         id: host_operation,
     });
-    Err(anyhow::anyhow!("{PAUSE_MARKER}: signal {name}"))
+    Err(anyhow::Error::new(RunInterrupt::Signal { name }))
 }
 
 /// `chidori.signal(names[], opts)` — the fan-in listen point (`docs/signals.md`
@@ -654,15 +658,14 @@ pub fn execute_signal_any(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         return Ok(result);
     }
 
-    let joined = names.join(", ");
     ctx.set_pending_signal(PendingSignal {
         seq,
         name: names[0].clone(),
-        names,
+        names: names.clone(),
         timeout_ms: signal_timeout_ms(args),
         id: host_operation,
     });
-    Err(anyhow::anyhow!("{PAUSE_MARKER}: signalAny [{joined}]"))
+    Err(anyhow::Error::new(RunInterrupt::SignalAny { names }))
 }
 
 /// `chidori.pollSignal(name)` — non-blocking signal consumption (`docs/signals.md`
@@ -2648,13 +2651,19 @@ mod tests {
     #[test]
     fn durable_json_call_pause_leaves_pending_host_operation_unrecorded() {
         let ctx = RuntimeContext::new();
+        // Raise the pause as a bare wire string, the shape it has after a JS
+        // round trip, so this also exercises the `from_message` fallback and
+        // the immediate re-typing in the dispatch error path.
         let err =
             execute_durable_json_call(&ctx, "tool", json!({ "name": "ask", "kwargs": {} }), || {
-                anyhow::bail!("{PAUSE_MARKER}: approval required")
+                anyhow::bail!(
+                    "{}: approval required",
+                    crate::runtime::errors::PAUSE_MARKER
+                )
             })
             .unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert!(err.downcast_ref::<RunInterrupt>().is_some());
         let pending = ctx.pending_host_operations();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, PendingHostOperationKind::Tool);
@@ -2937,7 +2946,12 @@ mod tests {
 
         let err = execute_input(&ctx, &json!({ "prompt": "Approve?" })).unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert_eq!(
+            RunInterrupt::from_error(&err),
+            Some(RunInterrupt::Input {
+                prompt: "Approve?".to_string()
+            })
+        );
         let pending = ctx.pending_host_operations();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, PendingHostOperationKind::Input);
@@ -2960,7 +2974,12 @@ mod tests {
 
         let err = execute_signal(&ctx, &json!({ "name": "review", "opts": null })).unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert_eq!(
+            RunInterrupt::from_error(&err),
+            Some(RunInterrupt::Signal {
+                name: "review".to_string()
+            })
+        );
         // The pending host op carries kind Signal and the name-only match key.
         let pending = ctx.pending_host_operations();
         assert_eq!(pending.len(), 1);
@@ -3169,7 +3188,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert!(RunInterrupt::from_error(&err).is_some());
         let pending = ctx.take_pending_signal().expect("pending signal set");
         assert_eq!(pending.timeout_ms, Some(1500));
         assert_eq!(pending.listen_names(), vec!["review".to_string()]);
@@ -3186,7 +3205,12 @@ mod tests {
         let err = execute_signal_any(&ctx, &json!({ "names": ["review", "steer"], "opts": null }))
             .unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert_eq!(
+            RunInterrupt::from_error(&err),
+            Some(RunInterrupt::SignalAny {
+                names: vec!["review".to_string(), "steer".to_string()]
+            })
+        );
         let pending = ctx.pending_host_operations();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, PendingHostOperationKind::Signal);
@@ -3327,7 +3351,7 @@ mod tests {
             |_names, _timeout_ms| crate::runtime::context::ActorSignalWait::Park,
         ));
         let err = execute_signal(&ctx, &json!({ "name": "go" })).unwrap_err();
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert!(RunInterrupt::from_error(&err).is_some());
         let pending = ctx
             .take_pending_signal()
             .expect("pause path must set pending");

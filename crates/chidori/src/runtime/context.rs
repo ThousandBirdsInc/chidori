@@ -448,8 +448,12 @@ pub struct PendingApproval {
 }
 
 /// Marker text used to tag the pause sentinel error so the engine can
-/// distinguish it from a genuine failure.
-pub const PAUSE_MARKER: &str = "__CHIDORI_PAUSED_FOR_INPUT__";
+/// distinguish it from a genuine failure. Lives in [`crate::runtime::errors`]
+/// with the typed [`crate::runtime::errors::RunInterrupt`] taxonomy;
+/// re-exported here for the historical import path.
+#[allow(unused_imports)]
+// Historical-path re-export; the bin target compiles the module tree separately and never uses it.
+pub use crate::runtime::errors::PAUSE_MARKER;
 
 /// True when `CHIDORI_REPLAY_LAX=1`: argument-level replay divergences are
 /// downgraded to warnings that restore the historical best-effort behavior
