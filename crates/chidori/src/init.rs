@@ -311,7 +311,9 @@ Set one provider environment variable before runs that call the model:
 
 - `ANTHROPIC_API_KEY` for Anthropic (Claude) models.
 - `OPENAI_API_KEY` for OpenAI models.
-- `LITELLM_API_URL` + `LITELLM_API_KEY` to route through a LiteLLM proxy.
+- `CHIDORI_OPENAI_COMPAT_URL` + `CHIDORI_OPENAI_COMPAT_KEY` for any
+  OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, a LiteLLM
+  proxy…) — pick the model with `--model` or `CHIDORI_MODEL`.
 
 No key handy? Run `chidori model-login` to sign in with OpenRouter in your browser.
 Chidori exchanges the sign-in for a user-scoped key (saved to

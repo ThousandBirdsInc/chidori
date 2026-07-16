@@ -802,6 +802,16 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         ctx.set_run_id(run_id.clone());
         ctx.set_input_mode(crate::runtime::context::InputMode::Pause);
         ctx.enable_persistence_with_store(run_dir.clone(), store.clone());
+        // Same implicit workspace root as run/serve/resume: the project
+        // directory (run_base is `<project>/.chidori/runs`). Without this, a
+        // detached agent calling `chidori.workspace.*` fails unless the
+        // operator sets CHIDORI_WORKSPACE_ROOT — which, when set, has
+        // already populated the context and is left untouched here.
+        if ctx.workspace_root().is_none() {
+            if let Some(project_root) = parts.run_base.parent().and_then(|p| p.parent()) {
+                ctx.set_workspace_root(project_root.to_path_buf());
+            }
+        }
 
         let Ok(policy) = RuntimePolicy::from_env_for_durable_run(&run_id) else {
             settle(

@@ -1615,6 +1615,50 @@ fn stable_source_hash(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod completed_args_match_tests {
+    use super::completed_args_match;
+    use serde_json::json;
+
+    #[test]
+    fn identical_args_match() {
+        let args = json!({"text": "hi", "model": "m"});
+        assert!(completed_args_match(&args, &args));
+    }
+
+    #[test]
+    fn request_digest_is_ignored() {
+        assert!(completed_args_match(
+            &json!({"text": "hi", "request_digest": "aaa"}),
+            &json!({"text": "hi", "request_digest": "bbb"}),
+        ));
+    }
+
+    /// Metadata evolution: newer runtimes journal keys (e.g. `max_tokens`)
+    /// that older checkpoints don't carry — those must still replay.
+    #[test]
+    fn key_missing_from_recorded_side_is_tolerated() {
+        assert!(completed_args_match(
+            &json!({"text": "hi"}),
+            &json!({"text": "hi", "max_tokens": 1200, "temperature": 0.7}),
+        ));
+    }
+
+    /// But a key present on BOTH sides must match: editing a journaled
+    /// argument is a loud divergence, not a silent cache hit.
+    #[test]
+    fn differing_shared_key_is_a_divergence() {
+        assert!(!completed_args_match(
+            &json!({"text": "hi", "max_tokens": 1200}),
+            &json!({"text": "hi", "max_tokens": 800}),
+        ));
+        assert!(!completed_args_match(
+            &json!({"text": "hi"}),
+            &json!({"text": "CHANGED"}),
+        ));
+    }
+}
+
+#[cfg(test)]
 mod host_promise_union_tests {
     use super::*;
     use crate::runtime::store::{FsRunStore, RunStore as _};

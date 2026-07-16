@@ -291,6 +291,15 @@ of commits as this document:
   the npm package in lockstep with the binary release remains a
   release-process action this branch can't perform.
 
+A second audit pass closed the residual gaps: the `chidori demo` provider
+detection recognizes `CHIDORI_OPENAI_COMPAT_URL`; the init-template README,
+deployment doc, and every CLI hint teach the vendor-neutral pair instead of
+the LiteLLM alias; **detached agents** get the same implicit project-directory
+workspace root as run/serve/resume; `llm.txt` warns about the
+`interface`-vs-`type` gotcha (it is the reference AI code generators read);
+and regression tests pin the new behaviors (target-wide approval cache,
+tolerant-but-loud journal argument comparison, priced-vs-unknown cost).
+
 **Not fixed: error frames anchored at `run(`.** Investigated: the engine's
 stack frames carry each function's *definition site*
 (`FuncProto.source_line`), and the bytecode has no per-instruction line

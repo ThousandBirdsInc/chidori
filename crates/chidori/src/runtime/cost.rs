@@ -159,6 +159,13 @@ mod tests {
     }
 
     #[test]
+    fn test_is_priced_model_distinguishes_unknown_from_free() {
+        assert!(is_priced_model("claude-sonnet-4-6"));
+        assert!(is_priced_model("gpt-4o"));
+        assert!(!is_priced_model("deepseek-v4-flash"));
+    }
+
+    #[test]
     fn test_cache_tokens_price_at_documented_multiples() {
         // claude-sonnet base input is $3/MTok: 1M cache-write ≈ $3.75 (1.25x),
         // 1M cache-read ≈ $0.30 (0.1x).

@@ -434,6 +434,23 @@ mod tests {
     }
 
     #[test]
+    fn policy_cache_per_args_approval_does_not_leak_to_other_args() {
+        let mut cache = PolicyCache::default();
+        cache.approve("tool:web_search", &json!({"query": "a"}));
+        assert!(cache.is_approved("tool:web_search", &json!({"query": "a"})));
+        assert!(!cache.is_approved("tool:web_search", &json!({"query": "b"})));
+    }
+
+    #[test]
+    fn policy_cache_target_approval_covers_any_args_but_not_other_targets() {
+        let mut cache = PolicyCache::default();
+        cache.approve_target("tool:web_search");
+        assert!(cache.is_approved("tool:web_search", &json!({"query": "a"})));
+        assert!(cache.is_approved("tool:web_search", &json!({"query": "b"})));
+        assert!(!cache.is_approved("tool:reverse", &json!({"text": "a"})));
+    }
+
+    #[test]
     fn untrusted_profile_denies_by_default() {
         let cfg = builtin_profile("untrusted").expect("untrusted profile exists");
         assert_eq!(cfg.default, Decision::NeverAllow);

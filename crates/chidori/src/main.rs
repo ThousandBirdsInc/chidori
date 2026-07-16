@@ -359,6 +359,11 @@ enum Commands {
         #[arg(long)]
         tools: Vec<PathBuf>,
 
+        /// Default model for prompts that don't set one in code (equivalent
+        /// to CHIDORI_MODEL), applied to every session this server runs.
+        #[arg(long)]
+        model: Option<String>,
+
         /// Serve under the built-in deny-by-default `untrusted` policy profile:
         /// gated effects (http, workspace mutations) are refused unless
         /// allowlisted. Equivalent to CHIDORI_POLICY_PROFILE=untrusted, but
@@ -588,6 +593,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             host,
             verbose,
             tools,
+            model,
             untrusted,
             trusted,
             isolate,
@@ -597,6 +603,9 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                 crate::runtime::isolate::enable();
             } else if no_isolate {
                 crate::runtime::isolate::disable();
+            }
+            if let Some(ref model) = model {
+                std::env::set_var("CHIDORI_MODEL", model);
             }
             (
                 cmd_serve(&file, host.as_deref(), port, verbose, &tools, untrusted, trusted),
@@ -861,8 +870,9 @@ fn cmd_demo() -> Result<()> {
         println!("or set one of:");
         println!("  export ANTHROPIC_API_KEY=sk-ant-...");
         println!("  export OPENAI_API_KEY=sk-...");
-        println!("  export LITELLM_API_URL=http://localhost:4401/v1");
-        println!("  export LITELLM_API_KEY=sk-litellm-master-key");
+        println!("  # any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, LiteLLM...):");
+        println!("  export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com");
+        println!("  export CHIDORI_OPENAI_COMPAT_KEY=sk-...");
         return Ok(());
     }
 
@@ -949,6 +959,7 @@ fn confirm_start_server(port: u16) -> Result<bool> {
 fn has_llm_provider() -> bool {
     std::env::var_os("ANTHROPIC_API_KEY").is_some()
         || std::env::var_os("OPENAI_API_KEY").is_some()
+        || std::env::var_os("CHIDORI_OPENAI_COMPAT_URL").is_some()
         || std::env::var_os("LITELLM_API_URL").is_some()
         || providers::openrouter::saved_api_key().is_some()
 }
@@ -993,7 +1004,10 @@ fn ensure_llm_provider_interactive() -> bool {
     }
 
     println!();
-    println!("No LLM provider key found (ANTHROPIC_API_KEY / OPENAI_API_KEY).");
+    println!(
+        "No LLM provider key found (ANTHROPIC_API_KEY / OPENAI_API_KEY / \
+         CHIDORI_OPENAI_COMPAT_URL)."
+    );
     println!("You can sign in with OpenRouter to try this out — no API key setup needed.");
     if !providers::openrouter::confirm_login() {
         return false;

@@ -30,6 +30,9 @@ Rules:
 - Import `{ chidori, run }` from `chidori:agent` and call `run(handler)` at the
   top level. (Legacy fallback: `export async function agent(input, chidori)`
   is still accepted when `run(...)` wasn't called.)
+- Type the input with an inline object type or a `type` alias, never an
+  `interface` — interfaces have no implicit index signature, so they fail the
+  handler's `AgentJson` constraint with a confusing type error.
 - Return JSON-compatible values only.
 - Use `chidori.*` for LLMs, tools, input, signals, memory, templates, workspace
   files, and logging. HTTP goes through the standard `fetch`, which the runtime
@@ -148,7 +151,7 @@ first reads the shared prefix at the discounted cached rate.
 - `prompt(options?)` → `{ text, context }`: send, return the answer plus the
   context extended with the assistant turn (including any tool-use exchange).
 - `respond(options?)` → `{ response, context }`: one structured turn for
-  author-driven tool loops (`response.toolCalls`, `response.blocks`).
+  author-driven tool loops (`response.toolCalls`, `response.blocks`; reasoning models also expose `response.reasoning`).
 - `digest()` → stable content hash of the assembled request, also recorded in
   each prompt's call-log args as `request_digest`.
 - `estimateTokens()` → rough local size estimate for window budgeting.
@@ -477,9 +480,10 @@ await chidori.workspace.delete("notes/draft.md", "superseded");
 const manifest = await chidori.workspace.manifest();
 ```
 
-Durable file store rooted at the run's workspace directory
-(`CHIDORI_WORKSPACE_ROOT` when set). Entries carry `{ path, status, sha256,
-bytes }`. Every action is policy-gated (`workspace:write` /
+Durable file store rooted at the project directory (the agent file's dir)
+under `run`, `resume`, `serve`, and detached agents alike;
+`CHIDORI_WORKSPACE_ROOT` overrides the root. Entries carry `{ path, status,
+sha256, bytes }`. Every action is policy-gated (`workspace:write` /
 `workspace:delete` are refused under `untrusted`) and recorded in the call
 log. `remove` is an alias for `delete`.
 
