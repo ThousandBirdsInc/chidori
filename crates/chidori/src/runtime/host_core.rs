@@ -270,7 +270,19 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         InputMode::Stdin => {
             eprintln!("{}", prompt);
             let mut line = String::new();
-            std::io::stdin().read_line(&mut line)?;
+            let bytes_read = std::io::stdin().read_line(&mut line)?;
+            // EOF means nobody can answer (stdin closed, e.g. `< /dev/null` in
+            // CI). Silently treating that as an empty answer lets approval
+            // prompts "succeed" unanswered — fail loudly instead; answers can
+            // still be piped in via stdin.
+            if bytes_read == 0 {
+                anyhow::bail!(
+                    "input: stdin is at EOF, no answer available for prompt {:?} — \
+                     pipe an answer via stdin, or use `chidori serve` to pause the \
+                     run for a later response",
+                    prompt
+                );
+            }
             let response = line.trim_end_matches(&['\r', '\n'][..]).to_string();
             ctx.resolve_host_operation(host_operation, Value::String(response.clone()))?;
             ctx.record_call(CallRecord {

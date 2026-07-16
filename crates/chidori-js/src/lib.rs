@@ -6,6 +6,11 @@
 //! See `docs/architecture.md` and `docs/conformance.md` for the engine design
 //! and Test262 conformance status.
 
+// The engine is the sandbox: memory safety is a security property here, not a
+// style preference (docs/sandbox-model.md). Enforce the zero-`unsafe` claim at
+// compile time rather than by convention.
+#![forbid(unsafe_code)]
+
 pub mod builtins;
 pub mod bytecode;
 pub mod compiler;

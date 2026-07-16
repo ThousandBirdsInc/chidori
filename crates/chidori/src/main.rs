@@ -1064,6 +1064,22 @@ fn cmd_run(
     // Parse inputs into a JSON object.
     let input_value = parse_inputs(inputs)?;
 
+    // The durable defaults pin the clock to the epoch and seed Math.random()
+    // so replay is byte-identical — powerful, but invisible: 1970 timestamps
+    // and repeating "random" values look like bugs to a first-time author.
+    // Say it once, only when the defaults are in effect.
+    // Terminal-only: interactive authors get the hint, scripts and CI stay quiet.
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal()
+        && std::env::var_os("CHIDORI_TS_DATE").is_none()
+        && std::env::var_os("CHIDORI_TS_RANDOM").is_none()
+    {
+        eprintln!(
+            "determinism: clock pinned to epoch, Math.random() seeded (replay-safe defaults; \
+             override with CHIDORI_TS_DATE / CHIDORI_TS_RANDOM, see docs/replay.md)"
+        );
+    }
+
     // Resolve the project base directory.
     let base_dir = file
         .parent()

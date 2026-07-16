@@ -952,11 +952,21 @@ fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engine {
     for def in app.mcp_tools.iter() {
         registry.register(def.clone());
     }
+    // Default `chidori.workspace` to the served agent's project directory,
+    // matching `chidori run` — an explicit CHIDORI_WORKSPACE_ROOT still wins
+    // (it populates the context default, which the engine never overrides).
+    let workspace_root = app
+        .agent_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let workspace_root = std::fs::canonicalize(&workspace_root).unwrap_or(workspace_root);
     Engine::new(providers, app.template_engine.clone(), rt)
         .with_tools(Arc::new(registry))
         .with_policy(session_policy(app, policy_profile))
         .with_mcp(app.mcp.clone())
         .with_persist_base(app.run_base.clone())
+        .with_workspace_root(workspace_root)
 }
 
 /// Synchronous one-shot runner used by the ACP endpoint. Runs the agent on
