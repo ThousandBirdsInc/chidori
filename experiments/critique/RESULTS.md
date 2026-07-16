@@ -115,3 +115,38 @@ Bugs / papercuts filed from this session:
 7. Landlock warning printed on every run (needs a once-per-session or --quiet path).
 8. Default fixed clock/seed makes two *fresh* runs identical — powerful but
    under-signposted at the CLI (a one-line "clock pinned, rng seeded" notice would do).
+
+---
+
+## Fixes (same branch, after the critique)
+
+All eight findings were fixed and re-verified against their original repros:
+
+1. **`import(` substring scan** → dynamic import is now rejected from the oxc
+   AST (`ImportExpression` visitor); comments/strings/identifiers no longer
+   false-positive; parse errors defer to transpile diagnostics. 3 new unit tests.
+2. **Stack frames anchor at declarations** → a pc→source position table is
+   threaded through compilation and both interpreter tiers; innermost frame =
+   throw site (8:3), outer frames = call sites, awaited rejections = the await.
+3. **Policy caret at `run(`** → same fix; now lands on the gated
+   `chidori.tool(...)` call (4:24).
+4. **Duplicated frame** → frame recovery matched a trace embedded in a nested
+   tool error's *message*; recovery now strips the creation-time stack head.
+   (Fixing this also surfaced and fixed a pre-existing +2-line drift on
+   tool-file frames: the TS-remap project root was set on the wrong thread.)
+5. **`serve` vs `run` workspace root** → `serve` now defaults the workspace to
+   the served agent's project dir; explicit `CHIDORI_WORKSPACE_ROOT` wins.
+6. **`input()` EOF → silent ""** → fails loudly at EOF; piped answers still work.
+7. **Landlock warning every run** → sandbox degradation notes print once per
+   parent process.
+8. **Invisible determinism defaults** → `chidori run` prints a one-line,
+   tty-only notice (clock pinned, RNG seeded, override env vars named).
+
+Also: `#![forbid(unsafe_code)]` now enforces the engine's zero-unsafe claim at
+compile time; `docs/conformance.md` synced to the committed baseline
+(39,837 / 357); new `docs/README.md` separates user docs from internal notes.
+
+Verification: full `chidori` + `chidori-js` test suites pass, clippy clean at
+`-D warnings`, Test262 gate zero regressions (99.11% of executed), and the
+E4/E9 exactly-once + byte-identical replay experiments re-run clean on the
+fixed binary.
