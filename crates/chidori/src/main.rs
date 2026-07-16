@@ -395,9 +395,26 @@ fn main() {
     // --isolate/--no-isolate flags (handled per command below) always win.
     crate::runtime::isolate::default_on_if_unset();
 
+    // Confine error-report source reads (snippets, stack-frame remaps) to the
+    // entry agent's workspace root. The root lives in a THREAD-local (tests
+    // need per-thread isolation), and error display spans two threads: the
+    // command thread emits `--stream` failure events, while `report_cli_error`
+    // below renders on this main thread — so the root must be stamped on
+    // both, or the main-thread reporter silently falls back to the current
+    // directory and absolute-path invocations lose their remap and snippet.
+    let display_root = display_project_root_of(&cli.command);
+    if let Some(root) = &display_root {
+        crate::runtime::rust_engine::set_display_project_root(root.clone());
+    }
+
     // Commands that only do parsing/validation return exit code 2 on failure;
     // everything else returns 1. Success is 0.
-    let (result, parse_only) = on_js_stack(move || dispatch_command(cli.command));
+    let (result, parse_only) = on_js_stack(move || {
+        if let Some(root) = display_root {
+            crate::runtime::rust_engine::set_display_project_root(root);
+        }
+        dispatch_command(cli.command)
+    });
 
     // Flush any buffered OTLP spans before the process exits. No-op when
     // OTEL_EXPORTER_OTLP_ENDPOINT wasn't set.
@@ -432,24 +449,25 @@ fn on_js_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 
 /// Dispatch one parsed CLI command to its handler, returning its result and
 /// whether it is a parse/validation-only command (exit code 2 on failure).
-fn dispatch_command(command: Commands) -> (Result<()>, bool) {
-    // Confine error-report source snippets to the entry agent's workspace root
-    // (see `rust_engine::read_project_source`): a run/check names a `.ts` file,
-    // whose workspace root is where its modules live.
-    let entry_file = match &command {
+/// The workspace root error display is confined to (see
+/// `rust_engine::read_project_source`): a run/check names a `.ts` file, whose
+/// workspace root is where its modules live. `None` for commands that run no
+/// agent file.
+fn display_project_root_of(command: &Commands) -> Option<PathBuf> {
+    let file = match command {
         Commands::Run { file, .. }
         | Commands::Check { file }
         | Commands::Resume { file, .. }
-        | Commands::Serve { file, .. } => Some(file.clone()),
-        Commands::Chat { agent, .. } => agent.clone(),
-        _ => None,
+        | Commands::Serve { file, .. } => file.clone(),
+        Commands::Chat { agent, .. } => agent.clone()?,
+        _ => return None,
     };
-    if let Some(file) = entry_file {
-        crate::runtime::rust_engine::set_display_project_root(
-            crate::runtime::typescript::transpile::find_workspace_root(&file),
-        );
-    }
+    Some(crate::runtime::typescript::transpile::find_workspace_root(
+        &file,
+    ))
+}
 
+fn dispatch_command(command: Commands) -> (Result<()>, bool) {
     match command {
         Commands::Run {
             file,

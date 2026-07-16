@@ -184,9 +184,14 @@ fn join_message(head: &str, rest: &str) -> String {
 
 thread_local! {
     /// The directory tree stack-frame source reads are confined to (see
-    /// [`read_project_source`]). Set to the entry agent's workspace root at the
-    /// start of each JS-running CLI command; unset (falls back to the current
-    /// directory) in the library and tests that don't establish one.
+    /// [`read_project_source`]). Set to the entry agent's workspace root as a
+    /// JS-running CLI command starts — on EVERY thread that renders errors:
+    /// the command thread (`--stream` failure events) and the process main
+    /// thread (`main::report_cli_error`), see `main::display_project_root_of`.
+    /// Deliberately thread-local rather than a process global so parallel
+    /// tests can each confine to their own temp root; unset (falls back to
+    /// the current directory) in the library and tests that don't establish
+    /// one.
     static DISPLAY_PROJECT_ROOT: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1346,8 +1351,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.ts");
         // The interface block only exists in the original TypeScript — the
-        // frames must still point at the original lines (validate on 6,
-        // lookup on 10), proving the source-map remap ran.
+        // frames must still point at the original lines (validate's throw on
+        // 7, lookup's call on 11), proving the source-map remap ran.
         let src = "import { chidori, run } from \"chidori:agent\";\n\
                    interface Row {\n\
                    \x20 id: string;\n\
@@ -1387,17 +1392,18 @@ mod tests {
             "caller frame is labeled too: {err}"
         );
 
-        // Display-time remap lands both frames on their original definition
-        // lines (validate on 6, lookup on 10), past the interface block that
-        // only exists in the original TypeScript.
+        // Display-time remap lands both frames on their original lines — the
+        // throw statement (7) for the innermost frame and the call site (11)
+        // for its caller, past the interface block that only exists in the
+        // original TypeScript.
         let remapped = remap_stack_frames(&err);
         assert!(
-            remapped.contains(&format!("at validate ({path_str}:6:")),
-            "innermost frame remaps to the original definition line: {remapped}"
+            remapped.contains(&format!("at validate ({path_str}:7:")),
+            "innermost frame remaps to the original throw line: {remapped}"
         );
         assert!(
-            remapped.contains(&format!("at lookup ({path_str}:10:")),
-            "caller frame remaps too: {remapped}"
+            remapped.contains(&format!("at lookup ({path_str}:11:")),
+            "caller frame remaps to its original call-site line: {remapped}"
         );
 
         let _ = std::fs::remove_dir_all(dir);

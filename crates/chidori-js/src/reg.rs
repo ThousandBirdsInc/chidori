@@ -106,6 +106,12 @@ pub struct RegProto {
     /// indexed by the op's `ic` payload. Same key-verified discipline as
     /// [`crate::bytecode::FuncProto::ic`].
     pub ic: Box<[IcEntry]>,
+    /// Per-op source position, index-parallel to `code`: the
+    /// [`crate::bytecode::FuncProto::pos`] entry of the stack op each
+    /// register op was translated from, so a throw on this tier reports the
+    /// same statement/call-site position as the stack tier. Empty when the
+    /// input carried no position table.
+    pub pos: Box<[u32]>,
 }
 
 /// Unary value ops sharing one register shape (`dst = op(src)`).
@@ -899,8 +905,15 @@ fn rop_budget_pure(op: &ROp) -> bool {
 /// Returns `None` when the function contains any op outside the translated
 /// subset, contains loop kernels, or exceeds the register budget. `consts`
 /// is read only by build-time fusions that need a constant's VALUE (the
-/// `TypeofBr` typeof-name check).
-pub fn regify(code: &[Op], num_locals: u32, consts: &[crate::bytecode::Const]) -> Option<RegProto> {
+/// `TypeofBr` typeof-name check). `pos` is the stack code's per-op source
+/// position table (index-parallel to `code`, or empty when untracked); each
+/// emitted register op inherits the position of the stack op it stands for.
+pub fn regify(
+    code: &[Op],
+    num_locals: u32,
+    consts: &[crate::bytecode::Const],
+    pos: &[u32],
+) -> Option<RegProto> {
     if code.is_empty() || num_locals > u16::MAX as u32 / 2 {
         return None;
     }
@@ -1166,6 +1179,24 @@ pub fn regify(code: &[Op], num_locals: u32, consts: &[crate::bytecode::Const]) -
     }
     debug_assert_eq!(e.pending, 0);
     rpc_at[code.len()] = e.code.len() as u32;
+    // Per-register-op source positions, derived from the finished `rpc_at`
+    // map: every register op emitted for stack ip `i` — flushes and charge
+    // sinks included — lands in `[rpc_at[i], rpc_at[i+1])` (interior ops of a
+    // multi-op window map to the window head, whose range then covers the
+    // whole emission). `rpc_at` is monotone by construction, so this fills
+    // the table left to right.
+    let rpos: Vec<u32> = if pos.len() == code.len() {
+        let mut rpos = vec![0u32; e.code.len()];
+        for (ip, &p) in pos.iter().enumerate() {
+            let (start, end) = (rpc_at[ip] as usize, rpc_at[ip + 1] as usize);
+            rpos[start..end].fill(p);
+        }
+        // The end-of-code return pad pushed below inherits the last position.
+        rpos.push(pos.last().copied().unwrap_or(0));
+        rpos
+    } else {
+        Vec::new()
+    };
     // Falling off the end of the code returns like the stack loop's
     // `ip >= code.len()` exit; also the landing pad for end-of-code jump
     // targets, so pc can never overrun. Costs one unit: the stack loop
@@ -1201,11 +1232,13 @@ pub fn regify(code: &[Op], num_locals: u32, consts: &[crate::bytecode::Const]) -
         })
         .collect();
     debug_assert_eq!(e.code.len(), e.costs.len());
+    debug_assert!(rpos.is_empty() || rpos.len() == e.code.len());
     Some(RegProto {
         code: e.code,
         costs: e.costs.into_boxed_slice(),
         num_regs: num_regs as u16,
         ic,
+        pos: rpos.into_boxed_slice(),
     })
 }
 
