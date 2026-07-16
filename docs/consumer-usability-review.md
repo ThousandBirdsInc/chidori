@@ -175,8 +175,9 @@ with five prompts and two tools, "your agent failed at `run(`" is no
 information at all; in a 1,000-line agent it would be actively painful. The
 divergence errors prove the runtime knows the failing seq and call; the
 frames just don't use the real call site. (This clearly improved recently —
-#132 added stack traces — but the top frame shown to the user is still the
-registration site.)
+#132 added stack traces — but at review time the top frame shown to the
+user was still the registration site. Since fixed by the per-op position
+table; see the note in the fixes section below.)
 
 ## Friction 6: CLI/server asymmetries a consumer trips on, in order
 
@@ -300,14 +301,23 @@ workspace root as run/serve/resume; `llm.txt` warns about the
 and regression tests pin the new behaviors (target-wide approval cache,
 tolerant-but-loud journal argument comparison, priced-vs-unknown cost).
 
-**Not fixed: error frames anchored at `run(`.** Investigated: the engine's
-stack frames carry each function's *definition site*
-(`FuncProto.source_line`), and the bytecode has no per-instruction line
-table, so pointing a frame at the failing `await` requires adding a pc→span
-table to compiled functions and teaching the unwinder to read the current pc
-— a real engine project rather than a polish fix. Runtime error *messages*
-carry the failing seq and call details, which mitigates but does not replace
-call-site frames.
+**Fixed since this review: error frames anchored at `run(`.** At the time
+of the investigation the engine's stack frames carried each function's
+*definition site* (`FuncProto.source_line`) and the bytecode had no
+per-instruction line table — pointing a frame at the failing `await` meant
+adding a pc→span table to compiled functions and teaching the unwinder to
+read the current pc. That engine work has since landed (#135): a per-op
+position table (`FuncProto::pos`, index-parallel to the code and remapped by
+every code-shortening pass) is threaded through both interpreter tiers, and
+the unwinder records each frame at the position the throw crossed it — the
+throwing statement for the innermost frame, the awaiting call for outer
+frames. Host-raised failures (policy denials, provider errors, workspace
+errors, unknown tools) now anchor at the gated call rather than the `run(`
+registration line, with the definition site remaining only as the fallback
+for synthetic protos. Regression tests pin the behavior in
+`crates/chidori-js/tests/errors.rs` and
+`crates/chidori/src/runtime/rust_engine.rs`
+(`policy_denied_effect_frame_anchors_at_the_gated_call_not_run`).
 
 ## Closing
 
