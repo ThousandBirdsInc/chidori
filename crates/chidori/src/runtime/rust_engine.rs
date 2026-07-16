@@ -214,9 +214,21 @@ pub(crate) fn set_display_project_root(root: PathBuf) {
 pub(crate) fn read_project_source(file: &str) -> Option<String> {
     let root = DISPLAY_PROJECT_ROOT
         .with(|r| r.borrow().clone())
-        .or_else(|| std::env::current_dir().ok())?
-        .canonicalize()
-        .ok()?;
+        .or_else(|| std::env::current_dir().ok())?;
+    read_project_source_within(&root, file)
+}
+
+/// As [`read_project_source`], but confined to an explicit `root` instead of
+/// the thread-local display root — for surfaces whose display boundary is not
+/// the CLI process's JS thread (the HTTP server's session errors). An empty
+/// root (the parent of a bare `agent.ts`) means the current directory.
+pub(crate) fn read_project_source_within(root: &Path, file: &str) -> Option<String> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
+    let root = root.canonicalize().ok()?;
     let full = Path::new(file).canonicalize().ok()?;
     full.starts_with(&root)
         .then(|| std::fs::read_to_string(&full).ok())
@@ -283,6 +295,19 @@ pub(crate) fn parse_stack_frame(line: &str) -> Option<StackFrame<'_>> {
 /// uniform transpiled coordinates); error path only, so each distinct file
 /// re-runs the transpile pipeline once with map generation on.
 pub(crate) fn remap_stack_frames(err: &str) -> String {
+    remap_stack_frames_via(err, read_project_source)
+}
+
+/// As [`remap_stack_frames`], but confining frame source reads to an explicit
+/// project root — the server's variant, applied where a run error becomes a
+/// session's stored/returned `error` (the CLI resolves its root from the
+/// thread-local set at command startup; the server handlers run on tokio
+/// threads that never set it, so the agent's workspace root is passed in).
+pub(crate) fn remap_stack_frames_within(root: &Path, err: &str) -> String {
+    remap_stack_frames_via(err, |file| read_project_source_within(root, file))
+}
+
+fn remap_stack_frames_via(err: &str, read: impl Fn(&str) -> Option<String>) -> String {
     use std::collections::HashMap;
     let mut sources: HashMap<&str, Option<String>> = HashMap::new();
     let mut out = String::with_capacity(err.len());
@@ -294,7 +319,7 @@ pub(crate) fn remap_stack_frames(err: &str) -> String {
             let file = frame.file?;
             let source = sources
                 .entry(file)
-                .or_insert_with(|| read_project_source(file))
+                .or_insert_with(|| read(file))
                 .as_deref()?;
             let pos = crate::runtime::typescript::transpile::remap_to_original(
                 Path::new(file),

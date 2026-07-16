@@ -676,7 +676,8 @@ pub async fn serve(
     let acp_state = AcpState {
         store: state.session_store.clone(),
         run_prompt: Arc::new(move |inputs: Value| -> Result<Value, String> {
-            run_agent_sync(&acp_runner_state, inputs).map_err(|e| e.to_string())
+            run_agent_sync(&acp_runner_state, inputs)
+                .map_err(|e| agent_error_string(&acp_runner_state.agent_path, &e))
         }),
     };
 
@@ -1350,7 +1351,7 @@ async fn create_session(
     };
     match result {
         Ok(run_result) => apply_run_outcome(&mut session, run_result),
-        Err(e) => session.error = Some(e.to_string()),
+        Err(e) => session.error = Some(agent_error_string(&state.agent_path, &e)),
     }
 
     if let Some(err) = store_or_500(&state, &session) {
@@ -1911,7 +1912,8 @@ async fn stream_session(
                         Err(e) => {
                             session.status = SessionStatus::Failed;
                             session.output = None;
-                            session.error = Some(e.to_string());
+                            session.error =
+                                Some(agent_error_string(&state_for_stream.agent_path, &e));
                         }
                     }
                     if was_cancelled {
@@ -2105,6 +2107,18 @@ async fn cancel_session(
         "reason": reason,
     }))
     .into_response()
+}
+
+/// Render an agent-run error for a session's stored/returned `error` field.
+/// Uncaught-exception stack frames arrive from the engine in transpiled
+/// coordinates; remap them to positions in the original TypeScript against
+/// the served agent's workspace root — the same display-boundary remap the
+/// CLI applies in `main::report_cli_error` (which resolves its root from a
+/// thread-local these tokio handlers never set). Frames that can't be read
+/// or remapped pass through unchanged, as does any error without frames.
+fn agent_error_string(agent_path: &FsPath, e: &anyhow::Error) -> String {
+    let root = crate::runtime::typescript::transpile::find_workspace_root(agent_path);
+    crate::runtime::rust_engine::remap_stack_frames_within(&root, &e.to_string())
 }
 
 /// Map a finished engine run onto a stored session: status, output, call log,
@@ -2363,13 +2377,14 @@ async fn complete_pending_and_resume(
             (StatusCode::OK, Json(session_view(&session))).into_response()
         }
         Err(e) => {
+            let error = agent_error_string(&state.agent_path, &e);
             session.status = SessionStatus::Failed;
-            session.error = Some(e.to_string());
+            session.error = Some(error.clone());
             let _ = state.session_store.put(&session);
             state.warm_runs.lock().unwrap().remove(&session.id);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
+                Json(json!({"error": error})),
             )
                 .into_response()
         }
@@ -2447,7 +2462,7 @@ async fn resume_session(
                     Some(Ok(run_result)) => apply_run_outcome(&mut session, run_result),
                     Some(Err(e)) => {
                         session.status = SessionStatus::Failed;
-                        session.error = Some(e.to_string());
+                        session.error = Some(agent_error_string(&state.agent_path, &e));
                     }
                     None => {
                         session.status = SessionStatus::Failed;
@@ -2927,12 +2942,13 @@ async fn approve_session(
             (StatusCode::OK, Json(session_view(&session))).into_response()
         }
         Err(e) => {
+            let error = agent_error_string(&state.agent_path, &e);
             session.status = SessionStatus::Failed;
-            session.error = Some(e.to_string());
+            session.error = Some(error.clone());
             let _ = state.session_store.put(&session);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
+                Json(json!({"error": error})),
             )
                 .into_response()
         }
@@ -3012,7 +3028,7 @@ async fn handle_event(
         }
         Err(e) => {
             eprintln!("Agent error: {e:#}");
-            let error = json!({"error": e.to_string()});
+            let error = json!({"error": agent_error_string(&state.agent_path, &e)});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
         }
     }
@@ -3025,6 +3041,73 @@ mod tests {
         RuntimePolicy, SnapshotAbi, SourceFingerprint, HOST_PROMISE_TABLE_FILE,
     };
     use axum::body;
+
+    /// A failed session's `error` must carry stack frames in ORIGINAL
+    /// TypeScript coordinates for every frame, not just the throwing one —
+    /// the engine hands the server transpiled-bundle positions, and the
+    /// server (whose tokio handlers never set the CLI's thread-local display
+    /// root) remaps them against the agent's workspace root.
+    #[test]
+    fn agent_error_string_remaps_every_frame_to_original_source() {
+        let dir = std::env::temp_dir().join(format!("chidori-srv-frames-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent_path = dir.join("agent.ts");
+        // The interface block exists only in the original TypeScript, so every
+        // transpiled line number below it disagrees with the original.
+        let src = "interface Row {\n\
+                   \x20 id: string;\n\
+                   }\n\
+                   function inner(row: Row): never {\n\
+                   \x20 throw new Error(\"bad \" + row.id);\n\
+                   }\n\
+                   function outer(): never {\n\
+                   \x20 return inner({ id: \"x\" });\n\
+                   }\n\
+                   export async function agent() { return outer(); }\n";
+        std::fs::write(&agent_path, src).unwrap();
+
+        // Derive the frames' transpiled coordinates the same way the engine
+        // stamps them: the emitted definition line of each function.
+        let (js, _map) =
+            crate::runtime::typescript::transpile::transpile_source_with_map(&agent_path, src)
+                .unwrap();
+        let emitted_line = |name: &str| {
+            js.lines()
+                .position(|l| l.contains(&format!("function {name}")))
+                .map(|i| i as u32 + 1)
+                .unwrap()
+        };
+        let (inner_line, outer_line) = (emitted_line("inner"), emitted_line("outer"));
+        // The interface strip is what makes this test meaningful: emitted
+        // positions must disagree with the original definition lines (4, 7).
+        assert_ne!(
+            inner_line, 4,
+            "transpile no longer shifts lines; rewrite this test"
+        );
+
+        let path_str = agent_path.to_string_lossy();
+        let err = anyhow::anyhow!(
+            "JavaScript exception: Error: bad x\n    at inner ({path_str}:{inner_line}:10)\n    at outer ({path_str}:{outer_line}:10)"
+        );
+        let remapped = agent_error_string(&agent_path, &err);
+        assert!(
+            remapped.contains(&format!("at inner ({path_str}:4:")),
+            "throwing frame lands on the original definition line: {remapped}"
+        );
+        assert!(
+            remapped.contains(&format!("at outer ({path_str}:7:")),
+            "the frame ABOVE the throwing one lands on its original line too: {remapped}"
+        );
+
+        // Errors without frames pass through byte-identical.
+        let plain = anyhow::anyhow!("policy: `tool:x` denied");
+        assert_eq!(
+            agent_error_string(&agent_path, &plain),
+            "policy: `tool:x` denied"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn bearer_token_matches_single_key() {

@@ -1253,10 +1253,14 @@ fn cmd_run_stream(
             Ok(())
         }
         Err(e) => {
+            // Frames arrive in transpiled coordinates; the stream consumer
+            // sees the same original-TypeScript positions the CLI reporter
+            // shows. The returned error stays raw — report_cli_error remaps
+            // it once at its own display boundary.
             let line = serde_json::json!({
                 "type": "done",
                 "status": "failed",
-                "error": format!("{e:#}"),
+                "error": crate::runtime::rust_engine::remap_stack_frames(&format!("{e:#}")),
             });
             println!("{line}");
             Err(e)
