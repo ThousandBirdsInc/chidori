@@ -1418,6 +1418,74 @@ mod tests {
     }
 
     #[test]
+    fn policy_denied_effect_frame_anchors_at_the_gated_call_not_run() {
+        // Critique E3 regression (experiments/critique/RESULTS.md): the
+        // policy-denial error used to anchor at `run(` — the handler's
+        // definition line — instead of the gated call. Unlike a plain JS
+        // throw, the denial is raised by the HOST binding (an `Err(String)`
+        // crossing back into the VM mid-await), so this pins the one path
+        // where the frame position must come from the per-op position table
+        // at the awaiting call site rather than the proto's definition site.
+        let dir = std::env::temp_dir().join(format!("chidori-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        // `run(` sits on line 3; the gated `fetch(...)` call (which routes
+        // through the policy-checked `__chidori_http` host op) on line 4.
+        let src = "import { chidori, run } from \"chidori:agent\";\n\n\
+                   run(async () => {\n\
+                   \x20 const res = await fetch(\"https://denied.test/\");\n\
+                   \x20 return res.status;\n\
+                   });\n";
+        std::fs::write(&path, src).unwrap();
+
+        let policy = PolicyConfig {
+            rules: vec![crate::policy::PolicyRule {
+                target: "http".to_string(),
+                decision: crate::policy::Decision::NeverAllow,
+                match_args: None,
+                reason: Some("network disabled in this test".to_string()),
+            }],
+            ..PolicyConfig::default()
+        };
+        let backend = HostBindingBackend::for_runtime(
+            RuntimeContext::new(),
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(".")),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            Arc::new(policy),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("rust-engine-test"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(McpManager::new()),
+        );
+
+        let err = run_agent(&path, src, &serde_json::json!({}), &backend)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("policy: `http` denied"),
+            "the denial names the gated target: {err}"
+        );
+
+        // Frames arrive in transpiled coordinates; remap at the display
+        // boundary exactly as the CLI does, then the handler frame must land
+        // on the gated call (line 4), not the `run(` line (line 3).
+        super::set_display_project_root(dir.clone());
+        let remapped = remap_stack_frames(&err);
+        let path_str = path.to_string_lossy();
+        assert!(
+            remapped.contains(&format!("at <anonymous> ({path_str}:4:")),
+            "handler frame anchors at the gated fetch call: {remapped}"
+        );
+        assert!(
+            !remapped.contains(&format!("({path_str}:3:")),
+            "no frame anchors at the run( line: {remapped}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn run_agent_executes_ts_through_rust_engine_and_records_host_calls() {
         // A single-file TS agent that does JS work (a nested function call) and a
         // chidori.log host effect, then returns a value derived from its input.
