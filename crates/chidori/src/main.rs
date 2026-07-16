@@ -75,6 +75,12 @@ enum Commands {
         #[arg(long)]
         tools: Vec<PathBuf>,
 
+        /// Default model for prompts that don't set one in code (equivalent
+        /// to CHIDORI_MODEL). Any model name your configured provider
+        /// accepts, e.g. `claude-sonnet-4-6`, `gpt-4o`, `deepseek-chat`.
+        #[arg(long)]
+        model: Option<String>,
+
         /// Stream each host-function call as a newline-delimited JSON event to
         /// stdout as it executes. Each line is either:
         ///   {"type":"call","record":{...}}
@@ -243,6 +249,13 @@ enum Commands {
         /// resumes cleanly.
         #[arg(long)]
         allow_source_change: bool,
+
+        /// Default model for prompts executed live past the replay frontier
+        /// (equivalent to CHIDORI_MODEL). Already-recorded prompts keep their
+        /// recorded model; a recorded prompt whose model would change is a
+        /// divergence and fails loudly.
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// List a run's persisted `chidori.branch` sub-runs and their states.
@@ -340,6 +353,16 @@ enum Commands {
         /// Print host function calls to stderr during execution
         #[arg(short, long)]
         verbose: bool,
+
+        /// Extra directories to scan for tool files, mirroring `chidori run`.
+        /// Defaults to `<agent file's parent>/tools/` only.
+        #[arg(long)]
+        tools: Vec<PathBuf>,
+
+        /// Default model for prompts that don't set one in code (equivalent
+        /// to CHIDORI_MODEL), applied to every session this server runs.
+        #[arg(long)]
+        model: Option<String>,
 
         /// Serve under the built-in deny-by-default `untrusted` policy profile:
         /// gated effects (http, workspace mutations) are refused unless
@@ -475,6 +498,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             trace,
             verbose,
             tools,
+            model,
             stream,
             untrusted,
             trusted,
@@ -487,6 +511,16 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                 crate::runtime::isolate::enable();
             } else if no_isolate {
                 crate::runtime::isolate::disable();
+            }
+            // The runtime (and any isolate worker child) resolves the default
+            // model from CHIDORI_MODEL; the flag is a spelling of the env var.
+            if let Some(ref model) = model {
+                std::env::set_var("CHIDORI_MODEL", model);
+            }
+            // Propagate verbosity to the isolate worker child so its sandbox
+            // degradation notes surface under -v.
+            if verbose {
+                std::env::set_var("CHIDORI_VERBOSE", "1");
             }
             crate::runtime::isolate::warn_if_untrusted_without_isolation(untrusted);
             let result = if stream {
@@ -538,14 +572,20 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             dir,
             until_seq,
             allow_source_change,
+            model,
         } => (
-            cmd_resume(
-                &file,
-                &run_id,
-                dir.as_deref(),
-                until_seq,
-                allow_source_change,
-            ),
+            {
+                if let Some(ref model) = model {
+                    std::env::set_var("CHIDORI_MODEL", model);
+                }
+                cmd_resume(
+                    &file,
+                    &run_id,
+                    dir.as_deref(),
+                    until_seq,
+                    allow_source_change,
+                )
+            },
             false,
         ),
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
@@ -570,6 +610,8 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             port,
             host,
             verbose,
+            tools,
+            model,
             untrusted,
             trusted,
             isolate,
@@ -580,8 +622,19 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             } else if no_isolate {
                 crate::runtime::isolate::disable();
             }
+            if let Some(ref model) = model {
+                std::env::set_var("CHIDORI_MODEL", model);
+            }
             (
-                cmd_serve(&file, host.as_deref(), port, verbose, untrusted, trusted),
+                cmd_serve(
+                    &file,
+                    host.as_deref(),
+                    port,
+                    verbose,
+                    &tools,
+                    untrusted,
+                    trusted,
+                ),
                 false,
             )
         }
@@ -843,8 +896,9 @@ fn cmd_demo() -> Result<()> {
         println!("or set one of:");
         println!("  export ANTHROPIC_API_KEY=sk-ant-...");
         println!("  export OPENAI_API_KEY=sk-...");
-        println!("  export LITELLM_API_URL=http://localhost:4401/v1");
-        println!("  export LITELLM_API_KEY=sk-litellm-master-key");
+        println!("  # any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, LiteLLM...):");
+        println!("  export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com");
+        println!("  export CHIDORI_OPENAI_COMPAT_KEY=sk-...");
         return Ok(());
     }
 
@@ -877,7 +931,7 @@ fn cmd_demo() -> Result<()> {
             // The demo serves the developer's own example agent on their own
             // machine — the trusted posture, like `chidori run`, on the
             // default loopback bind.
-            cmd_serve(&PathBuf::from(file), None, *port, false, false, true)
+            cmd_serve(&PathBuf::from(file), None, *port, false, &[], false, true)
         }
     }
 }
@@ -931,6 +985,7 @@ fn confirm_start_server(port: u16) -> Result<bool> {
 fn has_llm_provider() -> bool {
     std::env::var_os("ANTHROPIC_API_KEY").is_some()
         || std::env::var_os("OPENAI_API_KEY").is_some()
+        || std::env::var_os("CHIDORI_OPENAI_COMPAT_URL").is_some()
         || std::env::var_os("LITELLM_API_URL").is_some()
         || providers::openrouter::saved_api_key().is_some()
 }
@@ -975,7 +1030,10 @@ fn ensure_llm_provider_interactive() -> bool {
     }
 
     println!();
-    println!("No LLM provider key found (ANTHROPIC_API_KEY / OPENAI_API_KEY).");
+    println!(
+        "No LLM provider key found (ANTHROPIC_API_KEY / OPENAI_API_KEY / \
+         CHIDORI_OPENAI_COMPAT_URL)."
+    );
     println!("You can sign in with OpenRouter to try this out — no API key setup needed.");
     if !providers::openrouter::confirm_login() {
         return false;
@@ -1585,7 +1643,12 @@ fn cmd_resume(
     let tools = Arc::new(
         ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
     );
-    let engine = Engine::new(providers, template_engine, tokio_rt).with_tools(tools);
+    // Same implicit workspace root as `chidori run`: a run that wrote
+    // workspace files must replay/resume without extra configuration.
+    // CHIDORI_WORKSPACE_ROOT still takes precedence inside the runtime.
+    let engine = Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(tools)
+        .with_workspace_root(abs_dir(&base_dir));
 
     let result = engine.run_with_replay(file, &input_value, records)?;
 
@@ -1625,7 +1688,9 @@ fn branch_engine(dir: Option<&std::path::Path>) -> Result<Engine> {
     let tools = Arc::new(
         ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
     );
-    Ok(Engine::new(providers, template_engine, tokio_rt).with_tools(tools))
+    Ok(Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(tools)
+        .with_workspace_root(abs_dir(&base_dir)))
 }
 
 fn cmd_branches(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
@@ -1682,6 +1747,7 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     let mut total_out = 0u64;
     let mut total_ms = 0u64;
     let mut total_cost = 0.0;
+    let mut unpriced_models: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for r in &records {
         let args_str = serde_json::to_string(&r.args).unwrap_or_default();
@@ -1709,8 +1775,15 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
             total_out += u.output_tokens;
             if r.function == "prompt" {
                 let model = r.args.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                total_cost +=
-                    crate::runtime::cost::estimate_cost_usd(model, u.input_tokens, u.output_tokens);
+                if crate::runtime::cost::is_priced_model(model) {
+                    total_cost += crate::runtime::cost::estimate_cost_usd(
+                        model,
+                        u.input_tokens,
+                        u.output_tokens,
+                    );
+                } else {
+                    unpriced_models.insert(model.to_string());
+                }
             }
         }
         total_ms += r.duration_ms;
@@ -1719,7 +1792,21 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     println!();
     if total_in > 0 || total_out > 0 {
         println!("Tokens:   {} in / {} out", total_in, total_out);
-        println!("Est cost: ${:.6}", total_cost);
+        // "$0.000000" for a model missing from the pricing table would read
+        // as "free"; say "unknown" instead and name the unpriced models.
+        if unpriced_models.is_empty() {
+            println!("Est cost: ${:.6}", total_cost);
+        } else {
+            let names = unpriced_models.into_iter().collect::<Vec<_>>().join(", ");
+            if total_cost > 0.0 {
+                println!(
+                    "Est cost: ${:.6} + unknown (no pricing data for: {})",
+                    total_cost, names
+                );
+            } else {
+                println!("Est cost: unknown (no pricing data for: {})", names);
+            }
+        }
     }
     println!("Duration: {} ms", total_ms);
     Ok(())
@@ -1821,15 +1908,33 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
         total_output_tokens,
         total_input_tokens + total_output_tokens
     );
-    println!("Est. cost:         ${:.6}", total_cost);
+    let unpriced: Vec<&String> = per_model
+        .keys()
+        .filter(|m| !crate::runtime::cost::is_priced_model(m))
+        .collect();
+    if unpriced.is_empty() {
+        println!("Est. cost:         ${:.6}", total_cost);
+    } else if total_cost > 0.0 {
+        println!(
+            "Est. cost:         ${:.6} + unknown (unpriced models below)",
+            total_cost
+        );
+    } else {
+        println!("Est. cost:         unknown (unpriced models below)");
+    }
     println!("Total duration:    {} ms", total_duration_ms);
 
     if !per_model.is_empty() {
         println!("\nPer model:");
         for (model, s) in &per_model {
+            let cost = if crate::runtime::cost::is_priced_model(model) {
+                format!("${:.6}", s.cost_usd)
+            } else {
+                "cost unknown (no pricing data)".to_string()
+            };
             println!(
-                "  {:<24} {:>4} calls  {:>8} in  {:>8} out  ${:.6}",
-                model, s.calls, s.input_tokens, s.output_tokens, s.cost_usd
+                "  {:<24} {:>4} calls  {:>8} in  {:>8} out  {}",
+                model, s.calls, s.input_tokens, s.output_tokens, cost
             );
         }
     }
@@ -1842,10 +1947,14 @@ fn cmd_serve(
     host: Option<&str>,
     port: u16,
     verbose: bool,
+    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
     if verbose {
+        // Isolate worker children read this to decide whether to print
+        // sandbox degradation notes.
+        std::env::set_var("CHIDORI_VERBOSE", "1");
         tracing_subscriber::fmt()
             .with_env_filter("info")
             .with_target(false)
@@ -1890,6 +1999,7 @@ fn cmd_serve(
         providers,
         template_engine,
         file.to_path_buf(),
+        extra_tool_dirs.to_vec(),
         host,
         port,
         policy,

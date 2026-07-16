@@ -18,6 +18,11 @@ pub struct OpenAiProvider {
     /// If empty, uses default matching (gpt, o1, o3).
     model_prefixes: Vec<String>,
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// Display name used in error messages. "OpenAI" for the real endpoint;
+    /// for OpenAI-compatible endpoints it names the host (e.g.
+    /// "OpenAI-compatible endpoint api.deepseek.com") so a failure is
+    /// attributed to the provider the user actually configured.
+    label: String,
 }
 
 impl OpenAiProvider {
@@ -28,17 +33,27 @@ impl OpenAiProvider {
             client: Client::new(),
             model_prefixes: Vec::new(),
             rate_limiter: None,
+            label: "OpenAI".to_string(),
         }
     }
 
-    /// Create a provider pointing at an OpenAI-compatible endpoint (e.g. LiteLLM, Ollama).
+    /// Create a provider pointing at an OpenAI-compatible endpoint (e.g.
+    /// DeepSeek, Groq, Ollama, vLLM, LiteLLM). The error label is derived
+    /// from the endpoint's host.
     pub fn with_base_url(api_key: String, base_url: String, model_prefixes: Vec<String>) -> Self {
+        let label = match url_host(&base_url) {
+            Some(host) if host != "api.openai.com" => {
+                format!("OpenAI-compatible endpoint {host}")
+            }
+            _ => "OpenAI".to_string(),
+        };
         Self {
             api_key,
             base_url,
             client: Client::new(),
             model_prefixes,
             rate_limiter: None,
+            label,
         }
     }
 
@@ -46,6 +61,15 @@ impl OpenAiProvider {
         self.rate_limiter = Some(Arc::new(RateLimiter::new(rpm)));
         self
     }
+}
+
+/// Best-effort host extraction for error labels; avoids pulling in a URL crate.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host = rest.split(['/', '?', '#']).next()?;
+    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    (!host.is_empty()).then_some(host)
 }
 
 #[derive(Deserialize)]
@@ -67,6 +91,11 @@ struct OpenAiResponseMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCall>>,
+    /// Hidden chain-of-thought emitted by reasoning models on
+    /// OpenAI-compatible backends (DeepSeek et al.). Not part of the
+    /// conversation; captured so authors can inspect it.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -174,19 +203,24 @@ impl LlmProvider for OpenAiProvider {
         let resp_text = resp
             .text()
             .await
-            .context("Failed to read OpenAI response")?;
+            .with_context(|| format!("Failed to read {} response", self.label))?;
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<OpenAiError>(&resp_text) {
-                bail!("OpenAI API error ({}): {}", status, err.error.message);
+                bail!(
+                    "{} API error ({}): {}",
+                    self.label,
+                    status,
+                    err.error.message
+                );
             }
-            bail!("OpenAI API error ({}): {}", status, resp_text);
+            bail!("{} API error ({}): {}", self.label, status, resp_text);
         }
 
-        let parsed: OpenAiResponseBody =
-            serde_json::from_str(&resp_text).context("Failed to parse OpenAI response")?;
+        let parsed: OpenAiResponseBody = serde_json::from_str(&resp_text)
+            .with_context(|| format!("Failed to parse {} response", self.label))?;
 
-        let (text, finish_reason, raw_tool_calls) = parsed
+        let (text, finish_reason, raw_tool_calls, reasoning) = parsed
             .choices
             .into_iter()
             .next()
@@ -195,6 +229,7 @@ impl LlmProvider for OpenAiProvider {
                     c.message.content.unwrap_or_default(),
                     c.finish_reason.unwrap_or_default(),
                     c.message.tool_calls.unwrap_or_default(),
+                    c.message.reasoning_content.filter(|r| !r.is_empty()),
                 )
             })
             .unwrap_or_default();
@@ -252,6 +287,7 @@ impl LlmProvider for OpenAiProvider {
             output_tokens,
             cache_creation_tokens: 0,
             cache_read_tokens,
+            reasoning,
         })
     }
 
@@ -316,11 +352,12 @@ impl LlmProvider for OpenAiProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            bail!("OpenAI stream error ({}): {}", status, text);
+            bail!("{} stream error ({}): {}", self.label, status, text);
         }
 
         // Accumulators.
         let mut text_buf = String::new();
+        let mut reasoning_buf = String::new();
         // Tool calls keyed by index (OpenAI streams partial tool calls across
         // multiple chunks, each with an index field).
         let mut tool_acc: std::collections::BTreeMap<u64, (String, String, String)> =
@@ -388,6 +425,11 @@ impl LlmProvider for OpenAiProvider {
                         on_delta(text);
                     }
                 }
+                // Reasoning deltas accumulate silently: they are not part of
+                // the visible answer, so they never reach the token sink.
+                if let Some(text) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                    reasoning_buf.push_str(text);
+                }
                 if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tcs {
                         let i = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -448,6 +490,7 @@ impl LlmProvider for OpenAiProvider {
             output_tokens,
             cache_creation_tokens: 0,
             cache_read_tokens,
+            reasoning: (!reasoning_buf.is_empty()).then_some(reasoning_buf),
         })
     }
 }

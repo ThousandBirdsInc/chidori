@@ -282,6 +282,12 @@ impl HostBindingBackend {
                     "tools": all_tool_names,
                     "turn": turn,
                     "context_segments": segments.len(),
+                    // Journaled so `trace` can explain a short/odd response
+                    // and so an edit to them is a visible divergence on
+                    // resume (older checkpoints without these keys still
+                    // replay — see snapshot::completed_args_match).
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
                     "request_digest": host_core::prompt_request_digest(request),
                 })
             };
@@ -400,6 +406,8 @@ impl HostBindingBackend {
                         "tools": tool_names,
                         "turn": turn,
                         "max_turns": max_turns,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
                         "request_digest": request_digest,
                     }),
                     prompt_type.clone(),
@@ -445,6 +453,8 @@ impl HostBindingBackend {
                 "text": text,
                 "model": model,
                 "type": prompt_type,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
                 "request_digest": request_digest,
             }),
             prompt_type.clone(),
@@ -543,14 +553,20 @@ impl HostBindingBackend {
         )))
     }
 
-    fn input(&self, prompt: String) -> std::result::Result<String, String> {
+    fn input(
+        &self,
+        prompt: String,
+        opts: serde_json::Value,
+    ) -> std::result::Result<String, String> {
         let HostBindingBackend::Runtime { runtime_ctx, .. } = self else {
             return Err("chidori.input requires the runtime host backend".to_string());
         };
 
-        let result =
-            host_core::execute_input(runtime_ctx, &serde_json::json!({ "prompt": prompt }))
-                .map_err(|err| err.to_string())?;
+        let result = host_core::execute_input(
+            runtime_ctx,
+            &serde_json::json!({ "prompt": prompt, "opts": opts }),
+        )
+        .map_err(|err| err.to_string())?;
         Ok(result.as_str().unwrap_or("").to_string())
     }
 
@@ -622,18 +638,28 @@ impl HostBindingBackend {
                     return Err(RunInterrupt::Approval.to_wire());
                 }
                 // Bare CLI: ask the operator on the controlling terminal.
-                // Approvals are remembered per (target, args) for this run.
-                if let Some(approved) =
+                // "y" is remembered per (target, args); "a" allows every
+                // further call to this target for the rest of the run.
+                if let Some(answer) =
                     crate::policy::prompt_operator_approval(target, args, reason.as_deref())
                 {
-                    if approved {
-                        policy_cache.lock().unwrap().approve(target, args);
-                        return Ok(());
+                    use crate::policy::OperatorAnswer;
+                    match answer {
+                        OperatorAnswer::Approve => {
+                            policy_cache.lock().unwrap().approve(target, args);
+                            return Ok(());
+                        }
+                        OperatorAnswer::ApproveTarget => {
+                            policy_cache.lock().unwrap().approve_target(target);
+                            return Ok(());
+                        }
+                        OperatorAnswer::Deny => {
+                            return Err(format!(
+                                "policy: `{}` denied at the operator prompt",
+                                target
+                            ));
+                        }
                     }
-                    return Err(format!(
-                        "policy: `{}` denied at the operator prompt",
-                        target
-                    ));
                 }
                 // Non-interactive and nothing to answer the prompt: fail closed.
                 // A policy-supplied reason already tells the operator how to
@@ -990,7 +1016,8 @@ impl HostBindingBackend {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                self.input(prompt).map(serde_json::Value::String)
+                let opts = a.get("opts").cloned().unwrap_or(serde_json::Value::Null);
+                self.input(prompt, opts).map(serde_json::Value::String)
             }
             // Inside an actor sub-run, pump the actor's shared mailbox into
             // the run-level inbox first, so the listen point's drain sees

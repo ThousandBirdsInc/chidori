@@ -198,12 +198,24 @@ pub(in crate::server) async fn resume_session(
 ) -> Response {
     let original = match state.session_store.get(&id) {
         Ok(Some(s)) if s.status == SessionStatus::Paused => s,
-        Ok(Some(_)) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "Session is not paused"})),
-            )
-                .into_response();
+        Ok(Some(s)) => {
+            // A failed session's journal is still intact — including a pause
+            // answer recorded before the failure — so point at the recovery
+            // path instead of a dead-end "not paused".
+            let error = if s.status == SessionStatus::Failed {
+                format!(
+                    "Session is not paused (status: failed). Its journal is intact: \
+                     POST /sessions/{id}/replay re-drives the run from the recorded \
+                     calls — including any pause answer recorded before the failure — \
+                     and continues live where the journal ends."
+                )
+            } else {
+                format!(
+                    "Session is not paused (status: {})",
+                    format!("{:?}", s.status).to_lowercase()
+                )
+            };
+            return (StatusCode::CONFLICT, Json(json!({ "error": error }))).into_response();
         }
         Ok(None) => {
             return (

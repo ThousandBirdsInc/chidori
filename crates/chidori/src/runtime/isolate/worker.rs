@@ -139,9 +139,17 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
         let _ = &limits;
         super::sandbox::SandboxOutcome::default()
     };
-    // Degradation notes print once per parent process, not once per run — the
-    // supervisor marks every worker after its first (see `run_agent_isolated`).
-    if !env_truthy("CHIDORI_ISOLATE_SANDBOX_NOTES_QUIET") {
+    // Degradation notes (e.g. "landlock not enforced: no kernel support" on
+    // older kernels and most containers) are diagnostics, not alarms: printed
+    // only under --verbose (CHIDORI_VERBOSE) or CHIDORI_ISOLATE_VERBOSE —
+    // unconditional, they were the first line every containerized user ever
+    // saw from chidori. Even then they print once per parent process, not
+    // once per run: the supervisor marks every worker after its first (see
+    // `run_agent_isolated`). Enforcement, as opposed to diagnostics, is
+    // CHIDORI_ISOLATE_REQUIRE_SANDBOX below.
+    if (env_truthy("CHIDORI_VERBOSE") || env_truthy("CHIDORI_ISOLATE_VERBOSE"))
+        && !env_truthy("CHIDORI_ISOLATE_SANDBOX_NOTES_QUIET")
+    {
         for note in &sandbox.notes {
             eprintln!("isolate worker: sandbox: {note}");
         }

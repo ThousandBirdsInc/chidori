@@ -53,6 +53,18 @@ run(async (input: { document: string }) => {
 (Tool files import `type { ToolDefinition }` from the same module. The legacy
 agent form — `export async function agent(input, chidori)` — is still accepted.)
 
+> **Typing the input: use a `type` alias, not an `interface`.** The handler's
+> input parameter is constrained to `AgentJson` (JSON-compatible data), and a
+> TypeScript `interface` has no implicit index signature, so
+> `run(async (input: MyInterface) => …)` fails the constraint with a
+> confusing `Type 'AgentJson' is not assignable` error. A structurally
+> identical `type MyInput = { … }` (or an inline object type, as above)
+> satisfies it.
+>
+> **Version note:** install the SDK version matching your `chidori` binary —
+> the published types must agree with the runtime (e.g. `LlmResponseJson`
+> uses `toolCalls`, camelCase, since 3.6.x runtimes).
+
 So there are exactly **two** specifiers, with different jobs:
 
 | Specifier | What it is | Where it's used |

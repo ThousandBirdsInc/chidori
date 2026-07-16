@@ -91,6 +91,11 @@ export interface LlmResponseJson {
   outputTokens: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
+  /** Hidden reasoning text from reasoning models (OpenAI-compatible
+   * `reasoning_content`, e.g. DeepSeek). Present only when the provider
+   * reported it; never part of the conversation. Useful for inspecting why
+   * a model spent output budget before its visible answer. */
+  reasoning?: string;
 }
 
 /** Options for `Context.compact()` — explicit, opt-in window compaction. */

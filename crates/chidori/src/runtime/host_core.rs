@@ -247,19 +247,32 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("input requires string prompt"))?
         .to_string();
+    // Author-declared options (`type`, `choices`, `default`). Behavioral only:
+    // the durable shapes below stay normalized to `{"prompt"}` so existing
+    // checkpoints and pending-operation records replay unchanged.
+    let default_answer = args
+        .get("opts")
+        .and_then(|o| o.get("default"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let normalized = json!({ "prompt": prompt });
     let seq = ctx.next_seq();
     // Both the live paths and the server's synthetic resume record store the
     // normalized `{"prompt"}` shape, so that is what divergence compares.
     if let Some(record) = ctx
-        .try_replay_checked(seq, "input", &json!({ "prompt": prompt }))
+        .try_replay_checked(seq, "input", &normalized)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
     }
 
-    if let Some(result) =
-        replay_completed_host_operation(ctx, seq, "input", PendingHostOperationKind::Input, args)?
-    {
+    if let Some(result) = replay_completed_host_operation(
+        ctx,
+        seq,
+        "input",
+        PendingHostOperationKind::Input,
+        &normalized,
+    )? {
         return Ok(result);
     }
 
@@ -267,7 +280,7 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         seq,
         PendingHostOperationKind::Input,
         Some("input".to_string()),
-        args.clone(),
+        normalized.clone(),
     );
     ctx.run_host_operation_safepoint(host_operation)?;
     match ctx.input_mode() {
@@ -275,19 +288,23 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
             eprintln!("{}", prompt);
             let mut line = String::new();
             let bytes_read = std::io::stdin().read_line(&mut line)?;
-            // EOF means nobody can answer (stdin closed, e.g. `< /dev/null` in
-            // CI). Silently treating that as an empty answer lets approval
-            // prompts "succeed" unanswered — fail loudly instead; answers can
-            // still be piped in via stdin.
-            if bytes_read == 0 {
-                anyhow::bail!(
-                    "input: stdin is at EOF, no answer available for prompt {:?} — \
-                     pipe an answer via stdin, or use `chidori serve` to pause the \
-                     run for a later response",
-                    prompt
-                );
+            let mut response = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+            // An empty answer — blank enter, or EOF in a non-interactive run —
+            // takes the author-declared default. EOF with no default is an
+            // error: silently proceeding with "" would send the agent down a
+            // branch the author never chose.
+            if response.is_empty() {
+                if let Some(default) = default_answer {
+                    response = default;
+                } else if bytes_read == 0 {
+                    anyhow::bail!(
+                        "input() reached end-of-file on stdin with no `default` declared \
+                         (prompt: {prompt:?}). Provide an answer on stdin, declare a \
+                         `default` in the input options, or run under `chidori serve` \
+                         where input() pauses the session instead."
+                    );
+                }
             }
-            let response = line.trim_end_matches(&['\r', '\n'][..]).to_string();
             ctx.resolve_host_operation(host_operation, Value::String(response.clone()))?;
             ctx.record_call(CallRecord {
                 seq,
@@ -984,6 +1001,29 @@ fn complete_prompt_from_local_cache(
     Ok(())
 }
 
+/// Surface a hard-to-see failure mode: a response cut off by the output-token
+/// cap. `chidori.prompt()` returns a bare string, so without this the
+/// truncation is invisible — the cut-off text flows on as if complete.
+/// Reasoning models make this likely: hidden reasoning spends the same
+/// `maxTokens` budget before any visible output.
+fn warn_if_truncated(response: &LlmResponse, seq: u64, max_tokens: u64) {
+    if matches!(response.stop_reason.as_str(), "length" | "max_tokens") {
+        eprintln!(
+            "chidori: warning: prompt (seq {seq}) hit the {max_tokens}-token output cap \
+             (stop reason `{}`) — the response is truncated mid-generation. Raise \
+             `maxTokens` in the prompt options; reasoning models also spend this budget \
+             on hidden reasoning before visible output.",
+            response.stop_reason
+        );
+        tracing::warn!(
+            seq,
+            max_tokens,
+            stop_reason = %response.stop_reason,
+            "prompt response truncated at the output-token cap"
+        );
+    }
+}
+
 pub fn execute_prompt_text(
     ctx: &RuntimeContext,
     providers: &ProviderRegistry,
@@ -1033,6 +1073,7 @@ pub fn execute_prompt_text(
 
     match response {
         Ok(response) => {
+            warn_if_truncated(&response, seq, request.max_tokens);
             if crate::runtime::prompt_cache::enabled() {
                 crate::runtime::prompt_cache::store(
                     &prompt_request_digest(&request),
@@ -1127,6 +1168,7 @@ pub fn execute_prompt_response(
 
     match response {
         Ok(response) => {
+            warn_if_truncated(&response, seq, request.max_tokens);
             let result = llm_response_to_json(&response);
             if crate::runtime::prompt_cache::enabled() {
                 crate::runtime::prompt_cache::store(&prompt_request_digest(&request), &result);
@@ -1205,7 +1247,7 @@ fn send_prompt_request(
 }
 
 pub fn llm_response_to_json(response: &LlmResponse) -> Value {
-    json!({
+    let mut value = json!({
         "content": response.content,
         "blocks": response.blocks,
         "toolCalls": response.tool_calls.iter().map(|call| json!({
@@ -1218,7 +1260,13 @@ pub fn llm_response_to_json(response: &LlmResponse) -> Value {
         "outputTokens": response.output_tokens,
         "cacheCreationTokens": response.cache_creation_tokens,
         "cacheReadTokens": response.cache_read_tokens,
-    })
+    });
+    // Only present for reasoning models; omitted otherwise so existing
+    // checkpoints and consumers see an unchanged shape.
+    if let Some(ref reasoning) = response.reasoning {
+        value["reasoning"] = json!(reasoning);
+    }
+    value
 }
 
 pub fn llm_response_from_json(value: &Value) -> Option<LlmResponse> {
@@ -1248,6 +1296,10 @@ pub fn llm_response_from_json(value: &Value) -> Option<LlmResponse> {
             .get("cacheReadTokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        reasoning: value
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 

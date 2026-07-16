@@ -78,6 +78,9 @@ struct AppState {
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
     agent_path: PathBuf,
+    /// Extra tool directories (`--tools`) scanned in addition to the implicit
+    /// `<agent dir>/tools/`, mirroring `chidori run`.
+    extra_tool_dirs: Arc<Vec<PathBuf>>,
     run_base: PathBuf,
     session_store: Arc<dyn SessionStore>,
     policy: Arc<PolicyConfig>,
@@ -568,6 +571,7 @@ pub async fn serve(
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
     agent_path: PathBuf,
+    extra_tool_dirs: Vec<PathBuf>,
     host: String,
     port: u16,
     policy: Arc<PolicyConfig>,
@@ -629,6 +633,7 @@ pub async fn serve(
         providers,
         template_engine,
         agent_path,
+        extra_tool_dirs: Arc::new(extra_tool_dirs),
         run_base,
         session_store,
         policy,
@@ -658,13 +663,14 @@ pub async fn serve(
     // previous process died and re-arm hibernating agents' alarm deadlines.
     {
         let rt = crate::scheduler::shared_tokio_runtime()?;
-        let tools_dir = state
+        let mut tool_dirs = vec![state
             .agent_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
-            .join("tools");
+            .join("tools")];
+        tool_dirs.extend(state.extra_tool_dirs.iter().cloned());
         let mut registry =
-            ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new());
+            ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new());
         for def in state.mcp_tools.iter() {
             registry.register(def.clone());
         }

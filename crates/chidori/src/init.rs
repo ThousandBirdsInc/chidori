@@ -69,7 +69,7 @@ until it finishes. Tools live in `tools/`; a sample `reverse` tool is included.
       --input task="Reverse the word 'chidori' and tell me the result." \
       --tools tools
 
-Each tool call asks for a y/N approval at the terminal (the ask-by-default
+Each tool call asks for a y/a/N approval (`a` approves the tool for the whole run) at the terminal (the ask-by-default
 policy for running unfamiliar code). Add `--trusted` to skip the prompts —
 required when running non-interactively, where gated effects fail closed.
 
@@ -311,7 +311,9 @@ Set one provider environment variable before runs that call the model:
 
 - `ANTHROPIC_API_KEY` for Anthropic (Claude) models.
 - `OPENAI_API_KEY` for OpenAI models.
-- `LITELLM_API_URL` + `LITELLM_API_KEY` to route through a LiteLLM proxy.
+- `CHIDORI_OPENAI_COMPAT_URL` + `CHIDORI_OPENAI_COMPAT_KEY` for any
+  OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, a LiteLLM
+  proxy…) — pick the model with `--model` or `CHIDORI_MODEL`.
 
 No key handy? Run `chidori model-login` to sign in with OpenRouter in your browser.
 Chidori exchanges the sign-in for a user-scoped key (saved to
@@ -327,7 +329,7 @@ need no key at all.
 Agents run in a pure-Rust JavaScript sandbox — there is no raw shell or
 unfettered filesystem access. Effects that touch the outside world go through a
 policy layer. By default `chidori run` asks before powerful effects (tool
-calls, network, workspace writes) with a y/N prompt at the terminal; LLM
+calls, network, workspace writes) with a y/a/N prompt (`a` approves all further calls to that target for the run) at the terminal; LLM
 prompts and pure compute never ask. Pass `--trusted` for the permissive
 allow-all behavior (needed for non-interactive runs, where gated effects fail
 closed), or `--untrusted` for deny-by-default (workspace reads allowed, writes

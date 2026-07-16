@@ -38,11 +38,14 @@ to the model on every turn). Type `exit`/`quit` or Ctrl-D to end.
 chidori serve agents/my_agent.ts --port 8080
 ```
 
+Tool discovery matches `chidori run`: the server scans `tools/` next to the
+agent file automatically, plus any extra directories passed with `--tools`.
+
 The server is **deny-by-default**: unless you configure a policy
 (`CHIDORI_POLICY*` env vars) or pass `--trusted`, gated effects (network
 requests via `fetch`/`node:http`, workspace mutations) are refused — sessions
 arrive from callers you may not control. Local `chidori run` is
-**ask-by-default**: with nothing configured, gated effects pause for a y/N
+**ask-by-default**: with nothing configured, gated effects pause for a y/a/N
 prompt on your terminal (and fail closed without one); pass `--trusted` for
 the permissive allow-all posture when running agents you wrote yourself. See
 [`docs/sandbox-model.md`](./sandbox-model.md).
