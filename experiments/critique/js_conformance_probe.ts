@@ -81,10 +81,10 @@ run(async () => {
   results.push(await probeAsync("Promise.allSettled", async () =>
     (await Promise.allSettled([Promise.resolve(1), Promise.reject(new Error("x"))])).map((r) => r.status).join(",")));
   results.push(await probeAsync("Promise.any", async () => Promise.any([Promise.reject(new Error("a")), Promise.resolve("b")])));
-  results.push(await probeAsync("dynamic import()", async () => {
-    try { await import("data:text/javascript,export const v=1"); return "supported"; }
-    catch (e) { throw e; }
-  }));
+  // NOTE: dynamic import-expressions were probed but cannot be feature-tested at runtime:
+  // the compiler statically rejects the whole file with
+  // "dynamic import is disabled in durable TypeScript agents" — a deliberate
+  // determinism constraint that fails fast at load time.
 
   const passed = results.filter(([, r]) => r.ok).length;
   await chidori.log(`JS conformance probe: ${passed}/${results.length} passed`);
