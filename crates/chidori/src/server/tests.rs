@@ -126,6 +126,7 @@ fn test_state(run_base: PathBuf, agent_path: PathBuf) -> AppState {
         providers: Arc::new(ProviderRegistry::new()),
         template_engine: Arc::new(TemplateEngine::new(".")),
         agent_path,
+        extra_tool_dirs: Arc::new(Vec::new()),
         run_base,
         session_store: Arc::new(crate::storage::MemoryStore::new()),
         policy: PolicyConfig::from_env(),

@@ -279,8 +279,21 @@ fn read_only_workspace_allowlist() -> Vec<PolicyRule> {
     ]
 }
 
+/// The operator's answer to an `AskBefore` prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorAnswer {
+    /// Allow this call; remembered per (target, args) for the run.
+    Approve,
+    /// Allow every further call to this target for the rest of the run,
+    /// regardless of arguments — so a ten-step tool loop is one keypress,
+    /// not ten.
+    ApproveTarget,
+    /// Deny the call.
+    Deny,
+}
+
 /// Ask the operator on the controlling terminal whether an `AskBefore` call
-/// may proceed. Returns `Some(true/false)` when a terminal answered, `None`
+/// may proceed. Returns `Some(answer)` when a terminal answered, `None`
 /// when no terminal is available — non-interactive runs must fail closed
 /// instead of assuming consent.
 ///
@@ -288,7 +301,11 @@ fn read_only_workspace_allowlist() -> Vec<PolicyRule> {
 /// piped input and stdout is a JSON stream (`run --stream`). When `/dev/tty`
 /// is unavailable (or off-Unix) it falls back to stderr + stdin, but only when
 /// both are terminals.
-pub fn prompt_operator_approval(target: &str, args: &Value, reason: Option<&str>) -> Option<bool> {
+pub fn prompt_operator_approval(
+    target: &str,
+    args: &Value,
+    reason: Option<&str>,
+) -> Option<OperatorAnswer> {
     use std::io::Write;
 
     let args_short: String = {
@@ -302,14 +319,16 @@ pub fn prompt_operator_approval(target: &str, args: &Value, reason: Option<&str>
         }
     };
     let prompt = format!(
-        "chidori policy: agent requests `{}`{}\n  args: {}\nAllow (remembered for this run)? [y/N] ",
-        target,
+        "chidori policy: agent requests `{target}`{}\n  args: {args_short}\nAllow? \
+         [y]es once (remembered for these args) / [a]ll further `{target}` calls this run / [N]o ",
         reason.map(|r| format!(" — {r}")).unwrap_or_default(),
-        args_short
     );
 
-    let parse_answer =
-        |line: &str| matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    let parse_answer = |line: &str| match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => OperatorAnswer::Approve,
+        "a" | "all" | "always" => OperatorAnswer::ApproveTarget,
+        _ => OperatorAnswer::Deny,
+    };
 
     #[cfg(unix)]
     {
@@ -375,12 +394,18 @@ pub struct PolicyCache {
 impl PolicyCache {
     pub fn is_approved(&self, target: &str, args: &Value) -> bool {
         self.inner
-            .get(&cache_key(target, args))
+            .get(&target_key(target))
+            .or_else(|| self.inner.get(&cache_key(target, args)))
             .copied()
             .unwrap_or(false)
     }
     pub fn approve(&mut self, target: &str, args: &Value) {
         self.inner.insert(cache_key(target, args), true);
+    }
+    /// The operator's "[a]ll" answer: allow every further call to this target
+    /// for the rest of the run, regardless of arguments.
+    pub fn approve_target(&mut self, target: &str) {
+        self.inner.insert(target_key(target), true);
     }
 }
 
@@ -392,6 +417,12 @@ fn cache_key(target: &str, args: &Value) -> String {
     )
 }
 
+/// Target-wide key. Cannot collide with `cache_key`: the args side there is
+/// always serialized JSON, and `*` is not valid JSON.
+fn target_key(target: &str) -> String {
+    format!("{target}::*")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +431,23 @@ mod tests {
     #[test]
     fn unknown_profile_is_none() {
         assert!(builtin_profile("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn policy_cache_per_args_approval_does_not_leak_to_other_args() {
+        let mut cache = PolicyCache::default();
+        cache.approve("tool:web_search", &json!({"query": "a"}));
+        assert!(cache.is_approved("tool:web_search", &json!({"query": "a"})));
+        assert!(!cache.is_approved("tool:web_search", &json!({"query": "b"})));
+    }
+
+    #[test]
+    fn policy_cache_target_approval_covers_any_args_but_not_other_targets() {
+        let mut cache = PolicyCache::default();
+        cache.approve_target("tool:web_search");
+        assert!(cache.is_approved("tool:web_search", &json!({"query": "a"})));
+        assert!(cache.is_approved("tool:web_search", &json!({"query": "b"})));
+        assert!(!cache.is_approved("tool:reverse", &json!({"text": "a"})));
     }
 
     #[test]

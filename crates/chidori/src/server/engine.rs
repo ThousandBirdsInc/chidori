@@ -31,12 +31,16 @@ pub(super) fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engi
     // `serve`; re-deriving it here would drop any test-injected providers and
     // break resume parity between the two paths.
     let providers = app.providers.clone();
-    let tools_dir = app
+    // Tools come from the implicit `<agent dir>/tools/` convention plus any
+    // `--tools` dirs passed to `chidori serve` — the same discovery rule as
+    // `chidori run`.
+    let mut tool_dirs = vec![app
         .agent_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
-        .join("tools");
-    let mut registry = ToolRegistry::load_from_dirs_cached(&[tools_dir])
+        .join("tools")];
+    tool_dirs.extend(app.extra_tool_dirs.iter().cloned());
+    let mut registry = ToolRegistry::load_from_dirs_cached(&tool_dirs)
         .map(|r| (*r).clone())
         .unwrap_or_else(|_| ToolRegistry::new());
     for def in app.mcp_tools.iter() {

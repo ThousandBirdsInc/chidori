@@ -44,7 +44,7 @@ Expected output:
 ```
 
 > **Approval prompts:** `chidori run` asks before *powerful* effects by
-> default — tool calls, network access, workspace writes — with a y/N prompt
+> default — tool calls, network access, workspace writes — with a y/a/N prompt (`a` approves all further calls to that target for the run)
 > at the terminal. (LLM prompts and pure compute, like this example, never
 > ask.) Running non-interactively — scripts, CI — there is no terminal to ask
 > at and gated effects fail closed: pass `--trusted` there, or configure a
@@ -128,4 +128,4 @@ See [`examples/`](../examples):
 - [`agents/tool_use.ts`](../examples/agents/tool_use.ts) — tool call example
 - [`sdk_demo.py`](../examples/sdk_demo.py) — Python SDK with checkpointing + replay
 - [`prompts/analysis.jinja`](../examples/prompts/analysis.jinja) — shared prompt template
-- [`tools/web_search.ts`](../examples/tools/web_search.ts) — simple tool definition
+- [`tools/web_search.ts`](../examples/tools/web_search.ts) — real network-backed tool (keyless DuckDuckGo search)

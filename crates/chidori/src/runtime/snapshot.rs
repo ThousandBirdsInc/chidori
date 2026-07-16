@@ -520,14 +520,20 @@ pub(crate) fn completed_args_match(recorded: &Value, rebuilt: &Value) -> bool {
     if recorded == rebuilt {
         return true;
     }
-    let strip = |value: &Value| {
-        let mut value = value.clone();
-        if let Some(map) = value.as_object_mut() {
-            map.remove("request_digest");
-        }
-        value
-    };
-    strip(recorded) == strip(rebuilt)
+    // `request_digest` is derived metadata, never compared. Beyond that the
+    // comparison is key-tolerant at the top level: a key present on only one
+    // side is metadata evolution (e.g. newer runtimes journal `max_tokens` /
+    // `temperature`, older checkpoints don't carry them) and must not fail
+    // replay of existing runs. A key present on BOTH sides must match
+    // exactly — so an edit that changes a journaled argument still fails
+    // loudly as a divergence.
+    match (recorded, rebuilt) {
+        (Value::Object(a), Value::Object(b)) => a
+            .iter()
+            .filter(|(k, _)| k.as_str() != "request_digest")
+            .all(|(k, av)| b.get(k).map(|bv| av == bv).unwrap_or(true)),
+        _ => false,
+    }
 }
 
 /// One signal sitting in the durable per-run mailbox (`signals/inbox.json`),
@@ -1606,6 +1612,50 @@ fn stable_source_hash(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+#[cfg(test)]
+mod completed_args_match_tests {
+    use super::completed_args_match;
+    use serde_json::json;
+
+    #[test]
+    fn identical_args_match() {
+        let args = json!({"text": "hi", "model": "m"});
+        assert!(completed_args_match(&args, &args));
+    }
+
+    #[test]
+    fn request_digest_is_ignored() {
+        assert!(completed_args_match(
+            &json!({"text": "hi", "request_digest": "aaa"}),
+            &json!({"text": "hi", "request_digest": "bbb"}),
+        ));
+    }
+
+    /// Metadata evolution: newer runtimes journal keys (e.g. `max_tokens`)
+    /// that older checkpoints don't carry — those must still replay.
+    #[test]
+    fn key_missing_from_recorded_side_is_tolerated() {
+        assert!(completed_args_match(
+            &json!({"text": "hi"}),
+            &json!({"text": "hi", "max_tokens": 1200, "temperature": 0.7}),
+        ));
+    }
+
+    /// But a key present on BOTH sides must match: editing a journaled
+    /// argument is a loud divergence, not a silent cache hit.
+    #[test]
+    fn differing_shared_key_is_a_divergence() {
+        assert!(!completed_args_match(
+            &json!({"text": "hi", "max_tokens": 1200}),
+            &json!({"text": "hi", "max_tokens": 800}),
+        ));
+        assert!(!completed_args_match(
+            &json!({"text": "hi"}),
+            &json!({"text": "CHANGED"}),
+        ));
+    }
 }
 
 #[cfg(test)]

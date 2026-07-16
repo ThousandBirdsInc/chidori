@@ -65,7 +65,7 @@ the three rules below encode.
 ## Configuration (identical on every host)
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY / LITELLM_API_URL
+ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY, or CHIDORI_OPENAI_COMPAT_URL + _KEY (any OpenAI-compatible endpoint)
 CHIDORI_API_KEY=<long random>       # bearer auth on everything except GET /health
 CHIDORI_DB_PATH=.chidori/sessions.sqlite3   # session index; this path is the default (`:memory:` opts out)
 CHIDORI_RUN_STORE=sqlite            # journal mirror — see table below

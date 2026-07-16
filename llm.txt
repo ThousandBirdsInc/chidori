@@ -30,6 +30,9 @@ Rules:
 - Import `{ chidori, run }` from `chidori:agent` and call `run(handler)` at the
   top level. (Legacy fallback: `export async function agent(input, chidori)`
   is still accepted when `run(...)` wasn't called.)
+- Type the input with an inline object type or a `type` alias, never an
+  `interface` — interfaces have no implicit index signature, so they fail the
+  handler's `AgentJson` constraint with a confusing type error.
 - Return JSON-compatible values only.
 - Use `chidori.*` for LLMs, tools, input, signals, memory, templates, workspace
   files, and logging. HTTP goes through the standard `fetch`, which the runtime
@@ -46,6 +49,7 @@ chidori init my-agent --template chat      # scaffold a starter project (or: doc
 chidori check agents/my_agent.ts
 chidori run agents/my_agent.ts --input key=value
 chidori run agents/my_agent.ts --input '{"document": "text"}'
+chidori run agents/my_agent.ts --model deepseek-chat   # default model for prompts (or CHIDORI_MODEL)
 chidori run agents/my_agent.ts --stream
 chidori run agents/my_agent.ts --trace
 chidori chat --system "You are a concise assistant." --model claude-sonnet
@@ -95,7 +99,9 @@ Options:
 
 - `type`: label for streamed prompt output, such as `"progress"`, `"draft"`,
   `"subagent"`, or `"final"`.
-- `model`: provider model override.
+- `model`: provider model override. Prompts that don't set it use the run's
+  default model (`--model` / `CHIDORI_MODEL`, falling back to
+  `claude-sonnet-4-6`).
 - `system`: system prompt for this call.
 - `maxTokens`: output token cap.
 - `maxTurns`: cap on provider tool-use turns.
@@ -106,6 +112,12 @@ Options:
   the stable request head (system, tools, conversation prefix) so providers
   bill repeated prefixes at the cached rate. `false` disables for this call;
   `"1h"` requests the extended TTL. Caching never changes a response.
+
+`prompt()` returns only the text. If the response was cut off by the
+`maxTokens` cap the runtime prints a truncation warning to stderr (reasoning
+models spend the same budget on hidden reasoning first, so budget generously
+for them); use `context().respond()` when you need the structured
+`stopReason` / token counts / `reasoning` yourself.
 
 When streaming is enabled, prompt events include `prompt_type`, `stream_id`,
 and `seq` so UIs can filter progress streams separately from final-answer
@@ -139,7 +151,7 @@ first reads the shared prefix at the discounted cached rate.
 - `prompt(options?)` → `{ text, context }`: send, return the answer plus the
   context extended with the assistant turn (including any tool-use exchange).
 - `respond(options?)` → `{ response, context }`: one structured turn for
-  author-driven tool loops (`response.toolCalls`, `response.blocks`).
+  author-driven tool loops (`response.toolCalls`, `response.blocks`; reasoning models also expose `response.reasoning`).
 - `digest()` → stable content hash of the assembled request, also recorded in
   each prompt's call-log args as `request_digest`.
 - `estimateTokens()` → rough local size estimate for window budgeting.
@@ -219,6 +231,11 @@ const answer = await chidori.input("Approve this request?", {
 In server mode, `input()` pauses the session. Resume it with
 `POST /sessions/{id}/resume` or `AgentClient.resume(id, response)`.
 
+Under `chidori run`, `input()` reads one line from stdin. An empty answer —
+blank enter, or end-of-file in a non-interactive run — resolves to the
+declared `default`; EOF with no `default` fails the run rather than silently
+returning an empty string.
+
 ### signal / pollSignal
 
 ```ts
@@ -251,7 +268,9 @@ const result = await chidori.tool("web_search", { query: "snapshot runtime" });
 ```
 
 Tools discovered from disk are TypeScript `.ts` modules or MCP-backed remote
-tools. Tool directory discovery ignores `.star` files.
+tools. Tool directory discovery ignores `.star` files. `chidori run`,
+`chidori serve`, and `chidori resume` all scan `<agent dir>/tools/`
+implicitly; `run` and `serve` also accept extra directories via `--tools`.
 
 ### callAgent
 
@@ -461,9 +480,10 @@ await chidori.workspace.delete("notes/draft.md", "superseded");
 const manifest = await chidori.workspace.manifest();
 ```
 
-Durable file store rooted at the run's workspace directory
-(`CHIDORI_WORKSPACE_ROOT` when set). Entries carry `{ path, status, sha256,
-bytes }`. Every action is policy-gated (`workspace:write` /
+Durable file store rooted at the project directory (the agent file's dir)
+under `run`, `resume`, `serve`, and detached agents alike;
+`CHIDORI_WORKSPACE_ROOT` overrides the root. Entries carry `{ path, status,
+sha256, bytes }`. Every action is policy-gated (`workspace:write` /
 `workspace:delete` are refused under `untrusted`) and recorded in the call
 log. `remove` is an alias for `delete`.
 
@@ -615,7 +635,7 @@ chidori serve examples/agents/webhook.ts --port 8080 --trusted
 `fetch`/`node:http`, tool calls, workspace mutations) are refused under the
 built-in `untrusted` profile (read-only workspace introspection stays
 allowed). `--untrusted` forces that profile over any env configuration.
-`chidori run` is ask-by-default: gated effects prompt for a y/N approval at
+`chidori run` is ask-by-default: gated effects prompt for a y/a/N approval (`a` = allow that target for the rest of the run) at
 the terminal, and fail closed when no terminal is available (scripts, CI) —
 pass `--trusted` there for the permissive allow-all behavior. LLM prompts and
 pure compute are never gated.
@@ -662,6 +682,27 @@ const manifest = await client.getSnapshotManifest(session.id);
 
 `Checkpoint` contains the replay call log and optional snapshot manifest
 metadata. It does not contain raw VM snapshot bytes.
+
+## Providers & Model Selection
+
+Providers register from environment variables (all can coexist; requests
+route by model name, first match wins):
+
+- `ANTHROPIC_API_KEY` — Anthropic (`claude-*` models).
+- `OPENAI_API_KEY` — OpenAI; `OPENAI_BASE_URL` redirects it at any
+  OpenAI-compatible endpoint and widens it to match all model names.
+- `CHIDORI_OPENAI_COMPAT_URL` + `CHIDORI_OPENAI_COMPAT_KEY` — any
+  OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, LiteLLM…),
+  matching all model names. `/v1` and bare hosts both work.
+  (`LITELLM_API_URL`/`LITELLM_API_KEY` are legacy aliases.)
+- `chidori model-login` — zero-setup OpenRouter fallback.
+
+The default model for prompts that don't set `model` in code is
+`CHIDORI_MODEL` (or `--model` on `run`/`resume`), falling back to
+`claude-sonnet-4-6`.
+
+`chidori.workspace.*` roots at the project directory under `run`, `resume`,
+and `serve`; `CHIDORI_WORKSPACE_ROOT` overrides the location.
 
 ## Runtime Policy
 
