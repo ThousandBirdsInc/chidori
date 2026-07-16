@@ -252,6 +252,54 @@ tables), `branch`, actors, detached agents, durable storage backends, and
 the Python SDK. The docs for those read well, but this review can't vouch
 for them.
 
+## Status: fixes shipped
+
+Every issue above was addressed on this branch except one, in the same series
+of commits as this document:
+
+- **Provider onboarding** — `CHIDORI_OPENAI_COMPAT_URL`/`_KEY` is the
+  documented vendor-neutral pair (`LITELLM_*` stays as a legacy alias);
+  `OPENAI_BASE_URL` is honored; errors name the endpoint actually configured
+  ("OpenAI-compatible endpoint api.deepseek.com" instead of "OpenAI");
+  `chidori run`/`resume` accept `--model`; `CHIDORI_MODEL` and the provider
+  matrix are documented in the README and `llm.txt`.
+- **Cost display** — unpriced models report `Est cost: unknown (no pricing
+  data for: …)` in `trace` and `stats` instead of `$0.000000`.
+- **Workspace root** — `resume`, `serve`, and the branch commands now provide
+  the same implicit project-directory workspace root as `run`
+  (`CHIDORI_WORKSPACE_ROOT` still overrides); a failed session's resume
+  error now points at `POST /sessions/{id}/replay` as the recovery path.
+- **`input()` at EOF** — an empty answer resolves to the declared `default`;
+  EOF with no default fails loudly instead of silently returning `""`.
+- **CLI/server asymmetries** — `chidori serve` accepts `--tools` (and the
+  implicit `tools/` convention is documented); the approval prompt gained an
+  `[a]ll further calls to this target` answer; sandbox degradation notes
+  (the landlock line) print only under `--verbose` /
+  `CHIDORI_ISOLATE_VERBOSE`, with `CHIDORI_ISOLATE_REQUIRE_SANDBOX`
+  unchanged for enforcement.
+- **Prompt metadata** — a response cut off at the `maxTokens` cap prints a
+  truncation warning naming the seq and cap; `max_tokens`/`temperature` are
+  journaled in prompt args (`trace` shows them; editing them is now a
+  visible divergence, while old checkpoints without the keys still replay —
+  the argument comparison tolerates keys absent from the recorded side);
+  `reasoning_content` from reasoning models is captured on
+  `LlmResponse.reasoning`, journaled, and exposed on `respond()`.
+- **Example tool** — `examples/tools/web_search.ts` performs a real
+  (keyless) DuckDuckGo Instant Answer search instead of returning `[]`.
+- **Types** — the `interface`-vs-`type` input gotcha and the
+  SDK-must-match-binary rule are documented in the SDK README. Republishing
+  the npm package in lockstep with the binary release remains a
+  release-process action this branch can't perform.
+
+**Not fixed: error frames anchored at `run(`.** Investigated: the engine's
+stack frames carry each function's *definition site*
+(`FuncProto.source_line`), and the bytecode has no per-instruction line
+table, so pointing a frame at the failing `await` requires adding a pc→span
+table to compiled functions and teaching the unwinder to read the current pc
+— a real engine project rather than a polish fix. Runtime error *messages*
+carry the failing seq and call details, which mitigates but does not replace
+call-site frames.
+
 ## Closing
 
 The hard part of this framework — the journal, the replay semantics, the

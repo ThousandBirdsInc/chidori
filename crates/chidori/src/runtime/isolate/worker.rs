@@ -139,8 +139,15 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
         let _ = &limits;
         super::sandbox::SandboxOutcome::default()
     };
-    for note in &sandbox.notes {
-        eprintln!("isolate worker: sandbox: {note}");
+    // Degradation notes (e.g. "landlock not enforced: no kernel support" on
+    // older kernels and most containers) are diagnostics, not alarms: printed
+    // under --verbose (CHIDORI_VERBOSE) or CHIDORI_ISOLATE_VERBOSE, and
+    // enforced by CHIDORI_ISOLATE_REQUIRE_SANDBOX below. Unconditional, they
+    // were the first line every containerized user ever saw from chidori.
+    if env_truthy("CHIDORI_VERBOSE") || env_truthy("CHIDORI_ISOLATE_VERBOSE") {
+        for note in &sandbox.notes {
+            eprintln!("isolate worker: sandbox: {note}");
+        }
     }
     if apply_limits && env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") && !sandbox.core_confined() {
         let mut guard = io.borrow_mut();

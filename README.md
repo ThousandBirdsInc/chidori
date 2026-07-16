@@ -215,13 +215,27 @@ the per-file directive). See the
 ```bash
 # The OpenRouter sign-in from step 1 is all you need. Prefer your own key?
 # export ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY=...
-# Or route through a LiteLLM proxy:
-# export LITELLM_API_URL=http://localhost:4401/v1
-# export LITELLM_API_KEY=sk-litellm-master-key
 
 chidori run summarizer.ts \
   --input document="Rust is a systems programming language..."
 ```
+
+**Any OpenAI-compatible provider (DeepSeek, Groq, Ollama, vLLM, LiteLLM…).**
+Point Chidori at any endpoint that speaks the OpenAI chat-completions
+protocol, and pick the model with `--model` (or the `CHIDORI_MODEL` env var —
+prompts that don't set `model` in code default to `claude-sonnet-4-6`
+otherwise):
+
+```bash
+export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com   # /v1 optional
+export CHIDORI_OPENAI_COMPAT_KEY=sk-...
+chidori run summarizer.ts --model deepseek-chat \
+  --input document="Rust is a systems programming language..."
+```
+
+`OPENAI_BASE_URL` (alongside `OPENAI_API_KEY`) works too, and
+`LITELLM_API_URL`/`LITELLM_API_KEY` remain as legacy aliases of the
+`CHIDORI_OPENAI_COMPAT_*` pair.
 
 `chidori run` **asks before powerful effects by default**: tool calls, network
 access (`chidori.fetch`), and workspace writes pause for a one-keypress

@@ -301,6 +301,7 @@ impl LlmProvider for AnthropicProvider {
                 output_tokens: parsed.usage.output_tokens,
                 cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
                 cache_read_tokens: parsed.usage.cache_read_input_tokens,
+                reasoning: None,
             });
         }
     }
@@ -529,6 +530,7 @@ impl LlmProvider for AnthropicProvider {
             output_tokens,
             cache_creation_tokens,
             cache_read_tokens,
+            reasoning: None,
         })
     }
 }

@@ -520,14 +520,20 @@ pub(crate) fn completed_args_match(recorded: &Value, rebuilt: &Value) -> bool {
     if recorded == rebuilt {
         return true;
     }
-    let strip = |value: &Value| {
-        let mut value = value.clone();
-        if let Some(map) = value.as_object_mut() {
-            map.remove("request_digest");
-        }
-        value
-    };
-    strip(recorded) == strip(rebuilt)
+    // `request_digest` is derived metadata, never compared. Beyond that the
+    // comparison is key-tolerant at the top level: a key present on only one
+    // side is metadata evolution (e.g. newer runtimes journal `max_tokens` /
+    // `temperature`, older checkpoints don't carry them) and must not fail
+    // replay of existing runs. A key present on BOTH sides must match
+    // exactly — so an edit that changes a journaled argument still fails
+    // loudly as a divergence.
+    match (recorded, rebuilt) {
+        (Value::Object(a), Value::Object(b)) => a
+            .iter()
+            .filter(|(k, _)| k.as_str() != "request_digest")
+            .all(|(k, av)| b.get(k).map(|bv| av == bv).unwrap_or(true)),
+        _ => false,
+    }
 }
 
 /// One signal sitting in the durable per-run mailbox (`signals/inbox.json`),

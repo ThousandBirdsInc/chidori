@@ -44,6 +44,9 @@ struct AppState {
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
     agent_path: PathBuf,
+    /// Extra tool directories (`--tools`) scanned in addition to the implicit
+    /// `<agent dir>/tools/`, mirroring `chidori run`.
+    extra_tool_dirs: Arc<Vec<PathBuf>>,
     run_base: PathBuf,
     session_store: Arc<dyn SessionStore>,
     policy: Arc<PolicyConfig>,
@@ -534,6 +537,7 @@ pub async fn serve(
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
     agent_path: PathBuf,
+    extra_tool_dirs: Vec<PathBuf>,
     host: String,
     port: u16,
     policy: Arc<PolicyConfig>,
@@ -595,6 +599,7 @@ pub async fn serve(
         providers,
         template_engine,
         agent_path,
+        extra_tool_dirs: Arc::new(extra_tool_dirs),
         run_base,
         session_store,
         policy,
@@ -624,13 +629,14 @@ pub async fn serve(
     // previous process died and re-arm hibernating agents' alarm deadlines.
     {
         let rt = crate::scheduler::shared_tokio_runtime()?;
-        let tools_dir = state
+        let mut tool_dirs = vec![state
             .agent_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
-            .join("tools");
+            .join("tools")];
+        tool_dirs.extend(state.extra_tool_dirs.iter().cloned());
         let mut registry =
-            ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new());
+            ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new());
         for def in state.mcp_tools.iter() {
             registry.register(def.clone());
         }
@@ -941,22 +947,42 @@ fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engine {
     // `serve`; re-deriving it here would drop any test-injected providers and
     // break resume parity between the two paths.
     let providers = app.providers.clone();
-    let tools_dir = app
+    // Tools come from the implicit `<agent dir>/tools/` convention plus any
+    // `--tools` dirs passed to `chidori serve` — the same discovery rule as
+    // `chidori run`.
+    let mut tool_dirs = vec![app
         .agent_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
-        .join("tools");
-    let mut registry = ToolRegistry::load_from_dirs_cached(&[tools_dir])
+        .join("tools")];
+    tool_dirs.extend(app.extra_tool_dirs.iter().cloned());
+    let mut registry = ToolRegistry::load_from_dirs_cached(&tool_dirs)
         .map(|r| (*r).clone())
         .unwrap_or_else(|_| ToolRegistry::new());
     for def in app.mcp_tools.iter() {
         registry.register(def.clone());
     }
+    // Same implicit workspace root as `chidori run` (the agent file's
+    // directory): a workspace-using agent must work under the session API
+    // without the operator divining CHIDORI_WORKSPACE_ROOT — which, when
+    // set, still takes precedence inside the runtime.
+    let workspace_root = app
+        .agent_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let workspace_root = std::fs::canonicalize(&workspace_root).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&workspace_root))
+            .unwrap_or(workspace_root)
+    });
     Engine::new(providers, app.template_engine.clone(), rt)
         .with_tools(Arc::new(registry))
         .with_policy(session_policy(app, policy_profile))
         .with_mcp(app.mcp.clone())
         .with_persist_base(app.run_base.clone())
+        .with_workspace_root(workspace_root)
 }
 
 /// Synchronous one-shot runner used by the ACP endpoint. Runs the agent on
@@ -2410,12 +2436,24 @@ async fn resume_session(
 ) -> Response {
     let original = match state.session_store.get(&id) {
         Ok(Some(s)) if s.status == SessionStatus::Paused => s,
-        Ok(Some(_)) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "Session is not paused"})),
-            )
-                .into_response();
+        Ok(Some(s)) => {
+            // A failed session's journal is still intact — including a pause
+            // answer recorded before the failure — so point at the recovery
+            // path instead of a dead-end "not paused".
+            let error = if s.status == SessionStatus::Failed {
+                format!(
+                    "Session is not paused (status: failed). Its journal is intact: \
+                     POST /sessions/{id}/replay re-drives the run from the recorded \
+                     calls — including any pause answer recorded before the failure — \
+                     and continues live where the journal ends."
+                )
+            } else {
+                format!(
+                    "Session is not paused (status: {})",
+                    format!("{:?}", s.status).to_lowercase()
+                )
+            };
+            return (StatusCode::CONFLICT, Json(json!({ "error": error }))).into_response();
         }
         Ok(None) => {
             return (
@@ -3159,6 +3197,7 @@ mod tests {
             providers: Arc::new(ProviderRegistry::new()),
             template_engine: Arc::new(TemplateEngine::new(".")),
             agent_path,
+            extra_tool_dirs: Arc::new(Vec::new()),
             run_base,
             session_store: Arc::new(crate::storage::MemoryStore::new()),
             policy: PolicyConfig::from_env(),
