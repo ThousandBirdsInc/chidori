@@ -243,7 +243,7 @@ jobs:
           fetch-depth: 0 # full history so --generate-notes finds the prior tag
 
       - name: Download prebuilt binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: chidori-*
           path: dist
