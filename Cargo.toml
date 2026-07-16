@@ -4,6 +4,12 @@ members = [
     "crates/chidori-js",
     "crates/test262-runner",
 ]
+# Bare `cargo run` / `cargo build` at the workspace root mean the CLI — the
+# form every README and doc uses (`cargo run -- run agents/my_agent.ts`).
+# Without this, the test262-runner binary makes `cargo run` ambiguous and it
+# refuses to run anything. CI's workspace-wide jobs pass `--workspace`
+# explicitly, so they are unaffected.
+default-members = ["crates/chidori"]
 resolver = "2"
 
 # Workspace-wide lint levels, inherited by every crate via `[lints]

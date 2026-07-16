@@ -9,7 +9,7 @@ import { chidori, run } from "chidori:agent";
  * are served from the log instead of re-executing — so the ticket isn't filed
  * twice and the email isn't sent twice, no matter how many times you replay.
  *
- *   chidori run examples/record-replay/exactly_once.ts -i name=Ada
+ *   chidori run examples/record-replay/exactly_once.ts -i name=Ada --trusted
  *   chidori trace <run-id>            # see the recorded tool calls
  *   chidori resume examples/record-replay/exactly_once.ts <run-id>   # no re-send
  */

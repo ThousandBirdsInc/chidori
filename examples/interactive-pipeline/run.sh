@@ -29,5 +29,8 @@ else
   echo "  (start tael, then re-run; or set OTEL_EXPORTER_OTLP_ENDPOINT yourself)" >&2
 fi
 
+# --trusted: the per-stage review_batch tool call is a gated effect, and
+# `chidori run` asks before gated effects by default — the flag keeps the
+# session's only prompts the agent's own checkpoints.
 exec cargo run --quiet --manifest-path "$REPO/Cargo.toml" \
-  -- run "$AGENT" -i "$INPUT"
+  -- run "$AGENT" -i "$INPUT" --trusted

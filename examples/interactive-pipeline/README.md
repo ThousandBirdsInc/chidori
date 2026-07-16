@@ -35,12 +35,17 @@ examples/interactive-pipeline/run.sh
 
 # …or directly
 chidori run examples/interactive-pipeline/interactive_pipeline.ts \
-  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}'
+  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}' --trusted
 
 # …or from source
 cargo run -- run examples/interactive-pipeline/interactive_pipeline.ts \
-  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}'
+  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}' --trusted
 ```
+
+(`--trusted`: the per-stage `review_batch` tool call is a gated effect, and
+`chidori run` is ask-by-default — without the flag each stage stops for an
+extra y/N approval before its checkpoint. This is in-repo code you're running
+on yourself; see [`docs/running-modes.md`](../../docs/running-modes.md).)
 
 At each checkpoint the agent prints a prompt to your terminal and **blocks on
 stdin** (`chidori.input`). Type one of:
@@ -62,7 +67,7 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
 export OTEL_SERVICE_NAME=interactive-pipeline        # optional (defaults to "chidori")
 
 chidori run examples/interactive-pipeline/interactive_pipeline.ts \
-  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}'
+  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}' --trusted
 ```
 
 `run.sh` does this for you, but only when tael is actually listening on `:4317`.
