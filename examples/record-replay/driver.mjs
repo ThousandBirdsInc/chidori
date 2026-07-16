@@ -7,8 +7,10 @@
 // pause -> resume.
 //
 // Usage:
-//   1. Start a server for ONE scenario (each binds a single agent file):
-//        cargo run -- serve examples/record-replay/exactly_once.ts --port 8080
+//   1. Start a server for ONE scenario (each binds a single agent file;
+//      --trusted allows the example's tool calls, which the server's
+//      deny-by-default posture would otherwise refuse):
+//        cargo run -- serve examples/record-replay/exactly_once.ts --port 8080 --trusted
 //   2. Run the matching driver scenario:
 //        node examples/record-replay/driver.mjs --scenario exactly_once
 //
@@ -98,6 +100,6 @@ try {
   }
 } catch (err) {
   console.error(`\nFAILED: ${err.message}`);
-  console.error(`(is a server running? try: cargo run -- serve examples/record-replay/${scenario}.ts --port 8080)`);
+  console.error(`(is a server running? try: cargo run -- serve examples/record-replay/${scenario}.ts --port 8080 --trusted)`);
   process.exitCode = 1;
 }

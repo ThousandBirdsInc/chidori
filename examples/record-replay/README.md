@@ -38,6 +38,21 @@ All commands are run **from the repository root**.
   cargo build --release          # produces ./target/release/chidori
   ```
 
+- Build the TypeScript SDK once (needed only for the SDK driver in step 3 —
+  `driver.mjs` imports the built `sdk/typescript/dist/`):
+
+  ```bash
+  npm --prefix sdk/typescript install
+  npm --prefix sdk/typescript run build
+  ```
+
+> **Why `--trusted` below:** tool calls are gated effects. `chidori run` is
+> **ask-by-default** (each tool call pauses for a y/N prompt on your terminal,
+> and fails closed without one) and `chidori serve` is **deny-by-default**.
+> These agents are in-repo code you're running on yourself, so the commands
+> pass `--trusted` for the permissive posture; drop it to see the prompts.
+> See [`docs/running-modes.md`](../../docs/running-modes.md).
+
 ### 1. Layer 1 — run the Rust engine examples (no server, fastest)
 
 Run one:
@@ -65,8 +80,8 @@ to copy it by hand:
 ```bash
 BIN=./target/release/chidori
 
-# record
-$BIN run examples/record-replay/exactly_once.ts -i name=Ada
+# record (--trusted: the agent's tool calls run without per-call prompts)
+$BIN run examples/record-replay/exactly_once.ts -i name=Ada --trusted
 
 # grab the id of the run just created
 RUN_ID=$(ls -t examples/record-replay/.chidori/runs | head -1)
@@ -87,8 +102,8 @@ Swap `exactly_once.ts` for any agent in this directory
 Two terminals: one serves a single agent, the other records + replays it.
 
 ```bash
-# terminal 1 — serve one agent
-cargo run -- serve examples/record-replay/exactly_once.ts --port 8080
+# terminal 1 — serve one agent (--trusted: allow its tool calls)
+cargo run -- serve examples/record-replay/exactly_once.ts --port 8080 --trusted
 
 # terminal 2 — run, checkpoint, replay; assert the output is byte-identical
 node examples/record-replay/driver.mjs --scenario exactly_once
@@ -162,23 +177,30 @@ it: tool calls return their recorded results instead of executing.
 
 ```bash
 # record
-cargo run -- run examples/record-replay/exactly_once.ts -i name=Ada
+cargo run -- run examples/record-replay/exactly_once.ts -i name=Ada --trusted
 # inspect the recorded call log
 cargo run -- trace <run-id> -d examples/record-replay
 # replay — open_ticket / send_email are NOT re-invoked
 cargo run -- resume examples/record-replay/exactly_once.ts <run-id> -d examples/record-replay
 ```
 
+(`resume` needs no `--trusted`: the recorded tool calls are served from the
+call log, so no gated effect ever re-executes.)
+
 **See exactly-once for yourself:** record a run, then break a tool body so it
 throws, and resume. The replay still succeeds with the original result — proof
 the tool body was never re-run:
 
 ```bash
-cargo run -- run examples/record-replay/exactly_once.ts -i name=Ada
+cargo run -- run examples/record-replay/exactly_once.ts -i name=Ada --trusted
 # edit tools/send_email.ts to `throw new Error("boom")`, then:
 cargo run -- resume examples/record-replay/exactly_once.ts <run-id> -d examples/record-replay
 # -> still returns the recorded { delivered: true, ... }
 ```
+
+(Tool files live outside the agent's import graph, so editing one doesn't
+trip the resume source-fingerprint check — the *agent* file is what must
+stay unchanged, unless you opt in with `--allow-source-change`, below.)
 
 ### Option B — the SDK (`AgentClient`, over HTTP)
 
@@ -187,8 +209,8 @@ This mirrors how you'd use the published `@1kbirds/chidori` npm package
 the matching driver scenario:
 
 ```bash
-# terminal 1 — serve one agent
-cargo run -- serve examples/record-replay/exactly_once.ts --port 8080
+# terminal 1 — serve one agent (--trusted: allow its tool calls)
+cargo run -- serve examples/record-replay/exactly_once.ts --port 8080 --trusted
 
 # terminal 2 — record, checkpoint, replay; assert the output is identical
 node examples/record-replay/driver.mjs --scenario exactly_once
@@ -197,7 +219,7 @@ node examples/record-replay/driver.mjs --scenario exactly_once
 For the human-in-the-loop agent, the driver demonstrates **pause → resume**:
 
 ```bash
-cargo run -- serve examples/record-replay/human_approval.ts --port 8080
+cargo run -- serve examples/record-replay/human_approval.ts --port 8080 --trusted
 node examples/record-replay/driver.mjs --scenario human_approval
 #   run -> status "paused"
 #   client.resume(id, "approve") -> status "completed", refund issued
@@ -211,9 +233,18 @@ Scenarios: `exactly_once`, `deterministic_identity`, `retry_flaky_tool`,
 
 Record any run, edit the agent's logic *after* the point it paused/finished
 reading effects (e.g. change how `tool_pipeline` formats its briefing), and
-`resume`: the recorded tool calls are reused and only the new tail runs. Editing
-an *already-executed* step instead is rejected with a clear divergence error
-(the `edit_and_resume.rs` example shows both halves).
+resume with `--allow-source-change`: the recorded tool calls are reused and
+only the new tail runs. The flag is required because resume verifies the
+agent source against the run's snapshot manifest and refuses on mismatch —
+cached results are never silently paired with changed code:
+
+```bash
+cargo run -- resume examples/record-replay/tool_pipeline.ts <run-id> \
+  -d examples/record-replay --allow-source-change
+```
+
+Editing an *already-executed* step instead is rejected with a clear divergence
+error (the `edit_and_resume.rs` example shows both halves).
 
 ---
 
