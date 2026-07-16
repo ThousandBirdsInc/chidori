@@ -22,16 +22,14 @@ exercises `prompt`, `context`/`respond`/`toolResult`, `tool`, captured
 `chidori trace`, `chidori serve`, and the session HTTP API. Full source in
 the appendix.
 
-**Provider caveat:** the DeepSeek key available for this exercise turned out
-to have no billing balance (`402 Insufficient Balance` on a direct `curl`),
-so after validating Chidori's routing to the real DeepSeek endpoint (the
-request demonstrably reached DeepSeek and failed only on billing), the model
-was stood in for by a scripted OpenAI-compatible mock on
-`127.0.0.1:8399`. Everything else — the wire protocol, the tool-call
-plumbing, the HTTP fetches to Algolia, policy gating, journaling, crash
-recovery — ran for real. Findings about response *quality* were out of
-scope anyway; findings about the *framework* are unaffected, except where
-noted (streaming and prompt-cache effectiveness were not exercised).
+**Provider note:** the DeepSeek key initially had no billing balance
+(`402 Insufficient Balance` on a direct `curl`), so the first round of
+testing validated routing to the real endpoint and then substituted a
+scripted OpenAI-compatible mock for the model itself. The key was later
+funded and the full exercise re-ran against live DeepSeek
+(`deepseek-v4-flash`, a reasoning model) — see
+[Round 2](#round-2-the-same-agent-against-live-deepseek). All findings
+below held in both rounds; Round 2 added several new ones.
 
 ---
 
@@ -200,12 +198,59 @@ registration site.)
   tools in the appendix took ten minutes to write; the bundled examples
   deserve one real HTTP-backed tool.
 
+## Round 2: the same agent against live DeepSeek
+
+Once the key was funded, the identical agent ran unmodified against
+`deepseek-v4-flash`. The good news first:
+
+- **It just worked, and worked well.** A 68-second run: 5 model turns, 13
+  real tool calls across both HN tools, a genuinely publication-quality
+  briefing, a 52-call journal. The OpenAI-compat provider handled a
+  *reasoning* model's tool calling without any framework-side accommodation.
+- **Replay proof got stronger.** Replaying the 52-call run with a
+  deliberately **invalid** API key succeeded — byte-identical output. Zero
+  provider calls is not a claim, it's enforced by construction.
+- **Streaming works** through the OpenAI-compat path: clean per-token
+  `prompt_delta` events. (The CLI's `--stream` prints raw JSONL event
+  objects — great for piping, not a human-facing rendering.)
+
+New findings only a real model could surface:
+
+1. **Truncation is silent, and reasoning models make it likely.**
+   The briefing was cut off mid-sentence: `deepseek-v4-flash` spends the
+   completion budget on hidden reasoning before visible output, so the
+   agent's `maxTokens: 1200` produced ~760 visible tokens and a hard stop.
+   The provider reported `finish_reason: length` — but `chidori.prompt()`
+   returns a bare string, so the author has **no way to see the stop
+   reason** short of dropping to `context().respond()`. Nothing logged a
+   warning; the truncated briefing sailed through the approval gate into
+   the workspace. A `stopReason` on some richer return form (or at minimum
+   a runtime warning log when a prompt stops on `length`) would have
+   caught this.
+2. **Sampling parameters aren't journaled.** The recorded `prompt` args
+   contain `model`, `text`, `type`, and `request_digest` — but not the
+   `maxTokens` that shaped the response (it *is* sent on the wire;
+   verified in `providers/openai.rs`). Consequences: `chidori trace`
+   can't show why a response stopped short, and the argument-level
+   divergence check on resume is blind to an edit that changes
+   `maxTokens`/`temperature` — it replays cached results as if nothing
+   changed. (`request_digest` is explicitly ignored in divergence
+   comparisons per `docs/replay.md`, so it doesn't backstop this either.)
+3. **`reasoning_content` is dropped on the floor.** Reasonable as a
+   default — it keeps journals lean — but there is no opt-in to see or
+   record it, and users of reasoning models (an ecosystem-wide trend) will
+   ask for it when debugging why a model burned 400 tokens before
+   answering.
+4. **The `$0.000000` cost line got worse with real numbers behind it:**
+   `Tokens: 15087 in / 4443 out · Est cost: $0.000000` is now a concrete
+   lie about a run that cost real money.
+
 ## What was *not* evaluated
 
-Streaming (`--stream`/SSE), prompt-cache economics, `branch`, actors,
-detached agents, durable storage backends, the Python SDK, and real-model
-response quality (blocked on the dead key). The docs for those read well,
-but this review can't vouch for them.
+Prompt-cache economics (DeepSeek's cache discount isn't in the cost
+tables), `branch`, actors, detached agents, durable storage backends, and
+the Python SDK. The docs for those read well, but this review can't vouch
+for them.
 
 ## Closing
 
