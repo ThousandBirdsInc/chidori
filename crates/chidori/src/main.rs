@@ -626,7 +626,15 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                 std::env::set_var("CHIDORI_MODEL", model);
             }
             (
-                cmd_serve(&file, host.as_deref(), port, verbose, &tools, untrusted, trusted),
+                cmd_serve(
+                    &file,
+                    host.as_deref(),
+                    port,
+                    verbose,
+                    &tools,
+                    untrusted,
+                    trusted,
+                ),
                 false,
             )
         }
@@ -1907,7 +1915,10 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
     if unpriced.is_empty() {
         println!("Est. cost:         ${:.6}", total_cost);
     } else if total_cost > 0.0 {
-        println!("Est. cost:         ${:.6} + unknown (unpriced models below)", total_cost);
+        println!(
+            "Est. cost:         ${:.6} + unknown (unpriced models below)",
+            total_cost
+        );
     } else {
         println!("Est. cost:         unknown (unpriced models below)");
     }

@@ -553,7 +553,11 @@ impl HostBindingBackend {
         )))
     }
 
-    fn input(&self, prompt: String, opts: serde_json::Value) -> std::result::Result<String, String> {
+    fn input(
+        &self,
+        prompt: String,
+        opts: serde_json::Value,
+    ) -> std::result::Result<String, String> {
         let HostBindingBackend::Runtime { runtime_ctx, .. } = self else {
             return Err("chidori.input requires the runtime host backend".to_string());
         };

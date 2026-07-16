@@ -207,7 +207,12 @@ impl LlmProvider for OpenAiProvider {
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<OpenAiError>(&resp_text) {
-                bail!("{} API error ({}): {}", self.label, status, err.error.message);
+                bail!(
+                    "{} API error ({}): {}",
+                    self.label,
+                    status,
+                    err.error.message
+                );
             }
             bail!("{} API error ({}): {}", self.label, status, resp_text);
         }
