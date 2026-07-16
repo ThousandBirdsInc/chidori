@@ -53,6 +53,14 @@ pub(crate) fn run_agent_isolated(
     backend: &HostBindingBackend,
 ) -> Result<Value> {
     let exe = std::env::current_exe().context("locating the chidori worker binary")?;
+    // Sandbox degradation notes (e.g. "landlock not enforced") are a real
+    // security signal, but each run spawns a fresh worker — unthrottled they
+    // repeat on every run of a long-lived server. Let the first worker of this
+    // parent process print them; later workers are told they've been said.
+    static SANDBOX_NOTES_RELAYED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let notes_already_relayed =
+        SANDBOX_NOTES_RELAYED.swap(true, std::sync::atomic::Ordering::Relaxed);
     let mut child = Command::new(&exe)
         .arg("__run-worker")
         .stdin(Stdio::piped())
@@ -63,6 +71,10 @@ pub(crate) fn run_agent_isolated(
         // Explicitly `off` (not unset) so nothing downstream can re-apply a
         // default-on posture to the worker or its descendants.
         .env("CHIDORI_ISOLATE", "off")
+        .env(
+            "CHIDORI_ISOLATE_SANDBOX_NOTES_QUIET",
+            if notes_already_relayed { "1" } else { "0" },
+        )
         .spawn()
         .with_context(|| format!("spawning isolate worker `{} __run-worker`", exe.display()))?;
 

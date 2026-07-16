@@ -27,6 +27,49 @@ pub enum Const {
     BigInt(Rc<str>),
 }
 
+/// A compilation's source text plus its line-start index, shared (one `Rc`)
+/// by every `FuncProto` the compilation produced. Exists so stack frames can
+/// resolve a bytecode position table entry (a byte offset — see
+/// [`FuncProto::pos`]) into a 1-based line/column *lazily, on the error path
+/// only*: the happy path pays one `Rc` per proto instead of an eager per-op
+/// line/column resolution at compile time.
+#[derive(Debug)]
+pub struct SourceInfo {
+    text: Rc<str>,
+    /// Byte offset of each line start in `text` (`[0]` is always 0).
+    line_starts: Box<[u32]>,
+}
+
+impl SourceInfo {
+    pub fn new(text: Rc<str>) -> SourceInfo {
+        let mut line_starts = vec![0u32];
+        for (i, b) in text.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push(i as u32 + 1);
+            }
+        }
+        SourceInfo {
+            text,
+            line_starts: line_starts.into_boxed_slice(),
+        }
+    }
+
+    /// 1-based (line, column) of byte `offset` in the source. Columns count
+    /// characters, not bytes, matching the parser's diagnostics.
+    pub fn line_col_of(&self, offset: u32) -> (u32, u32) {
+        let offset = offset.min(self.text.len() as u32);
+        let line = self.line_starts.partition_point(|&s| s <= offset).max(1);
+        let start = self.line_starts[line - 1] as usize;
+        let col = self
+            .text
+            .get(start..offset as usize)
+            .map(|s| s.chars().count())
+            .unwrap_or(0) as u32
+            + 1;
+        (line as u32, col)
+    }
+}
+
 /// How a free variable referenced by a nested function is captured at closure
 /// creation time.
 #[derive(Clone, Copy, Debug)]
@@ -135,11 +178,24 @@ pub struct FuncProto {
     pub kind: FuncKind,
     /// Source span for stack traces (start byte offset).
     pub source_start: u32,
-    /// 1-based line/column of the function's definition site in its source,
-    /// rendered in error stack traces (`at name (line:col)`). `0` = unknown
-    /// (synthetic protos, sources compiled without position tracking).
+    /// 1-based line/column of the function's definition site in its source.
+    /// `0` = unknown (synthetic protos, sources compiled without position
+    /// tracking). Stack frames prefer the per-op position (`pos` at the
+    /// frame's current ip); this is the fallback when no source is attached.
     pub source_line: u32,
     pub source_col: u32,
+    /// Per-op source position table, index-parallel to `code`: the byte
+    /// offset (into `source_info`'s text) of the statement or call the op was
+    /// emitted for. Lets a stack frame report where the frame *is* — the
+    /// throwing statement for the innermost frame, the call site for outer
+    /// frames — instead of where its function was declared. Maintained by
+    /// every code-shortening pass (fusion remaps it alongside the ops);
+    /// resolved to line/column only on the error path.
+    pub pos: Box<[u32]>,
+    /// The compilation's shared source text + line index used to resolve
+    /// `pos` entries. `None` for synthetic protos and sources compiled
+    /// without text, which then fall back to the definition site.
+    pub source_info: Option<Rc<SourceInfo>>,
     /// Which source this function came from — the module key/path supplied to
     /// [`crate::compiler::compile_module_labeled`] — rendered in stack frames
     /// as `at name (label:line:col)` so an embedder can resolve the frame back
@@ -257,6 +313,12 @@ pub struct IcEntry {
 }
 
 impl FuncProto {
+    /// Source position (byte offset) recorded for the op at `ip`, or `None`
+    /// when this proto carries no position table (synthetic protos).
+    pub fn pos_at(&self, ip: usize) -> Option<u32> {
+        self.pos.get(ip).copied()
+    }
+
     pub fn empty(name: &str, kind: FuncKind) -> FuncProto {
         FuncProto {
             name: name.to_string(),
@@ -274,6 +336,8 @@ impl FuncProto {
             source_start: 0,
             source_line: 0,
             source_col: 0,
+            pos: Box::new([]),
+            source_info: None,
             source_label: None,
             uses_arguments: false,
             param_names: Vec::new(),

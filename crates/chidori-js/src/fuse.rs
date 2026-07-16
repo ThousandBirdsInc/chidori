@@ -262,13 +262,15 @@ fn try_fuse_window(code: &[Op], i: usize, is_target: &[bool]) -> Option<(Op, usi
 /// themselves fusion products (`LoadCellConst ; CmpBranchFalse` →
 /// `CmpCellConstBranchFalse`), so the single pass repeats until no window
 /// shrinks the code. Every fusion strictly shortens `code`, so this
-/// terminates in at most a few rounds.
-pub fn fuse_code_fixpoint(mut code: Vec<Op>) -> Vec<Op> {
+/// terminates in at most a few rounds. `pos` is the per-op source position
+/// table ([`crate::bytecode::FuncProto::pos`]), remapped alongside the ops so
+/// it stays index-parallel.
+pub fn fuse_code_fixpoint(mut code: Vec<Op>, mut pos: Vec<u32>) -> (Vec<Op>, Vec<u32>) {
     loop {
         let before = code.len();
-        code = fuse_code(code);
+        (code, pos) = fuse_code(code, pos);
         if code.len() == before {
-            return code;
+            return (code, pos);
         }
     }
 }
@@ -276,10 +278,13 @@ pub fn fuse_code_fixpoint(mut code: Vec<Op>) -> Vec<Op> {
 /// Rewrite `code` in place, fusing recognized adjacent sequences. Safe to call
 /// on already-final bytecode (all jump targets absolute). Idempotent in effect:
 /// re-running over fused code is a no-op for the patterns it recognizes.
-pub fn fuse_code(code: Vec<Op>) -> Vec<Op> {
+/// A fused op keeps the source position of its window's head (`pos` stays
+/// index-parallel to the returned code).
+pub fn fuse_code(code: Vec<Op>, pos: Vec<u32>) -> (Vec<Op>, Vec<u32>) {
+    debug_assert_eq!(pos.len(), code.len());
     let n = code.len();
     if n < 2 {
-        return code;
+        return (code, pos);
     }
 
     // 1. Mark every instruction that is the target of some jump/handler. A window
@@ -304,6 +309,7 @@ pub fn fuse_code(code: Vec<Op>) -> Vec<Op> {
     //    the compiler's `here()` at the tail, which exits the frame), and that
     //    sentinel must remap to the NEW length, not be left dangling.
     let mut out: Vec<Op> = Vec::with_capacity(n);
+    let mut out_pos: Vec<u32> = Vec::with_capacity(n);
     let mut old_to_new = vec![0u32; n + 1];
     let mut i = 0usize;
     while i < n {
@@ -318,11 +324,13 @@ pub fn fuse_code(code: Vec<Op>) -> Vec<Op> {
                 *slot = out.len() as u32;
             }
             out.push(fused);
+            out_pos.push(pos[i]);
             i += len;
             continue;
         }
         old_to_new[i] = out.len() as u32;
         out.push(code[i].clone());
+        out_pos.push(pos[i]);
         i += 1;
     }
     // The one-past-the-end target maps to the new end-of-code.
@@ -338,7 +346,7 @@ pub fn fuse_code(code: Vec<Op>) -> Vec<Op> {
         });
     }
 
-    out
+    (out, out_pos)
 }
 
 #[cfg(test)]
@@ -359,9 +367,14 @@ mod tests {
             Op::Jump(0),
             Op::Return,
         ];
-        let out = fuse_code(code);
+        // Positions 10..=16 tag each op so the remap is observable.
+        let pos: Vec<u32> = (10..10 + code.len() as u32).collect();
+        let (out, out_pos) = fuse_code(code, pos);
         // One slot shorter: the pair became a single op.
         assert_eq!(out.len(), 6);
+        // The fused op keeps its window head's position; later ops shift left
+        // with their own positions intact.
+        assert_eq!(out_pos, vec![10, 11, 12, 14, 15, 16]);
         assert!(
             matches!(
                 out[2],
@@ -384,7 +397,8 @@ mod tests {
     fn does_not_fuse_into_a_jump_target() {
         // 0:Lt 1:JumpIfFalse(3) 2:Jump(1) 3:Return — index 1 is a jump target.
         let code = vec![Op::Lt, Op::JumpIfFalse(3), Op::Jump(1), Op::Return];
-        let out = fuse_code(code);
+        let pos = vec![0; code.len()];
+        let (out, _) = fuse_code(code, pos);
         assert_eq!(out.len(), 4, "nothing should fuse");
         assert!(!out.iter().any(|op| matches!(op, Op::CmpBranchFalse { .. })));
         assert!(matches!(out[1], Op::JumpIfFalse(3)));
@@ -406,7 +420,8 @@ mod tests {
                 boundary: 2,
             },
         ];
-        let out = fuse_code(code);
+        let pos = vec![0; code.len()];
+        let (out, _) = fuse_code(code, pos);
         // Pair fused: len 4; CompletionJump now at index 3.
         match out[3] {
             Op::CompletionJump { target, boundary } => {

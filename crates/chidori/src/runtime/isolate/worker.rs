@@ -139,8 +139,12 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
         let _ = &limits;
         super::sandbox::SandboxOutcome::default()
     };
-    for note in &sandbox.notes {
-        eprintln!("isolate worker: sandbox: {note}");
+    // Degradation notes print once per parent process, not once per run — the
+    // supervisor marks every worker after its first (see `run_agent_isolated`).
+    if !env_truthy("CHIDORI_ISOLATE_SANDBOX_NOTES_QUIET") {
+        for note in &sandbox.notes {
+            eprintln!("isolate worker: sandbox: {note}");
+        }
     }
     if apply_limits && env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") && !sandbox.core_confined() {
         let mut guard = io.borrow_mut();
