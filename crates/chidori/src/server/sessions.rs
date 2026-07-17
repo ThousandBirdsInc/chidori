@@ -213,6 +213,17 @@ pub(super) async fn create_session(
                 return (status, Json(json!({"error": msg}))).into_response();
             }
         },
+        None if !state.has_default_agent => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({"error": "this server was started without an agent file \
+                    (fleet-only mode); name one per request with the `agent` field, or \
+                    restart the server with an agent path"}),
+                ),
+            )
+                .into_response();
+        }
         None => state.agent_path.clone(),
     };
     let app_state = state.clone();
@@ -268,6 +279,7 @@ pub(super) async fn create_session(
         error: None,
         pending_seq: None,
         pending_prompt: None,
+        pending_details: None,
         pending_signal_name: None,
         pending_signal_names: Vec::new(),
         pending_signal_deadline: None,
@@ -430,11 +442,16 @@ pub(super) async fn replay_session(
     let input_clone = input.clone();
     let approvals = original.approvals.clone();
     let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
+    let replay_run_id = original.run_id.clone();
     let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
+        let mut engine =
+            build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
+        if let Some(ref run_id) = replay_run_id {
+            engine = crate::server::engine::with_manifest_model(engine, &app_state, run_id);
+        }
         engine.run_with_replay_host_promises_and_vfs(
             &app_state.agent_path,
             &input_clone,
@@ -459,6 +476,7 @@ pub(super) async fn replay_session(
                 error: None,
                 pending_seq: None,
                 pending_prompt: None,
+                pending_details: None,
                 pending_signal_name: None,
                 pending_signal_names: Vec::new(),
                 pending_signal_deadline: None,
@@ -530,6 +548,7 @@ pub(super) async fn cancel_session(
             error: Some(reason.clone()),
             pending_seq: None,
             pending_prompt: None,
+            pending_details: None,
             pending_signal_name: None,
             pending_signal_names: Vec::new(),
             pending_signal_deadline: None,
@@ -601,6 +620,7 @@ fn apply_run_outcome(session: &mut StoredSession, run_result: RunResult) {
     session.output = None;
     session.pending_seq = None;
     session.pending_prompt = None;
+    session.pending_details = None;
     session.pending_signal_name = None;
     session.pending_signal_names = Vec::new();
     session.pending_signal_deadline = None;
@@ -609,6 +629,7 @@ fn apply_run_outcome(session: &mut StoredSession, run_result: RunResult) {
         session.status = SessionStatus::Paused;
         session.pending_seq = Some(pending.seq);
         session.pending_prompt = Some(pending.prompt);
+        session.pending_details = pending.details;
     } else if let Some(signal) = run_result.paused_signal {
         // A signal listen point with an empty mailbox. Reuse `Paused`;
         // `pending_signal_name(s)` (not the status) marks it as a signal pause

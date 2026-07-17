@@ -78,6 +78,10 @@ struct AppState {
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
     agent_path: PathBuf,
+    /// False when the server was started without an agent file (fleet-only
+    /// mode): `agent_path` is then a sentinel and handlers that would run the
+    /// default agent must reject with guidance instead.
+    has_default_agent: bool,
     /// Extra tool directories (`--tools`) scanned in addition to the implicit
     /// `<agent dir>/tools/`, mirroring `chidori run`.
     extra_tool_dirs: Arc<Vec<PathBuf>>,
@@ -294,6 +298,7 @@ fn session_view(s: &StoredSession) -> Value {
         "call_count": s.call_log.len(),
         "pending_seq": s.pending_seq,
         "pending_prompt": s.pending_prompt,
+        "pending_details": s.pending_details,
         "pending_signal_name": s.pending_signal_name,
         "pending_signal_names": s.pending_signal_names,
         "pending_signal_deadline": s.pending_signal_deadline,
@@ -570,13 +575,21 @@ fn resolve_persisted_pending_host_operation(
 pub async fn serve(
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
-    agent_path: PathBuf,
+    agent_path: Option<PathBuf>,
     extra_tool_dirs: Vec<PathBuf>,
     host: String,
     port: u16,
     policy: Arc<PolicyConfig>,
     policy_posture: String,
 ) -> anyhow::Result<()> {
+    // No agent file → a fleet-only server: it re-arms and drives the
+    // detached-agent fleet under the current directory, and every session
+    // request must name its agent explicitly. The sentinel path keeps the
+    // base-dir/tool-dir derivations working; `has_default_agent` gates the
+    // handlers that would otherwise run it.
+    let has_default_agent = agent_path.is_some();
+    let agent_path =
+        agent_path.unwrap_or_else(|| PathBuf::from(".").join("__no_default_agent__.ts"));
     // Configurable concurrency cap. Default 8 is low enough to keep one
     // LLM provider from being flooded and high enough that a small agent
     // fleet can saturate. Expose as env var so ops can tune without a
@@ -633,6 +646,7 @@ pub async fn serve(
         providers,
         template_engine,
         agent_path,
+        has_default_agent,
         extra_tool_dirs: Arc::new(extra_tool_dirs),
         run_base,
         session_store,

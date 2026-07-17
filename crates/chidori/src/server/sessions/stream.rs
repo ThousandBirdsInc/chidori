@@ -224,6 +224,17 @@ pub(in crate::server) async fn stream_session(
     if let Err((status, msg)) = validate_policy_profile(body.policy_profile.as_deref()) {
         return (status, Json(json!({"error": msg}))).into_response();
     }
+    if !state.has_default_agent {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error": "this server was started without an agent file \
+                (fleet-only mode); streaming sessions need a default agent — restart the \
+                server with an agent path"}),
+            ),
+        )
+            .into_response();
+    }
     let policy_profile = body.policy_profile.clone();
 
     let session_id = body
@@ -280,6 +291,7 @@ pub(in crate::server) async fn stream_session(
         error: None,
         pending_seq: None,
         pending_prompt: None,
+        pending_details: None,
         pending_signal_name: None,
         pending_signal_names: Vec::new(),
         pending_signal_deadline: None,
@@ -457,6 +469,7 @@ pub(in crate::server) async fn stream_session(
                             "status": "paused",
                             "pending_seq": session.pending_seq,
                             "pending_prompt": session.pending_prompt,
+                            "pending_details": session.pending_details,
                         }),
                         SessionStatus::AwaitingApproval => json!({
                             "id": session.id,

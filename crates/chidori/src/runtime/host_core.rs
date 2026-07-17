@@ -158,13 +158,14 @@ fn replay_completed_host_operation(
         }
         anyhow::bail!(
             "Replay divergence at seq {}: completed `{}` was recorded with arguments {} but the \
-             agent now calls it with {}. The agent code (or its inputs) changed since the \
-             checkpoint was saved — re-run without replay to regenerate, or set \
+             agent now calls it with {}.{} The agent code (or its inputs/configuration) changed \
+             since the checkpoint was saved — re-run without replay to regenerate, or set \
              CHIDORI_REPLAY_LAX=1 to tolerate argument drift and re-execute the effect live.",
             seq,
             function,
             crate::runtime::context::truncate_json_for_error(&record.operation.args),
-            crate::runtime::context::truncate_json_for_error(args)
+            crate::runtime::context::truncate_json_for_error(args),
+            crate::runtime::context::describe_args_divergence(&record.operation.args, args)
         );
     }
 
@@ -247,12 +248,22 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("input requires string prompt"))?
         .to_string();
-    // Author-declared options (`type`, `choices`, `default`). Behavioral only:
-    // the durable shapes below stay normalized to `{"prompt"}` so existing
-    // checkpoints and pending-operation records replay unchanged.
+    // Author-declared options (`type`, `choices`, `default`, `details`).
+    // Behavioral only: the durable shapes below stay normalized to
+    // `{"prompt"}` so existing checkpoints and pending-operation records
+    // replay unchanged.
     let default_answer = args
         .get("opts")
         .and_then(|o| o.get("default"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // `details` is the artifact under review — a draft, a diff, a report —
+    // shown to the human alongside the question so an approval gate is never
+    // blind. Rendered by the CLI and carried on the server's pending state;
+    // never part of the durable record shape.
+    let details = args
+        .get("opts")
+        .and_then(|o| o.get("details"))
         .and_then(Value::as_str)
         .map(str::to_string);
     let normalized = json!({ "prompt": prompt });
@@ -285,6 +296,9 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     ctx.run_host_operation_safepoint(host_operation)?;
     match ctx.input_mode() {
         InputMode::Stdin => {
+            if let Some(ref details) = details {
+                eprintln!("--- details ---\n{details}\n---------------");
+            }
             eprintln!("{}", prompt);
             let mut line = String::new();
             let bytes_read = std::io::stdin().read_line(&mut line)?;
@@ -334,6 +348,7 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
                 let pending = PendingInput {
                     seq,
                     prompt: prompt.clone(),
+                    details: details.clone(),
                 };
                 match bridge.wait(ctx, &pending) {
                     WarmInputWait::Delivered(response) => {
@@ -359,6 +374,7 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
             ctx.set_pending_input(PendingInput {
                 seq,
                 prompt: prompt.clone(),
+                details,
             });
             Err(anyhow::Error::new(RunInterrupt::Input { prompt }))
         }

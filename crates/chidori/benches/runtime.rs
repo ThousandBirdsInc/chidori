@@ -143,6 +143,7 @@ fn bench_session_store_put(c: &mut Criterion) {
             error: None,
             pending_seq: Some(n),
             pending_prompt: Some("continue?".into()),
+            pending_details: None,
             pending_signal_name: None,
             pending_signal_names: Vec::new(),
             pending_signal_deadline: None,

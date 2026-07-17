@@ -52,6 +52,14 @@ pub struct Engine {
     /// `CHIDORI_WORKSPACE_ROOT` env var still wins (it populates the context
     /// default, which takes precedence over this fallback).
     workspace_root: Option<PathBuf>,
+    /// Default model applied to every run's context, overriding the
+    /// environment-derived default (see [`Engine::with_default_model`]).
+    default_model: Option<String>,
+    /// Allow this run to persist a call log SHORTER than the durable one —
+    /// the explicit opt-in for intentional history rewrites
+    /// (`resume --until-seq` time travel). Off by default so an
+    /// early-diverged resume attempt can never truncate a journal.
+    allow_history_rewrite: bool,
 }
 
 pub struct RunResult {
@@ -145,6 +153,12 @@ pub(crate) struct ScaffoldPersister {
     /// so they are serialized once here and written once per run.
     blob_bytes: Vec<u8>,
     blob_written: std::sync::atomic::AtomicBool,
+    /// The longest call log ever durably written for this run — loaded once
+    /// from the previous manifest (resume) and advanced with each write.
+    /// A resume attempt that diverged or was denied early carries a SHORTER
+    /// log than the durable one; letting it compact would destroy recorded
+    /// history, so shorter-log writes are skipped (see `persist`).
+    checkpoint_floor: std::sync::OnceLock<std::sync::atomic::AtomicUsize>,
 }
 
 impl ScaffoldPersister {
@@ -170,7 +184,27 @@ impl ScaffoldPersister {
             modules: std::sync::OnceLock::new(),
             blob_bytes: serde_json::to_vec(&blob).unwrap_or_default(),
             blob_written: std::sync::atomic::AtomicBool::new(false),
+            checkpoint_floor: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The journal-length floor below which this run refuses to compact
+    /// (initialized from the previous manifest's `call_log_len`, 0 for a
+    /// fresh run). `reset_checkpoint_floor` is the explicit opt-out for
+    /// intentional history rewrites (`resume --until-seq` time travel).
+    fn checkpoint_floor(&self) -> &std::sync::atomic::AtomicUsize {
+        self.checkpoint_floor.get_or_init(|| {
+            let previous = SnapshotStore::new(self.base.join(&self.run_id))
+                .load_manifest()
+                .map(|manifest| manifest.call_log_len)
+                .unwrap_or(0);
+            std::sync::atomic::AtomicUsize::new(previous)
+        })
+    }
+
+    pub(crate) fn reset_checkpoint_floor(&self) {
+        self.checkpoint_floor()
+            .store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn modules(&self) -> Result<&(Vec<SourceFingerprint>, Vec<SnapshotModuleGraphEntry>)> {
@@ -192,6 +226,24 @@ impl ScaffoldPersister {
     pub(crate) fn persist(&self, ctx: &RuntimeContext, checkpoint: CheckpointWrite) -> Result<()> {
         use std::sync::atomic::Ordering;
 
+        // Monotonicity guard: a resume attempt that diverged, was denied, or
+        // failed BEFORE reaching the durable frontier carries a shorter call
+        // log than the one on disk. Persisting it would overwrite recorded
+        // history with a truncation — so skip, and leave the longer journal
+        // authoritative. (`resume --until-seq` resets the floor explicitly.)
+        let floor = self.checkpoint_floor();
+        let current_len = ctx.call_log_len();
+        if current_len < floor.load(Ordering::SeqCst) {
+            tracing::warn!(
+                run_id = %self.run_id,
+                current = current_len,
+                durable = floor.load(Ordering::SeqCst),
+                "skipping journal persist: this attempt's call log is shorter than the \
+                 durable one (an early-diverged resume must not truncate history)"
+            );
+            return Ok(());
+        }
+
         let pending = ctx.active_pending_host_operation();
         let compact = checkpoint == CheckpointWrite::Compact;
         let (modules, module_graph) = self.modules()?;
@@ -206,7 +258,8 @@ impl ScaffoldPersister {
         )
         .with_module_graph(module_graph.clone())
         .with_capabilities(ctx.capabilities())
-        .with_vfs(ctx.vfs_snapshot());
+        .with_vfs(ctx.vfs_snapshot())
+        .with_default_model(Some(ctx.config().model));
         // The embedded host-promise table has the same freshness contract as
         // checkpoint.json: a compaction-time snapshot. Runtime resume never
         // reads it (deliveries and replay load `host_promises.json` ∪ the
@@ -231,6 +284,7 @@ impl ScaffoldPersister {
             let call_log = ctx.call_log().into_records();
             store.write_call_log(&call_log)?;
             ctx.clear_call_log_checkpoint_dirty(call_log.len());
+            floor.fetch_max(call_log.len(), Ordering::SeqCst);
         }
         if compact {
             store.compact_host_promises(&manifest.host_promises)?;
@@ -295,6 +349,8 @@ impl Engine {
             run_store: None,
             warm_input_bridge: None,
             workspace_root: None,
+            default_model: None,
+            allow_history_rewrite: false,
         }
     }
 
@@ -347,6 +403,23 @@ impl Engine {
     /// Set the default `chidori.workspace` root, applied to each run whose
     /// context doesn't already carry one (i.e. when `CHIDORI_WORKSPACE_ROOT` is
     /// unset). Lets the CLI scope the workspace to the agent's project dir.
+    /// Default model for prompts that don't set one in code — overrides the
+    /// context's environment-derived default. `resume`/`branch-rerun` pass
+    /// the model recorded in the run's manifest here so replays and
+    /// continuations keep the run's model instead of re-deriving it from
+    /// whatever environment hosts them.
+    pub fn with_default_model(mut self, model: Option<String>) -> Self {
+        self.default_model = model;
+        self
+    }
+
+    /// Opt this run into intentional journal truncation (`resume --until-seq`
+    /// time travel). See the `allow_history_rewrite` field.
+    pub fn with_history_rewrite_allowed(mut self, allowed: bool) -> Self {
+        self.allow_history_rewrite = allowed;
+        self
+    }
+
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace_root = Some(root);
         self
@@ -426,11 +499,22 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    /// `run`, announcing the fresh run's id on stderr before execution
+    /// starts. The CLI uses this so the id `chidori resume` needs after a
+    /// crash is already on record — a SIGKILLed process loses whatever stdout
+    /// it had buffered, and the success-path id print never happens.
+    pub fn run_announced(&self, path: &Path, inputs: &Value) -> Result<RunResult> {
+        let ctx = RuntimeContext::new();
+        eprintln!("Run id: {}", ctx.run_id());
+        self.run_with_context(path, inputs, ctx)
+    }
+
     /// Run an agent with a pre-loaded call log for replay.
     ///
     /// Host function calls whose sequence numbers match the replay log
     /// return cached results instantly. Calls past the end of the log
     /// execute normally. The returned call log is the full merged log.
+    #[allow(dead_code)] // Lib-facade entry point; the bin target's resume path uses `resume_run`.
     pub fn run_with_replay(
         &self,
         path: &Path,
@@ -438,6 +522,23 @@ impl Engine {
         replay_log: Vec<CallRecord>,
     ) -> Result<RunResult> {
         let ctx = RuntimeContext::with_replay(replay_log);
+        self.run_with_context(path, inputs, ctx)
+    }
+
+    /// `run_with_replay` under the run's ORIGINAL id: with persistence
+    /// configured, live continuation past the replay frontier journals into
+    /// the same run directory, so a crash-resume that itself crashes resumes
+    /// from the new frontier instead of the old one. This is the CLI
+    /// `chidori resume` path.
+    pub fn resume_run(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        run_id: &str,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::with_replay(replay_log);
+        ctx.set_run_id(run_id.to_string());
         self.run_with_context(path, inputs, ctx)
     }
 
@@ -713,6 +814,9 @@ impl Engine {
                 ctx.set_workspace_root(root.clone());
             }
         }
+        if let Some(ref model) = self.default_model {
+            ctx.set_default_model(model.clone());
+        }
         if let Some(ref bridge) = self.warm_input_bridge {
             ctx.set_warm_input_bridge(bridge.clone());
         }
@@ -810,6 +914,12 @@ impl Engine {
                 ))
             });
             if let Some(ref persister) = persister {
+                if self.allow_history_rewrite {
+                    // `resume --until-seq` time travel: the caller truncated
+                    // the journal on purpose; the shorter-log guard must not
+                    // pin the run to its longer past.
+                    persister.reset_checkpoint_floor();
+                }
                 install_scaffold_safepoints_with(persister.clone(), &ctx);
                 persister.persist(&ctx, CheckpointWrite::IfDirty)?;
             }

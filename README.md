@@ -249,8 +249,11 @@ chidori run my_agent.ts --trusted --tools tools
 ```
 
 Re-run the same agent with `chidori resume summarizer.ts <run_id>` to replay it
-byte-for-byte with zero model calls (the run id is printed under
-`.chidori/runs/`).
+byte-for-byte with zero model calls (the run id is printed when the run
+starts, and lives under `.chidori/runs/`). The run's model travels with it —
+a `--model deepseek-chat` run resumes under `deepseek-chat` with no extra
+flags — and crash recovery of a trusted, tool-using run mirrors `run`'s
+flags: `chidori resume my_agent.ts <run_id> --trusted --tools tools`.
 
 ### 4. Try the bundled examples
 

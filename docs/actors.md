@@ -114,6 +114,33 @@ const msg = await chidori.receive(["draft", "cancel"]);      // fan-in
 const msg = await chidori.receive("draft", { timeoutMs: 60000 }); // may be { timedOut: true }
 ```
 
+### Monitoring: `__chidori.down__`
+
+An actor that settles **without producing what its owner is waiting on** —
+`failed` (restart budget spent) or `paused` (parked on something the runtime
+can't answer in-process) — delivers a monitor message to its owner's mailbox
+under the reserved name `__chidori.down__`, with payload
+`{ pid, name, status, error?, pendingPrompt?, restarts }`. Include it in a
+fan-in so a collection loop reacts to worker death immediately instead of
+waiting out its timeout:
+
+```ts
+const msg = await chidori.receive(["finding", "__chidori.down__"], { timeoutMs: 480000 });
+if (msg.name === "__chidori.down__") {
+  const down = msg.payload as { pid: string; status: string; error?: string };
+  await chidori.log("worker down", down);   // reassign, degrade, or bail
+}
+```
+
+(`completed` and `stopped` settles deliver nothing — those are the owner's
+own `join`/`stop` flow.)
+
+As a backstop, a `receive` — even one with a `timeoutMs` — **fails fast**
+once every spawned actor has settled and no matching message is queued:
+nothing in-process can deliver anymore, so waiting out the timeout would be
+pure starvation. The error names `__chidori.down__` as the way to observe
+the failures.
+
 Blocking, in-place consumption, in delivery order. Inside an actor it drains
 the actor's own mailbox; in the spawning run it drains parent-addressed
 messages (plus any pre-queued external signals). The difference from
@@ -156,7 +183,7 @@ await chidori.actors.lookup("researcher");  // a handle, or null
 |---|---|
 | `never` (default) | The failure is the actor's final outcome. |
 | `clean` | Re-run the module from scratch: fresh call log, the spawn-time VFS anchor, the original input. |
-| `resume` | Replay the accumulated call log with the **crash frontier** (the trailing failed records) stripped: completed work returns from cache, the failing call re-executes live. |
+| `resume` | Replay the accumulated call log with the **crash frontier** (the trailing failed records) stripped: completed work returns from cache, the failing call re-executes live. The strip cascades to the frontier's *nested* effects — a failed tool call's inner `http` record is discarded with it, so the retry re-drives the upstream for real instead of replaying a recorded 5xx forever. |
 
 `resume` is the strategy a process-restart model cannot express: the actor
 comes back *with its history* and retries from the exact point of failure,

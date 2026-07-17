@@ -805,6 +805,12 @@ pub struct SnapshotManifest {
     /// context on resume so reads/writes survive suspend identically.
     #[serde(default)]
     pub vfs: crate::runtime::vfs::Vfs,
+    /// The run's resolved default model (`--model` / `CHIDORI_MODEL` / the
+    /// built-in default at run time), so `resume` and the branch commands can
+    /// re-run under the same model without the operator re-deriving flags.
+    /// `None` on manifests written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     pub call_log_len: usize,
     pub snapshot_file: String,
     pub created_at: DateTime<Utc>,
@@ -833,10 +839,16 @@ impl SnapshotManifest {
             branch: None,
             capabilities: CapabilityLedger::new(),
             vfs: crate::runtime::vfs::Vfs::new(),
+            default_model: None,
             call_log_len,
             snapshot_file: SNAPSHOT_BLOB_FILE.to_string(),
             created_at: Utc::now(),
         }
+    }
+
+    pub fn with_default_model(mut self, model: Option<String>) -> Self {
+        self.default_model = model;
+        self
     }
 
     pub fn with_host_promises(mut self, host_promises: Vec<HostPromiseRecord>) -> Self {

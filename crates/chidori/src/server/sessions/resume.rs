@@ -97,6 +97,9 @@ pub(super) async fn complete_pending_and_resume(
     let run_leg = move |bridge: Option<crate::runtime::context::WarmInputBridge>| {
         let mut engine =
             build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
+        if let Some(ref run_id) = resume_run_id {
+            engine = crate::server::engine::with_manifest_model(engine, &app_state, run_id);
+        }
         if let Some(bridge) = bridge {
             engine = engine.with_warm_input_bridge(bridge);
         }
@@ -681,7 +684,11 @@ pub(in crate::server) async fn approve_session(
     let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
+        let mut engine =
+            build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
+        if let Some(ref run_id) = resume_run_id {
+            engine = crate::server::engine::with_manifest_model(engine, &app_state, run_id);
+        }
         // Replay the recorded call log (so any host calls the agent made before
         // the policy block — e.g. a prior `input()` — return their recorded
         // results instead of pausing again) with the approval seeded in the
@@ -722,11 +729,13 @@ pub(in crate::server) async fn approve_session(
                 session.status = SessionStatus::Paused;
                 session.pending_seq = Some(pending.seq);
                 session.pending_prompt = Some(pending.prompt);
+                session.pending_details = pending.details;
                 session.pending_signal_name = None;
             } else if let Some(signal) = run_result.paused_signal {
                 session.status = SessionStatus::Paused;
                 session.pending_seq = Some(signal.seq);
                 session.pending_prompt = None;
+                session.pending_details = None;
                 session.pending_signal_name = Some(signal.name);
             } else if let Some(appr) = run_result.paused_approval {
                 session.status = SessionStatus::AwaitingApproval;

@@ -42,6 +42,8 @@ authoritative — several document retired or superseded work:
 - [resume-performance.md](./resume-performance.md) — resume cost analysis
 - [dom-runtime-prototype.md](./dom-runtime-prototype.md) — DOM runtime prototype
 - [ai-sdk-gap-analysis.md](./ai-sdk-gap-analysis.md) — feature comparison vs Vercel AI SDK
+- [consumer-usability-review.md](./consumer-usability-review.md) — round 1: building a real agent on 3.6.0 (linear path)
+- [consumer-usability-review-2.md](./consumer-usability-review-2.md) — round 2: the multi-agent surface (actors, branches, detached agents) under failure
 - [branching-execution.md](./branching-execution.md) — also doubles as the branching design record
 - [rust-style-guide.md](./rust-style-guide.md) — contributor conventions
 - [releasing.md](./releasing.md) — release train and versioning

@@ -122,7 +122,7 @@ When the parent run persists (`.chidori/runs/<run id>/`), every branch sub-run
 is persisted under it:
 
 ```text
-<run dir>/branches/op-<branch seq>/
+<run dir>/branches/op-<branch seq, zero-padded to 20 digits>/
   anchor.json              fork-time anchor: the parent VFS snapshot
   branch-<k>/
     source.ts              the branch's own EDITABLE source copy
@@ -151,6 +151,11 @@ chidori branch-resume <run-id> <branch-id> --value "blue"
 $EDITOR .chidori/runs/<run-id>/branches/op-*/branch-001/source.ts
 chidori branch-rerun <run-id> <branch-id>
 ```
+
+Both commands default their model to the one recorded in the parent run's
+manifest (override with `--model` or `CHIDORI_MODEL`), and accept
+`--trusted`/`--untrusted` for the branch's live gated effects — the same
+posture flags as `chidori run`.
 
 - **Resume** replays the branch's checkpoint with a synthetic `input` record at
   the pending seq (the same mechanism the server's `/resume` uses), then runs

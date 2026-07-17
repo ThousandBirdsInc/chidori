@@ -274,6 +274,14 @@ export interface InputOptions {
   type?: string;
   default?: string;
   choices?: string[];
+  /**
+   * The artifact under review — a draft, a diff, a report — shown to the
+   * human alongside the question so an approval gate is never blind. The CLI
+   * renders it above the prompt; over HTTP it is surfaced as the paused
+   * session's `pending_details`. Never part of the durable record, so adding
+   * or editing it does not diverge an existing checkpoint.
+   */
+  details?: string;
 }
 
 /**
@@ -550,6 +558,13 @@ export interface SpawnAgentOptions {
   maxRestarts?: number;
   /** Base delay between restarts, doubling per attempt (default 0). */
   backoffMs?: number;
+  /**
+   * Default model for the agent's prompts. Defaults to the spawner's
+   * resolved model and travels with the agent's durable descriptor, so a
+   * wake in a differently-configured process (another server, another env)
+   * keeps running on the same model.
+   */
+  model?: string;
 }
 
 /**
@@ -816,6 +831,16 @@ export interface Chidori {
    * which pauses the whole run so an external party can resume it — `receive`
    * waits in place and is woken directly by in-process senders. Reach for
    * `receive` for actor messages; use `signal` for external deliveries.
+   *
+   * Actor death is observable: an actor that settles `failed` (restart
+   * budget spent) or `paused` delivers a monitor message named
+   * `"__chidori.down__"` to its owner's mailbox with payload
+   * `{ pid, name, status, error?, pendingPrompt?, restarts }` — include it in
+   * a fan-in (`receive(["result", "__chidori.down__"])`) so a collection
+   * loop reacts to worker death instead of waiting out its timeout. As a
+   * backstop, a `receive` (even with `timeoutMs`) fails fast once every
+   * spawned actor has settled and nothing matching is queued — nothing
+   * in-process can deliver anymore, so blocking would be pure starvation.
    */
   receive<T = AgentJson>(names: string | string[]): Promise<ActorMessage<T>>;
   receive<T = AgentJson>(

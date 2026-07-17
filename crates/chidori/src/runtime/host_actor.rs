@@ -127,6 +127,16 @@ const DEFAULT_MAX_RESTARTS: u32 = 3;
 /// spawning run for a top-level actor.
 const PARENT_ADDRESS: &str = "parent";
 
+/// The reserved message name delivered to an actor's owner when the actor
+/// settles without producing a result the owner is waiting on — `failed`
+/// (restart budget spent) or `paused` (parked on something the runtime cannot
+/// answer in-process). The payload carries
+/// `{ pid, name, status, error?, pendingPrompt?, restarts }`. Listen for it in
+/// a fan-in loop (`chidori.receive(["result", "__chidori.down__"])`) to observe
+/// worker death instead of waiting out a timeout — the monitor message of this
+/// process model.
+pub(crate) const DOWN_MESSAGE: &str = "__chidori.down__";
+
 // --- Supervision options -----------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,6 +410,20 @@ impl ActorHub {
                 Lifecycle::Terminal(_)
             )
         })
+    }
+
+    /// True when this run spawned actors and every one of them has settled —
+    /// a fan-in `receive` waiting on actor traffic can never be delivered to
+    /// again, so waiting out a timeout is pure starvation.
+    fn all_spawned_actors_settled(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.spawned_total > 0
+            && !inner.actors.values().any(|entry| {
+                !matches!(
+                    entry.shared.state.lock().unwrap().lifecycle,
+                    Lifecycle::Terminal(_)
+                )
+            })
     }
 
     fn deliver_to_parent(&self, name: &str, payload: Value, from: Value) {
@@ -703,6 +727,7 @@ fn start_actor(
         let options = options.clone();
         let range = range.clone();
         let anchor_vfs = ctx.vfs_snapshot();
+        let owner_for_down = owner.clone();
         std::thread::Builder::new()
             .name(format!("chidori-{pid}"))
             .stack_size(ACTOR_THREAD_STACK_BYTES)
@@ -723,6 +748,33 @@ fn start_actor(
                 // actor spawned and never settled, BEFORE going terminal, so
                 // whoever joins this actor observes a fully-settled subtree.
                 hub.stop_owned_subtree(&pid);
+                // A settle the owner isn't necessarily watching for — failed
+                // (restart budget spent) or paused (parked on something the
+                // runtime can't answer) — delivers a monitor message to the
+                // owner's mailbox, so a fan-in `receive` loop can observe
+                // worker death instead of waiting out its timeout. Completed
+                // and stopped settles are the owner's own join/stop flow.
+                // Delivered BEFORE the terminal transition so a receive that
+                // fails fast on "all actors settled" can never miss it.
+                if matches!(outcome.status, "failed" | "paused") {
+                    let payload = json!({
+                        "pid": pid,
+                        "name": options.name,
+                        "status": outcome.status,
+                        "error": outcome.error.clone(),
+                        "pendingPrompt": outcome.pending_prompt.clone(),
+                        "restarts": outcome.restarts,
+                    });
+                    let from = json!({ "kind": "agent", "id": pid });
+                    match owner_for_down {
+                        Some(ref owner_pid) => {
+                            if let Some(owner_shared) = hub.shared_of(owner_pid) {
+                                owner_shared.deliver(DOWN_MESSAGE, payload, from);
+                            }
+                        }
+                        None => hub.deliver_to_parent(DOWN_MESSAGE, payload, from),
+                    }
+                }
                 shared.set_lifecycle(Lifecycle::Terminal(outcome.status.to_string()));
                 // Wake a parent blocked in `receive` so it can re-check
                 // whether anything can still send to it.
@@ -848,9 +900,44 @@ pub(crate) fn receive(backend: &HostBindingBackend, a: &Value) -> Result<Value, 
 
     let call_args = json!({ "names": names, "opts": { "timeoutMs": timeout_ms } });
     host_core::execute_durable_json_call(ctx, "receive", call_args, || {
+        // A live receive is an addressing point for the whole fan-out: on a
+        // crash-resume, replayed `spawn_actor` records returned cached pids
+        // without starting anything, and a receive-driven parent (unlike a
+        // join-driven one) never names an actor — so re-materialize every
+        // recorded-but-unsettled actor here, or the wait can never be
+        // delivered to.
+        ensure_recorded_actors_live(backend, ctx);
         receive_live(ctx, &names, timeout_ms).map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
+}
+
+/// Re-create every actor this journal spawned but never settled and that has
+/// no hub entry (live or terminal) — the crash-resume counterpart of
+/// `ensure_live_actor`, for waits that don't address a specific actor. A
+/// normal (non-resumed) run is a no-op: every spawn it made is in the hub.
+fn ensure_recorded_actors_live(backend: &HostBindingBackend, ctx: &RuntimeContext) {
+    let hub = ctx.ensure_actor_hub();
+    let records = ctx.call_log().into_records();
+    let settled: std::collections::HashSet<&str> = records
+        .iter()
+        .filter(|r| matches!(r.function.as_str(), "join_actor" | "stop_actor") && r.error.is_none())
+        .filter_map(|r| r.args.get("pid").and_then(Value::as_str))
+        .collect();
+    for record in &records {
+        if record.function != "spawn_actor" || record.error.is_some() {
+            continue;
+        }
+        let Some(pid) = record.result.get("pid").and_then(Value::as_str) else {
+            continue;
+        };
+        if settled.contains(pid) || hub.resolve_pid(pid).is_some() {
+            continue;
+        }
+        if let Err(err) = ensure_live_actor(backend, ctx, pid) {
+            tracing::warn!(pid, error = %err, "re-creating recorded actor for a live receive");
+        }
+    }
 }
 
 fn message_json(message: &QueuedSignal) -> Value {
@@ -928,6 +1015,22 @@ fn receive_live(
         if let Some(deadline) = deadline {
             if now >= deadline {
                 return Ok(host_core::signal_timeout_sentinel(names));
+            }
+            // Fail fast instead of waiting out the timeout when this run's
+            // actor fan-out has fully settled: nothing in-process can deliver
+            // anymore, and actor failures already left a `__chidori.down__`
+            // monitor message for listeners that ask for it.
+            if hub
+                .as_ref()
+                .is_some_and(|hub| hub.all_spawned_actors_settled())
+            {
+                return Err(format!(
+                    "chidori.receive([{}]) can no longer be delivered to: every spawned \
+                     actor has settled and no matching message is queued. Listen for \
+                     \"{DOWN_MESSAGE}\" alongside your result names to observe actor \
+                     failures, or join the actors for their outcomes.",
+                    names.join(", ")
+                ));
             }
         } else {
             let can_be_sent_to = hub.as_ref().is_some_and(|hub| hub.has_live_actors());
@@ -1298,11 +1401,37 @@ fn settle_iteration(result: anyhow::Result<Value>, ctx: &RuntimeContext) -> Iter
 /// cache and re-executes the failing call live. Failed records *before* the
 /// frontier (errors the agent caught and handled) are preserved: their
 /// consumption shaped the control flow that followed them.
-fn strip_crash_frontier(mut records: Vec<CallRecord>) -> Vec<CallRecord> {
+///
+/// The strip cascades to the frontier's *nested* effects: a failed tool call's
+/// inner `http` record is a completed effect on its own (a 5xx response is
+/// still a response), but it was consumed by the failing call — replaying it
+/// from cache would freeze every retry on the recorded failure, so the
+/// re-executed call must re-drive its inner effects live too.
+pub(crate) fn strip_crash_frontier(mut records: Vec<CallRecord>) -> Vec<CallRecord> {
+    let mut stripped: std::collections::HashSet<u64> = std::collections::HashSet::new();
     while records.last().is_some_and(|r| r.error.is_some()) {
-        records.pop();
+        if let Some(record) = records.pop() {
+            stripped.insert(record.seq);
+        }
     }
-    records
+    if stripped.is_empty() {
+        return records;
+    }
+    // Descendants of a stripped record can precede it in recording order
+    // (children settle before their parent), so sweep to a fixpoint.
+    loop {
+        let before = records.len();
+        records.retain(|r| match r.parent_seq {
+            Some(parent) if stripped.contains(&parent) => {
+                stripped.insert(r.seq);
+                false
+            }
+            _ => true,
+        });
+        if records.len() == before {
+            return records;
+        }
+    }
 }
 
 /// How a mailbox wait ended.
@@ -1631,12 +1760,16 @@ mod tests {
     use crate::mcp::McpManager;
     use crate::policy::{PolicyCache, PolicyConfig};
     use crate::providers::ProviderRegistry;
+    use crate::runtime::call_log::CallRecord;
     use crate::runtime::context::RuntimeContext;
     use crate::runtime::rust_engine::run_agent;
     use crate::runtime::snapshot::RuntimePolicy;
     use crate::runtime::template::TemplateEngine;
     use crate::runtime::typescript::bindings::HostBindingBackend;
     use crate::tools::ToolRegistry;
+
+    use super::{strip_crash_frontier, DOWN_MESSAGE};
+    use std::time::Duration;
 
     /// A fully-wired runtime backend over `ctx`/`tools`, mirroring the
     /// host_branch test harness.
@@ -1873,6 +2006,73 @@ mod tests {
     }
 
     #[test]
+    fn resume_past_a_replayed_spawn_recreates_the_actor_at_a_live_receive() {
+        // The receive-driven fan-in shape: the parent collects results with
+        // `receive`, never addressing an actor by pid. A crash-resume replays
+        // the spawn from cache (starting nothing) — the live `receive` itself
+        // must re-materialize the recorded, unsettled actor or the wait can
+        // never be delivered to (observed in the field as a full receive
+        // timeout on every crash-resume of a receive-driven pipeline).
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        let tool_counter = counter.clone();
+        registry.register_native("count", "counts live calls", Vec::new(), move |_args| {
+            Ok(json!({ "count": tool_counter.fetch_add(1, Ordering::SeqCst) + 1 }))
+        });
+
+        let dir = test_dir("respawn-receive");
+        let worker = write_agent(
+            &dir,
+            "reporter.ts",
+            r#"
+            export async function agent() {
+                const { count } = await chidori.tool("count", {});
+                await chidori.actors.send("parent", "result", { count });
+                return { count };
+            }
+            "#,
+        );
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const { pid } = await chidori.actors.spawn("__WORKER__");
+                const msg = await chidori.receive("result", { timeoutMs: 30000 });
+                const outcome = await chidori.actors.join(pid);
+                return { got: msg.payload, status: outcome.status };
+            }
+        "#
+        .replace("__WORKER__", &worker);
+        std::fs::write(&path, &src).unwrap();
+
+        let live_ctx = RuntimeContext::new();
+        let registry = Arc::new(registry);
+        let live_backend = test_backend(live_ctx.clone(), registry.clone());
+        let live_output = run_agent(&path, &src, &json!({}), &live_backend).unwrap();
+        assert_eq!(live_output["got"], json!({ "count": 1 }));
+
+        // Crash-time journal: only the spawn survives — the receive, join,
+        // and the actor's folded records do not.
+        let records = live_ctx.call_log().into_records();
+        let truncated: Vec<_> = records
+            .into_iter()
+            .filter(|r| r.function == "spawn_actor")
+            .collect();
+        assert_eq!(truncated.len(), 1, "only the spawn survives the crash");
+
+        let resume_ctx = RuntimeContext::with_replay(truncated);
+        let resume_backend = test_backend(resume_ctx, registry);
+        let resumed = run_agent(&path, &src, &json!({}), &resume_backend).unwrap();
+
+        // The live receive re-created the actor: it re-ran (live counter
+        // advanced), its message arrived, and the join settled.
+        assert_eq!(resumed["got"], json!({ "count": 2 }));
+        assert_eq!(resumed["status"], json!("completed"));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn failed_actor_restarts_clean_until_success() {
         // The `attempt` tool returns 1, 2, ... across LIVE invocations. The
         // actor throws while n < 2; with restart "clean" the runtime re-runs
@@ -1981,6 +2181,133 @@ mod tests {
             "resume must not re-run completed work"
         );
         assert_eq!(flaky_calls.load(Ordering::SeqCst), 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strip_crash_frontier_cascades_to_the_frontier_s_nested_effects() {
+        // A failed tool call's inner http effect COMPLETED (a 5xx response is
+        // still a response) — but it belongs to the stripped frontier. If it
+        // survived, every `resume` retry would replay the recorded 5xx from
+        // cache and fail identically forever (observed in the field: a flaky
+        // upstream was hit exactly once across three restart attempts).
+        let record =
+            |seq: u64, function: &str, parent: Option<u64>, error: Option<&str>| CallRecord {
+                seq,
+                parent_seq: parent,
+                function: function.to_string(),
+                args: json!({}),
+                result: json!({}),
+                duration_ms: 0,
+                token_usage: None,
+                timestamp: chrono::Utc::now(),
+                error: error.map(str::to_string),
+            };
+        // Recording order: children settle before their parent.
+        let records = vec![
+            record(1, "prompt", None, None),
+            record(3, "http", Some(2), None), // nested in the failing tool
+            record(4, "log", Some(3), None),  // grandchild of the frontier
+            record(2, "tool", None, Some("upstream returned HTTP 500")),
+        ];
+        let kept = strip_crash_frontier(records);
+        assert_eq!(
+            kept.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1],
+            "the frontier's nested effects must be stripped with it"
+        );
+
+        // Failed records BEFORE the frontier (caught errors) keep theirs.
+        let records = vec![
+            record(1, "tool", None, Some("caught and handled")),
+            record(3, "http", Some(1), None),
+            record(2, "prompt", None, None),
+        ];
+        let kept = strip_crash_frontier(records);
+        assert_eq!(kept.len(), 3, "a handled failure is not the crash frontier");
+    }
+
+    #[test]
+    fn failed_actor_delivers_a_down_message_to_its_owner() {
+        let dir = test_dir("down");
+        let worker = write_agent(
+            &dir,
+            "dies.ts",
+            r#"
+            export async function agent() {
+                throw new Error("worker exploded");
+            }
+            "#,
+        );
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const { pid } = await chidori.actors.spawn("__WORKER__", {}, { name: "doomed" });
+                const down = await chidori.receive("__chidori.down__", { timeoutMs: 30000 });
+                const outcome = await chidori.actors.join(pid);
+                return { down, joined: outcome.status };
+            }
+        "#
+        .replace("__WORKER__", &worker);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+
+        assert_eq!(output["down"]["name"], json!("__chidori.down__"));
+        assert_eq!(output["down"]["payload"]["pid"], json!("actor-1"));
+        assert_eq!(output["down"]["payload"]["name"], json!("doomed"));
+        assert_eq!(output["down"]["payload"]["status"], json!("failed"));
+        assert!(output["down"]["payload"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("worker exploded"));
+        assert_eq!(output["joined"], json!("failed"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn receive_with_timeout_fails_fast_once_every_actor_has_settled() {
+        // The fan-in starvation case: the parent waits for "result" messages
+        // that can never arrive because its only worker died. The receive
+        // must fail fast with guidance, not sit out its full timeout.
+        let dir = test_dir("failfast");
+        let worker = write_agent(
+            &dir,
+            "dies.ts",
+            r#"
+            export async function agent() {
+                throw new Error("no result for you");
+            }
+            "#,
+        );
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                await chidori.actors.spawn("__WORKER__");
+                // 10 minutes: if fail-fast regresses, the suite hangs loudly.
+                return await chidori.receive("result", { timeoutMs: 600000 });
+            }
+        "#
+        .replace("__WORKER__", &worker);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let started = std::time::Instant::now();
+        let err = run_agent(&path, &src, &json!({}), &backend).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "receive should fail fast, not wait out its timeout"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("every spawned actor has settled") && message.contains(DOWN_MESSAGE),
+            "unexpected error: {message}"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

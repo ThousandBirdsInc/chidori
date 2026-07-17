@@ -606,6 +606,14 @@ impl HostBindingBackend {
             return Ok(());
         };
 
+        // A call about to be served from the replay journal executes no side
+        // effect — the recorded result returns from cache, or the divergence
+        // check refuses loudly. Policy gates guard LIVE effects, so a pure
+        // replay must not ask (or fail closed) for work it will never do.
+        if runtime_ctx.next_call_is_replayed() {
+            return Ok(());
+        }
+
         let (decision, reason) = policy.decide(target, args);
         match decision {
             Decision::AlwaysAllow => Ok(()),

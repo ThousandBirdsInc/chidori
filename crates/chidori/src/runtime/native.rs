@@ -487,6 +487,7 @@ impl NativeAgentRunner {
                 let input = PendingInput {
                     seq,
                     prompt: prompt.clone(),
+                    details: None,
                 };
                 ctx.begin_host_operation_with_function(
                     seq,
