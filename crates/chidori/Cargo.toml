@@ -70,7 +70,7 @@ subtle = "2"
 hmac = "0.12"
 base64 = "0.22"
 hex = "0.4"
-rand = "0.8"
+rand = "0.9"
 
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
 chidori-js = { path = "../chidori-js", version = "0.3.3" }
