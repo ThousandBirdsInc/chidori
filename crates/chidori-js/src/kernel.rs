@@ -323,7 +323,8 @@ fn op_targets(op: &Op) -> Vec<u32> {
         | Op::JumpIfNullish(t)
         | Op::JumpIfFalsyPeek(t)
         | Op::JumpIfTruthyPeek(t)
-        | Op::JumpIfNullishPeek(t) => out.push(*t),
+        | Op::JumpIfNullishPeek(t)
+        | Op::JumpIfNullishDropUnder(t) => out.push(*t),
         Op::CmpBranchFalse { target, .. }
         | Op::CmpBranchTrue { target, .. }
         | Op::CmpLocalConstBranchFalse { target, .. }

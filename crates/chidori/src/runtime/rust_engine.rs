@@ -744,8 +744,13 @@ pub(crate) fn run_module(
             // Serve the shim by name under a stable synthetic key. The shim's own
             // `node:` imports (e.g. `node:buffer`) recurse through this same
             // branch; its body is plain JS, so it needs no transpilation.
-            let src = crate::runtime::typescript::builtins::shim_source(name)
-                .ok_or_else(|| format!("unsupported node: builtin '{specifier}'"))?;
+            let src = crate::runtime::typescript::builtins::shim_source(name).ok_or_else(|| {
+                format!(
+                    "unsupported node: builtin '{specifier}' (imported from {importer_key}); \
+                     the runtime shims only a small allowlist of node builtins — \
+                     see docs/package-management.md#compatibility"
+                )
+            })?;
             return Ok((format!("node:{name}"), src.to_string()));
         }
         // Vendored packages (react, react-dom/server, …): self-contained UMD

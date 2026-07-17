@@ -953,6 +953,11 @@ pub enum Op {
     JumpIfFalsyPeek(u32), // peek top; if falsy jump (keep), else pop
     JumpIfTruthyPeek(u32),
     JumpIfNullishPeek(u32),
+    /// Optional CALL short-circuit for method callees (`o.m?.()`): stack is
+    /// [receiver, func]. Peek func; if nullish, pop BOTH, push `undefined`,
+    /// and jump (the optional chain's end expects exactly one value). Falls
+    /// through with the stack untouched otherwise.
+    JumpIfNullishDropUnder(u32),
 
     // ---- exceptions ----
     Throw,

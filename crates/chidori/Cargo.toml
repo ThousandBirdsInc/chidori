@@ -73,7 +73,7 @@ hex = "0.4"
 rand = "0.8"
 
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
-chidori-js = { path = "../chidori-js", version = "0.3.2" }
+chidori-js = { path = "../chidori-js", version = "0.3.3" }
 async-trait = "0.1"
 
 # SQLite session store

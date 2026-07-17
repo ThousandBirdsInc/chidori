@@ -12,14 +12,19 @@ run store, machine-loss hydration, `--until-seq` time travel, and
 1. Parses `data/Cargo.toml` + `data/Cargo.lock` with
    [`fast-toml`](https://www.npmjs.com/package/fast-toml) (installed via
    `chidori add`, no Node involved) inside a `chidori.step` value checkpoint.
-   (`fast-toml` is the *third* TOML parser tried — `smol-toml` and `confbox`
-   both install cleanly but fail at import time; see the review's Finding 3.)
+   (`fast-toml` is the *third* TOML parser tried — at review time `smol-toml`
+   and `confbox` both installed cleanly but failed at import; see the
+   review's Finding 3. The cycle bug behind `smol-toml`'s failure has since
+   been fixed and it now loads; `confbox` genuinely needs the unshimmed
+   `node:module` builtin, and `chidori check` now says so up front.)
 2. Triages each direct dependency with a DeepSeek tool loop over two live
    tools: crates.io metadata and the OSV vulnerability database.
 3. Validates every model verdict with [`valibot`](https://valibot.dev) before
-   trusting it. (Not zod — the docs' own flagship package example throws
-   `ReferenceError: Cannot access binding before initialization` at import
-   evaluation, in both v3 and v4; see the review's Finding 4.)
+   trusting it. (Not zod — at the time of the review, the docs' own flagship
+   package example threw `ReferenceError: Cannot access binding before
+   initialization` at import evaluation, in both v3 and v4; see the review's
+   Finding 4. Both engine bugs behind that have since been fixed and zod now
+   runs — this example keeps valibot as the honest record of the round.)
 4. Gates publication on a human decision (`chidori.input`).
 5. Publishes `AUDIT.md` to the workspace.
 

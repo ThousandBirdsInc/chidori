@@ -116,12 +116,17 @@ three cliffs, concretely:
    `https`, `path`, `path/posix`, `events`, `url`, `assert`,
    `assert/strict`, `os`. Anything else — `net`, `stream`, `child_process`,
    `worker_threads`, `zlib`, `tls`, `vm`, … — is not provided, and importing
-   it fails with an allowlist error. (Networking is `fetch` plus the
-   `node:http`/`node:https` client shims, all captured for replay.)
+   it fails with an allowlist error naming the importing file. (Networking is
+   `fetch` plus the `node:http`/`node:https` client shims, all captured for
+   replay.)
 3. **No native addons.** There is no node-gyp build step (lifecycle scripts
    never run) and no way to load a `.node` binary. Packages that depend on
    `node-gyp-build`, `prebuild-install`, `bindings`, etc. cannot work, even
    when the install "succeeds".
+
+(Circular ES module imports are **not** a cliff: the engine links cycles with
+live bindings per the spec — zod's and smol-toml's internal cycles both load
+— and the module walk records them without complaint.)
 
 In short: **pure-ESM, native-free, allowlist-respecting packages work**; the
 rest fail at first import. Because installs are pure data movement, `chidori
@@ -130,8 +135,13 @@ each added package for these three cliffs and prints a `warning:` when it
 finds one (no ESM build, native-addon markers, imports of unprovided
 builtins). The scan is a bounded heuristic: it can miss dynamically computed
 specifiers, so a quiet `add` is strong — not perfect — evidence of
-compatibility. `chidori check agent.ts` (or just running the agent) gives the
-definitive answer, since the module graph resolves eagerly.
+compatibility. `chidori check agent.ts` gives the definitive answer for
+static imports: it resolves the agent's full module graph — local files,
+node_modules packages (minified dist files included), re-export edges,
+builtin shims — with the same resolver the runtime uses, so a package that
+cannot load fails `check` with the importing file and line. (Dynamic
+`import()` inside a dependency's lazy path is only policy-checked at the
+moment it executes.)
 
 ## Out of scope (v1) and why
 

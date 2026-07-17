@@ -33,6 +33,15 @@ fn check_agent_source(
         },
     )?;
 
+    // Walk the FULL module graph — local imports, node_modules packages,
+    // re-export edges, builtin shims — with the same resolver the runtime
+    // uses, so an import that would fail at `chidori run` (a missing package
+    // deep in a dependency, a non-allowlisted node builtin) fails here, with
+    // the importing file and line. Checking only the entry file made `check`
+    // vouch for graphs the engine could not load.
+    crate::runtime::typescript::module_graph::snapshot_modules(path, source, policy)
+        .context("resolving the agent's module graph")?;
+
     if !declares_run_entrypoint(&javascript) && !exports_async_function(&javascript, "agent") {
         anyhow::bail!(
             "No agent entrypoint found in {}: call `run(handler)` at the top level \
@@ -108,6 +117,78 @@ mod tests {
         let result = check_agent_file(&path, &policy).unwrap();
         assert!(result.javascript.contains("run("));
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn check_accepts_cyclic_local_imports() {
+        // Cycles are legal ES modules; the engine links them. `check` (and the
+        // manifest walk under it) must accept them rather than bail.
+        let policy = RuntimePolicy::durable_default("run");
+        let dir = std::env::temp_dir().join(format!("chidori-ts-check-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.ts"),
+            r#"
+                import { chidori, run } from "chidori:agent";
+                import { fromB } from "./b.ts";
+                export function fromA(): string { return "A"; }
+                run(async () => ({ out: fromB() }));
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.ts"),
+            r#"
+                import { fromA } from "./agent.ts";
+                export function fromB(): string { return fromA() + "B"; }
+            "#,
+        )
+        .unwrap();
+
+        check_agent_file(&dir.join("agent.ts"), &policy).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn check_walks_reexport_edges_and_names_the_failing_file() {
+        // A package whose entry only RE-EXPORTS (`export * from`) a module
+        // that imports a non-allowlisted node builtin: `check` must follow the
+        // re-export edge and fail naming the importing file — not say OK and
+        // let `run` explode later.
+        let policy = RuntimePolicy::durable_default("run");
+        let dir = std::env::temp_dir().join(format!("chidori-ts-check-{}", uuid::Uuid::new_v4()));
+        let pkg = dir.join("node_modules/badpkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"t","private":true}"#).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"badpkg","version":"1.0.0","type":"module","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), "export * from \"./impl.js\";\n").unwrap();
+        std::fs::write(
+            pkg.join("impl.js"),
+            "import { createRequire } from \"node:module\";\nexport const x = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agent.ts"),
+            r#"
+                import { chidori, run } from "chidori:agent";
+                import { x } from "badpkg";
+                run(async () => ({ x }));
+            "#,
+        )
+        .unwrap();
+
+        let err = match check_agent_file(&dir.join("agent.ts"), &policy) {
+            Ok(_) => panic!("check should fail on the unshimmed builtin import"),
+            // `{:#}` includes the whole context chain; the file/line live in
+            // the inner resolver error.
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("impl.js"), "error should name the file: {err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

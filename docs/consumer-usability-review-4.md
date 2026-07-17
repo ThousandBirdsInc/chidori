@@ -178,6 +178,21 @@ would be fine — except the error was `unsupported node: builtin
 tree, "something, somewhere, wants `node:module`" is a grep assignment, not
 an error message.
 
+> **Follow-up (same day):** fixed on all three fronts. (1) Cycles are no
+> longer a cliff at all — see Finding 4's follow-up — and the manifest walk
+> records them instead of bailing. (2) The walk was also quietly
+> *incomplete* in two ways this review only saw the symptoms of: it ignored
+> `export … from` re-export edges (why zod's and confbox's interiors were
+> invisible to it) and it text-scanned line-by-line, which sees nothing in
+> minified dist files (`import"node:module";var …`). It now collects
+> specifiers from the oxc AST, re-export edges included. (3) `chidori
+> check` resolves the agent's full module graph with the runtime's own
+> resolver, so the confbox case now fails at *check* time naming the exact
+> file, line, missing builtin, and the allowlist — and the runtime's error
+> names the importing file too. Dynamic `import()` inside a dependency's
+> lazy path is deliberately left to runtime policy rather than failing the
+> walk. The docs' compatibility section was updated to match.
+
 ## Finding 4: zod — the docs' own flagship example — cannot run, and the error blames *your* code
 
 `docs/package-management.md` opens its "Using packages from agents" section
@@ -214,6 +229,34 @@ half-detector is the worst of both worlds.
 (`valibot` worked first try and is a fine library — but "use valibot" is a
 workaround, not an answer, and I found it by trial and error: five
 `chidori add`s to get two working packages.)
+
+> **Follow-up (same day):** fixed — the spec-correct path. Two distinct
+> engine bugs stacked under this finding:
+>
+> 1. **The TDZ explosion was not about evaluation order at all.** The
+>    linker wires imports module-by-module with the entry first; wiring a
+>    namespace import *replaced* the pre-allocated binding cell with a
+>    fresh one, so any importer wired earlier — exactly zod's
+>    `import * as z … ; export { z }` entry shape — kept the original,
+>    forever-uninitialized cell. Namespace wiring now fills the
+>    pre-allocated cell in place, preserving cell identity regardless of
+>    wiring order. Engine regression tests reproduce the zod entry shape
+>    and its schemas⇄iso cycle in miniature
+>    (`crates/chidori-js/tests/module_cycles.rs` — both fail on the old
+>    engine).
+> 2. One layer deeper, zod v4's *issue formatter* hit a second engine bug:
+>    the optional-call operator on a member (`o.m?.()`) tested the wrong
+>    stack slot and called `undefined` instead of short-circuiting. Fixed
+>    with a dedicated bytecode op; `iss.inst?._zod.def?.error?.(iss)` now
+>    short-circuits per spec (tests in `tests/smoke.rs`).
+>
+> Verified live against the real packages: **zod v4 (4.4.3) and zod v3
+> (3.25.76) now build schemas, parse, and report issues correctly; the
+> docs' own example runs; smol-toml — the package that opened Finding 3 —
+> parses Cargo manifests**. `chidori check` passes all of them and still
+> fails confbox (correctly, with the file name). The round's demo agent
+> keeps valibot + fast-toml as the honest record of what round 4 was like
+> to live through.
 
 ## Finding 5: a run that failed on a bad model response cannot be cleanly repaired — and the one path that works forfeits `verify` forever
 

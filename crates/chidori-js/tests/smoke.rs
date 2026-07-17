@@ -399,3 +399,40 @@ fn default_sort_precomputed_keys() {
     // toSorted shares the same path.
     assert_eq!(run("[3,20,1].toSorted().join(',')"), "1,20,3");
 }
+
+#[test]
+fn optional_call_on_member_short_circuits() {
+    // `o.m?.()` with a missing/nullish method short-circuits to undefined —
+    // it must NOT try to call undefined (zod v4's issue formatter relies on
+    // this: `iss.inst?._zod.def?.error?.(iss)`).
+    assert_eq!(run("const o = {}; String(o.m?.())"), "undefined");
+    assert_eq!(run("const o = { m: null }; String(o.m?.())"), "undefined");
+    assert_eq!(run("const o = { m: () => 7 }; String(o.m?.())"), "7");
+    assert_eq!(
+        run("const o = { k: {} }; String(o.k.m?.(1, 2))"),
+        "undefined"
+    );
+    // Computed member callee.
+    assert_eq!(run("const o = {}; String(o['m']?.())"), "undefined");
+    assert_eq!(
+        run("const o = { m: (x) => x + 1 }; String(o['m']?.(1))"),
+        "2"
+    );
+    // Bare callee (was already correct).
+    assert_eq!(run("const f = undefined; String(f?.())"), "undefined");
+    // Arguments are NOT evaluated when the call short-circuits.
+    assert_eq!(
+        run("let hit = 0; const o = {}; o.m?.(hit = 1); String(hit)"),
+        "0"
+    );
+    // The chain result feeds ?? and further chaining like the spec says.
+    assert_eq!(
+        run("const iss = { inst: { d: {} } }; String(iss.inst?.d?.error?.(iss) ?? 'fallback')"),
+        "fallback"
+    );
+    // Longer chain after the optional call keeps short-circuiting.
+    assert_eq!(
+        run("const o = {}; String(o.m?.().deeper.prop)"),
+        "undefined"
+    );
+}
