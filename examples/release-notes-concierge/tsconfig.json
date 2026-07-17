@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": ["@1kbirds/chidori/agent-env"]
+  },
+  "include": ["agent.ts", "tools/**/*.ts"]
+}
