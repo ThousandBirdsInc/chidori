@@ -1,0 +1,134 @@
+[package]
+name = "chidori"
+version = "3.6.0"
+edition = "2021"
+# oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
+rust-version = "1.95"
+authors = ["Colton Pierson <colton@thousandbirds.ai>"]
+description = "The agent framework where every run is durable, replayable, and resumable by default. Plain async TypeScript agents on an embedded pure-Rust JS engine."
+homepage = "https://docs.thousandbirds.ai"
+keywords = ["agent", "ai", "llm", "typescript", "replay"]
+categories = ["development-tools", "command-line-utilities"]
+readme.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "chidori"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for LLM providers. rustls (no OpenSSL/native-tls) so the published
+# `chidori` binary links no system TLS libraries and cross-compiles cleanly for
+# every release target. `*-native-roots` keeps using the platform trust store,
+# preserving custom/corporate-CA support (e.g. self-hosted LiteLLM proxies).
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "charset",
+    "http2",
+    "system-proxy",
+    "json",
+    "stream",
+    "gzip",
+    "rustls-tls-native-roots",
+] }
+url = "2"
+
+# HTTP server for serve command
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Template engine
+minijinja = { version = "2", features = ["loader"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utilities
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+tokio-stream = "0.1"
+async-stream = "0.3"
+sha2 = "0.10"
+sha1 = "0.10"
+# Constant-time comparison for API-key checks (already in-tree via `digest`).
+subtle = "2"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
+
+# Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
+chidori-js = { path = "../chidori-js", version = "0.3.2" }
+async-trait = "0.1"
+
+# SQLite session store
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Cron scheduler for recipes
+cron = "0.12"
+
+# YAML recipe parsing
+serde_yaml = "0.9"
+
+# OpenTelemetry OTLP export — emits one span per host function call so agents
+# can be shipped into any OTLP-compatible backend (tael, Jaeger, Tempo, etc.).
+# Activated at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+
+# TypeScript-to-JavaScript stripping. Replaces a hand-rolled line-based stripper
+# that missed constructs like type predicates (`(t): t is string => ...`),
+# `satisfies` in odd positions, and overload signatures. oxc parses to a real
+# AST and emits JS via codegen, so unsupported sugar can't slip through.
+oxc = { version = "0.133", features = ["transformer", "codegen", "semantic", "ast_visit"] }
+# Generated→original position lookup for the codegen source maps that back
+# error-frame remapping (`CodegenReturn::map` is this crate's `SourceMap`;
+# the oxc facade does not re-export it).
+oxc_sourcemap = "6"
+nodejs-semver = "5.0.0"
+tar = "0.4.46"
+flate2 = "1.1.9"
+
+# Unix-only: apply per-process resource limits (setrlimit) and deadline-kill
+# (kill) to the OS-isolation worker child. See `runtime::isolate::limits`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Linux-only: seccomp-bpf syscall confinement + Landlock filesystem confinement
+# for the isolation worker. See `runtime::isolate::sandbox`.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+landlock = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+# In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
+# with the runtime `opentelemetry_sdk` features for test builds.
+opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+criterion = "0.5"
+
+# Runtime-layer perf coverage (journal replay lookup, session/run stores,
+# per-run construction costs). See `benches/runtime.rs`.
+[[bench]]
+name = "runtime"
+harness = false
+
+# Workspace-wide lint levels (see [workspace.lints] in the root Cargo.toml).
+[lints]
+workspace = true
