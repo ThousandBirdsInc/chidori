@@ -7,5 +7,4 @@ pub mod helpers;
 pub mod loader;
 pub mod module_graph;
 pub mod resolver;
-pub mod tools;
 pub mod transpile;

@@ -32,17 +32,9 @@ pub(super) fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engi
     // break resume parity between the two paths.
     let providers = app.providers.clone();
     // Tools come from the implicit `<agent dir>/tools/` convention plus any
-    // `--tools` dirs passed to `chidori serve` — the same discovery rule as
-    // `chidori run`.
-    let mut tool_dirs = vec![app
-        .agent_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("tools")];
-    tool_dirs.extend(app.extra_tool_dirs.iter().cloned());
-    let mut registry = ToolRegistry::load_from_dirs_cached(&tool_dirs)
-        .map(|r| (*r).clone())
-        .unwrap_or_else(|_| ToolRegistry::new());
+    // The registry holds only externally-sourced tools (MCP servers). Agent
+    // tools are defined in-VM with `defineTool` and never registered.
+    let mut registry = ToolRegistry::new();
     for def in app.mcp_tools.iter() {
         registry.register(def.clone());
     }

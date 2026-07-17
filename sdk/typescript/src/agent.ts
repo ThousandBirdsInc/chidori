@@ -55,13 +55,19 @@ export interface ToolDefinition {
 }
 
 /**
- * An import-defined tool: a plain object built with {@link defineTool},
- * imported (or defined inline) like any other code — the standard-pattern
- * alternative to the `tools/` directory. Pass handles directly in
- * `prompt({ tools: [...] })`, `conversation({ tools: [...] })`, or
- * `context().tools([...])`, freely mixed with registered tool names.
+ * A tool is nothing more than a function with a documented signature: a
+ * `name`, a `description`, and a JSON-schema for its `parameters`, wrapped
+ * around the `run` function the model actually calls. That's the whole
+ * contract — the signature is what the model reads to decide when and how to
+ * call it; the function is what runs. {@link defineTool} builds one as a
+ * plain object you import (or define inline) like any other code — no
+ * `tools/` directory, no registry.
  *
- * The `run` body executes in the AGENT'S OWN VM, so closures over agent
+ * Pass handles directly in `prompt({ tools: [...] })`,
+ * `conversation({ tools: [...] })`, or `context().tools([...])`, freely
+ * mixed with registered tool names.
+ *
+ * The `run` function executes in the AGENT'S OWN VM, so closures over agent
  * state and ordinary imports all work, and its side effects (fetch,
  * workspace, node:fs, ...) are the captured effects every agent already
  * has — journaled and deterministically replayable for free. Each model
@@ -70,10 +76,19 @@ export interface ToolDefinition {
  */
 export interface ToolHandle<Args extends JsonObject = JsonObject> {
   readonly __chidoriTool: true;
+  /** The name the model calls the tool by. */
   readonly name: string;
+  /** What the tool does — the model reads this to decide when to call it. */
   readonly description: string;
+  /** JSON-schema for the arguments: the documented shape of the call. */
   readonly parameters: JsonSchema & { type: "object" };
-  run(args: Args, chidori: Chidori): AgentOutput | Promise<AgentOutput>;
+  /**
+   * The function that runs when the tool is called. The `chidori` runtime
+   * handle is passed in by the tool loop, but tool bodies usually just close
+   * over the imported `chidori`, so it is optional when you call `run`
+   * directly (`tool.run(args)`).
+   */
+  run(args: Args, chidori?: Chidori): AgentOutput | Promise<AgentOutput>;
 }
 
 export type PromptStreamType = "progress" | "draft" | "subagent" | "final" | (string & {});
@@ -964,10 +979,14 @@ export function run<TInput extends AgentJson = JsonObject, TOutput extends Agent
 }
 
 /**
- * Build a {@link ToolHandle} — a tool as a plain importable object, no
- * `tools/` directory involved. `parameters` defaults to an empty object
- * schema; `description` to `""`. Inside the runtime this import is replaced
- * by the live implementation, exactly like `run` and `chidori`.
+ * Wrap a function into a {@link ToolHandle} by attaching its documented
+ * signature — a `name`, a `description`, and a JSON-schema for its
+ * `parameters`. That signature is all the model needs to call the function;
+ * the function itself is just code. No `tools/` directory, no registry —
+ * import (or define inline) the handle like any other value. `parameters`
+ * defaults to an empty object schema; `description` to `""`. Inside the
+ * runtime this import is replaced by the live implementation, exactly like
+ * `run` and `chidori`.
  *
  * ```ts
  * import { chidori, run, defineTool } from "chidori:agent";
@@ -986,7 +1005,7 @@ export function defineTool<Args extends JsonObject = JsonObject>(def: {
   name: string;
   description?: string;
   parameters?: JsonSchema & { type: "object" };
-  run(args: Args, chidori: Chidori): AgentOutput | Promise<AgentOutput>;
+  run(args: Args, chidori?: Chidori): AgentOutput | Promise<AgentOutput>;
 }): ToolHandle<Args> {
   void def;
   throw new Error(

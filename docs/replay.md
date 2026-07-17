@@ -46,11 +46,10 @@ flag archaeology:
   byte-for-byte; an explicit `--model`/`CHIDORI_MODEL` still overrides —
   and a divergence error that stems from a model mismatch says so, naming
   both models, instead of blaming "changed code".
-- **Trust and tools mirror `run`.** `resume` accepts `--trusted` /
-  `--untrusted` and `--tools <dir>` so live continuation past the replay
-  frontier (crash recovery) executes under the same posture the original
-  `chidori run --trusted --tools …` had. Without `--trusted`, gated effects
-  re-ask at the terminal exactly like `run`.
+- **Trust mirrors `run`.** `resume` accepts `--trusted` / `--untrusted` so
+  live continuation past the replay frontier (crash recovery) executes under
+  the same posture the original `chidori run --trusted` had. Without
+  `--trusted`, gated effects re-ask at the terminal exactly like `run`.
 - **Continuation is journaled.** Live records past the frontier persist
   into the same run directory, so a resume that itself crashes resumes from
   the *new* frontier — and the run's lease (`lease.json`) refuses a second

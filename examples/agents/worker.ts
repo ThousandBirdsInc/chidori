@@ -1,4 +1,11 @@
-import { chidori, run, type AgentJson, type JsonObject } from "chidori:agent";
+import {
+  chidori,
+  run,
+  defineTool,
+  type AgentJson,
+  type JsonObject,
+  type ToolHandle,
+} from "chidori:agent";
 
 /**
  * An autonomous "worker" agent: it loops — think, call a tool, observe the
@@ -7,14 +14,39 @@ import { chidori, run, type AgentJson, type JsonObject } from "chidori:agent";
  * The loop is author-driven via `context.respond()`, which returns the model's
  * structured turn (`toolCalls` + `text`). Tool results are appended back to the
  * context with `toolResult(...)`, and the next `respond()` continues from there.
- * Every turn and tool call is a durable host call, so the whole run replays for
- * free.
+ * (For the common case, `prompt(text, { tools, maxTurns })` runs this whole
+ * loop for you — reach for the manual form only when you need per-step control.)
+ *
+ * A tool is just a function with a documented signature — a `name`, a
+ * `description`, and JSON-schema `parameters`. `defineTool` staples that
+ * signature onto the function, giving a plain handle you define inline or
+ * import; its `run` executes in the agent's own VM. No `tools/` directory, no
+ * `--tools` flag. Every model turn is a durable host call, so the run replays
+ * for free.
  *
  * Run:
  *   chidori run examples/agents/worker.ts \
- *     --input task="Reverse the word 'chidori' and tell me the result." \
- *     --tools examples/tools
+ *     --input task="Reverse the word 'chidori' and tell me the result."
  */
+
+const reverse = defineTool({
+  name: "reverse",
+  description: "Reverse a string and return it.",
+  parameters: {
+    type: "object",
+    properties: { text: { type: "string", description: "The text to reverse" } },
+    required: ["text"],
+  },
+  run: async (args: { text: string }) => ({
+    reversed: [...String(args.text)].reverse().join(""),
+  }),
+});
+
+// The tools this worker can call, indexed by name so the loop can dispatch a
+// model tool-call to the right handle. Typed as `ToolHandle` (JsonObject args)
+// so any registered tool accepts the model's JSON tool-call input.
+const toolbox = new Map<string, ToolHandle>([[reverse.name, reverse]]);
+
 run(async (input: { task: string; maxSteps?: number }) => {
   const maxSteps = input.maxSteps ?? 8;
 
@@ -25,7 +57,7 @@ run(async (input: { task: string; maxSteps?: number }) => {
         "task. Call a tool when it helps; when you are finished, reply with a " +
         "final answer and no tool calls.",
     )
-    .tools(["reverse"]) // tool names discovered from the --tools directory
+    .tools([...toolbox.values()]) // pass the defineTool handles
     .user(input.task);
 
   const steps: { tool: string; input: JsonObject; result: AgentJson }[] = [];
@@ -39,9 +71,12 @@ run(async (input: { task: string; maxSteps?: number }) => {
       return { answer: response.content, steps };
     }
 
-    // Run each requested tool and feed the result back for the next turn.
+    // Run each requested tool in-VM and feed the result back for the next turn.
     for (const call of response.toolCalls) {
-      const result = await chidori.tool(call.name, call.input);
+      const tool = toolbox.get(call.name);
+      const result = (
+        tool ? await tool.run(call.input, chidori) : { error: `unknown tool: ${call.name}` }
+      ) as AgentJson;
       steps.push({ tool: call.name, input: call.input, result });
       ctx = ctx.toolResult(call.id, JSON.stringify(result));
     }

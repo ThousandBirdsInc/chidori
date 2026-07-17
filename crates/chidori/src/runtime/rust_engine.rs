@@ -347,30 +347,10 @@ fn remap_stack_frames_via(err: &str, read: impl Fn(&str) -> Option<String>) -> S
 
 /// Run a nested TypeScript **tool** file natively on the rust engine (G4).
 ///
-/// Re-enters [`run_module`] with the tool's `run(args)` entrypoint. The
-/// same `backend` (hence the same `RuntimeContext`) is threaded through, so the
-/// tool's host effects nest under the parent tool call (`parent_seq`) and share
-/// the durable call log, policy, MCP, and OTEL span tree. A suspension inside
-/// the tool (e.g. `chidori.input()` in Pause mode) surfaces as the usual
-/// `PAUSE_MARKER` error and propagates to the parent run.
-pub(crate) fn run_tool_file(
-    path: &Path,
-    kwargs: &Value,
-    backend: &HostBindingBackend,
-) -> Result<Value> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("reading tool {}: {e}", path.display()))?;
-    run_module(
-        path,
-        &source,
-        "run",
-        kwargs,
-        Rc::new(InProcessHost::new(backend.clone())),
-    )
-}
-
 /// Run a nested TypeScript **sub-agent** file natively on the rust engine (G4).
-/// Mirrors [`run_tool_file`] but invokes the `agent(input)` entrypoint.
+/// Invokes the `agent(input)` entrypoint, threading the same `backend` (hence
+/// the same `RuntimeContext`) so the sub-agent's host effects nest under the
+/// parent call and share the durable call log, policy, MCP, and OTEL span tree.
 pub(crate) fn run_agent_file(
     path: &Path,
     input: &Value,
@@ -1237,7 +1217,7 @@ mod tests {
     use crate::runtime::context::RuntimeContext;
     use crate::runtime::snapshot::RuntimePolicy;
     use crate::runtime::template::TemplateEngine;
-    use crate::tools::{ToolBackend, ToolRegistry};
+    use crate::tools::ToolRegistry;
 
     /// A fully-wired runtime backend over `ctx`/`tools` with default providers,
     /// template engine, tokio runtime, policy, and MCP — enough to exercise the
@@ -1753,77 +1733,6 @@ mod tests {
         let records = ctx.call_log().into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].function, "log");
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn run_agent_nests_tool_internal_calls_under_the_tool_on_rust_engine() {
-        // A TypeScript tool whose `run` makes its own chidori.log calls: those
-        // must be recorded as CHILDREN of the tool call (parent_seq = tool seq),
-        // so the trace nests correctly.
-        let ctx = RuntimeContext::new();
-        let dir = std::env::temp_dir().join(format!("chidori-rust-tool-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("tools")).unwrap();
-
-        let tool_path = dir.join("tools").join("echo2.ts");
-        std::fs::write(
-            &tool_path,
-            r#"
-            export const tool = { name: "echo2", description: "doubles and logs", parameters: {} };
-            export async function run(args: { value: number }) {
-                chidori.log("tool: doubling " + args.value);
-                return { value: args.value * 2 };
-            }
-            "#,
-        )
-        .unwrap();
-
-        let agent_path = dir.join("agent.ts");
-        let agent_src = r#"
-            export async function agent(input: { value: number }) {
-                chidori.log("agent: before tool");
-                const r = await chidori.tool("echo2", { value: input.value });
-                return r;
-            }
-        "#;
-        std::fs::write(&agent_path, agent_src).unwrap();
-
-        let mut registry = ToolRegistry::new();
-        registry.register(crate::tools::ToolDef {
-            name: "echo2".to_string(),
-            description: "doubles and logs".to_string(),
-            params: Vec::new(),
-            source_path: tool_path,
-            source_fingerprint: None,
-            backend: ToolBackend::TypeScript,
-        });
-        let tools = Arc::new(registry);
-
-        let backend = test_backend(ctx.clone(), tools);
-        let output = run_agent(
-            &agent_path,
-            agent_src,
-            &serde_json::json!({ "value": 5 }),
-            &backend,
-        )
-        .unwrap();
-        assert_eq!(output, serde_json::json!({ "value": 10 }));
-
-        let records = ctx.call_log().into_records();
-        // agent log (top-level), tool's internal log (nested), tool call.
-        let tool = records.iter().find(|r| r.function == "tool").unwrap();
-        let tool_log = records
-            .iter()
-            .find(|r| r.function == "log" && r.args["message"] == "tool: doubling 5")
-            .unwrap();
-        let agent_log = records
-            .iter()
-            .find(|r| r.function == "log" && r.args["message"] == "agent: before tool")
-            .unwrap();
-        // The tool's log nests under the tool; the agent's log is top-level.
-        assert_eq!(tool_log.parent_seq, Some(tool.seq));
-        assert_eq!(agent_log.parent_seq, None);
 
         let _ = std::fs::remove_dir_all(dir);
     }

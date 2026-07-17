@@ -1,11 +1,12 @@
 {
-  "//": "Typecheck the example agents/tools against the in-repo SDK types. Run: npx tsc -p examples/record-replay",
+  "//": "Typecheck the example agents against the in-repo SDK types. Run: npx tsc -p examples/record-replay",
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "types": [],
     "baseUrl": ".",
@@ -14,5 +15,5 @@
       "@1kbirds/chidori": ["../../sdk/typescript/src/index.ts"]
     }
   },
-  "include": ["*.ts", "tools/*.ts"]
+  "include": ["*.ts"]
 }

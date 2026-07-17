@@ -765,17 +765,6 @@ impl HostBindingBackend {
                         mcp.call_tool(server_id, remote_name, &serde_json::Value::Object(kwargs))
                             .await
                     }),
-                    ToolBackend::TypeScript => {
-                        // Nested execution: run the nested TS tool on the rust
-                        // engine, threading the same backend (`self`) so host
-                        // effects nest under this tool call and a suspension
-                        // propagates.
-                        crate::runtime::rust_engine::run_tool_file(
-                            &tool_def.source_path,
-                            &serde_json::Value::Object(kwargs),
-                            self,
-                        )
-                    }
                     ToolBackend::Native => {
                         tools.dispatch_native(tool_name, serde_json::Value::Object(kwargs))
                     }

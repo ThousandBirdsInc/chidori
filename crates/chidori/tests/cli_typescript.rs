@@ -153,47 +153,38 @@ fn cli_run_typescript_agent_outputs_json_and_persists_snapshot_manifest() {
 }
 
 #[test]
-fn cli_run_discovers_local_typescript_tool_directory_for_direct_tool_calls() {
-    let dir = temp_project("run-tool-dir");
-    let tools_dir = dir.join("tools");
-    fs::create_dir_all(&tools_dir).unwrap();
+fn cli_run_typescript_agent_uses_definetool() {
+    let dir = temp_project("run-definetool");
     let agent = dir.join("agent.ts");
     fs::write(
         &agent,
         r#"
-            export async function agent(input, chidori) {
-                const searchResults = await chidori.tool("web_search", {
-                    query: "latest developments " + input.topic,
-                });
-                return { searchResults };
-            }
-        "#,
-    )
-    .unwrap();
-    fs::write(
-        tools_dir.join("web_search.ts"),
-        r#"
-            export const tool = {
+            import { chidori, run, defineTool } from "chidori:agent";
+            const webSearch = defineTool({
                 name: "web_search",
                 description: "Search the web for a short query.",
                 parameters: {
                     type: "object",
-                    properties: {
-                        query: { type: "string", description: "Search query" },
-                    },
+                    properties: { query: { type: "string", description: "Search query" } },
                     required: ["query"],
                 },
-            };
-
-            export async function run(args, chidori) {
-                await chidori.log("web_search", { query: args.query });
-                return {
-                    query: args.query,
-                    results: [
-                        { title: "Chidori tools", url: "https://example.test/chidori-tools" },
-                    ],
-                };
-            }
+                run: async (args) => {
+                    await chidori.log("web_search", { query: args.query });
+                    return {
+                        query: args.query,
+                        results: [
+                            { title: "Chidori tools", url: "https://example.test/chidori-tools" },
+                        ],
+                    };
+                },
+            });
+            run(async (input) => {
+                const searchResults = await webSearch.run(
+                    { query: "latest developments " + input.topic },
+                    chidori,
+                );
+                return { searchResults };
+            });
         "#,
     )
     .unwrap();
@@ -691,128 +682,17 @@ fn cli_stream_failure_done_event_includes_full_error_chain() {
 }
 
 #[test]
-fn cli_tools_lists_typescript_tools_and_ignores_starlark_files() {
-    let dir = temp_project("tools");
-    let tools_dir = dir.join("tools");
-    fs::create_dir_all(&tools_dir).unwrap();
-    fs::write(
-        tools_dir.join("web_search.ts"),
-        r#"
-            export const tool = {
-                name: "web_search",
-                description: "Search the web.",
-                parameters: {
-                    type: "object",
-                    properties: { query: { type: "string" } },
-                    required: ["query"],
-                },
-            };
-            export async function run(args, chidori) {
-                await chidori.log("search", args);
-                return { results: [] };
-            }
-        "#,
-    )
-    .unwrap();
-    fs::write(
-        tools_dir.join("legacy.star"),
-        r#"
-            def legacy():
-                return "ignored"
-        "#,
-    )
-    .unwrap();
-
-    let output = run_chidori(&["tools", "--dir", tools_dir.to_str().unwrap()], &dir);
-    assert_success(&output);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("web_search"));
-    assert!(stdout.contains("Search the web."));
-    assert!(!stdout.contains("legacy"));
-
-    fs::remove_dir_all(dir).ok();
-}
-
-#[test]
-fn cli_run_typescript_agent_invokes_typescript_tool() {
-    let dir = temp_project("tool-run");
-    let tools_dir = dir.join("tools");
-    fs::create_dir_all(&tools_dir).unwrap();
-    let agent = dir.join("agent.ts");
-    fs::write(
-        &agent,
-        r#"
-            export async function agent(input, chidori) {
-                return await chidori.tool("echo", { value: input.value });
-            }
-        "#,
-    )
-    .unwrap();
-    fs::write(
-        tools_dir.join("echo.ts"),
-        r#"
-            export const tool = {
-                name: "echo",
-                description: "Echo a value.",
-                parameters: {
-                    type: "object",
-                    properties: { value: { type: "number" } },
-                    required: ["value"],
-                },
-            };
-            export async function run(args, chidori) {
-                await chidori.log("echo", args);
-                return { echoed: args.value };
-            }
-        "#,
-    )
-    .unwrap();
-
-    let output = run_chidori(
-        &[
-            "run",
-            agent.to_str().unwrap(),
-            "--trusted",
-            "--input",
-            r#"{"value": 7}"#,
-        ],
-        &dir,
-    );
-    assert_success(&output);
-    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(stdout["echoed"], 7);
-
-    fs::remove_dir_all(dir).ok();
-}
-
-#[test]
 fn cli_run_default_posture_fails_closed_on_gated_effects_without_terminal() {
     // With no policy configured, no --trusted, and no terminal to answer the
-    // approval prompt, a gated effect (tool call) must fail closed with an
+    // approval prompt, a gated effect (network fetch) must fail closed with an
     // actionable message instead of running fully trusted.
     let dir = temp_project("default-posture");
-    let tools_dir = dir.join("tools");
-    fs::create_dir_all(&tools_dir).unwrap();
     let agent = dir.join("agent.ts");
     fs::write(
         &agent,
         r#"
             export async function agent(input, chidori) {
-                return await chidori.tool("echo", { value: 1 });
-            }
-        "#,
-    )
-    .unwrap();
-    fs::write(
-        tools_dir.join("echo.ts"),
-        r#"
-            export const tool = {
-                name: "echo",
-                description: "Echo a value.",
-                parameters: { type: "object", properties: {}, required: [] },
-            };
-            export async function run(args, chidori) {
-                return { echoed: args.value };
+                return await fetch("https://example.test/gated");
             }
         "#,
     )

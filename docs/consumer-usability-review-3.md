@@ -74,12 +74,14 @@ strict `tsc` project.
 > available tools and the load failures, session lists carry
 > `run_id`/`pending_prompt`, both SDKs expose `run_id`/`pending_details`,
 > `resume` reports the true replayed/live split, and `stats` per-model rows
-> reconcile with the top line. A second follow-up removed the magic
-> directory itself: `defineTool()` makes a tool a plain importable object
-> whose body runs in the agent's own VM (closures and captured effects
-> included), passed directly in `prompt({tools: [...]})` — the demo now
-> uses it and has no `tools/` directory at all; the directory registry
-> remains as an option for sharing tools across agents.
+> reconcile with the top line. Two further follow-ups reworked tools
+> entirely: `defineTool()` makes a tool a plain importable object whose body
+> runs in the agent's own VM (closures and captured effects included), passed
+> directly in `prompt({tools: [...]})` — and the directory-scanned tool
+> registry was then removed outright. There is no `tools/` directory, no
+> `--tools` flag, and no `chidori tools` command; `chidori.tool(name)` now
+> serves only externally-sourced tools (MCP servers, Rust-native tools). Every
+> example is on `defineTool`.
 
 The engine's promises survive contact with a consumer better than round 2
 left me expecting: this round found **no failure of the durability model

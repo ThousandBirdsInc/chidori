@@ -37,9 +37,12 @@ directly, so the runtime sees and records everything. See
 | `chidori.util.retry(fn, options)` | Retry with backoff (in-VM helper) |
 | `chidori.util.tryCall(fn)` | Capture errors without raising (in-VM helper) |
 
-**Tools are plain code.** The primary way to give a prompt tools is
-`defineTool` — a tool as an ordinary object you define inline or import from
-any module, no special directory or registration step:
+**A tool is just a function with a documented signature.** There is no tool
+type to implement and no registry to populate — a tool is an ordinary
+function plus the `name`, `description`, and JSON-schema `parameters` that
+tell the model when and how to call it. `defineTool` staples that signature
+onto the function and hands you back a plain object you define inline or
+import from any module — no special directory, no registration step:
 
 ```ts
 import { chidori, run, defineTool } from "chidori:agent";
@@ -64,13 +67,13 @@ invocation deterministic on replay. Each model turn is a durable `respond()`
 call and each invocation is journaled as a `mark("tool:<name>")` record, so
 the loop appears in `chidori trace` like any other work.
 
-**The tool loop is built in** for directory-registered tools too:
-`chidori.prompt(text, { tools: ["hn_search"], maxTurns: 8 })` runs a complete
-provider tool-use loop — the model calls tools, the runtime executes them and
-feeds results back, up to `maxTurns` — and returns the final text; every
-inner call is journaled like any other effect. Names and `defineTool` handles
-mix freely in the same `tools` array (names resolve against the `--tools`
-directory registry; handles run in-VM). Hand-roll the loop with
+**The tool loop is built in.** `chidori.prompt(text, { tools: [search],
+maxTurns: 8 })` runs a complete provider tool-use loop — the model calls tools,
+the runtime executes them and feeds results back, up to `maxTurns` — and
+returns the final text; every inner call is journaled like any other effect. A
+`tools` array may also carry string NAMES for tools sourced from outside the
+agent (MCP servers, Rust-native tools), freely mixed with `defineTool`
+handles. Hand-roll the loop with
 `context().respond()` / `toolResult()` only when you need per-step control
 (inspecting each call, streaming progress between steps, custom budgets — see
 [`examples/agents/worker.ts`](../examples/agents/worker.ts)).
@@ -184,6 +187,6 @@ Drop to `chat.context` whenever you need the lower-level API (manual `compact`,
 loops. See [`examples/agents/conversation.ts`](../examples/agents/conversation.ts).
 
 To chat with the model directly — no agent file — run `chidori chat` (`--system`,
-`--model`, `--tools <dir>`). It is a thin REPL over `conversation()`: each turn
+`--model`). It is a thin REPL over `conversation()`: each turn
 is durable and streams its reply token-by-token, and the prior turns replay for
 free, so only your newest message reaches the provider.

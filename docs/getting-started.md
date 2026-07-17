@@ -125,7 +125,6 @@ See [`examples/`](../examples):
 - [`agents/context_qa.ts`](../examples/agents/context_qa.ts) — cache-aware multi-turn Q&A via `chidori.context`
 - [`agents/streaming_progress.ts`](../examples/agents/streaming_progress.ts) — labelled prompt progress streams
 - [`agents/webhook.ts`](../examples/agents/webhook.ts) — event-driven HTTP handler
-- [`agents/tool_use.ts`](../examples/agents/tool_use.ts) — tool call example
+- [`agents/tool_use.ts`](../examples/agents/tool_use.ts) — a tool defined inline with `defineTool`
 - [`sdk_demo.py`](../examples/sdk_demo.py) — Python SDK with checkpointing + replay
 - [`prompts/analysis.jinja`](../examples/prompts/analysis.jinja) — shared prompt template
-- [`tools/web_search.ts`](../examples/tools/web_search.ts) — real network-backed tool (keyless DuckDuckGo search)

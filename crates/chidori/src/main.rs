@@ -70,11 +70,6 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
-        /// Extra directories to scan for tool files.
-        /// Defaults to `<agent file's parent>/tools/` only.
-        #[arg(long)]
-        tools: Vec<PathBuf>,
-
         /// Default model for prompts that don't set one in code (equivalent
         /// to CHIDORI_MODEL). Any model name your configured provider
         /// accepts, e.g. `claude-sonnet-4-6`, `gpt-4o`, `deepseek-chat`.
@@ -201,11 +196,6 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
 
-        /// Extra directories to scan for tool files (defaults to ./tools/).
-        /// Discovered tools are offered to the model on every turn.
-        #[arg(long)]
-        tools: Vec<PathBuf>,
-
         /// Run under the built-in deny-by-default `untrusted` policy profile.
         #[arg(long, conflicts_with = "trusted")]
         untrusted: bool,
@@ -213,13 +203,6 @@ enum Commands {
         /// Opt out of the ask-before-powerful-effects default (see `run --trusted`).
         #[arg(long)]
         trusted: bool,
-    },
-
-    /// List all available tools
-    Tools {
-        /// Tool directories to search (defaults to ./tools/)
-        #[arg(short, long)]
-        dir: Vec<PathBuf>,
     },
 
     /// Replay a persisted run from its checkpoint. Re-runs the agent with
@@ -258,11 +241,6 @@ enum Commands {
         /// fails loudly.
         #[arg(long)]
         model: Option<String>,
-
-        /// Extra directories to scan for tool files, mirroring `chidori run`.
-        /// `<agent file's parent>/tools/` is always scanned.
-        #[arg(long)]
-        tools: Vec<PathBuf>,
 
         /// Deny gated effects (tool calls, network, workspace writes) that
         /// live continuation past the replay frontier would perform.
@@ -423,11 +401,6 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
-        /// Extra directories to scan for tool files, mirroring `chidori run`.
-        /// Defaults to `<agent file's parent>/tools/` only.
-        #[arg(long)]
-        tools: Vec<PathBuf>,
-
         /// Default model for prompts that don't set one in code (equivalent
         /// to CHIDORI_MODEL), applied to every session this server runs.
         #[arg(long)]
@@ -567,7 +540,6 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             input,
             trace,
             verbose,
-            tools,
             model,
             stream,
             untrusted,
@@ -594,9 +566,9 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             }
             crate::runtime::isolate::warn_if_untrusted_without_isolation(untrusted);
             let result = if stream {
-                cmd_run_stream(&file, &input, verbose, &tools, untrusted, trusted)
+                cmd_run_stream(&file, &input, verbose, untrusted, trusted)
             } else {
-                cmd_run(&file, &input, trace, verbose, &tools, untrusted, trusted)
+                cmd_run(&file, &input, trace, verbose, untrusted, trusted)
             };
             (result, false)
         }
@@ -626,15 +598,13 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             agent,
             system,
             model,
-            tools,
             untrusted,
             trusted,
         } => (
-            cmd_chat(agent.as_deref(), system, model, &tools, untrusted, trusted),
+            cmd_chat(agent.as_deref(), system, model, untrusted, trusted),
             false,
         ),
         Commands::Check { file } => (cmd_check(&file), true),
-        Commands::Tools { dir } => (cmd_tools(&dir), false),
         Commands::Stats { dir } => (cmd_stats(dir.as_deref()), false),
         Commands::Resume {
             file,
@@ -643,7 +613,6 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             until_seq,
             allow_source_change,
             model,
-            tools,
             untrusted,
             trusted,
         } => (
@@ -658,7 +627,6 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                     until_seq,
                     allow_source_change,
                     model,
-                    &tools,
                     untrusted,
                     trusted,
                 )
@@ -714,7 +682,6 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             port,
             host,
             verbose,
-            tools,
             model,
             untrusted,
             trusted,
@@ -735,7 +702,6 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                     host.as_deref(),
                     port,
                     verbose,
-                    &tools,
                     untrusted,
                     trusted,
                 ),
@@ -881,7 +847,6 @@ enum DemoAction {
         input: &'static [&'static str],
         trace: bool,
         stream: bool,
-        tools: &'static [&'static str],
     },
     Serve {
         file: &'static str,
@@ -901,20 +866,18 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["name=Colton"],
                 trace: false,
                 stream: false,
-                tools: &[],
             },
         },
         DemoExample {
             title: "Tool call",
-            description: "Loads a local TypeScript tool and calls it from an agent.",
-            command: "chidori run examples/agents/tool_use.ts --input query=chidori --tools examples/tools",
+            description: "Defines a tool inline with defineTool and calls it from an agent.",
+            command: "chidori run examples/agents/tool_use.ts --input query=chidori",
             requires_provider: false,
             action: DemoAction::Run {
                 file: "examples/agents/tool_use.ts",
                 input: &["query=chidori"],
                 trace: false,
                 stream: false,
-                tools: &["examples/tools"],
             },
         },
         DemoExample {
@@ -927,7 +890,6 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["document=Rust is great."],
                 trace: true,
                 stream: false,
-                tools: &[],
             },
         },
         DemoExample {
@@ -940,7 +902,6 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["{\"topic\":\"runtime snapshots\"}"],
                 trace: false,
                 stream: false,
-                tools: &[],
             },
         },
         DemoExample {
@@ -953,7 +914,6 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["topic=runtime snapshots"],
                 trace: false,
                 stream: true,
-                tools: &[],
             },
         },
         DemoExample {
@@ -1012,20 +972,18 @@ fn cmd_demo() -> Result<()> {
             input,
             trace,
             stream,
-            tools,
         } => {
             let file = PathBuf::from(file);
             let inputs = input
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>();
-            let tool_dirs = tools.iter().map(PathBuf::from).collect::<Vec<_>>();
             // The demo runs the repo's own example agents on the developer's
             // machine — the trusted posture, like `run --trusted`.
             if *stream {
-                cmd_run_stream(&file, &inputs, false, &tool_dirs, false, true)
+                cmd_run_stream(&file, &inputs, false, false, true)
             } else {
-                cmd_run(&file, &inputs, *trace, false, &tool_dirs, false, true)
+                cmd_run(&file, &inputs, *trace, false, false, true)
             }
         }
         DemoAction::Serve { file, port } => {
@@ -1035,15 +993,7 @@ fn cmd_demo() -> Result<()> {
             // The demo serves the developer's own example agent on their own
             // machine — the trusted posture, like `chidori run`, on the
             // default loopback bind.
-            cmd_serve(
-                Some(&PathBuf::from(file)),
-                None,
-                *port,
-                false,
-                &[],
-                false,
-                true,
-            )
+            cmd_serve(Some(&PathBuf::from(file)), None, *port, false, false, true)
         }
     }
 }
@@ -1236,7 +1186,6 @@ fn cmd_run(
     inputs: &[String],
     trace: bool,
     verbose: bool,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -1280,11 +1229,9 @@ fn cmd_run(
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
-    // Auto-discover tools from `<project>/tools/` plus any `--tools` dirs.
-    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    // Agent tools are defined in-VM with `defineTool`; the registry is for
+    // externally-sourced tools only (MCP), unused on the plain CLI path.
+    let tools = Arc::new(ToolRegistry::new());
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
@@ -1355,7 +1302,6 @@ fn cmd_run_stream(
     file: &Path,
     inputs: &[String],
     verbose: bool,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -1380,10 +1326,7 @@ fn cmd_run_stream(
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
-    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tools = Arc::new(ToolRegistry::new());
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
@@ -1488,7 +1431,6 @@ fn cmd_chat(
     agent: Option<&std::path::Path>,
     system: Option<String>,
     model: Option<String>,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -1527,10 +1469,7 @@ fn cmd_chat(
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
-    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tools = Arc::new(ToolRegistry::new());
     let tool_names: Vec<String> = tools.list().iter().map(|t| t.name.clone()).collect();
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
@@ -1652,68 +1591,6 @@ fn cmd_check(file: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tools(dirs: &[PathBuf]) -> Result<()> {
-    let dirs = if dirs.is_empty() {
-        vec![PathBuf::from("tools")]
-    } else {
-        dirs.to_vec()
-    };
-
-    let registry = ToolRegistry::load_from_dirs(&dirs)?;
-    let tools = registry.list();
-
-    if tools.is_empty() {
-        println!(
-            "No tools found in: {}",
-            dirs.iter()
-                .map(|d| d.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        print_tool_load_errors(&registry);
-        return Ok(());
-    }
-
-    for tool in tools {
-        println!("  {} — {}", tool.name, tool.description);
-        for param in &tool.params {
-            let req = if param.required { " (required)" } else { "" };
-            let default = param
-                .default
-                .as_ref()
-                .map(|d| format!(" [default: {d}]"))
-                .unwrap_or_default();
-            println!("    {}: {}{}{}", param.name, param.param_type, req, default);
-        }
-        println!();
-    }
-
-    print_tool_load_errors(&registry);
-    Ok(())
-}
-
-/// A `.ts` file in a tool directory that failed to load is the number-one
-/// silent footgun (e.g. an import that escapes the tool directory): the
-/// consumer's next signal is an "Unknown tool" failure mid-run. Print each
-/// skipped file and why.
-fn print_tool_load_errors(registry: &ToolRegistry) {
-    let errors = registry.load_errors();
-    if errors.is_empty() {
-        return;
-    }
-    println!(
-        "{} tool file(s) failed to load and are NOT registered:",
-        errors.len()
-    );
-    for (path, reason) in errors {
-        println!(
-            "  {} — {}",
-            path.display(),
-            reason.lines().next().unwrap_or(reason)
-        );
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn cmd_resume(
     file: &Path,
@@ -1722,7 +1599,6 @@ fn cmd_resume(
     until_seq: Option<u64>,
     allow_source_change: bool,
     model: Option<String>,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -1817,10 +1693,7 @@ fn cmd_resume(
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
-    let mut tool_dirs = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tools = Arc::new(ToolRegistry::new());
     // Same implicit workspace root as `chidori run`: a run that wrote
     // workspace files must replay/resume without extra configuration.
     // CHIDORI_WORKSPACE_ROOT still takes precedence inside the runtime.
@@ -1899,9 +1772,7 @@ fn cmd_verify(file: &Path, run_id: &str, dir: Option<&std::path::Path>) -> Resul
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
-    let tool_dirs = vec![base_dir.join("tools")];
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tools = Arc::new(ToolRegistry::new());
     let manifest_model = crate::runtime::snapshot::SnapshotStore::new(run_dir.clone())
         .load_manifest()
         .ok()
@@ -2008,10 +1879,7 @@ fn branch_engine(
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
-    let tools_dir = base_dir.join("tools");
-    let tools = Arc::new(
-        ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
-    );
+    let tools = Arc::new(ToolRegistry::new());
     Ok(Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
         .with_policy(cli_policy(untrusted, trusted))
@@ -2447,7 +2315,6 @@ fn cmd_serve(
     host: Option<&str>,
     port: u16,
     verbose: bool,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -2508,7 +2375,6 @@ fn cmd_serve(
         providers,
         template_engine,
         file.map(|f| f.to_path_buf()),
-        extra_tool_dirs.to_vec(),
         host,
         port,
         policy,

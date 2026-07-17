@@ -58,7 +58,7 @@ chidori serve agents/webhook.ts --port 8080 --trusted
 chidori serve --port 8080                   # no FILE: fleet-only server (detached agents; sessions must name an agent)
 chidori resume agents/my_agent.ts <run_id>  # replay a recorded run byte-for-byte with zero model calls (durable resume);
                                             # the run's recorded model applies automatically (override with --model)
-chidori resume agents/my_agent.ts <run_id> --trusted --tools tools  # crash recovery of a trusted tool-using run:
+chidori resume agents/my_agent.ts <run_id> --trusted  # crash recovery of a trusted tool-using run:
                                             # same posture flags as `run`; continuation journals into the same run dir
 chidori resume agents/my_agent.ts <run_id> --allow-source-change  # edit-and-resume: replay against edited code (divergence-checked)
 chidori verify agents/my_agent.ts <run_id>  # checkpoint-as-test: replay with NO provider, deny-all policy, no writes;
@@ -68,19 +68,18 @@ chidori snapshot <run_id>
 ```
 
 `chidori init [dir] --template docs|chat|worker` scaffolds a starter project
-(agent + README, plus a `tools/` dir for `worker` and a bundled docs corpus for
-`docs`); omit `--template` to pick interactively. The `docs` template chats
+(agent + README, plus a bundled docs corpus for `docs`); omit `--template` to pick interactively. The `docs` template chats
 with the bundled Chidori docs; the `chat` template is a conversational agent;
 the `worker` template is an autonomous tool-using loop (see
 `examples/agents/worker.ts`).
 
 `chidori chat` is an interactive multi-turn REPL backed by `conversation()`. With
 no agent file it chats with the model directly; pass a conversational agent file
-(one accepting `{ messages, system?, model?, tools? }` and returning
+(one accepting `{ messages, system?, model? }` and returning
 `{ transcript }` or `{ history }`, like the `chat` template) to chat through it.
 Each turn is a durable host call and streams its reply token-by-token; the prior
 turns replay for free, so only your newest message reaches the provider. Flags:
-`--system`, `--model`, `--tools <dir>`. Type `exit`/`quit` or Ctrl-D to end.
+`--system`, `--model`. Type `exit`/`quit` or Ctrl-D to end.
 
 `chidori snapshot <run_id>` prints `runtime.snapshot.json` metadata without
 printing raw VM snapshot bytes.
@@ -120,7 +119,7 @@ Options:
   custom budgets).
 - `temperature`: sampling temperature.
 - `tools`: the tools available to the loop — registered tool NAMES (from the
-  `--tools` directory registry) and/or `defineTool(...)` HANDLES, freely
+  MCP/native registry) and/or `defineTool(...)` HANDLES, freely
   mixed. Handles are plain objects defined inline or imported from any
   module; their `run` executes in the agent's own VM (closures + captured
   effects work, replay is deterministic), each invocation journaled as a
@@ -303,14 +302,18 @@ resume a matching pause in-process. See `docs/signals.md`.
 
 ### tool
 
+A tool is merely a function with a documented signature — a `name`, a
+`description`, and JSON-schema `parameters` — nothing more. Agent tools are
+defined in-VM with `defineTool`, which wraps that signature around a `run`
+function, and passed to `prompt` / `context().tools` as handles (see the
+`tools` prompt option above). The
+`chidori.tool(name, args)` host effect is for tools sourced from OUTSIDE the
+agent — MCP-server tools (configured via `CHIDORI_MCP_*`) and Rust-native
+tools registered by an embedding application — dispatched by name:
+
 ```ts
 const result = await chidori.tool("web_search", { query: "snapshot runtime" });
 ```
-
-Tools discovered from disk are TypeScript `.ts` modules or MCP-backed remote
-tools. Tool directory discovery ignores `.star` files. `chidori run`,
-`chidori serve`, and `chidori resume` all scan `<agent dir>/tools/`
-implicitly; all three also accept extra directories via `--tools`.
 
 A tool's `fetch` is SSRF-guarded by default: requests to hosts that resolve
 to non-public addresses (localhost, RFC-1918 ranges) are refused even under

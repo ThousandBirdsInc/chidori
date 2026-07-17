@@ -318,8 +318,8 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                 return append(this, { kind: "system", text: String(text) });
             },
             tools(list) {
-                // Mixed input: registered tool NAMES (strings, resolved against
-                // the --tools registry by the host) and import-defined tool
+                // Mixed input: tool NAMES (strings, resolved by the host
+                // against the MCP/native registry) and import-defined tool
                 // HANDLES from defineTool(). Handles contribute their schema
                 // inline; their run() functions never enter the segment (it
                 // crosses the host boundary as JSON) — the JS-side loop that
@@ -637,9 +637,11 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
 
 
     // ---- Import-defined tools: defineTool() + the in-VM function-tool loop.
-    // The standard-pattern alternative to the tools/ directory: a tool is a
-    // plain object you import (or define inline), with a `run` function that
-    // executes in the AGENT'S OWN VM. Its side effects (fetch, workspace,
+    // A tool is merely a function with a documented signature: defineTool()
+    // pairs a `run` function with the `name`/`description`/`parameters` the
+    // model reads to call it. The result is a plain object you import (or
+    // define inline) — no tools/ directory, no registry. The `run` function
+    // executes in the AGENT'S OWN VM, so its side effects (fetch, workspace,
     // node:fs, ...) are the captured effects every agent already has, so
     // journaling and deterministic replay come for free; each model turn of
     // the loop is a durable respond() call, and each tool invocation is
@@ -1132,42 +1134,6 @@ pub(crate) const FETCH_POLYFILL: &str = r#"
     globalThis.Request = Request;
     globalThis.Response = Response;
 })();
-"#;
-
-pub(crate) const URL_SEARCH_PARAMS_POLYFILL: &str = r#"
-globalThis.URLSearchParams = class URLSearchParams {
-    constructor(init) {
-        this._p = [];
-        if (typeof init === "string") {
-            const s = init.charAt(0) === "?" ? init.slice(1) : init;
-            if (s.length) {
-                for (const pair of s.split("&")) {
-                    const i = pair.indexOf("=");
-                    const k = i === -1 ? pair : pair.slice(0, i);
-                    const v = i === -1 ? "" : pair.slice(i + 1);
-                    this._p.push([decodeURIComponent(k), decodeURIComponent(v.replace(/\+/g, " "))]);
-                }
-            }
-        } else if (init && typeof init === "object") {
-            const entries = typeof init.forEach === "function" && !Array.isArray(init)
-                ? Array.from(init)
-                : (Array.isArray(init) ? init : Object.entries(init));
-            for (const [k, v] of entries) this._p.push([String(k), String(v)]);
-        }
-    }
-    append(k, v) { this._p.push([String(k), String(v)]); }
-    set(k, v) { this.delete(k); this._p.push([String(k), String(v)]); }
-    get(k) { const e = this._p.find((p) => p[0] === k); return e ? e[1] : null; }
-    getAll(k) { return this._p.filter((p) => p[0] === k).map((p) => p[1]); }
-    has(k) { return this._p.some((p) => p[0] === k); }
-    delete(k) { this._p = this._p.filter((p) => p[0] !== k); }
-    forEach(cb) { for (const [k, v] of this._p) cb(v, k, this); }
-    toString() {
-        return this._p
-            .map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v))
-            .join("&");
-    }
-};
 "#;
 
 /// Virtual timer queue: deterministic, driven by the logical clock. Timers fire
