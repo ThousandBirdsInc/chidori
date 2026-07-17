@@ -54,7 +54,17 @@ and neither can pull the unrelated package:
 
    ```bash
    ./scripts/check-sdk-versions.sh X.Y.Z
+   ./scripts/check-npm-drift.sh
    ```
+
+   The second script guards the skip-if-published behavior below: because a
+   version already on npm is never re-published, **any change to
+   `sdk/typescript` that ships to users requires a version bump** — otherwise
+   the npm package silently stays stale at the old contents (this is how the
+   published 3.6.0 ended up missing the 3.6.0 runtime's `defineTool` types).
+   The script fails when the tree drifts from the published tarball of the
+   same version; CI runs it on every PR and the release workflow re-checks it
+   before deciding to skip.
 
 3. Commit, merge to `main`, then tag and push:
 

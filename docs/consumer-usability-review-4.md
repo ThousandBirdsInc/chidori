@@ -101,6 +101,15 @@ editor-types layout is a trap laid for every monorepo consumer. Skip the
 unsupported dep with a warning (the way unresolvable `optionalDependencies`
 already are) instead of halting the world.
 
+> **Follow-up (same day):** fixed. Manifest deps in unsupported forms
+> (`file:`, `git:`, `link:`, `workspace:`, `npm:`, URL) are now skipped
+> per-dependency with a warning: `add`/`install`/`remove` proceed for
+> everything else, package.json keeps the entry verbatim, and a
+> `node_modules` entry another tool materialized for it is exempt from
+> pruning. Explicitly `chidori add`ing an unsupported form is still a hard
+> error. Covered by `unsupported_manifest_deps_are_skipped_per_dependency`
+> in `tests/pkg_install.rs`.
+
 ## Finding 2: npm `@1kbirds/chidori@3.6.0` is not SDK 3.6.0
 
 Having been forced off the `file:` dep, I did the natural thing:
@@ -126,6 +135,17 @@ Version-bump discipline (or CI that diffs the published `.d.ts` against the
 source tree at release time) would make this impossible. Workaround used
 here: a tsconfig `paths` override to the in-repo SDK source — available
 only to someone who has the repo cloned.
+
+> **Follow-up (same day):** root-caused and guarded. The release workflow
+> skips any version already on its registry, so SDK changes that land
+> without a version bump silently never publish — that is how npm 3.6.0
+> went stale. Fixed by (a) bumping the version train to 3.6.1 so the
+> current types actually ship on the next tag, and (b) a new
+> `scripts/check-npm-drift.sh` that fails CI and the release workflow
+> whenever the tree differs from the npm-published tarball of the same
+> version (run it locally before tagging too — see docs/releasing.md).
+> Verified: at 3.6.0 the script reproduces this exact finding; at 3.6.1 it
+> passes.
 
 ## Finding 3: the compatibility cliffs are four, not three — and the fourth is invisible until runtime
 

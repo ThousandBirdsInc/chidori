@@ -10,7 +10,7 @@
 //! carries enough (exact versions, edges, tarball URLs, integrity) to rebuild
 //! the tree from the store alone.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Instant;
 
@@ -21,12 +21,56 @@ use super::layout::{chain_to_path, plan_layout, LayoutPlan};
 use super::lockfile::{Lockfile, LOCKFILE_NAME};
 use super::manifest::Manifest;
 use super::registry::{validate_package_name, RegistryClient};
-use super::resolve::{resolve, Resolution};
+use super::resolve::{resolve, unsupported_spec_kind, Resolution};
 use super::store::{Integrity, PackageStore};
 
 /// Concurrent tarball downloads. Hashing/extraction runs on the blocking
 /// pool, so this only bounds network fan-out.
 const DOWNLOAD_CONCURRENCY: usize = 8;
+
+/// Manifest dependencies split into the registry-resolvable set and the
+/// forms chidori's package manager cannot manage (`file:`, `git:`, …).
+struct RootDeps {
+    supported: BTreeMap<String, String>,
+    /// (name, spec, kind) of every skipped manifest dependency.
+    skipped: Vec<(String, String, &'static str)>,
+}
+
+/// Partition manifest deps and warn once per skipped entry. Skipped deps are
+/// per-dependency: they stay in package.json untouched, their `node_modules`
+/// entries are exempt from pruning, and everything else proceeds — one
+/// `file:` line must not block the whole project.
+fn partition_root_deps(deps: BTreeMap<String, String>) -> RootDeps {
+    let mut supported = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for (name, spec) in deps {
+        match unsupported_spec_kind(&spec) {
+            Some(kind) => skipped.push((name, spec, kind)),
+            None => {
+                supported.insert(name, spec);
+            }
+        }
+    }
+    for (name, spec, kind) in &skipped {
+        eprintln!(
+            "warning: skipping `{name}@{spec}`: {kind} dependencies are not managed by \
+             chidori's package manager; package.json and any existing node_modules/{name} \
+             are left untouched"
+        );
+    }
+    RootDeps { supported, skipped }
+}
+
+/// Top-level `node_modules` names pruning must leave alone: skipped deps may
+/// have been materialized by another tool (npm/bun symlinks or copies).
+fn keep_names(roots: &RootDeps) -> BTreeSet<String> {
+    roots
+        .skipped
+        .iter()
+        .filter(|(name, _, _)| !roots.supported.contains_key(name))
+        .map(|(name, _, _)| name.clone())
+        .collect()
+}
 
 /// `chidori add <spec>... [--dev]`
 pub fn cmd_add(dir: &Path, specs: &[String], dev: bool) -> Result<()> {
@@ -41,15 +85,26 @@ pub fn cmd_add(dir: &Path, specs: &[String], dev: bool) -> Result<()> {
         .iter()
         .map(|s| parse_add_spec(s))
         .collect::<Result<_>>()?;
+    // Asking for an unsupported form by name is still a hard error — only
+    // *pre-existing* manifest entries are skipped leniently.
+    for (name, range) in &requested {
+        if let Some(kind) = range.as_deref().and_then(unsupported_spec_kind) {
+            bail!(
+                "`{name}@{}`: {kind} dependencies are not supported by chidori's package manager",
+                range.as_deref().unwrap_or_default()
+            );
+        }
+    }
 
     // Root set = current manifest deps + the new specs (range or `latest`).
-    let mut root_deps = manifest.all_dependencies();
+    let mut roots = partition_root_deps(manifest.all_dependencies());
     for (name, range) in &requested {
-        root_deps.insert(
+        roots.supported.insert(
             name.clone(),
             range.clone().unwrap_or_else(|| "latest".to_string()),
         );
     }
+    let root_deps = roots.supported.clone();
 
     let registry = RegistryClient::from_env()?;
     let preferred = preferred_versions(lockfile.as_ref());
@@ -76,7 +131,7 @@ pub fn cmd_add(dir: &Path, specs: &[String], dev: bool) -> Result<()> {
     );
     lockfile.save(&dir.join(LOCKFILE_NAME))?;
 
-    let stats = sync_tree(dir, &resolution, Some(&registry))?;
+    let stats = sync_tree(dir, &resolution, Some(&registry), &keep_names(&roots))?;
     for (name, _) in &requested {
         let version = &resolution.roots[name];
         println!("+ {name}@{version}");
@@ -108,6 +163,7 @@ pub fn cmd_install(dir: &Path, frozen: bool) -> Result<()> {
         return Ok(());
     }
 
+    let roots = partition_root_deps(manifest.all_dependencies());
     let (resolution, registry) = match &lockfile {
         Some(lock) if lock.matches_manifest(&deps, &dev_deps) => {
             // In sync: no resolution needed; network only for store misses.
@@ -119,17 +175,15 @@ pub fn cmd_install(dir: &Path, frozen: bool) -> Result<()> {
         None if frozen => bail!("--frozen requires an existing {LOCKFILE_NAME}"),
         _ => {
             let registry = RegistryClient::from_env()?;
-            let mut root_deps = deps.clone();
-            root_deps.extend(dev_deps.clone());
             let preferred = preferred_versions(lockfile.as_ref());
-            let resolution = block_on(resolve(&registry, &root_deps, &preferred))?;
+            let resolution = block_on(resolve(&registry, &roots.supported, &preferred))?;
             Lockfile::from_resolution(&resolution, deps, dev_deps)
                 .save(&dir.join(LOCKFILE_NAME))?;
             (resolution, Some(registry))
         }
     };
 
-    let stats = sync_tree(dir, &resolution, registry.as_ref())?;
+    let stats = sync_tree(dir, &resolution, registry.as_ref(), &keep_names(&roots))?;
     report(&resolution, &stats, started);
     Ok(())
 }
@@ -150,6 +204,7 @@ pub fn cmd_remove(dir: &Path, names: &[String]) -> Result<()> {
     manifest.save()?;
     let deps = manifest.dependencies();
     let dev_deps = manifest.dev_dependencies();
+    let roots = partition_root_deps(manifest.all_dependencies());
 
     // Prefer the offline path: shrink the existing lockfile graph to what's
     // still reachable from the remaining roots.
@@ -169,14 +224,12 @@ pub fn cmd_remove(dir: &Path, names: &[String]) -> Result<()> {
         _ => {
             // Lockfile absent or drifted: re-resolve what's left.
             let registry = RegistryClient::from_env()?;
-            let mut root_deps = deps.clone();
-            root_deps.extend(dev_deps.clone());
-            block_on(resolve(&registry, &root_deps, &HashMap::new()))?
+            block_on(resolve(&registry, &roots.supported, &HashMap::new()))?
         }
     };
 
     Lockfile::from_resolution(&resolution, deps, dev_deps).save(&dir.join(LOCKFILE_NAME))?;
-    let stats = sync_tree(dir, &resolution, None)?;
+    let stats = sync_tree(dir, &resolution, None, &keep_names(&roots))?;
     for name in names {
         println!("- {name}");
     }
@@ -218,11 +271,14 @@ pub struct SyncStats {
     pub pruned: usize,
 }
 
-/// Make `node_modules` match the resolution exactly.
+/// Make `node_modules` match the resolution exactly — except `keep`:
+/// top-level entries for manifest deps chidori doesn't manage (`file:`,
+/// `git:`, …), which pruning leaves alone.
 fn sync_tree(
     dir: &Path,
     resolution: &Resolution,
     registry: Option<&RegistryClient>,
+    keep: &BTreeSet<String>,
 ) -> Result<SyncStats> {
     let plan = plan_layout(resolution)?;
     let store = PackageStore::from_env()?;
@@ -307,9 +363,9 @@ fn sync_tree(
         linked += 1;
     }
 
-    // Phase 3: prune everything the plan doesn't claim.
+    // Phase 3: prune everything the plan doesn't claim (minus `keep`).
     let mut pruned = 0usize;
-    prune_extraneous(&dir.join("node_modules"), &[], &plan, &mut pruned)?;
+    prune_extraneous(&dir.join("node_modules"), &[], &plan, keep, &mut pruned)?;
 
     Ok(SyncStats {
         installed: plan.len(),
@@ -334,11 +390,13 @@ fn installed_version_matches(dest: &Path, name: &str, version: &str) -> bool {
 
 /// Remove package directories under `nm_dir` that the plan doesn't place.
 /// Recurses through planned packages' nested `node_modules`. Non-directory
-/// entries (e.g. stray files) are left alone.
+/// entries (e.g. stray files, npm's `file:` symlinks) are left alone, as are
+/// top-level names in `keep` (unmanaged manifest deps).
 fn prune_extraneous(
     nm_dir: &Path,
     prefix: &[String],
     plan: &LayoutPlan,
+    keep: &BTreeSet<String>,
     pruned: &mut usize,
 ) -> Result<()> {
     if !nm_dir.is_dir() {
@@ -358,14 +416,14 @@ fn prune_extraneous(
                     continue;
                 }
                 let full = format!("{dir_name}/{}", sub.file_name().to_string_lossy());
-                prune_one(&sub.path(), &full, prefix, plan, pruned)?;
+                prune_one(&sub.path(), &full, prefix, plan, keep, pruned)?;
             }
             // Drop the scope dir once emptied.
             if std::fs::read_dir(entry.path())?.next().is_none() {
                 std::fs::remove_dir(entry.path())?;
             }
         } else {
-            prune_one(&entry.path(), &dir_name, prefix, plan, pruned)?;
+            prune_one(&entry.path(), &dir_name, prefix, plan, keep, pruned)?;
         }
     }
     Ok(())
@@ -376,12 +434,16 @@ fn prune_one(
     name: &str,
     prefix: &[String],
     plan: &LayoutPlan,
+    keep: &BTreeSet<String>,
     pruned: &mut usize,
 ) -> Result<()> {
+    if prefix.is_empty() && keep.contains(name) {
+        return Ok(());
+    }
     let mut chain = prefix.to_vec();
     chain.push(name.to_string());
     if plan.contains_key(&chain) {
-        prune_extraneous(&path.join("node_modules"), &chain, plan, pruned)
+        prune_extraneous(&path.join("node_modules"), &chain, plan, keep, pruned)
     } else {
         std::fs::remove_dir_all(path).with_context(|| format!("pruning {}", path.display()))?;
         *pruned += 1;

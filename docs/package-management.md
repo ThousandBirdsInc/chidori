@@ -140,8 +140,12 @@ definitive answer, since the module graph resolves eagerly.
   chidori's sandbox posture.
 - **`node_modules/.bin` linking** — chidori doesn't execute package binaries;
   there's no Node process to run them.
-- **git / file / workspace / `npm:` alias dependencies** — rejected with a
-  clear error rather than half-supported.
+- **git / file / workspace / `npm:` alias dependencies** — not resolvable
+  from the registry. Explicitly `chidori add`ing one is a clear error.
+  *Pre-existing* manifest entries in these forms are skipped per-dependency
+  with a warning instead of blocking the project: `add`/`install`/`remove`
+  proceed for everything else, package.json keeps the entry verbatim, and a
+  `node_modules` entry another tool materialized for it is never pruned.
 - **Full CommonJS emulation (`require`)** — would need a synchronous module
   linker path in the engine; revisit if real agent dependencies demand it.
 - **Auto-installed peer dependencies** — warned instead; install explicitly.

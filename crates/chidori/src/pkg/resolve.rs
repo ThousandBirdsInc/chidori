@@ -43,16 +43,14 @@ pub struct Resolution {
     pub warnings: Vec<String>,
 }
 
-/// Pick the version of `name` that satisfies `spec` from a packument.
+/// Dependency spec forms the registry cannot serve (`file:`, `git:`,
+/// `workspace:`, …). Returns the human-readable kind when `spec` is one.
 ///
-/// `spec` may be a semver range (`^1.2.3`, `1.x`, `>=2 <3 || 4.x`, …) or a
-/// dist-tag (`latest`, `beta`). `preferred` versions win when they satisfy.
-fn select_version<'p>(
-    name: &str,
-    spec: &str,
-    packument: &'p super::registry::Packument,
-    preferred: &BTreeSet<String>,
-) -> Result<&'p PackageVersion> {
+/// Callers decide the policy: manifest-level deps in these forms are
+/// *skipped per-dependency* with a warning (one `file:` line must not brick
+/// `add`/`install`/`remove` for the whole project), while an explicitly
+/// requested `chidori add name@file:…` is still a hard error.
+pub fn unsupported_spec_kind(spec: &str) -> Option<&'static str> {
     let spec = spec.trim();
     for (prefix, kind) in [
         ("git+", "git"),
@@ -66,8 +64,27 @@ fn select_version<'p>(
         ("https://", "url"),
     ] {
         if spec.starts_with(prefix) {
-            bail!("`{name}@{spec}`: {kind} dependencies are not supported by chidori's package manager");
+            return Some(kind);
         }
+    }
+    None
+}
+
+/// Pick the version of `name` that satisfies `spec` from a packument.
+///
+/// `spec` may be a semver range (`^1.2.3`, `1.x`, `>=2 <3 || 4.x`, …) or a
+/// dist-tag (`latest`, `beta`). `preferred` versions win when they satisfy.
+fn select_version<'p>(
+    name: &str,
+    spec: &str,
+    packument: &'p super::registry::Packument,
+    preferred: &BTreeSet<String>,
+) -> Result<&'p PackageVersion> {
+    let spec = spec.trim();
+    if let Some(kind) = unsupported_spec_kind(spec) {
+        bail!(
+            "`{name}@{spec}`: {kind} dependencies are not supported by chidori's package manager"
+        );
     }
 
     let range: Option<Range> = if spec.is_empty() {
