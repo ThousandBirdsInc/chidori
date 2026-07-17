@@ -514,6 +514,7 @@ impl Engine {
     /// Host function calls whose sequence numbers match the replay log
     /// return cached results instantly. Calls past the end of the log
     /// execute normally. The returned call log is the full merged log.
+    #[allow(dead_code)] // Lib-facade entry point; the bin target's resume path uses `resume_run`.
     pub fn run_with_replay(
         &self,
         path: &Path,

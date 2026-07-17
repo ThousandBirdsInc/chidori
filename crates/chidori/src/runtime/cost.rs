@@ -176,6 +176,7 @@ pub fn is_priced_model(model: &str) -> bool {
 
 /// Estimate USD cost for a single LLM call. Returns 0.0 for unknown models
 /// (check [`is_priced_model`] before presenting that as a real price).
+#[allow(dead_code)] // Lib-facade convenience; the bin target's callers all use the cache-aware variant.
 pub fn estimate_cost_usd(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
     estimate_cost_usd_with_cache(model, input_tokens, output_tokens, 0, 0)
 }
