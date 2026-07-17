@@ -23,10 +23,12 @@ same budget), hence the generous budgets on each prompt.
 
 ## Setup
 
-`data/gitlog.txt` ships with a 50-commit snapshot of this repository. To
-point the desk at another repo (or refresh the window):
+The desk reads its input from `data/gitlog.txt` — a `git log --numstat` dump
+of whatever repo you want release notes for. Generate one (from this repo, or
+point `-C` at any other):
 
 ```bash
+mkdir -p data
 git -C /path/to/repo log --date=short --numstat \
   --pretty=format:'COMMIT %h%nDATE %ad%nSUBJECT %s%nBODY%n%b%nFILES' -60 \
   > data/gitlog.txt
