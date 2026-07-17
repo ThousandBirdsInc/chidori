@@ -81,6 +81,13 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Skipping an already-published version is only safe if that publish
+      # matches this tree. Otherwise the SDK changed without a version bump
+      # and the "skip" would silently strand users on stale contents.
+      - name: Fail if the published tarball drifted from this tree
+        if: steps.check.outputs.published == 'true'
+        run: SKIP_BUILD=1 ../../scripts/check-npm-drift.sh
+
       - name: Publish (dry run)
         if: github.event_name == 'workflow_dispatch'
         run: npm publish --dry-run

@@ -54,6 +54,7 @@ fn for_each_ip(op: &mut Op, mut f: impl FnMut(&mut u32)) {
         | Op::JumpIfFalsyPeek(t)
         | Op::JumpIfTruthyPeek(t)
         | Op::JumpIfNullishPeek(t)
+        | Op::JumpIfNullishDropUnder(t)
         | Op::JumpIfNullish(t) => f(t),
         Op::CmpBranchFalse { target, .. }
         | Op::CmpBranchTrue { target, .. }

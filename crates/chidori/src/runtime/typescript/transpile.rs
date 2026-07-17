@@ -380,6 +380,31 @@ pub fn validate_imports(
     source: &str,
     policy: TypeScriptImportPolicy,
 ) -> Result<Vec<ModuleImport>> {
+    validate_imports_inner(path, source, policy, true)
+}
+
+/// Like [`validate_imports`], but tuned for describing the module graph of
+/// THIRD-PARTY files (under `node_modules`): the dynamic-import rejection is
+/// skipped there — a package's lazily-imported paths are not executed at link
+/// time, and the runtime enforces the dynamic-import policy at the moment of
+/// use — while every *static* edge still resolves strictly (an unresolvable
+/// static edge fails the engine's eager loader the same way). Project files
+/// keep the full policy.
+pub fn module_graph_imports(
+    path: &Path,
+    source: &str,
+    policy: TypeScriptImportPolicy,
+) -> Result<Vec<ModuleImport>> {
+    let third_party = path.components().any(|c| c.as_os_str() == "node_modules");
+    validate_imports_inner(path, source, policy, !third_party)
+}
+
+fn validate_imports_inner(
+    path: &Path,
+    source: &str,
+    policy: TypeScriptImportPolicy,
+    reject_dynamic_import: bool,
+) -> Result<Vec<ModuleImport>> {
     let mut imports = Vec::new();
     let project_root = path.parent().unwrap_or_else(|| Path::new("."));
 
@@ -387,7 +412,10 @@ pub fn validate_imports(
     // comment, a string literal, or an identifier ending in "import" must not
     // fail the file. If the source doesn't parse, skip the check here — the
     // transpile step reports parse errors with full diagnostics.
-    if let Some(span_start) = find_dynamic_import(path, source) {
+    if let Some(span_start) = reject_dynamic_import
+        .then(|| find_dynamic_import(path, source))
+        .flatten()
+    {
         let line_no = source[..span_start].bytes().filter(|&b| b == b'\n').count() + 1;
         anyhow::bail!(
             "{}:{}: dynamic import is disabled in durable TypeScript agents",
@@ -401,7 +429,7 @@ pub fn validate_imports(
     // legacy policies.
     let mut node_resolver: Option<Resolver> = None;
 
-    for (line_no, specifier) in import_specifiers(source) {
+    for (line_no, specifier, type_only) in import_specifiers(path, source) {
         if is_chidori_sdk_specifier(&specifier) {
             imports.push(ModuleImport {
                 specifier,
@@ -423,6 +451,13 @@ pub fn validate_imports(
                 specifier,
                 CHIDORI_AGENT_SPECIFIER,
             );
+        }
+
+        // Type-only imports/exports are erased by transpilation: no runtime
+        // edge, nothing to resolve (a types-only package need not exist on
+        // disk). The name checks above still apply.
+        if type_only {
+            continue;
         }
 
         // Vendored packages (react, react-dom/server, …) are served from the
@@ -511,17 +546,81 @@ pub fn validate_imports(
     Ok(imports)
 }
 
-fn import_specifiers(source: &str) -> Vec<(usize, String)> {
+/// One collected specifier: (line, specifier, type_only). Type-only imports
+/// are erased by transpilation — they get the name checks (legacy-SDK
+/// migration, policy) but never resolve to a module-graph edge.
+type CollectedSpecifier = (usize, String, bool);
+
+fn import_specifiers(path: &Path, source: &str) -> Vec<CollectedSpecifier> {
+    // AST first: real dist files are minified (`import"node:module";var …`),
+    // which no line scan can see. The text scan below stays as the fallback
+    // for sources oxc cannot parse — the transpile step reports those with
+    // full diagnostics anyway.
+    ast_import_specifiers(path, source).unwrap_or_else(|| text_import_specifiers(source))
+}
+
+/// Every static module-graph edge, from the AST: `import … from`, side-effect
+/// `import "x"`, `export * from`, `export {a} from`, and `export * as ns
+/// from`.
+fn ast_import_specifiers(path: &Path, source: &str) -> Option<Vec<CollectedSpecifier>> {
+    use oxc::ast::ast::Statement;
+
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.errors.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut push = |start: usize, specifier: &str, type_only: bool| {
+        let line_no = source[..start].bytes().filter(|&b| b == b'\n').count() + 1;
+        out.push((line_no, specifier.to_string(), type_only));
+    };
+    for stmt in &parsed.program.body {
+        match stmt {
+            Statement::ImportDeclaration(d) => {
+                push(
+                    d.span.start as usize,
+                    d.source.value.as_str(),
+                    d.import_kind.is_type(),
+                );
+            }
+            Statement::ExportAllDeclaration(d) => {
+                push(
+                    d.span.start as usize,
+                    d.source.value.as_str(),
+                    d.export_kind.is_type(),
+                );
+            }
+            Statement::ExportNamedDeclaration(d) => {
+                if let Some(src) = &d.source {
+                    push(
+                        d.span.start as usize,
+                        src.value.as_str(),
+                        d.export_kind.is_type(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+fn text_import_specifiers(source: &str) -> Vec<CollectedSpecifier> {
     let mut out = Vec::new();
     for (line_no, line) in source.lines().enumerate() {
         let trimmed = line.trim();
-        if !trimmed.starts_with("import ") {
-            continue;
-        }
-        if let Some(specifier) =
-            specifier_after_from(trimmed).or_else(|| side_effect_import(trimmed))
-        {
-            out.push((line_no + 1, specifier));
+        if trimmed.starts_with("import ") {
+            if let Some(specifier) =
+                specifier_after_from(trimmed).or_else(|| side_effect_import(trimmed))
+            {
+                out.push((line_no + 1, specifier, false));
+            }
+        } else if trimmed.starts_with("export ") {
+            if let Some(specifier) = specifier_after_from(trimmed) {
+                out.push((line_no + 1, specifier, false));
+            }
         }
     }
     out

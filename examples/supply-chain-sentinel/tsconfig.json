@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    // The npm-published @1kbirds/chidori@3.6.0 types lag the 3.6.0 runtime
+    // (no defineTool / chidori.util / input details) — see review round 4,
+    // Finding 2. Point at the in-repo SDK source until a fixed release ships.
+    "paths": {
+      "chidori:agent": ["../../sdk/typescript/src/agent.ts"]
+    },
+    "types": []
+  },
+  "include": [
+    "agent.ts",
+    "fast-toml.d.ts"
+  ]
+}

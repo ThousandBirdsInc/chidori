@@ -508,3 +508,58 @@ fn scoped_packages_install_under_scope_dirs() {
 
     registry.stop();
 }
+
+#[test]
+fn unsupported_manifest_deps_are_skipped_per_dependency() {
+    let registry = MockRegistry::start();
+    registry.publish("apple", "1.0.0", &[]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let _env = setup_env(&registry.base, &tmp.path().join("store"));
+
+    // A monorepo-style manifest: one file: dep (e.g. local SDK types) that
+    // another tool materialized into node_modules as a real directory.
+    std::fs::write(
+        project.join("package.json"),
+        r#"{"name":"demo","private":true,"devDependencies":{"local-types":"file:../sdk"}}"#,
+    )
+    .unwrap();
+    let local = project.join("node_modules/local-types");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(
+        local.join("package.json"),
+        r#"{"name":"local-types","version":"0.0.0"}"#,
+    )
+    .unwrap();
+
+    // add / install / remove all proceed despite the file: dep...
+    cmd_add(&project, &["apple".to_string()], false).unwrap();
+    assert_eq!(
+        installed_version(&project, "node_modules/apple").as_deref(),
+        Some("1.0.0")
+    );
+    cmd_install(&project, false).unwrap();
+    cmd_remove(&project, &["apple".to_string()]).unwrap();
+    assert!(!project.join("node_modules/apple").exists());
+
+    // ...the manifest entry survives verbatim, and the unmanaged
+    // node_modules entry is never pruned.
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(project.join("package.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["devDependencies"]["local-types"], "file:../sdk");
+    assert!(
+        project.join("node_modules/local-types").is_dir(),
+        "unmanaged file: dep must survive pruning"
+    );
+
+    // Explicitly *requesting* an unsupported form is still a hard error.
+    let err = cmd_add(&project, &["thing@file:../elsewhere".to_string()], false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("file dependencies are not supported"), "{err}");
+
+    registry.stop();
+}

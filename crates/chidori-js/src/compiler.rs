@@ -1007,6 +1007,7 @@ impl Compiler {
             | Op::JumpIfFalsyPeek(t)
             | Op::JumpIfTruthyPeek(t)
             | Op::JumpIfNullishPeek(t)
+            | Op::JumpIfNullishDropUnder(t)
             | Op::JumpIfNullish(t) => *t = target,
             Op::PushTryHandler { catch, .. } => *catch = target,
             Op::MarkDelegationHandler(t) => *t = target,
@@ -4756,7 +4757,12 @@ impl Compiler {
                 return Ok(());
             }
         }
-        // Method call: set `this` to the receiver.
+        // Method call: set `this` to the receiver. For an optional CALL
+        // (`o.m?.(…)`), the nullish test targets the looked-up METHOD while
+        // the receiver is still under it on the stack — `JumpIfNullishDropUnder`
+        // unwinds both and leaves the chain's `undefined` (the old emit tested
+        // after the Swap, i.e. the receiver, so `o.m?.()` with a missing `m`
+        // threw instead of short-circuiting — the zod v4 issue-formatting bug).
         match &c.callee {
             Expression::StaticMemberExpression(m) => {
                 self.compile_expr(&m.object)?; // [obj]
@@ -4767,11 +4773,11 @@ impl Compiler {
                 self.emit(Op::Dup); // [obj, obj]
                 let k = self.str_const(m.property.name.as_str());
                 self.emit(Op::GetProp(k)); // [obj, func]
-                self.emit(Op::Swap); // [func, obj]
                 if c.optional {
-                    let j = self.emit(Op::JumpIfNullish(0));
+                    let j = self.emit(Op::JumpIfNullishDropUnder(0));
                     self.chain_jumps.push(j);
                 }
+                self.emit(Op::Swap); // [func, obj]
                 self.finish_call(c)?;
             }
             Expression::ComputedMemberExpression(m) => {
@@ -4782,7 +4788,11 @@ impl Compiler {
                 }
                 self.emit(Op::Dup);
                 self.compile_expr(&m.expression)?;
-                self.emit(Op::GetPropDynamic);
+                self.emit(Op::GetPropDynamic); // [obj, func]
+                if c.optional {
+                    let j = self.emit(Op::JumpIfNullishDropUnder(0));
+                    self.chain_jumps.push(j);
+                }
                 self.emit(Op::Swap);
                 self.finish_call(c)?;
             }
@@ -4792,6 +4802,12 @@ impl Compiler {
                                     // Brand-checking read: calling a private method on an object that
                                     // doesn't have it must throw a TypeError (not silently read undefined).
                 self.emit_private_get_op(m.field.name.as_str())?; // [obj, method]
+                if c.optional {
+                    // `o.#m?.()`: the brand check passed but the field may
+                    // hold a nullish value.
+                    let j = self.emit(Op::JumpIfNullishDropUnder(0));
+                    self.chain_jumps.push(j);
+                }
                 self.emit(Op::Swap); // [method, obj]
                 self.finish_call(c)?;
             }

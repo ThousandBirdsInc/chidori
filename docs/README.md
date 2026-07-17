@@ -44,6 +44,8 @@ authoritative — several document retired or superseded work:
 - [ai-sdk-gap-analysis.md](./ai-sdk-gap-analysis.md) — feature comparison vs Vercel AI SDK
 - [consumer-usability-review.md](./consumer-usability-review.md) — round 1: building a real agent on 3.6.0 (linear path)
 - [consumer-usability-review-2.md](./consumer-usability-review-2.md) — round 2: the multi-agent surface (actors, branches, detached agents) under failure
+- [consumer-usability-review-3.md](./consumer-usability-review-3.md) — round 3: the everyday-agent surface as a daily driver
+- [consumer-usability-review-4.md](./consumer-usability-review-4.md) — round 4: the day-2 surface (npm packages, durable store, hydration, time travel, `verify`)
 - [branching-execution.md](./branching-execution.md) — also doubles as the branching design record
 - [rust-style-guide.md](./rust-style-guide.md) — contributor conventions
 - [releasing.md](./releasing.md) — release train and versioning

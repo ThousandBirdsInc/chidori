@@ -6318,6 +6318,19 @@ impl Vm {
                 }
                 frame.stack.pop();
             }
+            Op::JumpIfNullishDropUnder(t) => {
+                // [receiver, func] with func on top: a nullish method in an
+                // optional call (`o.m?.()`) short-circuits the whole chain to
+                // `undefined`, unwinding the receiver too.
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if v.is_nullish() {
+                    frame.stack.pop();
+                    if let Some(top) = frame.stack.last_mut() {
+                        *top = Value::Undefined;
+                    }
+                    return Ok(Ctl::Jump(*t as usize));
+                }
+            }
 
             // ---- exceptions ----
             Op::Throw => {

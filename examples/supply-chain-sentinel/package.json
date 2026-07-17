@@ -1,0 +1,12 @@
+{
+  "dependencies": {
+    "fast-toml": "^0.5.4",
+    "valibot": "^1.4.2"
+  },
+  "description": "Chidori consumer demo: live dependency auditor exercising the day-2 surface — npm packages, durable run store, hydration, time travel (see docs/consumer-usability-review-4.md)",
+  "devDependencies": {
+    "@1kbirds/chidori": "^3.6.0"
+  },
+  "name": "supply-chain-sentinel",
+  "private": true
+}
