@@ -65,6 +65,10 @@ pub struct Engine {
 pub struct RunResult {
     pub output: Value,
     pub call_log: CallLog,
+    /// How many of `call_log`'s records were served from the replay journal
+    /// rather than executed live — the audited replay/re-execution split a
+    /// resume reports to the consumer.
+    pub replayed_calls: u64,
     #[allow(dead_code)]
     pub run_id: String,
     /// Set when the agent called `input()` in Pause mode. The caller should
@@ -483,7 +487,7 @@ impl Engine {
         if path.extension().and_then(|e| e.to_str()) == Some("ts") {
             let run_id = "check";
             let policy = crate::runtime::snapshot::RuntimePolicy::from_env_for_durable_run(run_id)?;
-            crate::runtime::typescript::check::check_typescript_file(path, &policy)?;
+            crate::runtime::typescript::check::check_agent_file(path, &policy)?;
             return Ok(());
         }
 
@@ -948,6 +952,7 @@ impl Engine {
                     return Some(RunResult {
                         output: Value::Null,
                         call_log: ctx.call_log(),
+                        replayed_calls: ctx.replay_hit_count(),
                         run_id: ctx.run_id(),
                         paused: Some(pending),
                         paused_approval: None,
@@ -962,6 +967,7 @@ impl Engine {
                     return Some(RunResult {
                         output: Value::Null,
                         call_log: ctx.call_log(),
+                        replayed_calls: ctx.replay_hit_count(),
                         run_id: ctx.run_id(),
                         paused: None,
                         paused_approval: Some(approval),
@@ -979,6 +985,7 @@ impl Engine {
                     return Some(RunResult {
                         output: Value::Null,
                         call_log: ctx.call_log(),
+                        replayed_calls: ctx.replay_hit_count(),
                         run_id: ctx.run_id(),
                         paused: None,
                         paused_approval: None,
@@ -1024,6 +1031,7 @@ impl Engine {
                     Ok(RunResult {
                         output,
                         call_log: ctx.call_log(),
+                        replayed_calls: ctx.replay_hit_count(),
                         run_id: ctx.run_id(),
                         paused: None,
                         paused_approval: None,
@@ -1199,7 +1207,7 @@ mod tests {
             r#"
                 import type { Chidori } from "chidori:agent";
                 export async function agent(input: { name: string }, chidori: Chidori) {
-                    await chidori.log("starting");
+                    await chidori.log("starting", { who: input.name, attempt: 1 });
                     return { greeting: "Hello, " + input.name };
                 }
             "#,
@@ -1222,6 +1230,14 @@ mod tests {
         let records = result.call_log.into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].function, "log");
+        // The structured fields object must reach the journal — the binding
+        // used to silently forward only the message.
+        assert_eq!(
+            records[0].args.get("fields"),
+            Some(&serde_json::json!({ "who": "TypeScript", "attempt": 1 })),
+            "log fields are journaled: {:?}",
+            records[0].args
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1790,240 +1806,6 @@ mod tests {
         let usage = checkpoint[0].token_usage.as_ref().unwrap();
         assert_eq!(usage.input_tokens, 7);
         assert_eq!(usage.output_tokens, 11);
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn engine_tool_completion_safepoint_persists_tool_result_record() {
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-tool-completion-safepoint-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        let tool_path = dir.join("echo.ts");
-        std::fs::write(
-            &path,
-            r#"
-                export async function agent(input, chidori) {
-                    await chidori.tool("echo", { value: input.value });
-                    throw new Error("after tool result");
-                }
-            "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &tool_path,
-            r#"
-                export const tool = {
-                  name: "echo",
-                  description: "Echo a value",
-                  parameters: {
-                    type: "object",
-                    properties: { value: { type: "number" } },
-                    required: ["value"],
-                  },
-                };
-
-                export async function run(args, chidori) {
-                  return { value: args.value + 1 };
-                }
-            "#,
-        )
-        .unwrap();
-        let mut registry = ToolRegistry::new();
-        registry.register(crate::tools::ToolDef {
-            name: "echo".to_string(),
-            description: "Echo a value".to_string(),
-            params: Vec::new(),
-            source_path: tool_path,
-            source_fingerprint: None,
-            backend: crate::tools::ToolBackend::TypeScript,
-        });
-        let run_base = dir.join(".chidori").join("runs");
-        let engine = Engine::new(
-            Arc::new(ProviderRegistry::new()),
-            Arc::new(TemplateEngine::new(&dir)),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
-        )
-        .with_tools(Arc::new(registry))
-        .with_persist_base(run_base.clone());
-
-        let err = match engine.run(&path, &serde_json::json!({ "value": 41 })) {
-            Ok(_) => panic!("expected JavaScript error after tool result"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("after tool result"),
-            "unexpected error: {err}"
-        );
-
-        let run_dir = std::fs::read_dir(&run_base)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let loaded = SnapshotStore::new(run_dir).load().unwrap();
-        assert_eq!(loaded.manifest.call_log_len, 1);
-        assert!(loaded.manifest.pending.is_none());
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
-        assert_eq!(
-            loaded.manifest.host_promises[0].operation.kind,
-            crate::runtime::snapshot::PendingHostOperationKind::Tool
-        );
-        match &loaded.manifest.host_promises[0].state {
-            crate::runtime::snapshot::HostPromiseState::Resolved { value, .. } => {
-                assert_eq!(value, &serde_json::json!({ "value": 42 }));
-            }
-            other => panic!("expected resolved tool host promise, got {other:?}"),
-        }
-        assert!(!loaded.blob.is_empty());
-        let checkpoint: Vec<CallRecord> = serde_json::from_slice(
-            &std::fs::read(
-                run_base
-                    .join(&loaded.manifest.run_id)
-                    .join("checkpoint.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(checkpoint.len(), 1);
-        assert_eq!(checkpoint[0].function, "tool");
-        assert_eq!(checkpoint[0].args["name"], serde_json::json!("echo"));
-        assert_eq!(
-            checkpoint[0].args["kwargs"],
-            serde_json::json!({ "value": 41 })
-        );
-        assert_eq!(checkpoint[0].result, serde_json::json!({ "value": 42 }));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn engine_tool_pause_persists_inner_pending_operation_and_outer_tool_promise() {
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-tool-pause-snapshot-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        let tool_path = dir.join("ask.ts");
-        std::fs::write(
-            &path,
-            r#"
-                export async function agent(input, chidori) {
-                    return await chidori.tool("ask", { prompt: input.prompt });
-                }
-            "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &tool_path,
-            r#"
-                export const tool = {
-                  name: "ask",
-                  description: "Ask for input",
-                  parameters: {
-                    type: "object",
-                    properties: { prompt: { type: "string" } },
-                    required: ["prompt"],
-                  },
-                };
-
-                export async function run(args, chidori) {
-                  const answer = await chidori.input(args.prompt);
-                  return { answer };
-                }
-            "#,
-        )
-        .unwrap();
-        let mut registry = ToolRegistry::new();
-        registry.register(crate::tools::ToolDef {
-            name: "ask".to_string(),
-            description: "Ask for input".to_string(),
-            params: Vec::new(),
-            source_path: tool_path,
-            source_fingerprint: None,
-            backend: crate::tools::ToolBackend::TypeScript,
-        });
-        let run_base = dir.join(".chidori").join("runs");
-        let engine = Engine::new(
-            Arc::new(ProviderRegistry::new()),
-            Arc::new(TemplateEngine::new(&dir)),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
-        )
-        .with_tools(Arc::new(registry))
-        .with_persist_base(run_base.clone());
-
-        let paused = engine
-            .run_pausable(&path, &serde_json::json!({ "prompt": "Continue?" }))
-            .unwrap();
-        let pending_input = paused.paused.expect("expected tool input pause");
-        assert_eq!(pending_input.prompt, "Continue?");
-
-        let loaded = SnapshotStore::new(run_base.join(&paused.run_id))
-            .load()
-            .unwrap();
-        let pending = loaded.manifest.pending.as_ref().unwrap();
-        assert_eq!(
-            pending.kind,
-            crate::runtime::snapshot::PendingHostOperationKind::Input
-        );
-        assert_eq!(pending.args, serde_json::json!({ "prompt": "Continue?" }));
-        assert_eq!(loaded.manifest.host_promises.len(), 2);
-        assert!(loaded.manifest.host_promises.iter().any(|record| {
-            record.operation.kind == crate::runtime::snapshot::PendingHostOperationKind::Tool
-                && matches!(
-                    record.state,
-                    crate::runtime::snapshot::HostPromiseState::Pending
-                )
-        }));
-        assert!(loaded.manifest.host_promises.iter().any(|record| {
-            record.operation.kind == crate::runtime::snapshot::PendingHostOperationKind::Input
-                && matches!(
-                    record.state,
-                    crate::runtime::snapshot::HostPromiseState::Pending
-                )
-        }));
-        let persisted_pending: crate::runtime::snapshot::PendingHostOperation =
-            serde_json::from_slice(
-                &std::fs::read(
-                    run_base
-                        .join(&paused.run_id)
-                        .join(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            persisted_pending.kind,
-            crate::runtime::snapshot::PendingHostOperationKind::Input
-        );
-
-        let mut host_promises = loaded.manifest.host_promises.clone();
-        let input_record = host_promises
-            .iter_mut()
-            .find(|record| {
-                record.operation.kind == crate::runtime::snapshot::PendingHostOperationKind::Input
-            })
-            .expect("expected persisted input host promise");
-        input_record.state = crate::runtime::snapshot::HostPromiseState::Resolved {
-            value: serde_json::json!("yes"),
-            completed_at: chrono::Utc::now(),
-        };
-
-        let resumed = engine
-            .run_replay_pausable_with_host_promises(
-                &path,
-                &serde_json::json!({ "prompt": "Continue?" }),
-                Vec::new(),
-                host_promises,
-            )
-            .unwrap();
-        assert!(resumed.paused.is_none());
-        assert_eq!(resumed.output, serde_json::json!({ "answer": "yes" }));
 
         let _ = std::fs::remove_dir_all(dir);
     }

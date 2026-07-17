@@ -2948,6 +2948,7 @@ impl Vm {
         frame.pending_completion = None;
         frame.pending_throw = None;
         frame.pending_return = None;
+        frame.unwind_pos = None;
         frame.args.clear();
         frame.func_obj = None;
         frame.dispose_scopes.clear();
@@ -3034,6 +3035,7 @@ impl Vm {
                 handlers: Vec::new(),
                 pending_completion: None,
                 pending_throw: None,
+                unwind_pos: None,
                 pending_return: None,
                 args: Vec::new(),
                 func_obj: None,
@@ -3337,12 +3339,13 @@ impl Vm {
             // `frame.ip` already points past the Await/Yield op, so the op
             // before it is where this frame observes the throw.
             let resume_at = frame.ip.saturating_sub(1);
+            Self::park_unwind_pos(&mut frame, proto.pos_at(resume_at));
             match self.do_completion(&mut frame, Completion::Throw(e)) {
                 Ok(Ctl::Jump(t)) => frame.ip = t,
                 Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
                 Ok(_) => unreachable!("throw completion yields jump or return"),
                 Err(e) => {
-                    self.throw_pos = proto.pos_at(resume_at);
+                    self.throw_pos = frame.unwind_pos.take().or_else(|| proto.pos_at(resume_at));
                     done!(Flow::Throw(e))
                 }
             }
@@ -3461,21 +3464,32 @@ impl Vm {
                         kind: SuspendKind::GeneratorStart,
                     })
                 }
-                Err(e) => match self.do_completion(&mut frame, Completion::Throw(e)) {
-                    Ok(Ctl::Jump(t)) => {
-                        frame.ip = t;
-                        continue;
+                Err(e) => {
+                    // Remember where THIS throw originated before dispatching
+                    // it through the handler stack: a `finally` (e.g. the
+                    // iterator-close protocol of every `for-of`) parks the
+                    // completion and re-raises it from `EndFinally`, and the
+                    // frame must stay attributed to the original site. A
+                    // re-raise arrives here with the position already parked.
+                    // (A cold helper: this loop's native frame size bounds JS
+                    // recursion depth.)
+                    Self::park_unwind_pos(&mut frame, proto.pos_at(ip));
+                    match self.do_completion(&mut frame, Completion::Throw(e)) {
+                        Ok(Ctl::Jump(t)) => {
+                            frame.ip = t;
+                            continue;
+                        }
+                        Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
+                        Ok(_) => unreachable!("throw completion yields jump or return"),
+                        Err(e) => {
+                            // Unhandled: attribute the frame to the original
+                            // throw site (parked above, possibly several
+                            // finalizers ago), falling back to the op at `ip`.
+                            self.throw_pos = frame.unwind_pos.take().or_else(|| proto.pos_at(ip));
+                            done!(Flow::Throw(e))
+                        }
                     }
-                    Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
-                    Ok(_) => unreachable!("throw completion yields jump or return"),
-                    Err(e) => {
-                        // Unhandled: the op at `ip` is where the throw left
-                        // this frame — the throw site itself, or the call op
-                        // a callee's throw propagated out of.
-                        self.throw_pos = proto.pos_at(ip);
-                        done!(Flow::Throw(e))
-                    }
-                },
+                }
             }
         }
     }
@@ -3621,6 +3635,18 @@ impl Vm {
         }
     }
 
+    /// Park the source position of a freshly-raised throw on the frame (see
+    /// `Frame::unwind_pos`). Cold and never inlined: it is called from the
+    /// interpreter hot loops, whose native frame size bounds JS recursion
+    /// depth.
+    #[cold]
+    #[inline(never)]
+    fn park_unwind_pos(frame: &mut Frame, pos: Option<u32>) {
+        if frame.unwind_pos.is_none() {
+            frame.unwind_pos = pos;
+        }
+    }
+
     fn do_completion(&mut self, frame: &mut Frame, comp: Completion) -> Result<Ctl, Value> {
         let boundary = match &comp {
             Completion::Jump { boundary, .. } => *boundary as usize,
@@ -3641,6 +3667,10 @@ impl Vm {
                 if let Some(catch_ip) = h.catch_ip {
                     if !(skip_delegation && h.delegation) {
                         frame.stack.push(err.clone());
+                        // The throw is handled: drop the parked unwind
+                        // position so a later, unrelated throw is not
+                        // attributed to this one's origin.
+                        frame.unwind_pos = None;
                         return Ok(Ctl::Jump(catch_ip as usize));
                     }
                 }
@@ -4724,7 +4754,17 @@ impl Vm {
             // try-handlers — the register-mode `do_completion`.
             macro_rules! complete {
                 ($comp:expr) => {{
-                    match self.reg_do_completion(&mut frame, num_locals, $comp) {
+                    // The position rides as an argument (not a local) so the
+                    // macro's many expansions do not grow this hot frame —
+                    // 2000-deep JS recursion must exhaust the depth guard
+                    // before the native stack. `reg_do_completion` parks it
+                    // for original-site throw attribution.
+                    match self.reg_do_completion(
+                        &mut frame,
+                        num_locals,
+                        $comp,
+                        reg.pos.get(pc - 1).copied(),
+                    ) {
                         Ok(RegCtl::Jump(t)) => {
                             pc = t;
                             continue;
@@ -4733,7 +4773,10 @@ impl Vm {
                         Err(e) => {
                             // Unhandled throw: `pc` already advanced past the
                             // op that raised (or propagated) it.
-                            self.throw_pos = reg.pos.get(pc - 1).copied();
+                            self.throw_pos = frame
+                                .unwind_pos
+                                .take()
+                                .or_else(|| reg.pos.get(pc - 1).copied());
                             done!(Flow::Throw(e))
                         }
                     }
@@ -5178,7 +5221,13 @@ impl Vm {
         frame: &mut Frame,
         num_locals: usize,
         comp: Completion,
+        throw_pos: Option<u32>,
     ) -> Result<RegCtl, Value> {
+        // Original-site attribution: a `finally` may park this throw and
+        // re-raise it from a later op, so remember where it really started.
+        if frame.unwind_pos.is_none() && matches!(comp, Completion::Throw(_)) {
+            frame.unwind_pos = throw_pos;
+        }
         let boundary = match &comp {
             Completion::Jump { boundary, .. } => *boundary as usize,
             _ => 0,
@@ -5200,6 +5249,7 @@ impl Vm {
             if let Completion::Throw(err) = &comp {
                 if let Some(catch_ip) = h.catch_ip {
                     frame.locals[base] = err.clone();
+                    frame.unwind_pos = None;
                     return Ok(RegCtl::Jump(catch_ip as usize));
                 }
             }

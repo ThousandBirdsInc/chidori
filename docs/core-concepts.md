@@ -29,7 +29,7 @@ directly, so the runtime sees and records everything. See
 | `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued; `timeoutMs` resolves to a `{ timedOut: true }` sentinel after the deadline |
 | `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
 | `chidori.signal(names[], options)` | Fan-in — pass an array to pause until ANY of the named signals is delivered; the result's `name` says which fired |
-| `chidori.memory.set/get/delete/list/clear` | Persistent key-value storage, namespaced on disk |
+| `chidori.memory.set/get/delete/list/clear` | Persistent key-value storage, namespaced on disk under the agent's `.chidori/memory/` (anchored to the workspace root, like runs; `CHIDORI_MEMORY_DIR` overrides) |
 | `chidori.workspace.{list,read,write,delete,manifest}` | Shared workspace files under the run's workspace root — policy-gated, recorded like every other effect |
 | `chidori.log(msg, data)` | Structured logging |
 | `chidori.mark(label, data)` | Record a labelled trace marker in the call log (the durable *value* checkpoint is `chidori.step`) |
@@ -37,13 +37,45 @@ directly, so the runtime sees and records everything. See
 | `chidori.util.retry(fn, options)` | Retry with backoff (in-VM helper) |
 | `chidori.util.tryCall(fn)` | Capture errors without raising (in-VM helper) |
 
-**The tool loop is built in.** `chidori.prompt(text, { tools: ["hn_search"],
-maxTurns: 8 })` runs a complete provider tool-use loop — the model calls
-tools, the runtime executes them and feeds results back, up to `maxTurns` —
-and returns the final text; every inner call is journaled like any other
-effect. Hand-roll the loop with `context().respond()` / `toolResult()` only
-when you need per-step control (inspecting each call, streaming progress
-between steps, custom budgets — see
+**A tool is just a function with a documented signature.** There is no tool
+type to implement and no registry to populate — a tool is an ordinary
+function plus the `name`, `description`, and JSON-schema `parameters` that
+tell the model when and how to call it. `defineTool` staples that signature
+onto the function and hands you back a plain object you define inline or
+import from any module — no special directory, no registration step:
+
+```ts
+import { chidori, run, defineTool } from "chidori:agent";
+
+const search = defineTool({
+  name: "search_commits",
+  description: "Keyword search over the release window.",
+  parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+  run: async ({ query }) => commits.filter((c) => c.subject.includes(query)), // closures work
+});
+
+const section = await chidori.prompt("Investigate the theme.", {
+  tools: [search],
+  maxTurns: 8,
+});
+```
+
+The handle's `run` executes in the agent's own VM: closures over agent state,
+ordinary imports, and every captured effect (fetch, workspace, `node:fs`)
+work exactly as they do in the agent body — which is also what makes each
+invocation deterministic on replay. Each model turn is a durable `respond()`
+call and each invocation is journaled as a `mark("tool:<name>")` record, so
+the loop appears in `chidori trace` like any other work.
+
+**The tool loop is built in.** `chidori.prompt(text, { tools: [search],
+maxTurns: 8 })` runs a complete provider tool-use loop — the model calls tools,
+the runtime executes them and feeds results back, up to `maxTurns` — and
+returns the final text; every inner call is journaled like any other effect. A
+`tools` array may also carry string NAMES for tools sourced from outside the
+agent (MCP servers, Rust-native tools), freely mixed with `defineTool`
+handles. Hand-roll the loop with
+`context().respond()` / `toolResult()` only when you need per-step control
+(inspecting each call, streaming progress between steps, custom budgets — see
 [`examples/agents/worker.ts`](../examples/agents/worker.ts)).
 
 **Approval gates can show their artifact.** `chidori.input(prompt, { details })`
@@ -155,6 +187,6 @@ Drop to `chat.context` whenever you need the lower-level API (manual `compact`,
 loops. See [`examples/agents/conversation.ts`](../examples/agents/conversation.ts).
 
 To chat with the model directly — no agent file — run `chidori chat` (`--system`,
-`--model`, `--tools <dir>`). It is a thin REPL over `conversation()`: each turn
+`--model`). It is a thin REPL over `conversation()`: each turn
 is durable and streams its reply token-by-token, and the prior turns replay for
 free, so only your newest message reaches the provider.

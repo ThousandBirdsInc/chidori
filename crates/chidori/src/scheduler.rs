@@ -7,7 +7,6 @@
 //! schedule on a recipe simply means "no scheduling", and the scheduler
 //! skips it.
 
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
@@ -136,18 +135,9 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
         let rt = crate::scheduler::shared_tokio_runtime()?;
         let providers = deps.providers.clone();
 
-        // Build the tool registry: recipe-local dirs + default `<agent>/tools`
-        // + any MCP tools the server handed us.
-        let mut dirs: Vec<PathBuf> = recipe.tools.to_vec();
-        dirs.push(
-            agent_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("tools"),
-        );
-        let mut registry = ToolRegistry::load_from_dirs_cached(&dirs)
-            .map(|r| (*r).clone())
-            .unwrap_or_else(|_| ToolRegistry::new());
+        // The registry holds only externally-sourced tools (MCP servers the
+        // server handed us). Agent tools are defined in-VM with `defineTool`.
+        let mut registry = ToolRegistry::new();
         for def in &deps.mcp_tools {
             registry.register(def.clone());
         }

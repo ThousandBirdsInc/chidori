@@ -136,12 +136,25 @@ impl Engine {
         let chidori = self.vm.new_object();
         let d = dispatch.clone();
         self.vm
-            .define_method(&chidori, "log", 1, move |vm, _t, args| {
+            .define_method(&chidori, "log", 2, move |vm, _t, args| {
                 let msg = args
                     .first()
                     .map(|v| vm.to_string_lossy(v))
                     .unwrap_or_default();
-                forward_effect(vm, &d, "log", serde_json::json!({ "message": msg }))
+                // Forward the structured fields object too — the host side
+                // (`host_core::execute_log`) has always accepted it, but the
+                // binding used to drop everything past the message, silently
+                // losing every `chidori.log(msg, {...})` payload.
+                let fields = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let payload = if fields.is_null() {
+                    serde_json::json!({ "message": msg })
+                } else {
+                    serde_json::json!({ "message": msg, "fields": fields })
+                };
+                forward_effect(vm, &d, "log", payload)
             });
         let d = dispatch.clone();
         self.vm

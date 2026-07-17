@@ -4,19 +4,25 @@ import { chidori, run } from "chidori:agent";
  * Deterministic non-determinism — reproducible ids, clocks, and choices.
  *
  * Agents reach for non-deterministic primitives constantly: a fresh id, the
- * current time, a sampled branch. The `mint_id` tool produces both an id and a
- * timestamp; because the tool call is recorded, every replay reproduces the
- * SAME id and timestamp. That makes an agent run reproducible for audit or
- * time-travel debugging — replay sees exactly what the original run saw.
+ * current time, a sampled branch. Two runtime facts make them reproducible:
  *
- * (The Chidori runtime also has policy knobs — `date: "fixed"`,
- * `random: "seeded"` — that make Date.now()/Math.random() deterministic without
- * a tool. This example uses an explicit tool so the recorded value is obvious in
- * the call log.)
+ *   1. Policy knobs (`date: "fixed"`, `random: "seeded"`) make Date.now() and
+ *      Math.random() deterministic, so the same code yields the same values on
+ *      every replay.
+ *   2. `chidori.step(name, fn)` records the computed value into the durable
+ *      call log and serves it verbatim on replay — so the minted id is obvious
+ *      in `chidori trace` and never recomputed on resume.
+ *
+ * Replay sees exactly what the original run saw — reproducible for audit or
+ * time-travel debugging.
  */
 run(async (input: { prefix?: string }) => {
-  const minted = await chidori.tool<{ prefix: string }, { id: string; epochMs: number }>("mint_id", {
-    prefix: input.prefix ?? "run",
+  const prefix = input.prefix ?? "run";
+
+  const minted = await chidori.step("mint_id", () => {
+    const epochMs = Date.now();
+    const rand = Math.floor(Math.random() * 1e9).toString(36);
+    return { id: `${prefix}-${epochMs}-${rand}`, epochMs };
   });
 
   // Derive a deterministic branch from the recorded id so the choice replays too.

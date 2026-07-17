@@ -155,6 +155,14 @@ class Session:
     # to the human and later call `client.resume(session.id, response)`.
     pending_seq: int | None = None
     pending_prompt: str | None = None
+    # The artifact under review for an `input()` pause created with
+    # `{ details }` (a draft, a diff) — surface it so a human never
+    # approves blind. None when the pause carries no details.
+    pending_details: str | None = None
+    # The durable run directory id (`.chidori/runs/<run_id>`) this session
+    # journals into. Deliberately distinct from the session id: `chidori
+    # resume <agent.ts> <run_id>` and `chidori trace <run_id>` take THIS id.
+    run_id: str | None = None
     # When the run is `paused` at a `chidori.signal(name)` listen point, the
     # name it is waiting on (so the caller can deliver via `client.signal`).
     # None for plain `input()` pauses and non-signal states.
@@ -285,6 +293,8 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            pending_details=data.get("pending_details"),
+            run_id=data.get("run_id"),
             pending_signal_name=data.get("pending_signal_name"),
             pending_signal_names=data.get("pending_signal_names") or [],
             pending_signal_deadline=data.get("pending_signal_deadline"),
@@ -314,6 +324,8 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            pending_details=data.get("pending_details"),
+            run_id=data.get("run_id"),
             pending_signal_name=data.get("pending_signal_name"),
             pending_signal_names=data.get("pending_signal_names") or [],
             pending_signal_deadline=data.get("pending_signal_deadline"),
@@ -336,6 +348,8 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            pending_details=data.get("pending_details"),
+            run_id=data.get("run_id"),
             pending_signal_name=data.get("pending_signal_name"),
             pending_signal_names=data.get("pending_signal_names") or [],
             pending_signal_deadline=data.get("pending_signal_deadline"),
@@ -385,6 +399,8 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            pending_details=data.get("pending_details"),
+            run_id=data.get("run_id"),
             pending_signal_name=data.get("pending_signal_name"),
             pending_signal_names=data.get("pending_signal_names") or [],
             pending_signal_deadline=data.get("pending_signal_deadline"),
@@ -403,6 +419,8 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            pending_details=data.get("pending_details"),
+            run_id=data.get("run_id"),
             pending_signal_name=data.get("pending_signal_name"),
             pending_signal_names=data.get("pending_signal_names") or [],
             pending_signal_deadline=data.get("pending_signal_deadline"),

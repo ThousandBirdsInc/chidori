@@ -33,6 +33,9 @@
 **/.chidori/wasm-cache/
 **/.chidori/memory/
 **/.chidori/sessions.sqlite3*
+# Workspace file store (chidori.workspace.write) + its generation manifest
+**/.generation/
+examples/*/RELEASE_NOTES.md
 
 # Python build/dist
 __pycache__/

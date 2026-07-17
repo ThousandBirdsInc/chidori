@@ -34,8 +34,6 @@ pub struct Recipe {
     pub inputs: Value,
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
-    pub tools: Vec<PathBuf>,
 }
 
 impl Recipe {

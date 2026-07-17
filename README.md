@@ -245,7 +245,7 @@ scripts, or in CI — where there is no terminal to ask at, so gated effects
 fail closed — pass `--trusted`:
 
 ```bash
-chidori run my_agent.ts --trusted --tools tools
+chidori run my_agent.ts --trusted
 ```
 
 Re-run the same agent with `chidori resume summarizer.ts <run_id>` to replay it
@@ -253,7 +253,7 @@ byte-for-byte with zero model calls (the run id is printed when the run
 starts, and lives under `.chidori/runs/`). The run's model travels with it —
 a `--model deepseek-chat` run resumes under `deepseek-chat` with no extra
 flags — and crash recovery of a trusted, tool-using run mirrors `run`'s
-flags: `chidori resume my_agent.ts <run_id> --trusted --tools tools`.
+flags: `chidori resume my_agent.ts <run_id> --trusted`.
 
 ### 4. Try the bundled examples
 
@@ -272,12 +272,12 @@ so they run with zero setup:
 ```bash
 chidori run examples/agents/hello.ts --input name=Colton  # no LLM calls
 chidori run examples/agents/tool_use.ts \
-  --input query=chidori --tools examples/tools            # local TS tool, no LLM
+  --input query=chidori                                   # defineTool, no LLM
 ```
 
-(The tool call in the second example is a gated effect: approve it at the
-prompt, or add `--trusted` to skip the ask — see
-[Running modes](./docs/running-modes.md).)
+(The second example defines its tool inline with `defineTool` and calls it —
+no directory, no `--tools`. See [Running modes](./docs/running-modes.md) for
+the approval model.)
 
 For a guided walkthrough — inspecting a run, the demo picker, and the
 human-in-the-loop pause/resume loop — see

@@ -82,9 +82,6 @@ struct AppState {
     /// mode): `agent_path` is then a sentinel and handlers that would run the
     /// default agent must reject with guidance instead.
     has_default_agent: bool,
-    /// Extra tool directories (`--tools`) scanned in addition to the implicit
-    /// `<agent dir>/tools/`, mirroring `chidori run`.
-    extra_tool_dirs: Arc<Vec<PathBuf>>,
     run_base: PathBuf,
     session_store: Arc<dyn SessionStore>,
     policy: Arc<PolicyConfig>,
@@ -195,6 +192,7 @@ fn install_warm_run(
         let leg = Ok(RunResult {
             output: Value::Null,
             call_log: ctx.call_log(),
+            replayed_calls: ctx.replay_hit_count(),
             run_id: ctx.run_id(),
             paused: Some(pending.clone()),
             paused_approval: None,
@@ -576,7 +574,6 @@ pub async fn serve(
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
     agent_path: Option<PathBuf>,
-    extra_tool_dirs: Vec<PathBuf>,
     host: String,
     port: u16,
     policy: Arc<PolicyConfig>,
@@ -647,7 +644,6 @@ pub async fn serve(
         template_engine,
         agent_path,
         has_default_agent,
-        extra_tool_dirs: Arc::new(extra_tool_dirs),
         run_base,
         session_store,
         policy,
@@ -677,14 +673,9 @@ pub async fn serve(
     // previous process died and re-arm hibernating agents' alarm deadlines.
     {
         let rt = crate::scheduler::shared_tokio_runtime()?;
-        let mut tool_dirs = vec![state
-            .agent_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("tools")];
-        tool_dirs.extend(state.extra_tool_dirs.iter().cloned());
-        let mut registry =
-            ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new());
+        // The registry holds only externally-sourced tools (MCP servers).
+        // Agent tools are defined in-VM with `defineTool` and never registered.
+        let mut registry = ToolRegistry::new();
         for def in state.mcp_tools.iter() {
             registry.register(def.clone());
         }

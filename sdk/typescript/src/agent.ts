@@ -54,6 +54,43 @@ export interface ToolDefinition {
   parameters: JsonSchema & { type: "object" };
 }
 
+/**
+ * A tool is nothing more than a function with a documented signature: a
+ * `name`, a `description`, and a JSON-schema for its `parameters`, wrapped
+ * around the `run` function the model actually calls. That's the whole
+ * contract — the signature is what the model reads to decide when and how to
+ * call it; the function is what runs. {@link defineTool} builds one as a
+ * plain object you import (or define inline) like any other code — no
+ * `tools/` directory, no registry.
+ *
+ * Pass handles directly in `prompt({ tools: [...] })`,
+ * `conversation({ tools: [...] })`, or `context().tools([...])`, freely
+ * mixed with registered tool names.
+ *
+ * The `run` function executes in the AGENT'S OWN VM, so closures over agent
+ * state and ordinary imports all work, and its side effects (fetch,
+ * workspace, node:fs, ...) are the captured effects every agent already
+ * has — journaled and deterministically replayable for free. Each model
+ * turn of the loop is a durable `respond()` call; each invocation is
+ * journaled as a `mark("tool:<name>")` record for the trace.
+ */
+export interface ToolHandle<Args extends JsonObject = JsonObject> {
+  readonly __chidoriTool: true;
+  /** The name the model calls the tool by. */
+  readonly name: string;
+  /** What the tool does — the model reads this to decide when to call it. */
+  readonly description: string;
+  /** JSON-schema for the arguments: the documented shape of the call. */
+  readonly parameters: JsonSchema & { type: "object" };
+  /**
+   * The function that runs when the tool is called. The `chidori` runtime
+   * handle is passed in by the tool loop, but tool bodies usually just close
+   * over the imported `chidori`, so it is optional when you call `run`
+   * directly (`tool.run(args)`).
+   */
+  run(args: Args, chidori?: Chidori): AgentOutput | Promise<AgentOutput>;
+}
+
 export type PromptStreamType = "progress" | "draft" | "subagent" | "final" | (string & {});
 
 /** Provider prompt-cache lifetime for a cached prefix. */
@@ -66,8 +103,22 @@ export interface PromptOptions {
   maxTokens?: number;
   maxTurns?: number;
   temperature?: number;
-  tools?: string[];
+  tools?: Array<string | ToolHandle>;
+  /**
+   * `"json"` parses the reply as JSON (a single wrapping markdown fence is
+   * tolerated) and, by default, THROWS when the reply is not valid JSON — a
+   * truncated reply (e.g. a reasoning model spending the whole `maxTokens`
+   * budget on hidden reasoning) can never masquerade as a successful
+   * structured result. Set `strict: false` for the lenient raw-string
+   * fallback.
+   */
   format?: "json" | (string & {});
+  /**
+   * Applies to `format: "json"`. `true` (the default): unparseable output
+   * throws with the parse error and the reply head. `false`: fall back to
+   * returning the raw reply string.
+   */
+  strict?: boolean;
   stream?: boolean;
   /**
    * Prompt-cache posture. Defaults to on (`"5m"`): the runtime marks the
@@ -143,7 +194,7 @@ export interface CompactOptions {
 export interface Context {
   system(text: string): Context;
   /** Expose registered tools (by name, resolved like `prompt({ tools })`). */
-  tools(names: string[]): Context;
+  tools(list: Array<string | ToolHandle>): Context;
   /** A large stable reference block, labelled for the trace. */
   doc(label: string, text: string): Context;
   user(text: string): Context;
@@ -189,7 +240,7 @@ export interface ConversationOptions {
   /** System prompt — frozen once as the conversation's cacheable prefix. */
   system?: string;
   /** Tool names available on every turn (resolved like `prompt({ tools })`). */
-  tools?: string[];
+  tools?: Array<string | ToolHandle>;
   /** Default stream label for each turn's prompt (default `"final"`). */
   type?: PromptStreamType;
   /** Default model for each turn (a per-turn override still wins). */
@@ -745,7 +796,7 @@ export interface RuntimePolicyConfig {
 export interface Chidori {
   workspace: WorkspaceHost;
   /** Start an immutable multi-turn prompt context (optionally seeded). */
-  context(seed?: { system?: string; tools?: string[] }): Context;
+  context(seed?: { system?: string; tools?: Array<string | ToolHandle> }): Context;
   /**
    * Start a multi-turn chat assistant — a stateful wrapper over `context()`
    * that owns the running dialogue. Send turns with `chat.say(message)` or drive
@@ -782,6 +833,11 @@ export interface Chidori {
    * resumed run does not re-pay it. The callback must be pure, synchronous
    * compute — host effects (`chidori.*`), captured randomness, filesystem
    * writes, timers, and async callbacks are refused inside a step.
+   *
+   * Type the result with a `type` alias, not an `interface`: interfaces lack
+   * the index signature `AgentJson` requires, so `interface Commit {...}`
+   * fails to satisfy `T extends AgentJson` while the structurally identical
+   * `type Commit = {...}` works.
    */
   step<T extends AgentJson = AgentJson>(name: string, fn: () => T): Promise<T>;
   /**
@@ -919,5 +975,41 @@ export function run<TInput extends AgentJson = JsonObject, TOutput extends Agent
   throw new Error(
     "run() is only available inside the chidori runtime; this import is " +
       "replaced when an agent runs under chidori.",
+  );
+}
+
+/**
+ * Wrap a function into a {@link ToolHandle} by attaching its documented
+ * signature — a `name`, a `description`, and a JSON-schema for its
+ * `parameters`. That signature is all the model needs to call the function;
+ * the function itself is just code. No `tools/` directory, no registry —
+ * import (or define inline) the handle like any other value. `parameters`
+ * defaults to an empty object schema; `description` to `""`. Inside the
+ * runtime this import is replaced by the live implementation, exactly like
+ * `run` and `chidori`.
+ *
+ * ```ts
+ * import { chidori, run, defineTool } from "chidori:agent";
+ *
+ * const search = defineTool({
+ *   name: "search",
+ *   description: "Search the corpus.",
+ *   parameters: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+ *   run: async ({ q }) => (await fetch(BASE + q)).json(),
+ * });
+ *
+ * run(async () => chidori.prompt("find chidori", { tools: [search], maxTurns: 6 }));
+ * ```
+ */
+export function defineTool<Args extends JsonObject = JsonObject>(def: {
+  name: string;
+  description?: string;
+  parameters?: JsonSchema & { type: "object" };
+  run(args: Args, chidori?: Chidori): AgentOutput | Promise<AgentOutput>;
+}): ToolHandle<Args> {
+  void def;
+  throw new Error(
+    "defineTool() is only available inside the chidori runtime; this import " +
+      "is replaced when an agent runs under chidori.",
   );
 }

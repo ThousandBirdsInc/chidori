@@ -70,11 +70,6 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
-        /// Extra directories to scan for tool files.
-        /// Defaults to `<agent file's parent>/tools/` only.
-        #[arg(long)]
-        tools: Vec<PathBuf>,
-
         /// Default model for prompts that don't set one in code (equivalent
         /// to CHIDORI_MODEL). Any model name your configured provider
         /// accepts, e.g. `claude-sonnet-4-6`, `gpt-4o`, `deepseek-chat`.
@@ -201,11 +196,6 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
 
-        /// Extra directories to scan for tool files (defaults to ./tools/).
-        /// Discovered tools are offered to the model on every turn.
-        #[arg(long)]
-        tools: Vec<PathBuf>,
-
         /// Run under the built-in deny-by-default `untrusted` policy profile.
         #[arg(long, conflicts_with = "trusted")]
         untrusted: bool,
@@ -213,13 +203,6 @@ enum Commands {
         /// Opt out of the ask-before-powerful-effects default (see `run --trusted`).
         #[arg(long)]
         trusted: bool,
-    },
-
-    /// List all available tools
-    Tools {
-        /// Tool directories to search (defaults to ./tools/)
-        #[arg(short, long)]
-        dir: Vec<PathBuf>,
     },
 
     /// Replay a persisted run from its checkpoint. Re-runs the agent with
@@ -259,11 +242,6 @@ enum Commands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Extra directories to scan for tool files, mirroring `chidori run`.
-        /// `<agent file's parent>/tools/` is always scanned.
-        #[arg(long)]
-        tools: Vec<PathBuf>,
-
         /// Deny gated effects (tool calls, network, workspace writes) that
         /// live continuation past the replay frontier would perform.
         #[arg(long, conflicts_with = "trusted")]
@@ -275,6 +253,27 @@ enum Commands {
         /// scripts), even though the original run was trusted.
         #[arg(long)]
         trusted: bool,
+    },
+
+    /// Replay a recorded run as a deterministic test: re-run the agent with
+    /// every host call served from the journal, with NO provider configured
+    /// and NO writes to the run directory (top-level workspace effects
+    /// re-materialize their recorded artifacts, byte-identical), and assert
+    /// the run completes with output identical to the recorded one. Exit 0 on pass; non-zero with a
+    /// diagnosis on drift (changed source refuses, a diverging call fails
+    /// loudly, a run that tries to execute anything live fails). Commit a run
+    /// directory to git and run this in CI — a full integration test that
+    /// costs $0 and takes milliseconds.
+    Verify {
+        /// Agent .ts file (same one the run was created from)
+        file: PathBuf,
+
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to agent file's parent)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
     },
 
     /// List a run's persisted `chidori.branch` sub-runs and their states.
@@ -402,11 +401,6 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
-        /// Extra directories to scan for tool files, mirroring `chidori run`.
-        /// Defaults to `<agent file's parent>/tools/` only.
-        #[arg(long)]
-        tools: Vec<PathBuf>,
-
         /// Default model for prompts that don't set one in code (equivalent
         /// to CHIDORI_MODEL), applied to every session this server runs.
         #[arg(long)]
@@ -526,9 +520,10 @@ fn on_js_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 /// agent file.
 fn display_project_root_of(command: &Commands) -> Option<PathBuf> {
     let file = match command {
-        Commands::Run { file, .. } | Commands::Check { file } | Commands::Resume { file, .. } => {
-            file.clone()
-        }
+        Commands::Run { file, .. }
+        | Commands::Check { file }
+        | Commands::Resume { file, .. }
+        | Commands::Verify { file, .. } => file.clone(),
         Commands::Serve { file, .. } => file.clone()?,
         Commands::Chat { agent, .. } => agent.clone()?,
         _ => return None,
@@ -545,7 +540,6 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             input,
             trace,
             verbose,
-            tools,
             model,
             stream,
             untrusted,
@@ -572,9 +566,9 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             }
             crate::runtime::isolate::warn_if_untrusted_without_isolation(untrusted);
             let result = if stream {
-                cmd_run_stream(&file, &input, verbose, &tools, untrusted, trusted)
+                cmd_run_stream(&file, &input, verbose, untrusted, trusted)
             } else {
-                cmd_run(&file, &input, trace, verbose, &tools, untrusted, trusted)
+                cmd_run(&file, &input, trace, verbose, untrusted, trusted)
             };
             (result, false)
         }
@@ -604,15 +598,13 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             agent,
             system,
             model,
-            tools,
             untrusted,
             trusted,
         } => (
-            cmd_chat(agent.as_deref(), system, model, &tools, untrusted, trusted),
+            cmd_chat(agent.as_deref(), system, model, untrusted, trusted),
             false,
         ),
         Commands::Check { file } => (cmd_check(&file), true),
-        Commands::Tools { dir } => (cmd_tools(&dir), false),
         Commands::Stats { dir } => (cmd_stats(dir.as_deref()), false),
         Commands::Resume {
             file,
@@ -621,7 +613,6 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             until_seq,
             allow_source_change,
             model,
-            tools,
             untrusted,
             trusted,
         } => (
@@ -636,13 +627,15 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                     until_seq,
                     allow_source_change,
                     model,
-                    &tools,
                     untrusted,
                     trusted,
                 )
             },
             false,
         ),
+        Commands::Verify { file, run_id, dir } => {
+            (cmd_verify(&file, &run_id, dir.as_deref()), false)
+        }
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
         Commands::BranchResume {
             run_id,
@@ -689,7 +682,6 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             port,
             host,
             verbose,
-            tools,
             model,
             untrusted,
             trusted,
@@ -710,7 +702,6 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                     host.as_deref(),
                     port,
                     verbose,
-                    &tools,
                     untrusted,
                     trusted,
                 ),
@@ -856,7 +847,6 @@ enum DemoAction {
         input: &'static [&'static str],
         trace: bool,
         stream: bool,
-        tools: &'static [&'static str],
     },
     Serve {
         file: &'static str,
@@ -876,20 +866,18 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["name=Colton"],
                 trace: false,
                 stream: false,
-                tools: &[],
             },
         },
         DemoExample {
             title: "Tool call",
-            description: "Loads a local TypeScript tool and calls it from an agent.",
-            command: "chidori run examples/agents/tool_use.ts --input query=chidori --tools examples/tools",
+            description: "Defines a tool inline with defineTool and calls it from an agent.",
+            command: "chidori run examples/agents/tool_use.ts --input query=chidori",
             requires_provider: false,
             action: DemoAction::Run {
                 file: "examples/agents/tool_use.ts",
                 input: &["query=chidori"],
                 trace: false,
                 stream: false,
-                tools: &["examples/tools"],
             },
         },
         DemoExample {
@@ -902,7 +890,6 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["document=Rust is great."],
                 trace: true,
                 stream: false,
-                tools: &[],
             },
         },
         DemoExample {
@@ -915,7 +902,6 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["{\"topic\":\"runtime snapshots\"}"],
                 trace: false,
                 stream: false,
-                tools: &[],
             },
         },
         DemoExample {
@@ -928,7 +914,6 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["topic=runtime snapshots"],
                 trace: false,
                 stream: true,
-                tools: &[],
             },
         },
         DemoExample {
@@ -987,20 +972,18 @@ fn cmd_demo() -> Result<()> {
             input,
             trace,
             stream,
-            tools,
         } => {
             let file = PathBuf::from(file);
             let inputs = input
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>();
-            let tool_dirs = tools.iter().map(PathBuf::from).collect::<Vec<_>>();
             // The demo runs the repo's own example agents on the developer's
             // machine — the trusted posture, like `run --trusted`.
             if *stream {
-                cmd_run_stream(&file, &inputs, false, &tool_dirs, false, true)
+                cmd_run_stream(&file, &inputs, false, false, true)
             } else {
-                cmd_run(&file, &inputs, *trace, false, &tool_dirs, false, true)
+                cmd_run(&file, &inputs, *trace, false, false, true)
             }
         }
         DemoAction::Serve { file, port } => {
@@ -1010,15 +993,7 @@ fn cmd_demo() -> Result<()> {
             // The demo serves the developer's own example agent on their own
             // machine — the trusted posture, like `chidori run`, on the
             // default loopback bind.
-            cmd_serve(
-                Some(&PathBuf::from(file)),
-                None,
-                *port,
-                false,
-                &[],
-                false,
-                true,
-            )
+            cmd_serve(Some(&PathBuf::from(file)), None, *port, false, false, true)
         }
     }
 }
@@ -1211,7 +1186,6 @@ fn cmd_run(
     inputs: &[String],
     trace: bool,
     verbose: bool,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -1255,11 +1229,9 @@ fn cmd_run(
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
-    // Auto-discover tools from `<project>/tools/` plus any `--tools` dirs.
-    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    // Agent tools are defined in-VM with `defineTool`; the registry is for
+    // externally-sourced tools only (MCP), unused on the plain CLI path.
+    let tools = Arc::new(ToolRegistry::new());
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
@@ -1330,7 +1302,6 @@ fn cmd_run_stream(
     file: &Path,
     inputs: &[String],
     verbose: bool,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -1355,10 +1326,7 @@ fn cmd_run_stream(
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
-    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tools = Arc::new(ToolRegistry::new());
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
@@ -1463,7 +1431,6 @@ fn cmd_chat(
     agent: Option<&std::path::Path>,
     system: Option<String>,
     model: Option<String>,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -1502,10 +1469,7 @@ fn cmd_chat(
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
-    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tools = Arc::new(ToolRegistry::new());
     let tool_names: Vec<String> = tools.list().iter().map(|t| t.name.clone()).collect();
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
@@ -1627,44 +1591,6 @@ fn cmd_check(file: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tools(dirs: &[PathBuf]) -> Result<()> {
-    let dirs = if dirs.is_empty() {
-        vec![PathBuf::from("tools")]
-    } else {
-        dirs.to_vec()
-    };
-
-    let registry = ToolRegistry::load_from_dirs(&dirs)?;
-    let tools = registry.list();
-
-    if tools.is_empty() {
-        println!(
-            "No tools found in: {}",
-            dirs.iter()
-                .map(|d| d.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        return Ok(());
-    }
-
-    for tool in tools {
-        println!("  {} — {}", tool.name, tool.description);
-        for param in &tool.params {
-            let req = if param.required { " (required)" } else { "" };
-            let default = param
-                .default
-                .as_ref()
-                .map(|d| format!(" [default: {d}]"))
-                .unwrap_or_default();
-            println!("    {}: {}{}{}", param.name, param.param_type, req, default);
-        }
-        println!();
-    }
-
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn cmd_resume(
     file: &Path,
@@ -1673,7 +1599,6 @@ fn cmd_resume(
     until_seq: Option<u64>,
     allow_source_change: bool,
     model: Option<String>,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -1768,10 +1693,7 @@ fn cmd_resume(
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
-    let mut tool_dirs = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tools = Arc::new(ToolRegistry::new());
     // Same implicit workspace root as `chidori run`: a run that wrote
     // workspace files must replay/resume without extra configuration.
     // CHIDORI_WORKSPACE_ROOT still takes precedence inside the runtime.
@@ -1793,10 +1715,129 @@ fn cmd_resume(
 
     let output_str = serde_json::to_string_pretty(&result.output)?;
     println!("{output_str}");
+    // Report the replayed/live split — the total alone reads as "everything
+    // was replayed" and hides what the recovery actually re-executed (and
+    // re-billed). In-flight work at a crash re-executes by design
+    // (at-least-once), so the live count is the honest recovery cost.
+    let total = result.call_log.records().len() as u64;
     eprintln!(
-        "\nResumed from {} ({} calls replayed)",
-        run_id,
-        result.call_log.records().len()
+        "\nResumed from {run_id} ({} recorded calls replayed, {} executed live)",
+        result.replayed_calls,
+        total.saturating_sub(result.replayed_calls)
+    );
+    Ok(())
+}
+
+/// `chidori verify` — checkpoint-as-test as a first-class command. Replays a
+/// recorded run with no provider configured, a deny-all policy, and no
+/// persistence (the run directory is never written), then asserts the run
+/// completed with byte-identical output. Every drift mode fails loudly:
+/// changed source refuses via the manifest check, a diverging recorded call
+/// errors positionally, a run that reaches for anything live has no provider
+/// (and no allowed gated effects) to reach.
+fn cmd_verify(file: &Path, run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .or_else(|| file.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
+
+    use crate::runtime::store::RunStore as _;
+    let store = crate::runtime::store::FsRunStore::new(run_dir.clone());
+    let records = store
+        .load_call_log()?
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+    let recorded_output: Option<Value> = store
+        .get_blob("output.json")?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+
+    let input_path = run_dir.join("input.json");
+    let input_value: Value = if input_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&input_path)?)
+            .unwrap_or(Value::Object(Default::default()))
+    } else {
+        Value::Object(Default::default())
+    };
+
+    // Drift gate 1: the agent source must match the recorded fingerprints.
+    // No `--allow-source-change` escape here — a verify against edited code
+    // is not a verification.
+    crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file, false)
+        .context("verify refused: the agent source no longer matches this run's checkpoint")?;
+
+    // No providers, deny-all policy, no persistence: the replay must be able
+    // to answer EVERY effect from the journal or fail.
+    let providers = Arc::new(ProviderRegistry::new());
+    let template_engine = Arc::new(TemplateEngine::new(&base_dir));
+    let tokio_rt =
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
+    let tools = Arc::new(ToolRegistry::new());
+    let manifest_model = crate::runtime::snapshot::SnapshotStore::new(run_dir.clone())
+        .load_manifest()
+        .ok()
+        .and_then(|manifest| manifest.default_model);
+    let engine = Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(tools)
+        .with_policy(Arc::new(
+            policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
+        ))
+        .with_default_model(manifest_model)
+        .with_workspace_root(abs_dir(&base_dir));
+
+    let journal_len = records.len() as u64;
+    let result = engine
+        .resume_run(file, &input_value, records, run_id)
+        .context("verify FAILED: the recorded run did not replay cleanly")?;
+
+    if result.paused.is_some() || result.paused_approval.is_some() || result.paused_signal.is_some()
+    {
+        anyhow::bail!(
+            "verify FAILED: the run replayed to a pause instead of completing — \
+             only completed runs can be verified"
+        );
+    }
+    if let Some(recorded) = recorded_output {
+        if recorded != result.output {
+            anyhow::bail!(
+                "verify FAILED: replayed output differs from the recorded output.\n\
+                 recorded: {}\n\
+                 replayed: {}",
+                serde_json::to_string(&recorded).unwrap_or_default(),
+                serde_json::to_string(&result.output).unwrap_or_default()
+            );
+        }
+    } else {
+        eprintln!(
+            "chidori: warning: no recorded output.json under {} — verified replay \
+             consistency only, not output identity",
+            run_dir.display()
+        );
+    }
+    let records = result.call_log.records();
+    let total = records.len() as u64;
+    let live = total.saturating_sub(result.replayed_calls);
+    // Workspace effects re-execute by design on every replay (the workspace
+    // is real disk state, re-materialized rather than served from the
+    // journal; nested ones replay inside their container's subtree). Only
+    // top-level workspace records are expected live — anything else live
+    // means the replay reached past the journal.
+    let expected_live = records
+        .iter()
+        .filter(|r| r.function == "workspace" && r.parent_seq.is_none())
+        .count() as u64;
+    if live > expected_live {
+        anyhow::bail!(
+            "verify FAILED: {} call(s) executed live beyond the expected {expected_live} \
+             workspace re-materialization(s) ({} of {journal_len} journal records replayed)",
+            live - expected_live,
+            result.replayed_calls
+        );
+    }
+    println!(
+        "verified: {} calls replayed, {live} workspace re-materialization(s), \
+         output identical — $0",
+        result.replayed_calls
     );
     Ok(())
 }
@@ -1838,10 +1879,7 @@ fn branch_engine(
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
-    let tools_dir = base_dir.join("tools");
-    let tools = Arc::new(
-        ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
-    );
+    let tools = Arc::new(ToolRegistry::new());
     Ok(Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
         .with_policy(cli_policy(untrusted, trusted))
@@ -2174,6 +2212,18 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
         for r in records {
             if r.function == "prompt" {
                 prompt_count += 1;
+                // Count the call under its model even when the record carries
+                // no token usage (e.g. a locally-cache-served or zero-usage
+                // prompt) — otherwise the top-line "Prompt calls" and the
+                // per-model rows silently disagree.
+                let model = r
+                    .args
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let ms = per_model.entry(model.clone()).or_default();
+                ms.calls += 1;
                 if let Some(ref usage) = r.token_usage {
                     total_input_tokens += usage.input_tokens;
                     total_output_tokens += usage.output_tokens;
@@ -2181,12 +2231,6 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
                     let cache_write = usage.cache_creation_tokens.unwrap_or(0);
                     total_cache_read += cache_read;
                     total_cache_write += cache_write;
-                    let model = r
-                        .args
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
                     let cost = estimate_cost_usd_with_cache(
                         &model,
                         usage.input_tokens,
@@ -2196,7 +2240,6 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
                     );
                     total_cost += cost;
                     let ms = per_model.entry(model).or_default();
-                    ms.calls += 1;
                     ms.input_tokens += usage.input_tokens;
                     ms.output_tokens += usage.output_tokens;
                     ms.cache_read_tokens += cache_read;
@@ -2272,7 +2315,6 @@ fn cmd_serve(
     host: Option<&str>,
     port: u16,
     verbose: bool,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -2333,7 +2375,6 @@ fn cmd_serve(
         providers,
         template_engine,
         file.map(|f| f.to_path_buf()),
-        extra_tool_dirs.to_vec(),
         host,
         port,
         policy,

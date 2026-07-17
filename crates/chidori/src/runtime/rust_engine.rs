@@ -347,30 +347,10 @@ fn remap_stack_frames_via(err: &str, read: impl Fn(&str) -> Option<String>) -> S
 
 /// Run a nested TypeScript **tool** file natively on the rust engine (G4).
 ///
-/// Re-enters [`run_module`] with the tool's `run(args)` entrypoint. The
-/// same `backend` (hence the same `RuntimeContext`) is threaded through, so the
-/// tool's host effects nest under the parent tool call (`parent_seq`) and share
-/// the durable call log, policy, MCP, and OTEL span tree. A suspension inside
-/// the tool (e.g. `chidori.input()` in Pause mode) surfaces as the usual
-/// `PAUSE_MARKER` error and propagates to the parent run.
-pub(crate) fn run_tool_file(
-    path: &Path,
-    kwargs: &Value,
-    backend: &HostBindingBackend,
-) -> Result<Value> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("reading tool {}: {e}", path.display()))?;
-    run_module(
-        path,
-        &source,
-        "run",
-        kwargs,
-        Rc::new(InProcessHost::new(backend.clone())),
-    )
-}
-
 /// Run a nested TypeScript **sub-agent** file natively on the rust engine (G4).
-/// Mirrors [`run_tool_file`] but invokes the `agent(input)` entrypoint.
+/// Invokes the `agent(input)` entrypoint, threading the same `backend` (hence
+/// the same `RuntimeContext`) so the sub-agent's host effects nest under the
+/// parent call and share the durable call log, policy, MCP, and OTEL span tree.
 pub(crate) fn run_agent_file(
     path: &Path,
     input: &Value,
@@ -1237,11 +1217,152 @@ mod tests {
     use crate::runtime::context::RuntimeContext;
     use crate::runtime::snapshot::RuntimePolicy;
     use crate::runtime::template::TemplateEngine;
-    use crate::tools::{ToolBackend, ToolRegistry};
+    use crate::tools::ToolRegistry;
 
     /// A fully-wired runtime backend over `ctx`/`tools` with default providers,
     /// template engine, tokio runtime, policy, and MCP — enough to exercise the
     /// full effect dispatch in tests.
+    /// A scripted provider for the defineTool loop: turn 1 requests the
+    /// `lookup` tool, turn 2 answers. Also asserts the inline (import-defined)
+    /// tool schema actually reached the provider request.
+    struct ScriptedToolProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        saw_inline_schema: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for ScriptedToolProvider {
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+        async fn send(
+            &self,
+            request: &crate::providers::LlmRequest,
+        ) -> anyhow::Result<crate::providers::LlmResponse> {
+            use crate::providers::{ContentBlock, LlmResponse, ToolCall};
+            if request.tools.iter().any(|t| t.name == "lookup") {
+                self.saw_inline_schema
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let call_index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_index == 0 {
+                return Ok(LlmResponse {
+                    content: String::new(),
+                    blocks: vec![ContentBlock::ToolUse {
+                        id: "call-1".to_string(),
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({ "key": "answer" }),
+                    }],
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({ "key": "answer" }),
+                    }],
+                    stop_reason: "tool_use".to_string(),
+                    ..LlmResponse::default()
+                });
+            }
+            Ok(LlmResponse {
+                content: "the value is 42".to_string(),
+                blocks: vec![ContentBlock::Text {
+                    text: "the value is 42".to_string(),
+                }],
+                ..LlmResponse::default()
+            })
+        }
+    }
+
+    #[test]
+    fn define_tool_import_pattern_runs_in_vm_and_journals() {
+        // The standard-pattern alternative to the tools/ directory: a tool is
+        // a plain object built with defineTool() (imported or defined inline),
+        // whose `run` executes in the agent's own VM via the JS-side loop.
+        // No registry, no magic directory, closures allowed.
+        let ctx = RuntimeContext::new();
+        let dir = std::env::temp_dir().join(format!("chidori-definetool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            import { chidori, run, defineTool } from "chidori:agent";
+
+            const seen: string[] = [];
+            const lookup = defineTool({
+                name: "lookup",
+                description: "Look up a value by key.",
+                parameters: {
+                    type: "object",
+                    properties: { key: { type: "string" } },
+                    required: ["key"],
+                },
+                run: async (args: { key: string }) => {
+                    seen.push(args.key); // closures over agent state work
+                    await chidori.log("in-vm tool ran", { key: args.key });
+                    return { value: 42 };
+                },
+            });
+
+            run(async () => {
+                const answer = await chidori.prompt("What is the value?", {
+                    tools: [lookup],
+                    maxTurns: 4,
+                });
+                return { answer, seen };
+            });
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let saw_inline_schema = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut providers = ProviderRegistry::new();
+        providers.register(Box::new(ScriptedToolProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            saw_inline_schema: saw_inline_schema.clone(),
+        }));
+        let backend = HostBindingBackend::for_runtime(
+            ctx.clone(),
+            Arc::new(providers),
+            Arc::new(TemplateEngine::new(".")),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            PolicyConfig::from_env(),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("rust-engine-test"),
+            Arc::new(ToolRegistry::new()), // registry stays EMPTY — no directory tools
+            Arc::new(McpManager::new()),
+        );
+
+        let output = run_agent(&path, src, &serde_json::json!({}), &backend).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({ "answer": "the value is 42", "seen": ["answer"] })
+        );
+        assert!(
+            saw_inline_schema.load(std::sync::atomic::Ordering::SeqCst),
+            "the defineTool schema reached the provider request"
+        );
+
+        let records = ctx.call_log().into_records();
+        // Two respond turns journaled as prompts; the in-VM invocation as a
+        // mark; the tool body's own log as an ordinary journaled effect.
+        assert_eq!(
+            records.iter().filter(|r| r.function == "prompt").count(),
+            2,
+            "records: {:?}",
+            records
+                .iter()
+                .map(|r| r.function.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(records
+            .iter()
+            .any(|r| r.function == "mark" && r.args["label"] == "tool:lookup"));
+        assert!(records
+            .iter()
+            .any(|r| r.function == "log" && r.args["fields"]["key"] == "answer"));
+        // And NO host-side `tool` record: the body ran in the agent's VM.
+        assert!(!records.iter().any(|r| r.function == "tool"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn test_backend(ctx: RuntimeContext, tools: Arc<ToolRegistry>) -> HostBindingBackend {
         HostBindingBackend::for_runtime(
             ctx,
@@ -1486,6 +1607,72 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tool_error_frame_anchors_at_the_prompt_call() {
+        // Round-3 consumer review finding: `prompt({tools: ["missing"]})`
+        // failed with "Unknown tool ..." whose frame pointed at the NEXT
+        // await after the prompt (a `chidori.log` ten lines below), not the
+        // prompt call itself. Same contract as the policy-denial test above:
+        // a host-binding failure must anchor at the awaiting call site.
+        let dir =
+            std::env::temp_dir().join(format!("chidori-unknown-tool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        // The exact consumer shape that misattributed: a MULTI-LINE prompt
+        // call inside a for-loop, with a decoy `chidori.log` after it. The
+        // failing `await chidori.prompt(` sits on line 5; the decoy log on
+        // line 10. (A single-line prompt anchored correctly all along — the
+        // loop + multi-line argument span is what pushed the frame onto the
+        // next await.)
+        let src = "import { chidori, run } from \"chidori:agent\";\n\n\
+                   run(async () => {\n\
+                   \x20 for (const theme of [\"a\", \"b\"]) {\n\
+                   \x20   const s = await chidori.prompt(\n\
+                   \x20     `investigate ${theme}` +\n\
+                   \x20       `across multiple lines`,\n\
+                   \x20     { tools: [\"missing_tool\"], maxTurns: 8 },\n\
+                   \x20   );\n\
+                   \x20   await chidori.log(\"after\", { theme, s });\n\
+                   \x20 }\n\
+                   \x20 return null;\n\
+                   });\n";
+        std::fs::write(&path, src).unwrap();
+
+        let backend = HostBindingBackend::for_runtime(
+            RuntimeContext::new(),
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(".")),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            Arc::new(PolicyConfig::default()),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("rust-engine-test"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(McpManager::new()),
+        );
+
+        let err = run_agent(&path, src, &serde_json::json!({}), &backend)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Unknown tool"),
+            "the failure names the missing tool: {err}"
+        );
+
+        super::set_display_project_root(dir.clone());
+        let remapped = remap_stack_frames(&err);
+        let path_str = path.to_string_lossy();
+        assert!(
+            remapped.contains(&format!("at <anonymous> ({path_str}:5:")),
+            "frame anchors at the failing prompt call (line 5): {remapped}"
+        );
+        assert!(
+            !remapped.contains(&format!("({path_str}:10:")),
+            "no frame anchors at the unrelated chidori.log call (line 10): {remapped}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn run_agent_executes_ts_through_rust_engine_and_records_host_calls() {
         // A single-file TS agent that does JS work (a nested function call) and a
         // chidori.log host effect, then returns a value derived from its input.
@@ -1546,77 +1733,6 @@ mod tests {
         let records = ctx.call_log().into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].function, "log");
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn run_agent_nests_tool_internal_calls_under_the_tool_on_rust_engine() {
-        // A TypeScript tool whose `run` makes its own chidori.log calls: those
-        // must be recorded as CHILDREN of the tool call (parent_seq = tool seq),
-        // so the trace nests correctly.
-        let ctx = RuntimeContext::new();
-        let dir = std::env::temp_dir().join(format!("chidori-rust-tool-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("tools")).unwrap();
-
-        let tool_path = dir.join("tools").join("echo2.ts");
-        std::fs::write(
-            &tool_path,
-            r#"
-            export const tool = { name: "echo2", description: "doubles and logs", parameters: {} };
-            export async function run(args: { value: number }) {
-                chidori.log("tool: doubling " + args.value);
-                return { value: args.value * 2 };
-            }
-            "#,
-        )
-        .unwrap();
-
-        let agent_path = dir.join("agent.ts");
-        let agent_src = r#"
-            export async function agent(input: { value: number }) {
-                chidori.log("agent: before tool");
-                const r = await chidori.tool("echo2", { value: input.value });
-                return r;
-            }
-        "#;
-        std::fs::write(&agent_path, agent_src).unwrap();
-
-        let mut registry = ToolRegistry::new();
-        registry.register(crate::tools::ToolDef {
-            name: "echo2".to_string(),
-            description: "doubles and logs".to_string(),
-            params: Vec::new(),
-            source_path: tool_path,
-            source_fingerprint: None,
-            backend: ToolBackend::TypeScript,
-        });
-        let tools = Arc::new(registry);
-
-        let backend = test_backend(ctx.clone(), tools);
-        let output = run_agent(
-            &agent_path,
-            agent_src,
-            &serde_json::json!({ "value": 5 }),
-            &backend,
-        )
-        .unwrap();
-        assert_eq!(output, serde_json::json!({ "value": 10 }));
-
-        let records = ctx.call_log().into_records();
-        // agent log (top-level), tool's internal log (nested), tool call.
-        let tool = records.iter().find(|r| r.function == "tool").unwrap();
-        let tool_log = records
-            .iter()
-            .find(|r| r.function == "log" && r.args["message"] == "tool: doubling 5")
-            .unwrap();
-        let agent_log = records
-            .iter()
-            .find(|r| r.function == "log" && r.args["message"] == "agent: before tool")
-            .unwrap();
-        // The tool's log nests under the tool; the agent's log is top-level.
-        assert_eq!(tool_log.parent_seq, Some(tool.seq));
-        assert_eq!(agent_log.parent_seq, None);
 
         let _ = std::fs::remove_dir_all(dir);
     }

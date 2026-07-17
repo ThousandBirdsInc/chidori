@@ -19,6 +19,5 @@
     "branching/**/*.ts",
     "interactive-pipeline/**/*.ts",
     "multiplayer-review/**/*.ts",
-    "tools/**/*.ts"
   ]
 }
