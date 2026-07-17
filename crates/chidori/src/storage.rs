@@ -45,6 +45,11 @@ pub struct StoredSession {
     pub error: Option<String>,
     pub pending_seq: Option<u64>,
     pub pending_prompt: Option<String>,
+    /// The artifact under review for an `input()` pause (`opts.details`) —
+    /// surfaced alongside `pending_prompt` so an approval UI can show what it
+    /// is approving. Defaulted for sessions stored before the field existed.
+    #[serde(default)]
+    pub pending_details: Option<String>,
     /// Set when status == Paused on a `chidori.signal(name)` listen point.
     /// Carries the listen-point name so the view advertises which signal the
     /// run is awaiting and the delivery endpoint can match `body.name` against
@@ -284,6 +289,7 @@ mod tests {
             id: id.to_string(),
             run_id: None,
             status: SessionStatus::Completed,
+            pending_details: None,
             input: serde_json::json!({}),
             output: Some(serde_json::json!({"ok": true})),
             call_log: Vec::new(),

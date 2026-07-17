@@ -38,6 +38,7 @@ use crate::providers::ProviderRegistry;
 use crate::runtime::call_log::CallRecord;
 use crate::runtime::context::{PendingSignal, RuntimeContext};
 use crate::runtime::errors::RunInterrupt;
+use crate::runtime::host_actor::strip_crash_frontier;
 use crate::runtime::host_core;
 use crate::runtime::snapshot::{QueuedSignal, RuntimePolicy, SIGNAL_INBOX_FILE};
 use crate::runtime::store::RunStoreFactory;
@@ -97,6 +98,13 @@ pub struct AgentDescriptor {
     pub max_restarts: u32,
     pub backoff_ms: u64,
     pub owner_run_id: String,
+    /// The default model for the agent's prompts, captured at spawn time (the
+    /// spawner's resolved model, or an explicit `model` spawn option) so a
+    /// wake in a differently-configured process doesn't silently switch
+    /// models. `None` on descriptors persisted before this field existed —
+    /// those keep resolving from the waking process's environment.
+    #[serde(default)]
+    pub model: Option<String>,
     /// `running` | `hibernating` | `paused` | `completed` | `failed` | `stopped`
     pub status: String,
     #[serde(default)]
@@ -257,6 +265,7 @@ impl DetachedAgentHub {
             .unwrap_or_else(|| format!("agent-{}", &uuid::Uuid::new_v4().to_string()[..8]));
         // A live (non-settled) agent squats on its name; a settled one may be
         // replaced by a fresh spawn.
+        let mut predecessor_run_id: Option<String> = None;
         if let Ok(Some(existing)) = factory.registry_get(&name) {
             let status = existing
                 .get("descriptor")
@@ -268,6 +277,11 @@ impl DetachedAgentHub {
                     "chidori.agents.spawn: agent name `{name}` is already registered and live"
                 ));
             }
+            predecessor_run_id = existing
+                .get("run_id")
+                .or_else(|| existing.get("descriptor").and_then(|d| d.get("run_id")))
+                .and_then(Value::as_str)
+                .map(str::to_string);
         }
         let now = Utc::now();
         let descriptor = AgentDescriptor {
@@ -279,6 +293,7 @@ impl DetachedAgentHub {
             max_restarts: options.max_restarts,
             backoff_ms: options.backoff_ms,
             owner_run_id,
+            model: options.model.clone(),
             status: "running".to_string(),
             listen: None,
             restarts: 0,
@@ -289,6 +304,39 @@ impl DetachedAgentHub {
         };
         persist_descriptor(&factory, &descriptor);
         let run_id = descriptor.run_id.clone();
+
+        // Mail follows the NAME, not the incarnation: whatever the settled
+        // predecessor never consumed is re-queued for the replacement instead
+        // of stranding in the dead run's inbox.
+        if let Some(ref old_run_id) = predecessor_run_id {
+            let old_store = factory.store_for(old_run_id);
+            if let Ok(Some(bytes)) = old_store.get_blob(SIGNAL_INBOX_FILE) {
+                let leftover: Vec<QueuedSignal> =
+                    serde_json::from_slice(&bytes).unwrap_or_default();
+                if !leftover.is_empty() {
+                    let migrated: Vec<QueuedSignal> = leftover
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, queued)| QueuedSignal {
+                            delivery_seq: (i + 1) as u64,
+                            ..queued
+                        })
+                        .collect();
+                    tracing::info!(
+                        agent = %name,
+                        from_run = %old_run_id,
+                        messages = migrated.len(),
+                        "migrating unconsumed mailbox from the settled predecessor"
+                    );
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&migrated) {
+                        let _ = factory
+                            .store_for(&run_id)
+                            .put_blob(SIGNAL_INBOX_FILE, &bytes);
+                    }
+                    let _ = old_store.put_blob(SIGNAL_INBOX_FILE, b"[]");
+                }
+            }
+        }
 
         let entry = Arc::new(AgentEntry {
             name: name.clone(),
@@ -392,6 +440,12 @@ impl DetachedAgentHub {
                     wake = true;
                 }
             }
+            // `running` with no worker thread means the previous driver died
+            // mid-run: the delivery is durably queued, so use it as the wake
+            // signal instead of letting the message strand.
+            if state.descriptor.status == "running" && !state.thread_live && !state.stop_requested {
+                wake = true;
+            }
             if wake {
                 state.descriptor.status = "running".to_string();
                 state.descriptor.updated_at = Utc::now();
@@ -469,7 +523,13 @@ impl DetachedAgentHub {
     pub fn status(&self, parts: &AgentRuntimeParts, to: &str) -> Result<Value, String> {
         let entry = self.ensure_entry(parts, to)?;
         let state = entry.state.lock().unwrap();
-        Ok(state.descriptor.status_json())
+        let mut status = state.descriptor.status_json();
+        // The descriptor is durable state; `live` is the truth about THIS
+        // process: whether a worker thread is actually executing the agent
+        // right now. `status: "running", live: false` means the driver died
+        // and the reconciler will re-drive it — not that work is happening.
+        status["live"] = json!(state.thread_live);
+        Ok(status)
     }
 
     pub fn lookup(&self, parts: &AgentRuntimeParts, name: &str) -> Result<Value, String> {
@@ -545,29 +605,31 @@ impl DetachedAgentHub {
                 // thread) alarm deadlines wake it.
                 "hibernating" => {
                     let _ = factory.hydrate(&descriptor.run_id);
-                    let entry = self.ensure_entry(&parts_for_entries, &name)?;
-                    let has_deadline = {
-                        let state = entry.state.lock().unwrap();
-                        state
-                            .descriptor
-                            .listen
-                            .as_ref()
-                            .is_some_and(|l| l.deadline.is_some())
-                    };
-                    if has_deadline {
-                        self.ensure_timer();
-                    }
+                    self.ensure_entry(&parts_for_entries, &name)?;
                     rearmed += 1;
                 }
                 _ => {}
             }
         }
+        // The timer doubles as the fleet reconciler: it re-arms alarm
+        // deadlines AND re-drives `running` entries whose driver died (e.g. a
+        // wake that stood down on a contended lease). Always run it when a
+        // fleet exists.
+        if rearmed > 0 {
+            self.ensure_timer();
+        }
         Ok(rearmed)
     }
 
-    /// Lazily start the alarm timer thread: scans hibernating entries and
-    /// wakes any whose deadline has passed. Poll granularity is one second —
-    /// alarms are minute-scale scheduling, not precise timers.
+    /// Lazily start the alarm/reconciler timer thread. Scans entries once a
+    /// second and (a) wakes hibernating agents whose alarm deadline passed,
+    /// (b) re-drives `running` agents that have no worker thread — an agent
+    /// whose previous driver died (or whose wake stood down on a contended
+    /// lease) must not stay `running` forever with no one executing it. The
+    /// re-drive is rate-limited by `updated_at` so a stand-down against a
+    /// genuinely live remote driver retries cheaply, not in a hot loop. Poll
+    /// granularity is one second — alarms are minute-scale scheduling, not
+    /// precise timers.
     fn ensure_timer(&self) {
         let mut started = self.timer_started.lock().unwrap();
         if *started {
@@ -585,14 +647,20 @@ impl DetachedAgentHub {
                         .values()
                         .filter(|entry| {
                             let state = entry.state.lock().unwrap();
-                            state.descriptor.status == "hibernating"
+                            let alarm_due = state.descriptor.status == "hibernating"
                                 && !state.thread_live
                                 && state
                                     .descriptor
                                     .listen
                                     .as_ref()
                                     .and_then(|l| l.deadline)
-                                    .is_some_and(|deadline| deadline <= Utc::now())
+                                    .is_some_and(|deadline| deadline <= Utc::now());
+                            let driverless = state.descriptor.status == "running"
+                                && !state.thread_live
+                                && !state.stop_requested
+                                && state.descriptor.updated_at
+                                    <= Utc::now() - chrono::Duration::seconds(30);
+                            alarm_due || driverless
                         })
                         .cloned()
                         .collect()
@@ -621,6 +689,9 @@ pub struct SpawnOptions {
     pub restart: String,
     pub max_restarts: u32,
     pub backoff_ms: u64,
+    /// Default model for the agent's prompts. Explicit spawn option, or
+    /// filled with the spawner's resolved model by the binding.
+    pub model: Option<String>,
 }
 
 impl SpawnOptions {
@@ -660,6 +731,11 @@ impl SpawnOptions {
                 .and_then(Value::as_u64)
                 .unwrap_or(3) as u32,
             backoff_ms: value.get("backoffMs").and_then(Value::as_u64).unwrap_or(0),
+            model: value
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         })
     }
 
@@ -669,6 +745,7 @@ impl SpawnOptions {
             "restart": self.restart,
             "maxRestarts": self.max_restarts,
             "backoffMs": self.backoff_ms,
+            "model": self.model,
         })
     }
 }
@@ -695,18 +772,61 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
     {
         let run_id = entry.state.lock().unwrap().descriptor.run_id.clone();
         let store = factory.store_for(&run_id);
-        match crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl) {
-            Ok(Ok(_)) => {}
-            Ok(Err(holder)) => {
-                tracing::info!(
-                    agent = %entry.name,
-                    holder = %holder.owner,
-                    "detached agent is leased to another process; standing down"
-                );
-                return;
-            }
-            Err(err) => {
-                tracing::warn!(agent = %entry.name, error = %err, "acquiring agent lease");
+        // Contended lease: wait out the holder's TTL instead of standing down
+        // for good. A dead process never renews, so its lease expires and this
+        // wake takes over; a live holder keeps pushing `expires_at` forward —
+        // THAT is the genuinely-driven-elsewhere case worth yielding to.
+        // (Standing down permanently on a not-yet-expired stale lease was how
+        // an agent could wedge forever as `running` with no worker anywhere.)
+        loop {
+            match crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl) {
+                Ok(Ok(_)) => break,
+                Ok(Err(holder)) => {
+                    let previous_expiry = holder.expires_at;
+                    tracing::warn!(
+                        agent = %entry.name,
+                        holder = %holder.owner,
+                        expires_at = %holder.expires_at,
+                        "detached agent is leased to another process; waiting for the lease \
+                         to expire or be renewed"
+                    );
+                    // Sleep to the holder's expiry in stop-aware slices.
+                    loop {
+                        if entry.state.lock().unwrap().stop_requested {
+                            return;
+                        }
+                        let remaining = previous_expiry - Utc::now();
+                        if remaining <= chrono::Duration::zero() {
+                            break;
+                        }
+                        let slice = remaining
+                            .to_std()
+                            .unwrap_or(Duration::from_secs(1))
+                            .min(Duration::from_secs(1));
+                        std::thread::sleep(slice);
+                    }
+                    // Renewed while we waited → a live driver owns this agent.
+                    if let Ok(Some(bytes)) = store.get_blob(crate::runtime::store::LEASE_FILE) {
+                        if let Ok(current) =
+                            serde_json::from_slice::<crate::runtime::store::RunLease>(&bytes)
+                        {
+                            if current.owner != lease_owner && current.expires_at > previous_expiry
+                            {
+                                tracing::info!(
+                                    agent = %entry.name,
+                                    holder = %current.owner,
+                                    "lease was renewed by a live driver; standing down"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    // Expired and unrenewed (dead node): loop re-acquires.
+                }
+                Err(err) => {
+                    tracing::warn!(agent = %entry.name, error = %err, "acquiring agent lease");
+                    break;
+                }
             }
         }
     }
@@ -803,6 +923,12 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         ctx.set_run_id(run_id.clone());
         ctx.set_input_mode(crate::runtime::context::InputMode::Pause);
         ctx.enable_persistence_with_store(run_dir.clone(), store.clone());
+        // The agent's model travels with its descriptor: a wake in a process
+        // configured for a different provider/model must not silently switch
+        // what the agent's prompts run on.
+        if let Some(ref model) = descriptor.model {
+            ctx.set_default_model(model.clone());
+        }
         // Same implicit workspace root as run/serve/resume: the project
         // directory (run_base is `<project>/.chidori/runs`). Without this, a
         // detached agent calling `chidori.workspace.*` fails unless the
@@ -1104,15 +1230,6 @@ fn settle_iteration(result: anyhow::Result<Value>, ctx: &RuntimeContext) -> Iter
     }
 }
 
-/// Strip the trailing failed host records off a crashed iteration's log (the
-/// crash frontier), mirroring the actor `resume` restart semantics.
-fn strip_crash_frontier(mut records: Vec<CallRecord>) -> Vec<CallRecord> {
-    while records.last().is_some_and(|r| r.error.is_some()) {
-        records.pop();
-    }
-    records
-}
-
 fn resolve_source(template_engine: &TemplateEngine, source: &str) -> PathBuf {
     let path = Path::new(source);
     if path.is_absolute() {
@@ -1194,7 +1311,12 @@ pub(crate) fn spawn_agent(backend: &HostBindingBackend, a: &Value) -> Result<Val
         .cloned()
         .filter(|v| !v.is_null())
         .unwrap_or_else(|| json!({}));
-    let options = SpawnOptions::parse(&options_value)?;
+    let mut options = SpawnOptions::parse(&options_value)?;
+    if options.model.is_none() {
+        // The spawner's resolved default model travels with the agent, so a
+        // wake in a differently-configured process keeps the same model.
+        options.model = Some(ctx.config().model);
+    }
     if !resolve_source(&backend.template_engine(), &source).is_file() {
         return Err(format!(
             "chidori.agents.spawn: source module not found: {source}"

@@ -384,6 +384,11 @@ pub enum InputMode {
 pub struct PendingInput {
     pub seq: u64,
     pub prompt: String,
+    /// The artifact under review (`input()`'s `opts.details`) — surfaced to
+    /// whoever answers (CLI render, server `pending_details`) so an approval
+    /// gate can show what it is approving. Never part of the durable record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 
 /// Set by `execute_signal` / `execute_signal_any` when a listen point has no
@@ -466,6 +471,53 @@ pub(crate) fn replay_lax() -> bool {
 
 /// Render call args for a divergence message without flooding the error with
 /// a multi-kilobyte prompt payload.
+/// Name the top-level keys that actually differ between a recorded call's
+/// args and the args the agent is calling with now — "the agent code changed"
+/// is the wrong diagnosis when the only drift is configuration (e.g. resuming
+/// under a different default model), so the error should say which knob moved.
+pub(crate) fn describe_args_divergence(
+    recorded: &serde_json::Value,
+    current: &serde_json::Value,
+) -> String {
+    let (Some(recorded), Some(current)) = (recorded.as_object(), current.as_object()) else {
+        return String::new();
+    };
+    let mut keys: Vec<&String> = recorded
+        .keys()
+        .chain(current.keys())
+        .filter(|k| *k != "request_digest" && recorded.get(*k) != current.get(*k))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        return String::new();
+    }
+    let mut description = format!(
+        " Differing field(s): {}.",
+        keys.iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if keys.iter().any(|k| *k == "model") {
+        let recorded_model = recorded
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unset>");
+        let current_model = current
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unset>");
+        description.push_str(&format!(
+            " The run was recorded with model `{recorded_model}` but is replaying under \
+             `{current_model}` — a configuration mismatch, not a code change; pass \
+             `--model {recorded_model}` (or leave `--model`/CHIDORI_MODEL unset so the \
+             model recorded in the run's manifest applies)."
+        ));
+    }
+    description
+}
+
 pub(crate) fn truncate_json_for_error(value: &serde_json::Value) -> String {
     let s = serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string());
     if s.chars().count() > 300 {
@@ -970,6 +1022,14 @@ impl RuntimeContext {
         self.inner.lock().unwrap().config.clone()
     }
 
+    /// Override the default model for prompts that don't set one in code —
+    /// used to make a run's recorded model travel with it (manifest on
+    /// resume, descriptor on a detached-agent wake) instead of being
+    /// re-derived from whatever environment happens to host the wake.
+    pub fn set_default_model(&self, model: String) {
+        self.inner.lock().unwrap().config.model = model;
+    }
+
     pub fn next_seq(&self) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         inner.seq += 1;
@@ -1002,6 +1062,19 @@ impl RuntimeContext {
     /// Check if there is a cached result for the given sequence number.
     /// If so, return it (and record the replayed call in the new log).
     /// If not, return None — the host function should execute normally.
+    /// Whether the NEXT durable call will be served from the replay journal.
+    /// A replayed call executes no side effect — its recorded result returns
+    /// from cache (or the divergence check refuses loudly) — so policy gates,
+    /// which exist to guard live effects, skip asking for it.
+    pub fn next_call_is_replayed(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let next = inner.seq + 1;
+        inner
+            .replay_log
+            .as_ref()
+            .is_some_and(|journal| journal.by_seq.contains_key(&next))
+    }
+
     pub fn try_replay(&self, seq: u64) -> Option<CallRecord> {
         let mut inner = self.inner.lock().unwrap();
         let mut record = {
@@ -1074,13 +1147,15 @@ impl RuntimeContext {
                 }
                 Err(format!(
                     "Replay divergence at seq {}: `{}` was recorded with arguments {} but the \
-                     agent now calls it with {}. The agent code (or its inputs) changed since \
-                     the checkpoint was saved — re-run without replay to regenerate, or set \
-                     CHIDORI_REPLAY_LAX=1 to tolerate argument drift and serve cached results.",
+                     agent now calls it with {}.{} The agent code (or its inputs/configuration) \
+                     changed since the checkpoint was saved — re-run without replay to \
+                     regenerate, or set CHIDORI_REPLAY_LAX=1 to tolerate argument drift and \
+                     serve cached results.",
                     seq,
                     expected_fn,
                     truncate_json_for_error(&record.args),
-                    truncate_json_for_error(expected_args)
+                    truncate_json_for_error(expected_args),
+                    describe_args_divergence(&record.args, expected_args)
                 ))
             }
             Some(record) => Ok(Some(record)),

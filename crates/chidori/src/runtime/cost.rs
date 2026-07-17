@@ -4,12 +4,69 @@
 /// deliberately approximate — the goal is a ballpark figure for the trace
 /// output and the `stats` command, not a billing-grade number. Update the
 /// table as new models ship.
+///
+/// Models the built-in table doesn't know (or knows wrong) can be priced via
+/// `CHIDORI_PRICING` — a JSON object of model prefix → per-MTok rates that is
+/// consulted BEFORE the built-in table:
+///
+/// ```text
+/// CHIDORI_PRICING='{"deepseek-v4-flash":{"input_per_mtok":0.28,"output_per_mtok":0.42,
+///                    "cache_read_multiplier":0.1}}'
+/// ```
+///
+/// `cache_read_multiplier`/`cache_write_multiplier` are optional (defaults
+/// 0.5 / 1.0, the OpenAI-compatible convention).
 
 #[derive(Debug, Clone, Copy)]
 struct Pricing {
     prefix: &'static str,
     input_per_mtok: f64,
     output_per_mtok: f64,
+}
+
+/// A user-supplied pricing row, parsed from `CHIDORI_PRICING`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct UserPricing {
+    input_per_mtok: f64,
+    output_per_mtok: f64,
+    #[serde(default)]
+    cache_read_multiplier: Option<f64>,
+    #[serde(default)]
+    cache_write_multiplier: Option<f64>,
+}
+
+/// Parse `CHIDORI_PRICING` once. A malformed value warns (once) and is
+/// ignored — pricing is advisory, never a reason to fail a run.
+fn user_pricing() -> &'static Vec<(String, UserPricing)> {
+    static TABLE: std::sync::OnceLock<Vec<(String, UserPricing)>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let Ok(raw) = std::env::var("CHIDORI_PRICING") else {
+            return Vec::new();
+        };
+        parse_user_pricing(&raw)
+    })
+}
+
+fn parse_user_pricing(raw: &str) -> Vec<(String, UserPricing)> {
+    match serde_json::from_str::<std::collections::BTreeMap<String, UserPricing>>(raw) {
+        Ok(map) => {
+            // Longest prefix first, so a specific row beats a generic one.
+            let mut rows: Vec<(String, UserPricing)> = map.into_iter().collect();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.0.len()));
+            rows
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "ignoring malformed CHIDORI_PRICING");
+            Vec::new()
+        }
+    }
+}
+
+fn user_pricing_for(model: &str) -> Option<&'static UserPricing> {
+    user_pricing()
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix.as_str()))
+        .map(|(_, pricing)| pricing)
 }
 
 const PRICING: &[Pricing] = &[
@@ -109,11 +166,12 @@ fn cache_multipliers(model: &str) -> (f64, f64) {
     }
 }
 
-/// Whether the pricing table knows this model. Callers displaying costs
-/// should distinguish "$0 because free" from "$0 because unpriced" — an
-/// unpriced model's cost is unknown, not zero.
+/// Whether the pricing table (user-supplied `CHIDORI_PRICING` or built-in)
+/// knows this model. Callers displaying costs should distinguish "$0 because
+/// free" from "$0 because unpriced" — an unpriced model's cost is unknown,
+/// not zero.
 pub fn is_priced_model(model: &str) -> bool {
-    PRICING.iter().any(|p| model.starts_with(p.prefix))
+    user_pricing_for(model).is_some() || PRICING.iter().any(|p| model.starts_with(p.prefix))
 }
 
 /// Estimate USD cost for a single LLM call. Returns 0.0 for unknown models
@@ -131,14 +189,24 @@ pub fn estimate_cost_usd_with_cache(
     cache_creation_tokens: u64,
     cache_read_tokens: u64,
 ) -> f64 {
-    let Some(p) = PRICING.iter().find(|p| model.starts_with(p.prefix)) else {
-        return 0.0;
-    };
-    let (write_mult, read_mult) = cache_multipliers(model);
-    let input = (input_tokens as f64 / 1_000_000.0) * p.input_per_mtok;
-    let cache_write = (cache_creation_tokens as f64 / 1_000_000.0) * p.input_per_mtok * write_mult;
-    let cache_read = (cache_read_tokens as f64 / 1_000_000.0) * p.input_per_mtok * read_mult;
-    let output = (output_tokens as f64 / 1_000_000.0) * p.output_per_mtok;
+    let (input_per_mtok, output_per_mtok, write_mult, read_mult) =
+        if let Some(user) = user_pricing_for(model) {
+            (
+                user.input_per_mtok,
+                user.output_per_mtok,
+                user.cache_write_multiplier.unwrap_or(1.0),
+                user.cache_read_multiplier.unwrap_or(0.5),
+            )
+        } else if let Some(p) = PRICING.iter().find(|p| model.starts_with(p.prefix)) {
+            let (write_mult, read_mult) = cache_multipliers(model);
+            (p.input_per_mtok, p.output_per_mtok, write_mult, read_mult)
+        } else {
+            return 0.0;
+        };
+    let input = (input_tokens as f64 / 1_000_000.0) * input_per_mtok;
+    let cache_write = (cache_creation_tokens as f64 / 1_000_000.0) * input_per_mtok * write_mult;
+    let cache_read = (cache_read_tokens as f64 / 1_000_000.0) * input_per_mtok * read_mult;
+    let output = (output_tokens as f64 / 1_000_000.0) * output_per_mtok;
     input + cache_write + cache_read + output
 }
 
@@ -163,6 +231,20 @@ mod tests {
         assert!(is_priced_model("claude-sonnet-4-6"));
         assert!(is_priced_model("gpt-4o"));
         assert!(!is_priced_model("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn test_user_pricing_parses_and_prefers_longest_prefix() {
+        let rows = parse_user_pricing(
+            r#"{"deepseek":{"input_per_mtok":1.0,"output_per_mtok":2.0},
+                "deepseek-v4-flash":{"input_per_mtok":0.28,"output_per_mtok":0.42,
+                                     "cache_read_multiplier":0.1}}"#,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "deepseek-v4-flash"); // longest prefix first
+        assert!((rows[0].1.input_per_mtok - 0.28).abs() < f64::EPSILON);
+        assert_eq!(rows[0].1.cache_read_multiplier, Some(0.1));
+        assert!(parse_user_pricing("not json").is_empty());
     }
 
     #[test]

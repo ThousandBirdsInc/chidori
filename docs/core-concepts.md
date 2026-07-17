@@ -37,6 +37,20 @@ directly, so the runtime sees and records everything. See
 | `chidori.util.retry(fn, options)` | Retry with backoff (in-VM helper) |
 | `chidori.util.tryCall(fn)` | Capture errors without raising (in-VM helper) |
 
+**The tool loop is built in.** `chidori.prompt(text, { tools: ["hn_search"],
+maxTurns: 8 })` runs a complete provider tool-use loop — the model calls
+tools, the runtime executes them and feeds results back, up to `maxTurns` —
+and returns the final text; every inner call is journaled like any other
+effect. Hand-roll the loop with `context().respond()` / `toolResult()` only
+when you need per-step control (inspecting each call, streaming progress
+between steps, custom budgets — see
+[`examples/agents/worker.ts`](../examples/agents/worker.ts)).
+
+**Approval gates can show their artifact.** `chidori.input(prompt, { details })`
+carries the thing under review (a draft, a diff); the CLI prints it above the
+prompt and a paused session exposes it as `pending_details`, so a human never
+approves blind.
+
 There is no `chidori.http`. Networking is done with the **standard web/Node
 APIs** — `fetch` (plus `Headers`/`Request`/`Response`) and the
 `node:http`/`node:https` client modules — which the runtime replaces with

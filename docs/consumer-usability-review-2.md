@@ -300,6 +300,70 @@ Fairness requires the same list rigor as the complaints:
   api.deepseek.com") de-confused every failure; `input()` honored its
   default at EOF through the approval gate.
 
+## Status: fixes shipped
+
+Every finding above was addressed on this branch, in the same series of
+commits as this update, and re-verified against the original scenarios:
+
+- **Finding 1 (crash-resume)** — `chidori resume` accepts
+  `--trusted`/`--untrusted`/`--tools`, journals live continuation into the
+  same run dir, and takes the run's lease against concurrent drivers.
+  Investigating the re-verification exposed the *actual* root cause beneath
+  the policy gap: replayed `spawn_actor` records never re-created actors
+  unless a live `send`/`join` addressed them — a `receive`-driven fan-in
+  never does, so crash-resumed pipelines starved regardless of policy. Live
+  `receive` now re-materializes every recorded-but-unsettled actor
+  (regression-tested). Re-run: SIGKILL mid-fan-out → `resume --trusted` →
+  completed and published in 61s; then a bare `chidori resume` with an
+  invalid key replayed all 192 calls byte-identically in 0.16s **with no
+  flags at all**.
+- **Finding 2 (flaky restart)** — the crash-frontier strip cascades to the
+  frontier's nested effects (shared by actors and detached agents;
+  regression-tested). Re-run of the flaky lab: upstream hit exactly twice,
+  `restarts: 1`, `completed`.
+- **Finding 3 (silent actor death)** — a `failed`/`paused` settle delivers
+  a `__chidori.down__` monitor message to the owner's mailbox, and a
+  `receive` (even with `timeoutMs`) fails fast with guidance once every
+  spawned actor has settled with nothing matching queued. Both
+  regression-tested.
+- **Finding 4 (detached wedge)** — a wake that finds a dead process's lease
+  now waits it out and takes over (standing down only for a holder that
+  actively renews); the alarm timer doubles as a reconciler that re-drives
+  `running`-with-no-worker agents; a queued send wakes them too. Status
+  reports `live` (is a worker actually executing here) and surfaces the
+  real error on failure. Replacement spawns migrate the settled
+  predecessor's unconsumed inbox — mail follows the name. Re-run of the
+  wedge repro: self-healed after lease expiry, consumed the tip delivered
+  during the wedge window, hibernated with its alarm armed.
+- **Finding 5 (model doesn't travel)** — the run's resolved model is
+  recorded in its manifest and applied by `resume`, `branch-resume`,
+  `branch-rerun`, and the server's resume/replay/approve routes; detached
+  agents carry theirs in the registry descriptor (spawn option `model`,
+  defaulting to the spawner's). A model-mismatch divergence now names the
+  differing field and both models instead of claiming "the agent code
+  changed".
+- **Finding 6 (observability)** — `chidori trace` labels every record with
+  its owner (`researcher-1 (actor-1)`, `branch:exec-brief`), prints an
+  owners roster, and shows range-relative offsets instead of 13-digit seqs;
+  trace and `stats` display prompt-cache read/write totals and price with
+  cache-aware rates; `CHIDORI_PRICING` teaches the cost tables any model.
+  The 192-call newsroom run now traces with a real dollar figure
+  (`$0.011356`) and its 18,944 cached tokens visible.
+- **Finding 7 (assorted)** — `chidori.input()` takes `details` (the CLI
+  renders it above the prompt; paused sessions expose `pending_details`);
+  `chidori serve` without a file hosts the fleet alone and rejects
+  defaultless sessions with guidance; `chidori run` announces the run id on
+  stderr at start (it now survives SIGKILL); the built-in
+  `prompt({tools, maxTurns})` tool loop, the SSRF allowlist for
+  local-service tools, and the zero-padded branch-store path are documented
+  (core-concepts, llm.txt, branching doc); the README resume example is
+  accurate again.
+
+One fix begat a guard worth noting: because resume now persists, an
+early-diverged resume attempt could have *truncated* a journal with its
+shorter log — the persister refuses shorter-than-durable checkpoint writes
+(`resume --until-seq` time travel opts out explicitly).
+
 ## The consumer verdict
 
 Would I build on this today? For a **single durable agent with
@@ -319,6 +383,12 @@ a cascaded frontier strip, a loud registry error, a manifest field) —
 none require touching the engine, which is visibly the strongest thing
 here. Round 1 ended "ship the polish"; round 2's version is: **ship the
 failure paths.** The features work; it's their *failures* that don't.
+
+*(Postscript: shipped — see [Status: fixes shipped](#status-fixes-shipped)
+above. One caveat the fixes surfaced: "fixable at the surface" was wrong
+for Finding 1 — the crash-resume failure ran deeper than the missing flag,
+into actor re-materialization at live receives — but it landed all the
+same, with regression tests.)*
 
 ---
 

@@ -71,6 +71,7 @@ async fn create_thread(
         error: None,
         pending_seq: None,
         pending_prompt: None,
+        pending_details: None,
         pending_signal_name: None,
         pending_signal_names: Vec::new(),
         pending_signal_deadline: None,

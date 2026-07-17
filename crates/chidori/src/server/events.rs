@@ -50,6 +50,17 @@ pub(super) async fn handle_event(
     });
 
     let input = json!({"event": event});
+    if !state.has_default_agent {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(
+                json!({"error": "this server was started without an agent file \
+                (fleet-only mode), so there is no agent(event) handler; use the \
+                /agents/detached/* endpoints or restart the server with an agent path"}),
+            ),
+        )
+            .into_response();
+    }
     let app_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {

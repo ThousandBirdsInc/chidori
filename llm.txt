@@ -55,7 +55,11 @@ chidori run agents/my_agent.ts --trace
 chidori chat --system "You are a concise assistant." --model claude-sonnet
 chidori chat agents/chat.ts                 # chat through a conversational agent file
 chidori serve agents/webhook.ts --port 8080 --trusted
-chidori resume agents/my_agent.ts <run_id>  # replay a recorded run byte-for-byte with zero model calls (durable resume)
+chidori serve --port 8080                   # no FILE: fleet-only server (detached agents; sessions must name an agent)
+chidori resume agents/my_agent.ts <run_id>  # replay a recorded run byte-for-byte with zero model calls (durable resume);
+                                            # the run's recorded model applies automatically (override with --model)
+chidori resume agents/my_agent.ts <run_id> --trusted --tools tools  # crash recovery of a trusted tool-using run:
+                                            # same posture flags as `run`; continuation journals into the same run dir
 chidori resume agents/my_agent.ts <run_id> --allow-source-change  # edit-and-resume: replay against edited code (divergence-checked)
 chidori trace <run_id>
 chidori snapshot <run_id>
@@ -101,10 +105,17 @@ Options:
   `"subagent"`, or `"final"`.
 - `model`: provider model override. Prompts that don't set it use the run's
   default model (`--model` / `CHIDORI_MODEL`, falling back to
-  `claude-sonnet-4-6`).
+  `claude-sonnet-4-6`). The resolved default is recorded in the run's
+  manifest, so `resume`/`branch-rerun` re-run under the same model
+  automatically.
 - `system`: system prompt for this call.
 - `maxTokens`: output token cap.
-- `maxTurns`: cap on provider tool-use turns.
+- `maxTurns`: cap on provider tool-use turns — with `tools` set, `prompt()`
+  runs a COMPLETE provider tool-use loop internally (call tools, feed back
+  results, repeat up to `maxTurns`) and returns the final text. Reach for
+  the manual `context().respond()`/`toolResult()` loop only when you need
+  per-step control (inspecting calls, streaming progress between steps,
+  custom budgets).
 - `temperature`: sampling temperature.
 - `tools`: registered tool names available to provider tool-use loops.
 - `format`: `"json"` parses the reply as JSON (falls back to the raw string).
@@ -225,8 +236,14 @@ const answer = await chidori.input("Approve this request?", {
   type: "approval",
   choices: ["yes", "no"],
   default: "no",
+  details: draft,   // the artifact under review — shown to the human
 });
 ```
+
+`details` carries the thing being approved (a draft, a diff, a report): the
+CLI prints it above the prompt, and a paused session exposes it as
+`pending_details` alongside `pending_prompt` — so approval gates are never
+blind. It is display-only and never part of the durable record.
 
 In server mode, `input()` pauses the session. Resume it with
 `POST /sessions/{id}/resume` or `AgentClient.resume(id, response)`.
@@ -270,7 +287,15 @@ const result = await chidori.tool("web_search", { query: "snapshot runtime" });
 Tools discovered from disk are TypeScript `.ts` modules or MCP-backed remote
 tools. Tool directory discovery ignores `.star` files. `chidori run`,
 `chidori serve`, and `chidori resume` all scan `<agent dir>/tools/`
-implicitly; `run` and `serve` also accept extra directories via `--tools`.
+implicitly; all three also accept extra directories via `--tools`.
+
+A tool's `fetch` is SSRF-guarded by default: requests to hosts that resolve
+to non-public addresses (localhost, RFC-1918 ranges) are refused even under
+`--trusted`. Tools that talk to local services (an Ollama sidecar, a local
+index) need `CHIDORI_HTTP_ALLOW_HOSTS=127.0.0.1` (comma-separated hosts,
+IPs, or CIDRs; `*` disables the guard). Provider endpoints
+(`CHIDORI_OPENAI_COMPAT_URL=http://localhost:11434`) are NOT affected — the
+guard covers only agent/tool-initiated http effects.
 
 ### callAgent
 
@@ -368,10 +393,19 @@ concurrently on its own thread with a durable mailbox. Inside an actor,
 the signal envelope; `from.id` is the sending actor's pid, or `"run"`), and
 `receive` waits in place without pausing the run. Restart strategies:
 `clean` re-runs from scratch; `resume` replays the actor's accumulated log
-minus the trailing failed records, so completed work returns from cache and
-only the failing call retries. Every primitive is a durable call — replay of
-the spawning run re-runs nothing — and a crash before a join re-creates the
-actor on resume from the recorded spawn/send records.
+minus the trailing failed records (including their nested effects — a failed
+tool call's inner http record retries live, not from cache), so completed
+work returns from cache and only the failing call retries. Every primitive
+is a durable call — replay of the spawning run re-runs nothing — and a crash
+before a join re-creates the actor on resume from the recorded spawn/send
+records.
+
+Actor death is observable: a `failed` or `paused` settle delivers a
+`"__chidori.down__"` message to the owner's mailbox
+(`{ pid, name, status, error?, pendingPrompt?, restarts }`) — include it in
+fan-in receives (`receive(["result", "__chidori.down__"])`). A `receive`
+(even with `timeoutMs`) fails fast once every spawned actor has settled and
+nothing matching is queued.
 
 Actors form **supervision trees**: an actor can spawn its own supervised
 children (each level carves child sequence ranges out of its own, bounding
@@ -395,6 +429,8 @@ const svc = await chidori.agents.spawn("services/inbox-triager.ts", {}, {
   restart: "resume",       // "never" | "clean" | "resume" (default)
   maxRestarts: 3,
   backoffMs: 500,
+  model: "deepseek-chat",  // optional; defaults to the spawner's resolved model
+                           // and travels with the agent across wakes/restarts
 });
 
 await svc.send("email", { from: "a@x.com" });          // durable delivery; wakes a
@@ -699,7 +735,21 @@ route by model name, first match wins):
 
 The default model for prompts that don't set `model` in code is
 `CHIDORI_MODEL` (or `--model` on `run`/`resume`), falling back to
-`claude-sonnet-4-6`.
+`claude-sonnet-4-6`. The resolved default is recorded in each run's
+manifest, so `resume`, `branch-resume`/`branch-rerun`, and server
+resume/replay routes re-run under the run's own model with no flags.
+Detached agents likewise carry their model in their registry descriptor.
+
+Cost estimation covers Anthropic/OpenAI models out of the box; teach it
+other models with `CHIDORI_PRICING` (JSON, model prefix → USD per MTok,
+consulted before the built-in table):
+
+```bash
+CHIDORI_PRICING='{"deepseek-v4-flash":{"input_per_mtok":0.28,"output_per_mtok":0.42,"cache_read_multiplier":0.1}}'
+```
+
+`chidori trace` and `chidori stats` display prompt-cache read/write token
+totals alongside cost.
 
 `chidori.workspace.*` roots at the project directory under `run`, `resume`,
 and `serve`; `CHIDORI_WORKSPACE_ROOT` overrides the location.

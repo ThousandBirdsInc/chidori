@@ -36,6 +36,26 @@ Replay is guarded, not best-effort:
   divergence to a warning (serving the cached result / re-executing live,
   the historical behavior). Function-name mismatches are always fatal.
 
+`chidori resume` carries the run's own configuration so recovery needs no
+flag archaeology:
+
+- **The model travels with the run.** The run's resolved default model is
+  recorded in its manifest; `resume` (and `branch-resume`/`branch-rerun`,
+  and the server's resume/replay/approve routes) default to it. A bare
+  `chidori resume agent.ts <run-id>` replays a `--model`-started run
+  byte-for-byte; an explicit `--model`/`CHIDORI_MODEL` still overrides —
+  and a divergence error that stems from a model mismatch says so, naming
+  both models, instead of blaming "changed code".
+- **Trust and tools mirror `run`.** `resume` accepts `--trusted` /
+  `--untrusted` and `--tools <dir>` so live continuation past the replay
+  frontier (crash recovery) executes under the same posture the original
+  `chidori run --trusted --tools …` had. Without `--trusted`, gated effects
+  re-ask at the terminal exactly like `run`.
+- **Continuation is journaled.** Live records past the frontier persist
+  into the same run directory, so a resume that itself crashes resumes from
+  the *new* frontier — and the run's lease (`lease.json`) refuses a second
+  concurrent driver of the same run dir.
+
 This means you can:
 - **Debug without spending money:** save a failing session, replay locally with breakpoints.
 - **Run deterministic tests:** check in a checkpoint, assert the agent's behavior hasn't changed.

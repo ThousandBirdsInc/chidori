@@ -63,10 +63,31 @@ pub(super) fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engi
         .with_workspace_root(workspace_root)
 }
 
+/// Layer a persisted run's recorded default model onto an engine, when its
+/// manifest carries one: resume/replay/approve re-runs of a session keep the
+/// model the run was recorded with, instead of silently switching to
+/// whatever the serving process's environment says.
+pub(super) fn with_manifest_model(engine: Engine, app: &AppState, run_id: &str) -> Engine {
+    let model = crate::runtime::snapshot::SnapshotStore::new(app.run_base.join(run_id))
+        .load_manifest()
+        .ok()
+        .and_then(|manifest| manifest.default_model);
+    match model {
+        Some(model) => engine.with_default_model(Some(model)),
+        None => engine,
+    }
+}
+
 /// Synchronous one-shot runner used by the ACP endpoint. Runs the agent on
 /// the current thread (already inside spawn_blocking) and returns the output
 /// JSON. Any error is bubbled as an anyhow::Error.
 pub(super) fn run_agent_sync(app: &AppState, inputs: Value) -> anyhow::Result<Value> {
+    if !app.has_default_agent {
+        anyhow::bail!(
+            "this server was started without an agent file (fleet-only mode); \
+             restart it with an agent path to serve agent runs"
+        );
+    }
     let engine = build_engine(app, None);
     let result = engine.run(&app.agent_path, &inputs)?;
     Ok(result.output)
