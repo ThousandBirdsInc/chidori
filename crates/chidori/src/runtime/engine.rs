@@ -65,6 +65,10 @@ pub struct Engine {
 pub struct RunResult {
     pub output: Value,
     pub call_log: CallLog,
+    /// How many of `call_log`'s records were served from the replay journal
+    /// rather than executed live — the audited replay/re-execution split a
+    /// resume reports to the consumer.
+    pub replayed_calls: u64,
     #[allow(dead_code)]
     pub run_id: String,
     /// Set when the agent called `input()` in Pause mode. The caller should
@@ -948,6 +952,7 @@ impl Engine {
                     return Some(RunResult {
                         output: Value::Null,
                         call_log: ctx.call_log(),
+                        replayed_calls: ctx.replay_hit_count(),
                         run_id: ctx.run_id(),
                         paused: Some(pending),
                         paused_approval: None,
@@ -962,6 +967,7 @@ impl Engine {
                     return Some(RunResult {
                         output: Value::Null,
                         call_log: ctx.call_log(),
+                        replayed_calls: ctx.replay_hit_count(),
                         run_id: ctx.run_id(),
                         paused: None,
                         paused_approval: Some(approval),
@@ -979,6 +985,7 @@ impl Engine {
                     return Some(RunResult {
                         output: Value::Null,
                         call_log: ctx.call_log(),
+                        replayed_calls: ctx.replay_hit_count(),
                         run_id: ctx.run_id(),
                         paused: None,
                         paused_approval: None,
@@ -1024,6 +1031,7 @@ impl Engine {
                     Ok(RunResult {
                         output,
                         call_log: ctx.call_log(),
+                        replayed_calls: ctx.replay_hit_count(),
                         run_id: ctx.run_id(),
                         paused: None,
                         paused_approval: None,
@@ -1199,7 +1207,7 @@ mod tests {
             r#"
                 import type { Chidori } from "chidori:agent";
                 export async function agent(input: { name: string }, chidori: Chidori) {
-                    await chidori.log("starting");
+                    await chidori.log("starting", { who: input.name, attempt: 1 });
                     return { greeting: "Hello, " + input.name };
                 }
             "#,
@@ -1222,6 +1230,14 @@ mod tests {
         let records = result.call_log.into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].function, "log");
+        // The structured fields object must reach the journal — the binding
+        // used to silently forward only the message.
+        assert_eq!(
+            records[0].args.get("fields"),
+            Some(&serde_json::json!({ "who": "TypeScript", "attempt": 1 })),
+            "log fields are journaled: {:?}",
+            records[0].args
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

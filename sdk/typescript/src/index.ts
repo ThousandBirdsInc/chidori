@@ -290,6 +290,18 @@ export class Session {
      * when it passes. `null` when the pause has no timeout.
      */
     public pendingSignalDeadline: string | null = null,
+    /**
+     * The artifact under review for an `input()` pause created with
+     * `{ details }` (a draft, a diff) — surface it so a human never approves
+     * blind. `null` when the pause carries no details.
+     */
+    public pendingDetails: string | null = null,
+    /**
+     * The durable run directory id (`.chidori/runs/<run_id>`) this session
+     * journals into. Deliberately distinct from the session id: `chidori
+     * resume <agent.ts> <run_id>` and `chidori trace <run_id>` take THIS id.
+     */
+    public runId: string | null = null,
   ) {}
 
   get ok(): boolean {
@@ -658,6 +670,8 @@ export class AgentClient {
       (data.pending_signal_name as string | undefined) ?? null,
       (data.pending_signal_names as string[] | undefined) ?? [],
       (data.pending_signal_deadline as string | undefined) ?? null,
+      (data.pending_details as string | undefined) ?? null,
+      (data.run_id as string | undefined) ?? null,
     );
   }
 

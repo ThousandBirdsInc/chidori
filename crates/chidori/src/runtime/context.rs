@@ -234,6 +234,11 @@ struct RuntimeContextInner {
     /// records are already durable via the O(1) journal append in
     /// `record_call`, so steady-state safepoints skip the O(history) rewrite.
     pub call_log_dirty: bool,
+    /// How many records in `call_log` were served from the replay journal
+    /// (`try_replay` / `absorb_replayed_subtree`) rather than executed live.
+    /// Surfaced after a resume so the consumer can audit what a recovery
+    /// actually replayed vs. re-executed (and re-billed).
+    pub replay_hits: u64,
     /// Sequence counter for call log entries.
     pub seq: u64,
     /// Pre-loaded call log for replay mode. When set, host functions
@@ -564,6 +569,7 @@ impl RuntimeContext {
                 config: AgentConfig::default(),
                 call_log: CallLog::new(),
                 call_log_dirty: false,
+                replay_hits: 0,
                 seq: 0,
                 replay_log: None,
                 run_id: uuid::Uuid::new_v4().to_string(),
@@ -639,6 +645,7 @@ impl RuntimeContext {
                 config: AgentConfig::default(),
                 call_log: CallLog::new(),
                 call_log_dirty: false,
+                replay_hits: 0,
                 seq: 0,
                 replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id: uuid::Uuid::new_v4().to_string(),
@@ -686,6 +693,7 @@ impl RuntimeContext {
                 // Seeded records never went through this context's store
                 // handle; the first checkpoint write must include them.
                 call_log_dirty: true,
+                replay_hits: 0,
                 seq,
                 replay_log: None,
                 run_id,
@@ -741,6 +749,7 @@ impl RuntimeContext {
                 config: parent_inner.config.clone(),
                 call_log: CallLog::new(),
                 call_log_dirty: false,
+                replay_hits: 0,
                 seq: base_seq,
                 replay_log: None,
                 run_id,
@@ -797,6 +806,7 @@ impl RuntimeContext {
                 config: AgentConfig::default(),
                 call_log: CallLog::new(),
                 call_log_dirty: false,
+                replay_hits: 0,
                 seq: base_seq,
                 replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id,
@@ -864,6 +874,7 @@ impl RuntimeContext {
                 config: parent_inner.config.clone(),
                 call_log: CallLog::new(),
                 call_log_dirty: false,
+                replay_hits: 0,
                 seq: base_seq,
                 replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id: actor_id.clone(),
@@ -1100,7 +1111,16 @@ impl RuntimeContext {
         // covering the replayed prefix plus any synthetic resume records.
         inner.call_log.push(record.clone());
         inner.call_log_dirty = true;
+        inner.replay_hits += 1;
         Some(record)
+    }
+
+    /// How many call-log records were served from the replay journal rather
+    /// than executed live. After a resume this is the audited "replayed"
+    /// count; `call_log_len() - replay_hit_count()` is what actually
+    /// re-executed (and re-billed).
+    pub fn replay_hit_count(&self) -> u64 {
+        self.inner.lock().unwrap().replay_hits
     }
 
     /// Replay-cache lookup with divergence check. Returns:
@@ -1210,6 +1230,7 @@ impl RuntimeContext {
                 if r.seq != root_seq && subtree.contains(&r.seq) {
                     inner.call_log.push(r.clone());
                     inner.call_log_dirty = true;
+                    inner.replay_hits += 1;
                     max_seq = max_seq.max(r.seq);
                 }
             }

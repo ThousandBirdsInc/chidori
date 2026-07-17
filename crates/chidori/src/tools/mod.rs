@@ -183,6 +183,13 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
+    /// Tool files that were found but failed to load, with the reason each
+    /// was skipped. Surfaced by `chidori tools` and startup warnings so a
+    /// broken tool is a diagnosable event, not a silent absence.
+    pub fn load_errors(&self) -> &[(PathBuf, String)] {
+        &self.load_errors
+    }
+
     pub fn list(&self) -> Vec<&ToolDef> {
         let mut tools: Vec<_> = self.tools.values().collect();
         tools.sort_by_key(|t| &t.name);
@@ -206,12 +213,35 @@ impl ToolRegistry {
                 let path = entry.path();
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ext == "ts" {
+                    // A `.ts` file that never declares `export const tool` is
+                    // a helper module tools import, not a broken tool — skip
+                    // it quietly. Only a file that CLAIMS to be a tool and
+                    // fails to load warrants the loud warning below.
+                    if let Ok(source) = std::fs::read_to_string(&path) {
+                        if !crate::runtime::typescript::tools::source_declares_tool(&source) {
+                            tracing::debug!(
+                                path = %path.display(),
+                                "skipping .ts file without an `export const tool` declaration"
+                            );
+                            continue;
+                        }
+                    }
                     match parse_tool_file(&path) {
                         Ok(tool) => {
                             registry.register(tool);
                         }
                         Err(e) => {
                             let reason = format!("{e:#}");
+                            // A tool file that fails to load must not vanish
+                            // silently: the consumer finds out mid-run, after
+                            // the spend, as "Unknown tool". Warn on stderr the
+                            // way truncated prompts do — tracing alone is
+                            // invisible in a default CLI session.
+                            eprintln!(
+                                "chidori: warning: tool file {} skipped: {}",
+                                path.display(),
+                                reason.lines().next().unwrap_or(&reason)
+                            );
                             tracing::warn!(
                                 path = %path.display(),
                                 error = %reason,
@@ -397,6 +427,28 @@ mod tests {
             && !param.required
             && param.default == Some(Value::Number(3.into()))));
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn helper_module_without_tool_export_is_skipped_quietly() {
+        // A `.ts` helper that tools import (no `export const tool`) must not
+        // land in load_errors — only files that CLAIM to be tools and fail
+        // to load are diagnosable events.
+        let dir = std::env::temp_dir().join(format!("chidori-helper-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("parse.ts"),
+            "export function parse(s: string) { return s; }\n",
+        )
+        .unwrap();
+        let registry = ToolRegistry::load_from_dirs(&[dir.clone()]).unwrap();
+        assert!(registry.list().is_empty());
+        assert!(
+            registry.load_errors().is_empty(),
+            "helper module recorded as a load error: {:?}",
+            registry.load_errors()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

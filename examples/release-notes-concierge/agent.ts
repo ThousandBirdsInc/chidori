@@ -50,8 +50,9 @@ run(async (input: { audience?: string; feedback?: string[]; maxThemes?: number }
   );
   const themes: Theme[] = (clustering as any).themes ?? [];
   if (themes.length === 0) {
-    // format:"json" silently falls back to the raw string on truncation/parse
-    // failure — without this guard the agent "succeeds" with an empty product.
+    // format:"json" now throws on truncated/unparseable output by default, so
+    // this guard covers only the residual case: valid JSON of the wrong shape.
+    // Without it the agent would "succeed" with an empty product.
     throw new Error("theme clustering returned no themes: " + String(clustering).slice(0, 200));
   }
   await chidori.log("themes", { titles: themes.map((t) => t.title) });

@@ -277,6 +277,27 @@ enum Commands {
         trusted: bool,
     },
 
+    /// Replay a recorded run as a deterministic test: re-run the agent with
+    /// every host call served from the journal, with NO provider configured
+    /// and NO writes to the run directory (top-level workspace effects
+    /// re-materialize their recorded artifacts, byte-identical), and assert
+    /// the run completes with output identical to the recorded one. Exit 0 on pass; non-zero with a
+    /// diagnosis on drift (changed source refuses, a diverging call fails
+    /// loudly, a run that tries to execute anything live fails). Commit a run
+    /// directory to git and run this in CI — a full integration test that
+    /// costs $0 and takes milliseconds.
+    Verify {
+        /// Agent .ts file (same one the run was created from)
+        file: PathBuf,
+
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to agent file's parent)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+    },
+
     /// List a run's persisted `chidori.branch` sub-runs and their states.
     Branches {
         /// Run id (subdirectory name under `.chidori/runs/`)
@@ -526,9 +547,10 @@ fn on_js_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 /// agent file.
 fn display_project_root_of(command: &Commands) -> Option<PathBuf> {
     let file = match command {
-        Commands::Run { file, .. } | Commands::Check { file } | Commands::Resume { file, .. } => {
-            file.clone()
-        }
+        Commands::Run { file, .. }
+        | Commands::Check { file }
+        | Commands::Resume { file, .. }
+        | Commands::Verify { file, .. } => file.clone(),
         Commands::Serve { file, .. } => file.clone()?,
         Commands::Chat { agent, .. } => agent.clone()?,
         _ => return None,
@@ -643,6 +665,9 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             },
             false,
         ),
+        Commands::Verify { file, run_id, dir } => {
+            (cmd_verify(&file, &run_id, dir.as_deref()), false)
+        }
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
         Commands::BranchResume {
             run_id,
@@ -1645,6 +1670,7 @@ fn cmd_tools(dirs: &[PathBuf]) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        print_tool_load_errors(&registry);
         return Ok(());
     }
 
@@ -1662,7 +1688,30 @@ fn cmd_tools(dirs: &[PathBuf]) -> Result<()> {
         println!();
     }
 
+    print_tool_load_errors(&registry);
     Ok(())
+}
+
+/// A `.ts` file in a tool directory that failed to load is the number-one
+/// silent footgun (e.g. an import that escapes the tool directory): the
+/// consumer's next signal is an "Unknown tool" failure mid-run. Print each
+/// skipped file and why.
+fn print_tool_load_errors(registry: &ToolRegistry) {
+    let errors = registry.load_errors();
+    if errors.is_empty() {
+        return;
+    }
+    println!(
+        "{} tool file(s) failed to load and are NOT registered:",
+        errors.len()
+    );
+    for (path, reason) in errors {
+        println!(
+            "  {} — {}",
+            path.display(),
+            reason.lines().next().unwrap_or(reason)
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1793,10 +1842,131 @@ fn cmd_resume(
 
     let output_str = serde_json::to_string_pretty(&result.output)?;
     println!("{output_str}");
+    // Report the replayed/live split — the total alone reads as "everything
+    // was replayed" and hides what the recovery actually re-executed (and
+    // re-billed). In-flight work at a crash re-executes by design
+    // (at-least-once), so the live count is the honest recovery cost.
+    let total = result.call_log.records().len() as u64;
     eprintln!(
-        "\nResumed from {} ({} calls replayed)",
-        run_id,
-        result.call_log.records().len()
+        "\nResumed from {run_id} ({} recorded calls replayed, {} executed live)",
+        result.replayed_calls,
+        total.saturating_sub(result.replayed_calls)
+    );
+    Ok(())
+}
+
+/// `chidori verify` — checkpoint-as-test as a first-class command. Replays a
+/// recorded run with no provider configured, a deny-all policy, and no
+/// persistence (the run directory is never written), then asserts the run
+/// completed with byte-identical output. Every drift mode fails loudly:
+/// changed source refuses via the manifest check, a diverging recorded call
+/// errors positionally, a run that reaches for anything live has no provider
+/// (and no allowed gated effects) to reach.
+fn cmd_verify(file: &Path, run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .or_else(|| file.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
+
+    use crate::runtime::store::RunStore as _;
+    let store = crate::runtime::store::FsRunStore::new(run_dir.clone());
+    let records = store
+        .load_call_log()?
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+    let recorded_output: Option<Value> = store
+        .get_blob("output.json")?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+
+    let input_path = run_dir.join("input.json");
+    let input_value: Value = if input_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&input_path)?)
+            .unwrap_or(Value::Object(Default::default()))
+    } else {
+        Value::Object(Default::default())
+    };
+
+    // Drift gate 1: the agent source must match the recorded fingerprints.
+    // No `--allow-source-change` escape here — a verify against edited code
+    // is not a verification.
+    crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file, false)
+        .context("verify refused: the agent source no longer matches this run's checkpoint")?;
+
+    // No providers, deny-all policy, no persistence: the replay must be able
+    // to answer EVERY effect from the journal or fail.
+    let providers = Arc::new(ProviderRegistry::new());
+    let template_engine = Arc::new(TemplateEngine::new(&base_dir));
+    let tokio_rt =
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
+    let tool_dirs = vec![base_dir.join("tools")];
+    let tools =
+        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let manifest_model = crate::runtime::snapshot::SnapshotStore::new(run_dir.clone())
+        .load_manifest()
+        .ok()
+        .and_then(|manifest| manifest.default_model);
+    let engine = Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(tools)
+        .with_policy(Arc::new(
+            policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
+        ))
+        .with_default_model(manifest_model)
+        .with_workspace_root(abs_dir(&base_dir));
+
+    let journal_len = records.len() as u64;
+    let result = engine
+        .resume_run(file, &input_value, records, run_id)
+        .context("verify FAILED: the recorded run did not replay cleanly")?;
+
+    if result.paused.is_some() || result.paused_approval.is_some() || result.paused_signal.is_some()
+    {
+        anyhow::bail!(
+            "verify FAILED: the run replayed to a pause instead of completing — \
+             only completed runs can be verified"
+        );
+    }
+    if let Some(recorded) = recorded_output {
+        if recorded != result.output {
+            anyhow::bail!(
+                "verify FAILED: replayed output differs from the recorded output.\n\
+                 recorded: {}\n\
+                 replayed: {}",
+                serde_json::to_string(&recorded).unwrap_or_default(),
+                serde_json::to_string(&result.output).unwrap_or_default()
+            );
+        }
+    } else {
+        eprintln!(
+            "chidori: warning: no recorded output.json under {} — verified replay \
+             consistency only, not output identity",
+            run_dir.display()
+        );
+    }
+    let records = result.call_log.records();
+    let total = records.len() as u64;
+    let live = total.saturating_sub(result.replayed_calls);
+    // Workspace effects re-execute by design on every replay (the workspace
+    // is real disk state, re-materialized rather than served from the
+    // journal; nested ones replay inside their container's subtree). Only
+    // top-level workspace records are expected live — anything else live
+    // means the replay reached past the journal.
+    let expected_live = records
+        .iter()
+        .filter(|r| r.function == "workspace" && r.parent_seq.is_none())
+        .count() as u64;
+    if live > expected_live {
+        anyhow::bail!(
+            "verify FAILED: {} call(s) executed live beyond the expected {expected_live} \
+             workspace re-materialization(s) ({} of {journal_len} journal records replayed)",
+            live - expected_live,
+            result.replayed_calls
+        );
+    }
+    println!(
+        "verified: {} calls replayed, {live} workspace re-materialization(s), \
+         output identical — $0",
+        result.replayed_calls
     );
     Ok(())
 }
@@ -2174,6 +2344,18 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
         for r in records {
             if r.function == "prompt" {
                 prompt_count += 1;
+                // Count the call under its model even when the record carries
+                // no token usage (e.g. a locally-cache-served or zero-usage
+                // prompt) — otherwise the top-line "Prompt calls" and the
+                // per-model rows silently disagree.
+                let model = r
+                    .args
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let ms = per_model.entry(model.clone()).or_default();
+                ms.calls += 1;
                 if let Some(ref usage) = r.token_usage {
                     total_input_tokens += usage.input_tokens;
                     total_output_tokens += usage.output_tokens;
@@ -2181,12 +2363,6 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
                     let cache_write = usage.cache_creation_tokens.unwrap_or(0);
                     total_cache_read += cache_read;
                     total_cache_write += cache_write;
-                    let model = r
-                        .args
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
                     let cost = estimate_cost_usd_with_cache(
                         &model,
                         usage.input_tokens,
@@ -2196,7 +2372,6 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
                     );
                     total_cost += cost;
                     let ms = per_model.entry(model).or_default();
-                    ms.calls += 1;
                     ms.input_tokens += usage.input_tokens;
                     ms.output_tokens += usage.output_tokens;
                     ms.cache_read_tokens += cache_read;

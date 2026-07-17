@@ -67,7 +67,21 @@ export interface PromptOptions {
   maxTurns?: number;
   temperature?: number;
   tools?: string[];
+  /**
+   * `"json"` parses the reply as JSON (a single wrapping markdown fence is
+   * tolerated) and, by default, THROWS when the reply is not valid JSON — a
+   * truncated reply (e.g. a reasoning model spending the whole `maxTokens`
+   * budget on hidden reasoning) can never masquerade as a successful
+   * structured result. Set `strict: false` for the lenient raw-string
+   * fallback.
+   */
   format?: "json" | (string & {});
+  /**
+   * Applies to `format: "json"`. `true` (the default): unparseable output
+   * throws with the parse error and the reply head. `false`: fall back to
+   * returning the raw reply string.
+   */
+  strict?: boolean;
   stream?: boolean;
   /**
    * Prompt-cache posture. Defaults to on (`"5m"`): the runtime marks the
@@ -782,6 +796,11 @@ export interface Chidori {
    * resumed run does not re-pay it. The callback must be pure, synchronous
    * compute — host effects (`chidori.*`), captured randomness, filesystem
    * writes, timers, and async callbacks are refused inside a step.
+   *
+   * Type the result with a `type` alias, not an `interface`: interfaces lack
+   * the index signature `AgentJson` requires, so `interface Commit {...}`
+   * fails to satisfy `T extends AgentJson` while the structurally identical
+   * `type Commit = {...}` works.
    */
   step<T extends AgentJson = AgentJson>(name: string, fn: () => T): Promise<T>;
   /**

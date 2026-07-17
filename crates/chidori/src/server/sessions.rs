@@ -309,11 +309,19 @@ pub(super) async fn list_sessions(State(state): State<AppState>) -> Response {
             let list: Vec<Value> = sessions
                 .iter()
                 .map(|s| {
+                    // Carry enough for a dashboard to be useful without an
+                    // N+1 detail fetch per row: the durable run directory this
+                    // session journals into (`run_id` — deliberately distinct
+                    // from the session id) and what a paused row is waiting on.
                     json!({
                         "id": s.id,
+                        "run_id": s.run_id,
                         "status": s.status,
                         "error": s.error,
                         "created_at": s.created_at,
+                        "pending_prompt": s.pending_prompt,
+                        "pending_signal_name": s.pending_signal_name,
+                        "pending_signal_names": s.pending_signal_names,
                     })
                 })
                 .collect();
@@ -488,16 +496,11 @@ pub(super) async fn replay_session(
             if let Some(err) = store_or_500(&state, &session) {
                 return err;
             }
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    "id": new_id,
-                    "replayed_from": id,
-                    "status": session.status,
-                    "output": session.output,
-                })),
-            )
-                .into_response()
+            // The full session view (run_id included — the replay leg journals
+            // into its own run directory) plus where it was replayed from.
+            let mut view = session_view(&session);
+            view["replayed_from"] = json!(id);
+            (StatusCode::CREATED, Json(view)).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

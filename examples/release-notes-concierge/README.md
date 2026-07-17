@@ -14,12 +14,15 @@ provider (DeepSeek):
 - `chidori.input()` — human feedback gate (scripted or interactive)
 - `chidori.workspace.write` — publishes `RELEASE_NOTES.md`
 
-Two gotchas this demo already works around (see the review for details):
-shared helper modules must live *inside* `tools/` (an import that escapes
-the tool directory silently unregisters the tool), and reasoning models
-need a much larger `maxTokens` than the visible output suggests (hidden
-reasoning spends the same budget — the guard after the clustering prompt
-fails loudly instead of publishing an empty document).
+Two gotchas this demo works around (see the review for details): shared
+helper modules must live *inside* `tools/` (an import that escapes the tool
+directory unregisters the tool — the loader now warns on stderr and
+`chidori tools` lists the skipped file with the reason), and reasoning
+models need a much larger `maxTokens` than the visible output suggests
+(hidden reasoning spends the same budget). Since the review's fixes landed,
+`format: "json"` throws on a truncated/unparseable reply by default, so the
+belt-and-suspenders guard after the clustering prompt mainly documents the
+failure mode.
 
 ## Setup
 

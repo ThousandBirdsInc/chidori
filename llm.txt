@@ -61,6 +61,8 @@ chidori resume agents/my_agent.ts <run_id>  # replay a recorded run byte-for-byt
 chidori resume agents/my_agent.ts <run_id> --trusted --tools tools  # crash recovery of a trusted tool-using run:
                                             # same posture flags as `run`; continuation journals into the same run dir
 chidori resume agents/my_agent.ts <run_id> --allow-source-change  # edit-and-resume: replay against edited code (divergence-checked)
+chidori verify agents/my_agent.ts <run_id>  # checkpoint-as-test: replay with NO provider, deny-all policy, no writes;
+                                            # asserts completion with byte-identical output. Exit 0 = pass. Built for CI.
 chidori trace <run_id>
 chidori snapshot <run_id>
 ```
@@ -118,7 +120,13 @@ Options:
   custom budgets).
 - `temperature`: sampling temperature.
 - `tools`: registered tool names available to provider tool-use loops.
-- `format`: `"json"` parses the reply as JSON (falls back to the raw string).
+- `format`: `"json"` parses the reply as JSON (a single wrapping markdown
+  fence is tolerated). Unparseable output — e.g. a reply truncated by
+  `maxTokens` — THROWS by default so it can't masquerade as a structured
+  result; pass `strict: false` to fall back to the raw string instead.
+- `strict`: applies to `format: "json"`. `true` (default) throws on
+  unparseable output with the parse error and reply head; `false` restores
+  the lenient raw-string fallback.
 - `cache`: prompt-cache posture. Defaults to on (`"5m"`): the runtime marks
   the stable request head (system, tools, conversation prefix) so providers
   bill repeated prefixes at the cached rate. `false` disables for this call;

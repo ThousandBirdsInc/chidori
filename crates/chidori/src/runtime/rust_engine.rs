@@ -1486,6 +1486,72 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tool_error_frame_anchors_at_the_prompt_call() {
+        // Round-3 consumer review finding: `prompt({tools: ["missing"]})`
+        // failed with "Unknown tool ..." whose frame pointed at the NEXT
+        // await after the prompt (a `chidori.log` ten lines below), not the
+        // prompt call itself. Same contract as the policy-denial test above:
+        // a host-binding failure must anchor at the awaiting call site.
+        let dir =
+            std::env::temp_dir().join(format!("chidori-unknown-tool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        // The exact consumer shape that misattributed: a MULTI-LINE prompt
+        // call inside a for-loop, with a decoy `chidori.log` after it. The
+        // failing `await chidori.prompt(` sits on line 5; the decoy log on
+        // line 10. (A single-line prompt anchored correctly all along — the
+        // loop + multi-line argument span is what pushed the frame onto the
+        // next await.)
+        let src = "import { chidori, run } from \"chidori:agent\";\n\n\
+                   run(async () => {\n\
+                   \x20 for (const theme of [\"a\", \"b\"]) {\n\
+                   \x20   const s = await chidori.prompt(\n\
+                   \x20     `investigate ${theme}` +\n\
+                   \x20       `across multiple lines`,\n\
+                   \x20     { tools: [\"missing_tool\"], maxTurns: 8 },\n\
+                   \x20   );\n\
+                   \x20   await chidori.log(\"after\", { theme, s });\n\
+                   \x20 }\n\
+                   \x20 return null;\n\
+                   });\n";
+        std::fs::write(&path, src).unwrap();
+
+        let backend = HostBindingBackend::for_runtime(
+            RuntimeContext::new(),
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(".")),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            Arc::new(PolicyConfig::default()),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("rust-engine-test"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(McpManager::new()),
+        );
+
+        let err = run_agent(&path, src, &serde_json::json!({}), &backend)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Unknown tool"),
+            "the failure names the missing tool: {err}"
+        );
+
+        super::set_display_project_root(dir.clone());
+        let remapped = remap_stack_frames(&err);
+        let path_str = path.to_string_lossy();
+        assert!(
+            remapped.contains(&format!("at <anonymous> ({path_str}:5:")),
+            "frame anchors at the failing prompt call (line 5): {remapped}"
+        );
+        assert!(
+            !remapped.contains(&format!("({path_str}:10:")),
+            "no frame anchors at the unrelated chidori.log call (line 10): {remapped}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn run_agent_executes_ts_through_rust_engine_and_records_host_calls() {
         // A single-file TS agent that does JS work (a nested function call) and a
         // chidori.log host effect, then returns a value derived from its input.

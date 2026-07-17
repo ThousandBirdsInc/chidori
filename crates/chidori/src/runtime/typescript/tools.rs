@@ -56,7 +56,7 @@ pub fn check_tool_source(
     Ok(TypeScriptToolCheck { javascript, tool })
 }
 
-pub(super) fn source_declares_tool(source: &str) -> bool {
+pub(crate) fn source_declares_tool(source: &str) -> bool {
     source.contains("export const tool")
 }
 

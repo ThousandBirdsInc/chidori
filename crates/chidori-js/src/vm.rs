@@ -100,6 +100,14 @@ pub struct Frame {
     pub pending_completion: Option<Completion>,
     /// Set when resuming a suspended frame with a rejection: raised at loop top.
     pub pending_throw: Option<Value>,
+    /// Source position of the throw currently unwinding through this frame's
+    /// `finally` blocks. Captured when the throw is first dispatched so the
+    /// frame it ultimately exits is attributed to the ORIGINAL throw site,
+    /// not the `EndFinally` / `IteratorClose` op that re-raised the parked
+    /// completion (e.g. a throw inside a `for-of` body, whose iterator-close
+    /// finalizer otherwise pins the frame to the loop's last op). Cleared
+    /// when a `catch` handles the throw.
+    pub unwind_pos: Option<u32>,
     /// Set when resuming a suspended generator via `.return(v)`: dispatched as a
     /// `Return` completion at loop top so enclosing `finally` blocks run.
     pub pending_return: Option<Value>,

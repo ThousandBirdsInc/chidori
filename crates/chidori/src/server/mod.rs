@@ -195,6 +195,7 @@ fn install_warm_run(
         let leg = Ok(RunResult {
             output: Value::Null,
             call_log: ctx.call_log(),
+            replayed_calls: ctx.replay_hit_count(),
             run_id: ctx.run_id(),
             paused: Some(pending.clone()),
             paused_approval: None,

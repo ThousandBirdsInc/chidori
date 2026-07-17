@@ -58,7 +58,14 @@ flag archaeology:
 
 This means you can:
 - **Debug without spending money:** save a failing session, replay locally with breakpoints.
-- **Run deterministic tests:** check in a checkpoint, assert the agent's behavior hasn't changed.
+- **Run deterministic tests:** check in a run directory, and `chidori verify
+  <agent.ts> <run_id>` asserts it still replays cleanly: no provider
+  configured, deny-all policy, no writes to the run directory, output must be
+  identical to the recorded one and every call must come from the journal
+  (top-level workspace effects re-materialize their recorded artifacts —
+  workspace state is real disk, not journal-served).
+  Exit 0 on pass — a full integration test that costs $0 and runs in
+  milliseconds, built for CI.
 - **Resume after crashes:** the runtime can persist checkpoints after each call; on restart, replay picks up where it left off.
 - **Pause for human approval:** `input()` suspends execution; when the human responds, the agent replays to that point and continues.
 

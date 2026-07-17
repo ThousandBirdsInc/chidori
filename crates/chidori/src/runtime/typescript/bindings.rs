@@ -202,6 +202,16 @@ impl HostBindingBackend {
             .get("format")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
+        // `format:"json"` historically fell back to the raw string on ANY
+        // parse failure, so a truncated reply (e.g. a reasoning model spending
+        // the whole `maxTokens` budget before visible output) flowed on as an
+        // empty/garbage value and the run "succeeded" with a degraded product.
+        // Strict by default now: unparseable JSON throws. `strict: false`
+        // restores the lenient raw-string fallback.
+        let strict_json = options
+            .get("strict")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
         let prompt_type = options
             .get("type")
             .or_else(|| options.get("streamType"))
@@ -242,9 +252,12 @@ impl HostBindingBackend {
             }
             let mut tool_schemas = Vec::new();
             for name in &all_tool_names {
-                let tool_def = tools
-                    .get(name)
-                    .ok_or_else(|| format!("Unknown tool in context tools: {name}"))?;
+                let tool_def = tools.get(name).ok_or_else(|| {
+                    format!(
+                        "{} (referenced in context tools)",
+                        tools.describe_miss(name)
+                    )
+                })?;
                 tool_schemas.push(tool_def_to_schema(tool_def));
             }
             let system = match (parts.system, system) {
@@ -373,9 +386,9 @@ impl HostBindingBackend {
 
         let mut tool_schemas = Vec::new();
         for name in &tool_names {
-            let tool_def = tools
-                .get(name)
-                .ok_or_else(|| format!("Unknown tool in prompt tools: {name}"))?;
+            let tool_def = tools.get(name).ok_or_else(|| {
+                format!("{} (referenced in prompt tools)", tools.describe_miss(name))
+            })?;
             tool_schemas.push(tool_def_to_schema(tool_def));
         }
 
@@ -427,8 +440,7 @@ impl HostBindingBackend {
                 });
             }
             if format.as_deref() == Some("json") {
-                return serde_json::from_str::<serde_json::Value>(&final_text)
-                    .or(Ok(serde_json::Value::String(final_text)));
+                return parse_json_reply(&final_text, strict_json);
             }
             return Ok(serde_json::Value::String(final_text));
         }
@@ -463,8 +475,7 @@ impl HostBindingBackend {
 
         if format.as_deref() == Some("json") {
             if let Some(content) = result.as_str() {
-                serde_json::from_str::<serde_json::Value>(content)
-                    .or(Ok(serde_json::Value::String(content.to_string())))
+                parse_json_reply(content, strict_json)
             } else {
                 Ok(result)
             }
@@ -520,9 +531,12 @@ impl HostBindingBackend {
         let parts = context_request_parts(segments)?;
         let mut tool_schemas = Vec::new();
         for name in &parts.tool_names {
-            let tool_def = tools
-                .get(name)
-                .ok_or_else(|| format!("Unknown tool in context tools: {name}"))?;
+            let tool_def = tools.get(name).ok_or_else(|| {
+                format!(
+                    "{} (referenced in context tools)",
+                    tools.describe_miss(name)
+                )
+            })?;
             tool_schemas.push(tool_def_to_schema(tool_def));
         }
         let mut request = LlmRequest {
@@ -1012,7 +1026,13 @@ impl HostBindingBackend {
         match effect {
             "log" => {
                 let message = a.get("message").cloned().unwrap_or(serde_json::Value::Null);
-                let args = serde_json::json!({ "message": message });
+                let mut args = serde_json::json!({ "message": message });
+                // Keep the structured fields: this arm used to rebuild the
+                // payload as message-only, silently dropping every
+                // `chidori.log(msg, {...})` object from the journal.
+                if let Some(fields) = a.get("fields").filter(|f| !f.is_null()) {
+                    args["fields"] = fields.clone();
+                }
                 self.durable_call("log", args.clone(), || {
                     host_core::execute_log(&args).map_err(|err| err.to_string())
                 })
@@ -1399,6 +1419,44 @@ struct ContextRequestParts {
     tool_names: Vec<String>,
     messages: Vec<LlmMessage>,
     cache: CacheLayout,
+}
+
+/// Parse a `format:"json"` model reply. Tolerates the common markdown-fence
+/// wrapping (```json ... ```). On unparseable output: strict mode (the
+/// default) fails loudly with the likely cause and the reply head, so a
+/// truncated or off-format reply can never masquerade as a successful
+/// structured result; `strict: false` restores the historical raw-string
+/// fallback.
+fn parse_json_reply(reply: &str, strict: bool) -> std::result::Result<serde_json::Value, String> {
+    let mut candidate = reply.trim();
+    // Strip a single wrapping markdown fence: ```json\n...\n``` or ```\n...\n```.
+    if let Some(rest) = candidate.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        if let Some(inner) = rest.trim_start_matches(['\r', '\n']).strip_suffix("```") {
+            candidate = inner.trim();
+        }
+    }
+    match serde_json::from_str::<serde_json::Value>(candidate) {
+        Ok(value) => Ok(value),
+        Err(parse_err) => {
+            if strict {
+                let head: String = candidate.chars().take(120).collect();
+                let head = if head.is_empty() {
+                    "(empty — was the response truncated? see the `maxTokens` warning above; \
+                     reasoning models spend the budget on hidden reasoning first)"
+                        .to_string()
+                } else {
+                    format!("reply starts: {head:?}")
+                };
+                Err(format!(
+                    "format:\"json\": the model reply is not valid JSON ({parse_err}); {head}. \
+                     Pass `strict: false` in the prompt options to get the raw string instead."
+                ))
+            } else {
+                Ok(serde_json::Value::String(reply.to_string()))
+            }
+        }
+    }
 }
 
 fn cache_ttl_from_str(value: &str) -> CacheTtl {
@@ -1956,5 +2014,53 @@ fn tool_def_to_schema(def: &ToolDef) -> ToolSchema {
             "properties": properties,
             "required": required,
         }),
+    }
+}
+
+#[cfg(test)]
+mod json_reply_tests {
+    use super::parse_json_reply;
+
+    #[test]
+    fn parses_plain_json() {
+        let v = parse_json_reply(r#"{"themes": [1, 2]}"#, true).unwrap();
+        assert_eq!(v["themes"][1], 2);
+    }
+
+    #[test]
+    fn strips_a_wrapping_markdown_fence() {
+        for reply in [
+            "```json\n{\"ok\": true}\n```",
+            "```\n{\"ok\": true}\n```",
+            "  ```json\r\n{\"ok\": true}\r\n```  ",
+        ] {
+            let v = parse_json_reply(reply, true).unwrap();
+            assert_eq!(v["ok"], true, "fenced reply parses: {reply:?}");
+        }
+    }
+
+    #[test]
+    fn strict_throws_on_unparseable_with_actionable_message() {
+        // The empty reply is the reasoning-model truncation shape: the whole
+        // maxTokens budget went to hidden reasoning, zero visible output.
+        let err = parse_json_reply("", true).unwrap_err();
+        assert!(err.contains("format:\"json\""), "{err}");
+        assert!(err.contains("truncated"), "names the likely cause: {err}");
+        assert!(
+            err.contains("strict: false"),
+            "names the escape hatch: {err}"
+        );
+
+        let err = parse_json_reply("Sure! Here are the themes: ...", true).unwrap_err();
+        assert!(
+            err.contains("reply starts:"),
+            "carries the reply head: {err}"
+        );
+    }
+
+    #[test]
+    fn lenient_falls_back_to_the_raw_string() {
+        let v = parse_json_reply("not json", false).unwrap();
+        assert_eq!(v, serde_json::Value::String("not json".to_string()));
     }
 }

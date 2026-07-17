@@ -3882,6 +3882,13 @@ impl Compiler {
             }
             Expression::AwaitExpression(a) => {
                 self.compile_expr(&a.argument)?;
+                // Pin the Await op to the await expression itself. Compiling a
+                // multi-line argument (a call with an options object, say)
+                // leaves `cur_pos` at the LAST sub-expression compiled, so an
+                // awaited rejection — which the resume path attributes to this
+                // op (`pos_at(ip - 1)`) — used to anchor past the call, on
+                // whatever statement the position table reached next.
+                self.set_pos(a.span.start);
                 self.emit(Op::Await);
             }
             Expression::YieldExpression(y) => self.compile_yield(y)?,

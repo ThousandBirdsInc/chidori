@@ -56,6 +56,26 @@ strict `tsc` project.
 | Server killed and restarted with `--trusted`, paused session resumed | **Completed** — journal replayed free, only the write executed live |
 | Entire campaign: 8+ live runs, serve sessions, chat REPL, all testing | **$0.02 actual provider spend** (DeepSeek balance: 19.95 → 19.93) |
 
+> **Follow-up (same day):** the findings below were re-verified while fixing
+> them, and three claims did not fully survive: (1) `chidori serve --help`
+> *does* document `--trusted`/`--untrusted` and the startup banner *does*
+> print the policy posture — the review read a truncated help output and
+> never read the top of the server log; (2) the human's final answer in
+> Finding 3 *was* journaled, and `POST /sessions/{id}/replay` recovered the
+> failed session end-to-end once the policy was fixed — the "discarded
+> answer" diagnosis came from reading the wrong run directory mid-flush
+> (itself the id-confusion problem of Finding 4); (3) replayed records
+> *preserve* their original timestamps — the "rewritten" stamps in Finding 4
+> belong to in-flight container work that genuinely re-executed at resume
+> (documented at-least-once semantics). Corrections are marked inline.
+> Everything else stood, and the fixes landed alongside this note: `log`
+> fields journaled, skipped tool files warn with reasons everywhere,
+> `format:"json"` is strict by default, unknown-tool errors name the
+> available tools and the load failures, session lists carry
+> `run_id`/`pending_prompt`, both SDKs expose `run_id`/`pending_details`,
+> `resume` reports the true replayed/live split, and `stats` per-model rows
+> reconcile with the top line.
+
 The engine's promises survive contact with a consumer better than round 2
 left me expecting: this round found **no failure of the durability model
 itself**. What it found instead is a pattern the first two rounds only
@@ -154,11 +174,16 @@ deny-by-default. Three observations, in increasing order of concern:
 
 1. **The error message is excellent** — it names `CHIDORI_POLICY`,
    `CHIDORI_POLICY_FILE`, `CHIDORI_POLICY_PROFILE`, and `--trusted`, and the
-   frame points at the exact `workspace.write` line. But `chidori serve
-   --help` mentions **none of these** — no `--trusted`, no policy flags, no
-   hint that a served agent runs under a different posture than
-   `chidori run`. The consumer meets the policy system for the first time
-   as a post-mortem.
+   frame points at the exact `workspace.write` line.
+   **Correction (follow-up):** the original text here claimed `chidori serve
+   --help` documents none of this — false. The review read only the first
+   twenty lines of the help output; `--trusted`/`--untrusted` are fully
+   documented further down, and the startup banner prints
+   `Policy: deny-by-default (…pass --trusted or set CHIDORI_POLICY* to
+   relax)` on every boot. The consumer *was* told, twice, and didn't read
+   either. What stands is only the softer point: the posture line scrolls
+   away with the endpoint listing, and nothing at *session-creation* time
+   repeats it.
 2. **The denial is late.** Everything cheap happened first; the gated
    effect was the last record of the run. Tool calls and `workspace.read`
    sailed through the default policy, so nothing early in the run hinted at
@@ -167,21 +192,24 @@ deny-by-default. Three observations, in increasing order of concern:
    startup note ("this server's policy denies `workspace:write`; runs will
    fail if they attempt it") would set expectations. Failing three minutes
    and two human interactions in is the expensive way to learn the default.
-3. **The failed continuation rolled back the human's answer.** The
-   segment after the final resume — the "approve" input record, the style
-   distillation prompt — was discarded with the failure; the on-disk journal
-   ends at the *previous* pause. Rolling back unjournaled *effects* is the
-   right call, but the session is now `failed` and terminal: `POST
-   …/resume` refuses (409), so from the server API there is no
-   fix-the-policy-and-retry path — the human's final answer is simply gone.
-   I recovered only because a `checkpoint()`+`replay()` copy I'd made for
-   other reasons happened to re-pause at the same point, and *that* session
-   completed after a server restart with `--trusted` (journal replayed
-   free, write executed live — the durable core doing exactly what it
-   should). The blessed recovery is presumably `chidori resume` against the
-   run directory — but see Finding 4.
+3. **The failed continuation rolled back the human's answer.**
+   **Correction (follow-up): it didn't.** The "approve" input record, the
+   distillation prompt, and the memory write were all journaled before the
+   denied `workspace.write` — the review's diagnosis read a *different
+   session's* run directory mid-investigation (the session-id/run-id
+   confusion of Finding 4 claiming a scalp). And the recovery path is not
+   only real but documented in the failure itself: the 409 from
+   `POST …/resume` on a failed session points at `POST …/replay`, which —
+   verified live after restarting the server with `--trusted` — replayed
+   the whole journal including the human's answer for free and executed
+   only the denied write. The engine and its error surface were both right;
+   the consumer (me) was lost in the identity maze below.
 
-The engine made recovery *possible*; the surface made it *accidental*.
+What Finding 3 reduces to after correction: the deny-by-default cliff is
+real but *announced*; the recovery exists and is signposted at the moment
+of failure. The residual asks are visibility ones — repeat the posture at
+session creation, and make the session↔run mapping legible enough that a
+consumer under pressure reads the right journal (Finding 4).
 
 ## Finding 4: session ids, run ids, and an audit trail that rewrites itself
 
@@ -195,15 +223,24 @@ Small identity frictions that each cost minutes:
   endpoint omits `pending_prompt` (the detail endpoint has it), so a
   dashboard can't say what each paused run is waiting for without N+1
   fetches.
-- After a crash-resume, the journal's **timestamps are rewritten and out of
-  order** (replayed records get resume-time stamps; I found records at
-  07:51:36 *after* a record at 07:52:31). Round 1 audited "exactly one call
-  re-billed" — this round couldn't: the `Resumed from … (118 calls
-  replayed)` message counts the *entire* journal, not the replayed prefix,
-  and the rewritten timestamps erase the live/replayed boundary. For a
-  framework whose pitch is auditability, the journal should preserve the
-  original record times (or mark records `replayed: true`) so a consumer
-  can verify what a recovery actually cost.
+- After a crash-resume, the journal's timestamps looked **rewritten and out
+  of order**. **Correction (follow-up):** they aren't rewritten — replayed
+  records are cloned verbatim from the journal, original timestamps
+  included; the fresh stamps belong to the in-flight tool-loop *container*
+  that legitimately re-executed (a half-finished container can't replay —
+  the documented at-least-once window), and the apparent disorder is
+  flush-order in `records.jsonl`, which was never seq-ordered. So the
+  audit trail was sound; what was actually missing is the summary: the
+  `Resumed from … (118 calls replayed)` message counts the *entire* final
+  journal, not the replayed prefix, so the consumer can't see the
+  replayed/re-executed split without diffing timestamps by hand. (Fixed
+  alongside this review: resume now reports "N recorded calls replayed, M
+  executed live" from a real replay-hit counter.) One genuine semantic
+  discovered while fixing this: **top-level `workspace` effects re-execute
+  on every replay** — workspace state is real disk, re-materialized rather
+  than journal-served — which is also what re-stamped seq 1 in the crash
+  drill. Byte-identical inputs make it invisible, but a consumer who edits
+  a workspace file between record and replay changes what a "replay" reads.
 
 ## Finding 5: `chidori.log(message, fields)` discards `fields`
 
@@ -283,6 +320,9 @@ experiment. The SDK side (`session.checkpoint()` → `checkpoint.save()` →
 `client.replay(cp)`) worked as documented and is arguably the cleaner CI
 primitive today. Given how good the underlying guards are, a first-class
 test command is cheap adoption fuel being left on the table.
+*(Follow-up: `chidori verify <agent.ts> <run_id>` shipped with this
+review's fixes — no provider, deny-all policy, no run-dir writes, asserts
+completion with byte-identical output and zero live calls.)*
 
 ## Where this leaves a consumer
 
