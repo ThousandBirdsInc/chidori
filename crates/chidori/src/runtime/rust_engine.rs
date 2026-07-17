@@ -1242,6 +1242,147 @@ mod tests {
     /// A fully-wired runtime backend over `ctx`/`tools` with default providers,
     /// template engine, tokio runtime, policy, and MCP — enough to exercise the
     /// full effect dispatch in tests.
+    /// A scripted provider for the defineTool loop: turn 1 requests the
+    /// `lookup` tool, turn 2 answers. Also asserts the inline (import-defined)
+    /// tool schema actually reached the provider request.
+    struct ScriptedToolProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        saw_inline_schema: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for ScriptedToolProvider {
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+        async fn send(
+            &self,
+            request: &crate::providers::LlmRequest,
+        ) -> anyhow::Result<crate::providers::LlmResponse> {
+            use crate::providers::{ContentBlock, LlmResponse, ToolCall};
+            if request.tools.iter().any(|t| t.name == "lookup") {
+                self.saw_inline_schema
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let call_index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_index == 0 {
+                return Ok(LlmResponse {
+                    content: String::new(),
+                    blocks: vec![ContentBlock::ToolUse {
+                        id: "call-1".to_string(),
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({ "key": "answer" }),
+                    }],
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({ "key": "answer" }),
+                    }],
+                    stop_reason: "tool_use".to_string(),
+                    ..LlmResponse::default()
+                });
+            }
+            Ok(LlmResponse {
+                content: "the value is 42".to_string(),
+                blocks: vec![ContentBlock::Text {
+                    text: "the value is 42".to_string(),
+                }],
+                ..LlmResponse::default()
+            })
+        }
+    }
+
+    #[test]
+    fn define_tool_import_pattern_runs_in_vm_and_journals() {
+        // The standard-pattern alternative to the tools/ directory: a tool is
+        // a plain object built with defineTool() (imported or defined inline),
+        // whose `run` executes in the agent's own VM via the JS-side loop.
+        // No registry, no magic directory, closures allowed.
+        let ctx = RuntimeContext::new();
+        let dir = std::env::temp_dir().join(format!("chidori-definetool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            import { chidori, run, defineTool } from "chidori:agent";
+
+            const seen: string[] = [];
+            const lookup = defineTool({
+                name: "lookup",
+                description: "Look up a value by key.",
+                parameters: {
+                    type: "object",
+                    properties: { key: { type: "string" } },
+                    required: ["key"],
+                },
+                run: async (args: { key: string }) => {
+                    seen.push(args.key); // closures over agent state work
+                    await chidori.log("in-vm tool ran", { key: args.key });
+                    return { value: 42 };
+                },
+            });
+
+            run(async () => {
+                const answer = await chidori.prompt("What is the value?", {
+                    tools: [lookup],
+                    maxTurns: 4,
+                });
+                return { answer, seen };
+            });
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let saw_inline_schema = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut providers = ProviderRegistry::new();
+        providers.register(Box::new(ScriptedToolProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            saw_inline_schema: saw_inline_schema.clone(),
+        }));
+        let backend = HostBindingBackend::for_runtime(
+            ctx.clone(),
+            Arc::new(providers),
+            Arc::new(TemplateEngine::new(".")),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            PolicyConfig::from_env(),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("rust-engine-test"),
+            Arc::new(ToolRegistry::new()), // registry stays EMPTY — no directory tools
+            Arc::new(McpManager::new()),
+        );
+
+        let output = run_agent(&path, src, &serde_json::json!({}), &backend).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({ "answer": "the value is 42", "seen": ["answer"] })
+        );
+        assert!(
+            saw_inline_schema.load(std::sync::atomic::Ordering::SeqCst),
+            "the defineTool schema reached the provider request"
+        );
+
+        let records = ctx.call_log().into_records();
+        // Two respond turns journaled as prompts; the in-VM invocation as a
+        // mark; the tool body's own log as an ordinary journaled effect.
+        assert_eq!(
+            records.iter().filter(|r| r.function == "prompt").count(),
+            2,
+            "records: {:?}",
+            records
+                .iter()
+                .map(|r| r.function.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(records
+            .iter()
+            .any(|r| r.function == "mark" && r.args["label"] == "tool:lookup"));
+        assert!(records
+            .iter()
+            .any(|r| r.function == "log" && r.args["fields"]["key"] == "answer"));
+        // And NO host-side `tool` record: the body ran in the agent's VM.
+        assert!(!records.iter().any(|r| r.function == "tool"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn test_backend(ctx: RuntimeContext, tools: Arc<ToolRegistry>) -> HostBindingBackend {
         HostBindingBackend::for_runtime(
             ctx,

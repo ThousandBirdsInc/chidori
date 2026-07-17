@@ -1,8 +1,8 @@
 {
   "name": "release-notes-concierge",
   "private": true,
-  "description": "Chidori consumer demo: durable release-notes desk (see docs/consumer-usability-review-3.md)",
+  "description": "Chidori consumer demo: durable release-notes desk with import-defined tools (see docs/consumer-usability-review-3.md)",
   "devDependencies": {
-    "@1kbirds/chidori": "^3.6.0"
+    "@1kbirds/chidori": "file:../../sdk/typescript"
   }
 }

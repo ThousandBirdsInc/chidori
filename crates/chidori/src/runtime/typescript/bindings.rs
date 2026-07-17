@@ -260,6 +260,7 @@ impl HostBindingBackend {
                 })?;
                 tool_schemas.push(tool_def_to_schema(tool_def));
             }
+            tool_schemas.extend(parts.inline_tool_schemas.iter().cloned());
             let system = match (parts.system, system) {
                 (Some(ctx_system), Some(opt_system)) => {
                     Some(format!("{ctx_system}\n\n{opt_system}"))
@@ -539,6 +540,7 @@ impl HostBindingBackend {
             })?;
             tool_schemas.push(tool_def_to_schema(tool_def));
         }
+        tool_schemas.extend(parts.inline_tool_schemas.iter().cloned());
         let mut request = LlmRequest {
             model: opts
                 .get("model")
@@ -1141,8 +1143,14 @@ impl HostBindingBackend {
                     "prefix": prefix,
                     "value": value,
                 });
+                // Anchor the store to the agent, not the process cwd: the
+                // workspace root (agent dir / CHIDORI_WORKSPACE_ROOT), with a
+                // CHIDORI_MEMORY_DIR override, falling back to cwd only when no
+                // root is known (bare embedding). Mirrors how runs and
+                // workspace resolve their `.chidori/` location.
+                let base = memory_base(self);
                 self.durable_call("memory", args.clone(), || {
-                    host_core::execute_memory(&args).map_err(|err| err.to_string())
+                    host_core::execute_memory(&base, &args).map_err(|err| err.to_string())
                 })
                 .map(opt_null)
             }
@@ -1417,6 +1425,13 @@ impl HostBindingBackend {
 struct ContextRequestParts {
     system: Option<String>,
     tool_names: Vec<String>,
+    /// Tool schemas carried inline by the context (import-defined function
+    /// tools via `defineTool`), as opposed to `tool_names`, which resolve
+    /// against the registry of directory-loaded tools. Inline tools are
+    /// executed by the AGENT's own VM (the JS-side loop over `respond()`),
+    /// never by the host — the host only advertises their schemas to the
+    /// provider.
+    inline_tool_schemas: Vec<ToolSchema>,
     messages: Vec<LlmMessage>,
     cache: CacheLayout,
 }
@@ -1480,6 +1495,7 @@ fn context_request_parts(
     };
     let mut system_parts: Vec<String> = Vec::new();
     let mut tool_names: Vec<String> = Vec::new();
+    let mut inline_tool_schemas: Vec<ToolSchema> = Vec::new();
     let mut messages: Vec<LlmMessage> = Vec::new();
     let mut cache = CacheLayout::default();
     for seg in segments {
@@ -1500,6 +1516,35 @@ fn context_request_parts(
                     if !tool_names.iter().any(|existing| existing == name) {
                         tool_names.push(name.to_string());
                     }
+                }
+                // Inline schemas from import-defined tools (`defineTool`):
+                // full {name, description, parameters} objects, no registry.
+                for schema in seg
+                    .get("schemas")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(name) = schema.get("name").and_then(serde_json::Value::as_str) else {
+                        return Err("tools segment schema entry is missing `name`".to_string());
+                    };
+                    if inline_tool_schemas.iter().any(|t| t.name == name)
+                        || tool_names.iter().any(|existing| existing == name)
+                    {
+                        continue;
+                    }
+                    inline_tool_schemas.push(ToolSchema {
+                        name: name.to_string(),
+                        description: schema
+                            .get("description")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        input_schema: schema
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+                    });
                 }
             }
             "doc" => {
@@ -1562,6 +1607,7 @@ fn context_request_parts(
             Some(system_parts.join("\n\n"))
         },
         tool_names,
+        inline_tool_schemas,
         messages,
         cache,
     })
@@ -1593,6 +1639,21 @@ fn workspace_root(backend: &HostBindingBackend) -> std::result::Result<PathBuf, 
     backend.workspace_root().ok_or_else(|| {
         "chidori.workspace requires CHIDORI_WORKSPACE_ROOT or a runtime workspace root".to_string()
     })
+}
+
+/// The directory under which `chidori.memory` stores `.chidori/memory/`.
+/// Precedence: `CHIDORI_MEMORY_DIR`, then the run's workspace root (the agent
+/// file's directory / `CHIDORI_WORKSPACE_ROOT`), then the process cwd as a
+/// last resort. Unlike `chidori.workspace`, memory never hard-fails on a
+/// missing root — an agent embedded without one still gets a working store,
+/// just cwd-relative as before.
+fn memory_base(backend: &HostBindingBackend) -> PathBuf {
+    if let Some(dir) = std::env::var_os("CHIDORI_MEMORY_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    backend
+        .workspace_root()
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 const WORKSPACE_MANIFEST_VERSION: u32 = 1;

@@ -74,7 +74,12 @@ strict `tsc` project.
 > available tools and the load failures, session lists carry
 > `run_id`/`pending_prompt`, both SDKs expose `run_id`/`pending_details`,
 > `resume` reports the true replayed/live split, and `stats` per-model rows
-> reconcile with the top line.
+> reconcile with the top line. A second follow-up removed the magic
+> directory itself: `defineTool()` makes a tool a plain importable object
+> whose body runs in the agent's own VM (closures and captured effects
+> included), passed directly in `prompt({tools: [...]})` — the demo now
+> uses it and has no `tools/` directory at all; the directory registry
+> remains as an option for sharing tools across agents.
 
 The engine's promises survive contact with a consumer better than round 2
 left me expecting: this round found **no failure of the durability model

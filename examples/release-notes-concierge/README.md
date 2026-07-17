@@ -5,24 +5,21 @@ A durable release-notes desk for a real repository — the demo built for
 It exercises the "everyday agent" surface of Chidori on a non-default
 provider (DeepSeek):
 
+- **import-defined tools** — `defineTool()` handles declared right in
+  `agent.ts`, closing over the parsed commit list; no `tools/` directory,
+  no `--tools` flag, no per-call re-reads. Their bodies run in the agent's
+  own VM, so journaling and deterministic replay come for free
 - `chidori.step` — memoized parse of a 90KB `git log --numstat` dump
 - `chidori.prompt(..., { format: "json" })` — structured theme clustering
-- the built-in provider tool loop (`tools` + `maxTurns`) over two local tools
-  (`commit_detail`, `search_commits`) that read the dump via `workspace.read`
+  (strict by default: a truncated reply throws instead of degrading)
 - `chidori.conversation()` — an editorial revise-until-approved dialogue
 - `chidori.memory` — house style learned in one session is applied in the next
 - `chidori.input()` — human feedback gate (scripted or interactive)
 - `chidori.workspace.write` — publishes `RELEASE_NOTES.md`
 
-Two gotchas this demo works around (see the review for details): shared
-helper modules must live *inside* `tools/` (an import that escapes the tool
-directory unregisters the tool — the loader now warns on stderr and
-`chidori tools` lists the skipped file with the reason), and reasoning
-models need a much larger `maxTokens` than the visible output suggests
-(hidden reasoning spends the same budget). Since the review's fixes landed,
-`format: "json"` throws on a truncated/unparseable reply by default, so the
-belt-and-suspenders guard after the clustering prompt mainly documents the
-failure mode.
+One gotcha this demo works around: reasoning models need a much larger
+`maxTokens` than the visible output suggests (hidden reasoning spends the
+same budget), hence the generous budgets on each prompt.
 
 ## Setup
 
@@ -36,20 +33,23 @@ git -C /path/to/repo log --date=short --numstat \
 ```
 
 ```bash
-
 export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com
 export CHIDORI_OPENAI_COMPAT_KEY=sk-...
+export CHIDORI_MODEL=deepseek-v4-flash
 ```
 
 ## Run
 
 ```bash
 # scripted feedback (deterministic — replayable as a $0 regression test)
-chidori run agent.ts --trusted --tools tools --model deepseek-v4-flash \
+chidori run agent.ts --trusted \
   --input '{"feedback": ["Tighten the intro.", "approve"]}'
 
 # interactive: answer the feedback prompt at the terminal
-chidori run agent.ts --trusted --tools tools --model deepseek-v4-flash
+chidori run agent.ts --trusted
+
+# verify a recorded run as a CI test: $0, milliseconds
+chidori verify agent.ts <run_id>
 ```
 
-Editor types: `npm install` (dev-dep on `@1kbirds/chidori`), `npx tsc`.
+Editor types: `npm install` (dev-dep on the in-repo SDK), `npx tsc`.

@@ -1319,7 +1319,7 @@ pub fn llm_response_from_json(value: &Value) -> Option<LlmResponse> {
     })
 }
 
-pub fn execute_memory(args: &Value) -> Result<Value> {
+pub fn execute_memory(base: &std::path::Path, args: &Value) -> Result<Value> {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
     let namespace = args
         .get("namespace")
@@ -1329,7 +1329,7 @@ pub fn execute_memory(args: &Value) -> Result<Value> {
     let value = args.get("value").filter(|value| !value.is_null());
     let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
 
-    execute_memory_action(action, namespace, key, value, prefix)
+    execute_memory_action(base, action, namespace, key, value, prefix)
 }
 
 pub fn execute_template(template_engine: &TemplateEngine, args: &Value) -> Result<Value> {

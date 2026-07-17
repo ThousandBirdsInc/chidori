@@ -442,7 +442,7 @@ mod tests {
             "export function parse(s: string) { return s; }\n",
         )
         .unwrap();
-        let registry = ToolRegistry::load_from_dirs(&[dir.clone()]).unwrap();
+        let registry = ToolRegistry::load_from_dirs(std::slice::from_ref(&dir)).unwrap();
         assert!(registry.list().is_empty());
         assert!(
             registry.load_errors().is_empty(),

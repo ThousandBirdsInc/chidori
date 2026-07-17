@@ -317,11 +317,27 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             system(text) {
                 return append(this, { kind: "system", text: String(text) });
             },
-            tools(names) {
-                return append(this, {
-                    kind: "tools",
-                    names: (names || []).map(String),
-                });
+            tools(list) {
+                // Mixed input: registered tool NAMES (strings, resolved against
+                // the --tools registry by the host) and import-defined tool
+                // HANDLES from defineTool(). Handles contribute their schema
+                // inline; their run() functions never enter the segment (it
+                // crosses the host boundary as JSON) — the JS-side loop that
+                // executes them keeps the handles itself.
+                const names = [];
+                const schemas = [];
+                for (const t of list || []) {
+                    if (t && typeof t === "object" && t.__chidoriTool === true) {
+                        schemas.push({
+                            name: t.name,
+                            description: t.description,
+                            parameters: t.parameters,
+                        });
+                    } else {
+                        names.push(String(t));
+                    }
+                }
+                return append(this, { kind: "tools", names, schemas });
             },
             doc(label, text) {
                 return append(this, {
@@ -468,6 +484,14 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             // budgeted `context.compact()` no-op until the tail exceeds budget.
             const compactOptions =
                 opts.compact && typeof opts.compact === "object" ? opts.compact : null;
+            // Import-defined tools (defineTool handles) configured on the
+            // conversation: say() drives the in-VM tool loop for these.
+            const toolSplit = globalThis.chidori.__splitTools
+                ? globalThis.chidori.__splitTools(opts.tools)
+                : { names: [], handles: new Map() };
+            const fnToolMaxTurns = Number.isFinite(Number(opts.maxTurns))
+                ? Number(opts.maxTurns)
+                : 8;
 
             let ctx = globalThis.chidori.context({
                 system: opts.system,
@@ -506,7 +530,21 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                     if (compactOptions) ctx = await ctx.compact(compactOptions);
                     ctx = ctx.user(text);
                     turns.push({ role: "user", text });
-                    const result = await ctx.prompt(turnOptions(perTurn));
+                    let result;
+                    if (toolSplit.handles.size > 0) {
+                        const respondOptions = turnOptions(perTurn);
+                        delete respondOptions.format;
+                        delete respondOptions.strict;
+                        const loop = await globalThis.chidori.__fnToolLoop(
+                            ctx,
+                            respondOptions,
+                            toolSplit.handles,
+                            fnToolMaxTurns,
+                        );
+                        result = { text: loop.text, context: loop.context };
+                    } else {
+                        result = await ctx.prompt(turnOptions(perTurn));
+                    }
                     ctx = result.context;
                     turns.push({ role: "assistant", text: result.text });
                     return result.text;
@@ -596,6 +634,168 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             },
         };
     }
+
+
+    // ---- Import-defined tools: defineTool() + the in-VM function-tool loop.
+    // The standard-pattern alternative to the tools/ directory: a tool is a
+    // plain object you import (or define inline), with a `run` function that
+    // executes in the AGENT'S OWN VM. Its side effects (fetch, workspace,
+    // node:fs, ...) are the captured effects every agent already has, so
+    // journaling and deterministic replay come for free; each model turn of
+    // the loop is a durable respond() call, and each tool invocation is
+    // journaled as a `mark` record for the trace.
+    (() => {
+        const isHandle = (t) => t && typeof t === "object" && t.__chidoriTool === true;
+
+        globalThis.defineTool = function defineTool(def) {
+            if (!def || typeof def.name !== "string" || def.name === "") {
+                throw new Error("defineTool: `name` (non-empty string) is required");
+            }
+            if (typeof def.run !== "function") {
+                throw new Error(
+                    "defineTool: `run` (function) is required — the tool body runs in the agent's own VM",
+                );
+            }
+            return Object.freeze({
+                __chidoriTool: true,
+                name: def.name,
+                description: typeof def.description === "string" ? def.description : "",
+                parameters: def.parameters || { type: "object", properties: {} },
+                run: def.run,
+            });
+        };
+        globalThis.chidori.defineTool = globalThis.defineTool;
+
+        function splitTools(list) {
+            const names = [];
+            const handles = new Map();
+            for (const t of list || []) {
+                if (isHandle(t)) handles.set(t.name, t);
+                else names.push(String(t));
+            }
+            return { names, handles };
+        }
+
+        // Mirror of the host's strict format:"json" contract (a wrapping
+        // markdown fence tolerated; unparseable throws unless strict:false).
+        // Duplicated here because the function-tool loop's final text never
+        // flows back through the native prompt path.
+        function parseJsonReply(text, strict) {
+            let candidate = String(text == null ? "" : text).trim();
+            if (candidate.startsWith("```")) {
+                let rest = candidate.slice(3);
+                if (rest.startsWith("json")) rest = rest.slice(4);
+                rest = rest.replace(/^\r?\n/, "");
+                if (rest.endsWith("```")) candidate = rest.slice(0, -3).trim();
+            }
+            try {
+                return JSON.parse(candidate);
+            } catch (e) {
+                if (strict === false) return String(text);
+                const head =
+                    candidate === ""
+                        ? "(empty - was the response truncated? reasoning models spend the maxTokens budget on hidden reasoning first)"
+                        : "reply starts: " + JSON.stringify(candidate.slice(0, 120));
+                throw new Error(
+                    'format:"json": the model reply is not valid JSON (' +
+                        (e && e.message ? e.message : e) +
+                        "); " +
+                        head +
+                        ". Pass `strict: false` in the prompt options to get the raw string instead.",
+                );
+            }
+        }
+
+        function stringifyResult(value) {
+            return typeof value === "string" ? value : JSON.stringify(value);
+        }
+
+        // Drive the tool loop from `ctx` (which already carries the tools
+        // head): respond -> execute requested tools -> feed results back,
+        // until a turn makes no tool calls or maxTurns is exhausted.
+        // Import-defined tools run in-VM; registered names still dispatch to
+        // the host's journaled `chidori.tool` effect. Returns {text, context}.
+        async function runToolLoop(ctx, respondOptions, handles, maxTurns) {
+            let current = ctx;
+            let lastText = "";
+            for (let turn = 0; turn < maxTurns; turn++) {
+                const { response, context } = await current.respond(respondOptions);
+                current = context;
+                lastText =
+                    response && typeof response.content === "string" ? response.content : "";
+                const calls = (response && response.toolCalls) || [];
+                if (calls.length === 0) break;
+                for (const call of calls) {
+                    let content;
+                    let isError = false;
+                    const handle = handles.get(call.name);
+                    try {
+                        if (handle) {
+                            // Journal the in-VM invocation so the trace shows
+                            // the tool call (the body's own captured effects
+                            // journal themselves).
+                            await globalThis.chidori.mark("tool:" + call.name, {
+                                args: call.input,
+                            });
+                            content = stringifyResult(
+                                await handle.run(call.input, globalThis.chidori),
+                            );
+                        } else {
+                            content = stringifyResult(
+                                await globalThis.chidori.tool(call.name, call.input),
+                            );
+                        }
+                    } catch (e) {
+                        content = String(e && e.message ? e.message : e);
+                        isError = true;
+                    }
+                    current = current.toolResult(call.id, content, isError);
+                }
+            }
+            return { text: lastText, context: current };
+        }
+        // Shared with conversation() below.
+        globalThis.chidori.__fnToolLoop = runToolLoop;
+        globalThis.chidori.__splitTools = splitTools;
+        globalThis.chidori.__parseJsonReply = parseJsonReply;
+
+        // Wrap chidori.prompt: when options.tools contains defineTool handles,
+        // lower to a context + tool loop entirely in-VM. Name-only tools (and
+        // tool-less prompts) delegate to the native host path unchanged.
+        const nativePrompt = globalThis.chidori.prompt;
+        globalThis.chidori.prompt = function prompt(text, options) {
+            const opts = options || {};
+            const list = Array.isArray(opts.tools) ? opts.tools : [];
+            if (!list.some(isHandle)) {
+                return nativePrompt.call(globalThis.chidori, text, options);
+            }
+            return (async () => {
+                const maxTurns = Number.isFinite(Number(opts.maxTurns))
+                    ? Number(opts.maxTurns)
+                    : 8;
+                let ctx = globalThis.chidori.context();
+                if (typeof opts.system === "string") ctx = ctx.system(opts.system);
+                ctx = ctx.tools(list).user(String(text == null ? "" : text));
+                const respondOptions = Object.assign({}, opts);
+                delete respondOptions.tools;
+                delete respondOptions.system;
+                delete respondOptions.format;
+                delete respondOptions.strict;
+                delete respondOptions.maxTurns;
+                const { handles } = splitTools(list);
+                const { text: reply } = await runToolLoop(
+                    ctx,
+                    respondOptions,
+                    handles,
+                    maxTurns,
+                );
+                if (opts.format === "json") {
+                    return parseJsonReply(reply, opts.strict);
+                }
+                return reply;
+            })();
+        };
+    })();
 
     return null;
 })()

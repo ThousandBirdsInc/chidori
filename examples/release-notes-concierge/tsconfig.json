@@ -6,7 +6,12 @@
     "strict": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
-    "types": ["@1kbirds/chidori/agent-env"]
+    "types": [
+      "@1kbirds/chidori/agent-env"
+    ]
   },
-  "include": ["agent.ts", "tools/**/*.ts"]
+  "include": [
+    "agent.ts",
+    "lib/**/*.ts"
+  ]
 }

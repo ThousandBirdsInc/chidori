@@ -119,7 +119,22 @@ Options:
   per-step control (inspecting calls, streaming progress between steps,
   custom budgets).
 - `temperature`: sampling temperature.
-- `tools`: registered tool names available to provider tool-use loops.
+- `tools`: the tools available to the loop — registered tool NAMES (from the
+  `--tools` directory registry) and/or `defineTool(...)` HANDLES, freely
+  mixed. Handles are plain objects defined inline or imported from any
+  module; their `run` executes in the agent's own VM (closures + captured
+  effects work, replay is deterministic), each invocation journaled as a
+  `mark("tool:<name>")` record:
+
+    import { chidori, run, defineTool } from "chidori:agent";
+    const search = defineTool({
+      name: "search",
+      description: "Search the corpus.",
+      parameters: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+      run: async ({ q }) => corpus.filter((d) => d.includes(q)),
+    });
+    const answer = await chidori.prompt("find it", { tools: [search], maxTurns: 6 });
+
 - `format`: `"json"` parses the reply as JSON (a single wrapping markdown
   fence is tolerated). Unparseable output — e.g. a reply truncated by
   `maxTokens` — THROWS by default so it can't masquerade as a structured
@@ -512,7 +527,12 @@ await chidori.memory.delete("draft");
 await chidori.memory.clear();
 ```
 
-Memory actions are logged and replay-aware.
+Memory actions are logged and replay-aware. The store lives at
+`<root>/.chidori/memory/<namespace>.json`, where `<root>` is the run's
+workspace root (the agent file's directory under `run`/`resume`/`serve`, or
+`CHIDORI_WORKSPACE_ROOT`) — so memory is anchored to the agent, like runs and
+workspace, and persists across sessions regardless of the process's current
+directory. `CHIDORI_MEMORY_DIR` overrides the root.
 
 ### workspace
 
