@@ -233,6 +233,15 @@ enum Commands {
         #[arg(long)]
         until_seq: Option<u64>,
 
+        /// Repair a failed run: strip the trailing failed record(s) — and any
+        /// nested effects the failed call consumed — from the journal, replay
+        /// everything before the failure from cache, then re-execute the
+        /// failed call live. Errors if the run's journal has no trailing
+        /// failure (a completed run needs nothing; a paused run wants plain
+        /// `resume`). Mutually exclusive with `--until-seq`.
+        #[arg(long, conflicts_with = "until_seq")]
+        retry_failed: bool,
+
         /// Edit-and-resume: proceed even though the agent source changed
         /// since this run was recorded. Recorded calls replay positionally
         /// against the edited code; an edit that touches already-replayed
@@ -620,6 +629,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             run_id,
             dir,
             until_seq,
+            retry_failed,
             allow_source_change,
             model,
             untrusted,
@@ -634,6 +644,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                     &run_id,
                     dir.as_deref(),
                     until_seq,
+                    retry_failed,
                     allow_source_change,
                     model,
                     untrusted,
@@ -1969,6 +1980,7 @@ fn cmd_resume(
     run_id: &str,
     dir: Option<&std::path::Path>,
     until_seq: Option<u64>,
+    retry_failed: bool,
     allow_source_change: bool,
     model: Option<String>,
     untrusted: bool,
@@ -1992,6 +2004,63 @@ fn cmd_resume(
         .store_for(run_id)
         .load_call_log()?
         .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+
+    // `--retry-failed`: first-class repair for a failed run. The trailing
+    // failed record(s) — the crash frontier — are stripped with the exact
+    // fixpoint the actor `restart: "resume"` path and the detached-agent
+    // supervisor use (`strip_crash_frontier`): pop trailing failed records,
+    // then sweep out every record whose parent is stripped, so a failed
+    // call's nested effects re-execute live too. Divergence scoping falls out
+    // of the strip: the surviving prefix still replays under the normal
+    // strict rules (nothing here loosens them, and `--allow-source-change`
+    // keeps its usual meaning), while the retried tail has no records left to
+    // diverge against — it is ordinary live execution, so a different
+    // args/result on the retry needs no opt-in.
+    if retry_failed {
+        if records.last().map_or(true, |r| r.error.is_none()) {
+            let store = factory.store_for(run_id);
+            let state = if store.get_blob("output.json").ok().flatten().is_some() {
+                "completed — it already has a recorded output, so there is nothing to \
+                 retry (use `chidori verify` to re-check it, or `--until-seq` to \
+                 time-travel into its history)"
+                    .to_string()
+            } else if store
+                .get_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                "paused on a pending operation, not failed — continue it with a plain \
+                 `chidori resume` (or deliver its input/signal through `chidori serve`)"
+                    .to_string()
+            } else {
+                format!(
+                    "not in a failed state: its journal's last record ({}) completed, so \
+                     there is no failure frontier to retry",
+                    records
+                        .last()
+                        .map(|r| format!("seq {} `{}`", r.seq, r.function))
+                        .unwrap_or_else(|| "empty journal".to_string())
+                )
+            };
+            anyhow::bail!("--retry-failed: run {run_id} is {state}.");
+        }
+        let before_seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
+        records = crate::runtime::host_actor::strip_crash_frontier(records);
+        let kept: std::collections::HashSet<u64> = records.iter().map(|r| r.seq).collect();
+        let removed: Vec<u64> = before_seqs
+            .into_iter()
+            .filter(|seq| !kept.contains(seq))
+            .collect();
+        let low = removed.iter().min().copied().unwrap_or_default();
+        let high = removed.iter().max().copied().unwrap_or_default();
+        eprintln!(
+            "retry-failed: stripped {} failed record(s) (seqs {low}..{high}), \
+             replaying {} records then executing live",
+            removed.len(),
+            records.len()
+        );
+    }
 
     // Time travel: truncate the journal at the requested frontier; replay
     // serves everything up to it from cache and the run continues live there.
@@ -2077,7 +2146,13 @@ fn cmd_resume(
         .with_policy(cli_policy(untrusted, trusted))
         .with_persist_base(run_base.clone())
         .with_default_model(default_model)
-        .with_history_rewrite_allowed(until_seq.is_some())
+        // Both `--until-seq` and `--retry-failed` intentionally hand the
+        // engine a journal SHORTER than the durable one; without the opt-in
+        // the shorter-log floor would refuse to compact the repaired history
+        // (e.g. a retry that settles in fewer records than the failed attempt
+        // journaled), leaving stale failed records behind for `verify` to
+        // trip over.
+        .with_history_rewrite_allowed(until_seq.is_some() || retry_failed)
         .with_workspace_root(abs_dir(&base_dir));
 
     // Journaled top-level workspace records re-execute on every replay by

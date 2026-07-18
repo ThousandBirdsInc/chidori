@@ -907,6 +907,158 @@ fn cli_plain_run_reports_prompt_progress_on_stderr() {
     fs::remove_dir_all(dir).ok();
 }
 
+/// Run chidori with every LLM provider hook removed (and HOME pointed at the
+/// empty project dir so saved `model-login` credentials can't register a
+/// provider either). Used to force a deterministic provider failure — and to
+/// prove `verify` needs no provider.
+fn run_chidori_without_providers(args: &[&str], cwd: &Path) -> Output {
+    let mut command = Command::new(chidori_bin());
+    command.args(args).current_dir(cwd).env("HOME", cwd);
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CHIDORI_OPENAI_COMPAT_URL",
+        "CHIDORI_OPENAI_COMPAT_KEY",
+        "LITELLM_API_URL",
+        "LITELLM_API_KEY",
+        "OPENROUTER_API_KEY",
+        "CHIDORI_TEST_LLM_RESPONSE",
+    ] {
+        command.env_remove(key);
+    }
+    command.output().unwrap()
+}
+
+fn first_run_id(dir: &Path) -> String {
+    fs::read_dir(dir.join(".chidori").join("runs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .into_string()
+        .unwrap()
+}
+
+// `chidori resume --retry-failed` — first-class repair for a failed run:
+// strip the trailing failed record(s) from the journal, replay the intact
+// prefix from cache, re-execute the failure live. The repaired journal must
+// then hold up to `chidori verify` — the whole point over hand-computed
+// `--until-seq` surgery.
+#[test]
+fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
+    let dir = temp_project("retry-failed");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("start", {});
+                const text = await chidori.prompt("say hi");
+                return { text };
+            }
+        "#,
+    )
+    .unwrap();
+
+    // Force the failure: no provider configured, so the prompt call fails
+    // and journals as the run's trailing failed record.
+    let output = run_chidori_without_providers(&["run", agent.to_str().unwrap()], &dir);
+    assert_failure(&output);
+    let run_id = first_run_id(&dir);
+
+    // A plain resume would replay the recorded failure. --retry-failed
+    // strips it and re-executes the prompt live against the now-working
+    // provider — no --allow-source-change needed for the retried tail.
+    let output = run_chidori_with_str_env(
+        &["resume", agent.to_str().unwrap(), &run_id, "--retry-failed"],
+        &dir,
+        &[("CHIDORI_TEST_LLM_RESPONSE", "repaired")],
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("retry-failed: stripped 1 failed record(s)"),
+        "expected the stripped-count line on stderr, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("replaying 1 records then executing live"),
+        "expected the replay/live split in the stripped line, got:\n{stderr}"
+    );
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stdout["text"], "repaired");
+
+    // The repaired run is a coherent recorded run: verify replays it to the
+    // identical output with NO provider configured.
+    let output =
+        run_chidori_without_providers(&["verify", agent.to_str().unwrap(), &run_id], &dir);
+    assert_success(&output);
+
+    fs::remove_dir_all(dir).ok();
+}
+
+// --retry-failed on a run with nothing to retry must say what state the run
+// is actually in and what to do instead.
+#[test]
+fn cli_resume_retry_failed_on_completed_run_errors_clearly() {
+    let dir = temp_project("retry-failed-completed");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("fine", {});
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori(&["run", agent.to_str().unwrap()], &dir);
+    assert_success(&output);
+    let run_id = first_run_id(&dir);
+
+    let output = run_chidori(
+        &["resume", agent.to_str().unwrap(), &run_id, "--retry-failed"],
+        &dir,
+    );
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("completed") && stderr.contains("nothing to retry"),
+        "expected a clear completed-run refusal naming the state, got:\n{stderr}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+// --retry-failed and --until-seq name different frontiers; combining them is
+// ambiguous and must be rejected up front.
+#[test]
+fn cli_resume_retry_failed_rejects_until_seq_combination() {
+    let dir = temp_project("retry-failed-conflict");
+    let output = run_chidori(
+        &[
+            "resume",
+            "agent.ts",
+            "some-run",
+            "--retry-failed",
+            "--until-seq",
+            "3",
+        ],
+        &dir,
+    );
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--retry-failed") && stderr.contains("--until-seq"),
+        "expected a flag-conflict error naming both flags, got:\n{stderr}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
 // A chat session is a durable run: the session id is announced, every turn
 // journals under `.chidori/runs/<session_id>` with `input.json` holding the
 // dialogue state, and `--resume` replays the transcript and continues the

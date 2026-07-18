@@ -132,6 +132,34 @@ frontier. This is *logic-level* time travel — a stronger operation than
 restoring a database to a past moment, because the run continues executing
 from the restored point.
 
+## Repairing a failed run: `--retry-failed`
+
+A run that failed mid-flight leaves its journal ending in the failed
+record(s), so replaying it replays the failure. Repair used to mean
+hand-computing an `--until-seq` frontier just before the failure —
+error-prone, and easy to get wrong in a way that forfeits `verify`.
+`--retry-failed` does it first-class:
+
+```bash
+chidori resume agent.ts <run_id> --retry-failed
+```
+
+strips the trailing failed record(s) from the journal — cascading to any
+nested effects the failing call consumed, the same crash-frontier rule the
+actor `restart: "resume"` path uses — replays every record before the
+failure from cache, and re-executes the failed call live
+(`retry-failed: stripped N failed record(s) (seqs X..Y), replaying M records
+then executing live` on stderr names the split). On success the run settles
+normally and the repaired journal is coherent: `chidori verify` passes on it.
+
+Tolerance is scoped to the retried call only: the stripped tail re-executes
+live, so a different args/result on the retry needs no opt-in, while the
+surviving prefix still replays under the normal divergence rules
+(`--allow-source-change` keeps its usual meaning). The flag refuses a run
+whose journal has no trailing failure — a completed run needs nothing, a
+paused run wants plain `resume` — and is mutually exclusive with
+`--until-seq`.
+
 ## Leases: single-writer ownership
 
 `lease.json` (via `acquire_lease` / `release_lease` in `store.rs`) records
