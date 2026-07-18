@@ -648,8 +648,10 @@ mod tests {
         }))
         .unwrap();
 
-        let (decision, _) =
-            cfg.decide("http", &json!({ "url": "http://ops.internal:9911/status/x" }));
+        let (decision, _) = cfg.decide(
+            "http",
+            &json!({ "url": "http://ops.internal:9911/status/x" }),
+        );
         assert_eq!(decision, Decision::AlwaysAllow);
 
         // A different host is denied…

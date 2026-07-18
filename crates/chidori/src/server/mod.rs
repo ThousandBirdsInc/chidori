@@ -796,7 +796,9 @@ pub async fn serve(
         }
     );
     eprintln!();
-    eprintln!("  Events:     ANY /*           → agent(event); a pausing run becomes a session (202)");
+    eprintln!(
+        "  Events:     ANY /*           → agent(event); a pausing run becomes a session (202)"
+    );
     eprintln!("  Sessions:   POST /sessions   → create & run");
     eprintln!("              GET  /sessions   → list all");
     eprintln!("              GET  /sessions/{{id}}  → get result");
