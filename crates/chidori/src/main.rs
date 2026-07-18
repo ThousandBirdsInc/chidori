@@ -2185,7 +2185,7 @@ fn cmd_verify(file: &Path, run_id: &str, dir: Option<&std::path::Path>) -> Resul
 /// This is the regression-test mode `tael eval run --cmd` consumes: a golden
 /// case whose fixture is a checkpoint replays at $0 in milliseconds, and any
 /// nonzero exit marks the case failed.
-fn cmd_resume_ci(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) -> i32 {
+fn cmd_resume_ci(file: &Path, run_id: &str, dir: Option<&std::path::Path>) -> i32 {
     let report = |value: Value| {
         println!(
             "{}",

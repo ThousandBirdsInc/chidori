@@ -497,7 +497,7 @@ async fn logs(cfg: &Config, name: Option<String>, tail: u32) -> Result<()> {
         println!(
             "{at}  {:<9} {}  {}",
             status,
-            &run_id.chars().take(8).collect::<String>(),
+            run_id.chars().take(8).collect::<String>(),
             line
         );
     }
@@ -849,7 +849,7 @@ async fn accept_callback(
                 .await;
             continue;
         }
-        let query = path.splitn(2, '?').nth(1).unwrap_or("");
+        let query = path.split_once('?').map(|x| x.1).unwrap_or("");
         let (mut key, mut got_state) = (None, None);
         for kv in query.split('&') {
             let mut it = kv.splitn(2, '=');
@@ -1117,8 +1117,8 @@ async fn fleet(cfg: &Config, window: u32) -> Result<()> {
     }
     println!("Fleet health over the last {window}h (schedule * = enabled):\n");
     println!(
-        "{:<24} {:<9} {:>5} {:>5} {:>7} {:>7} {:>6} {}",
-        "AGENT", "HEALTH", "OK%", "RUNS", "P50ms", "P95ms", "SCHED", "NEXT RUN"
+        "{:<24} {:<9} {:>5} {:>5} {:>7} {:>7} {:>6} NEXT RUN",
+        "AGENT", "HEALTH", "OK%", "RUNS", "P50ms", "P95ms", "SCHED"
     );
     for a in rows {
         let name = a.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1232,8 +1232,8 @@ async fn schedule_list(cfg: &Config) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<38} {:<15} {:<7} {:<18} {}",
-        "ID", "CRON", "STATE", "NEXT RUN", "AGENTS"
+        "{:<38} {:<15} {:<7} {:<18} AGENTS",
+        "ID", "CRON", "STATE", "NEXT RUN"
     );
     for s in rows {
         let id = s.get("id").and_then(Value::as_str).unwrap_or("");
