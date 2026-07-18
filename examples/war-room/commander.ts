@@ -73,14 +73,39 @@ function makeTools(opsBase: string) {
   return { serviceStatus, runbook };
 }
 
+type WebhookEvent = {
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  query: Record<string, string>;
+  body: { alert?: Alert; approvalTimeoutMs?: number; maxPages?: number } | string | null;
+};
+
 run(
   async (input: {
-    alert: Alert;
+    alert?: Alert;
+    event?: WebhookEvent;
     opsBase?: string;
     approvalTimeoutMs?: number;
     maxPages?: number;
   }) => {
-    const alert = input.alert;
+    // Accept either a session input ({ alert }) or the server's event-driven
+    // surface (ANY /* folds the request into { event: { method, path, headers,
+    // query, body } } — undocumented; shape read from server/events.rs).
+    const eventBody =
+      input.event && typeof input.event.body === "object" && input.event.body !== null
+        ? input.event.body
+        : undefined;
+    const alert = input.alert ?? eventBody?.alert;
+    if (!alert) {
+      // Non-incident traffic (health probes, scanners) ends here — cheaply.
+      return { status: 400, body: { error: "no alert in request" } };
+    }
+    input = {
+      ...input,
+      approvalTimeoutMs: input.approvalTimeoutMs ?? eventBody?.approvalTimeoutMs,
+      maxPages: input.maxPages ?? eventBody?.maxPages,
+    };
     const opsBase = input.opsBase ?? OPS_DEFAULT;
     const approvalTimeoutMs = input.approvalTimeoutMs ?? 120_000;
     const maxPages = input.maxPages ?? 2;

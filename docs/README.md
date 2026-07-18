@@ -46,6 +46,7 @@ authoritative — several document retired or superseded work:
 - [consumer-usability-review-2.md](./consumer-usability-review-2.md) — round 2: the multi-agent surface (actors, branches, detached agents) under failure
 - [consumer-usability-review-3.md](./consumer-usability-review-3.md) — round 3: the everyday-agent surface as a daily driver
 - [consumer-usability-review-4.md](./consumer-usability-review-4.md) — round 4: the day-2 surface (npm packages, durable store, hydration, time travel, `verify`)
+- [consumer-usability-review-5.md](./consumer-usability-review-5.md) — round 5: shipping to users (`serve` in production posture, SSE streaming, multiplayer signals under crashes, SDK-as-client, webhooks)
 - [branching-execution.md](./branching-execution.md) — also doubles as the branching design record
 - [rust-style-guide.md](./rust-style-guide.md) — contributor conventions
 - [releasing.md](./releasing.md) — release train and versioning
