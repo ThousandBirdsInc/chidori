@@ -492,8 +492,26 @@ llm.txt's `verify` description now says workspace writes re-materialize
 counts in-VM `defineTool` invocations (journaled as `mark("tool:...")`)
 instead of reporting `Tool calls: 0` for the most common agent shape.
 
-With these landed, the review's bottom line moves: the five "one focused
-sprint" items are done (four in this branch, publishing remains), and the
+**Live re-verification.** Every fix was then exercised end-to-end against
+live DeepSeek with the same war-room demo, in the full production posture
+(`CHIDORI_API_KEY` + `CHIDORI_POLICY_FILE` with `url_prefix` + SSRF
+allowlist), on the rebuilt binary:
+
+| Fix | Live result |
+|---|---|
+| SDK auth (F1) | Dashboard streamed and responders signaled through bearer auth, first try — full multiplayer incident (note → revise → approve → mitigate → postmortem) in 54s |
+| Webhook sessions (F2) | `POST /alerts/pagerduty` with a pausing incident → `202` with `{id, status: "paused", pending_signal_names, run_id}`; one `responder.mjs approve` completed it. Stray `GET /favicon.ico` → 400, zero session rows added |
+| Signal records on the stream (F4) | `call #11 signal_any` arrived on the SSE stream at delivery; `chidori trace` renders `← note from human:dana: {"text":"..."}` and `← approve from human:sam: {"decision":"mitigate"}` |
+| Audible denials + `url_prefix` (F5) | The same policy that allowed every `127.0.0.1:9911` call denied a `:9912` probe — with `chidori: policy: \`http\` denied (war-room server allows only the ops API...)` on the server console at fire time |
+| Replay labels + pricing (F7) | `resume` of the completed run: "16 recorded calls replayed, **1 workspace re-materialization(s), 0 executed live**"; `resume` of a signal-paused run prints delivery guidance instead of `null`; `stats` reports `Tool calls: 4`; `trace` priced the run ($0.001359) in a shell with **no** `CHIDORI_PRICING` set, from the manifest-journaled table |
+
+Test additions: 5 server/policy regression tests (boot re-arm, event-pause
+session, event statelessness, SSE signal record, `url_prefix` anchoring)
+and 2 SDK auth tests — 426/426 lib tests and 36/36 SDK tests pass.
+Verification spend: ~$0.01 of DeepSeek.
+
+With these landed, the review's bottom line moves: the "one focused
+sprint" items are done (in this branch; publishing remains), and the
 sharpest sentence in the verdict — *"not on the documented path, today"* —
 no longer holds for auth, webhooks, or observability. What remains open:
 SDK package publishing, and a stream re-attach endpoint for dashboards

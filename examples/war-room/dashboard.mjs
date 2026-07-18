@@ -48,12 +48,17 @@ try {
       case "prompt_end":
         process.stdout.write(`\n[dash ${ts()}] ── end (${currentType})\n`);
         break;
-      case "call":
+      case "call": {
+        // Consumed signals carry who steered the run — render the attribution.
+        const r = evt.record;
+        const isSignal = r.function === "signal" || r.function === "signal_any";
+        const from = isSignal && r.result?.from ? `${r.result.from.kind}:${r.result.from.id}` : null;
         console.log(
-          `[dash ${ts()}] call #${evt.record.seq} ${evt.record.function}` +
-            (evt.record.function === "signal" ? ` -> ${JSON.stringify(evt.record.result)}` : ""),
+          `[dash ${ts()}] call #${r.seq} ${r.function}` +
+            (from ? ` ← ${r.result.name} from ${from}: ${JSON.stringify(r.result.payload)}` : ""),
         );
         break;
+      }
       case "paused":
         console.log(
           `\n[dash ${ts()}] ⏸ WAR ROOM OPEN — session ${evt.id} waiting on ` +
