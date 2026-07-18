@@ -991,8 +991,7 @@ fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
 
     // The repaired run is a coherent recorded run: verify replays it to the
     // identical output with NO provider configured.
-    let output =
-        run_chidori_without_providers(&["verify", agent.to_str().unwrap(), &run_id], &dir);
+    let output = run_chidori_without_providers(&["verify", agent.to_str().unwrap(), &run_id], &dir);
     assert_success(&output);
 
     fs::remove_dir_all(dir).ok();

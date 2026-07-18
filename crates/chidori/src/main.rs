@@ -2017,7 +2017,7 @@ fn cmd_resume(
     // diverge against — it is ordinary live execution, so a different
     // args/result on the retry needs no opt-in.
     if retry_failed {
-        if records.last().map_or(true, |r| r.error.is_none()) {
+        if records.last().is_none_or(|r| r.error.is_none()) {
             let store = factory.store_for(run_id);
             let state = if store.get_blob("output.json").ok().flatten().is_some() {
                 "completed — it already has a recorded output, so there is nothing to \
