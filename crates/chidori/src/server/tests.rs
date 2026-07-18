@@ -176,6 +176,7 @@ async fn cancel_session_marks_active_session_cancelled() {
             cancel_tx,
             attempt_number: Some(7),
             signals: None,
+            event_log: None,
         },
     );
     state
@@ -2749,10 +2750,13 @@ async fn event_run_that_completes_stays_stateless() {
     );
     let state = signal_test_state(&temp_dir, agent_path);
 
+    // A stray path that is NOT on the noise short-circuit list (favicon &
+    // friends are answered 404 before the agent — covered separately below):
+    // the agent runs and its cheap {status: 400} branch is honored.
     let response = handle_event(
         State(state.clone()),
         axum::http::Method::GET,
-        "/favicon.ico".parse().unwrap(),
+        "/stray/scanner-probe".parse().unwrap(),
         axum::http::HeaderMap::new(),
         axum::extract::Query(HashMap::new()),
         axum::body::Bytes::new(),
@@ -2767,4 +2771,295 @@ async fn event_run_that_completes_stays_stateless() {
     );
 
     let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Round-6 usability fixes: event noise short-circuit, SSE re-attach, and the
+// static effect preflight.
+// ---------------------------------------------------------------------------
+
+/// The noise predicate stays conservative: only paths browsers and
+/// well-behaved bots fetch on their own, matched at the path root.
+#[test]
+fn noise_path_predicate_matches_only_browser_scanner_noise() {
+    assert!(is_probe_noise_path("/favicon.ico"));
+    assert!(is_probe_noise_path("/robots.txt"));
+    assert!(is_probe_noise_path("/apple-touch-icon.png"));
+    assert!(is_probe_noise_path("/apple-touch-icon-precomposed.png"));
+    assert!(is_probe_noise_path("/.well-known/security.txt"));
+    // Deliberate event paths never match.
+    assert!(!is_probe_noise_path("/"));
+    assert!(!is_probe_noise_path("/alerts/pagerduty"));
+    assert!(!is_probe_noise_path("/webhooks/favicon.ico"));
+    assert!(!is_probe_noise_path("/robots"));
+    assert!(!is_probe_noise_path("/.well-known")); // only paths UNDER it
+}
+
+/// `CHIDORI_SERVE_ALL_PATHS=1` disables the short-circuit (tested through the
+/// split-out pure function so no test mutates process-global env state).
+#[test]
+fn noise_short_circuit_escape_hatch_serves_all_paths() {
+    assert!(noise_short_circuit("/favicon.ico", false));
+    assert!(!noise_short_circuit("/favicon.ico", true));
+    assert!(!noise_short_circuit("/alerts/pagerduty", false));
+}
+
+/// In event mode, browser/scanner noise paths are answered 404 with an empty
+/// body BEFORE the agent runs — this agent answers 200 to anything, so a 404
+/// proves the short-circuit fired — and no session row is stored.
+#[tokio::test]
+async fn event_noise_paths_404_without_running_the_agent() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("chidori-event-noise-{}", uuid::Uuid::new_v4()));
+    let agent_path = write_agent(
+        &temp_dir,
+        r#"
+            export async function agent(input) {
+                return { status: 200, body: { ran: true } };
+            }
+        "#,
+    );
+    let state = signal_test_state(&temp_dir, agent_path);
+
+    for path in ["/favicon.ico", "/robots.txt", "/.well-known/security.txt"] {
+        let response = handle_event(
+            State(state.clone()),
+            axum::http::Method::GET,
+            path.parse().unwrap(),
+            axum::http::HeaderMap::new(),
+            axum::extract::Query(HashMap::new()),
+            axum::body::Bytes::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "path: {path}");
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.is_empty(), "noise 404 must have an empty body: {path}");
+    }
+    assert!(
+        state.session_store.list().unwrap().is_empty(),
+        "noise short-circuits must not store sessions"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+// -----------------------------------------------------------------------
+// GET /sessions/{id}/stream — SSE re-attach (catch-up + follow).
+// -----------------------------------------------------------------------
+
+/// Collect a (finite or done-terminated) SSE response body to a string.
+async fn collect_sse(response: Response) -> String {
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+/// Re-attaching to an unknown session id is a 404, not an empty stream.
+#[tokio::test]
+async fn attach_stream_unknown_session_is_404() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("chidori-attach-404-{}", uuid::Uuid::new_v4()));
+    let agent_path = write_agent(&temp_dir, "export async function agent() { return {}; }");
+    let state = signal_test_state(&temp_dir, agent_path);
+
+    let response = attach_session_stream(State(state), Path("no-such".to_string())).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// Re-attaching to a SETTLED session replays its logged call records as
+/// `call` events (same SSE format as the live stream) and closes with a
+/// `done` event carrying the terminal state.
+#[tokio::test]
+async fn attach_stream_replays_settled_session_journal() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("chidori-attach-settled-{}", uuid::Uuid::new_v4()));
+    let agent_path = write_agent(
+        &temp_dir,
+        r#"
+            export async function agent(input, chidori) {
+                const queued = await chidori.pollSignal("steer");
+                return { ok: true, queued: queued !== null };
+            }
+        "#,
+    );
+    let state = signal_test_state(&temp_dir, agent_path);
+
+    let (status, body) = response_json(
+        create_session(State(state.clone()), Json(warm_create_request("settled-1"))).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["status"], json!("completed"), "body: {body}");
+
+    let response =
+        attach_session_stream(State(state.clone()), Path("settled-1".to_string())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let sse_text = collect_sse(response).await;
+    assert!(sse_text.contains("event: call"), "sse: {sse_text}");
+    assert!(
+        sse_text.contains("\"function\":\"poll_signal\""),
+        "replayed journal must carry the recorded call: {sse_text}"
+    );
+    assert!(sse_text.contains("event: done"), "sse: {sse_text}");
+    assert!(
+        sse_text.contains("\"status\":\"completed\""),
+        "sse: {sse_text}"
+    );
+    assert!(
+        sse_text.contains("\"ok\":true"),
+        "done event must carry the output: {sse_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// The re-attach flow the endpoint exists for: a streaming session pauses on
+/// a signal, the original client's stream is gone, a second client attaches
+/// via GET — catches up on the already-emitted events (the `paused`
+/// announcement) — and then follows live through the delivered signal to
+/// `done`, in the same SSE format as the POST stream.
+#[tokio::test]
+async fn attach_stream_catches_up_and_follows_live_run() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("chidori-attach-live-{}", uuid::Uuid::new_v4()));
+    let agent_path = write_agent(
+        &temp_dir,
+        r#"
+            export async function agent(input, chidori) {
+                const review = await chidori.signal("review");
+                return { decision: review.payload.decision, by: review.from.id };
+            }
+        "#,
+    );
+    let state = signal_test_state(&temp_dir, agent_path);
+
+    let sse = start_stream(&state, "reattach-1", json!({})).await;
+    wait_for_status(&state, "reattach-1", SessionStatus::Paused).await;
+
+    // Attach while the session is live and paused: the response must be an
+    // SSE stream that first replays what was already emitted.
+    let response =
+        attach_session_stream(State(state.clone()), Path("reattach-1".to_string())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let attached = tokio::spawn(collect_sse(response));
+
+    // Deliver the signal; the supervisor resumes in-process and completes.
+    let (status, body) = response_json(
+        signal_session(
+            State(state.clone()),
+            Path("reattach-1".to_string()),
+            Json(SignalRequest {
+                allow_source_change: false,
+                name: "review".to_string(),
+                payload: json!({ "decision": "approve" }),
+                from: json!({ "kind": "human", "id": "mara" }),
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    wait_for_status(&state, "reattach-1", SessionStatus::Completed).await;
+
+    // The attached stream terminates on `done` — with catch-up (paused) and
+    // the live tail (consumed signal + completion) all present.
+    let attached_text = attached.await.unwrap();
+    assert!(
+        attached_text.contains("event: paused"),
+        "catch-up must replay the pause announcement: {attached_text}"
+    );
+    assert!(
+        attached_text.contains("\"function\":\"signal\"")
+            && attached_text.contains("\"id\":\"mara\""),
+        "live tail must carry the consumed signal record: {attached_text}"
+    );
+    assert!(
+        attached_text.contains("event: done")
+            && attached_text.contains("\"status\":\"completed\""),
+        "attached stream must follow to settlement: {attached_text}"
+    );
+
+    // The original POST stream saw the same terminal event.
+    let sse_text = sse.await.unwrap();
+    assert!(sse_text.contains("\"status\":\"completed\""), "{sse_text}");
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+// -----------------------------------------------------------------------
+// Static effect preflight (server/preflight.rs): agents declare no effects,
+// so the scan greps the source for gated-surface spellings and flags only
+// targets the policy denies for EVERY argument shape.
+// -----------------------------------------------------------------------
+
+#[test]
+fn static_effect_scan_finds_gated_references_at_identifier_boundaries() {
+    let refs = preflight::static_effect_refs(
+        r#"
+            const res = await fetch("https://example.com/");
+            await chidori.workspace.write("out.txt", "hi");
+            await chidori.workspace.read("in.txt");
+        "#,
+    );
+    let targets: Vec<&str> = refs.iter().map(|r| r.target).collect();
+    assert!(targets.contains(&"http"), "targets: {targets:?}");
+    assert!(targets.contains(&"workspace:write"), "targets: {targets:?}");
+    assert!(targets.contains(&"workspace:read"), "targets: {targets:?}");
+
+    // Identifier-boundary check: a user-defined `myFetch(...)` is not the
+    // http effect, while `globalThis.fetch(...)` is.
+    assert!(preflight::static_effect_refs("myFetch(1)").is_empty());
+    assert!(!preflight::static_effect_refs("globalThis.fetch(url)").is_empty());
+}
+
+#[test]
+fn preflight_flags_only_unconditionally_denied_targets() {
+    let untrusted = crate::policy::builtin_profile("untrusted").unwrap();
+
+    // http under the untrusted profile: denied for every argument → flagged,
+    // and the denial reason rides along.
+    let denied = preflight::denied_static_effects(HTTP_AGENT, &untrusted);
+    assert_eq!(denied.len(), 1, "denied: {denied:?}");
+    assert_eq!(denied[0].0.target, "http");
+
+    // Read-only workspace introspection is on the untrusted allowlist → not
+    // flagged.
+    let denied = preflight::denied_static_effects(
+        r#"await chidori.workspace.read("a.txt");"#,
+        &untrusted,
+    );
+    assert!(denied.is_empty(), "denied: {denied:?}");
+
+    // A deny-by-default policy with a SCOPED http allow rule can pass some
+    // calls, so the warning must stay quiet (no false positives).
+    let scoped: PolicyConfig = serde_json::from_value(json!({
+        "rules": [{
+            "target": "http",
+            "decision": "always_allow",
+            "match_args": { "url_prefix": "https://api.example.com/" }
+        }],
+        "default": "never_allow"
+    }))
+    .unwrap();
+    assert!(
+        preflight::denied_static_effects(HTTP_AGENT, &scoped).is_empty(),
+        "a scoped allow means http is not unconditionally denied"
+    );
+
+    // Ask-by-default (supervised) pauses rather than denies → not flagged.
+    let supervised = crate::policy::builtin_profile("supervised").unwrap();
+    assert!(preflight::denied_static_effects(HTTP_AGENT, &supervised).is_empty());
+
+    // Layered: a permissive server policy tightened by an untrusted session
+    // profile denies http at the overlay → flagged.
+    let layered =
+        PolicyConfig::default().restricted_by(Arc::new(crate::policy::builtin_profile("untrusted").unwrap()));
+    let denied = preflight::denied_static_effects(HTTP_AGENT, &layered);
+    assert_eq!(denied.len(), 1, "denied: {denied:?}");
+    assert_eq!(denied[0].0.target, "http");
 }
