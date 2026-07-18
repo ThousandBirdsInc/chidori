@@ -52,6 +52,44 @@ fn decode_lone_surrogates(value: &str) -> JsString {
     JsString::from_code_units(&units)
 }
 
+/// Render one oxc diagnostic with the 1-based line/column of its primary
+/// label — `Unexpected token (line 3, column 7)` — so a parse error points at
+/// its source position instead of leaving the user to hunt for it. The span
+/// is resolved by miette (the diagnostic toolkit oxc's errors are built on).
+/// `line_offset` shifts reported lines up by that many wrapper lines (direct
+/// eval compiles inside a synthetic wrapper), clamped at line 1.
+fn render_diagnostic(src: &str, e: &oxc::diagnostics::OxcDiagnostic, line_offset: u32) -> String {
+    use miette::SourceCode as _;
+    let msg = e.to_string();
+    let Some(offset) = e
+        .labels
+        .as_ref()
+        .and_then(|l| l.first())
+        .map(|l| l.offset())
+    else {
+        return msg;
+    };
+    let Ok(span) = src.read_span(&miette::SourceSpan::new(offset.into(), 0), 0, 0) else {
+        return msg;
+    };
+    let line = (span.line() as u32 + 1).saturating_sub(line_offset).max(1);
+    let col = span.column() as u32 + 1;
+    format!("{msg} (line {line}, column {col})")
+}
+
+/// Render a diagnostic list (each with its position) joined with `"; "`.
+fn render_diagnostics(
+    src: &str,
+    errors: &[oxc::diagnostics::OxcDiagnostic],
+    line_offset: u32,
+) -> String {
+    errors
+        .iter()
+        .map(|e| render_diagnostic(src, e, line_offset))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub fn compile_script(src: &str) -> Result<FuncProto, String> {
     compile_script_impl(src, false, true, true)
 }
@@ -118,13 +156,10 @@ pub fn compile_script_kernels(src: &str, kernels: bool) -> Result<FuncProto, Str
     let source_type = SourceType::script();
     let ret = Parser::new(&allocator, src, source_type).parse();
     if !ret.errors.is_empty() {
-        let msg = ret
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("SyntaxError: {msg}"));
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(src, &ret.errors, 0)
+        ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
@@ -133,16 +168,48 @@ pub fn compile_script_kernels(src: &str, kernels: bool) -> Result<FuncProto, Str
     if !sem.errors.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            sem.errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            render_diagnostics(src, &sem.errors, 0)
         ));
     }
     let mut c = Compiler::new();
-    c.source = src.to_string();
+    c.source = Rc::from(src);
     c.kernelize = kernels;
+    c.compile_toplevel(&program).map_err(|e| {
+        if e.starts_with("SyntaxError") {
+            e
+        } else {
+            format!("SyntaxError: {e}")
+        }
+    })
+}
+
+/// Compile with the register-bytecode pass toggled — used by the register-tier
+/// differential test (`tests/reg.rs`), which asserts register and stack
+/// execution are byte-identical. Production uses [`compile_script`] (register
+/// bytecode on).
+pub fn compile_script_regs(src: &str, regs: bool) -> Result<FuncProto, String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::script();
+    let ret = Parser::new(&allocator, src, source_type).parse();
+    if !ret.errors.is_empty() {
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(src, &ret.errors, 0)
+        ));
+    }
+    let program = ret.program;
+    let sem = oxc::semantic::SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&program);
+    if !sem.errors.is_empty() {
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(src, &sem.errors, 0)
+        ));
+    }
+    let mut c = Compiler::new();
+    c.source = Rc::from(src);
+    c.regify = regs;
     c.compile_toplevel(&program).map_err(|e| {
         if e.starts_with("SyntaxError") {
             e
@@ -175,13 +242,10 @@ fn compile_script_impl(
     let source_type = SourceType::script();
     let ret = Parser::new(&allocator, src, source_type).parse();
     if !ret.errors.is_empty() {
-        let msg = ret
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("SyntaxError: {msg}"));
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(src, &ret.errors, 0)
+        ));
     }
     let program = ret.program;
     // Semantic early-errors (duplicate lexical declarations, illegal `await`,
@@ -193,15 +257,11 @@ fn compile_script_impl(
     if !sem.errors.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            sem.errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            render_diagnostics(src, &sem.errors, 0)
         ));
     }
     let mut c = Compiler::new();
-    c.source = src.to_string();
+    c.source = Rc::from(src);
     c.toplevel_is_eval = as_eval;
     c.fuse = fuse;
     c.localize = localize;
@@ -269,15 +329,18 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
         Wrap::Method => format!("({{ m(){{\n{strict_prefix}{src}\n}} }})"),
     };
     let source_type = SourceType::script();
+    // Positions are computed against the wrapped text, then shifted back by
+    // the wrapper's leading lines so they land on the user's eval source.
+    let wrapper_lines = match wrap {
+        Wrap::None => 0,
+        Wrap::Function | Wrap::Method => 1,
+    } + u32::from(desc.strict);
     let ret = Parser::new(&allocator, &wrapped, source_type).parse();
     if !ret.errors.is_empty() {
-        let msg = ret
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("SyntaxError: {msg}"));
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(&wrapped, &ret.errors, wrapper_lines)
+        ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
@@ -295,17 +358,18 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
     let sem_errors: Vec<String> = sem
         .errors
         .iter()
-        .map(|e| e.to_string())
-        .filter(|msg| {
+        .filter(|e| {
+            let msg = e.to_string();
             let name = msg
                 .strip_prefix("Private identifier '#")
                 .or_else(|| msg.strip_prefix("Private field '#"))
-                .and_then(|r| r.split('\'').next());
+                .and_then(|r| r.split('\'').next().map(str::to_string));
             match name {
-                Some(n) => !seeded.contains(n),
+                Some(n) => !seeded.contains(n.as_str()),
                 None => true,
             }
         })
+        .map(|e| render_diagnostic(&wrapped, e, wrapper_lines))
         .collect();
     if !sem_errors.is_empty() {
         return Err(format!("SyntaxError: {}", sem_errors.join("; ")));
@@ -352,7 +416,7 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
             .any(|d| d.directive.as_str() == "use strict");
 
     let mut c = Compiler::new();
-    c.source = wrapped.clone();
+    c.source = Rc::from(wrapped.as_str());
     // Seed the caller's enclosing class private scopes (outermost first) so
     // `this.#x` in the eval body resolves to the caller's storage keys; the
     // runtime names come from the caller frame's private environment chain.
@@ -484,18 +548,26 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
 /// top-level `this` is `undefined`, and top-level declarations are lexical cells
 /// (NOT global-object properties).
 pub fn compile_module(src: &str) -> Result<crate::module::CompiledModule, String> {
+    compile_module_labeled(src, None)
+}
+
+/// As [`compile_module`], with a source label — the module's registry key or
+/// file path — stamped on every compiled function so stack frames render as
+/// `at name (label:line:col)` and an embedder can resolve a frame back to a
+/// file.
+pub fn compile_module_labeled(
+    src: &str,
+    label: Option<&str>,
+) -> Result<crate::module::CompiledModule, String> {
     use crate::module::*;
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_module(true);
     let ret = Parser::new(&allocator, src, source_type).parse();
     if !ret.errors.is_empty() {
-        let msg = ret
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("SyntaxError: {msg}"));
+        return Err(format!(
+            "SyntaxError: {}",
+            render_diagnostics(src, &ret.errors, 0)
+        ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
@@ -504,16 +576,13 @@ pub fn compile_module(src: &str) -> Result<crate::module::CompiledModule, String
     if !sem.errors.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            sem.errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            render_diagnostics(src, &sem.errors, 0)
         ));
     }
     let mut c = Compiler::new();
-    c.source = src.to_string();
+    c.source = Rc::from(src);
     c.is_module = true;
+    c.source_label = label.map(Rc::from);
     let (proto, cell_of_name) = c.compile_module_toplevel(&program).map_err(|e| {
         if e.starts_with("SyntaxError") {
             e
@@ -581,6 +650,15 @@ struct LoopCtx {
 
 struct FnCtx {
     code: Vec<Op>,
+    /// Per-op source position (byte offset), index-parallel to `code`: the
+    /// value of `cur_pos` when each op was emitted. Becomes
+    /// [`FuncProto::pos`] after the code-shortening passes remap it.
+    pos: Vec<u32>,
+    /// Source position stamped on ops as they are emitted. Advanced at every
+    /// statement start and again at each call/`new` site, so a frame's
+    /// current ip resolves to the executing statement (innermost frame) or
+    /// the active call (outer frames) rather than the definition site.
+    cur_pos: u32,
     consts: Vec<Const>,
     scopes: Vec<Scope>,
     num_cells: u32,
@@ -595,7 +673,9 @@ struct FnCtx {
     uses_arguments: bool,
     /// Cell index of the implicit `this` binding (for non-arrow functions).
     this_cell: Option<u32>,
+    #[allow(dead_code)] // Reserved for new.target support; written but not yet read.
     new_target_cell: Option<u32>,
+    #[allow(dead_code)] // Reserved for mapped-arguments support; written but not yet read.
     arguments_cell: Option<u32>,
     /// Names captured by nested functions (conservative): such bindings become
     /// cells (always true here since all bindings are cells, but retained for
@@ -616,7 +696,7 @@ struct FnCtx {
     script_global: bool,
     /// Nesting depth of enclosing `with` statements within this function. When
     /// > 0, unqualified identifier reads/writes compile to dynamic name ops that
-    /// consult the runtime with-scope stack before the static binding.
+    /// > consult the runtime with-scope stack before the static binding.
     with_depth: u32,
     /// True when this function is textually nested inside a `with` block of an
     /// enclosing function: its free identifiers must also resolve dynamically
@@ -663,12 +743,21 @@ struct FnCtx {
     inherit_home: bool,
     /// Tagged-template literals compiled in this function (see `FuncProto`).
     templates: Vec<TemplateParts>,
+    /// Object-literal templates (see [`crate::bytecode::ObjTemplate`]).
+    obj_tpls: Vec<std::rc::Rc<crate::bytecode::ObjTemplate>>,
+    /// Byte offset of the function's definition site in `Compiler::source`
+    /// (the parameter list's span start). `None` for synthetic contexts
+    /// (toplevel scripts/modules, eval bodies, `%fieldinit`, …), which then
+    /// render in stack traces without a position.
+    source_start: Option<u32>,
 }
 
 impl FnCtx {
     fn new(name: &str, kind: FuncKind) -> FnCtx {
         FnCtx {
             code: Vec::new(),
+            pos: Vec::new(),
+            cur_pos: 0,
             consts: Vec::new(),
             scopes: Vec::new(),
             num_cells: 0,
@@ -701,8 +790,10 @@ impl FnCtx {
             stable_cells: Vec::new(),
             inherit_home: false,
             templates: Vec::new(),
+            obj_tpls: Vec::new(),
             home_super: false,
             eval_scopes: Vec::new(),
+            source_start: None,
         }
     }
     fn alloc_cell(&mut self) -> u32 {
@@ -738,6 +829,15 @@ struct ClassPrivCtx {
 
 struct Compiler {
     fns: Vec<FnCtx>,
+    /// One `JsString` allocation per distinct string across the WHOLE
+    /// compilation (const pools, object-template keys): identical names in
+    /// different functions then share an `Rc`, so runtime equality — a
+    /// for-in key against a compare literal, a property probe against a
+    /// template-built map — confirms on `JsString`'s pointer fast path
+    /// instead of comparing bytes. Compile-scoped (dropped with the
+    /// Compiler), so nothing is retained across programs; content is
+    /// unchanged, only allocation identity is shared.
+    str_intern: std::collections::HashMap<Box<str>, JsString>,
     /// The toplevel being compiled is global EVAL code (indirect eval), not a
     /// script: `return` is illegal and global var bindings are deletable.
     toplevel_is_eval: bool,
@@ -761,8 +861,22 @@ struct Compiler {
     is_module: bool,
     /// The full source text, so a function's body region can be cheaply scanned
     /// for the word `arguments` — when absent, the per-call `arguments` object is
-    /// not materialized (a hot-path win for the common case).
-    source: String,
+    /// not materialized (a hot-path win for the common case). `Rc<str>` so the
+    /// per-proto [`SourceInfo`] shares it instead of copying it.
+    source: Rc<str>,
+    /// Shared source text + line-start index handed to every finished
+    /// `FuncProto` (see [`crate::bytecode::SourceInfo`]), so stack frames can
+    /// resolve their per-op position table on the error path. Built lazily on
+    /// the first position lookup / `finish`: the line-start scan runs once per
+    /// compiled source (a vendored bundle has thousands of functions), so it
+    /// needs an indexed table rather than miette's scan-from-the-start
+    /// `read_span` (which is linear per lookup and fine for the parse-error
+    /// path below, where at most a few diagnostics render).
+    source_info: std::cell::OnceCell<Rc<SourceInfo>>,
+    /// Module key/path this compilation came from (see
+    /// [`compile_module_labeled`]) — stamped on every finished `FuncProto` so
+    /// stack frames can name their source.
+    source_label: Option<Rc<str>>,
     /// Escaping `var`/function names collected while compiling a SLOPPY
     /// direct-eval body (see `FnCtx::eval_sloppy`).
     eval_var_names: Vec<String>,
@@ -790,12 +904,18 @@ struct Compiler {
     /// Always on in production; disabled for the kernel differential test and
     /// under the `op-histogram` feature (kernels would hide per-op counts).
     kernelize: bool,
+    /// Compile register bytecode (`reg.rs`) for eligible whole function
+    /// bodies. Always on in production; disabled for the register-tier
+    /// differential test and under the `op-histogram` feature (register
+    /// execution would hide per-op counts).
+    regify: bool,
 }
 
 impl Compiler {
     fn new() -> Compiler {
         Compiler {
             fns: Vec::new(),
+            str_intern: std::collections::HashMap::new(),
             toplevel_is_eval: false,
             class_privs: Vec::new(),
             next_class_id: 0,
@@ -806,7 +926,9 @@ impl Compiler {
             module_exports: Vec::new(),
             module_requested: Vec::new(),
             is_module: false,
-            source: String::new(),
+            source: Rc::from(""),
+            source_info: std::cell::OnceCell::new(),
+            source_label: None,
             eval_var_names: Vec::new(),
             pending_method: false,
             in_class_body: false,
@@ -814,7 +936,20 @@ impl Compiler {
             fuse: true,
             localize: true,
             kernelize: !cfg!(feature = "op-histogram"),
+            regify: !cfg!(feature = "op-histogram"),
         }
+    }
+
+    /// The compilation-wide shared [`SourceInfo`], built on first use.
+    fn source_info(&self) -> &Rc<SourceInfo> {
+        self.source_info
+            .get_or_init(|| Rc::new(SourceInfo::new(self.source.clone())))
+    }
+
+    /// 1-based (line, column) of byte `offset` in `self.source`. Columns count
+    /// characters, not bytes.
+    fn line_col_of(&self, offset: u32) -> (u32, u32) {
+        self.source_info().line_col_of(offset)
     }
 
     /// Whether the source region `[start, end)` mentions `arguments` (the word).
@@ -822,7 +957,7 @@ impl Compiler {
     fn region_has_arguments(&self, start: u32, end: u32) -> bool {
         self.source
             .get(start as usize..end as usize)
-            .map_or(true, |s| s.contains("arguments"))
+            .is_none_or(|s| s.contains("arguments"))
     }
 
     /// Whether the source region mentions `eval` — the conservative trigger
@@ -831,7 +966,7 @@ impl Compiler {
     fn region_has_eval(&self, start: u32, end: u32) -> bool {
         self.source
             .get(start as usize..end as usize)
-            .map_or(true, |s| s.contains("eval"))
+            .is_none_or(|s| s.contains("eval"))
     }
 }
 
@@ -848,8 +983,15 @@ impl Compiler {
 
     fn emit(&mut self, op: Op) -> usize {
         let c = self.cur();
+        c.pos.push(c.cur_pos);
         c.code.push(op);
         c.code.len() - 1
+    }
+
+    /// Stamp `offset` (a byte offset into the source) on the ops emitted from
+    /// here on, until the next statement/call advances it again.
+    fn set_pos(&mut self, offset: u32) {
+        self.cur().cur_pos = offset;
     }
 
     fn here(&mut self) -> u32 {
@@ -865,6 +1007,7 @@ impl Compiler {
             | Op::JumpIfFalsyPeek(t)
             | Op::JumpIfTruthyPeek(t)
             | Op::JumpIfNullishPeek(t)
+            | Op::JumpIfNullishDropUnder(t)
             | Op::JumpIfNullish(t) => *t = target,
             Op::PushTryHandler { catch, .. } => *catch = target,
             Op::MarkDelegationHandler(t) => *t = target,
@@ -893,8 +1036,26 @@ impl Compiler {
         (c.consts.len() - 1) as u32
     }
 
+    /// The compile-scoped interned `JsString` for `s` (see
+    /// [`Compiler::str_intern`]). The eight typeof names route to the
+    /// process-wide table in `names.rs` instead, so `typeof x === "number"`
+    /// compares pointer-equal against the interpreter's interned typeof
+    /// results.
+    fn interned(&mut self, s: &str) -> JsString {
+        if let Some(js) = crate::names::typeof_name(s) {
+            return js;
+        }
+        if let Some(js) = self.str_intern.get(s) {
+            return js.clone();
+        }
+        let js = JsString::new(s);
+        self.str_intern.insert(s.into(), js.clone());
+        js
+    }
+
     fn str_const(&mut self, s: &str) -> u32 {
-        self.intern_str(JsString::new(s))
+        let js = self.interned(s);
+        self.intern_str(js)
     }
 
     fn load_str(&mut self, s: &str) {
@@ -991,7 +1152,7 @@ impl Compiler {
     /// True while compiling directly in the top-level script body, where
     /// `var`/`function` declarations create global-object properties.
     fn in_global_scope(&self) -> bool {
-        self.fns.last().map_or(false, |f| f.script_global)
+        self.fns.last().is_some_and(|f| f.script_global)
     }
 
     /// Hoist one `var` binding pattern: a top-level simple identifier becomes a
@@ -1487,6 +1648,10 @@ impl Compiler {
         fc.strict = true;
         fc.script_global = false;
         fc.is_toplevel = true;
+        // Anchor the module body at its first byte so a throw during module
+        // evaluation renders `at <module> (its/path.ts:1:1)` — naming WHICH
+        // module failed to import — instead of a bare `at <module>`.
+        fc.source_start = Some(0);
         fc.contains_eval = self.source.contains("eval");
         let module_has_eval = fc.contains_eval;
         self.fns.push(fc);
@@ -1749,7 +1914,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn finish(&self, fc: FnCtx) -> FuncProto {
+    fn finish(&self, mut fc: FnCtx) -> FuncProto {
+        // The per-op position table rides along with `code` through the
+        // passes below: localization and kernelization rewrite ops in place
+        // (lengths and indices unchanged), fusion shortens the code and
+        // remaps the table alongside its jump targets.
+        let pos = std::mem::take(&mut fc.pos);
+        debug_assert_eq!(pos.len(), fc.code.len());
         // Cells→locals localization (docs/js-performance-roadmap.md §3.2):
         // provably-uncaptured bindings move from heap cells to pooled
         // `frame.locals` slots. Runs BEFORE fusion so the fusion pass sees
@@ -1775,10 +1946,10 @@ impl Compiler {
         // Peephole op-fusion (Phase 2): every finished function — top-level and
         // nested — flows through here, so applying it once covers the whole
         // proto tree. Disabled only by the differential test.
-        let code = if self.fuse {
-            crate::fuse::fuse_code_fixpoint(loc.code)
+        let (code, pos) = if self.fuse {
+            crate::fuse::fuse_code_fixpoint(loc.code, pos)
         } else {
-            loc.code
+            (loc.code, pos)
         };
         // Typed loop kernels (docs/js-performance-roadmap.md §6.5): translate
         // eligible numeric loops into unboxed register programs. Runs LAST so
@@ -1810,20 +1981,50 @@ impl Compiler {
         } else {
             None
         };
+        // Register bytecode (reg.rs, docs/js-performance-roadmap.md §3.5):
+        // translate the whole body into a register program when every op is
+        // in the translated subset. Runs LAST so it sees the final stream;
+        // functions carrying loop kernels decline inside `regify` (the
+        // unboxed kernels are faster than boxed register ops and own their
+        // functions), as does anything with try/finally handlers, `with`/
+        // direct-eval machinery, suspension, or super/private class wiring.
+        let reg = if self.regify {
+            crate::reg::regify(&code, loc.num_locals, &fc.consts, &pos).map(std::rc::Rc::new)
+        } else {
+            None
+        };
+        // Definition-site position for stack traces (0 = unknown: synthetic
+        // contexts, or a Compiler driven without its source text) — the
+        // fallback when a frame has no per-op position to resolve.
+        let (source_line, source_col) = match fc.source_start {
+            Some(off) if !self.source.is_empty() => self.line_col_of(off),
+            _ => (0, 0),
+        };
+        debug_assert_eq!(pos.len(), code.len());
+        let source_info = if self.source.is_empty() {
+            None
+        } else {
+            Some(self.source_info().clone())
+        };
         FuncProto {
             eval_scopes: fc.eval_scopes.clone(),
             name: fc.name,
             kernels,
             fn_kernel,
+            reg,
             ic: code
                 .iter()
                 .map(|_| crate::bytecode::IcEntry {
                     own_slot: std::cell::Cell::new(u32::MAX),
                     proto_slot: std::cell::Cell::new(u32::MAX),
                     holder: std::cell::RefCell::new(None),
+                    own_shape: std::cell::RefCell::new(None),
+                    proto_shape: std::cell::RefCell::new(None),
                 })
                 .collect(),
             code,
+            pos: pos.into_boxed_slice(),
+            source_info,
             consts: fc.consts,
             num_locals: loc.num_locals,
             num_cells: fc.num_cells,
@@ -1831,7 +2032,10 @@ impl Compiler {
             has_rest: fc.has_rest,
             upvalues: fc.upvalues,
             kind: fc.kind,
-            source_start: 0,
+            source_start: fc.source_start.unwrap_or(0),
+            source_line,
+            source_col,
+            source_label: self.source_label.clone(),
             uses_arguments: fc.uses_arguments,
             param_names: fc.param_names,
             mapped_param_cells: fc.mapped_param_cells,
@@ -1848,6 +2052,7 @@ impl Compiler {
             this_cell: fc.this_cell,
             inherit_home: fc.inherit_home,
             templates: fc.templates,
+            obj_tpls: fc.obj_tpls,
         }
     }
 
@@ -2179,6 +2384,11 @@ impl Compiler {
 
 impl Compiler {
     fn compile_stmt(&mut self, stmt: &Statement) -> R {
+        // Statement-level position tracking: every op compiled for this
+        // statement anchors at its start (call/`new` sites re-anchor more
+        // precisely below), so a throw reports the executing statement.
+        use oxc::span::GetSpan;
+        self.set_pos(stmt.span().start);
         match stmt {
             Statement::ExpressionStatement(e) => {
                 self.compile_expr(&e.expression)?;
@@ -2576,6 +2786,7 @@ impl Compiler {
         self.patch_jump(jhave2, have);
     }
 
+    #[allow(dead_code)] // Not referenced by the current iteration lowering; kept for the Op sequence it documents.
     fn emit_iter_step(&mut self, itc: u32) {
         self.emit(Op::LoadCell(itc)); // [iter]
         self.emit(Op::IteratorNext); // [iter, result]
@@ -2997,20 +3208,26 @@ impl Compiler {
         self.patch_jump(entry, call_next);
         self.emit(Op::LoadCell(next_cell));
         self.emit(Op::LoadCell(iter_cell)); // [next, iter]
-        self.emit(Op::Call(0)); // [result]
-        if f.r#await {
-            // for-await: the iterator's next() returns a promise of the result;
-            // await it before reading done/value (await of a non-promise is a
-            // no-op, so this also works for sync iterables of plain values).
+        let jt = if f.r#await {
+            self.emit(Op::Call(0)); // [result]
+                                    // for-await: the iterator's next() returns a promise of the result;
+                                    // await it before reading done/value (await of a non-promise is a
+                                    // no-op, so this also works for sync iterables of plain values).
             self.emit(Op::Await);
-        }
-        self.emit(Op::RequireIterResult);
-        self.emit(Op::Dup);
-        let done_k = self.str_const("done");
-        self.emit(Op::GetProp(done_k)); // [result, done]
-        let jt = self.emit(Op::JumpIfTrue(0)); // consumes done; [result]
-        let value_k = self.str_const("value");
-        self.emit(Op::GetProp(value_k)); // [value]
+            self.emit(Op::RequireIterResult);
+            self.emit(Op::Dup);
+            let done_k = self.str_const("done");
+            self.emit(Op::GetProp(done_k)); // [result, done]
+            let jt = self.emit(Op::JumpIfTrue(0)); // consumes done; [result]
+            let value_k = self.str_const("value");
+            self.emit(Op::GetProp(value_k)); // [value]
+            jt
+        } else {
+            // Sync: one fused protocol round — same observable sequence, and
+            // a pinned builtin `next` steps inline with no result object.
+            self.emit(Op::IteratorStepValue); // [value, done]
+            self.emit(Op::JumpIfTrue(0)) // consumes done; [value]
+        };
         let close_push = self.emit(Op::PushTryHandler {
             catch: u32::MAX,
             finally: u32::MAX,
@@ -3055,7 +3272,7 @@ impl Compiler {
         // (the protocol round runs outside it), so just drop the result.
         let done_label = self.here();
         self.patch_jump(jt, done_label);
-        self.emit(Op::Pop); // pop result on done path
+        self.emit(Op::Pop); // pop result (await) / undefined value (sync)
         let skip_close = self.emit(Op::Jump(0));
 
         // Close landing: reached only on abrupt completion (via the handler's
@@ -3173,6 +3390,7 @@ impl Compiler {
     ///   `finally`) is taken by `do_completion`;
     /// - throw/return/break/continue in `body` or `catch`: `do_completion` runs
     ///   the finalizer with the completion parked, and `EndFinally` resumes it.
+    ///
     /// This single-copy model (vs. duplicating the finalizer per path) is what
     /// makes non-local exits run `finally`.
     fn compile_try_with_finally(&mut self, t: &TryStatement, finalizer: &BlockStatement) -> R {
@@ -3665,6 +3883,13 @@ impl Compiler {
             }
             Expression::AwaitExpression(a) => {
                 self.compile_expr(&a.argument)?;
+                // Pin the Await op to the await expression itself. Compiling a
+                // multi-line argument (a call with an options object, say)
+                // leaves `cur_pos` at the LAST sub-expression compiled, so an
+                // awaited rejection — which the resume path attributes to this
+                // op (`pos_at(ip - 1)`) — used to anchor past the call, on
+                // whatever statement the position table reached next.
+                self.set_pos(a.span.start);
                 self.emit(Op::Await);
             }
             Expression::YieldExpression(y) => self.compile_yield(y)?,
@@ -3779,7 +4004,72 @@ impl Compiler {
         Ok(())
     }
 
+    /// Try to compile `o` as a TEMPLATE literal (see [`Op::NewObjectTpl`]):
+    /// every property a plain (non-computed, non-method, non-accessor,
+    /// non-spread, non-`__proto__`) data property with a distinct static
+    /// string key. Returns the template index, or `None` when any property
+    /// needs the generic `DefineField` path.
+    fn try_object_template(&mut self, o: &ObjectExpression) -> Option<u32> {
+        if o.properties.len() < 2 {
+            return None;
+        }
+        let mut names: Vec<String> = Vec::with_capacity(o.properties.len());
+        for prop in &o.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                return None;
+            };
+            if p.computed || p.method || !matches!(p.kind, PropertyKind::Init) {
+                return None;
+            }
+            let name = property_key_name(&p.key);
+            // Plain `__proto__: v` is a [[Prototype]] SET, not a property
+            // definition; duplicate keys keep later-wins semantics on the
+            // generic path.
+            if name == "__proto__" && !p.shorthand || names.contains(&name) {
+                return None;
+            }
+            names.push(name);
+        }
+        // Keys go through the compile-scoped interner: a for-in key cloned
+        // out of an instantiated template then pointer-matches compare
+        // literals and property-name consts built anywhere in this program.
+        let keys: Vec<crate::value::JsString> = names.iter().map(|n| self.interned(n)).collect();
+        let mut map = crate::fxhash::FxIndexMap::default();
+        map.reserve(names.len());
+        for key in keys {
+            map.insert(
+                crate::value::PropertyKey::Str(key),
+                crate::value::Property::data(crate::value::Value::Undefined),
+            );
+        }
+        let fc = self.fns.last_mut().expect("fn ctx");
+        fc.obj_tpls
+            .push(std::rc::Rc::new(crate::bytecode::ObjTemplate {
+                map,
+                shape_cache: Default::default(),
+            }));
+        Some((fc.obj_tpls.len() - 1) as u32)
+    }
+
     fn compile_object(&mut self, o: &ObjectExpression) -> R {
+        if let Some(idx) = self.try_object_template(o) {
+            // All-static-data-key literal: evaluate the values in source
+            // order (identical order and side effects to the generic path —
+            // static keys have no evaluation step), then instantiate from
+            // the pre-built template in one op.
+            for prop in &o.properties {
+                let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                    unreachable!("template eligibility excluded spreads")
+                };
+                let name = property_key_name(&p.key);
+                self.compile_named_expr(&p.value, &name)?;
+            }
+            self.emit(Op::NewObjectTpl {
+                idx,
+                n: o.properties.len() as u32,
+            });
+            return Ok(());
+        }
         self.emit(Op::NewObject);
         // Duplicate plain `__proto__: v` definitions are an early SyntaxError
         // (computed/shorthand/method forms don't count).
@@ -4081,14 +4371,11 @@ impl Compiler {
                         self.emit(Op::TypeofExpr);
                         return Ok(());
                     }
-                    match self.resolve(name) {
-                        Resolved::Global => {
-                            let n = self.str_const(name);
-                            self.emit(Op::LoadGlobalTypeof(n));
-                            self.emit(Op::TypeofExpr);
-                            return Ok(());
-                        }
-                        _ => {}
+                    if let Resolved::Global = self.resolve(name) {
+                        let n = self.str_const(name);
+                        self.emit(Op::LoadGlobalTypeof(n));
+                        self.emit(Op::TypeofExpr);
+                        return Ok(());
                     }
                 }
                 self.compile_expr(&u.argument)?;
@@ -4470,7 +4757,12 @@ impl Compiler {
                 return Ok(());
             }
         }
-        // Method call: set `this` to the receiver.
+        // Method call: set `this` to the receiver. For an optional CALL
+        // (`o.m?.(…)`), the nullish test targets the looked-up METHOD while
+        // the receiver is still under it on the stack — `JumpIfNullishDropUnder`
+        // unwinds both and leaves the chain's `undefined` (the old emit tested
+        // after the Swap, i.e. the receiver, so `o.m?.()` with a missing `m`
+        // threw instead of short-circuiting — the zod v4 issue-formatting bug).
         match &c.callee {
             Expression::StaticMemberExpression(m) => {
                 self.compile_expr(&m.object)?; // [obj]
@@ -4481,11 +4773,11 @@ impl Compiler {
                 self.emit(Op::Dup); // [obj, obj]
                 let k = self.str_const(m.property.name.as_str());
                 self.emit(Op::GetProp(k)); // [obj, func]
-                self.emit(Op::Swap); // [func, obj]
                 if c.optional {
-                    let j = self.emit(Op::JumpIfNullish(0));
+                    let j = self.emit(Op::JumpIfNullishDropUnder(0));
                     self.chain_jumps.push(j);
                 }
+                self.emit(Op::Swap); // [func, obj]
                 self.finish_call(c)?;
             }
             Expression::ComputedMemberExpression(m) => {
@@ -4496,7 +4788,11 @@ impl Compiler {
                 }
                 self.emit(Op::Dup);
                 self.compile_expr(&m.expression)?;
-                self.emit(Op::GetPropDynamic);
+                self.emit(Op::GetPropDynamic); // [obj, func]
+                if c.optional {
+                    let j = self.emit(Op::JumpIfNullishDropUnder(0));
+                    self.chain_jumps.push(j);
+                }
                 self.emit(Op::Swap);
                 self.finish_call(c)?;
             }
@@ -4506,6 +4802,12 @@ impl Compiler {
                                     // Brand-checking read: calling a private method on an object that
                                     // doesn't have it must throw a TypeError (not silently read undefined).
                 self.emit_private_get_op(m.field.name.as_str())?; // [obj, method]
+                if c.optional {
+                    // `o.#m?.()`: the brand check passed but the field may
+                    // hold a nullish value.
+                    let j = self.emit(Op::JumpIfNullishDropUnder(0));
+                    self.chain_jumps.push(j);
+                }
                 self.emit(Op::Swap); // [method, obj]
                 self.finish_call(c)?;
             }
@@ -4525,7 +4827,12 @@ impl Compiler {
     /// Compile arguments and emit the appropriate Call op. Stack has [func, this]
     /// already.
     fn finish_call(&mut self, c: &CallExpression) -> R {
-        match self.compile_args(&c.arguments)? {
+        let form = self.compile_args(&c.arguments)?;
+        // Anchor the call op at the call expression, not at whatever
+        // statement/nested call the argument ops last anchored: an error
+        // propagating out of the callee then reports this frame AT this call.
+        self.set_pos(c.span.start);
+        match form {
             ArgForm::Count(n) => {
                 self.emit(Op::Call(n));
             }
@@ -4574,6 +4881,7 @@ impl Compiler {
                 let e = a.as_expression().unwrap();
                 self.compile_expr(e)?;
             }
+            self.set_pos(n.span.start);
             self.emit(Op::New(n.arguments.len() as u32));
         } else {
             self.emit(Op::NewArray(0));
@@ -4589,6 +4897,7 @@ impl Compiler {
                     }
                 }
             }
+            self.set_pos(n.span.start);
             self.emit(Op::NewSpread);
         }
         Ok(())
@@ -5639,6 +5948,11 @@ impl Compiler {
         ctor_fields: Option<&[&PropertyDefinition]>,
     ) -> R {
         let mut fc = FnCtx::new(name.unwrap_or(""), kind);
+        // The parameter list's span start is the function's definition site —
+        // resolved to line/column in `finish` for error stack traces. Prologue
+        // ops emitted before the first body statement anchor there too.
+        fc.source_start = Some(params.span.start);
+        fc.cur_pos = params.span.start;
         // A function defined inside a `with` block (directly or transitively)
         // resolves free identifiers against the captured with-scope chain.
         fc.enclosed_in_with = self
@@ -7024,6 +7338,5 @@ fn collect_pattern_names(pat: &BindingPattern, out: &mut Vec<String>) {
             }
         }
         BindingPattern::AssignmentPattern(a) => collect_pattern_names(&a.left, out),
-        _ => {}
     }
 }

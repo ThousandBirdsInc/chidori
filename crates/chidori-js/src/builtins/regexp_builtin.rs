@@ -375,11 +375,7 @@ fn encode_for_regexp_escape(c: char) -> String {
 
 fn regexp_this(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
     match this {
-        Value::Object(o)
-            if o.borrow()
-                .props
-                .contains_key(&PropertyKey::str(REGEXP_MARK)) =>
-        {
+        Value::Object(o) if o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK)) => {
             Ok(o.clone())
         }
         _ => Err(vm.throw_type("Method RegExp.prototype called on incompatible receiver")),
@@ -408,7 +404,7 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &JsString) -> Result<
 
     if start > units.len() {
         if global || sticky {
-            vm.set_prop(
+            vm.set_prop_strict(
                 &Value::Object(re.clone()),
                 &PropertyKey::str("lastIndex"),
                 Value::Number(0.0),
@@ -418,12 +414,13 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &JsString) -> Result<
     }
 
     // For a sticky regexp the matcher itself enforces a match exactly at
-    // `start`; for plain/global it scans forward from `start`.
-    let m = regex_exec(&source, &flags, &units, start);
+    // `start`; for plain/global it scans forward from `start`. A blown match
+    // budget is a catchable error — never a silent "no match".
+    let m = regex_exec(&source, &flags, &units, start).map_err(|e| vm.throw_range(e.message()))?;
     match m {
         None => {
             if global || sticky {
-                vm.set_prop(
+                vm.set_prop_strict(
                     &Value::Object(re.clone()),
                     &PropertyKey::str("lastIndex"),
                     Value::Number(0.0),
@@ -433,7 +430,7 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &JsString) -> Result<
         }
         Some(mat) => {
             if global || sticky {
-                vm.set_prop(
+                vm.set_prop_strict(
                     &Value::Object(re.clone()),
                     &PropertyKey::str("lastIndex"),
                     Value::Number(mat.end as f64),
@@ -467,11 +464,7 @@ fn regexp_exec_abstract(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value, 
         return Ok(result);
     }
     let o = match rx {
-        Value::Object(o)
-            if o.borrow()
-                .props
-                .contains_key(&PropertyKey::str(REGEXP_MARK)) =>
-        {
+        Value::Object(o) if o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK)) => {
             o.clone()
         }
         _ => return Err(vm.throw_type("Method RegExp.prototype called on incompatible receiver")),
@@ -504,9 +497,14 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value,
     let u = vm.get_prop(rx, &PropertyKey::str("unicode"))?;
     let unicode = vm.to_boolean(&u);
     let units = s.to_utf16_vec();
-    vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
+    vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
     let mut out: Vec<Value> = Vec::new();
     loop {
+        // Metered like the array builtins' O(len) walks: an adversarial
+        // receiver (e.g. an accessor `lastIndex` that swallows the advance)
+        // can otherwise pin this native loop, where no interpreter op runs to
+        // consume the budget or observe the interrupt.
+        vm.native_tick()?;
         let result = regexp_exec_abstract(vm, rx, s)?;
         if result.is_null() {
             break;
@@ -519,7 +517,7 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value,
             let li = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
             let next = advance_string_index(&units, li, unicode);
-            vm.set_prop(
+            vm.set_prop_strict(
                 rx,
                 &PropertyKey::str("lastIndex"),
                 Value::Number(next as f64),
@@ -537,12 +535,12 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value,
 pub fn sym_search_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value, Value> {
     let prev = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
     if !crate::value::same_value(&prev, &Value::Number(0.0)) {
-        vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
+        vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
     }
     let result = regexp_exec_abstract(vm, rx, s)?;
     let cur = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
     if !crate::value::same_value(&cur, &prev) {
-        vm.set_prop(rx, &PropertyKey::str("lastIndex"), prev)?;
+        vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), prev)?;
     }
     if result.is_null() {
         Ok(Value::Number(-1.0))
@@ -586,7 +584,7 @@ pub fn sym_match_all_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Va
     let matcher = vm.construct(&c, &[rx.clone(), Value::str(&flags)], &c)?;
     let li_v = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
     let li = vm.to_length(&li_v)?;
-    vm.set_prop(
+    vm.set_prop_strict(
         &matcher,
         &PropertyKey::str("lastIndex"),
         Value::Number(li as f64),
@@ -635,7 +633,7 @@ fn make_regexp_string_iterator(
             let li = vm.get_prop(&matcher, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
             let next_i = advance_string_index(&s.to_utf16_vec(), li, unicode);
-            vm.set_prop(
+            vm.set_prop_strict(
                 &matcher,
                 &PropertyKey::str("lastIndex"),
                 Value::Number(next_i as f64),
@@ -643,7 +641,7 @@ fn make_regexp_string_iterator(
         }
         Ok(vm.make_iter_result(result, false))
     });
-    iter.borrow_mut().props.insert(
+    iter.borrow_mut().own_insert(
         PropertyKey::str("next"),
         Property::builtin(Value::Object(next)),
     );
@@ -674,7 +672,7 @@ pub fn sym_replace_generic(
     let unicode = if global {
         let u = vm.get_prop(rx, &PropertyKey::str("unicode"))?;
         let unicode = vm.to_boolean(&u);
-        vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
+        vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
         unicode
     } else {
         false
@@ -682,6 +680,8 @@ pub fn sym_replace_generic(
     // Collect all results (one for non-global, every match for global).
     let mut results: Vec<Value> = Vec::new();
     loop {
+        // Metered like the array builtins' O(len) walks — see sym_match_generic.
+        vm.native_tick()?;
         let result = regexp_exec_abstract(vm, rx, s)?;
         if result.is_null() {
             break;
@@ -696,7 +696,7 @@ pub fn sym_replace_generic(
             let li = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
             let next = advance_string_index(&units, li, unicode);
-            vm.set_prop(
+            vm.set_prop_strict(
                 rx,
                 &PropertyKey::str("lastIndex"),
                 Value::Number(next as f64),
@@ -894,7 +894,7 @@ pub fn build_match_array(
                     Some((s, e)) => Value::String(JsString::from_code_units(&units[s..e])),
                     None => Value::Undefined,
                 };
-                gb.props.insert(PropertyKey::str(name), Property::data(val));
+                gb.own_insert(PropertyKey::str(name), Property::data(val));
             }
         }
         Value::Object(obj)
@@ -925,16 +925,14 @@ pub fn build_match_array(
                     None => Value::Undefined,
                 };
                 obj.borrow_mut()
-                    .props
-                    .insert(PropertyKey::str(name), Property::data(val));
+                    .own_insert(PropertyKey::str(name), Property::data(val));
             }
             Value::Object(obj)
         };
         let idx_arr = vm.new_array(idx_elems);
         idx_arr
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str("groups"), Property::data(idx_groups));
+            .own_insert(PropertyKey::str("groups"), Property::data(idx_groups));
         Some(Value::Object(idx_arr))
     } else {
         None
@@ -942,19 +940,17 @@ pub fn build_match_array(
     let arr = vm.new_array(elems);
     {
         let mut b = arr.borrow_mut();
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("index"),
             Property::data(Value::Number(mat.start as f64)),
         );
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("input"),
             Property::data(Value::String(input.clone())),
         );
-        b.props
-            .insert(PropertyKey::str("groups"), Property::data(groups));
+        b.own_insert(PropertyKey::str("groups"), Property::data(groups));
         if let Some(indices) = indices {
-            b.props
-                .insert(PropertyKey::str("indices"), Property::data(indices));
+            b.own_insert(PropertyKey::str("indices"), Property::data(indices));
         }
     }
     Value::Object(arr)
@@ -975,11 +971,7 @@ fn define_string_getter(
 ) {
     let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
         let o = match &this {
-            Value::Object(o)
-                if o.borrow()
-                    .props
-                    .contains_key(&PropertyKey::str(REGEXP_MARK)) =>
-            {
+            Value::Object(o) if o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK)) => {
                 o.clone()
             }
             // RegExp.prototype itself reports the canonical empty source/flags.
@@ -1000,11 +992,7 @@ fn define_string_getter(
 fn define_flag_getter(vm: &mut Vm, proto: &JsObject, name: &str, flag: char) {
     let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
         let o = match &this {
-            Value::Object(o)
-                if o.borrow()
-                    .props
-                    .contains_key(&PropertyKey::str(REGEXP_MARK)) =>
-            {
+            Value::Object(o) if o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK)) => {
                 o.clone()
             }
             // RegExp.prototype itself is not a real RegExp: report undefined.
@@ -1022,7 +1010,7 @@ fn define_flag_getter(vm: &mut Vm, proto: &JsObject, name: &str, flag: char) {
 /// Insert a non-enumerable, configurable accessor property with the given
 /// getter and no setter.
 fn install_accessor(proto: &JsObject, name: &str, getter: JsObject) {
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str(name),
         Property {
             kind: PropertyKind::Accessor {

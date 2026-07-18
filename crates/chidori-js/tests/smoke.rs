@@ -27,6 +27,22 @@ fn arithmetic() {
 }
 
 #[test]
+fn realistic_large_allocations_succeed() {
+    // Sizes that real (agent-generated) JS produces must not trip the
+    // engine's DoS caps: production engines handle all of these.
+    assert_eq!(run("const a = []; a[2_000_000] = 'x'; a.length"), "2000001");
+    assert_eq!(run("new Array(2_000_000).length"), "2000000");
+    assert_eq!(
+        run("new Array(2_000_000).fill(1).reduce((s, x) => s + x, 0)"),
+        "2000000"
+    );
+    assert_eq!(run("'x'.repeat(20_000_000).length"), "20000000");
+    // The caps still exist for hostile sizes — and throw catchably.
+    let out = run("try { new Array(2**31) } catch (e) { e instanceof RangeError }");
+    assert_eq!(out, "true");
+}
+
+#[test]
 fn string_growth_is_bounded() {
     // A doubling loop must hit the string-length cap and throw RangeError rather
     // than allocating without bound (sandbox heap-DoS guard). Both the `+`
@@ -336,5 +352,87 @@ fn console_output() {
     assert_eq!(
         console("console.log({a: 1, b: 'two'})"),
         "{ a: 1, b: 'two' }"
+    );
+}
+
+#[test]
+fn default_sort_precomputed_keys() {
+    // The all-primitive default sort takes the precomputed-ToString-keys
+    // fast path (`sort_default_primitive`); these pin that its results are
+    // exactly the spec's per-comparison SortCompare order.
+    // Numbers sort as STRINGS under the default comparator.
+    assert_eq!(run("[10, 9, 100, 1].sort().join(',')"), "1,10,100,9");
+    // Mixed primitives: numeric strings interleave with numbers; booleans
+    // and null stringify for the SORT (null lands between "false" and
+    // "true") — join() then renders the null element as "" per spec.
+    assert_eq!(
+        run(r#"[10, "9", 2, true, null, "abc", false].sort().join('|')"#),
+        "10|2|9|abc|false||true"
+    );
+    // -0 stringifies as "0" and holds its slot; NaN sorts as "NaN".
+    assert_eq!(
+        run("const a=[-0, NaN, 0, 1]; a.sort(); (Object.is(a[0],-0)) + ',' + a.join(',')"),
+        "true,0,0,1,NaN"
+    );
+    // Stability: equal keys keep original order (indices via epsilon tags).
+    assert_eq!(
+        run(
+            r#"const a=[{k:"b",i:0},{k:"a",i:1},{k:"b",i:2}].map(o=>o); const s=["b","a","b"]; const t=[0,1,2]; const z=t.map((i)=>({toString(){return s[i];}, i})); z.sort(); z.map(o=>o.i).join(',')"#
+        ),
+        "1,0,2"
+    );
+    // An OBJECT element keeps the per-comparison path (its toString runs
+    // user code) — order still correct.
+    assert_eq!(
+        run(r#"const o={toString(){return "5";}}; [7,o,3,"4"].sort().map(String).join(',')"#),
+        "3,4,5,7"
+    );
+    // A Symbol element throws TypeError (never silently stringified).
+    assert!(run("[Symbol(), 1].sort()").contains("TypeError"));
+    // Undefineds sort to the end without entering the key path.
+    assert_eq!(
+        run("[undefined, 2, 10, undefined, 1].sort().map(String).join(',')"),
+        "1,10,2,undefined,undefined"
+    );
+    // Non-ASCII keys: UTF-16 code-unit order (astral pairs before U+E000+).
+    assert_eq!(run(r#"["￿", "a", "𐀀"].sort().join(',')"#), "a,𐀀,￿");
+    // toSorted shares the same path.
+    assert_eq!(run("[3,20,1].toSorted().join(',')"), "1,20,3");
+}
+
+#[test]
+fn optional_call_on_member_short_circuits() {
+    // `o.m?.()` with a missing/nullish method short-circuits to undefined —
+    // it must NOT try to call undefined (zod v4's issue formatter relies on
+    // this: `iss.inst?._zod.def?.error?.(iss)`).
+    assert_eq!(run("const o = {}; String(o.m?.())"), "undefined");
+    assert_eq!(run("const o = { m: null }; String(o.m?.())"), "undefined");
+    assert_eq!(run("const o = { m: () => 7 }; String(o.m?.())"), "7");
+    assert_eq!(
+        run("const o = { k: {} }; String(o.k.m?.(1, 2))"),
+        "undefined"
+    );
+    // Computed member callee.
+    assert_eq!(run("const o = {}; String(o['m']?.())"), "undefined");
+    assert_eq!(
+        run("const o = { m: (x) => x + 1 }; String(o['m']?.(1))"),
+        "2"
+    );
+    // Bare callee (was already correct).
+    assert_eq!(run("const f = undefined; String(f?.())"), "undefined");
+    // Arguments are NOT evaluated when the call short-circuits.
+    assert_eq!(
+        run("let hit = 0; const o = {}; o.m?.(hit = 1); String(hit)"),
+        "0"
+    );
+    // The chain result feeds ?? and further chaining like the spec says.
+    assert_eq!(
+        run("const iss = { inst: { d: {} } }; String(iss.inst?.d?.error?.(iss) ?? 'fallback')"),
+        "fallback"
+    );
+    // Longer chain after the optional call keeps short-circuiting.
+    assert_eq!(
+        run("const o = {}; String(o.m?.().deeper.prop)"),
+        "undefined"
     );
 }

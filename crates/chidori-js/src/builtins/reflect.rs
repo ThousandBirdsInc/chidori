@@ -267,7 +267,7 @@ fn reflect_get(
                     }
                 }
             }
-            b.props.get(key).cloned()
+            b.own_get(key).cloned()
         };
         match found {
             Some(prop) => match prop.kind {
@@ -352,7 +352,7 @@ pub(crate) fn reflect_set(
         }
         let kind = {
             let b = cur.borrow();
-            b.props.get(key).map(|p| match &p.kind {
+            b.own_get(key).map(|p| match &p.kind {
                 PropertyKind::Accessor { set, .. } => DescKind::Accessor(set.clone()),
                 PropertyKind::Data { writable, .. } => DescKind::Data(*writable),
             })
@@ -476,29 +476,28 @@ fn descriptor_to_object(vm: &mut Vm, p: &Property) -> Value {
         let mut b = o.borrow_mut();
         match &p.kind {
             PropertyKind::Data { value, writable } => {
-                b.props
-                    .insert(PropertyKey::str("value"), Property::data(value.clone()));
-                b.props.insert(
+                b.own_insert(PropertyKey::str("value"), Property::data(value.clone()));
+                b.own_insert(
                     PropertyKey::str("writable"),
                     Property::data(Value::Bool(*writable)),
                 );
             }
             PropertyKind::Accessor { get, set } => {
-                b.props.insert(
+                b.own_insert(
                     PropertyKey::str("get"),
                     Property::data(get.clone().unwrap_or(Value::Undefined)),
                 );
-                b.props.insert(
+                b.own_insert(
                     PropertyKey::str("set"),
                     Property::data(set.clone().unwrap_or(Value::Undefined)),
                 );
             }
         }
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("enumerable"),
             Property::data(Value::Bool(p.enumerable)),
         );
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("configurable"),
             Property::data(Value::Bool(p.configurable)),
         );

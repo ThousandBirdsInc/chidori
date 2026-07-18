@@ -36,13 +36,41 @@ npm run build
 ### Authoring agents and tools
 
 Agent and tool files run *inside* the Chidori runtime, not as a normal Node
-program. They get their authoring types — and the `chidori`/`run` globals — from
-the **virtual** module `chidori:agent`:
+program. They import their authoring surface — the `chidori` host object, the
+`run` definer, and every authoring type — from the **virtual** module
+`chidori:agent`:
 
 ```ts
 /// <reference types="@1kbirds/chidori/agent-env" />
-import type { Chidori, ToolDefinition } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
+
+run(async (input: { document: string }) => {
+  const summary = await chidori.prompt("Summarize:\n" + input.document);
+  return { summary };
+});
 ```
+
+(Tool files import `type { ToolDefinition }` from the same module. The legacy
+agent form — `export async function agent(input, chidori)` — is still accepted.)
+
+> **Typing the input: use a `type` alias, not an `interface`.** The handler's
+> input parameter is constrained to `AgentJson` (JSON-compatible data), and a
+> TypeScript `interface` has no implicit index signature, so
+> `run(async (input: MyInterface) => …)` fails the constraint with a
+> confusing `Type 'AgentJson' is not assignable` error. A structurally
+> identical `type MyInput = { … }` (or an inline object type, as above)
+> satisfies it.
+>
+> **Version note:** install the SDK version matching your `chidori` binary —
+> the published types must agree with the runtime (e.g. `LlmResponseJson`
+> uses `toolCalls`, camelCase, since 3.6.x runtimes).
+
+So there are exactly **two** specifiers, with different jobs:
+
+| Specifier | What it is | Where it's used |
+|---|---|---|
+| `chidori:agent` | Virtual module the runtime injects | Inside agent/tool files |
+| `@1kbirds/chidori` | This npm package (HTTP client + the ambient types for `chidori:agent`) | In your Node/browser app |
 
 There is no installable package behind `chidori:agent`; it is a URL-style scheme
 (like `node:fs`) that the runtime strips and injects at execution time, so the
@@ -57,6 +85,11 @@ the runtime itself needs nothing installed.
 import { AgentClient, Checkpoint, isSignalQueued } from "@1kbirds/chidori";
 
 const client = new AgentClient("http://localhost:8080");
+
+// Against a production server (CHIDORI_API_KEY set — see docs/deployment.md),
+// pass the bearer token; it is sent on every request, including stream():
+//   new AgentClient("https://agents.example.com", { apiKey: process.env.CHIDORI_API_KEY });
+// `headers: {...}` merges extra headers for proxies / custom auth schemes.
 
 // Run an agent
 const session = await client.run({ document: "Rust is a systems language." });
@@ -108,6 +141,48 @@ if (isSignalQueued(result)) {
 ```
 
 See the top-level `sdk/python/chidori` for the Python equivalent.
+
+## Timeouts, retries, and errors
+
+`apiKey` sends `Authorization: Bearer <apiKey>` on every request — required
+against a server started with `CHIDORI_API_KEY` (any non-loopback bind). An
+explicit `headers.Authorization` entry overrides it.
+
+Every request is bounded by `timeoutMs` (default 300 000 — generous because
+`run()` executes the whole agent before responding; pass `0` to disable).
+Idempotent GETs are retried `retries` times (default 2, exponential backoff
+from `retryDelayMs`) on connection errors, timeouts, and 429/502/503/504
+responses. POSTs are **never** retried — `run`/`resume`/`signal` are not
+idempotent. For `stream()` the timeout covers connection establishment only,
+never the open event stream.
+
+```ts
+const client = new AgentClient("http://localhost:8080", { timeoutMs: 60_000, retries: 3 });
+```
+
+Failures throw typed errors, all extending `AgentClientError`:
+
+```ts
+import { AgentClientError, ConnectionError, HttpError, TimeoutError } from "@1kbirds/chidori";
+
+try {
+  await client.signal(sessionId, { name: "review", payload: { decision: "approve" } });
+} catch (err) {
+  if (err instanceof HttpError) {
+    // err.status distinguishes the documented semantics:
+    // 400 empty name, 404 unknown session, 409 terminal run
+    if (err.status === 409) console.log("run already finished:", err.detail);
+  } else if (err instanceof TimeoutError) {
+    // server hung past timeoutMs
+  } else if (err instanceof ConnectionError) {
+    // nothing listening / connection refused
+  }
+}
+```
+
+`HttpError` carries `.status`, the raw `.body`, and `.detail` (the server's
+`error` field when the body was JSON), so status handling never string-matches
+messages.
 
 ## Snapshot-aware checkpoints
 

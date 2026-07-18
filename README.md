@@ -182,39 +182,78 @@ assistant) and `--template worker` (an autonomous tool-using loop); omit
 
 ### 2. Write your own agent
 
-An agent is just an exported `agent` function. Every model call is a recorded
-host call:
+An agent is a plain TypeScript file: import the `chidori` host object and the
+`run` definer from the virtual `chidori:agent` module and register your handler.
+Every model call is a recorded host call:
 
 ```ts
 // summarizer.ts
-import type { Chidori } from "chidori:agent";
+/// <reference types="@1kbirds/chidori/agent-env" />
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { document: string }, chidori: Chidori) {
+run(async (input: { document: string }) => {
   const summary = await chidori.prompt("Summarize in 3 bullets:\n" + input.document);
   const actionItems = await chidori.prompt("Extract action items:\n" + summary);
   return { summary, actionItems };
-}
+});
 ```
 
 That's a complete, durable agent. Both prompts are recorded; replay returns them
 for free.
+
+`chidori:agent` is a **virtual** module the runtime injects at execution time —
+there is no npm package behind it, so the runtime needs nothing installed. The
+`/// <reference …>` line is what gives your editor and `tsc` its types: they
+ship in the [`@1kbirds/chidori`](https://www.npmjs.com/package/@1kbirds/chidori)
+npm package (`npm install -D @1kbirds/chidori`, or add
+`"types": ["@1kbirds/chidori/agent-env"]` to your `tsconfig.json` instead of
+the per-file directive). See the
+[TypeScript SDK README](./sdk/typescript/README.md) for the full story.
 
 ### 3. Run it
 
 ```bash
 # The OpenRouter sign-in from step 1 is all you need. Prefer your own key?
 # export ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY=...
-# Or route through a LiteLLM proxy:
-# export LITELLM_API_URL=http://localhost:4401/v1
-# export LITELLM_API_KEY=sk-litellm-master-key
 
 chidori run summarizer.ts \
   --input document="Rust is a systems programming language..."
 ```
 
+**Any OpenAI-compatible provider (DeepSeek, Groq, Ollama, vLLM, LiteLLM…).**
+Point Chidori at any endpoint that speaks the OpenAI chat-completions
+protocol, and pick the model with `--model` (or the `CHIDORI_MODEL` env var —
+prompts that don't set `model` in code default to `claude-sonnet-4-6`
+otherwise):
+
+```bash
+export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com   # /v1 optional
+export CHIDORI_OPENAI_COMPAT_KEY=sk-...
+chidori run summarizer.ts --model deepseek-chat \
+  --input document="Rust is a systems programming language..."
+```
+
+`OPENAI_BASE_URL` (alongside `OPENAI_API_KEY`) works too, and
+`LITELLM_API_URL`/`LITELLM_API_KEY` remain as legacy aliases of the
+`CHIDORI_OPENAI_COMPAT_*` pair.
+
+`chidori run` **asks before powerful effects by default**: tool calls, network
+access (`chidori.fetch`), and workspace writes pause for a one-keypress
+approval at the terminal (LLM prompts and pure compute never ask). That's the
+safe default for running code you didn't write; for your own agents, in
+scripts, or in CI — where there is no terminal to ask at, so gated effects
+fail closed — pass `--trusted`:
+
+```bash
+chidori run my_agent.ts --trusted
+```
+
 Re-run the same agent with `chidori resume summarizer.ts <run_id>` to replay it
-byte-for-byte with zero model calls (the run id is printed under
-`.chidori/runs/`).
+byte-for-byte with zero model calls (the run id is printed when the run
+starts, and lives under `.chidori/runs/`). The run's model travels with it —
+a `--model deepseek-chat` run resumes under `deepseek-chat` with no extra
+flags — and crash recovery of a trusted, tool-using run mirrors `run`'s
+flags: `chidori resume my_agent.ts <run_id> --trusted`.
 
 ### 4. Try the bundled examples
 
@@ -233,8 +272,12 @@ so they run with zero setup:
 ```bash
 chidori run examples/agents/hello.ts --input name=Colton  # no LLM calls
 chidori run examples/agents/tool_use.ts \
-  --input query=chidori --tools examples/tools            # local TS tool, no LLM
+  --input query=chidori                                   # defineTool, no LLM
 ```
+
+(The second example defines its tool inline with `defineTool` and calls it —
+no directory, no `--tools`. See [Running modes](./docs/running-modes.md) for
+the approval model.)
 
 For a guided walkthrough — inspecting a run, the demo picker, and the
 human-in-the-loop pause/resume loop — see
@@ -263,9 +306,33 @@ human-in-the-loop pause/resume loop — see
   [signals](./docs/signals.md) until a human or another agent delivers a payload.
 - **Branching exploration** — fork a run into per-strategy sub-runs and compare
   every outcome ([branching execution](./docs/branching-execution.md)).
+- **Supervised multi-agent processes** — spawn agent modules as concurrent,
+  addressable [actors](./docs/actors.md) with durable mailboxes, message
+  passing, supervision trees, and runtime-owned restart policies — including
+  restart-with-history, which replays an actor's completed work and retries
+  only the failing call.
+- **Detached durable agents** — spawn long-lived, named
+  [agent processes](./docs/detached-agents.md) that outlive the run that
+  started them: they hibernate at listen points holding zero threads and zero
+  memory, wake on a mailbox delivery or a durable
+  `chidori.alarm(ms)` deadline, and survive server restarts (the fleet
+  re-arms from a durable registry at boot).
+- **Replicated run storage** — mirror every run's journal to
+  [any S3-compatible bucket (S3/R2/GCS/MinIO), SQLite, or a Cloudflare
+  Durable Object per run](./docs/durable-storage.md) (`CHIDORI_RUN_STORE`),
+  hydrate runs back after machine loss, gate side effects on journal
+  durability (`CHIDORI_DURABILITY=strict`), and time-travel with
+  `chidori resume --until-seq`.
 - **Cost-efficient prompting** — structural [prompt
   caching](./docs/context-management.md) re-bills stable prefixes at the cached
   rate, and replay pays zero tokens.
+- **npm packages without Node** — `chidori add zod` installs straight from the
+  npm registry into a content-addressed cache (SHA-512 verified, hardlinked
+  `node_modules`, merge-friendly JSONL lockfile, no install scripts ever), and
+  agents just `import { z } from "zod"`. The engine is not Node, so the
+  compatible set is pure-ESM, native-free packages using only the shimmed
+  builtins — `chidori add` warns when a package falls outside it. See
+  [package management](./docs/package-management.md#compatibility).
 - **Self-improving agents / harness engineering** — the same durability
   machinery is a substrate for the self-improvement loop: mine failures from
   traces, fork a controlled experiment from the failure's exact anchored state
@@ -342,11 +409,17 @@ deterministic, replayable, and testable for free.
 | [Running modes](./docs/running-modes.md) | One-shot CLI, HTTP server + session API, event-driven agents |
 | [How replay works](./docs/replay.md) | Record/checkpoint/replay model and SDK replay |
 | [Value checkpoints](./docs/value-checkpoints.md) | `chidori.step` — journal expensive pure compute so resume never re-pays it |
+| [Package management](./docs/package-management.md) | `chidori add`/`install`/`remove`: npm packages without Node — content-addressed store, SHA-512 verification, JSONL lockfile |
 | [Architecture & project structure](./docs/architecture.md) | High-level component map and repository layout |
 | [JavaScript conformance (Test262)](./docs/conformance.md) | Running the pure-Rust JS engine against the TC39 suite |
 | [Sandbox & security model](./docs/sandbox-model.md) | Deny-by-default policy, capability injection, resource limits |
 | [Context management & caching](./docs/context-management.md) | Immutable contexts, compaction, cost accounting |
 | [Signals & multiplayer](./docs/signals.md) | Named listen points, mailboxes, fan-in |
+| [Actors & supervision](./docs/actors.md) | Spawned agent processes, message passing, supervision trees, restart strategies |
+| [Detached agents](./docs/detached-agents.md) | Durable, addressable, hibernating agent processes; `chidori.alarm`; the `/agents/detached` HTTP surface |
+| [Durable storage](./docs/durable-storage.md) | The run store: append-only journal, SQLite / Durable Object mirrors, hydration, strict durability, leases, `--until-seq` |
+| [Deployment](./docs/deployment.md) | Running in production: config, durability tiers, recipes for a plain VM / Fly.io / Kubernetes, failure & recovery |
+| [Rust style guide](./docs/rust-style-guide.md) | Conventions for contributing Rust: error handling, panics, tracing, async, `unsafe` policy, testing |
 | [Observing runs with Tael](./docs/observing-with-tael.md) | OTLP export, run↔trace correlation, checkpoint-backed golden cases, the self-harness loop |
 | [Python SDK](./sdk/python/README.md) · [TypeScript SDK](./sdk/typescript/README.md) | HTTP clients with no native bindings |
 | [`llm.txt`](./llm.txt) | Complete API reference, optimized for LLMs generating agents |

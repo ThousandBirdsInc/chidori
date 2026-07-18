@@ -85,7 +85,7 @@ use crate::typed_array::ARRAY_BUFFER_MAX_SLOT as AB_MAX;
 
 /// The resizable max for a buffer, or `None` when it is fixed-length.
 fn ab_max_byte_length(o: &JsObject) -> Option<usize> {
-    match o.borrow().props.get(&PropertyKey::str(AB_MAX)) {
+    match o.borrow().own_get(&PropertyKey::str(AB_MAX)) {
         Some(Property {
             kind:
                 PropertyKind::Data {
@@ -130,7 +130,7 @@ fn ab_transfer(
     }
     if preserve_resizable {
         if let Some(m) = max {
-            new_buf.borrow_mut().props.insert(
+            new_buf.borrow_mut().own_insert(
                 PropertyKey::str(AB_MAX),
                 Property {
                     kind: PropertyKind::Data {
@@ -166,7 +166,7 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
                     if len > max {
                         return Err(vm.throw_range("ArrayBuffer length exceeds maxByteLength"));
                     }
-                    buf.borrow_mut().props.insert(
+                    buf.borrow_mut().own_insert(
                         PropertyKey::str(AB_MAX),
                         Property {
                             kind: PropertyKind::Data {
@@ -333,7 +333,7 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
                 vm.throw_type("ArrayBuffer.prototype.slice: species returned the same buffer")
             );
         }
-        if (buffer_byte_length(&new_buf) as usize) < new_len {
+        if buffer_byte_length(&new_buf) < new_len {
             return Err(vm.throw_type(
                 "ArrayBuffer.prototype.slice: species returned a buffer that is too small",
             ));
@@ -364,7 +364,7 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
 
     // ArrayBuffer.prototype[Symbol.toStringTag] = "ArrayBuffer"
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -551,7 +551,7 @@ fn install_shared_array_buffer(vm: &mut Vm, species: &JsSymbol) {
 
     // SharedArrayBuffer.prototype[Symbol.toStringTag] = "SharedArrayBuffer"
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -722,7 +722,7 @@ fn ta_species_create(vm: &mut Vm, exemplar: &JsObject, args: &[Value]) -> Result
     // time), not whatever `prototype.constructor` currently holds.
     let base = vm.realm.typed_array_proto.clone();
     let ckey = PropertyKey::str(format!("__ctor_{}", kind.name()));
-    let default_ctor = match base.borrow().props.get(&ckey).and_then(|p| p.value()) {
+    let default_ctor = match base.borrow().own_get(&ckey).and_then(|p| p.value()) {
         Some(v) => v.clone(),
         None => Value::Undefined,
     };
@@ -757,7 +757,7 @@ fn install_typed_array_base(vm: &mut Vm, species: &JsSymbol) -> JsObject {
         |vm, _t, _a| Err(vm.throw_type("Abstract class TypedArray not directly constructable")),
     );
     // Wire %TypedArray%.prototype <-> %TypedArray% without exposing a global.
-    ta_ctor.borrow_mut().props.insert(
+    ta_ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -768,7 +768,7 @@ fn install_typed_array_base(vm: &mut Vm, species: &JsSymbol) -> JsObject {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ta_ctor.clone())),
     );
@@ -869,6 +869,11 @@ fn install_ta_accessors(vm: &mut Vm, proto: &JsObject) {
         }
         Value::Number(ta_fields(o).map(|(_, _, l, _)| l).unwrap_or(0) as f64)
     });
+    // Pin the canonical getter so the loop-kernel `LoadLen` entry guard can
+    // identity-check that a typed-array base still resolves `.length` to it.
+    if let Value::Object(gobj) = &g {
+        vm.realm.ta_length_getter = Some(gobj.clone());
+    }
     vm.define_accessor(
         &Value::Object(proto.clone()),
         PropertyKey::str("length"),
@@ -1622,15 +1627,13 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         .realm
         .array_proto
         .borrow()
-        .props
-        .get(&PropertyKey::str("toString"))
+        .own_get(&PropertyKey::str("toString"))
         .and_then(|p| p.value().cloned());
     match array_to_string {
         Some(f) => {
             proto
                 .borrow_mut()
-                .props
-                .insert(PropertyKey::str("toString"), Property::builtin(f));
+                .own_insert(PropertyKey::str("toString"), Property::builtin(f));
         }
         None => {
             vm.define_method(proto, "toString", 0, |vm, this, _a| {
@@ -1667,6 +1670,7 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
 
 /// Snapshot a typed array's elements into a fresh dense JS array (used to back
 /// the keys/values/entries iterators).
+#[allow(dead_code)] // Superseded by the index-based iterators; kept as the snapshot fallback.
 fn ta_snapshot_array(vm: &mut Vm, o: &JsObject) -> JsObject {
     let len = vm.ta_length(o).unwrap_or(0);
     let mut elems = Vec::with_capacity(len);
@@ -1679,7 +1683,7 @@ fn ta_snapshot_array(vm: &mut Vm, o: &JsObject) -> JsObject {
 /// In-place sort of typed-array element values. Elements are all one kind
 /// (Number or BigInt). Default compare is ascending numeric (NaN sorts to the
 /// end); an optional comparator is honored. Stable merge sort.
-fn ta_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> Result<(), Value> {
+fn ta_sort(vm: &mut Vm, items: &mut [Value], cmp: &Value, has_cmp: bool) -> Result<(), Value> {
     // The comparator's function kernel, prepared ONCE for the whole sort
     // (see `Vm::prepare_kernel_callback`).
     let mut prep = if has_cmp {
@@ -1716,7 +1720,7 @@ fn ta_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> R
 
 fn ta_sort_range(
     vm: &mut Vm,
-    items: &mut Vec<Value>,
+    items: &mut [Value],
     cmp: &Value,
     has_cmp: bool,
     prep: &mut Option<crate::exec::PreparedKernel>,
@@ -1780,7 +1784,13 @@ fn ta_compare(
                             0.0
                         }
                     }
-                    _ => unreachable!("fn kernels return Number or Bool"),
+                    // Tier bug: throw a catchable internal error rather than
+                    // aborting the process.
+                    _ => {
+                        return Err(vm.throw_internal(
+                            "function kernel returned a non-Number, non-Bool value",
+                        ))
+                    }
                 };
                 return Ok(if n < 0.0 {
                     -1
@@ -1853,7 +1863,7 @@ fn default_numeric_compare(a: f64, b: f64) -> i32 {
 fn per_kind_proto(vm: &mut Vm, kind: TAKind) -> JsObject {
     let key = PropertyKey::str(format!("__proto_{}", kind.name()));
     let base = vm.realm.typed_array_proto.clone();
-    if let Some(p) = base.borrow().props.get(&key) {
+    if let Some(p) = base.borrow().own_get(&key) {
         if let Some(Value::Object(o)) = p.value() {
             return o.clone();
         }
@@ -1861,8 +1871,7 @@ fn per_kind_proto(vm: &mut Vm, kind: TAKind) -> JsObject {
     // Should have been installed by install_kind_ctors; create a bare fallback.
     let proto = vm.alloc_ordinary(Some(base.clone()));
     base.borrow_mut()
-        .props
-        .insert(key, Property::builtin(Value::Object(proto.clone())));
+        .own_insert(key, Property::builtin(Value::Object(proto.clone())));
     proto
 }
 
@@ -1875,8 +1884,7 @@ fn install_kind_ctors(vm: &mut Vm, ta_ctor: &JsObject) {
         let key = PropertyKey::str(format!("__proto_{}", kind.name()));
         ta_proto
             .borrow_mut()
-            .props
-            .insert(key, Property::builtin(Value::Object(proto.clone())));
+            .own_insert(key, Property::builtin(Value::Object(proto.clone())));
 
         let bytes_per = kind.bytes() as f64;
         let name = kind.name();
@@ -1929,13 +1937,12 @@ fn install_kind_ctors(vm: &mut Vm, ta_ctor: &JsObject) {
         let ckey = PropertyKey::str(format!("__ctor_{}", kind.name()));
         ta_proto
             .borrow_mut()
-            .props
-            .insert(ckey, Property::builtin(Value::Object(ctor.clone())));
+            .own_insert(ckey, Property::builtin(Value::Object(ctor.clone())));
 
         // BYTES_PER_ELEMENT on both ctor and prototype (non-writable,
         // non-enumerable, non-configurable).
         for target in [&ctor, &proto] {
-            target.borrow_mut().props.insert(
+            target.borrow_mut().own_insert(
                 PropertyKey::str("BYTES_PER_ELEMENT"),
                 Property {
                     kind: PropertyKind::Data {
@@ -2005,7 +2012,7 @@ fn construct_typed_array(vm: &mut Vm, kind: TAKind, args: &[Value]) -> Result<Va
                 // A RESIZABLE buffer's auto-length view is length-tracking:
                 // its element count floors freely, with no alignment demand
                 // (the requirement applies to fixed buffers only).
-                if remaining % elem != 0 && ab_max_byte_length(&buffer).is_none() {
+                if !remaining.is_multiple_of(elem) && ab_max_byte_length(&buffer).is_none() {
                     return Err(vm.throw_range("Byte length is not aligned to element size"));
                 }
                 remaining / elem
@@ -2253,7 +2260,7 @@ fn install_data_view(vm: &mut Vm) {
 
     // [Symbol.toStringTag] = "DataView"
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -2718,7 +2725,7 @@ enum AtomicOp {
 /// `ToIndex`: a non-negative integer ≤ 2^53−1, else a RangeError.
 fn to_index(vm: &mut Vm, v: &Value) -> Result<usize, Value> {
     let n = to_integer_or_infinity(vm, v)?;
-    if n < 0.0 || n > 9007199254740991.0 {
+    if !(0.0..=9007199254740991.0).contains(&n) {
         return Err(vm.throw_range("Atomics: index out of range"));
     }
     Ok(n as usize)
@@ -3049,7 +3056,7 @@ fn install_atomics(vm: &mut Vm) {
 
     // Atomics[Symbol.toStringTag] = "Atomics" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    atomics.borrow_mut().props.insert(
+    atomics.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {

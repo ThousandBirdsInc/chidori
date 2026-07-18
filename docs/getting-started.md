@@ -43,9 +43,17 @@ Expected output:
 }
 ```
 
+> **Approval prompts:** `chidori run` asks before *powerful* effects by
+> default — tool calls, network access, workspace writes — with a y/a/N prompt (`a` approves all further calls to that target for the run)
+> at the terminal. (LLM prompts and pure compute, like this example, never
+> ask.) Running non-interactively — scripts, CI — there is no terminal to ask
+> at and gated effects fail closed: pass `--trusted` there, or configure a
+> policy. See [Running modes](./running-modes.md).
+
 What this demonstrates:
 
-- `examples/agents/hello.ts` exports `agent(input, chidori)`.
+- `examples/agents/hello.ts` imports `{ chidori, run }` from `chidori:agent`
+  and registers its handler with `run(async (input) => …)`.
 - The agent calls `chidori.log(...)`, so the runtime records a host call.
 - The agent returns plain JSON, which is what CLI, server, and SDK users receive.
 - A checkpoint is written under `examples/agents/.chidori/runs/<run_id>/` for
@@ -117,7 +125,6 @@ See [`examples/`](../examples):
 - [`agents/context_qa.ts`](../examples/agents/context_qa.ts) — cache-aware multi-turn Q&A via `chidori.context`
 - [`agents/streaming_progress.ts`](../examples/agents/streaming_progress.ts) — labelled prompt progress streams
 - [`agents/webhook.ts`](../examples/agents/webhook.ts) — event-driven HTTP handler
-- [`agents/tool_use.ts`](../examples/agents/tool_use.ts) — tool call example
+- [`agents/tool_use.ts`](../examples/agents/tool_use.ts) — a tool defined inline with `defineTool`
 - [`sdk_demo.py`](../examples/sdk_demo.py) — Python SDK with checkpointing + replay
 - [`prompts/analysis.jinja`](../examples/prompts/analysis.jinja) — shared prompt template
-- [`tools/web_search.ts`](../examples/tools/web_search.ts) — simple tool definition

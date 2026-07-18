@@ -1,4 +1,4 @@
-import type { BranchOutcome, Chidori } from "chidori:agent";
+import { chidori, run, type BranchOutcome } from "chidori:agent";
 
 /**
  * Branching example (docs/branching-execution.md).
@@ -22,7 +22,7 @@ import type { BranchOutcome, Chidori } from "chidori:agent";
 
 type Brief = { topic?: string };
 
-export async function agent(input: Brief, chidori: Chidori) {
+run(async (input: Brief) => {
   const topic = input.topic ?? "incident postmortem";
 
   // Shared prefix: paid once, handed to every branch as state.
@@ -55,7 +55,7 @@ export async function agent(input: Brief, chidori: Chidori) {
   await chidori.log(`picked: ${best.label}`);
 
   return { picked: best.label, draft: best.output, outcomes };
-}
+});
 
 function score(outcome: BranchOutcome): number {
   const draft = (outcome.output as { draft?: string } | undefined)?.draft ?? "";

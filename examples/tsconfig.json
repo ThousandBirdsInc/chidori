@@ -1,0 +1,24 @@
+{
+  "//": "Typecheck every example agent/tool against the in-repo SDK types. Run: npx tsc -p examples",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": [],
+    "baseUrl": ".",
+    "paths": {
+      "chidori:agent": ["../sdk/typescript/src/agent.ts"],
+      "@1kbirds/chidori": ["../sdk/typescript/src/index.ts"]
+    }
+  },
+  "include": [
+    "agents/**/*.ts",
+    "branching/**/*.ts",
+    "interactive-pipeline/**/*.ts",
+    "multiplayer-review/**/*.ts",
+    "war-room/**/*.ts",
+  ]
+}

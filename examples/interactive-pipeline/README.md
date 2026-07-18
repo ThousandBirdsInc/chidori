@@ -21,9 +21,10 @@ run(async (input) => {
 
 The runtime strips the `from "chidori:agent"` import and supplies `chidori` + `run`
 at execution time. The agent ([`interactive_pipeline.ts`](./interactive_pipeline.ts))
-runs several review stages; each stage delegates a batch to the
-[`review_batch`](./tools/review_batch.ts) tool and then stops at a **checkpoint**
-for you to type a decision.
+runs several review stages; each stage delegates a batch to the `review_batch`
+tool — an import-defined tool (`defineTool`, right in the agent file) whose
+body runs in the agent's own VM — and then stops at a **checkpoint** for you to
+type a decision.
 
 ## Run it
 
@@ -35,12 +36,18 @@ examples/interactive-pipeline/run.sh
 
 # …or directly
 chidori run examples/interactive-pipeline/interactive_pipeline.ts \
-  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}'
+  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}' --trusted
 
 # …or from source
 cargo run -- run examples/interactive-pipeline/interactive_pipeline.ts \
-  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}'
+  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}' --trusted
 ```
+
+(`--trusted` runs this in-repo code without ask-by-default approval prompts.
+The `review_batch` tool and the `chidori.log`/`chidori.input` calls aren't
+gated effects, so this example runs the same with or without the flag; it's
+here for consistency with the other examples. See
+[`docs/running-modes.md`](../../docs/running-modes.md).)
 
 At each checkpoint the agent prints a prompt to your terminal and **blocks on
 stdin** (`chidori.input`). Type one of:
@@ -62,27 +69,30 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
 export OTEL_SERVICE_NAME=interactive-pipeline        # optional (defaults to "chidori")
 
 chidori run examples/interactive-pipeline/interactive_pipeline.ts \
-  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}'
+  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}' --trusted
 ```
 
 `run.sh` does this for you, but only when tael is actually listening on `:4317`.
 
-What you'll see in tael — a **nested** waterfall:
+What you'll see in tael — each host call streams as a span, in order, as the
+run progresses:
 
 ```
 agent.run interactive_pipeline
 ├─ host.log    stage 1/N: begin
-├─ tool.call   review_batch            ← container span for the stage
-│  ├─ host.log   review_batch: scanned item 1/4   ← nested (the tool's own calls)
-│  ├─ host.log   review_batch: scanned item 2/4
-│  ├─ host.log   review_batch: scanned item 3/4
-│  └─ host.log   review_batch: flagged item 3
+├─ host.log    review_batch: scanned item 1/4   ← the tool's own calls (in-VM)
+├─ host.log    review_batch: scanned item 2/4
+├─ host.log    review_batch: scanned item 3/4
+├─ host.log    review_batch: flagged item 3
 ├─ host.input  Stage 1/N checkpoint    ← the run idles here, waiting on you
 ├─ host.log    stage 1: operator said 'continue'
-├─ tool.call   review_batch (stage 2)
-│  └─ …nested…
+├─ host.log    stage 2/N: begin
 └─ …
 ```
+
+(An import-defined tool runs in the agent's own VM, so its host calls are
+recorded as the run's own calls — one flat stream — rather than nested under a
+separate `tool.call` span. The tool's work is still fully in the trace.)
 
 - The per-stage work is delegated to the `review_batch` tool, which logs each
   item **internally**. Because a tool runs inside the same run (sharing the

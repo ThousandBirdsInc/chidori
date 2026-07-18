@@ -17,6 +17,24 @@ Usage:
     replayed = client.replay(checkpoint)
 """
 
-from chidori.client import AgentClient, Session, Checkpoint, SignalQueued
+from chidori.client import (
+    AgentClient,
+    AgentClientError,
+    Checkpoint,
+    ConnectionError,
+    HttpError,
+    Session,
+    SignalQueued,
+    TimeoutError,
+)
 
-__all__ = ["AgentClient", "Session", "Checkpoint", "SignalQueued"]
+__all__ = [
+    "AgentClient",
+    "AgentClientError",
+    "Checkpoint",
+    "ConnectionError",
+    "HttpError",
+    "Session",
+    "SignalQueued",
+    "TimeoutError",
+]

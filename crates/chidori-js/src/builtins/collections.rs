@@ -41,18 +41,18 @@ fn init_map_entries(vm: &mut Vm, target: &JsObject, init: &Value) -> Result<(), 
         return Err(vm.throw_type("Map constructor: 'set' is not callable"));
     }
     let it = vm.get_iterator(init)?;
-    let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
+    let next = vm.get_prop(&it, &crate::names::key_next())?;
     loop {
         vm.native_tick()?;
         let res = vm.call(next.clone(), it.clone(), &[])?;
         if !matches!(res, Value::Object(_)) {
             return Err(vm.throw_type("iterator result is not an object"));
         }
-        let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+        let done = vm.get_prop(&res, &crate::names::key_done())?;
         if vm.to_boolean(&done) {
             return Ok(());
         }
-        let item = vm.get_prop(&res, &PropertyKey::str("value"))?;
+        let item = vm.get_prop(&res, &crate::names::key_value())?;
         // Each entry must be an Object; primitives (incl. strings) are rejected.
         if !matches!(item, Value::Object(_)) {
             let e = vm.throw_type("Iterator value is not an entry object");
@@ -85,18 +85,18 @@ fn init_set_entries(vm: &mut Vm, target: &JsObject, init: &Value) -> Result<(), 
         return Err(vm.throw_type("Set constructor: 'add' is not callable"));
     }
     let it = vm.get_iterator(init)?;
-    let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
+    let next = vm.get_prop(&it, &crate::names::key_next())?;
     loop {
         vm.native_tick()?;
         let res = vm.call(next.clone(), it.clone(), &[])?;
         if !matches!(res, Value::Object(_)) {
             return Err(vm.throw_type("iterator result is not an object"));
         }
-        let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+        let done = vm.get_prop(&res, &crate::names::key_done())?;
         if vm.to_boolean(&done) {
             return Ok(());
         }
-        let item = vm.get_prop(&res, &PropertyKey::str("value"))?;
+        let item = vm.get_prop(&res, &crate::names::key_value())?;
         if let Err(e) = vm.call(adder.clone(), tv.clone(), &[item]) {
             return Err(close_with(vm, &it, e));
         }
@@ -123,18 +123,18 @@ fn init_weak_entries(
         return Err(vm.throw_type(&format!("'{adder_name}' is not callable")));
     }
     let it = vm.get_iterator(init)?;
-    let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
+    let next = vm.get_prop(&it, &crate::names::key_next())?;
     loop {
         vm.native_tick()?;
         let res = vm.call(next.clone(), it.clone(), &[])?;
         if !matches!(res, Value::Object(_)) {
             return Err(vm.throw_type("iterator result is not an object"));
         }
-        let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+        let done = vm.get_prop(&res, &crate::names::key_done())?;
         if vm.to_boolean(&done) {
             return Ok(());
         }
-        let item = vm.get_prop(&res, &PropertyKey::str("value"))?;
+        let item = vm.get_prop(&res, &crate::names::key_value())?;
         let call_args: Vec<Value> = if paired {
             if !matches!(item, Value::Object(_)) {
                 let e = vm.throw_type("Iterator value is not an entry object");
@@ -767,7 +767,7 @@ fn define_size_getter(vm: &mut Vm, proto: &JsObject, is_map: bool) {
 /// Install a non-enumerable, non-writable, configurable `Symbol.toStringTag`.
 fn define_to_string_tag(vm: &mut Vm, proto: &JsObject, tag: &str) {
     let sym = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(sym),
         Property {
             kind: PropertyKind::Data {
@@ -874,7 +874,11 @@ struct SetRecord {
 impl SetRecord {
     /// Invoke `this.[[Has]](key)` and coerce the result to a boolean.
     fn has(&self, vm: &mut Vm, key: &Value) -> Result<bool, Value> {
-        let r = vm.call(self.has.clone(), self.obj.clone(), &[key.clone()])?;
+        let r = vm.call(
+            self.has.clone(),
+            self.obj.clone(),
+            std::slice::from_ref(key),
+        )?;
         Ok(vm.to_boolean(&r))
     }
 
@@ -890,18 +894,18 @@ impl SetRecord {
         if !matches!(it, Value::Object(_)) {
             return Err(vm.throw_type("set-like keys() did not return an object"));
         }
-        let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
+        let next = vm.get_prop(&it, &crate::names::key_next())?;
         loop {
             vm.native_tick()?;
             let res = vm.call(next.clone(), it.clone(), &[])?;
             if !matches!(res, Value::Object(_)) {
                 return Err(vm.throw_type("iterator result is not an object"));
             }
-            let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+            let done = vm.get_prop(&res, &crate::names::key_done())?;
             if vm.to_boolean(&done) {
                 return Ok(());
             }
-            let v = vm.get_prop(&res, &PropertyKey::str("value"))?;
+            let v = vm.get_prop(&res, &crate::names::key_value())?;
             if !f(vm, v)? {
                 let _ = vm.iterator_close(&it);
                 return Ok(());
@@ -917,18 +921,18 @@ impl SetRecord {
         }
         // Iterator record: Get "next" exactly once, call the cached method
         // per step (the spec's GetIteratorFromMethod + IteratorStepValue).
-        let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
+        let next = vm.get_prop(&it, &crate::names::key_next())?;
         let mut out = Vec::new();
         loop {
             let res = vm.call(next.clone(), it.clone(), &[])?;
             if !matches!(res, Value::Object(_)) {
                 return Err(vm.throw_type("iterator result is not an object"));
             }
-            let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+            let done = vm.get_prop(&res, &crate::names::key_done())?;
             if vm.to_boolean(&done) {
                 break;
             }
-            out.push(vm.get_prop(&res, &PropertyKey::str("value"))?);
+            out.push(vm.get_prop(&res, &crate::names::key_value())?);
         }
         Ok(out)
     }

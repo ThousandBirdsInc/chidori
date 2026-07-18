@@ -20,7 +20,7 @@ The same idea is shown at two layers:
 | Layer | Where | Run without a server? | The primitive |
 |-------|-------|-----------------------|---------------|
 | **`chidori-js` engine (Rust)** | `crates/chidori-js/examples/*.rs` | ✅ yes | `ReplayRuntime::record` / `restore` / `drive` |
-| **TypeScript SDK (`@1kbirds/chidori`)** | this directory | needs `chidori run`/`serve` | `chidori.tool` / `input` / `memory` + `AgentClient.replay` |
+| **TypeScript SDK (`@1kbirds/chidori`)** | this directory | needs `chidori run`/`serve` | `defineTool` / `step` / `input` / `memory` + `AgentClient.replay` |
 
 ---
 
@@ -37,6 +37,22 @@ All commands are run **from the repository root**.
   ```bash
   cargo build --release          # produces ./target/release/chidori
   ```
+
+- Build the TypeScript SDK once (needed only for the SDK driver in step 3 —
+  `driver.mjs` imports the built `sdk/typescript/dist/`):
+
+  ```bash
+  npm --prefix sdk/typescript install
+  npm --prefix sdk/typescript run build
+  ```
+
+> **Why `--trusted` below:** `chidori run` is **ask-by-default** for gated
+> effects (network, workspace writes) and `chidori serve` is
+> **deny-by-default**. These agents are in-repo code you're running on
+> yourself, so the commands pass `--trusted` for the permissive posture. (The
+> offline agents here only `log`/`memory`/`input`, none of which are gated, so
+> they run the same either way — the flag is for consistency.) See
+> [`docs/running-modes.md`](../../docs/running-modes.md).
 
 ### 1. Layer 1 — run the Rust engine examples (no server, fastest)
 
@@ -65,16 +81,16 @@ to copy it by hand:
 ```bash
 BIN=./target/release/chidori
 
-# record
-$BIN run examples/record-replay/exactly_once.ts -i name=Ada
+# record (--trusted: the agent's tool calls run without per-call prompts)
+$BIN run examples/record-replay/exactly_once.ts -i name=Ada --trusted
 
 # grab the id of the run just created
 RUN_ID=$(ls -t examples/record-replay/.chidori/runs | head -1)
 
-# inspect the recorded call log (tool calls + their nested logs)
+# inspect the recorded call log (each tool's host calls, journaled inline)
 $BIN trace "$RUN_ID" -d examples/record-replay
 
-# replay — open_ticket / send_email are served from the log, not re-invoked
+# replay — the tools' side-effect host calls are served from the log, not re-run
 $BIN resume examples/record-replay/exactly_once.ts "$RUN_ID" -d examples/record-replay
 ```
 
@@ -87,8 +103,8 @@ Swap `exactly_once.ts` for any agent in this directory
 Two terminals: one serves a single agent, the other records + replays it.
 
 ```bash
-# terminal 1 — serve one agent
-cargo run -- serve examples/record-replay/exactly_once.ts --port 8080
+# terminal 1 — serve one agent (--trusted: allow its tool calls)
+cargo run -- serve examples/record-replay/exactly_once.ts --port 8080 --trusted
 
 # terminal 2 — run, checkpoint, replay; assert the output is byte-identical
 node examples/record-replay/driver.mjs --scenario exactly_once
@@ -102,7 +118,7 @@ Point the driver elsewhere with `--url`, or override the input with
 ### (optional) Typecheck the agents against the SDK types
 
 ```bash
-npx -y typescript@5.4 tsc -p examples/record-replay
+npx -y -p typescript@5.4 tsc -p examples/record-replay
 ```
 
 The detailed walkthroughs for each layer — including the modify-and-resume and
@@ -162,23 +178,34 @@ it: tool calls return their recorded results instead of executing.
 
 ```bash
 # record
-cargo run -- run examples/record-replay/exactly_once.ts -i name=Ada
+cargo run -- run examples/record-replay/exactly_once.ts -i name=Ada --trusted
 # inspect the recorded call log
 cargo run -- trace <run-id> -d examples/record-replay
-# replay — open_ticket / send_email are NOT re-invoked
+# replay — the tools' side-effect host calls are served from the log
 cargo run -- resume examples/record-replay/exactly_once.ts <run-id> -d examples/record-replay
 ```
 
-**See exactly-once for yourself:** record a run, then break a tool body so it
-throws, and resume. The replay still succeeds with the original result — proof
-the tool body was never re-run:
+(`resume` needs no `--trusted`: every recorded host call is served from the
+call log, so no gated effect ever re-executes.)
+
+**See exactly-once for yourself:** record a run and look at its trace, then
+resume and look again. Each side effect (`open_ticket (SIDE EFFECT)`,
+`send_email (SIDE EFFECT)`) is a `chidori.log` host call that appears **once**
+in the journal; on resume those host calls are served from the log — not
+re-emitted — so the ticket is filed and the email sent exactly once no matter
+how many times you replay:
 
 ```bash
-cargo run -- run examples/record-replay/exactly_once.ts -i name=Ada
-# edit tools/send_email.ts to `throw new Error("boom")`, then:
-cargo run -- resume examples/record-replay/exactly_once.ts <run-id> -d examples/record-replay
-# -> still returns the recorded { delivered: true, ... }
+cargo run -- run examples/record-replay/exactly_once.ts -i name=Ada --trusted
+RUN_ID=$(ls -t examples/record-replay/.chidori/runs | head -1)
+cargo run -- trace "$RUN_ID" -d examples/record-replay      # one SIDE EFFECT log each
+cargo run -- resume examples/record-replay/exactly_once.ts "$RUN_ID" -d examples/record-replay
+# -> returns the recorded { delivered: true, ... }; no new SIDE EFFECT lines
 ```
+
+The tool bodies run in the agent's own VM, so their wrapper code re-runs on
+replay — but the *host calls* inside them (the side effects) are served from
+the journal, which is what makes the effect happen exactly once.
 
 ### Option B — the SDK (`AgentClient`, over HTTP)
 
@@ -187,8 +214,8 @@ This mirrors how you'd use the published `@1kbirds/chidori` npm package
 the matching driver scenario:
 
 ```bash
-# terminal 1 — serve one agent
-cargo run -- serve examples/record-replay/exactly_once.ts --port 8080
+# terminal 1 — serve one agent (--trusted: allow its tool calls)
+cargo run -- serve examples/record-replay/exactly_once.ts --port 8080 --trusted
 
 # terminal 2 — record, checkpoint, replay; assert the output is identical
 node examples/record-replay/driver.mjs --scenario exactly_once
@@ -197,7 +224,7 @@ node examples/record-replay/driver.mjs --scenario exactly_once
 For the human-in-the-loop agent, the driver demonstrates **pause → resume**:
 
 ```bash
-cargo run -- serve examples/record-replay/human_approval.ts --port 8080
+cargo run -- serve examples/record-replay/human_approval.ts --port 8080 --trusted
 node examples/record-replay/driver.mjs --scenario human_approval
 #   run -> status "paused"
 #   client.resume(id, "approve") -> status "completed", refund issued
@@ -211,9 +238,18 @@ Scenarios: `exactly_once`, `deterministic_identity`, `retry_flaky_tool`,
 
 Record any run, edit the agent's logic *after* the point it paused/finished
 reading effects (e.g. change how `tool_pipeline` formats its briefing), and
-`resume`: the recorded tool calls are reused and only the new tail runs. Editing
-an *already-executed* step instead is rejected with a clear divergence error
-(the `edit_and_resume.rs` example shows both halves).
+resume with `--allow-source-change`: the recorded tool calls are reused and
+only the new tail runs. The flag is required because resume verifies the
+agent source against the run's snapshot manifest and refuses on mismatch —
+cached results are never silently paired with changed code:
+
+```bash
+cargo run -- resume examples/record-replay/tool_pipeline.ts <run-id> \
+  -d examples/record-replay --allow-source-change
+```
+
+Editing an *already-executed* step instead is rejected with a clear divergence
+error (the `edit_and_resume.rs` example shows both halves).
 
 ---
 
@@ -222,13 +258,12 @@ an *already-executed* step instead is rejected with a clear divergence error
 A few constraints make agents and tools replay cleanly — worth knowing before you
 write your own:
 
-- **Tools may make nested host calls.** A tool's `run()` can call `chidori.log` /
-  `chidori.tool` / `chidori.memory` (these examples log their side effect that
-  way). The replay path absorbs the tool's recorded *subtree*, so nested calls
-  log during record and are served from the call log on replay without desyncing
-  the sequence. (`console` is still not defined in the tool sandbox — use
-  `chidori.log`.) Put the real side effect (the API POST) directly in the body —
-  it's recorded and replayed as one unit, so it happens exactly once.
+- **Route side effects through host calls.** A `defineTool` body runs in the
+  agent's own VM, so on replay the body re-runs but its host calls
+  (`chidori.log` / `chidori.fetch` / `chidori.memory`) are served from the
+  journal. Put the real side effect (the API POST) in a host call — that's what
+  makes it happen exactly once. Pure compute in the body is deterministic (fixed
+  clock, seeded RNG) and simply recomputes identically.
 - **Signal tool failure with a return flag, not a thrown error.** The call log
   records a tool's *return value*, so `return { ok: false, status: 503 }` replays
   exactly; a thrown/rejected effect does not currently re-reject cleanly on
@@ -247,7 +282,7 @@ write your own:
 ```
 exactly_once.ts            human_approval.ts        deterministic_identity.ts
 retry_flaky_tool.ts        tool_pipeline.ts
+tools.ts                   # offline stand-in tools (defineTool handles), imported by the agents
 driver.mjs                 # AgentClient run/checkpoint/replay + pause/resume
-tsconfig.json              # typecheck agents+tools against the in-repo SDK
-tools/                     # offline stand-in tools used by the agents
+tsconfig.json              # typecheck the agents against the in-repo SDK
 ```

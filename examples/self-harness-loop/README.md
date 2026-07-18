@@ -149,7 +149,7 @@ mismatching call in a JSON report. Try it:
 ```bash
 sed -i '' 's/anchoring shared prefix/anchoring modified prefix/' examples/self-harness-loop/experiment.ts
 chidori resume examples/self-harness-loop/experiment.ts $experiment_run --ci
-# { "status": "diverged", ... "Replay divergence at seq 1 (`log`) ..." }   exit 3
+# { "status": "diverged", "divergence": { "kind": "source_changed", ... } }   exit 3
 git checkout examples/self-harness-loop/experiment.ts
 ```
 

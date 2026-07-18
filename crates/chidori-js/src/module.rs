@@ -257,8 +257,18 @@ impl Vm {
                     self.resolve_export_cell(registry, &dep, "default", &mut HashSet::new())?
                 }
                 ImportName::Namespace => {
+                    // Fill the PRE-ALLOCATED cell instead of replacing the slot:
+                    // a re-exported namespace import (`import * as z; export {z}`)
+                    // resolves to this slot's cell, and an importer wired earlier
+                    // in the graph order may already hold it. Swapping in a fresh
+                    // Rc would strand that importer on the original cell —
+                    // permanently Uninitialized (this was how `import { z } from
+                    // "zod"` produced "Cannot access binding before
+                    // initialization" forever).
                     let ns = self.module_namespace(registry, &dep)?;
-                    Rc::new(RefCell::new(ns))
+                    let cell = rec.borrow().cells[local_idx].clone();
+                    *cell.borrow_mut() = ns;
+                    continue;
                 }
             };
             rec.borrow_mut().cells[local_idx] = cell;
@@ -542,9 +552,9 @@ impl Vm {
         // (filled below by the outermost call) instead of recursing forever.
         let obj = self.alloc(crate::value::ObjectData::new(
             None,
-            crate::value::Internal::ModuleNamespace(crate::value::NamespaceData {
+            crate::value::Internal::ModuleNamespace(Box::new(crate::value::NamespaceData {
                 exports: indexmap::IndexMap::new(),
-            }),
+            })),
         ));
         module.borrow_mut().namespace = Some(Value::Object(obj.clone()));
         let mut names = self.exported_names(registry, module, &mut HashSet::new())?;
@@ -568,7 +578,7 @@ impl Vm {
             // @@toStringTag = "Module" — non-writable, non-enumerable,
             // non-configurable (spec 28.3.1).
             let tag = self.realm.symbol_to_string_tag.clone();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::Sym(tag),
                 Property {
                     kind: crate::value::PropertyKind::Data {

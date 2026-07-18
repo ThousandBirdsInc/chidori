@@ -37,6 +37,7 @@ pub const DEFAULT_CONDITIONS: &[&str] = &["chidori", "import", "module", "defaul
 
 /// Same as DEFAULT_CONDITIONS but with `types` prepended, for the tsc-facing
 /// resolution pass.
+#[allow(dead_code)] // Staged for the tsc-facing resolution pass.
 pub const TYPES_CONDITIONS: &[&str] = &["types", "chidori", "import", "module", "default"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +86,7 @@ struct PackageJson {
     name: Option<String>,
     main: Option<String>,
     module: Option<String>,
+    #[allow(dead_code)] // Parsed for the tsc-facing pass; not yet read.
     types: Option<String>,
     exports: Option<Value>,
 }
@@ -103,6 +105,7 @@ impl Resolver {
         }
     }
 
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn project_root(&self) -> &Path {
         &self.project_root
     }

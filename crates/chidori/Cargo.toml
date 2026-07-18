@@ -1,6 +1,6 @@
 [package]
 name = "chidori"
-version = "3.6.0"
+version = "3.6.1"
 edition = "2021"
 # oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
@@ -26,6 +26,7 @@ tokio = { version = "1", features = ["full"] }
 # every release target. `*-native-roots` keeps using the platform trust store,
 # preserving custom/corporate-CA support (e.g. self-hosted LiteLLM proxies).
 reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
     "charset",
     "http2",
     "system-proxy",
@@ -57,7 +58,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utilities
 anyhow = "1"
-thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
@@ -65,15 +65,16 @@ tokio-stream = "0.1"
 async-stream = "0.3"
 sha2 = "0.10"
 sha1 = "0.10"
+# Constant-time comparison for API-key checks (already in-tree via `digest`).
+subtle = "2"
 hmac = "0.12"
 base64 = "0.22"
 hex = "0.4"
 rand = "0.8"
 
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
-chidori-js = { path = "../chidori-js", version = "0.3.2" }
+chidori-js = { path = "../chidori-js", version = "0.3.3" }
 async-trait = "0.1"
-derive_more = { version = "1", features = ["display"] }
 
 # SQLite session store
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -94,14 +95,19 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 # Checkpoint export: `chidori checkpoint export <run_id>` archives a run dir
 # as a .tar.gz so a golden eval case's fixture can be committed to git or
 # attached to a tael case without knowing the `.chidori/runs/` layout.
-tar = "0.4"
-flate2 = "1"
 
 # TypeScript-to-JavaScript stripping. Replaces a hand-rolled line-based stripper
 # that missed constructs like type predicates (`(t): t is string => ...`),
 # `satisfies` in odd positions, and overload signatures. oxc parses to a real
 # AST and emits JS via codegen, so unsupported sugar can't slip through.
-oxc = { version = "0.133", features = ["transformer", "codegen", "semantic"] }
+oxc = { version = "0.133", features = ["transformer", "codegen", "semantic", "ast_visit"] }
+# Generated→original position lookup for the codegen source maps that back
+# error-frame remapping (`CodegenReturn::map` is this crate's `SourceMap`;
+# the oxc facade does not re-export it).
+oxc_sourcemap = "6"
+nodejs-semver = "5.0.0"
+tar = "0.4.46"
+flate2 = "1.1.9"
 
 # Unix-only: apply per-process resource limits (setrlimit) and deadline-kill
 # (kill) to the OS-isolation worker child. See `runtime::isolate::limits`.
@@ -119,3 +125,14 @@ tempfile = "3"
 # In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
 # with the runtime `opentelemetry_sdk` features for test builds.
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+criterion = "0.5"
+
+# Runtime-layer perf coverage (journal replay lookup, session/run stores,
+# per-run construction costs). See `benches/runtime.rs`.
+[[bench]]
+name = "runtime"
+harness = false
+
+# Workspace-wide lint levels (see [workspace.lints] in the root Cargo.toml).
+[lints]
+workspace = true

@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::bytecode::{CmpOp, Const, FuncKind, KOp, Op, UpvalueSource};
+use crate::bytecode::{CmpOp, Const, FuncKind, KOp, Op, UpvalueSource, KWIN, KWIN_MASK};
 use crate::value::*;
 use crate::vm::*;
 
@@ -33,11 +33,19 @@ fn peek_plain_bytecode(v: &Value) -> Option<Rc<BytecodeFunction>> {
 /// [`Vm::prepare_kernel_callback`], executed by [`Vm::exec_prepared_kernel`].
 pub(crate) struct PreparedKernel {
     bf: Rc<BytecodeFunction>,
-    /// Kernel register file, allocated once for the whole invocation.
-    regs: Vec<f64>,
+    /// Kernel register window (fixed size; masked, bounds-check-free access).
+    regs: [f64; crate::bytecode::KWIN],
     /// Back-edge interrupt poll counter (cadence spans calls).
     poll: u32,
     interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Control-flow outcome of a register-mode completion dispatch (the
+/// register tier neither suspends nor delegates, so this is `Ctl` minus
+/// those arms).
+enum RegCtl {
+    Jump(usize),
+    Return(Value),
 }
 
 /// Control-flow signal from a single opcode step.
@@ -49,6 +57,54 @@ enum Ctl {
     Yield(Value),
     YieldStar(Value),
     GeneratorStart,
+}
+
+/// One slot-verified global identity check for a cached [`RecFamily`]:
+/// `globals.props` slot `slot` must still carry `key` as a plain data
+/// property holding the very closure `funcs[func]`. Insertion slots are
+/// stable under value writes and appends, so a hit costs an indexed read +
+/// two pointer compares — no hashing; a restructured table or a rebound
+/// name fails the key/identity match and the family re-resolves from
+/// scratch (today's full path).
+pub(crate) struct RecGlobalCheck {
+    key: PropertyKey,
+    slot: u32,
+    func: u8,
+}
+
+/// A resolved recursion FAMILY for the windowed recursive-kernel executor
+/// ([`Vm::run_fn_kernel_rec`]), cached on the Vm keyed by the entry
+/// closure's identity (`funcs[0]`). Everything here is a pure function of
+/// the member closures (immutable protos) plus the recorded identity
+/// checks, so a validated hit skips resolution entirely: the per-activation
+/// cost drops from half a dozen table allocations + O(code) scans per
+/// member to O(members) pointer compares. Holding member closures alive
+/// across activations is the same retention class as the prototype-holder
+/// inline caches ([`crate::bytecode::IcEntry`]); the cache is bounded and
+/// eviction is only ever a perf event, never observable.
+pub(crate) struct RecFamily {
+    /// The family members; `funcs[0]` is the entry closure (cache key).
+    funcs: Vec<Rc<BytecodeFunction>>,
+    /// `callee_map[j][c]` = `funcs` index for member `j`'s `SelfCall`
+    /// callee `c` (`c = 0` is `j` itself; `c = 1 + i` is `rec.globals[i]`).
+    callee_map: Vec<Vec<u8>>,
+    /// Per-member register-window size.
+    /// Per-member (register, argument index) entry loads.
+    arg_slots: Vec<Vec<(usize, usize)>>,
+    /// Per-member (register, upvalue index, snapshot) — the VALUE is
+    /// refreshed on every activation (cells can change between calls, never
+    /// during one).
+    uv_snaps: Vec<Vec<(usize, u32, f64)>>,
+    /// Every global binding the family's guard depends on.
+    global_checks: Vec<RecGlobalCheck>,
+    /// (member, upvalue index) self-references: the cell must hold that
+    /// member's own closure.
+    upval_self_checks: Vec<(u8, u32)>,
+    /// Members whose kernels use `Math` intrinsics (canonicals re-verified
+    /// per activation).
+    math_members: Vec<u8>,
+    /// The family's uniform `Ret` register type.
+    ret_bool: bool,
 }
 
 impl Vm {
@@ -343,6 +399,40 @@ impl Vm {
         r
     }
 
+    /// Verify a typed-array kernel base still resolves `.length` through the
+    /// realm's canonical `%TypedArray%.prototype.length` getter: no own
+    /// properties (nothing can shadow), and the FIRST `length` owner up the
+    /// prototype chain is an accessor whose getter is the pinned canonical.
+    /// Checked once per activation — nothing inside a kernel region can add
+    /// properties or change prototypes. Any deviation declines the kernel and
+    /// the generic path observes whatever the program set up.
+    fn kernel_ta_len_ok(&self, o: &crate::value::JsObject) -> bool {
+        let Some(canon) = &self.realm.ta_length_getter else {
+            return false;
+        };
+        if !o.borrow().own_is_empty() {
+            return false;
+        }
+        let key = crate::value::StrKeyRef("length");
+        let mut cur = o.borrow().proto.clone();
+        // The canonical chain is 2 hops (Float64Array.prototype →
+        // %TypedArray%.prototype); a longer walk is already exotic. Bound it
+        // so a pathological proto chain can't turn the entry guard O(n).
+        for _ in 0..4 {
+            let Some(p) = cur else { break };
+            let b = p.borrow();
+            if let Some(prop) = b.own_get(&key) {
+                return matches!(
+                    &prop.kind,
+                    PropertyKind::Accessor { get: Some(Value::Object(g)), .. }
+                        if g.ptr_eq(canon)
+                );
+            }
+            cur = b.proto.clone();
+        }
+        false
+    }
+
     /// Verify the global `Math` binding and each used method are still the
     /// realm's canonical objects, as plain data properties. Any deviation —
     /// deleted/replaced/shadowed `Math`, an accessor, a monkeypatched method
@@ -355,7 +445,7 @@ impl Vm {
         {
             let g = self.realm.global.borrow();
             let math_ok = matches!(
-                g.props.get(&PropertyKey::str("Math")),
+                g.own_get(&crate::value::StrKeyRef("Math")),
                 Some(Property {
                     kind: PropertyKind::Data { value: Value::Object(o), .. },
                     ..
@@ -368,7 +458,7 @@ impl Vm {
         let mb = canon.borrow();
         used.iter().all(|k| {
             matches!(
-                mb.props.get(&PropertyKey::str(k.name())),
+                mb.own_get(&crate::value::StrKeyRef(k.name())),
                 Some(Property {
                     kind: PropertyKind::Data { value: Value::Object(o), .. },
                     ..
@@ -389,7 +479,29 @@ impl Vm {
             return false;
         };
         matches!(
-            self.realm.array_proto.borrow().props.get(&PropertyKey::str(name)),
+            self.realm.array_proto.borrow().own_get(&crate::value::StrKeyRef(name)),
+            Some(Property {
+                kind: PropertyKind::Data { value: Value::Object(o), .. },
+                ..
+            }) if o.ptr_eq(canon)
+        )
+    }
+
+    /// `KOp::CharCodeAt` entry guard: `String.prototype.charCodeAt` must
+    /// still be a plain data property holding the canonical builtin (a
+    /// patched/replaced/accessor'd method must run generically, observably).
+    /// A string primitive receiver can carry no own shadow, and nothing
+    /// inside a kernel can write props, so one entry check covers the
+    /// activation.
+    fn kernel_char_code_ok(&self) -> bool {
+        let Some(canon) = &self.realm.string_char_code_at else {
+            return false;
+        };
+        matches!(
+            self.realm
+                .string_proto
+                .borrow()
+                .own_get(&crate::value::StrKeyRef("charCodeAt")),
             Some(Property {
                 kind: PropertyKind::Data { value: Value::Object(o), .. },
                 ..
@@ -468,6 +580,24 @@ impl Vm {
                 return self.step(frame, &k.fallback);
             }
         }
+        // Pinned STRING bases: each sslot local must hold a FLAT ASCII string
+        // (unit == byte, so `StrLen`/`CharCodeAt` are O(1) and total); a
+        // `charCodeAt` region additionally needs the canonical method
+        // resolution. Checked before any pooled state is taken; the strings
+        // themselves are cached below alongside the object bases.
+        for &l in k.sslots.iter() {
+            let ok = matches!(
+                &frame.locals[l as usize],
+                Value::String(st)
+                    if matches!(st.flatten_utf8(), Some(f) if f.len() == st.len_utf16())
+            );
+            if !ok {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        if k.uses_char_code && !self.kernel_char_code_ok() {
+            return self.step(frame, &k.fallback);
+        }
         // A `StoreElem` may CREATE an element (hole fill / exact append), and
         // the spec's OrdinarySet consults the prototype chain when the own
         // property is absent — so a chain carrying a reified index entry (a
@@ -479,6 +609,29 @@ impl Vm {
             for &l in k.oslots.iter() {
                 if let Value::Object(o) = &frame.locals[l as usize] {
                     if !crate::value::protos_allow_any_index_create(o) {
+                        return self.step(frame, &k.fallback);
+                    }
+                }
+            }
+        }
+        // Typed-array `.length` resolves through a prototype ACCESSOR (unlike
+        // a dense array's own exotic property), so any LoadLen base holding a
+        // typed array must still resolve to the canonical getter. Element
+        // reads/writes need no such check — valid-index integer-indexed
+        // [[Get]]/[[Set]] never consult own props or the chain, and every
+        // access re-checks kind/bounds and bails otherwise.
+        if k.loads_len {
+            for op in k.code.iter() {
+                // `LenBrCmp` is a fused `LoadLen` and needs the same check.
+                let (crate::bytecode::KOp::LoadLen { obj, .. }
+                | crate::bytecode::KOp::LenBrCmp { obj, .. }) = op
+                else {
+                    continue;
+                };
+                if let Value::Object(o) = &frame.locals[k.oslots[*obj as usize] as usize] {
+                    if matches!(o.borrow().internal, Internal::TypedArray(_))
+                        && !self.kernel_ta_len_ok(o)
+                    {
                         return self.step(frame, &k.fallback);
                     }
                 }
@@ -521,7 +674,7 @@ impl Vm {
                 let ok = if let Value::Object(o) = &frame.locals[k.oslots[obj as usize] as usize] {
                     let b = o.borrow();
                     matches!(b.internal, Internal::Array(_))
-                        && b.props.is_empty()
+                        && b.own_is_empty()
                         && b.extensible
                         && b.proto
                             .as_ref()
@@ -563,7 +716,7 @@ impl Vm {
                             kind: PropertyKind::Data { value, writable },
                             ..
                         },
-                    )) = b.props.get_full(&PropertyKey::str(&p.key))
+                    )) = b.own_get_full(&PropertyKey::str(&p.key))
                     {
                         if matches!(value, Value::Number(_)) && (!p.store || *writable) {
                             let id = (o.ptr_id(), idx as u32);
@@ -585,16 +738,34 @@ impl Vm {
         // kernels never nest at runtime). The base objects are pinned for the
         // whole activation — sound because stores to base LOCALS inside the
         // region are rejected at translation.
+        // The buffer is GROW-ONLY across activations: stale values from a
+        // previous activation are unreadable by construction (every mapped
+        // slot is loaded below; stack-temp registers are written before any
+        // read by the virtual-stack discipline), so re-zeroing would be pure
+        // memset tax.
+        // Layout: the caller's window is the first KWIN slots; pinned-callee
+        // windows (CALLEES) follow at fixed KWIN strides. Translation capped
+        // every kernel at KWIN registers, so the dispatch loop below indexes
+        // its `[f64; KWIN]` window with `& KWIN_MASK` — no bounds checks.
         let mut regs = std::mem::take(&mut self.kernel_regs);
-        regs.clear();
-        regs.resize(k.n_regs as usize, 0.0);
+        let need = KWIN * (1 + if CALLEES { k.callee_slots.len() } else { 0 });
+        if regs.len() < need {
+            regs.resize(need, 0.0);
+        }
         for (r, slot) in k.locals.iter().enumerate() {
             let v = match slot {
                 crate::bytecode::KSlot::Local(l) => frame.locals[*l as usize].clone(),
                 crate::bytecode::KSlot::Upvalue(u) => {
                     frame.func.upvalues[*u as usize].borrow().clone()
                 }
-                crate::bytecode::KSlot::Arg(_) => unreachable!("declined by the guard"),
+                // Function-kernel-only slot the entry guard declines. One
+                // slipping through is a translator bug — nothing has executed
+                // yet, so deopt to the fallback bytecode instead of aborting.
+                crate::bytecode::KSlot::Arg(_) => {
+                    self.kernel_regs = regs;
+                    self.kernel_prop_slots = prop_slots;
+                    return self.step(frame, &k.fallback);
+                }
             };
             if let Value::Number(n) = v {
                 regs[r] = n;
@@ -613,51 +784,107 @@ impl Vm {
                 objs.push(o.clone());
             }
         }
+        // Pinned strings (validated above; immutable, so no re-checks exist).
+        let mut sstrs = std::mem::take(&mut self.kernel_strs);
+        sstrs.clear();
+        for &l in k.sslots.iter() {
+            if let Value::String(st) = &frame.locals[l as usize] {
+                sstrs.push(st.clone());
+            }
+        }
         // Prop registers (the tail of the register file): load each resolved
         // slot's current value. The guard above proved every one a Number.
         if !k.props_used.is_empty() {
             let prop_base = k.n_regs as usize - k.props_used.len();
             for (i, p) in k.props_used.iter().enumerate() {
-                let b = objs[p.oslot as usize].borrow();
-                match b.props.get_index(prop_slots[i] as usize) {
-                    Some((
-                        _,
-                        Property {
-                            kind:
-                                PropertyKind::Data {
-                                    value: Value::Number(n),
-                                    ..
-                                },
-                            ..
-                        },
-                    )) => regs[prop_base + i] = *n,
-                    _ => unreachable!("kernel prop slot invariant"),
+                let loaded = {
+                    let b = objs[p.oslot as usize].borrow();
+                    match b.own_get_index(prop_slots[i] as usize) {
+                        Some((
+                            _,
+                            Property {
+                                kind:
+                                    PropertyKind::Data {
+                                        value: Value::Number(n),
+                                        ..
+                                    },
+                                ..
+                            },
+                        )) => Some(*n),
+                        _ => None,
+                    }
+                };
+                match loaded {
+                    Some(n) => regs[prop_base + i] = n,
+                    // The entry guard just resolved this slot to a Number
+                    // data property; a miss is a tier bug. Nothing has
+                    // executed yet — deopt to the fallback bytecode instead
+                    // of aborting the process.
+                    None => {
+                        self.kernel_regs = regs;
+                        objs.clear();
+                        self.kernel_objs = objs;
+                        sstrs.clear();
+                        self.kernel_strs = sstrs;
+                        self.kernel_prop_slots = prop_slots;
+                        return self.step(frame, &k.fallback);
+                    }
                 }
             }
         }
         // Pinned closure callees (`KOp::CallKernel`): ONE guard per
         // activation covers everything the per-call `run_fn_kernel` guard
-        // would check — the callee object is an oslot (in-region stores to
-        // it reject), so its identity, kernel, upvalue types and the Math
-        // canonicals cannot change while the loop runs. Loop calls happen at
-        // one constant depth, so a single depth check suffices; a trace sink
-        // declines (it must see an enter/exit per call).
+        // would check — the callee resolution (an oslot local that in-region
+        // stores reject, or a global-object own data property that nothing
+        // in-region can rebind), so its identity, kernel, upvalue types and
+        // the Math canonicals cannot change while the loop runs. Loop calls
+        // happen at one constant depth, so a single depth check suffices; a
+        // trace sink declines (it must see an enter/exit per call).
         let mut callee_bfs = std::mem::take(&mut self.kernel_callees);
         callee_bfs.clear();
         if CALLEES {
             let mut ok = self.trace_sink.is_none() && self.call_depth < self.max_call_depth;
-            let mut win = k.n_regs as usize;
+            let mut win = KWIN;
+            let mut any_uv_writes = false;
             if ok {
                 for c in k.callee_slots.iter() {
-                    let bf = {
-                        let b = objs[c.oslot as usize].borrow();
-                        match &b.internal {
-                            Internal::Function(FunctionInner::Bytecode(bf))
-                                if !bf.is_class_ctor =>
-                            {
-                                Some(bf.clone())
+                    let bf = match &c.source {
+                        crate::bytecode::KCalleeSrc::Oslot(oslot) => {
+                            let b = objs[*oslot as usize].borrow();
+                            match &b.internal {
+                                Internal::Function(FunctionInner::Bytecode(bf))
+                                    if !bf.is_class_ctor =>
+                                {
+                                    Some(bf.clone())
+                                }
+                                _ => None,
                             }
-                            _ => None,
+                        }
+                        // The `LoadGlobal` fast path: an own DATA property
+                        // of the global object. Accessor / proto-inherited /
+                        // missing globals decline — the generic loop then
+                        // resolves (or throws the ReferenceError) exactly as
+                        // the spec says.
+                        crate::bytecode::KCalleeSrc::Global(name) => {
+                            let g = self.realm.global.borrow();
+                            match g.own_get(&PropertyKey::str(name)) {
+                                Some(Property {
+                                    kind:
+                                        PropertyKind::Data {
+                                            value: Value::Object(o),
+                                            ..
+                                        },
+                                    ..
+                                }) => match &o.borrow().internal {
+                                    Internal::Function(FunctionInner::Bytecode(bf))
+                                        if !bf.is_class_ctor =>
+                                    {
+                                        Some(bf.clone())
+                                    }
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
                         }
                     };
                     let Some(bf) = bf else {
@@ -670,7 +897,10 @@ impl Vm {
                     };
                     // Number-returning, non-recursive, fully-supplied args,
                     // canonical Math, Number upvalues — else stay generic.
-                    let ck_ok = ck.self_global.is_none()
+                    // Cell-writing callees are admitted (their windows flush
+                    // written cells back per call) unless a written cell
+                    // aliases another of the callee's own captured cells.
+                    let ck_ok = ck.rec.is_none()
                         && ck
                             .code
                             .iter()
@@ -685,20 +915,31 @@ impl Vm {
                                 matches!(*bf.upvalues[*u as usize].borrow(), Value::Number(_))
                             }
                             _ => true,
-                        });
+                        })
+                        && (ck.uv_writes.is_empty() || !uv_write_cells_alias(ck, &bf));
                     if !ck_ok {
                         ok = false;
                         break;
                     }
-                    let n = ck.n_regs as usize;
+                    any_uv_writes |= !ck.uv_writes.is_empty();
                     callee_bfs.push((bf, win as u32));
-                    win += n;
+                    win += KWIN;
                 }
+            }
+            // Cross-window aliasing: a cell one callee WRITES must not be
+            // captured by any other callee window (their once-per-activation
+            // snapshots would go stale) or snapshot by the caller kernel's
+            // own upvalue registers. Distinct bindings are distinct cells,
+            // so this only fires when the same closure/cell is pinned twice.
+            if ok && any_uv_writes {
+                ok = !callee_cell_writes_alias(&callee_bfs, k, &frame.func.upvalues);
             }
             if !ok {
                 self.kernel_regs = regs;
                 objs.clear();
                 self.kernel_objs = objs;
+                sstrs.clear();
+                self.kernel_strs = sstrs;
                 self.kernel_prop_slots = prop_slots;
                 callee_bfs.clear();
                 self.kernel_callees = callee_bfs;
@@ -706,8 +947,11 @@ impl Vm {
             }
             // Extend the register file with the callee windows and load each
             // window's upvalue snapshot ONCE (identities are pinned; callee
-            // code never writes an upvalue register).
-            regs.resize(win, 0.0);
+            // code never writes an upvalue register). Grow-only: the buffer
+            // may already be longer than this activation needs.
+            if regs.len() < win {
+                regs.resize(win, 0.0);
+            }
             for (bf, wb) in callee_bfs.iter() {
                 let ck = bf.proto.fn_kernel.as_ref().expect("guarded");
                 for (r, slot) in ck.locals.iter().enumerate() {
@@ -719,11 +963,46 @@ impl Vm {
                 }
             }
         }
+        // Masked fixed window: `w` is this kernel's window (first KWIN slots);
+        // `wtail` holds the pinned-callee windows at KWIN strides (CALLEES
+        // only). Every register index is `< n_regs ≤ KWIN` by translation, so
+        // `& KWIN_MASK` is an identity on valid indices that proves the access
+        // in-bounds — the dispatch loop below carries no bounds checks.
+        let (whead, wtail) = regs.split_at_mut(KWIN);
+        let w: &mut [f64; KWIN] = whead.try_into().expect("sized above");
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
         let code = &k.code;
         let mut pc = 0usize;
         let (resume_ip, shape) = loop {
+            // Latch-and-unwind for ops the translator promised this loop
+            // never contains — a TIER BUG, but one that must stay inside the
+            // sandbox: write the (valid, Number/Bool) register state back,
+            // restore the pooled buffers, and throw a catchable internal
+            // error instead of aborting the host process.
+            macro_rules! kernel_internal_error {
+                ($msg:expr) => {{
+                    for (r, slot) in k.locals.iter().enumerate() {
+                        if let crate::bytecode::KSlot::Local(l) = slot {
+                            frame.locals[*l as usize] = Value::Number(w[r & KWIN_MASK]);
+                        }
+                    }
+                    for (j, &l) in k.bool_locals.iter().enumerate() {
+                        frame.locals[l as usize] =
+                            Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
+                    }
+                    writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
+                    self.kernel_regs = regs;
+                    objs.clear();
+                    self.kernel_objs = objs;
+                    sstrs.clear();
+                    self.kernel_strs = sstrs;
+                    self.kernel_prop_slots = prop_slots;
+                    callee_bfs.clear();
+                    self.kernel_callees = callee_bfs;
+                    return Err(self.throw_internal($msg));
+                }};
+            }
             // Taken branches funnel through here so back-edges can poll the
             // cooperative interrupt flag at the interpreter's cadence.
             macro_rules! branch {
@@ -739,17 +1018,20 @@ impl Vm {
                                     // cannot resume execution.
                                     for (r, slot) in k.locals.iter().enumerate() {
                                         if let crate::bytecode::KSlot::Local(l) = slot {
-                                            frame.locals[*l as usize] = Value::Number(regs[r]);
+                                            frame.locals[*l as usize] =
+                                                Value::Number(w[r & KWIN_MASK]);
                                         }
                                     }
                                     for (j, &l) in k.bool_locals.iter().enumerate() {
                                         frame.locals[l as usize] =
-                                            Value::Bool(regs[bool_base + j] != 0.0);
+                                            Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
                                     }
-                                    writeback_kernel_props(k, &objs, &prop_slots, &regs);
+                                    writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
                                     self.kernel_regs = regs;
                                     objs.clear();
                                     self.kernel_objs = objs;
+                                    sstrs.clear();
+                                    self.kernel_strs = sstrs;
                                     self.kernel_prop_slots = prop_slots;
                                     callee_bfs.clear();
                                     self.kernel_callees = callee_bfs;
@@ -764,19 +1046,27 @@ impl Vm {
                 }};
             }
             match code[pc] {
-                KOp::Mov { dst, src } => regs[dst as usize] = regs[src as usize],
-                KOp::Const { dst, k } => regs[dst as usize] = k,
-                KOp::Add { dst, a, b } => regs[dst as usize] = regs[a as usize] + regs[b as usize],
-                KOp::AddK { dst, a, k } => regs[dst as usize] = regs[a as usize] + k,
+                KOp::Mov { dst, src } => w[dst as usize & KWIN_MASK] = w[src as usize & KWIN_MASK],
+                KOp::Const { dst, k } => w[dst as usize & KWIN_MASK] = k,
+                KOp::Add { dst, a, b } => {
+                    w[dst as usize & KWIN_MASK] =
+                        w[a as usize & KWIN_MASK] + w[b as usize & KWIN_MASK]
+                }
+                KOp::AddK { dst, a, k } => {
+                    w[dst as usize & KWIN_MASK] = w[a as usize & KWIN_MASK] + k
+                }
                 KOp::Arith { kind, dst, a, b } => {
-                    regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind)
+                    w[dst as usize & KWIN_MASK] =
+                        number_arith_raw(w[a as usize & KWIN_MASK], w[b as usize & KWIN_MASK], kind)
                 }
                 KOp::ArithK { kind, dst, a, k } => {
-                    regs[dst as usize] = number_arith_raw(regs[a as usize], k, kind)
+                    w[dst as usize & KWIN_MASK] =
+                        number_arith_raw(w[a as usize & KWIN_MASK], k, kind)
                 }
-                KOp::Neg { dst, src } => regs[dst as usize] = -regs[src as usize],
+                KOp::Neg { dst, src } => w[dst as usize & KWIN_MASK] = -w[src as usize & KWIN_MASK],
                 KOp::BitNot { dst, src } => {
-                    regs[dst as usize] = !crate::vm::to_int32(regs[src as usize]) as f64
+                    w[dst as usize & KWIN_MASK] =
+                        !crate::vm::to_int32(w[src as usize & KWIN_MASK]) as f64
                 }
                 KOp::Br { target } => branch!(target),
                 KOp::BrCmp {
@@ -786,7 +1076,9 @@ impl Vm {
                     if_true,
                     target,
                 } => {
-                    if knum_cmp(cmp, regs[a as usize], regs[b as usize]) == if_true {
+                    if knum_cmp(cmp, w[a as usize & KWIN_MASK], w[b as usize & KWIN_MASK])
+                        == if_true
+                    {
                         branch!(target)
                     }
                 }
@@ -797,17 +1089,17 @@ impl Vm {
                     if_true,
                     target,
                 } => {
-                    if knum_cmp(cmp, regs[a as usize], k) == if_true {
+                    if knum_cmp(cmp, w[a as usize & KWIN_MASK], k) == if_true {
                         branch!(target)
                     }
                 }
                 KOp::BrFalsy { src, target } => {
-                    if !knum_truthy(regs[src as usize]) {
+                    if !knum_truthy(w[src as usize & KWIN_MASK]) {
                         branch!(target)
                     }
                 }
                 KOp::BrTruthy { src, target } => {
-                    if knum_truthy(regs[src as usize]) {
+                    if knum_truthy(w[src as usize & KWIN_MASK]) {
                         branch!(target)
                     }
                 }
@@ -819,17 +1111,36 @@ impl Vm {
                     idx,
                     bail,
                 } => {
-                    let i = regs[idx as usize];
+                    let i = w[idx as usize & KWIN_MASK];
                     let mut ok = false;
-                    if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
+                    if let Some(iu) = dense_index(i) {
                         let b = objs[obj as usize].borrow();
-                        if b.props.is_empty() {
-                            if let Internal::Array(arr) = &b.internal {
-                                if let Some(Value::Number(n)) = arr.get(i as usize) {
-                                    regs[dst as usize] = *n;
+                        match &b.internal {
+                            Internal::Array(arr) if b.own_is_empty() => {
+                                if let Some(Value::Number(n)) = arr.get(iu) {
+                                    w[dst as usize & KWIN_MASK] = *n;
                                     ok = true;
                                 }
                             }
+                            // Numeric typed arrays: a valid-index [[Get]]
+                            // reads element storage directly — own props and
+                            // the prototype chain are never consulted, so no
+                            // props/proto check is needed. OOB (incl.
+                            // detached / shrunk-view) bails to the generic
+                            // path, which owns the `undefined` absorption.
+                            Internal::TypedArray(t)
+                                if !t.kind.is_bigint()
+                                    && iu < crate::typed_array::ta_eff_length(t) =>
+                            {
+                                let off = t.byte_offset + iu * t.kind.bytes();
+                                let buf = t.buffer.borrow();
+                                if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
+                                    w[dst as usize & KWIN_MASK] =
+                                        crate::typed_array::decode(bytes, off, t.kind);
+                                    ok = true;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if !ok {
@@ -851,7 +1162,7 @@ impl Vm {
                     let mut ok = false;
                     {
                         let mut b = objs[obj as usize].borrow_mut();
-                        if b.props.is_empty()
+                        if b.own_is_empty()
                             && b.extensible
                             && b.proto
                                 .as_ref()
@@ -859,8 +1170,8 @@ impl Vm {
                         {
                             if let Internal::Array(arr) = &mut b.internal {
                                 if arr.len() < crate::value::MAX_DENSE_ARRAY {
-                                    arr.push(Value::Number(regs[val as usize]));
-                                    regs[dst as usize] = arr.len() as f64;
+                                    arr.push(Value::Number(w[val as usize & KWIN_MASK]));
+                                    w[dst as usize & KWIN_MASK] = arr.len() as f64;
                                     ok = true;
                                 }
                             }
@@ -878,10 +1189,10 @@ impl Vm {
                     let mut ok = false;
                     {
                         let mut b = objs[obj as usize].borrow_mut();
-                        if b.props.is_empty() && b.extensible {
+                        if b.own_is_empty() && b.extensible {
                             if let Internal::Array(arr) = &mut b.internal {
                                 if let Some(Value::Number(n)) = arr.last() {
-                                    regs[dst as usize] = *n;
+                                    w[dst as usize & KWIN_MASK] = *n;
                                     arr.pop();
                                     ok = true;
                                 }
@@ -907,23 +1218,23 @@ impl Vm {
                     val,
                     bail,
                 } => {
-                    let i = regs[idx as usize];
+                    let i = w[idx as usize & KWIN_MASK];
                     let mut ok = false;
-                    if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
+                    if let Some(iu) = dense_index(i) {
                         let mut b = objs[obj as usize].borrow_mut();
-                        if b.props.is_empty() {
-                            let extensible = b.extensible;
-                            if let Internal::Array(arr) = &mut b.internal {
-                                let iu = i as usize;
+                        let extensible = b.extensible;
+                        let props_empty = b.own_is_empty();
+                        match &mut b.internal {
+                            Internal::Array(arr) if props_empty => {
                                 match arr.get_mut(iu) {
                                     Some(slot) if !matches!(slot, Value::Hole) => {
-                                        *slot = Value::Number(regs[val as usize]);
+                                        *slot = Value::Number(w[val as usize & KWIN_MASK]);
                                         ok = true;
                                     }
                                     Some(slot) => {
                                         // In-bounds hole: creation.
                                         if extensible {
-                                            *slot = Value::Number(regs[val as usize]);
+                                            *slot = Value::Number(w[val as usize & KWIN_MASK]);
                                             ok = true;
                                         }
                                     }
@@ -933,12 +1244,38 @@ impl Vm {
                                             && iu == arr.len()
                                             && iu < crate::value::MAX_DENSE_ARRAY
                                         {
-                                            arr.push(Value::Number(regs[val as usize]));
+                                            arr.push(Value::Number(w[val as usize & KWIN_MASK]));
                                             ok = true;
                                         }
                                     }
                                 }
                             }
+                            // Numeric typed arrays: a valid-index [[Set]]
+                            // writes element storage directly, no props/proto
+                            // consult; the register already holds the
+                            // ToNumber'd value, and `encode` applies the same
+                            // per-kind conversion (f32 rounding, ToInt32-class
+                            // wrapping) as the builtin write path. OOB — a
+                            // silent no-op per spec — bails to the generic
+                            // path, which owns that behavior.
+                            Internal::TypedArray(t)
+                                if !t.kind.is_bigint()
+                                    && iu < crate::typed_array::ta_eff_length(t) =>
+                            {
+                                let off = t.byte_offset + iu * t.kind.bytes();
+                                let kind = t.kind;
+                                let mut buf = t.buffer.borrow_mut();
+                                if let Internal::ArrayBuffer(Some(bytes)) = &mut buf.internal {
+                                    crate::typed_array::encode(
+                                        bytes,
+                                        off,
+                                        kind,
+                                        w[val as usize & KWIN_MASK],
+                                    );
+                                    ok = true;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if !ok {
@@ -946,35 +1283,50 @@ impl Vm {
                     }
                 }
                 KOp::CmpSet { cmp, dst, a, b } => {
-                    regs[dst as usize] = if knum_cmp(cmp, regs[a as usize], regs[b as usize]) {
-                        1.0
-                    } else {
-                        0.0
-                    }
+                    w[dst as usize & KWIN_MASK] =
+                        if knum_cmp(cmp, w[a as usize & KWIN_MASK], w[b as usize & KWIN_MASK]) {
+                            1.0
+                        } else {
+                            0.0
+                        }
                 }
                 KOp::BoolNot { dst, src } => {
-                    regs[dst as usize] = if knum_truthy(regs[src as usize]) {
+                    w[dst as usize & KWIN_MASK] = if knum_truthy(w[src as usize & KWIN_MASK]) {
                         0.0
                     } else {
                         1.0
                     }
                 }
                 KOp::Math1 { kind, dst, src } => {
-                    regs[dst as usize] = kmath1(kind, regs[src as usize])
+                    w[dst as usize & KWIN_MASK] = kmath1(kind, w[src as usize & KWIN_MASK])
                 }
                 KOp::Math2 { kind, dst, a, b } => {
-                    regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
+                    w[dst as usize & KWIN_MASK] =
+                        kmath2(kind, w[a as usize & KWIN_MASK], w[b as usize & KWIN_MASK])
                 }
-                // Dense array `length` (unshadowed only), else bail.
+                // Dense array `length` (unshadowed only) or typed-array
+                // effective length (the entry guard verified the canonical
+                // accessor resolution for typed-array bases; the length
+                // itself cannot change mid-activation — resize/detach require
+                // calls, which kernel regions exclude), else bail.
                 KOp::LoadLen { dst, obj, bail } => {
                     let mut ok = false;
                     {
                         let b = objs[obj as usize].borrow();
-                        if b.props.is_empty() {
-                            if let Internal::Array(arr) = &b.internal {
-                                regs[dst as usize] = arr.len() as f64;
+                        match &b.internal {
+                            Internal::Array(arr) if b.own_is_empty() => {
+                                w[dst as usize & KWIN_MASK] = arr.len() as f64;
                                 ok = true;
                             }
+                            // Any kind — a BigInt-element array's `.length`
+                            // is the same plain count (its ELEMENT accesses
+                            // are what bail).
+                            Internal::TypedArray(t) => {
+                                w[dst as usize & KWIN_MASK] =
+                                    crate::typed_array::ta_eff_length(t) as f64;
+                                ok = true;
+                            }
+                            _ => {}
                         }
                     }
                     if !ok {
@@ -985,11 +1337,11 @@ impl Vm {
                 // register Mov at kernel build; the slots live only in the
                 // entry load and the exit/unwind write-back now.
                 KOp::LoadProp { .. } | KOp::StoreProp { .. } => {
-                    unreachable!("prop op survived kernel build")
+                    kernel_internal_error!("prop op survived kernel build")
                 }
                 KOp::Mov2 { d1, s1, d2, s2 } => {
-                    regs[d1 as usize] = regs[s1 as usize];
-                    regs[d2 as usize] = regs[s2 as usize];
+                    w[d1 as usize & KWIN_MASK] = w[s1 as usize & KWIN_MASK];
+                    w[d2 as usize & KWIN_MASK] = w[s2 as usize & KWIN_MASK];
                     // The unfused second op remains in the next slot as a
                     // branch-target landing pad; skip it.
                     pc += 1;
@@ -1003,13 +1355,184 @@ impl Vm {
                     a2,
                     b2,
                 } => {
-                    regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind);
-                    regs[d2 as usize] = regs[a2 as usize] + regs[b2 as usize];
+                    w[dst as usize & KWIN_MASK] = number_arith_raw(
+                        w[a as usize & KWIN_MASK],
+                        w[b as usize & KWIN_MASK],
+                        kind,
+                    );
+                    w[d2 as usize & KWIN_MASK] =
+                        w[a2 as usize & KWIN_MASK] + w[b2 as usize & KWIN_MASK];
                     pc += 1;
                 }
                 KOp::AddKBr { dst, a, k, target } => {
-                    regs[dst as usize] = regs[a as usize] + k;
+                    w[dst as usize & KWIN_MASK] = w[a as usize & KWIN_MASK] + k;
                     branch!(target)
+                }
+                KOp::ArithKAdd {
+                    kind,
+                    dst,
+                    a,
+                    k,
+                    d2,
+                    a2,
+                    b2,
+                } => {
+                    w[dst as usize & KWIN_MASK] =
+                        number_arith_raw(w[a as usize & KWIN_MASK], k, kind);
+                    w[d2 as usize & KWIN_MASK] =
+                        w[a2 as usize & KWIN_MASK] + w[b2 as usize & KWIN_MASK];
+                    pc += 1;
+                }
+                // Fused `i < a.length` header test: LoadLen's semantics (and
+                // bail edge) then BrCmp's compare-and-branch, one dispatch.
+                KOp::LenBrCmp {
+                    dst,
+                    obj,
+                    bail,
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    let mut ok = false;
+                    {
+                        let b = objs[obj as usize].borrow();
+                        match &b.internal {
+                            Internal::Array(arr) if b.own_is_empty() => {
+                                w[dst as usize & KWIN_MASK] = arr.len() as f64;
+                                ok = true;
+                            }
+                            Internal::TypedArray(t) => {
+                                w[dst as usize & KWIN_MASK] =
+                                    crate::typed_array::ta_eff_length(t) as f64;
+                                ok = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                    if knum_cmp(cmp, w[a as usize & KWIN_MASK], w[b as usize & KWIN_MASK])
+                        == if_true
+                    {
+                        branch!(target)
+                    }
+                    pc += 1;
+                }
+                // Fused `s += a[i]`: LoadElem's semantics (and bail edge)
+                // then the accumulating Add, one dispatch.
+                KOp::LoadElemAdd {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                    d2,
+                    a2,
+                    b2,
+                } => {
+                    let i = w[idx as usize & KWIN_MASK];
+                    let mut ok = false;
+                    if let Some(iu) = dense_index(i) {
+                        let b = objs[obj as usize].borrow();
+                        match &b.internal {
+                            Internal::Array(arr) if b.own_is_empty() => {
+                                if let Some(Value::Number(n)) = arr.get(iu) {
+                                    w[dst as usize & KWIN_MASK] = *n;
+                                    ok = true;
+                                }
+                            }
+                            Internal::TypedArray(t)
+                                if !t.kind.is_bigint()
+                                    && iu < crate::typed_array::ta_eff_length(t) =>
+                            {
+                                let off = t.byte_offset + iu * t.kind.bytes();
+                                let buf = t.buffer.borrow();
+                                if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
+                                    w[dst as usize & KWIN_MASK] =
+                                        crate::typed_array::decode(bytes, off, t.kind);
+                                    ok = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                    w[d2 as usize & KWIN_MASK] =
+                        w[a2 as usize & KWIN_MASK] + w[b2 as usize & KWIN_MASK];
+                    pc += 1;
+                }
+                // Fused `a[i] <op> …` (the dot-product second load feeding
+                // its multiply): LoadElem then Arith, one dispatch.
+                KOp::LoadElemArith {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                    kind,
+                    d2,
+                    a2,
+                    b2,
+                } => {
+                    let i = w[idx as usize & KWIN_MASK];
+                    let mut ok = false;
+                    if let Some(iu) = dense_index(i) {
+                        let b = objs[obj as usize].borrow();
+                        match &b.internal {
+                            Internal::Array(arr) if b.own_is_empty() => {
+                                if let Some(Value::Number(n)) = arr.get(iu) {
+                                    w[dst as usize & KWIN_MASK] = *n;
+                                    ok = true;
+                                }
+                            }
+                            Internal::TypedArray(t)
+                                if !t.kind.is_bigint()
+                                    && iu < crate::typed_array::ta_eff_length(t) =>
+                            {
+                                let off = t.byte_offset + iu * t.kind.bytes();
+                                let buf = t.buffer.borrow();
+                                if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
+                                    w[dst as usize & KWIN_MASK] =
+                                        crate::typed_array::decode(bytes, off, t.kind);
+                                    ok = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                    w[d2 as usize & KWIN_MASK] = number_arith_raw(
+                        w[a2 as usize & KWIN_MASK],
+                        w[b2 as usize & KWIN_MASK],
+                        kind,
+                    );
+                    pc += 1;
+                }
+                // Pinned-string reads: TOTAL on the entry-guarded flat-ASCII
+                // string (unit == byte). `StrLen` is an activation constant;
+                // `CharCodeAt` computes ToIntegerOrInfinity (NaN→0, truncate
+                // toward zero, saturating casts) and the out-of-range NaN
+                // exactly — no bail exists.
+                KOp::StrLen { dst, str } => {
+                    w[dst as usize & KWIN_MASK] = sstrs[str as usize].len_utf16() as f64;
+                }
+                KOp::CharCodeAt { dst, str, idx } => {
+                    let i = w[idx as usize & KWIN_MASK];
+                    let bytes = sstrs[str as usize]
+                        .flatten_utf8()
+                        .expect("entry-guarded flat ASCII")
+                        .as_bytes();
+                    let p = if i.is_nan() { 0i64 } else { i as i64 };
+                    w[dst as usize & KWIN_MASK] =
+                        match usize::try_from(p).ok().and_then(|p| bytes.get(p)) {
+                            Some(&b) => b as f64,
+                            None => f64::NAN,
+                        };
                 }
                 // A pinned-closure call: copy the arguments into the
                 // callee's window and run its (guarded) kernel inline.
@@ -1021,40 +1544,71 @@ impl Vm {
                 } if CALLEES => {
                     let (bf, wb) = &callee_bfs[fslot as usize];
                     let ck = bf.proto.fn_kernel.as_ref().expect("guarded");
-                    let win = *wb as usize;
+                    // Callee windows live in `wtail` at KWIN strides (window
+                    // base `wb` counts from the buffer start, so subtract the
+                    // caller's window).
+                    let cw: &mut [f64; KWIN] = (&mut wtail[*wb as usize - KWIN..][..KWIN])
+                        .try_into()
+                        .expect("sized above");
                     for (r, slot) in ck.locals.iter().enumerate() {
                         if let crate::bytecode::KSlot::Arg(a) = slot {
-                            regs[win + r] = regs[base as usize + *a as usize];
+                            cw[r & KWIN_MASK] = w[(base as usize + *a as usize) & KWIN_MASK];
                         }
                     }
-                    if !run_callee_window(&mut regs, ck, win, dst as usize, &interrupt, &mut poll) {
-                        // Interrupted on a callee back-edge: the same
-                        // latch-and-unwind as an interrupted caller edge.
-                        for (r, slot) in k.locals.iter().enumerate() {
-                            if let crate::bytecode::KSlot::Local(l) = slot {
-                                frame.locals[*l as usize] = Value::Number(regs[r]);
+                    let ret = run_callee_window(cw, ck, &interrupt, &mut poll);
+                    // A cell-writing callee flushes after EVERY call (return
+                    // or interrupt): the cell must be current before any
+                    // subsequent op that can bail to the generic loop, whose
+                    // remaining iterations call the callee generically. The
+                    // register persists in the pinned window, so no reload
+                    // is needed — nothing else can write the cell mid-loop
+                    // (cross-window aliasing declined at entry).
+                    if !ck.uv_writes.is_empty() {
+                        flush_uv_writes(ck, bf, cw);
+                    }
+                    match ret {
+                        CalleeOut::Ret(ret) => {
+                            w[dst as usize & KWIN_MASK] = ret;
+                        }
+                        CalleeOut::BadOp => {
+                            kernel_internal_error!("unsupported op in a callee kernel")
+                        }
+                        CalleeOut::Interrupted => {
+                            // Interrupted on a callee back-edge: the same
+                            // latch-and-unwind as an interrupted caller edge.
+                            for (r, slot) in k.locals.iter().enumerate() {
+                                if let crate::bytecode::KSlot::Local(l) = slot {
+                                    frame.locals[*l as usize] = Value::Number(w[r & KWIN_MASK]);
+                                }
                             }
+                            for (j, &l) in k.bool_locals.iter().enumerate() {
+                                frame.locals[l as usize] =
+                                    Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
+                            }
+                            writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
+                            self.kernel_regs = regs;
+                            objs.clear();
+                            self.kernel_objs = objs;
+                            sstrs.clear();
+                            self.kernel_strs = sstrs;
+                            self.kernel_prop_slots = prop_slots;
+                            callee_bfs.clear();
+                            self.kernel_callees = callee_bfs;
+                            self.op_budget = Some(0);
+                            return Err(self.throw_range("execution interrupted"));
                         }
-                        for (j, &l) in k.bool_locals.iter().enumerate() {
-                            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
-                        }
-                        writeback_kernel_props(k, &objs, &prop_slots, &regs);
-                        self.kernel_regs = regs;
-                        objs.clear();
-                        self.kernel_objs = objs;
-                        self.kernel_prop_slots = prop_slots;
-                        callee_bfs.clear();
-                        self.kernel_callees = callee_bfs;
-                        self.op_budget = Some(0);
-                        return Err(self.throw_range("execution interrupted"));
                     }
                 }
                 KOp::Exit { resume_ip, shape } => break (resume_ip, shape),
                 // Plain instantiation: a kernel without callee_slots never
                 // contains CallKernel (translator invariant).
-                KOp::CallKernel { .. } => unreachable!("CallKernel in a plain kernel loop"),
+                KOp::CallKernel { .. } => {
+                    kernel_internal_error!("CallKernel in a plain kernel loop")
+                }
                 // Function-kernel-only ops; loop translation never emits them.
-                KOp::Ret { .. } | KOp::SelfCall { .. } => unreachable!("fn op in a loop kernel"),
+                KOp::Ret { .. } | KOp::SelfCall { .. } => {
+                    kernel_internal_error!("fn op in a loop kernel")
+                }
             }
             pc += 1;
         };
@@ -1064,21 +1618,21 @@ impl Vm {
         // bytecode interpreter at the exit's target.
         for (r, slot) in k.locals.iter().enumerate() {
             if let crate::bytecode::KSlot::Local(l) = slot {
-                frame.locals[*l as usize] = Value::Number(regs[r]);
+                frame.locals[*l as usize] = Value::Number(w[r & KWIN_MASK]);
             }
         }
         for (j, &l) in k.bool_locals.iter().enumerate() {
-            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
+            frame.locals[l as usize] = Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
         }
-        writeback_kernel_props(k, &objs, &prop_slots, &regs);
+        writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
         for slot in k.shapes[shape as usize].iter() {
             match slot {
                 crate::bytecode::KShapeSlot::Num(r) => {
-                    frame.stack.push(Value::Number(regs[*r as usize]))
+                    frame.stack.push(Value::Number(w[*r as usize & KWIN_MASK]))
                 }
-                crate::bytecode::KShapeSlot::Bool(r) => {
-                    frame.stack.push(Value::Bool(regs[*r as usize] != 0.0))
-                }
+                crate::bytecode::KShapeSlot::Bool(r) => frame
+                    .stack
+                    .push(Value::Bool(w[*r as usize & KWIN_MASK] != 0.0)),
                 crate::bytecode::KShapeSlot::Obj(o) => {
                     frame.stack.push(Value::Object(objs[*o as usize].clone()))
                 }
@@ -1095,11 +1649,19 @@ impl Vm {
                 crate::bytecode::KShapeSlot::ArrayPopFn => frame.stack.push(Value::Object(
                     self.realm.array_pop.clone().expect("guarded"),
                 )),
+                crate::bytecode::KShapeSlot::Str(sl) => {
+                    frame.stack.push(Value::String(sstrs[*sl as usize].clone()))
+                }
+                crate::bytecode::KShapeSlot::CharCodeFn => frame.stack.push(Value::Object(
+                    self.realm.string_char_code_at.clone().expect("guarded"),
+                )),
             }
         }
         self.kernel_regs = regs;
         objs.clear();
         self.kernel_objs = objs;
+        sstrs.clear();
+        self.kernel_strs = sstrs;
         self.kernel_prop_slots = prop_slots;
         callee_bfs.clear();
         self.kernel_callees = callee_bfs;
@@ -1110,333 +1672,761 @@ impl Vm {
     /// runs in unboxed registers with no frame at all. `None` = the entry
     /// guard declined (an op budget installed — per-op counts are observable;
     /// a trace sink active — it must see an enter/exit per call; a consumed
-    /// argument or captured upvalue not a `Number`; a monkeypatched `Math`) —
-    /// the caller proceeds down the ordinary frame path. `Some` is the call's
+    /// argument or captured upvalue not a `Number`; a monkeypatched `Math`;
+    /// a written cell aliasing another captured cell) — the caller proceeds
+    /// down the ordinary frame path. Cells the body writes (`uv_writes`)
+    /// buffer in registers and flush back on completion. `Some` is the call's
     /// exact result, bit-identical to the generic path by the loop-kernel
     /// argument (shared numeric cores, an op set closed over numbers, typed
     /// returns). Callers have already applied the depth guard, so the
     /// max-call-depth RangeError fires identically on both paths.
     fn run_fn_kernel(
         &mut self,
-        bf: &BytecodeFunction,
+        bf: &Rc<BytecodeFunction>,
         args: &[Value],
     ) -> Option<Result<Value, Value>> {
         let k = bf.proto.fn_kernel.as_ref()?;
         if self.op_budget.is_some() || self.trace_sink.is_some() {
             return None;
         }
-        // Self-recursive kernels run the windowed executor.
-        if k.self_global.is_some() {
+        // Recursive kernels (self or mutual) run the windowed executor.
+        if k.rec.is_some() {
             return self.run_fn_kernel_rec(bf, args);
         }
-        let mut regs = std::mem::take(&mut self.kernel_regs);
-        regs.clear();
-        regs.resize(k.n_regs as usize, 0.0);
+        // One fixed window on the native stack (function kernels are tiny and
+        // never nest at runtime); masked indexing inside the executor makes
+        // every register access bounds-check-free.
+        let mut regs = [0.0f64; KWIN];
         for (r, slot) in k.locals.iter().enumerate() {
             match slot {
                 crate::bytecode::KSlot::Arg(a) => match args.get(*a as usize) {
-                    Some(Value::Number(n)) => regs[r] = *n,
-                    _ => {
-                        self.kernel_regs = regs;
-                        return None;
-                    }
+                    Some(Value::Number(n)) => regs[r & KWIN_MASK] = *n,
+                    _ => return None,
                 },
                 // Internal locals are pure register scratch: translation
                 // proved a store dominates every read, so no frame slot is
                 // needed (and none exists).
                 crate::bytecode::KSlot::Local(_) => {}
                 crate::bytecode::KSlot::Upvalue(u) => match &*bf.upvalues[*u as usize].borrow() {
-                    Value::Number(n) => regs[r] = *n,
-                    _ => {
-                        self.kernel_regs = regs;
-                        return None;
-                    }
+                    Value::Number(n) => regs[r & KWIN_MASK] = *n,
+                    _ => return None,
                 },
             }
         }
         if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
-            self.kernel_regs = regs;
+            return None;
+        }
+        // Written cells (`uv_writes`) buffer in their registers and flush on
+        // completion (out-of-line: most kernels have no writes, and keeping
+        // this function small protects the LTO inlining of the hot paths).
+        if !k.uv_writes.is_empty() && uv_write_cells_alias(k, bf) {
             return None;
         }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
         match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll) {
-            Some(ret) => {
-                self.kernel_regs = regs;
+            FnKernelOut::Ret(ret) => {
+                if !k.uv_writes.is_empty() {
+                    flush_uv_writes(k, bf, &regs);
+                }
                 Some(Ok(ret))
             }
-            None => {
-                // Interrupted on a back-edge: registers are pure scratch,
-                // nothing to write back on the unwind.
-                self.kernel_regs = regs;
+            FnKernelOut::Interrupted => {
+                if !k.uv_writes.is_empty() {
+                    flush_uv_writes(k, bf, &regs);
+                }
+                // Interrupted on a back-edge: latch the zero budget so a JS
+                // catch cannot resume execution.
+                self.op_budget = Some(0);
+                Some(Err(self.throw_range("execution interrupted")))
+            }
+            // Tier bug (an op fn-mode translation never emits). The kernel is
+            // pure and nothing was flushed, so declining to the generic call
+            // path re-runs the function with correct semantics.
+            FnKernelOut::BadOp => None,
+        }
+    }
+
+    /// The WINDOWED executor for RECURSIVE function kernels
+    /// ([`Kernel::rec`]): each [`KOp::SelfCall`] pushes a fresh register
+    /// window and an explicit (caller, return-pc, dst, caller-window) record
+    /// — the whole recursion (self OR mutual) runs without a single frame or
+    /// `Value`. Entry resolves the recursion FAMILY once:
+    ///
+    /// - Every [`SelfRefKind`] must hold for its member — a `Global` name
+    ///   must be a plain data property holding that very closure, an
+    ///   `Upvalue` cell must contain it (pointer identity) — so a
+    ///   shadowed/rebound/accessor'd reference declines to the generic path.
+    /// - Each [`KernelRec::globals`] name must resolve to a plain sync
+    ///   bytecode closure carrying a function kernel, transitively closed
+    ///   over the whole family (bounded), with every member's `Ret` type
+    ///   matching the entry kernel's and every call site supplying at least
+    ///   the resolved callee's consumed arguments.
+    ///
+    /// Nothing inside a RECURSIVE kernel can write globals or cells
+    /// (upvalue-writing kernels decline this tier at translation and at
+    /// family resolution), so the entry resolution holds for the whole
+    /// activation. Depth mirrors the
+    /// interpreter's limit; on overflow the activation is ABANDONED and
+    /// `None` returned — sound because kernels are pure (registers only),
+    /// and the caller's generic rerun then raises the spec RangeError from
+    /// the exact frame it belongs to.
+    ///
+    /// The resolved family is CACHED ([`RecFamily`], keyed by the entry
+    /// closure's identity): resolution allocates half a dozen tables and
+    /// walks every member's code, which dominated shallow recursions
+    /// (isEven-class) when paid per outer call. A hit re-verifies only the
+    /// dynamic facts — recorded global slots (key-verified, no hashing),
+    /// upvalue self-cells, canonical `Math` — and re-snapshots upvalue
+    /// values; any failure drops the entry and re-resolves from scratch,
+    /// which is exactly the uncached behavior. Hit or miss is therefore
+    /// unobservable: same declines, same results.
+    fn run_fn_kernel_rec(
+        &mut self,
+        bf: &Rc<BytecodeFunction>,
+        args: &[Value],
+    ) -> Option<Result<Value, Value>> {
+        let k0 = bf.proto.fn_kernel.as_ref()?;
+        k0.rec.as_deref()?;
+
+        let fam = match self.take_rec_family(bf) {
+            Some(f) => f,
+            None => self.build_rec_family(bf)?,
+        };
+        let ret_bool = fam.ret_bool;
+
+        // --- Window 0: the invoked member's arguments and upvalues. Windows
+        // are FIXED KWIN-slot strides (window d = regs[d*KWIN..(d+1)*KWIN]),
+        // so the dispatch loop below runs over a `&mut [f64; KWIN]` with
+        // masked, bounds-check-free indexing. The buffer is GROW-ONLY across
+        // activations: a deep recursion leaves it at its high-water length,
+        // so the next outer call's window pushes (`SelfCall`'s conditional
+        // resize) stop paying a zero-fill per window — which was ~11% of the
+        // mutual-recursion workload. Stale values are unreadable:
+        // args/upvalues are written here, locals are store-before-read by
+        // translation proof.
+        let mut regs = std::mem::take(&mut self.kernel_regs);
+        if regs.len() < KWIN {
+            regs.resize(KWIN, 0.0);
+        }
+        for &(r, a) in &fam.arg_slots[0] {
+            match args.get(a) {
+                Some(Value::Number(v)) => regs[r] = *v,
+                _ => {
+                    self.kernel_regs = regs;
+                    self.park_rec_family(fam);
+                    return None;
+                }
+            }
+        }
+        for &(r, _, v) in &fam.uv_snaps[0] {
+            regs[r] = v;
+        }
+
+        /// How the windowed loop below exited; the single tail then parks
+        /// the pooled buffers + family exactly once on every path.
+        enum RecOut {
+            Done(Value),
+            Interrupted,
+            Abandon,
+        }
+        /// A window-crossing step the masked dispatch loop cannot perform
+        /// while it holds the current window borrow: perform it over the
+        /// full buffer, then re-enter with the new window.
+        enum Act {
+            Call { t: usize, abase: u16, dst: u16 },
+            Ret { v: f64 },
+        }
+
+        let interrupt = self.interrupt.clone();
+        let mut poll: u32 = 0;
+        // (caller member, return pc, dst register, caller window base) —
+        // pooled on the Vm so a deep recursion allocates its stack once per
+        // Vm, not once per outer call.
+        let mut calls = std::mem::take(&mut self.rec_calls);
+        debug_assert!(calls.is_empty());
+        let mut cur = 0usize;
+        let mut base = 0usize;
+        let mut pc = 0usize;
+        let out = 'outer: loop {
+            // Member level: table hoists happen only when the executing
+            // MEMBER changes; same-kernel calls/returns (fib-class, the
+            // overwhelming case) stay inside the window loop below.
+            let code: &[KOp] = &fam.funcs[cur]
+                .proto
+                .fn_kernel
+                .as_ref()
+                .expect("resolved family")
+                .code;
+            let cur_map = &fam.callee_map[cur][..];
+            'win: loop {
+                // The current activation's fixed window (strided, sized above).
+                let w: &mut [f64; KWIN] = (&mut regs[base..base + KWIN])
+                    .try_into()
+                    .expect("strided window");
+                let act = loop {
+                    macro_rules! poll_interrupt {
+                        () => {{
+                            poll = poll.wrapping_add(1);
+                            if poll & 0xFF == 0 {
+                                if let Some(flag) = &interrupt {
+                                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                        break 'outer RecOut::Interrupted;
+                                    }
+                                }
+                            }
+                        }};
+                    }
+                    macro_rules! branch {
+                        ($t:expr) => {{
+                            let t = $t as usize;
+                            if t <= pc {
+                                poll_interrupt!();
+                            }
+                            pc = t;
+                            continue;
+                        }};
+                    }
+                    match code[pc] {
+                        KOp::Mov { dst, src } => {
+                            w[dst as usize & KWIN_MASK] = w[src as usize & KWIN_MASK]
+                        }
+                        KOp::Const { dst, k } => w[dst as usize & KWIN_MASK] = k,
+                        KOp::Add { dst, a, b } => {
+                            w[dst as usize & KWIN_MASK] =
+                                w[a as usize & KWIN_MASK] + w[b as usize & KWIN_MASK]
+                        }
+                        KOp::AddK { dst, a, k } => {
+                            w[dst as usize & KWIN_MASK] = w[a as usize & KWIN_MASK] + k
+                        }
+                        KOp::Arith { kind, dst, a, b } => {
+                            w[dst as usize & KWIN_MASK] = number_arith_raw(
+                                w[a as usize & KWIN_MASK],
+                                w[b as usize & KWIN_MASK],
+                                kind,
+                            )
+                        }
+                        KOp::ArithK { kind, dst, a, k } => {
+                            w[dst as usize & KWIN_MASK] =
+                                number_arith_raw(w[a as usize & KWIN_MASK], k, kind)
+                        }
+                        KOp::Neg { dst, src } => {
+                            w[dst as usize & KWIN_MASK] = -w[src as usize & KWIN_MASK]
+                        }
+                        KOp::BitNot { dst, src } => {
+                            w[dst as usize & KWIN_MASK] =
+                                !crate::vm::to_int32(w[src as usize & KWIN_MASK]) as f64
+                        }
+                        KOp::Br { target } => branch!(target),
+                        KOp::BrCmp {
+                            cmp,
+                            a,
+                            b,
+                            if_true,
+                            target,
+                        } => {
+                            if knum_cmp(cmp, w[a as usize & KWIN_MASK], w[b as usize & KWIN_MASK])
+                                == if_true
+                            {
+                                branch!(target)
+                            }
+                        }
+                        KOp::BrCmpK {
+                            cmp,
+                            a,
+                            k,
+                            if_true,
+                            target,
+                        } => {
+                            if knum_cmp(cmp, w[a as usize & KWIN_MASK], k) == if_true {
+                                branch!(target)
+                            }
+                        }
+                        KOp::BrFalsy { src, target } => {
+                            if !knum_truthy(w[src as usize & KWIN_MASK]) {
+                                branch!(target)
+                            }
+                        }
+                        KOp::BrTruthy { src, target } => {
+                            if knum_truthy(w[src as usize & KWIN_MASK]) {
+                                branch!(target)
+                            }
+                        }
+                        KOp::CmpSet { cmp, dst, a, b } => {
+                            w[dst as usize & KWIN_MASK] = if knum_cmp(
+                                cmp,
+                                w[a as usize & KWIN_MASK],
+                                w[b as usize & KWIN_MASK],
+                            ) {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        }
+                        KOp::BoolNot { dst, src } => {
+                            w[dst as usize & KWIN_MASK] =
+                                if knum_truthy(w[src as usize & KWIN_MASK]) {
+                                    0.0
+                                } else {
+                                    1.0
+                                }
+                        }
+                        KOp::Math1 { kind, dst, src } => {
+                            w[dst as usize & KWIN_MASK] = kmath1(kind, w[src as usize & KWIN_MASK])
+                        }
+                        KOp::Math2 { kind, dst, a, b } => {
+                            w[dst as usize & KWIN_MASK] =
+                                kmath2(kind, w[a as usize & KWIN_MASK], w[b as usize & KWIN_MASK])
+                        }
+                        KOp::Mov2 { d1, s1, d2, s2 } => {
+                            w[d1 as usize & KWIN_MASK] = w[s1 as usize & KWIN_MASK];
+                            w[d2 as usize & KWIN_MASK] = w[s2 as usize & KWIN_MASK];
+                            pc += 1;
+                        }
+                        KOp::ArithAdd {
+                            kind,
+                            dst,
+                            a,
+                            b,
+                            d2,
+                            a2,
+                            b2,
+                        } => {
+                            w[dst as usize & KWIN_MASK] = number_arith_raw(
+                                w[a as usize & KWIN_MASK],
+                                w[b as usize & KWIN_MASK],
+                                kind,
+                            );
+                            w[d2 as usize & KWIN_MASK] =
+                                w[a2 as usize & KWIN_MASK] + w[b2 as usize & KWIN_MASK];
+                            pc += 1;
+                        }
+                        KOp::AddKBr { dst, a, k, target } => {
+                            w[dst as usize & KWIN_MASK] = w[a as usize & KWIN_MASK] + k;
+                            branch!(target)
+                        }
+                        KOp::ArithKAdd {
+                            kind,
+                            dst,
+                            a,
+                            k,
+                            d2,
+                            a2,
+                            b2,
+                        } => {
+                            w[dst as usize & KWIN_MASK] =
+                                number_arith_raw(w[a as usize & KWIN_MASK], k, kind);
+                            w[d2 as usize & KWIN_MASK] =
+                                w[a2 as usize & KWIN_MASK] + w[b2 as usize & KWIN_MASK];
+                            pc += 1;
+                        }
+                        KOp::SelfCall {
+                            dst,
+                            base: abase,
+                            argc: _,
+                            callee,
+                        } => {
+                            // Mirror the generic per-call depth guard: an
+                            // overflow abandons the pure activation; the generic
+                            // rerun then recurses to the same depth and raises
+                            // the RangeError.
+                            if self.call_depth + calls.len() + 1 > self.max_call_depth {
+                                break 'outer RecOut::Abandon;
+                            }
+                            poll_interrupt!();
+                            let t = cur_map[callee as usize] as usize;
+                            break Act::Call { t, abase, dst };
+                        }
+                        KOp::Ret { src, boolean } => {
+                            // Entry verified every member's Ret type against the
+                            // family's (`ret_bool`); registers carry booleans as
+                            // exactly 0.0/1.0, so the raw value moves across.
+                            debug_assert_eq!(boolean, ret_bool);
+                            break Act::Ret {
+                                v: w[src as usize & KWIN_MASK],
+                            };
+                        }
+                        // Ops rec-mode translation promised it never emits —
+                        // a tier bug. Recursive kernels are PURE (registers
+                        // only), so abandoning the activation is safe and the
+                        // generic rerun produces the correct result; never a
+                        // process abort.
+                        KOp::ArrayPush { .. }
+                        | KOp::ArrayPop { .. }
+                        | KOp::LoadElem { .. }
+                        | KOp::StoreElem { .. }
+                        | KOp::LoadLen { .. }
+                        | KOp::StrLen { .. }
+                        | KOp::CharCodeAt { .. }
+                        | KOp::LoadElemAdd { .. }
+                        | KOp::LoadElemArith { .. }
+                        | KOp::LenBrCmp { .. }
+                        | KOp::LoadProp { .. }
+                        | KOp::StoreProp { .. }
+                        | KOp::CallKernel { .. }
+                        | KOp::Exit { .. } => break 'outer RecOut::Abandon,
+                    }
+                    pc += 1;
+                };
+                // Window-crossing steps run over the full buffer (the fixed
+                // window borrow has ended): populate the callee window / write
+                // the return value into the caller's dst. Same-member switches
+                // re-enter the window loop directly; a member change re-hoists.
+                match act {
+                    Act::Call { t, abase, dst } => {
+                        let new_base = base + KWIN;
+                        if regs.len() < new_base + KWIN {
+                            regs.resize(new_base + KWIN, 0.0);
+                        }
+                        // Arguments MOVE from the call site's contiguous
+                        // registers (translation guarantees argc covers every
+                        // consumed index — the entry cross-check re-verified it
+                        // against the RESOLVED callee), upvalues from the
+                        // member's entry snapshot, locals are scratch
+                        // (store-before-read proven at translation).
+                        let (lo, hi) = regs.split_at_mut(new_base);
+                        let caller = &lo[base..];
+                        let cw = &mut hi[..KWIN];
+                        for &(r, a) in &fam.arg_slots[t] {
+                            cw[r] = caller[abase as usize + a];
+                        }
+                        for &(r, _, v) in &fam.uv_snaps[t] {
+                            cw[r] = v;
+                        }
+                        calls.push((cur as u8, pc as u16 + 1, dst, base as u32));
+                        base = new_base;
+                        pc = 0;
+                        if t == cur {
+                            continue 'win;
+                        }
+                        cur = t;
+                        continue 'outer;
+                    }
+                    Act::Ret { v } => match calls.pop() {
+                        Some((cf, ret_pc, dst, prev)) => {
+                            base = prev as usize;
+                            regs[base + (dst as usize)] = v;
+                            pc = ret_pc as usize;
+                            if cf as usize == cur {
+                                continue 'win;
+                            }
+                            cur = cf as usize;
+                            continue 'outer;
+                        }
+                        None => {
+                            break 'outer RecOut::Done(if ret_bool {
+                                Value::Bool(v != 0.0)
+                            } else {
+                                Value::Number(v)
+                            })
+                        }
+                    },
+                }
+            }
+        };
+        self.kernel_regs = regs;
+        calls.clear();
+        self.rec_calls = calls;
+        self.park_rec_family(fam);
+        match out {
+            RecOut::Done(v) => Some(Ok(v)),
+            RecOut::Abandon => None,
+            RecOut::Interrupted => {
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
             }
         }
     }
 
-    /// The WINDOWED executor for self-recursive function kernels
-    /// (`Kernel::self_global`): each [`KOp::SelfCall`] pushes a fresh
-    /// `n_regs`-wide register window and an explicit (return-pc, dst,
-    /// caller-window) record — the whole recursion runs without a single
-    /// frame or `Value`. Extra guard over `run_fn_kernel`: the global the
-    /// recursive callee resolves through must be a plain data property
-    /// holding the VERY closure being invoked (pointer identity), so a
-    /// shadowed/rebound/accessor'd name declines and the call runs
-    /// generically. Depth mirrors the interpreter's limit; on overflow the
-    /// activation is ABANDONED and `None` returned — sound because kernels
-    /// are pure (registers only), and the caller's generic rerun then
-    /// raises the spec RangeError from the exact frame it belongs to.
-    fn run_fn_kernel_rec(
-        &mut self,
-        bf: &BytecodeFunction,
-        args: &[Value],
-    ) -> Option<Result<Value, Value>> {
-        let k = bf.proto.fn_kernel.as_ref()?;
-        let name = k.self_global.as_deref()?;
+    /// Take a cached, VALIDATED family for entry closure `bf`, or `None`
+    /// (miss, or a dynamic check failed — the entry is dropped and the
+    /// caller re-resolves, which is the uncached path and may itself
+    /// decline).
+    fn take_rec_family(&mut self, bf: &Rc<BytecodeFunction>) -> Option<RecFamily> {
+        let i = self
+            .rec_families
+            .iter()
+            .position(|f| Rc::ptr_eq(&f.funcs[0], bf))?;
+        let mut fam = self.rec_families.swap_remove(i);
+        if self.validate_rec_family(&mut fam) {
+            Some(fam)
+        } else {
+            None
+        }
+    }
+
+    /// Re-verify a cached family's DYNAMIC facts and refresh its upvalue
+    /// snapshots. Static facts (kernel presence, Ret types, argc coverage,
+    /// window sizes) live on immutable protos pinned by the identity checks,
+    /// so they never need re-checking.
+    fn validate_rec_family(&self, fam: &mut RecFamily) -> bool {
         {
             let g = self.realm.global.borrow();
+            for c in fam.global_checks.iter() {
+                let ok = matches!(
+                    g.own_get_index(c.slot as usize),
+                    Some((
+                        k,
+                        Property {
+                            kind: PropertyKind::Data { value: Value::Object(o), .. },
+                            ..
+                        },
+                    )) if *k == c.key && matches!(
+                        &o.borrow().internal,
+                        Internal::Function(FunctionInner::Bytecode(bf2))
+                            if Rc::ptr_eq(bf2, &fam.funcs[c.func as usize])
+                    )
+                );
+                if !ok {
+                    return false;
+                }
+            }
+        }
+        for &(m, u) in fam.upval_self_checks.iter() {
+            let f = &fam.funcs[m as usize];
             let ok = matches!(
-                g.props.get(&PropertyKey::str(name)),
-                Some(Property {
-                    kind: PropertyKind::Data { value: Value::Object(o), .. },
-                    ..
-                }) if matches!(
+                &*f.upvalues[u as usize].borrow(),
+                Value::Object(o) if matches!(
                     &o.borrow().internal,
                     Internal::Function(FunctionInner::Bytecode(bf2))
-                        if std::ptr::eq(Rc::as_ptr(bf2), bf)
+                        if Rc::ptr_eq(bf2, f)
                 )
             );
             if !ok {
+                return false;
+            }
+        }
+        for &m in fam.math_members.iter() {
+            let k = fam.funcs[m as usize]
+                .proto
+                .fn_kernel
+                .as_ref()
+                .expect("family member");
+            if !self.kernel_math_ok(&k.math_used) {
+                return false;
+            }
+        }
+        // Refresh upvalue snapshots: cells can change BETWEEN activations
+        // (never during one — kernels contain no calls).
+        let RecFamily {
+            funcs, uv_snaps, ..
+        } = fam;
+        for (f, uvs) in funcs.iter().zip(uv_snaps.iter_mut()) {
+            for (_, u, v) in uvs.iter_mut() {
+                match &*f.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => *v = *n,
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// Park a family back in the cache (MRU at the tail, bounded). Eviction
+    /// only ever costs the evicted entry a re-resolution on its next call.
+    fn park_rec_family(&mut self, fam: RecFamily) {
+        const REC_FAMILY_CACHE_CAP: usize = 8;
+        if self.rec_families.len() >= REC_FAMILY_CACHE_CAP {
+            self.rec_families.remove(0);
+        }
+        self.rec_families.push(fam);
+    }
+
+    /// Resolve the recursion family for entry closure `bf` from scratch
+    /// (`funcs[0]` = `bf`), recording the identity checks a cache hit will
+    /// re-verify. `None` = the family declines kernelization (this
+    /// activation runs generically); nothing is cached on decline.
+    fn build_rec_family(&self, bf: &Rc<BytecodeFunction>) -> Option<RecFamily> {
+        let ret_bool = bf.proto.fn_kernel.as_ref()?.ret_bool;
+        let mut funcs: Vec<Rc<BytecodeFunction>> = vec![bf.clone()];
+        // callee_map[j][c] = funcs index for member j's SelfCall callee c
+        // (c = 0 is j itself; c = 1 + i is j's rec.globals[i]).
+        let mut callee_map: Vec<Vec<u8>> = Vec::new();
+        let mut global_checks: Vec<RecGlobalCheck> = Vec::new();
+        let mut upval_self_checks: Vec<(u8, u32)> = Vec::new();
+        let mut math_members: Vec<u8> = Vec::new();
+        let mut wl = 0usize;
+        while wl < funcs.len() {
+            if funcs.len() > 8 {
                 return None;
             }
-        }
-        let n_regs = k.n_regs as usize;
-        let mut regs = std::mem::take(&mut self.kernel_regs);
-        regs.clear();
-        regs.resize(n_regs, 0.0);
-        for (r, slot) in k.locals.iter().enumerate() {
-            match slot {
-                crate::bytecode::KSlot::Arg(a) => match args.get(*a as usize) {
-                    Some(Value::Number(n)) => regs[r] = *n,
-                    _ => {
-                        self.kernel_regs = regs;
-                        return None;
-                    }
-                },
-                crate::bytecode::KSlot::Local(_) => {}
-                crate::bytecode::KSlot::Upvalue(u) => match &*bf.upvalues[*u as usize].borrow() {
-                    Value::Number(n) => regs[r] = *n,
-                    _ => {
-                        self.kernel_regs = regs;
-                        return None;
-                    }
-                },
+            let f = funcs[wl].clone();
+            let k = f.proto.fn_kernel.as_ref()?;
+            // No member may write cells: the windowed executor snapshots
+            // upvalues once per member and the family cache treats them as
+            // activation constants. (Recursive members can't have writes —
+            // translation declines — but a NON-recursive helper pulled in as
+            // a call target can.)
+            if !k.uv_writes.is_empty() {
+                return None;
             }
-        }
-        if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
-            self.kernel_regs = regs;
-            return None;
-        }
-        let interrupt = self.interrupt.clone();
-        let mut poll: u32 = 0;
-        let code = &k.code;
-        // (return pc, dst register, caller window base) per live self-call.
-        let mut calls: Vec<(u16, u16, usize)> = Vec::new();
-        let mut base = 0usize;
-        let mut pc = 0usize;
-        let ret = loop {
-            // Back-edges AND self-calls poll the cooperative interrupt flag.
-            macro_rules! poll_interrupt {
-                () => {{
-                    poll = poll.wrapping_add(1);
-                    if poll & 0xFF == 0 {
-                        if let Some(flag) = &interrupt {
-                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                self.kernel_regs = regs;
-                                self.op_budget = Some(0);
-                                return Some(Err(self.throw_range("execution interrupted")));
+            // Every member's Ret type must match the entry kernel's: a
+            // mismatched value would land in a caller register of the wrong
+            // static type. (Also rejects mixed-type non-recursive members.)
+            if k.code
+                .iter()
+                .any(|op| matches!(op, KOp::Ret { boolean, .. } if *boolean != ret_bool))
+            {
+                return None;
+            }
+            // Self references must hold for THIS member's closure.
+            if let Some(rec) = k.rec.as_deref() {
+                for r in rec.self_refs.iter() {
+                    match r {
+                        crate::bytecode::SelfRefKind::Global(name) => {
+                            let g = self.realm.global.borrow();
+                            match g.own_get_full(&PropertyKey::str(name)) {
+                                Some((
+                                    slot,
+                                    key,
+                                    Property {
+                                        kind:
+                                            PropertyKind::Data {
+                                                value: Value::Object(o),
+                                                ..
+                                            },
+                                        ..
+                                    },
+                                )) if matches!(
+                                    &o.borrow().internal,
+                                    Internal::Function(FunctionInner::Bytecode(bf2))
+                                        if Rc::ptr_eq(bf2, &f)
+                                ) =>
+                                {
+                                    global_checks.push(RecGlobalCheck {
+                                        // The MAP's key, so validation's
+                                        // equality hits the Rc fast path.
+                                        key: key.clone(),
+                                        slot: u32::try_from(slot).ok()?,
+                                        func: wl as u8,
+                                    });
+                                }
+                                _ => return None,
                             }
                         }
-                    }
-                }};
-            }
-            macro_rules! branch {
-                ($t:expr) => {{
-                    let t = $t as usize;
-                    if t <= pc {
-                        poll_interrupt!();
-                    }
-                    pc = t;
-                    continue;
-                }};
-            }
-            match code[pc] {
-                KOp::Mov { dst, src } => regs[base + dst as usize] = regs[base + src as usize],
-                KOp::Const { dst, k } => regs[base + dst as usize] = k,
-                KOp::Add { dst, a, b } => {
-                    regs[base + dst as usize] = regs[base + a as usize] + regs[base + b as usize]
-                }
-                KOp::AddK { dst, a, k } => regs[base + dst as usize] = regs[base + a as usize] + k,
-                KOp::Arith { kind, dst, a, b } => {
-                    regs[base + dst as usize] =
-                        number_arith_raw(regs[base + a as usize], regs[base + b as usize], kind)
-                }
-                KOp::ArithK { kind, dst, a, k } => {
-                    regs[base + dst as usize] = number_arith_raw(regs[base + a as usize], k, kind)
-                }
-                KOp::Neg { dst, src } => regs[base + dst as usize] = -regs[base + src as usize],
-                KOp::BitNot { dst, src } => {
-                    regs[base + dst as usize] =
-                        !crate::vm::to_int32(regs[base + src as usize]) as f64
-                }
-                KOp::Br { target } => branch!(target),
-                KOp::BrCmp {
-                    cmp,
-                    a,
-                    b,
-                    if_true,
-                    target,
-                } => {
-                    if knum_cmp(cmp, regs[base + a as usize], regs[base + b as usize]) == if_true {
-                        branch!(target)
-                    }
-                }
-                KOp::BrCmpK {
-                    cmp,
-                    a,
-                    k,
-                    if_true,
-                    target,
-                } => {
-                    if knum_cmp(cmp, regs[base + a as usize], k) == if_true {
-                        branch!(target)
-                    }
-                }
-                KOp::BrFalsy { src, target } => {
-                    if !knum_truthy(regs[base + src as usize]) {
-                        branch!(target)
-                    }
-                }
-                KOp::BrTruthy { src, target } => {
-                    if knum_truthy(regs[base + src as usize]) {
-                        branch!(target)
-                    }
-                }
-                KOp::CmpSet { cmp, dst, a, b } => {
-                    regs[base + dst as usize] =
-                        if knum_cmp(cmp, regs[base + a as usize], regs[base + b as usize]) {
-                            1.0
-                        } else {
-                            0.0
+                        crate::bytecode::SelfRefKind::Upvalue(u) => {
+                            let cell = f.upvalues.get(*u as usize)?;
+                            let ok = matches!(
+                                &*cell.borrow(),
+                                Value::Object(o) if matches!(
+                                    &o.borrow().internal,
+                                    Internal::Function(FunctionInner::Bytecode(bf2))
+                                        if Rc::ptr_eq(bf2, &f)
+                                )
+                            );
+                            if !ok {
+                                return None;
+                            }
+                            upval_self_checks.push((wl as u8, *u));
                         }
-                }
-                KOp::BoolNot { dst, src } => {
-                    regs[base + dst as usize] = if knum_truthy(regs[base + src as usize]) {
-                        0.0
-                    } else {
-                        1.0
                     }
                 }
-                KOp::Math1 { kind, dst, src } => {
-                    regs[base + dst as usize] = kmath1(kind, regs[base + src as usize])
+            }
+            if !k.math_used.is_empty() {
+                if !self.kernel_math_ok(&k.math_used) {
+                    return None;
                 }
-                KOp::Math2 { kind, dst, a, b } => {
-                    regs[base + dst as usize] =
-                        kmath2(kind, regs[base + a as usize], regs[base + b as usize])
+                math_members.push(wl as u8);
+            }
+            // Resolve this member's mutual-recursion partners.
+            let mut cmap: Vec<u8> = vec![wl as u8];
+            if let Some(rec) = k.rec.as_deref() {
+                for name in rec.globals.iter() {
+                    let (bf2, slot, key) = {
+                        let g = self.realm.global.borrow();
+                        match g.own_get_full(&PropertyKey::str(name)) {
+                            Some((
+                                slot,
+                                key,
+                                Property {
+                                    kind:
+                                        PropertyKind::Data {
+                                            value: Value::Object(o),
+                                            ..
+                                        },
+                                    ..
+                                },
+                            )) => match &o.borrow().internal {
+                                Internal::Function(FunctionInner::Bytecode(bf2))
+                                    if !bf2.is_class_ctor
+                                        && !bf2.proto.kind.is_generator()
+                                        && !bf2.proto.kind.is_async() =>
+                                {
+                                    (bf2.clone(), slot, key.clone())
+                                }
+                                _ => return None,
+                            },
+                            _ => return None,
+                        }
+                    };
+                    bf2.proto.fn_kernel.as_ref()?;
+                    let idx = match funcs.iter().position(|x| Rc::ptr_eq(x, &bf2)) {
+                        Some(i) => i,
+                        None => {
+                            funcs.push(bf2);
+                            funcs.len() - 1
+                        }
+                    };
+                    global_checks.push(RecGlobalCheck {
+                        key,
+                        slot: u32::try_from(slot).ok()?,
+                        func: idx as u8,
+                    });
+                    cmap.push(u8::try_from(idx).ok()?);
                 }
-                KOp::Mov2 { d1, s1, d2, s2 } => {
-                    regs[base + d1 as usize] = regs[base + s1 as usize];
-                    regs[base + d2 as usize] = regs[base + s2 as usize];
-                    pc += 1;
+            }
+            callee_map.push(cmap);
+            wl += 1;
+        }
+
+        // --- Per-member tables: window size, arg slots, upvalue snapshots
+        // (a member's upvalue cells are activation constants: nothing inside
+        // a kernel can write a cell). Then cross-check every call site's
+        // argc against its RESOLVED callee's consumption.
+        let n = funcs.len();
+        let mut arg_slots: Vec<Vec<(usize, usize)>> = Vec::with_capacity(n);
+        let mut uv_snaps: Vec<Vec<(usize, u32, f64)>> = Vec::with_capacity(n);
+        for f in funcs.iter() {
+            let k = f.proto.fn_kernel.as_ref()?;
+            let mut aslots = Vec::new();
+            let mut uvs = Vec::new();
+            for (r, slot) in k.locals.iter().enumerate() {
+                match slot {
+                    crate::bytecode::KSlot::Arg(a) => aslots.push((r, *a as usize)),
+                    crate::bytecode::KSlot::Upvalue(u) => {
+                        match &*f.upvalues.get(*u as usize)?.borrow() {
+                            Value::Number(v) => uvs.push((r, *u, *v)),
+                            _ => return None,
+                        }
+                    }
+                    crate::bytecode::KSlot::Local(_) => {}
                 }
-                KOp::ArithAdd {
-                    kind,
-                    dst,
-                    a,
-                    b,
-                    d2,
-                    a2,
-                    b2,
-                } => {
-                    regs[base + dst as usize] =
-                        number_arith_raw(regs[base + a as usize], regs[base + b as usize], kind);
-                    regs[base + d2 as usize] = regs[base + a2 as usize] + regs[base + b2 as usize];
-                    pc += 1;
-                }
-                KOp::AddKBr { dst, a, k, target } => {
-                    regs[base + dst as usize] = regs[base + a as usize] + k;
-                    branch!(target)
-                }
-                KOp::SelfCall {
-                    dst,
-                    base: abase,
-                    argc: _,
-                } => {
-                    // Mirror the generic per-call depth guard: an overflow
-                    // abandons the pure activation; the generic rerun then
-                    // recurses to the same depth and raises the RangeError.
-                    if self.call_depth + calls.len() + 1 > self.max_call_depth {
-                        self.kernel_regs = regs;
+            }
+            arg_slots.push(aslots);
+            uv_snaps.push(uvs);
+        }
+        for (j, f) in funcs.iter().enumerate() {
+            let k = f.proto.fn_kernel.as_ref()?;
+            for op in k.code.iter() {
+                if let KOp::SelfCall { argc, callee, .. } = op {
+                    let t = *callee_map[j].get(*callee as usize)? as usize;
+                    let tk = funcs[t].proto.fn_kernel.as_ref()?;
+                    if u32::from(*argc) < tk.args_used {
                         return None;
                     }
-                    poll_interrupt!();
-                    let new_base = base + n_regs;
-                    if regs.len() < new_base + n_regs {
-                        regs.resize(new_base + n_regs, 0.0);
-                    }
-                    // Populate the callee window: arguments from the call
-                    // site's contiguous registers, upvalues copied through
-                    // (same closure — the guard proved it), locals are
-                    // scratch (store-before-read proven at translation).
-                    for (r, slot) in k.locals.iter().enumerate() {
-                        match slot {
-                            crate::bytecode::KSlot::Arg(a) => {
-                                // Translation guarantees argc covers every
-                                // consumed argument index.
-                                regs[new_base + r] = regs[base + abase as usize + *a as usize];
-                            }
-                            crate::bytecode::KSlot::Upvalue(_) => {
-                                regs[new_base + r] = regs[base + r];
-                            }
-                            crate::bytecode::KSlot::Local(_) => {}
-                        }
-                    }
-                    calls.push((pc as u16 + 1, dst, base));
-                    base = new_base;
-                    pc = 0;
-                    continue;
                 }
-                KOp::Ret { src, boolean } => {
-                    // Recursive kernels are Number-only (enforced at
-                    // translation) — a boolean would land in a caller
-                    // register statically typed Num.
-                    debug_assert!(!boolean);
-                    let v = regs[base + src as usize];
-                    match calls.pop() {
-                        Some((ret_pc, dst, prev)) => {
-                            base = prev;
-                            regs[base + dst as usize] = v;
-                            pc = ret_pc as usize;
-                            continue;
-                        }
-                        None => break Value::Number(v),
-                    }
-                }
-                KOp::ArrayPush { .. }
-                | KOp::ArrayPop { .. }
-                | KOp::LoadElem { .. }
-                | KOp::StoreElem { .. }
-                | KOp::LoadLen { .. }
-                | KOp::LoadProp { .. }
-                | KOp::StoreProp { .. }
-                | KOp::CallKernel { .. }
-                | KOp::Exit { .. } => unreachable!("bail op in a function kernel"),
             }
-            pc += 1;
-        };
-        self.kernel_regs = regs;
-        Some(Ok(ret))
+        }
+        Some(RecFamily {
+            funcs,
+            callee_map,
+            arg_slots,
+            uv_snaps,
+            global_checks,
+            upval_self_checks,
+            math_members,
+            ret_bool,
+        })
     }
 
     /// Prepare a callback for REPEATED calls from a native higher-order
@@ -1470,7 +2460,10 @@ impl Vm {
         }
         {
             let k = bf.proto.fn_kernel.as_ref()?;
-            if k.self_global.is_some() {
+            // No upvalue writes: the prepared paths snapshot upvalues per
+            // call (or once per sort) and never flush, so a cell-writing
+            // callback falls back to the generic `Vm::call` per element.
+            if k.rec.is_some() || !k.uv_writes.is_empty() {
                 return None;
             }
         }
@@ -1480,9 +2473,8 @@ impl Vm {
         if self.call_depth + 1 > self.max_call_depth {
             return None;
         }
-        let n_regs = bf.proto.fn_kernel.as_ref().expect("checked").n_regs as usize;
         Some(PreparedKernel {
-            regs: vec![0.0; n_regs],
+            regs: [0.0; KWIN],
             poll: 0,
             interrupt: self.interrupt.clone(),
             bf,
@@ -1515,7 +2507,7 @@ impl Vm {
         for (r, slot) in k.locals.iter().enumerate() {
             match slot {
                 crate::bytecode::KSlot::Arg(a) => match args.get(*a as usize) {
-                    Some(Value::Number(n)) => p.regs[r] = *n,
+                    Some(Value::Number(n)) => p.regs[r & KWIN_MASK] = *n,
                     _ => return None,
                 },
                 // Register scratch: translation proved a store dominates
@@ -1523,7 +2515,7 @@ impl Vm {
                 // never observable.
                 crate::bytecode::KSlot::Local(_) => {}
                 crate::bytecode::KSlot::Upvalue(u) => match &*p.bf.upvalues[*u as usize].borrow() {
-                    Value::Number(n) => p.regs[r] = *n,
+                    Value::Number(n) => p.regs[r & KWIN_MASK] = *n,
                     _ => return None,
                 },
             }
@@ -1542,13 +2534,16 @@ impl Vm {
             }
         }
         match exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll) {
-            Some(v) => Some(Ok(v)),
-            None => {
+            FnKernelOut::Ret(v) => Some(Ok(v)),
+            FnKernelOut::Interrupted => {
                 // Same latch-and-unwind as an interrupted kernel back-edge:
                 // zero the budget so a JS catch cannot resume execution.
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
             }
+            // Tier bug; the kernel is pure, so declining re-runs the callback
+            // generically with correct semantics.
+            FnKernelOut::BadOp => None,
         }
     }
 
@@ -1583,7 +2578,7 @@ impl Vm {
                 crate::bytecode::KSlot::Arg(_) => return None,
                 crate::bytecode::KSlot::Local(_) => {}
                 crate::bytecode::KSlot::Upvalue(u) => match &*p.bf.upvalues[*u as usize].borrow() {
-                    Value::Number(n) => p.regs[r] = *n,
+                    Value::Number(n) => p.regs[r & KWIN_MASK] = *n,
                     _ => return None,
                 },
             }
@@ -1605,10 +2600,10 @@ impl Vm {
         y: f64,
     ) -> Result<i32, Value> {
         if let Some(r) = regs_ab.0 {
-            p.regs[r] = x;
+            p.regs[r & KWIN_MASK] = x;
         }
         if let Some(r) = regs_ab.1 {
-            p.regs[r] = y;
+            p.regs[r & KWIN_MASK] = y;
         }
         p.poll = p.poll.wrapping_add(1);
         let interrupted = if p.poll & 0xFF == 0 {
@@ -1622,21 +2617,30 @@ impl Vm {
         };
         let k = p.bf.proto.fn_kernel.as_ref().expect("prepared");
         let ret = if interrupted {
-            None
+            FnKernelOut::Interrupted
         } else {
             exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll)
         };
         match ret {
-            Some(Value::Number(n)) => Ok(if n < 0.0 {
+            FnKernelOut::Ret(Value::Number(n)) => Ok(if n < 0.0 {
                 -1
             } else if n > 0.0 {
                 1
             } else {
                 0
             }),
-            Some(Value::Bool(b)) => Ok(if b { 1 } else { 0 }),
-            Some(_) => unreachable!("fn kernels return Number or Bool"),
-            None => {
+            FnKernelOut::Ret(Value::Bool(b)) => Ok(if b { 1 } else { 0 }),
+            // Tier bugs (a non-Number/Bool return, or an op fn-mode
+            // translation never emits). The primed sort loop has no generic
+            // per-call fallback, so surface a catchable internal error rather
+            // than aborting the process.
+            FnKernelOut::Ret(_) => {
+                Err(self.throw_internal("function kernel returned a non-Number, non-Bool value"))
+            }
+            FnKernelOut::BadOp => {
+                Err(self.throw_internal("unsupported op in a primed comparator kernel"))
+            }
+            FnKernelOut::Interrupted => {
                 self.op_budget = Some(0);
                 Err(self.throw_range("execution interrupted"))
             }
@@ -1790,7 +2794,7 @@ impl Vm {
         {
             let mut b = o.borrow_mut();
             for (i, v) in frame.args.iter().enumerate() {
-                b.props.insert(
+                b.own_insert(
                     PropertyKey::from_index(i as u32),
                     Property {
                         kind: PropertyKind::Data {
@@ -1802,7 +2806,7 @@ impl Vm {
                     },
                 );
             }
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -1819,12 +2823,11 @@ impl Vm {
             .realm
             .array_proto
             .borrow()
-            .props
-            .get(&PropertyKey::str("values"))
+            .own_get(&PropertyKey::str("values"))
             .and_then(|p| p.value().cloned())
             .unwrap_or(Value::Undefined);
         let iter_key = PropertyKey::Sym(self.realm.symbol_iterator.clone());
-        o.borrow_mut().props.insert(
+        o.borrow_mut().own_insert(
             iter_key,
             Property {
                 kind: PropertyKind::Data {
@@ -1866,8 +2869,7 @@ impl Vm {
             }
         };
         o.borrow_mut()
-            .props
-            .insert(PropertyKey::str("callee"), callee);
+            .own_insert(PropertyKey::str("callee"), callee);
         Value::Object(o)
     }
 
@@ -1946,6 +2948,7 @@ impl Vm {
         frame.pending_completion = None;
         frame.pending_throw = None;
         frame.pending_return = None;
+        frame.unwind_pos = None;
         frame.args.clear();
         frame.func_obj = None;
         frame.dispose_scopes.clear();
@@ -2032,6 +3035,7 @@ impl Vm {
                 handlers: Vec::new(),
                 pending_completion: None,
                 pending_throw: None,
+                unwind_pos: None,
                 pending_return: None,
                 args: Vec::new(),
                 func_obj: None,
@@ -2264,7 +3268,47 @@ impl Vm {
     // The interpreter loop
     // =====================================================================
 
-    pub fn run_frame(&mut self, mut frame: Box<Frame>) -> Flow {
+    /// Run a frame to completion (or suspension): the register tier when the
+    /// proto carries a register program and per-op accounting is off, the
+    /// stack interpreter otherwise. Every execution entry point (calls,
+    /// [[Construct]], accessors, module/script evaluation, generator and
+    /// async resumption) funnels through here, so the two tiers can never be
+    /// entered inconsistently. Resumed generator/async frames always take the
+    /// stack path by construction: their protos contain suspension ops, which
+    /// decline register translation.
+    pub fn run_frame(&mut self, frame: Box<Frame>) -> Flow {
+        let proto = frame.func.proto.clone();
+        let flow = if let Some(reg) = &proto.reg {
+            // Budgeted runs (the production op budget, the conformance
+            // runner, untrusted eval) stay on the register tier too:
+            // `RegProto::costs` charges each register op its EXACT
+            // stack-op units, so the budget drains — and exhausts —
+            // identically on both tiers (gated by the budget-sweep
+            // differential in tests/reg.rs). The kernel tiers still decline
+            // under a budget. The debug-assert documents the resumed-frame
+            // invariant.
+            debug_assert!(
+                frame.ip == 0 && frame.pending_throw.is_none() && frame.pending_return.is_none()
+            );
+            let reg = reg.clone();
+            self.run_reg_frame(frame, &reg)
+        } else {
+            self.run_stack_frame(frame)
+        };
+        // A throw unwinding out of this activation records it on the error's
+        // `.stack`, so an uncaught error carries a real stack trace. Success
+        // pays only the `proto` Rc clone above. The tier stashed the throw's
+        // source position in `throw_pos` on its way out; taking it here keeps
+        // it from leaking into an outer frame's record (an outer frame that
+        // misses its own set degrades to the definition-site fallback).
+        if let Flow::Throw(e) = &flow {
+            let pos = self.throw_pos.take();
+            self.record_unwind_frame(e, &proto, pos);
+        }
+        flow
+    }
+
+    fn run_stack_frame(&mut self, mut frame: Box<Frame>) -> Flow {
         // Recycle this frame whole into the frame pool, then return the
         // (already-owned) outcome. Used only on synchronous Return/Throw exits;
         // the Suspend paths move the whole frame (buffers included) into the
@@ -2291,16 +3335,25 @@ impl Vm {
         // off the hot path. A resolved `Jump` just positions `frame.ip` and falls
         // into the loop. (Phase 1, docs/interpreter-optimization.md.)
         if let Some(e) = frame.pending_throw.take() {
+            // An injected rejection is delivered "at" the suspension point:
+            // `frame.ip` already points past the Await/Yield op, so the op
+            // before it is where this frame observes the throw.
+            let resume_at = frame.ip.saturating_sub(1);
+            Self::park_unwind_pos(&mut frame, proto.pos_at(resume_at));
             match self.do_completion(&mut frame, Completion::Throw(e)) {
                 Ok(Ctl::Jump(t)) => frame.ip = t,
                 Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
                 Ok(_) => unreachable!("throw completion yields jump or return"),
-                Err(e) => done!(Flow::Throw(e)),
+                Err(e) => {
+                    self.throw_pos = frame.unwind_pos.take().or_else(|| proto.pos_at(resume_at));
+                    done!(Flow::Throw(e))
+                }
             }
         } else if let Some(v) = frame.pending_return.take() {
             // Injected `.return(v)` on a suspended generator: dispatch a Return
             // completion so enclosing `finally` blocks run before the frame ends
             // (a `yield` in a finally re-suspends as a normal yield in the loop).
+            let resume_at = frame.ip.saturating_sub(1);
             match self.do_completion(&mut frame, Completion::Return(v)) {
                 Ok(Ctl::Jump(t)) => frame.ip = t,
                 Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
@@ -2309,7 +3362,10 @@ impl Vm {
                     Ok(Ctl::Jump(t)) => frame.ip = t,
                     Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
                     Ok(_) => unreachable!(),
-                    Err(e) => done!(Flow::Throw(e)),
+                    Err(e) => {
+                        self.throw_pos = proto.pos_at(resume_at);
+                        done!(Flow::Throw(e))
+                    }
                 },
             }
         }
@@ -2328,6 +3384,7 @@ impl Vm {
                 if let Some(budget) = self.op_budget.as_mut() {
                     if *budget == 0 {
                         // Uncatchable so execution is guaranteed to terminate.
+                        self.throw_pos = proto.pos_at(frame.ip);
                         done!(Flow::Throw(self.throw_range("execution budget exceeded")));
                     }
                     *budget -= 1;
@@ -2345,6 +3402,7 @@ impl Vm {
                         if let Some(flag) = &self.interrupt {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                                 self.op_budget = Some(0);
+                                self.throw_pos = proto.pos_at(frame.ip);
                                 done!(Flow::Throw(self.throw_range("execution interrupted")));
                             }
                         }
@@ -2406,15 +3464,32 @@ impl Vm {
                         kind: SuspendKind::GeneratorStart,
                     })
                 }
-                Err(e) => match self.do_completion(&mut frame, Completion::Throw(e)) {
-                    Ok(Ctl::Jump(t)) => {
-                        frame.ip = t;
-                        continue;
+                Err(e) => {
+                    // Remember where THIS throw originated before dispatching
+                    // it through the handler stack: a `finally` (e.g. the
+                    // iterator-close protocol of every `for-of`) parks the
+                    // completion and re-raises it from `EndFinally`, and the
+                    // frame must stay attributed to the original site. A
+                    // re-raise arrives here with the position already parked.
+                    // (A cold helper: this loop's native frame size bounds JS
+                    // recursion depth.)
+                    Self::park_unwind_pos(&mut frame, proto.pos_at(ip));
+                    match self.do_completion(&mut frame, Completion::Throw(e)) {
+                        Ok(Ctl::Jump(t)) => {
+                            frame.ip = t;
+                            continue;
+                        }
+                        Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
+                        Ok(_) => unreachable!("throw completion yields jump or return"),
+                        Err(e) => {
+                            // Unhandled: attribute the frame to the original
+                            // throw site (parked above, possibly several
+                            // finalizers ago), falling back to the op at `ip`.
+                            self.throw_pos = frame.unwind_pos.take().or_else(|| proto.pos_at(ip));
+                            done!(Flow::Throw(e))
+                        }
                     }
-                    Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
-                    Ok(_) => unreachable!("throw completion yields jump or return"),
-                    Err(e) => done!(Flow::Throw(e)),
-                },
+                }
             }
         }
     }
@@ -2428,6 +3503,7 @@ impl Vm {
     ///   finalizer (whose `EndFinally` resumes this dispatch);
     /// - once no more crossing handlers remain, the action is performed
     ///   (`Ctl::Return` / re-`throw` as `Err` / `Ctl::Jump` to the loop target).
+    ///
     /// PerformEval (spec 19.2.1.1) for a direct call to %eval%: compile the
     /// source against the call site's scope snapshot, run the spec's
     /// EvalDeclarationInstantiation checks (the sloppy `var arguments`
@@ -2481,7 +3557,7 @@ impl Vm {
                     let key = PropertyKey::str(name);
                     let (present, extensible) = {
                         let b = g.borrow();
-                        (b.props.contains_key(&key), b.extensible)
+                        (b.own_contains_key(&key), b.extensible)
                     };
                     if !present {
                         if !extensible {
@@ -2492,8 +3568,7 @@ impl Vm {
                         // global var is deletable (configurable), unlike a
                         // script-level one.
                         g.borrow_mut()
-                            .props
-                            .insert(key, Property::data(Value::Undefined));
+                            .own_insert(key, Property::data(Value::Undefined));
                     }
                 } else {
                     // Function-scope eval var: lives on the caller frame's
@@ -2509,10 +3584,10 @@ impl Vm {
                         }
                     };
                     let key = PropertyKey::str(name);
-                    if !ev.borrow().props.contains_key(&key) {
+                    if !ev.borrow().own_contains_key(&key) {
                         let mut p = Property::data(Value::Undefined);
                         p.enumerable = true;
-                        ev.borrow_mut().props.insert(key, p);
+                        ev.borrow_mut().own_insert(key, p);
                     }
                 }
             }
@@ -2560,6 +3635,18 @@ impl Vm {
         }
     }
 
+    /// Park the source position of a freshly-raised throw on the frame (see
+    /// `Frame::unwind_pos`). Cold and never inlined: it is called from the
+    /// interpreter hot loops, whose native frame size bounds JS recursion
+    /// depth.
+    #[cold]
+    #[inline(never)]
+    fn park_unwind_pos(frame: &mut Frame, pos: Option<u32>) {
+        if frame.unwind_pos.is_none() {
+            frame.unwind_pos = pos;
+        }
+    }
+
     fn do_completion(&mut self, frame: &mut Frame, comp: Completion) -> Result<Ctl, Value> {
         let boundary = match &comp {
             Completion::Jump { boundary, .. } => *boundary as usize,
@@ -2580,6 +3667,10 @@ impl Vm {
                 if let Some(catch_ip) = h.catch_ip {
                     if !(skip_delegation && h.delegation) {
                         frame.stack.push(err.clone());
+                        // The throw is handled: drop the parked unwind
+                        // position so a later, unrelated throw is not
+                        // attributed to this one's origin.
+                        frame.unwind_pos = None;
                         return Ok(Ctl::Jump(catch_ip as usize));
                     }
                 }
@@ -2634,6 +3725,920 @@ impl Vm {
         })
     }
 
+    // =====================================================================
+    // Shared op bodies (stack interpreter + register tier)
+    //
+    // These are the op implementations with nontrivial inline logic — the
+    // key-verified inline caches and the dense-element fast paths. Both
+    // `step`/`step_cold` and `run_reg_frame` call them, so each op keeps
+    // exactly ONE implementation and the two tiers cannot drift.
+    // =====================================================================
+
+    /// `Op::GetProp` / `ROp::GetProp` body: IC-accelerated named property
+    /// read. See `FuncProto::ic` for the cache discipline (a stale hint is a
+    /// miss, never a wrong answer).
+    #[inline]
+    pub(crate) fn ic_get_prop(
+        &mut self,
+        obj: Value,
+        name: JsString,
+        ic: Option<&crate::bytecode::IcEntry>,
+    ) -> Result<Value, Value> {
+        // Inline cache (key-verified hints; see `FuncProto::ic`).
+        // Two levels:
+        //  - `holder == None`: the receiver's OWN data property at
+        //    `slot` (ordinary objects).
+        //  - `holder == Some(p)`: a data property at `slot` on `p`,
+        //    verified to still be the receiver's DIRECT prototype and
+        //    not shadowed by an own property — the method-lookup
+        //    pattern (`arr.push`, class instances calling prototype
+        //    methods). Array receivers exclude keys with exotic own
+        //    behavior (`length`, indices). Deeper chains, accessors,
+        //    proxies, and every other exotic fall to the unchanged
+        //    slow path.
+        if let Value::Object(o) = &obj {
+            if let Some(ic) = ic {
+                let b = o.borrow();
+                let (is_ord, is_arr) = (
+                    matches!(b.internal, Internal::Ordinary),
+                    matches!(b.internal, Internal::Array(_)),
+                );
+                // Array exotics: `length` and index keys never take
+                // the IC (they don't live in the props map). But `length`
+                // on an array with no own props — the loop bound of every
+                // non-kernelized `for (i = 0; i < arr.length; i++)` — is
+                // answered directly from the dense Vec, mirroring
+                // `get_from_object`'s array arm (a reified `length` can
+                // only live in `props`, which is empty here).
+                if is_arr && b.own_is_empty() && name.as_str() == "length" {
+                    if let Internal::Array(a) = &b.internal {
+                        return Ok(Value::Number(a.len() as f64));
+                    }
+                }
+                let plain_key = !is_arr
+                    || (name.as_str() != "length"
+                        && crate::value::canonical_index(name.as_str()).is_none());
+                if (is_ord || is_arr) && plain_key {
+                    // Own-property hit: never touches the holder cell.
+                    if is_ord {
+                        // Shape-verified hit (docs §3.3): one `Rc::ptr_eq`
+                        // replaces the key compare + probe — shape identity
+                        // pins the key at every slot; only the property KIND
+                        // can differ (attributes live per-object), checked
+                        // as before. Dictionary-mode receivers keep the
+                        // key-verified slot hint unchanged.
+                        let shape_ok = match (b.own_shape(), &*ic.own_shape.borrow()) {
+                            (Some(s), Some(c)) => Rc::ptr_eq(c, s),
+                            _ => false,
+                        };
+                        if shape_ok {
+                            if let Some(prop) = b.own_prop_at(ic.own_slot.get() as usize) {
+                                if let PropertyKind::Data { value, .. } = &prop.kind {
+                                    let v = value.clone();
+                                    return Ok(v);
+                                }
+                            }
+                        } else if b.own_shape().is_none() {
+                            if let Some((PropertyKey::Str(k), prop)) =
+                                b.own_get_index(ic.own_slot.get() as usize)
+                            {
+                                if let PropertyKind::Data { value, .. } = &prop.kind {
+                                    if k == &name {
+                                        let v = value.clone();
+                                        return Ok(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Proto hit: valid only when the receiver has no
+                    // own props (nothing can shadow) and its CURRENT
+                    // direct proto is the cached holder.
+                    if b.own_is_empty() {
+                        let holder = ic.holder.borrow();
+                        if let Some(h) = &*holder {
+                            if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
+                                let hb = h.borrow();
+                                // Holder identity is already verified; a
+                                // shape-verified slot replaces the key
+                                // compare when the holder is shaped.
+                                let shape_ok = match (hb.own_shape(), &*ic.proto_shape.borrow()) {
+                                    (Some(s), Some(c)) => Rc::ptr_eq(c, s),
+                                    _ => false,
+                                };
+                                if shape_ok {
+                                    if let Some(prop) = hb.own_prop_at(ic.proto_slot.get() as usize)
+                                    {
+                                        if let PropertyKind::Data { value, .. } = &prop.kind {
+                                            let v = value.clone();
+                                            return Ok(v);
+                                        }
+                                    }
+                                } else if hb.own_shape().is_none() {
+                                    if let Some((PropertyKey::Str(k), prop)) =
+                                        hb.own_get_index(ic.proto_slot.get() as usize)
+                                    {
+                                        if let PropertyKind::Data { value, .. } = &prop.kind {
+                                            if k == &name {
+                                                let v = value.clone();
+                                                return Ok(v);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Refill: own data property first (ordinary only),
+                    // then a one-level proto data property when no own
+                    // props can shadow.
+                    let key = PropertyKey::Str(name.clone());
+                    if is_ord {
+                        if let Some((idx, _, prop)) = b.own_get_full(&key) {
+                            if let PropertyKind::Data { value, .. } = &prop.kind {
+                                ic.own_slot.set(idx as u32);
+                                let v = value.clone();
+                                *ic.own_shape.borrow_mut() = b.own_shape().cloned();
+                                return Ok(v);
+                            }
+                        }
+                    }
+                    if b.own_is_empty() {
+                        if let Some(p) = &b.proto {
+                            let pb = p.borrow();
+                            if matches!(pb.internal, Internal::Ordinary)
+                                || matches!(pb.internal, Internal::Array(_))
+                            {
+                                if let Some((idx, _, prop)) = pb.own_get_full(&key) {
+                                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                                        ic.proto_slot.set(idx as u32);
+                                        let v = value.clone();
+                                        let holder_obj = p.clone();
+                                        *ic.proto_shape.borrow_mut() = pb.own_shape().cloned();
+                                        drop(pb);
+                                        *ic.holder.borrow_mut() = Some(holder_obj);
+                                        return Ok(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.get_prop(&obj, &PropertyKey::Str(name))
+    }
+
+    /// `Op::SetProp` / `ROp::SetProp` body: IC-accelerated named property
+    /// write. Returns the value (the assignment expression's result).
+    #[inline]
+    pub(crate) fn ic_set_prop(
+        &mut self,
+        obj: Value,
+        name: JsString,
+        value: Value,
+        strict: bool,
+        ic: Option<&crate::bytecode::IcEntry>,
+    ) -> Result<Value, Value> {
+        // Inline cache (key-verified slot hint; see `FuncProto::ic`).
+        // Fast path only when the receiver is an ordinary object whose
+        // OWN property at the hinted slot is a WRITABLE data property —
+        // per OrdinarySetWithOwnDescriptor that assignment updates the
+        // value in place (attributes and slot order preserved, no
+        // prototype setter can intervene). Everything else (missing own
+        // key → proto-chain setters/read-only checks, accessors,
+        // non-writable → strict TypeError, exotics) takes the
+        // unchanged put_value path, which also refills the hint.
+        if let Value::Object(o) = &obj {
+            if let Some(ic) = ic {
+                let mut b = o.borrow_mut();
+                if matches!(b.internal, Internal::Ordinary) {
+                    // Shape-verified write (docs §3.3): pointer compare, then
+                    // the same writable-data-kind check as before.
+                    let shape_ok = match (b.own_shape(), &*ic.own_shape.borrow()) {
+                        (Some(s), Some(c)) => Rc::ptr_eq(c, s),
+                        _ => false,
+                    };
+                    if shape_ok {
+                        if let Some(prop) = b.own_prop_at_mut(ic.own_slot.get() as usize) {
+                            if let PropertyKind::Data {
+                                value: slot,
+                                writable: true,
+                            } = &mut prop.kind
+                            {
+                                *slot = value.clone();
+                                return Ok(value);
+                            }
+                        }
+                    } else if b.own_shape().is_none() {
+                        if let Some((PropertyKey::Str(k), prop)) =
+                            b.own_get_index_mut(ic.own_slot.get() as usize)
+                        {
+                            if k == &name {
+                                if let PropertyKind::Data {
+                                    value: slot,
+                                    writable: true,
+                                } = &mut prop.kind
+                                {
+                                    *slot = value.clone();
+                                    return Ok(value);
+                                }
+                            }
+                        }
+                    }
+                    let key = PropertyKey::Str(name.clone());
+                    let new_shape = b.own_shape().cloned();
+                    if let Some((idx, _, prop)) = b.own_get_full_mut(&key) {
+                        if let PropertyKind::Data {
+                            value: slot,
+                            writable: true,
+                        } = &mut prop.kind
+                        {
+                            ic.own_slot.set(idx as u32);
+                            *ic.own_shape.borrow_mut() = new_shape;
+                            *slot = value.clone();
+                            return Ok(value);
+                        }
+                    }
+                }
+            }
+        }
+        self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
+        Ok(value)
+    }
+
+    /// `Op::GetPropDynamic` / `ROp::GetElem` body: computed-key read with the
+    /// dense-array integer fast path.
+    #[inline]
+    pub(crate) fn elem_get(&mut self, obj: Value, key_v: Value) -> Result<Value, Value> {
+        // Integer fast path: `a[i]` on a dense array with an integral
+        // Number key reads the element directly — skipping
+        // ToPropertyKey's Number→String conversion (a float-format +
+        // heap allocation per access!), the reparse back to an index,
+        // and the property-map machinery. Only when no reified props
+        // entry can shadow the dense element (`props.is_empty()`) and
+        // the slot is a real element (in bounds, not a hole);
+        // everything else takes the unchanged spec path.
+        if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+            if let Some(iu) = dense_index(*n) {
+                let b = o.borrow();
+                if let Internal::Array(arr) = &b.internal {
+                    if b.own_is_empty() {
+                        if let Some(v) = arr.get(iu) {
+                            if !matches!(v, Value::Hole) {
+                                let v = v.clone();
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // String fast path: `s[i]` with an integral in-bounds Number key
+        // yields the code unit directly (O(1) on ASCII), skipping the
+        // Number→String key conversion and the digit re-parse inside
+        // `string_own_prop`. Out-of-bounds falls through — the spec path
+        // climbs to String.prototype, which is observable.
+        if let (Value::String(s), Value::Number(n)) = (&obj, &key_v) {
+            if let Some(iu) = dense_index(*n) {
+                if let Some(u) = s.code_unit_at(iu) {
+                    return Ok(Value::String(JsString::from_code_units(&[u])));
+                }
+            }
+        }
+        // GetValue: RequireObjectCoercible(base) (via ToObject) throws
+        // BEFORE ToPropertyKey coerces the key expression's value.
+        self.require_object_coercible(&obj, "read properties of")?;
+        let key = self.to_property_key(&key_v)?;
+        self.get_prop(&obj, &key)
+    }
+
+    /// `Op::SetPropDynamic` / `ROp::SetElem` body: computed-key write with
+    /// the dense-array fast paths (in-place overwrite, hole fill, append).
+    /// Returns the value (the assignment expression's result).
+    #[inline]
+    pub(crate) fn elem_set(
+        &mut self,
+        obj: Value,
+        key_v: Value,
+        value: Value,
+        strict: bool,
+    ) -> Result<Value, Value> {
+        // Integer fast path mirroring `elem_get`: overwrite an
+        // EXISTING dense element in place (an in-bounds non-hole dense
+        // slot is a plain writable data property per the array exotic
+        // [[Set]] — no setter, no length change, no extensibility
+        // interaction), fill an in-bounds HOLE, or append at exactly
+        // `length`. Filling and appending CREATE a property (the own
+        // property is absent), so they additionally require the array
+        // to be extensible (a sealed/prevented receiver must reject
+        // through the generic path), the dense-storage bound (the
+        // generic path owns that RangeError), and a prototype chain
+        // with no reified entry at the index — OrdinarySet consults
+        // the chain for an absent own property, so a proto accessor /
+        // non-writable index must intercept via the generic path
+        // (`protos_allow_index_create`). Gaps past the end, shadowed
+        // elements, and non-arrays take the spec path.
+        if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+            if let Some(i) = dense_index(*n) {
+                let mut creates = None;
+                {
+                    let mut b = o.borrow_mut();
+                    if b.own_is_empty() {
+                        let extensible = b.extensible;
+                        if let Internal::Array(arr) = &mut b.internal {
+                            match arr.get_mut(i) {
+                                Some(slot) if !matches!(slot, Value::Hole) => {
+                                    *slot = value.clone();
+                                    return Ok(value);
+                                }
+                                Some(_) => {
+                                    if extensible {
+                                        creates = Some(b.proto.clone());
+                                    }
+                                }
+                                None => {
+                                    if extensible
+                                        && i == arr.len()
+                                        && i < crate::value::MAX_DENSE_ARRAY
+                                    {
+                                        creates = Some(b.proto.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(proto) = creates {
+                    if crate::value::protos_allow_index_create(proto, i as u32, 1) {
+                        // No user code ran since the conditions were
+                        // checked (same native frame), so they still
+                        // hold.
+                        let mut b = o.borrow_mut();
+                        if let Internal::Array(arr) = &mut b.internal {
+                            match arr.get_mut(i) {
+                                Some(slot) => *slot = value.clone(),
+                                None => arr.push(value.clone()),
+                            }
+                            return Ok(value);
+                        }
+                    }
+                }
+            }
+        }
+        self.require_object_coercible(&obj, "set properties of")?;
+        let key = self.to_property_key(&key_v)?;
+        self.put_value(&obj, &key, value.clone(), strict)?;
+        Ok(value)
+    }
+
+    /// `Op::LoadGlobal` / `ROp::LoadGlobal` body: IC-accelerated global read.
+    #[inline]
+    pub(crate) fn ic_load_global(
+        &mut self,
+        name: JsString,
+        ic: Option<&crate::bytecode::IcEntry>,
+    ) -> Result<Value, Value> {
+        let g = self.realm.global.clone();
+        // Inline cache (key-verified slot hint; see `FuncProto::ic`):
+        // after the first resolution, a global read — above all a
+        // function resolving its own recursive self-reference — is one
+        // indexed load plus a pointer-equality key check, no hashing.
+        if let Some(ic) = ic {
+            let b = g.borrow();
+            if let Some((PropertyKey::Str(k), prop)) = b.own_get_index(ic.own_slot.get() as usize) {
+                if let PropertyKind::Data { value, .. } = &prop.kind {
+                    if k == &name {
+                        let v = value.clone();
+                        return Ok(v);
+                    }
+                }
+            }
+        }
+        let key = PropertyKey::Str(name.clone());
+        // Fast path: an own data property directly on the global object —
+        // the case for every top-level `function`/`var`/`let` binding.
+        // Resolves in a single hash with no prototype walk, and refills
+        // the inline cache with the slot it finds.
+        let fast = {
+            let b = g.borrow();
+            match b.own_get_full(&key) {
+                Some((
+                    idx,
+                    _,
+                    Property {
+                        kind: PropertyKind::Data { value, .. },
+                        ..
+                    },
+                )) => {
+                    if let Some(ic) = ic {
+                        ic.own_slot.set(idx as u32);
+                    }
+                    Some(value.clone())
+                }
+                _ => None,
+            }
+        };
+        match fast {
+            Some(v) => Ok(v),
+            None => {
+                // Accessor global, or a binding inherited via the global's
+                // prototype chain: fall back to the full [[Get]] (after the
+                // unresolvable-reference check that yields a ReferenceError).
+                if !self.has_own_or_proto(&g, &key) {
+                    return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
+                }
+                self.get_prop(&Value::Object(g), &key)
+            }
+        }
+    }
+
+    /// `Op::StoreGlobal` / `ROp::StoreGlobal` body.
+    #[inline]
+    pub(crate) fn store_global(
+        &mut self,
+        name: JsString,
+        v: Value,
+        strict: bool,
+    ) -> Result<(), Value> {
+        let g = self.realm.global.clone();
+        let key = PropertyKey::Str(name.clone());
+        // A bare assignment to a name bound nowhere is an unresolvable
+        // reference; PutValue on one throws ReferenceError in strict mode
+        // (a global-object property anywhere on the proto chain counts as
+        // resolvable). Sloppy mode creates the global property instead.
+        if strict && !self.has_prop(&Value::Object(g.clone()), &key)? {
+            return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
+        }
+        self.put_value(&Value::Object(g), &key, v, strict)
+    }
+
+    /// `Op::Closure` / `ROp::Closure` body: instantiate the nested function
+    /// template at const index `idx`, capturing cells/upvalues from `frame`
+    /// (plus the active with-scope, private-env, and [[HomeObject]]).
+    pub(crate) fn closure_from_const(&mut self, frame: &Frame, idx: u32) -> Result<Value, Value> {
+        let proto = match &frame.func.proto.consts[idx as usize] {
+            Const::Func(p) => p.clone(),
+            _ => return Err(self.throw_type("internal: bad closure const")),
+        };
+        let upvalues = proto
+            .upvalues
+            .iter()
+            .map(|src| match src {
+                UpvalueSource::ParentCell(idx) => frame.cells[*idx as usize].clone(),
+                UpvalueSource::ParentUpvalue(idx) => frame.func.upvalues[*idx as usize].clone(),
+            })
+            .collect();
+        let inherit_home = proto.kind.is_arrow() || proto.inherit_home;
+        let f = self.make_closure(proto, upvalues);
+        // Capture the active with-scope chain (closures defined inside
+        // `with` resolve free identifiers against it after the block)
+        // and the active private-environment chain (methods and
+        // initializers defined inside class bodies resolve `#x`
+        // against it). Arrows (and synthetic in-class closures) also
+        // inherit the creating frame's [[HomeObject]], so `super.x`
+        // inside them resolves like the enclosing method.
+        if !frame.with_scope.is_empty()
+            || frame.priv_env.is_some()
+            || (inherit_home && frame.func.home_object.is_some())
+        {
+            if let Internal::Function(FunctionInner::Bytecode(bf)) = &mut f.borrow_mut().internal {
+                let bf = Rc::make_mut(bf);
+                bf.captured_with = frame.with_scope.clone();
+                bf.captured_priv_env = frame.priv_env.clone();
+                if inherit_home {
+                    bf.home_object = frame.func.home_object.clone();
+                }
+            }
+        }
+        Ok(Value::Object(f))
+    }
+
+    /// `Op::BindThisSloppy` / `ROp::BindThisSloppy` body.
+    pub(crate) fn bind_this_sloppy(&mut self, t: Value) -> Result<Value, Value> {
+        Ok(match t {
+            Value::Undefined | Value::Null => Value::Object(self.realm.global.clone()),
+            Value::Object(_) => t,
+            // A primitive `this` is boxed (ToObject) in sloppy mode.
+            other => Value::Object(self.to_object(&other)?),
+        })
+    }
+
+    /// `Op::LoadRestArgs` / `ROp::RestArgs` body.
+    pub(crate) fn rest_args(&mut self, frame: &Frame, n: u32) -> Value {
+        let rest: Vec<Value> = if (n as usize) < frame.args.len() {
+            frame.args[n as usize..].to_vec()
+        } else {
+            Vec::new()
+        };
+        Value::Object(self.new_array(rest))
+    }
+
+    /// `Op::DeclareGlobal` / `ROp::DeclareGlobal` body.
+    pub(crate) fn declare_global(&mut self, name: JsString, deletable: bool) -> Result<(), Value> {
+        let g = self.realm.global.clone();
+        let key = PropertyKey::Str(name.clone());
+        let (present, extensible) = {
+            let b = g.borrow();
+            (b.own_contains_key(&key), b.extensible)
+        };
+        if !present {
+            // CanDeclareGlobalVar/Function: needs an extensible global.
+            if !extensible {
+                return Err(self.throw_type(&format!("Cannot declare global '{}'", name.as_str())));
+            }
+            // CreateGlobalVarBinding(N, D): writable, enumerable;
+            // configurable only for eval-created bindings.
+            g.borrow_mut().own_insert(
+                key,
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Undefined,
+                        writable: true,
+                    },
+                    enumerable: true,
+                    configurable: deletable,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// `Op::CanDeclareGlobalFunc` / `ROp::CanDeclareGlobalFunc` body.
+    pub(crate) fn can_declare_global_func(&mut self, name: JsString) -> Result<(), Value> {
+        let g = self.realm.global.clone();
+        let key = PropertyKey::Str(name.clone());
+        // CanDeclareGlobalFunction (9.1.1.4.16): an existing
+        // non-configurable property is acceptable only if it is a
+        // writable, enumerable data property; otherwise (or, when
+        // absent, on a non-extensible global) the declaration fails.
+        let definable = {
+            let b = g.borrow();
+            match b.own_get(&key) {
+                None => b.extensible,
+                Some(p) => {
+                    p.configurable
+                        || matches!(
+                            &p.kind,
+                            PropertyKind::Data { writable, .. }
+                                if *writable && p.enumerable
+                        )
+                }
+            }
+        };
+        if !definable {
+            return Err(self.throw_type(&format!(
+                "Cannot declare global function '{}'",
+                name.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `Op::DefineGlobalFunc` / `ROp::DefineGlobalFunc` body.
+    pub(crate) fn define_global_func(&mut self, name: JsString, value: Value, deletable: bool) {
+        let g = self.realm.global.clone();
+        let key = PropertyKey::Str(name.clone());
+        // CreateGlobalFunctionBinding (9.1.1.4.18): an absent or
+        // configurable existing property is (re)defined with function
+        // attributes; a non-configurable one keeps its attributes and
+        // is just assigned the new value.
+        let redefine = {
+            let b = g.borrow();
+            match b.own_get(&key) {
+                None => true,
+                Some(p) => p.configurable,
+            }
+        };
+        let mut b = g.borrow_mut();
+        if redefine {
+            b.own_insert(
+                key,
+                Property {
+                    kind: PropertyKind::Data {
+                        value,
+                        writable: true,
+                    },
+                    enumerable: true,
+                    configurable: deletable,
+                },
+            );
+        } else if let Some(p) = b.own_get_mut(&key) {
+            if let PropertyKind::Data { value: slot, .. } = &mut p.kind {
+                *slot = value;
+            }
+        }
+    }
+
+    /// `Op::GetTemplateObject` / `ROp::GetTemplateObject` body: the cached,
+    /// frozen template object, keyed by `(proto pointer, index)`.
+    pub(crate) fn template_object(&mut self, frame: &Frame, idx: u32) -> Result<Value, Value> {
+        let key = (Rc::as_ptr(&frame.func.proto) as *const () as usize, idx);
+        if let Some(o) = self.template_cache.get(&key) {
+            return Ok(Value::Object(o.clone()));
+        }
+        let parts = frame.func.proto.templates[idx as usize].clone();
+        // Cooked strings (an illegal escape cooks to `undefined`).
+        let cooked: Vec<Value> = parts
+            .cooked
+            .iter()
+            .map(|c| match c {
+                Some(s) => Value::String(JsString::from_rc_str(s.clone())),
+                None => Value::Undefined,
+            })
+            .collect();
+        let arr = self.new_array(cooked);
+        let raw: Vec<Value> = parts
+            .raw
+            .iter()
+            .map(|s| Value::String(JsString::from_rc_str(s.clone())))
+            .collect();
+        let raw_arr = self.new_array(raw);
+        // The `raw` array is frozen; `raw` is a non-enumerable,
+        // non-writable, non-configurable own property of the
+        // template object, which is itself frozen (spec
+        // GetTemplateObject / TemplateString integrity).
+        crate::builtins::fundamental::set_integrity_level(self, &raw_arr, true)?;
+        arr.borrow_mut().own_insert(
+            PropertyKey::str("raw"),
+            Property {
+                kind: PropertyKind::Data {
+                    value: Value::Object(raw_arr),
+                    writable: false,
+                },
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        crate::builtins::fundamental::set_integrity_level(self, &arr, true)?;
+        self.template_cache.insert(key, arr.clone());
+        Ok(Value::Object(arr))
+    }
+
+    /// `Op::ArraySpread` / `ROp::ArraySpread` body.
+    pub(crate) fn array_spread(&mut self, arr_v: &Value, src: &Value) -> Result<(), Value> {
+        let items = self.iterate_to_vec(src)?;
+        if let Value::Object(a) = arr_v {
+            let mut b = a.borrow_mut();
+            if let Internal::Array(elems) = &mut b.internal {
+                elems.extend(items);
+            }
+        }
+        Ok(())
+    }
+
+    /// The six `Op::Define*` / `ROp::DefineProp` bodies.
+    pub(crate) fn define_prop_kind(
+        &mut self,
+        kind: crate::reg::DefKind,
+        obj: &Value,
+        key_v: &Value,
+        value: Value,
+    ) -> Result<(), Value> {
+        use crate::reg::DefKind;
+        let key = self.to_property_key(key_v)?;
+        match kind {
+            DefKind::Field => {
+                if let Value::Object(o) = obj {
+                    crate::builtins::fundamental::create_data_property_or_throw(
+                        self, o, &key, value,
+                    )?;
+                }
+            }
+            DefKind::Method => {
+                // Class methods are non-enumerable (writable, configurable),
+                // defined with DefinePropertyOrThrow (a non-configurable own
+                // key — e.g. a computed static "prototype" — is a TypeError).
+                self.check_redefinable(obj, &key)?;
+                if let Value::Object(o) = obj {
+                    o.borrow_mut().own_insert(key, Property::builtin(value));
+                }
+            }
+            DefKind::Getter => {
+                self.check_redefinable(obj, &key)?;
+                self.define_accessor_with(obj, key, Some(value), None, true);
+            }
+            DefKind::Setter => {
+                self.check_redefinable(obj, &key)?;
+                self.define_accessor_with(obj, key, None, Some(value), true);
+            }
+            DefKind::MethodGetter => {
+                self.check_redefinable(obj, &key)?;
+                self.define_accessor_with(obj, key, Some(value), None, false);
+            }
+            DefKind::MethodSetter => {
+                self.check_redefinable(obj, &key)?;
+                self.define_accessor_with(obj, key, None, Some(value), false);
+            }
+        }
+        Ok(())
+    }
+
+    /// `Op::SetHomeObject` / `ROp::SetHomeObject` body (MakeMethod).
+    pub(crate) fn set_home_object_op(home: &Value, method: &Value) {
+        if let (Value::Object(home), Value::Object(m)) = (home, method) {
+            if let Internal::Function(FunctionInner::Bytecode(bf)) = &mut m.borrow_mut().internal {
+                Rc::make_mut(bf).home_object = Some(home.clone());
+            }
+        }
+    }
+
+    /// `Op::ObjectSpread` / `ROp::ObjectSpread` body.
+    pub(crate) fn object_spread(&mut self, target: &Value, src: &Value) -> Result<(), Value> {
+        if let Value::Object(t) = target {
+            if let Value::Object(s) = src {
+                for k in self.enumerable_own_keys_dyn(s)? {
+                    let val = self.get_prop(src, &k)?;
+                    t.borrow_mut().own_insert(k, Property::data(val));
+                }
+            } else if let Value::String(st) = src {
+                for (i, c) in st.as_str().chars().enumerate() {
+                    t.borrow_mut().own_insert(
+                        PropertyKey::from_index(i as u32),
+                        Property::data(Value::str(c.to_string())),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `Op::CopyDataPropertiesExcept` / `ROp::CopyDataPropsExcept` body
+    /// (keys already converted to property keys, in stack order).
+    pub(crate) fn copy_data_props_except(
+        &mut self,
+        target: &Value,
+        src: &Value,
+        excluded: &[PropertyKey],
+    ) -> Result<(), Value> {
+        if let Value::Object(t) = target {
+            if let Value::Object(s) = src {
+                // Excluded keys are skipped before ANY source access
+                // (CopyDataProperties step 4.b.i): a proxy source must
+                // not observe a [[GetOwnProperty]]/[[Get]] for them.
+                for k in self.enumerable_own_keys_excluding(s, excluded)? {
+                    let val = self.get_prop(src, &k)?;
+                    t.borrow_mut().own_insert(k, Property::data(val));
+                }
+            } else if let Value::String(st) = src {
+                // A primitive-string source contributes its index keys.
+                for (i, c) in st.as_str().chars().enumerate() {
+                    let k = PropertyKey::from_index(i as u32);
+                    if excluded.contains(&k) {
+                        continue;
+                    }
+                    t.borrow_mut()
+                        .own_insert(k, Property::data(Value::str(c.to_string())));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `Op::SetFunctionNameFromKey` / `ROp::SetFunctionNameFromKey` body.
+    pub(crate) fn set_function_name_from_key(
+        &mut self,
+        key: &Value,
+        value: &Value,
+        prefix: JsString,
+    ) {
+        if let Value::Object(f) = value {
+            if f.borrow().is_callable() {
+                let base = match key {
+                    Value::Symbol(sym) => match sym.description() {
+                        Some(d) => format!("[{d}]"),
+                        None => String::new(),
+                    },
+                    other => self.to_string_lossy(other),
+                };
+                let name = if prefix.as_str().is_empty() {
+                    base
+                } else {
+                    format!("{} {}", prefix.as_str(), base)
+                };
+                f.borrow_mut().own_insert(
+                    PropertyKey::str("name"),
+                    Property {
+                        kind: PropertyKind::Data {
+                            value: Value::str(name),
+                            writable: false,
+                        },
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+        }
+    }
+
+    /// `Op::SetProtoFromLiteral` / `ROp::SetProtoFromLiteral` body.
+    pub(crate) fn set_proto_from_literal(obj: &Value, v: Value) {
+        if let Value::Object(o) = obj {
+            match v {
+                Value::Object(p) => o.borrow_mut().proto = Some(p),
+                Value::Null => o.borrow_mut().proto = None,
+                // Non-object, non-null values are silently ignored.
+                _ => {}
+            }
+        }
+    }
+
+    /// `Op::DeleteProp` / `ROp::DelProp` body.
+    pub(crate) fn del_prop_named(
+        &mut self,
+        obj: Value,
+        name: JsString,
+        strict: bool,
+    ) -> Result<Value, Value> {
+        // `delete base.x` does ToObject(base) (spec step 5.b): a
+        // nullish base is a TypeError before any delete is attempted.
+        self.require_object_coercible(&obj, "delete properties of")?;
+        let r = self.delete_prop(&obj, &PropertyKey::Str(name.clone()))?;
+        // Strict-mode `delete` that fails throws (spec 13.5.1.2 step 5.c).
+        if !r && strict {
+            return Err(self.throw_type(&format!(
+                "Cannot delete property '{}' in strict mode",
+                name.as_str()
+            )));
+        }
+        Ok(Value::Bool(r))
+    }
+
+    /// `Op::DeletePropDynamic` / `ROp::DelElem` body.
+    pub(crate) fn del_prop_dynamic(
+        &mut self,
+        obj: Value,
+        key_v: Value,
+        strict: bool,
+    ) -> Result<Value, Value> {
+        self.require_object_coercible(&obj, "delete properties of")?;
+        let key = self.to_property_key(&key_v)?;
+        let r = self.delete_prop(&obj, &key)?;
+        if !r && strict {
+            return Err(self.throw_type("Cannot delete property in strict mode"));
+        }
+        Ok(Value::Bool(r))
+    }
+
+    /// `Op::ConcatStrings` / `ROp::ConcatStrings` body (template literals).
+    pub(crate) fn concat_strings(&mut self, parts: &[Value]) -> Result<Value, Value> {
+        let mut strs = Vec::with_capacity(parts.len());
+        let mut total = 0usize;
+        for p in parts {
+            let s = self.to_js_string(p)?;
+            // Same bound as `op_add`: a template-literal join in a doubling
+            // loop (`` s = `${s}${s}` ``) must not grow without limit.
+            total += s.byte_len();
+            if total > crate::value::MAX_STRING_LEN {
+                return Err(self.throw_range("invalid string length"));
+            }
+            strs.push(s);
+        }
+        // Fast path when every part is well-formed (the common case):
+        // a plain UTF-8 join. Otherwise go through code units so a
+        // surrogate straddling a boundary re-pairs (and lone surrogates
+        // survive instead of becoming U+FFFD).
+        let out = if strs.iter().all(|s| s.is_well_formed()) {
+            let mut out = String::with_capacity(total);
+            for s in &strs {
+                out.push_str(s.as_str());
+            }
+            JsString::new(out)
+        } else {
+            let mut units = Vec::new();
+            for s in &strs {
+                units.extend(s.code_units());
+            }
+            JsString::from_code_units(&units)
+        };
+        Ok(Value::String(out))
+    }
+
+    /// `Op::ForInEnumerate` / `ROp::ForInEnumerate` body: push a fresh
+    /// enumerator, returning its index value.
+    pub(crate) fn for_in_enumerate(
+        &mut self,
+        frame: &mut Frame,
+        v: &Value,
+    ) -> Result<Value, Value> {
+        let keys = self.for_in_keys(v)?;
+        frame.enumerators.push((keys, 0));
+        Ok(Value::Number((frame.enumerators.len() - 1) as f64))
+    }
+
+    /// `Op::ForInNext` / `ROp::ForInNext` body: `(key, has_next)`.
+    pub(crate) fn for_in_next(frame: &mut Frame) -> (Value, Value) {
+        let idx = frame.enumerators.len() - 1;
+        let (keys, cursor) = &mut frame.enumerators[idx];
+        if *cursor < keys.len() {
+            let k = keys[*cursor].clone();
+            *cursor += 1;
+            (Value::String(k), Value::Bool(true))
+        } else {
+            (Value::Undefined, Value::Bool(false))
+        }
+    }
+
     fn const_name(&self, frame: &Frame, idx: u32) -> JsString {
         match &frame.func.proto.consts[idx as usize] {
             Const::String(s) => s.clone(),
@@ -2654,6 +4659,1034 @@ impl Vm {
             self.set_prop_strict(base, key, value)
         } else {
             self.set_prop(base, key, value)
+        }
+    }
+
+    // =====================================================================
+    // Register-tier execution (reg.rs; docs/js-performance-roadmap.md §3.5)
+    // =====================================================================
+
+    /// Execute a frame through its register program. Same observable
+    /// behavior as `run_stack_frame` over the same proto by construction:
+    /// every arm calls the SAME helper as its stack twin, and the reg-on/off
+    /// differential corpus (`tests/reg.rs`) pins it. Register frames carry
+    /// no try-handlers (functions with handlers decline translation), so a
+    /// thrown error always tears the frame down; and no suspension ops
+    /// translate, so this never returns `Flow::Suspend`.
+    fn run_reg_frame(&mut self, mut frame: Box<Frame>, reg: &crate::reg::RegProto) -> Flow {
+        use crate::reg::{ROp, RUnary};
+        macro_rules! done {
+            ($flow:expr) => {{
+                let outcome = $flow;
+                self.recycle_frame(frame);
+                return outcome;
+            }};
+        }
+        let proto = frame.func.proto.clone();
+        // Registers 0..num_locals are the localized bindings (already sized
+        // by `init_frame`); the rest are the canonical operand slots.
+        frame.locals.resize(reg.num_regs as usize, Value::Undefined);
+        // Budget + cooperative cancellation mirror the stack loop's
+        // `counting` protocol (one predicted branch when neither is
+        // installed). Each register op charges its EXACT stack-op units
+        // (`RegProto::costs`): the charge is hard-checked BEFORE the op —
+        // the budget-exceeded throw fires exactly where the stack loop's
+        // per-op check would have, and no op the stack tier would not have
+        // reached can run. Pure stack ops charge at the NEXT anchor on
+        // their path (see `RegProto::costs` for why that is exact).
+        let counting = self.op_budget.is_some() || self.interrupt.is_some();
+        let costs = &reg.costs[..];
+        let mut poll: u32 = 0;
+        let code = &reg.code[..];
+        let num_locals = proto.num_locals as usize;
+        let mut pc: usize = 0;
+        loop {
+            if counting {
+                if let Some(budget) = self.op_budget.as_mut() {
+                    let cost = u64::from(costs[pc]);
+                    if *budget < cost {
+                        *budget = 0;
+                        // Uncatchable so execution is guaranteed to terminate.
+                        self.throw_pos = reg.pos.get(pc).copied();
+                        done!(Flow::Throw(self.throw_range("execution budget exceeded")));
+                    }
+                    *budget -= cost;
+                }
+                if self.interrupt.is_some() {
+                    poll = poll.wrapping_add(1);
+                    if poll & 0xFF == 0 {
+                        if let Some(flag) = &self.interrupt {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                self.op_budget = Some(0);
+                                self.throw_pos = reg.pos.get(pc).copied();
+                                done!(Flow::Throw(self.throw_range("execution interrupted")));
+                            }
+                        }
+                    }
+                }
+            }
+            let op = &code[pc];
+            pc += 1;
+            macro_rules! rd {
+                ($i:expr) => {
+                    frame.locals[$i as usize].clone()
+                };
+            }
+            macro_rules! wr {
+                ($i:expr, $v:expr) => {
+                    frame.locals[$i as usize] = $v
+                };
+            }
+            // Frame exit with the module-linker snapshot (mirror of the
+            // stack loop's `Ctl::Return` arm).
+            macro_rules! ret {
+                ($v:expr) => {{
+                    let v = $v;
+                    if let Some(p) = &self.module_capture_proto {
+                        if Rc::ptr_eq(&proto, p) {
+                            self.module_capture = Some(frame.cells.clone());
+                        }
+                    }
+                    done!(Flow::Return(v));
+                }};
+            }
+            // Dispatch an abrupt (or return) completion through the frame's
+            // try-handlers — the register-mode `do_completion`.
+            macro_rules! complete {
+                ($comp:expr) => {{
+                    // The position rides as an argument (not a local) so the
+                    // macro's many expansions do not grow this hot frame —
+                    // 2000-deep JS recursion must exhaust the depth guard
+                    // before the native stack. `reg_do_completion` parks it
+                    // for original-site throw attribution.
+                    match self.reg_do_completion(
+                        &mut frame,
+                        num_locals,
+                        $comp,
+                        reg.pos.get(pc - 1).copied(),
+                    ) {
+                        Ok(RegCtl::Jump(t)) => {
+                            pc = t;
+                            continue;
+                        }
+                        Ok(RegCtl::Return(v)) => ret!(v),
+                        Err(e) => {
+                            // Unhandled throw: `pc` already advanced past the
+                            // op that raised (or propagated) it.
+                            self.throw_pos = frame
+                                .unwind_pos
+                                .take()
+                                .or_else(|| reg.pos.get(pc - 1).copied());
+                            done!(Flow::Throw(e))
+                        }
+                    }
+                }};
+            }
+            macro_rules! tryv {
+                ($e:expr) => {
+                    match $e {
+                        Ok(v) => v,
+                        Err(e) => complete!(Completion::Throw(e)),
+                    }
+                };
+            }
+            // A TDZ read outside any handler is overwhelmingly common; the
+            // checked form routes the ReferenceError like any other throw.
+            macro_rules! tdz_throw {
+                () => {
+                    complete!(Completion::Throw(
+                        self.throw_reference("Cannot access binding before initialization")
+                    ))
+                };
+            }
+            match op {
+                // Pure budget landing: its units are charged by the loop
+                // head via the cost table; the op itself runs nothing.
+                ROp::Charge => {}
+                ROp::Mov { dst, src } => wr!(*dst, rd!(*src)),
+                ROp::Const { dst, idx } => wr!(*dst, self.const_val(&frame, *idx)),
+                ROp::Undef { dst } => wr!(*dst, Value::Undefined),
+                ROp::Null { dst } => wr!(*dst, Value::Null),
+                ROp::Bool { dst, v } => wr!(*dst, Value::Bool(*v)),
+                ROp::Hole { dst } => wr!(*dst, Value::Hole),
+                ROp::This { dst } => wr!(*dst, frame.this.clone()),
+                ROp::NewTarget { dst } => wr!(*dst, frame.new_target.clone()),
+                ROp::Arg { dst, idx } => wr!(
+                    *dst,
+                    frame
+                        .args
+                        .get(*idx as usize)
+                        .cloned()
+                        .unwrap_or(Value::Undefined)
+                ),
+                ROp::TdzCheck { src } => {
+                    if matches!(frame.locals[*src as usize], Value::Uninitialized) {
+                        tdz_throw!();
+                    }
+                }
+                ROp::StoreLocalChecked { local, src } => {
+                    let v = rd!(*src);
+                    let slot = &mut frame.locals[*local as usize];
+                    if matches!(slot, Value::Uninitialized) {
+                        tdz_throw!();
+                    }
+                    *slot = v;
+                }
+                ROp::InitLocalTdz { local } => wr!(*local, Value::Uninitialized),
+                ROp::IncLocal { local, dec } => {
+                    let v = rd!(*local);
+                    if matches!(v, Value::Uninitialized) {
+                        tdz_throw!();
+                    }
+                    // ToNumeric may run user code, but a localized binding is
+                    // reachable only from this frame, so read-coerce-write is
+                    // exactly the unfused sequence.
+                    let n = tryv!(self.to_numeric(&v));
+                    let r = tryv!(
+                        self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })
+                    );
+                    wr!(*local, r);
+                }
+                ROp::LoadCell { dst, cell } => {
+                    let v = frame.cells[*cell as usize].borrow().clone();
+                    if matches!(v, Value::Uninitialized) {
+                        tdz_throw!();
+                    }
+                    wr!(*dst, v);
+                }
+                ROp::StoreCell { cell, src } => {
+                    let v = rd!(*src);
+                    *frame.cells[*cell as usize].borrow_mut() = v;
+                }
+                ROp::LoadUpvalue { dst, idx } => {
+                    let v = frame.func.upvalues[*idx as usize].borrow().clone();
+                    if matches!(v, Value::Uninitialized) {
+                        tdz_throw!();
+                    }
+                    wr!(*dst, v);
+                }
+                ROp::LoadGlobal { dst, name, ic } => {
+                    let name = Self::const_name_proto(&proto, *name);
+                    let v = tryv!(self.ic_load_global(name, reg.ic.get(*ic as usize)));
+                    wr!(*dst, v);
+                }
+                ROp::Add { dst, a, b } => {
+                    let r = tryv!(self.op_add(rd!(*a), rd!(*b)));
+                    wr!(*dst, r);
+                }
+                ROp::AddK { dst, a, konst } => {
+                    let b = self.const_val(&frame, *konst);
+                    let r = tryv!(self.op_add(rd!(*a), b));
+                    wr!(*dst, r);
+                }
+                ROp::Arith { kind, dst, a, b } => {
+                    let r = tryv!(self.arith(rd!(*a), rd!(*b), *kind));
+                    wr!(*dst, r);
+                }
+                ROp::ArithK {
+                    kind,
+                    dst,
+                    a,
+                    konst,
+                } => {
+                    let b = self.const_val(&frame, *konst);
+                    let r = tryv!(self.arith(rd!(*a), b, *kind));
+                    wr!(*dst, r);
+                }
+                ROp::AddCellK { dst, cell, konst } => {
+                    let a = frame.cells[*cell as usize].borrow().clone();
+                    if matches!(a, Value::Uninitialized) {
+                        tdz_throw!();
+                    }
+                    let b = self.const_val(&frame, *konst);
+                    let r = tryv!(self.op_add(a, b));
+                    wr!(*dst, r);
+                }
+                ROp::ArithCellK {
+                    kind,
+                    dst,
+                    cell,
+                    konst,
+                } => {
+                    let a = frame.cells[*cell as usize].borrow().clone();
+                    if matches!(a, Value::Uninitialized) {
+                        tdz_throw!();
+                    }
+                    let b = self.const_val(&frame, *konst);
+                    let r = tryv!(self.arith(a, b, *kind));
+                    wr!(*dst, r);
+                }
+                ROp::Unary { kind, dst, src } => {
+                    let a = rd!(*src);
+                    let r = match kind {
+                        RUnary::Neg => tryv!(self.unary_arith(a, UnaryKind::Neg)),
+                        // ToNumber throws TypeError for BigInt (unary + is
+                        // invalid on it).
+                        RUnary::Pos => Value::Number(tryv!(self.to_number(&a))),
+                        RUnary::ToNumeric => tryv!(self.to_numeric(&a)),
+                        RUnary::Inc => tryv!(self.unary_arith(a, UnaryKind::Inc)),
+                        RUnary::Dec => tryv!(self.unary_arith(a, UnaryKind::Dec)),
+                        RUnary::BitNot => tryv!(self.unary_arith(a, UnaryKind::BitNot)),
+                        RUnary::Not => Value::Bool(!self.to_boolean(&a)),
+                        RUnary::Typeof => Value::String(crate::names::typeof_result(a.type_of())),
+                        RUnary::ToStr => Value::String(tryv!(self.to_js_string(&a))),
+                        RUnary::ToKey => match tryv!(self.to_property_key(&a)) {
+                            PropertyKey::Str(s) => Value::String(s),
+                            PropertyKey::Sym(s) => Value::Symbol(s),
+                        },
+                    };
+                    wr!(*dst, r);
+                }
+                // Compare/branch operands are borrowed from the register
+                // file, not cloned out of it (`rd!` is an `Rc` round-trip
+                // per operand per iteration on string/object values).
+                // `frame` is a local distinct from `self`, and nested user
+                // code (a `valueOf` inside `cmp_values`) runs in its own
+                // frames — it can reach this frame's CELLS, never its
+                // locals — so the borrows are sound.
+                ROp::Cmp { cmp, dst, a, b } => {
+                    let r = tryv!(self.cmp_values(
+                        *cmp,
+                        &frame.locals[*a as usize],
+                        &frame.locals[*b as usize]
+                    ));
+                    wr!(*dst, Value::Bool(r));
+                }
+                // ---- control flow ----
+                ROp::Jmp { target } => pc = *target as usize,
+                ROp::BrTrue { src, target } => {
+                    if self.to_boolean(&frame.locals[*src as usize]) {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrFalse { src, target } => {
+                    if !self.to_boolean(&frame.locals[*src as usize]) {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrFalsyKeep { src, target } => {
+                    if !self.to_boolean(&frame.locals[*src as usize]) {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrTruthyKeep { src, target } => {
+                    if self.to_boolean(&frame.locals[*src as usize]) {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrNotNullishKeep { src, target } => {
+                    if !frame.locals[*src as usize].is_nullish() {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::BrNullishUndef { reg, target } => {
+                    if frame.locals[*reg as usize].is_nullish() {
+                        // An optional chain short-circuits to `undefined` even
+                        // when the base was `null`.
+                        frame.locals[*reg as usize] = Value::Undefined;
+                        pc = *target as usize;
+                    }
+                }
+                ROp::CmpBr {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    let r = tryv!(self.cmp_values(
+                        *cmp,
+                        &frame.locals[*a as usize],
+                        &frame.locals[*b as usize]
+                    ));
+                    if r == *if_true {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::CmpBrK {
+                    cmp,
+                    a,
+                    konst,
+                    if_true,
+                    target,
+                } => {
+                    let b = self.const_val(&frame, *konst);
+                    let r = tryv!(self.cmp_values(*cmp, &frame.locals[*a as usize], &b));
+                    if r == *if_true {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::TypeofBr {
+                    src,
+                    tag,
+                    br_on_eq,
+                    target,
+                } => {
+                    // Total: `typeof` never throws, and the tag is one of
+                    // the eight statics `Value::type_of` returns, so this
+                    // is content equality of the unmaterialized compare.
+                    if (frame.locals[*src as usize].type_of() == *tag) == *br_on_eq {
+                        pc = *target as usize;
+                    }
+                }
+                ROp::CmpBrCellK {
+                    cmp,
+                    cell,
+                    konst,
+                    if_true,
+                    target,
+                } => {
+                    let a = frame.cells[*cell as usize].borrow().clone();
+                    if matches!(a, Value::Uninitialized) {
+                        tdz_throw!();
+                    }
+                    let b = self.const_val(&frame, *konst);
+                    if tryv!(self.cmp_values(*cmp, &a, &b)) == *if_true {
+                        pc = *target as usize;
+                    }
+                }
+                // ---- property access ----
+                ROp::GetProp { dst, obj, name, ic } => {
+                    let obj = rd!(*obj);
+                    let name = Self::const_name_proto(&proto, *name);
+                    let v = tryv!(self.ic_get_prop(obj, name, reg.ic.get(*ic as usize)));
+                    wr!(*dst, v);
+                }
+                ROp::SetProp {
+                    dst,
+                    obj,
+                    name,
+                    src,
+                    ic,
+                } => {
+                    let obj = rd!(*obj);
+                    let value = rd!(*src);
+                    let name = Self::const_name_proto(&proto, *name);
+                    let v = tryv!(self.ic_set_prop(
+                        obj,
+                        name,
+                        value,
+                        proto.is_strict,
+                        reg.ic.get(*ic as usize)
+                    ));
+                    wr!(*dst, v);
+                }
+                ROp::GetElem { dst, obj, key } => {
+                    let (obj, key) = (rd!(*obj), rd!(*key));
+                    let v = tryv!(self.elem_get(obj, key));
+                    wr!(*dst, v);
+                }
+                ROp::SetElem { dst, obj, key, src } => {
+                    let (obj, key, value) = (rd!(*obj), rd!(*key), rd!(*src));
+                    let v = tryv!(self.elem_set(obj, key, value, proto.is_strict));
+                    wr!(*dst, v);
+                }
+                // ---- calls ----
+                ROp::Call {
+                    dst,
+                    func,
+                    this,
+                    at,
+                    argc,
+                    has_this,
+                } => {
+                    let func_v = rd!(*func);
+                    let this_v = if *has_this {
+                        rd!(*this)
+                    } else {
+                        Value::Undefined
+                    };
+                    let r = if let Some(bf) = peek_plain_bytecode(&func_v) {
+                        self.call_direct_reg(&mut frame, *at, *argc, bf, func_v, this_v)
+                    } else {
+                        // Arguments MOVE out of their (dead) canonical slots
+                        // into the pooled buffer — same ownership shape as the
+                        // stack path's drain.
+                        let mut args = self.take_value_vec();
+                        for i in *at..*at + *argc {
+                            args.push(std::mem::replace(
+                                &mut frame.locals[i as usize],
+                                Value::Undefined,
+                            ));
+                        }
+                        self.call_valuevec(func_v, this_v, args)
+                    };
+                    wr!(*dst, tryv!(r));
+                }
+                ROp::New {
+                    dst,
+                    ctor,
+                    at,
+                    argc,
+                } => {
+                    let ctor_v = rd!(*ctor);
+                    // A ZERO-arg window's `at` may sit one past the register
+                    // file (nothing was ever materialized there, so the
+                    // emitter never grew it): slicing would panic on the
+                    // out-of-range START even though the range is empty.
+                    let args = if *argc == 0 {
+                        &[]
+                    } else {
+                        &frame.locals[*at as usize..(*at + *argc) as usize]
+                    };
+                    let v = tryv!(self.construct(&ctor_v, args, &ctor_v));
+                    wr!(*dst, v);
+                }
+                ROp::Ret { src } => {
+                    let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
+                    // Route through any enclosing `finally` blocks (mirror of
+                    // `Op::Return`); the no-handler fast path returns directly.
+                    if frame.handlers.is_empty() {
+                        ret!(v);
+                    }
+                    complete!(Completion::Return(v));
+                }
+                ROp::RetCompletion => {
+                    let v = frame.completion.clone();
+                    if frame.handlers.is_empty() {
+                        ret!(v);
+                    }
+                    complete!(Completion::Return(v));
+                }
+                ROp::Throw { src } => {
+                    let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
+                    complete!(Completion::Throw(v));
+                }
+                // ---- exceptions / completions ----
+                ROp::PushTryHandler {
+                    catch,
+                    finally,
+                    depth,
+                } => {
+                    frame.handlers.push(TryHandler {
+                        catch_ip: if *catch == u32::MAX {
+                            None
+                        } else {
+                            Some(*catch)
+                        },
+                        finally_ip: if *finally == u32::MAX {
+                            None
+                        } else {
+                            Some(*finally)
+                        },
+                        // Register mode: the CANONICAL operand depth (the
+                        // register file holds `num_locals + depth` live slots).
+                        stack_depth: *depth as usize,
+                        with_depth: frame.with_scope.len(),
+                        priv_env: frame.priv_env.clone(),
+                        delegation: false,
+                        delegation_return_ip: None,
+                    });
+                }
+                ROp::PopTryHandler => {
+                    frame.handlers.pop();
+                }
+                ROp::CompletionJump { target, boundary } => {
+                    complete!(Completion::Jump {
+                        target: *target,
+                        boundary: *boundary,
+                    });
+                }
+                ROp::EndFinally => {
+                    // Resume a parked non-local completion; the normal path
+                    // (finalizer ran with nothing parked) falls through.
+                    if let Some(c) = frame.pending_completion.take() {
+                        complete!(c);
+                    }
+                }
+                ROp::Closure { dst, idx } => {
+                    let f = tryv!(self.closure_from_const(&frame, *idx));
+                    wr!(*dst, f);
+                }
+                // Everything rarer runs through the cold arm, keeping this
+                // loop's native stack frame small (same split — and same
+                // reason — as `step`/`step_cold`).
+                cold => {
+                    tryv!(self.rstep_cold(&mut frame, reg, &proto, cold));
+                }
+            }
+        }
+    }
+
+    /// Register-mode mirror of [`Vm::do_completion`]: walk the frame's
+    /// try-handlers with a pending completion. "Truncate the operand stack"
+    /// becomes "clear the canonical registers above the handler's recorded
+    /// depth" (value-lifetime parity with the stack machine's truncate), and
+    /// the exception lands in `canon(depth)` — exactly where the catch
+    /// label's register state expects it. The delegation arms cannot occur:
+    /// generators never carry register programs.
+    #[inline(never)]
+    fn reg_do_completion(
+        &mut self,
+        frame: &mut Frame,
+        num_locals: usize,
+        comp: Completion,
+        throw_pos: Option<u32>,
+    ) -> Result<RegCtl, Value> {
+        // Original-site attribution: a `finally` may park this throw and
+        // re-raise it from a later op, so remember where it really started.
+        if frame.unwind_pos.is_none() && matches!(comp, Completion::Throw(_)) {
+            frame.unwind_pos = throw_pos;
+        }
+        let boundary = match &comp {
+            Completion::Jump { boundary, .. } => *boundary as usize,
+            _ => 0,
+        };
+        debug_assert!(!frame.skip_delegation_throw);
+        while frame.handlers.len() > boundary {
+            let h = frame.handlers.pop().unwrap();
+            debug_assert!(!h.delegation && h.delegation_return_ip.is_none());
+            let base = num_locals + h.stack_depth;
+            for slot in frame.locals[base..].iter_mut() {
+                *slot = Value::Undefined;
+            }
+            // Discard any `with` environments entered after this handler and
+            // restore the private-environment chain (both constant in
+            // register frames today — the ops that change them decline
+            // translation — but kept for exactness).
+            frame.with_scope.truncate(h.with_depth);
+            frame.priv_env = h.priv_env.clone();
+            if let Completion::Throw(err) = &comp {
+                if let Some(catch_ip) = h.catch_ip {
+                    frame.locals[base] = err.clone();
+                    frame.unwind_pos = None;
+                    return Ok(RegCtl::Jump(catch_ip as usize));
+                }
+            }
+            if let Some(finally_ip) = h.finally_ip {
+                frame.pending_completion = Some(comp);
+                return Ok(RegCtl::Jump(finally_ip as usize));
+            }
+        }
+        match comp {
+            Completion::Return(v) => Ok(RegCtl::Return(v)),
+            Completion::Throw(e) => Err(e),
+            Completion::Jump { target, .. } => Ok(RegCtl::Jump(target as usize)),
+        }
+    }
+
+    /// The register tier's rare ops. `#[inline(never)]` keeps their unioned
+    /// locals out of `run_reg_frame`'s native frame (deep JS recursion must
+    /// exhaust `max_call_depth` before the native stack; see `step_cold`).
+    /// Cold ops never branch, return, or call JS→JS directly, so the
+    /// signature carries no control flow.
+    #[inline(never)]
+    fn rstep_cold(
+        &mut self,
+        frame: &mut Frame,
+        reg: &crate::reg::RegProto,
+        proto: &Rc<crate::bytecode::FuncProto>,
+        op: &crate::reg::ROp,
+    ) -> Result<(), Value> {
+        use crate::reg::ROp;
+        macro_rules! rd {
+            ($i:expr) => {
+                frame.locals[$i as usize].clone()
+            };
+        }
+        macro_rules! wr {
+            ($i:expr, $v:expr) => {
+                frame.locals[$i as usize] = $v
+            };
+        }
+        match op {
+            ROp::RestArgs { dst, from } => {
+                let v = self.rest_args(frame, *from);
+                wr!(*dst, v);
+            }
+            ROp::Arguments { dst } => {
+                let v = self.make_arguments_object(frame);
+                wr!(*dst, v);
+            }
+            ROp::BindThisSloppy { reg: r } => {
+                let t = std::mem::replace(&mut frame.locals[*r as usize], Value::Undefined);
+                let bound = self.bind_this_sloppy(t)?;
+                wr!(*r, bound);
+            }
+            ROp::StoreCellChecked { cell, src } => {
+                let v = rd!(*src);
+                let mut slot = frame.cells[*cell as usize].borrow_mut();
+                if matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                *slot = v;
+            }
+            ROp::InitCell { cell, src } => {
+                let v = rd!(*src);
+                // A module's top-level cells are STABLE: mutate in place so a
+                // pre-wired import binding keeps pointing at the live cell.
+                if proto.stable_flags[*cell as usize] {
+                    *frame.cells[*cell as usize].borrow_mut() = v;
+                } else {
+                    let fresh = self.take_cell(v);
+                    let old = std::mem::replace(&mut frame.cells[*cell as usize], fresh);
+                    self.recycle_cell(old);
+                }
+            }
+            ROp::InitCellTdz { cell } => {
+                if proto.stable_flags[*cell as usize] {
+                    *frame.cells[*cell as usize].borrow_mut() = Value::Uninitialized;
+                } else {
+                    let fresh = self.take_cell(Value::Uninitialized);
+                    let old = std::mem::replace(&mut frame.cells[*cell as usize], fresh);
+                    self.recycle_cell(old);
+                }
+            }
+            ROp::IncCell { cell, dec } => {
+                let v = frame.cells[*cell as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let n = self.to_numeric(&v)?;
+                let r = self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })?;
+                *frame.cells[*cell as usize].borrow_mut() = r;
+            }
+            ROp::LoadCellInit { src, dest } => {
+                let v = frame.cells[*src as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                if proto.stable_flags[*dest as usize] {
+                    *frame.cells[*dest as usize].borrow_mut() = v;
+                } else {
+                    let fresh = self.take_cell(v);
+                    let old = std::mem::replace(&mut frame.cells[*dest as usize], fresh);
+                    self.recycle_cell(old);
+                }
+            }
+            ROp::StoreUpvalue { idx, src } => {
+                let v = rd!(*src);
+                *frame.func.upvalues[*idx as usize].borrow_mut() = v;
+            }
+            ROp::StoreUpvalueChecked { idx, src } => {
+                let v = rd!(*src);
+                let mut slot = frame.func.upvalues[*idx as usize].borrow_mut();
+                if matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                *slot = v;
+            }
+            ROp::StoreGlobal { name, src } => {
+                let v = rd!(*src);
+                let name = Self::const_name_proto(proto, *name);
+                self.store_global(name, v, proto.is_strict)?;
+            }
+            ROp::LoadGlobalTypeof { dst, name } => {
+                let name = Self::const_name_proto(proto, *name);
+                let g = self.realm.global.clone();
+                let v = self.get_prop(&Value::Object(g), &PropertyKey::Str(name))?;
+                wr!(*dst, v);
+            }
+            ROp::DeclareGlobal { name, deletable } => {
+                let name = Self::const_name_proto(proto, *name);
+                self.declare_global(name, *deletable)?;
+            }
+            ROp::CanDeclareGlobalFunc { name } => {
+                let name = Self::const_name_proto(proto, *name);
+                self.can_declare_global_func(name)?;
+            }
+            ROp::DefineGlobalFunc {
+                name,
+                deletable,
+                src,
+            } => {
+                // Clone, not move: `src` may be a live register (the
+                // translator does not canonicalize this operand).
+                let v = rd!(*src);
+                let name = Self::const_name_proto(proto, *name);
+                self.define_global_func(name, v, *deletable);
+            }
+            ROp::InstanceOf { dst, a, b } => {
+                let (a, b) = (rd!(*a), rd!(*b));
+                let r = self.instance_of(&a, &b)?;
+                wr!(*dst, Value::Bool(r));
+            }
+            ROp::DelProp { dst, obj, name } => {
+                let obj = rd!(*obj);
+                let name = Self::const_name_proto(proto, *name);
+                let v = self.del_prop_named(obj, name, proto.is_strict)?;
+                wr!(*dst, v);
+            }
+            ROp::DelElem { dst, obj, key } => {
+                let (obj, key) = (rd!(*obj), rd!(*key));
+                let v = self.del_prop_dynamic(obj, key, proto.is_strict)?;
+                wr!(*dst, v);
+            }
+            ROp::HasProp { dst, key, obj } => {
+                let (key_v, obj) = (rd!(*key), rd!(*obj));
+                let key = self.to_property_key(&key_v)?;
+                let r = self.has_prop(&obj, &key)?;
+                wr!(*dst, Value::Bool(r));
+            }
+            ROp::CallSpread {
+                dst,
+                func,
+                this,
+                args,
+            } => {
+                let (func, this, args_arr) = (rd!(*func), rd!(*this), rd!(*args));
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.call(func, this, &args)?;
+                wr!(*dst, r);
+            }
+            ROp::NewSpread { dst, ctor, args } => {
+                let (ctor, args_arr) = (rd!(*ctor), rd!(*args));
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.construct(&ctor, &args, &ctor)?;
+                wr!(*dst, r);
+            }
+            ROp::ThrowConstAssign => {
+                return Err(self.throw_type("Assignment to constant variable."));
+            }
+            ROp::NewObject { dst } => wr!(*dst, Value::Object(self.new_object())),
+            ROp::NewArray { dst, at, n } => {
+                let mut elems = Vec::with_capacity(*n as usize);
+                for i in *at..*at + *n {
+                    elems.push(std::mem::replace(
+                        &mut frame.locals[i as usize],
+                        Value::Undefined,
+                    ));
+                }
+                wr!(*dst, Value::Object(self.new_array(elems)));
+            }
+            ROp::NewObjectTpl { dst, at, n, tpl } => {
+                let tpl = frame.func.proto.obj_tpls[*tpl as usize].clone();
+                let obj = self.new_object_from_tpl(
+                    &tpl,
+                    frame.locals[*at as usize..(*at + *n) as usize]
+                        .iter_mut()
+                        .map(|slot| std::mem::replace(slot, Value::Undefined)),
+                );
+                wr!(*dst, Value::Object(obj));
+            }
+            ROp::ArraySpread { arr, src } => {
+                let (arr_v, src) = (rd!(*arr), rd!(*src));
+                self.array_spread(&arr_v, &src)?;
+            }
+            ROp::DefineProp {
+                kind,
+                obj,
+                key,
+                val,
+            } => {
+                let (obj, key_v, value) = (rd!(*obj), rd!(*key), rd!(*val));
+                self.define_prop_kind(*kind, &obj, &key_v, value)?;
+            }
+            ROp::SetHomeObject { obj, val } => {
+                let (home, m) = (rd!(*obj), rd!(*val));
+                Self::set_home_object_op(&home, &m);
+            }
+            ROp::ObjectSpread { target, src } => {
+                let (target, src) = (rd!(*target), rd!(*src));
+                self.object_spread(&target, &src)?;
+            }
+            ROp::CopyDataPropsExcept { target, src, at, n } => {
+                let mut excluded: Vec<PropertyKey> = Vec::with_capacity(*n as usize);
+                for i in *at..*at + *n {
+                    let k = std::mem::replace(&mut frame.locals[i as usize], Value::Undefined);
+                    excluded.push(self.to_property_key(&k)?);
+                }
+                let (target, src) = (rd!(*target), rd!(*src));
+                self.copy_data_props_except(&target, &src, &excluded)?;
+            }
+            ROp::GetTemplateObject { dst, idx } => {
+                let v = self.template_object(frame, *idx)?;
+                wr!(*dst, v);
+            }
+            ROp::NewRegExp {
+                dst,
+                pattern,
+                flags,
+            } => {
+                let p = Self::const_name_proto(proto, *pattern);
+                let f = Self::const_name_proto(proto, *flags);
+                let re = self.make_regexp(p.as_str(), f.as_str())?;
+                wr!(*dst, re);
+            }
+            ROp::ConcatStrings { dst, at, n } => {
+                let parts = &frame.locals[*at as usize..(*at + *n) as usize];
+                let v = self.concat_strings(parts)?;
+                wr!(*dst, v);
+            }
+            ROp::RequireObjectCoercible { src } => {
+                if frame.locals[*src as usize].is_nullish() {
+                    return Err(self.throw_type("Cannot destructure a null or undefined value"));
+                }
+            }
+            ROp::RequireCoercible { src } => {
+                let v = rd!(*src);
+                self.require_object_coercible(&v, "read properties of")?;
+            }
+            ROp::RequireIterResult { src } => {
+                if !matches!(frame.locals[*src as usize], Value::Object(_)) {
+                    return Err(self.throw_type("Iterator result is not an object"));
+                }
+            }
+            ROp::SetFunctionNameFromKey { prefix, key, val } => {
+                let (key, value) = (rd!(*key), rd!(*val));
+                let prefix = Self::const_name_proto(proto, *prefix);
+                self.set_function_name_from_key(&key, &value, prefix);
+            }
+            ROp::SetProtoFromLiteral { obj, src } => {
+                let (obj, v) = (rd!(*obj), rd!(*src));
+                Self::set_proto_from_literal(&obj, v);
+            }
+            ROp::GetIterator { dst, src } => {
+                let v = rd!(*src);
+                let it = self.get_iterator(&v)?;
+                wr!(*dst, it);
+            }
+            ROp::IterNext { dst, it } => {
+                let it = rd!(*it);
+                let next = self.get_prop(&it, &crate::names::key_next())?;
+                let res = self.call(next, it, &[])?;
+                wr!(*dst, res);
+            }
+            ROp::IterStepValue { dst, next, it } => {
+                let (next, it) = (rd!(*next), rd!(*it));
+                let (value, done) = self.iterator_step_value(next, it)?;
+                wr!(*dst, value);
+                wr!(*dst + 1, Value::Bool(done));
+            }
+            ROp::ForInEnumerate { dst, src } => {
+                let v = rd!(*src);
+                let idx = self.for_in_enumerate(frame, &v)?;
+                wr!(*dst, idx);
+            }
+            ROp::ForInNext { dst } => {
+                let (k, more) = Self::for_in_next(frame);
+                wr!(*dst, k);
+                wr!(*dst + 1, more);
+            }
+            ROp::IteratorClose { it } => {
+                // Reached only on an abrupt completion (for-of / destructuring
+                // landing pads), with that completion parked. Per spec
+                // (IteratorClose), if the completion is a throw, any error
+                // from `return()` is suppressed (the original throw wins);
+                // otherwise a `return()` error propagates and a non-object
+                // result is a TypeError.
+                let it = rd!(*it);
+                let completion_is_throw =
+                    matches!(frame.pending_completion, Some(Completion::Throw(_)));
+                let ret = match self.get_prop(&it, &crate::names::key_return()) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if completion_is_throw {
+                            Value::Undefined
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
+                if self.is_callable(&ret) {
+                    match self.call(ret, it.clone(), &[]) {
+                        Ok(v) => {
+                            if !completion_is_throw && !matches!(v, Value::Object(_)) {
+                                return Err(
+                                    self.throw_type("iterator return() result is not an object")
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if !completion_is_throw {
+                                return Err(e);
+                            }
+                        }
+                    }
+                } else if !ret.is_nullish() && !completion_is_throw {
+                    // GetMethod: a present but non-callable `return` is a
+                    // TypeError (masked only by an in-flight throw).
+                    return Err(self.throw_type("iterator return is not a function"));
+                }
+            }
+            ROp::ForInPop => {
+                if let Some((keys, _)) = frame.enumerators.pop() {
+                    self.park_forin_vec(keys);
+                }
+            }
+            // Every ROp is either handled above or inline in run_reg_frame's
+            // dispatch loop. Reaching here means the register-tier translator
+            // emitted an op this helper doesn't know — a tier bug that must
+            // stay inside the sandbox as a catchable error, not abort the host.
+            _ => return Err(self.throw_internal(&format!("unhandled op in run_reg_frame: {op:?}"))),
+        }
+        let _ = reg;
+        Ok(())
+    }
+
+    /// The register tier's JS→JS fast call (`ROp::Call` with a plain sync
+    /// bytecode callee): mirror of [`Vm::call_direct`] with arguments moving
+    /// out of the caller's registers instead of its operand stack.
+    fn call_direct_reg(
+        &mut self,
+        caller: &mut Frame,
+        at: u16,
+        argc: u16,
+        bf: Rc<BytecodeFunction>,
+        func_v: Value,
+        this: Value,
+    ) -> Result<Value, Value> {
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        // Function kernel: run frameless straight off the caller's registers
+        // (the arguments sit contiguously at `at..at+argc`). A ZERO-arg
+        // window's `at` may sit one past the register file — nothing was
+        // ever materialized there — so slicing it would panic on the
+        // out-of-range start even though the range is empty.
+        if bf.proto.fn_kernel.is_some() {
+            let args: &[Value] = if argc == 0 {
+                &[]
+            } else {
+                &caller.locals[at as usize..(at + argc) as usize]
+            };
+            if let Some(r) = self.run_fn_kernel(&bf, args) {
+                self.call_depth -= 1;
+                return r;
+            }
+        }
+        let mut callee = self.take_frame();
+        for i in at..at + argc {
+            callee.args.push(std::mem::replace(
+                &mut caller.locals[i as usize],
+                Value::Undefined,
+            ));
+        }
+        let uses_arguments = bf.proto.uses_arguments;
+        self.init_frame(&mut callee, bf, this, Value::Undefined);
+        if uses_arguments {
+            if let Value::Object(o) = func_v {
+                callee.func_obj = Some(o);
+            }
+        }
+        let token = self.trace_enter(&callee.func.proto);
+        callee.trace_token = token;
+        let r = match self.run_frame(callee) {
+            Flow::Return(v) => {
+                self.trace_exit(token, false);
+                Ok(v)
+            }
+            Flow::Throw(e) => {
+                self.trace_exit(token, true);
+                Err(e)
+            }
+            Flow::Suspend(_) => Err(self.throw_type("internal: sync function suspended")),
+        };
+        self.call_depth -= 1;
+        r
+    }
+
+    /// `const_name` against a proto (the register tier has no `&Frame`
+    /// borrow to spare at its call sites).
+    #[inline]
+    fn const_name_proto(proto: &crate::bytecode::FuncProto, idx: u32) -> JsString {
+        match &proto.consts[idx as usize] {
+            Const::String(s) => s.clone(),
+            _ => JsString::new(""),
         }
     }
 
@@ -2869,80 +5902,15 @@ impl Vm {
             }
             Op::LoadGlobal(i) => {
                 let name = self.const_name(frame, *i);
-                let g = self.realm.global.clone();
-                // Inline cache (key-verified slot hint; see `FuncProto::ic`):
-                // after the first resolution, a global read — above all a
-                // function resolving its own recursive self-reference — is one
-                // indexed load plus a pointer-equality key check, no hashing.
-                if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                    let b = g.borrow();
-                    if let Some((PropertyKey::Str(k), prop)) =
-                        b.props.get_index(ic.own_slot.get() as usize)
-                    {
-                        if let PropertyKind::Data { value, .. } = &prop.kind {
-                            if k == &name {
-                                let v = value.clone();
-                                drop(b);
-                                push!(v);
-                                return Ok(Ctl::Next);
-                            }
-                        }
-                    }
-                }
-                let key = PropertyKey::Str(name.clone());
-                // Fast path: an own data property directly on the global object —
-                // the case for every top-level `function`/`var`/`let` binding.
-                // Resolves in a single hash with no prototype walk, and refills
-                // the inline cache with the slot it finds.
-                let fast = {
-                    let b = g.borrow();
-                    match b.props.get_full(&key) {
-                        Some((
-                            idx,
-                            _,
-                            Property {
-                                kind: PropertyKind::Data { value, .. },
-                                ..
-                            },
-                        )) => {
-                            if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                                ic.own_slot.set(idx as u32);
-                            }
-                            Some(value.clone())
-                        }
-                        _ => None,
-                    }
-                };
-                let v = match fast {
-                    Some(v) => v,
-                    None => {
-                        // Accessor global, or a binding inherited via the global's
-                        // prototype chain: fall back to the full [[Get]] (after the
-                        // unresolvable-reference check that yields a ReferenceError).
-                        if !self.has_own_or_proto(&g, &key) {
-                            return Err(
-                                self.throw_reference(&format!("{} is not defined", name.as_str()))
-                            );
-                        }
-                        self.get_prop(&Value::Object(g), &key)?
-                    }
-                };
+                let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
+                let v = self.ic_load_global(name, ic)?;
                 push!(v);
             }
             Op::StoreGlobal(i) => {
                 let name = self.const_name(frame, *i);
                 let v = pop!();
-                let g = self.realm.global.clone();
                 let strict = frame.func.proto.is_strict;
-                let key = PropertyKey::Str(name.clone());
-                // A bare assignment to a name bound nowhere is an unresolvable
-                // reference; PutValue on one throws ReferenceError in strict mode
-                // (a global-object property anywhere on the proto chain counts as
-                // resolvable). Sloppy mode creates the global property instead.
-                if strict && !self.has_prop(&Value::Object(g.clone()), &key)? {
-                    return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
-                }
-                self.put_value(&Value::Object(g), &key, v, strict)?;
+                self.store_global(name, v, strict)?;
             }
             Op::Pop => {
                 frame.stack.pop();
@@ -2966,6 +5934,12 @@ impl Vm {
             }
 
             Op::NewObject => push!(Value::Object(self.new_object())),
+            Op::NewObjectTpl { idx, n } => {
+                let tpl = frame.func.proto.obj_tpls[*idx as usize].clone();
+                let at = frame.stack.len() - *n as usize;
+                let obj = self.new_object_from_tpl(&tpl, frame.stack.drain(at..));
+                push!(Value::Object(obj));
+            }
             Op::NewArray(n) => {
                 let n = *n as usize;
                 let at = frame.stack.len() - n;
@@ -2975,277 +5949,31 @@ impl Vm {
             Op::GetProp(i) => {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
-                // Inline cache (key-verified hints; see `FuncProto::ic`).
-                // Two levels:
-                //  - `holder == None`: the receiver's OWN data property at
-                //    `slot` (ordinary objects).
-                //  - `holder == Some(p)`: a data property at `slot` on `p`,
-                //    verified to still be the receiver's DIRECT prototype and
-                //    not shadowed by an own property — the method-lookup
-                //    pattern (`arr.push`, class instances calling prototype
-                //    methods). Array receivers exclude keys with exotic own
-                //    behavior (`length`, indices). Deeper chains, accessors,
-                //    proxies, and every other exotic fall to the unchanged
-                //    slow path.
-                if let Value::Object(o) = &obj {
-                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                        let b = o.borrow();
-                        let (is_ord, is_arr) = (
-                            matches!(b.internal, Internal::Ordinary),
-                            matches!(b.internal, Internal::Array(_)),
-                        );
-                        // Array exotics: `length` and index keys never take
-                        // the IC (they don't live in the props map).
-                        let plain_key = !is_arr
-                            || (name.as_str() != "length"
-                                && crate::value::canonical_index(name.as_str()).is_none());
-                        if (is_ord || is_arr) && plain_key {
-                            // Own-property hit: never touches the holder cell.
-                            if is_ord {
-                                if let Some((PropertyKey::Str(k), prop)) =
-                                    b.props.get_index(ic.own_slot.get() as usize)
-                                {
-                                    if let PropertyKind::Data { value, .. } = &prop.kind {
-                                        if k == &name {
-                                            let v = value.clone();
-                                            drop(b);
-                                            push!(v);
-                                            return Ok(Ctl::Next);
-                                        }
-                                    }
-                                }
-                            }
-                            // Proto hit: valid only when the receiver has no
-                            // own props (nothing can shadow) and its CURRENT
-                            // direct proto is the cached holder.
-                            if b.props.is_empty() {
-                                let holder = ic.holder.borrow();
-                                if let Some(h) = &*holder {
-                                    if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
-                                        let hb = h.borrow();
-                                        if let Some((PropertyKey::Str(k), prop)) =
-                                            hb.props.get_index(ic.proto_slot.get() as usize)
-                                        {
-                                            if let PropertyKind::Data { value, .. } = &prop.kind {
-                                                if k == &name {
-                                                    let v = value.clone();
-                                                    drop(hb);
-                                                    drop(holder);
-                                                    drop(b);
-                                                    push!(v);
-                                                    return Ok(Ctl::Next);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // Refill: own data property first (ordinary only),
-                            // then a one-level proto data property when no own
-                            // props can shadow.
-                            let key = PropertyKey::Str(name.clone());
-                            if is_ord {
-                                if let Some((idx, _, prop)) = b.props.get_full(&key) {
-                                    if let PropertyKind::Data { value, .. } = &prop.kind {
-                                        ic.own_slot.set(idx as u32);
-                                        let v = value.clone();
-                                        drop(b);
-                                        push!(v);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                            if b.props.is_empty() {
-                                if let Some(p) = &b.proto {
-                                    let pb = p.borrow();
-                                    if matches!(pb.internal, Internal::Ordinary)
-                                        || matches!(pb.internal, Internal::Array(_))
-                                    {
-                                        if let Some((idx, _, prop)) = pb.props.get_full(&key) {
-                                            if let PropertyKind::Data { value, .. } = &prop.kind {
-                                                ic.proto_slot.set(idx as u32);
-                                                let v = value.clone();
-                                                let holder_obj = p.clone();
-                                                drop(pb);
-                                                *ic.holder.borrow_mut() = Some(holder_obj);
-                                                drop(b);
-                                                push!(v);
-                                                return Ok(Ctl::Next);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let v = self.get_prop(&obj, &PropertyKey::Str(name))?;
+                let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
+                let v = self.ic_get_prop(obj, name, ic)?;
                 push!(v);
             }
             Op::SetProp(i) => {
                 let name = self.const_name(frame, *i);
                 let value = pop!();
                 let obj = pop!();
-                // Inline cache (key-verified slot hint; see `FuncProto::ic`).
-                // Fast path only when the receiver is an ordinary object whose
-                // OWN property at the hinted slot is a WRITABLE data property —
-                // per OrdinarySetWithOwnDescriptor that assignment updates the
-                // value in place (attributes and slot order preserved, no
-                // prototype setter can intervene). Everything else (missing own
-                // key → proto-chain setters/read-only checks, accessors,
-                // non-writable → strict TypeError, exotics) takes the
-                // unchanged put_value path, which also refills the hint.
-                if let Value::Object(o) = &obj {
-                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                        let mut b = o.borrow_mut();
-                        if matches!(b.internal, Internal::Ordinary) {
-                            if let Some((PropertyKey::Str(k), prop)) =
-                                b.props.get_index_mut(ic.own_slot.get() as usize)
-                            {
-                                if k == &name {
-                                    if let PropertyKind::Data {
-                                        value: slot,
-                                        writable: true,
-                                    } = &mut prop.kind
-                                    {
-                                        *slot = value.clone();
-                                        drop(b);
-                                        push!(value);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                            let key = PropertyKey::Str(name.clone());
-                            if let Some((idx, _, prop)) = b.props.get_full_mut(&key) {
-                                if let PropertyKind::Data {
-                                    value: slot,
-                                    writable: true,
-                                } = &mut prop.kind
-                                {
-                                    ic.own_slot.set(idx as u32);
-                                    *slot = value.clone();
-                                    drop(b);
-                                    push!(value);
-                                    return Ok(Ctl::Next);
-                                }
-                            }
-                        }
-                    }
-                }
                 let strict = frame.func.proto.is_strict;
-                self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
+                let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
+                let value = self.ic_set_prop(obj, name, value, strict, ic)?;
                 push!(value);
             }
             Op::GetPropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
-                // Integer fast path: `a[i]` on a dense array with an integral
-                // Number key reads the element directly — skipping
-                // ToPropertyKey's Number→String conversion (a float-format +
-                // heap allocation per access!), the reparse back to an index,
-                // and the property-map machinery. Only when no reified props
-                // entry can shadow the dense element (`props.is_empty()`) and
-                // the slot is a real element (in bounds, not a hole);
-                // everything else takes the unchanged spec path.
-                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
-                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
-                        let b = o.borrow();
-                        if let Internal::Array(arr) = &b.internal {
-                            if b.props.is_empty() {
-                                if let Some(v) = arr.get(*n as usize) {
-                                    if !matches!(v, Value::Hole) {
-                                        let v = v.clone();
-                                        drop(b);
-                                        push!(v);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // GetValue: RequireObjectCoercible(base) (via ToObject) throws
-                // BEFORE ToPropertyKey coerces the key expression's value.
-                self.require_object_coercible(&obj, "read properties of")?;
-                let key = self.to_property_key(&key_v)?;
-                let v = self.get_prop(&obj, &key)?;
+                let v = self.elem_get(obj, key_v)?;
                 push!(v);
             }
             Op::SetPropDynamic => {
                 let value = pop!();
                 let key_v = pop!();
                 let obj = pop!();
-                // Integer fast path mirroring `GetPropDynamic`: overwrite an
-                // EXISTING dense element in place (an in-bounds non-hole dense
-                // slot is a plain writable data property per the array exotic
-                // [[Set]] — no setter, no length change, no extensibility
-                // interaction), fill an in-bounds HOLE, or append at exactly
-                // `length`. Filling and appending CREATE a property (the own
-                // property is absent), so they additionally require the array
-                // to be extensible (a sealed/prevented receiver must reject
-                // through the generic path), the dense-storage bound (the
-                // generic path owns that RangeError), and a prototype chain
-                // with no reified entry at the index — OrdinarySet consults
-                // the chain for an absent own property, so a proto accessor /
-                // non-writable index must intercept via the generic path
-                // (`protos_allow_index_create`). Gaps past the end, shadowed
-                // elements, and non-arrays take the spec path.
-                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
-                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
-                        let i = *n as usize;
-                        let mut creates = None;
-                        {
-                            let mut b = o.borrow_mut();
-                            if b.props.is_empty() {
-                                let extensible = b.extensible;
-                                if let Internal::Array(arr) = &mut b.internal {
-                                    match arr.get_mut(i) {
-                                        Some(slot) if !matches!(slot, Value::Hole) => {
-                                            *slot = value.clone();
-                                            drop(b);
-                                            push!(value);
-                                            return Ok(Ctl::Next);
-                                        }
-                                        Some(_) => {
-                                            if extensible {
-                                                creates = Some(b.proto.clone());
-                                            }
-                                        }
-                                        None => {
-                                            if extensible
-                                                && i == arr.len()
-                                                && i < crate::value::MAX_DENSE_ARRAY
-                                            {
-                                                creates = Some(b.proto.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(proto) = creates {
-                            if crate::value::protos_allow_index_create(proto, i as u32, 1) {
-                                // No user code ran since the conditions were
-                                // checked (same native frame), so they still
-                                // hold.
-                                let mut b = o.borrow_mut();
-                                if let Internal::Array(arr) = &mut b.internal {
-                                    match arr.get_mut(i) {
-                                        Some(slot) => *slot = value.clone(),
-                                        None => arr.push(value.clone()),
-                                    }
-                                    drop(b);
-                                    push!(value);
-                                    return Ok(Ctl::Next);
-                                }
-                            }
-                        }
-                    }
-                }
-                self.require_object_coercible(&obj, "set properties of")?;
-                let key = self.to_property_key(&key_v)?;
                 let strict = frame.func.proto.is_strict;
-                self.put_value(&obj, &key, value.clone(), strict)?;
+                let value = self.elem_set(obj, key_v, value, strict)?;
                 push!(value);
             }
             Op::HasProp => {
@@ -3339,45 +6067,8 @@ impl Vm {
             }
 
             Op::Closure(i) => {
-                let proto = match &frame.func.proto.consts[*i as usize] {
-                    Const::Func(p) => p.clone(),
-                    _ => return Err(self.throw_type("internal: bad closure const")),
-                };
-                let upvalues = proto
-                    .upvalues
-                    .iter()
-                    .map(|src| match src {
-                        UpvalueSource::ParentCell(idx) => frame.cells[*idx as usize].clone(),
-                        UpvalueSource::ParentUpvalue(idx) => {
-                            frame.func.upvalues[*idx as usize].clone()
-                        }
-                    })
-                    .collect();
-                let inherit_home = proto.kind.is_arrow() || proto.inherit_home;
-                let f = self.make_closure(proto, upvalues);
-                // Capture the active with-scope chain (closures defined inside
-                // `with` resolve free identifiers against it after the block)
-                // and the active private-environment chain (methods and
-                // initializers defined inside class bodies resolve `#x`
-                // against it). Arrows (and synthetic in-class closures) also
-                // inherit the creating frame's [[HomeObject]], so `super.x`
-                // inside them resolves like the enclosing method.
-                if !frame.with_scope.is_empty()
-                    || frame.priv_env.is_some()
-                    || (inherit_home && frame.func.home_object.is_some())
-                {
-                    if let Internal::Function(FunctionInner::Bytecode(bf)) =
-                        &mut f.borrow_mut().internal
-                    {
-                        let bf = Rc::make_mut(bf);
-                        bf.captured_with = frame.with_scope.clone();
-                        bf.captured_priv_env = frame.priv_env.clone();
-                        if inherit_home {
-                            bf.home_object = frame.func.home_object.clone();
-                        }
-                    }
-                }
-                push!(Value::Object(f));
+                let f = self.closure_from_const(frame, *i)?;
+                push!(f);
             }
 
             // ---- arithmetic ----
@@ -3432,7 +6123,7 @@ impl Vm {
             Op::UShr => bin_arith(self, frame, ArithKind::UShr)?,
             Op::TypeofExpr => {
                 let a = pop!();
-                push!(Value::str(a.type_of()));
+                push!(Value::String(crate::names::typeof_result(a.type_of())));
             }
 
             // ---- comparison ----
@@ -3627,6 +6318,19 @@ impl Vm {
                 }
                 frame.stack.pop();
             }
+            Op::JumpIfNullishDropUnder(t) => {
+                // [receiver, func] with func on top: a nullish method in an
+                // optional call (`o.m?.()`) short-circuits the whole chain to
+                // `undefined`, unwinding the receiver too.
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if v.is_nullish() {
+                    frame.stack.pop();
+                    if let Some(top) = frame.stack.last_mut() {
+                        *top = Value::Undefined;
+                    }
+                    return Ok(Ctl::Jump(*t as usize));
+                }
+            }
 
             // ---- exceptions ----
             Op::Throw => {
@@ -3662,25 +6366,26 @@ impl Vm {
             }
             Op::IteratorNext => {
                 let it = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let next = self.get_prop(&it, &PropertyKey::str("next"))?;
+                let next = self.get_prop(&it, &crate::names::key_next())?;
                 let res = self.call(next, it, &[])?;
                 push!(res);
             }
+            Op::IteratorStepValue => {
+                let it = pop!();
+                let next = pop!();
+                let (value, done) = self.iterator_step_value(next, it)?;
+                push!(value);
+                push!(Value::Bool(done));
+            }
             Op::ForInPop => {
-                frame.enumerators.pop();
+                if let Some((keys, _)) = frame.enumerators.pop() {
+                    self.park_forin_vec(keys);
+                }
             }
             Op::ForInNext => {
-                let idx = frame.enumerators.len() - 1;
-                let (keys, cursor) = &mut frame.enumerators[idx];
-                if *cursor < keys.len() {
-                    let k = keys[*cursor].clone();
-                    *cursor += 1;
-                    push!(Value::String(k));
-                    push!(Value::Bool(true));
-                } else {
-                    push!(Value::Undefined);
-                    push!(Value::Bool(false));
-                }
+                let (k, more) = Self::for_in_next(frame);
+                push!(k);
+                push!(more);
             }
 
             // ---- generators / async ----
@@ -3777,21 +6482,12 @@ impl Vm {
             }
             Op::BindThisSloppy => {
                 let t = pop!();
-                let bound = match t {
-                    Value::Undefined | Value::Null => Value::Object(self.realm.global.clone()),
-                    Value::Object(_) => t,
-                    // A primitive `this` is boxed (ToObject) in sloppy mode.
-                    other => Value::Object(self.to_object(&other)?),
-                };
+                let bound = self.bind_this_sloppy(t)?;
                 push!(bound);
             }
             Op::LoadRestArgs(n) => {
-                let rest: Vec<Value> = if (*n as usize) < frame.args.len() {
-                    frame.args[*n as usize..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                push!(Value::Object(self.new_array(rest)));
+                let v = self.rest_args(frame, *n);
+                push!(v);
             }
             Op::LoadArguments => {
                 let o = self.make_arguments_object(frame);
@@ -3807,98 +6503,17 @@ impl Vm {
             }
             Op::DeclareGlobal { name: i, deletable } => {
                 let name = self.const_name(frame, *i);
-                let g = self.realm.global.clone();
-                let key = PropertyKey::Str(name.clone());
-                let (present, extensible) = {
-                    let b = g.borrow();
-                    (b.props.contains_key(&key), b.extensible)
-                };
-                if !present {
-                    // CanDeclareGlobalVar/Function: needs an extensible global.
-                    if !extensible {
-                        return Err(
-                            self.throw_type(&format!("Cannot declare global '{}'", name.as_str()))
-                        );
-                    }
-                    // CreateGlobalVarBinding(N, D): writable, enumerable;
-                    // configurable only for eval-created bindings.
-                    g.borrow_mut().props.insert(
-                        key,
-                        Property {
-                            kind: PropertyKind::Data {
-                                value: Value::Undefined,
-                                writable: true,
-                            },
-                            enumerable: true,
-                            configurable: *deletable,
-                        },
-                    );
-                }
+                self.declare_global(name, *deletable)?;
             }
 
             Op::CanDeclareGlobalFunc(i) => {
                 let name = self.const_name(frame, *i);
-                let g = self.realm.global.clone();
-                let key = PropertyKey::Str(name.clone());
-                // CanDeclareGlobalFunction (9.1.1.4.16): an existing
-                // non-configurable property is acceptable only if it is a
-                // writable, enumerable data property; otherwise (or, when
-                // absent, on a non-extensible global) the declaration fails.
-                let definable = {
-                    let b = g.borrow();
-                    match b.props.get(&key) {
-                        None => b.extensible,
-                        Some(p) => {
-                            p.configurable
-                                || matches!(
-                                    &p.kind,
-                                    PropertyKind::Data { writable, .. }
-                                        if *writable && p.enumerable
-                                )
-                        }
-                    }
-                };
-                if !definable {
-                    return Err(self.throw_type(&format!(
-                        "Cannot declare global function '{}'",
-                        name.as_str()
-                    )));
-                }
+                self.can_declare_global_func(name)?;
             }
             Op::DefineGlobalFunc { name: i, deletable } => {
                 let name = self.const_name(frame, *i);
                 let value = pop!();
-                let g = self.realm.global.clone();
-                let key = PropertyKey::Str(name.clone());
-                // CreateGlobalFunctionBinding (9.1.1.4.18): an absent or
-                // configurable existing property is (re)defined with function
-                // attributes; a non-configurable one keeps its attributes and
-                // is just assigned the new value.
-                let redefine = {
-                    let b = g.borrow();
-                    match b.props.get(&key) {
-                        None => true,
-                        Some(p) => p.configurable,
-                    }
-                };
-                let mut b = g.borrow_mut();
-                if redefine {
-                    b.props.insert(
-                        key,
-                        Property {
-                            kind: PropertyKind::Data {
-                                value,
-                                writable: true,
-                            },
-                            enumerable: true,
-                            configurable: *deletable,
-                        },
-                    );
-                } else if let Some(p) = b.props.get_mut(&key) {
-                    if let PropertyKind::Data { value: slot, .. } = &mut p.kind {
-                        *slot = value;
-                    }
-                }
+                self.define_global_func(name, value, *deletable);
             }
 
             Op::PushWithScope => {
@@ -4017,48 +6632,10 @@ impl Vm {
             }
 
             Op::GetTemplateObject(idx) => {
-                let key = (Rc::as_ptr(&frame.func.proto) as *const () as usize, *idx);
-                if let Some(o) = self.template_cache.get(&key) {
-                    push!(Value::Object(o.clone()));
-                } else {
-                    let parts = frame.func.proto.templates[*idx as usize].clone();
-                    // Cooked strings (an illegal escape cooks to `undefined`).
-                    let cooked: Vec<Value> = parts
-                        .cooked
-                        .iter()
-                        .map(|c| match c {
-                            Some(s) => Value::String(JsString::from_rc_str(s.clone())),
-                            None => Value::Undefined,
-                        })
-                        .collect();
-                    let arr = self.new_array(cooked);
-                    let raw: Vec<Value> = parts
-                        .raw
-                        .iter()
-                        .map(|s| Value::String(JsString::from_rc_str(s.clone())))
-                        .collect();
-                    let raw_arr = self.new_array(raw);
-                    // The `raw` array is frozen; `raw` is a non-enumerable,
-                    // non-writable, non-configurable own property of the
-                    // template object, which is itself frozen (spec
-                    // GetTemplateObject / TemplateString integrity).
-                    crate::builtins::fundamental::set_integrity_level(self, &raw_arr, true)?;
-                    arr.borrow_mut().props.insert(
-                        PropertyKey::str("raw"),
-                        Property {
-                            kind: PropertyKind::Data {
-                                value: Value::Object(raw_arr),
-                                writable: false,
-                            },
-                            enumerable: false,
-                            configurable: false,
-                        },
-                    );
-                    crate::builtins::fundamental::set_integrity_level(self, &arr, true)?;
-                    self.template_cache.insert(key, arr.clone());
-                    push!(Value::Object(arr));
-                }
+                let v = self.template_object(frame, *idx)?;
+                push!(v);
             }
+
             Op::ArrayPushElision => {
                 // For array literals we build via NewArray; elisions handled by
                 // pushing undefined holes at compile time.
@@ -4067,75 +6644,27 @@ impl Vm {
             Op::ArraySpread => {
                 let src = pop!();
                 let arr_v = pop!();
-                let items = self.iterate_to_vec(&src)?;
-                if let Value::Object(a) = &arr_v {
-                    let mut b = a.borrow_mut();
-                    if let Internal::Array(elems) = &mut b.internal {
-                        elems.extend(items);
-                    }
-                }
+                self.array_spread(&arr_v, &src)?;
                 push!(arr_v);
             }
-            Op::DefineField => {
+            Op::DefineField
+            | Op::DefineMethod
+            | Op::DefineGetter
+            | Op::DefineSetter
+            | Op::DefineMethodGetter
+            | Op::DefineMethodSetter => {
                 let value = pop!();
                 let key_v = pop!();
                 let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                if let Value::Object(o) = &obj {
-                    crate::builtins::fundamental::create_data_property_or_throw(
-                        self, o, &key, value,
-                    )?;
-                }
-                push!(obj);
-            }
-            Op::DefineMethod => {
-                // Class methods are non-enumerable (writable, configurable),
-                // defined with DefinePropertyOrThrow (a non-configurable own
-                // key — e.g. a computed static "prototype" — is a TypeError).
-                let value = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                if let Value::Object(o) = &obj {
-                    o.borrow_mut().props.insert(key, Property::builtin(value));
-                }
-                push!(obj);
-            }
-            Op::DefineGetter => {
-                let getter = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                self.define_accessor_with(&obj, key, Some(getter), None, true);
-                push!(obj);
-            }
-            Op::DefineSetter => {
-                let setter = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                self.define_accessor_with(&obj, key, None, Some(setter), true);
-                push!(obj);
-            }
-            Op::DefineMethodGetter => {
-                let getter = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                self.define_accessor_with(&obj, key, Some(getter), None, false);
-                push!(obj);
-            }
-            Op::DefineMethodSetter => {
-                let setter = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                let key = self.to_property_key(&key_v)?;
-                self.check_redefinable(&obj, &key)?;
-                self.define_accessor_with(&obj, key, None, Some(setter), false);
+                let kind = match op {
+                    Op::DefineField => crate::reg::DefKind::Field,
+                    Op::DefineMethod => crate::reg::DefKind::Method,
+                    Op::DefineGetter => crate::reg::DefKind::Getter,
+                    Op::DefineSetter => crate::reg::DefKind::Setter,
+                    Op::DefineMethodGetter => crate::reg::DefKind::MethodGetter,
+                    _ => crate::reg::DefKind::MethodSetter,
+                };
+                self.define_prop_kind(kind, &obj, &key_v, value)?;
                 push!(obj);
             }
             Op::SetHomeObject => {
@@ -4144,20 +6673,13 @@ impl Vm {
                 let n = frame.stack.len();
                 if n >= 3 {
                     let home = frame.stack[n - 3].clone();
-                    if let (Value::Object(home), Value::Object(m)) =
-                        (home, frame.stack[n - 1].clone())
-                    {
-                        if let Internal::Function(FunctionInner::Bytecode(bf)) =
-                            &mut m.borrow_mut().internal
-                        {
-                            Rc::make_mut(bf).home_object = Some(home);
-                        }
-                    }
+                    let m = frame.stack[n - 1].clone();
+                    Self::set_home_object_op(&home, &m);
                 }
             }
             Op::SetHomeObjectAt(n) => {
                 let len = frame.stack.len();
-                if len >= *n as usize + 1 {
+                if len > *n as usize {
                     let home = frame.stack[len - 1 - *n as usize].clone();
                     if let (Value::Object(home), Value::Object(m)) =
                         (home, frame.stack[len - 1].clone())
@@ -4217,21 +6739,7 @@ impl Vm {
             Op::ObjectSpread => {
                 let src = pop!();
                 let target = pop!();
-                if let Value::Object(t) = &target {
-                    if let Value::Object(s) = &src {
-                        for k in self.enumerable_own_keys_dyn(s)? {
-                            let val = self.get_prop(&src, &k)?;
-                            t.borrow_mut().props.insert(k, Property::data(val));
-                        }
-                    } else if let Value::String(st) = &src {
-                        for (i, c) in st.as_str().chars().enumerate() {
-                            t.borrow_mut().props.insert(
-                                PropertyKey::from_index(i as u32),
-                                Property::data(Value::str(c.to_string())),
-                            );
-                        }
-                    }
-                }
+                self.object_spread(&target, &src)?;
                 push!(target);
             }
             Op::CopyDataPropertiesExcept(n) => {
@@ -4243,28 +6751,7 @@ impl Vm {
                 }
                 let src = pop!();
                 let target = pop!();
-                if let Value::Object(t) = &target {
-                    if let Value::Object(s) = &src {
-                        // Excluded keys are skipped before ANY source access
-                        // (CopyDataProperties step 4.b.i): a proxy source must
-                        // not observe a [[GetOwnProperty]]/[[Get]] for them.
-                        for k in self.enumerable_own_keys_excluding(s, &excluded)? {
-                            let val = self.get_prop(&src, &k)?;
-                            t.borrow_mut().props.insert(k, Property::data(val));
-                        }
-                    } else if let Value::String(st) = &src {
-                        // A primitive-string source contributes its index keys.
-                        for (i, c) in st.as_str().chars().enumerate() {
-                            let k = PropertyKey::from_index(i as u32);
-                            if excluded.contains(&k) {
-                                continue;
-                            }
-                            t.borrow_mut()
-                                .props
-                                .insert(k, Property::data(Value::str(c.to_string())));
-                        }
-                    }
-                }
+                self.copy_data_props_except(&target, &src, &excluded)?;
                 push!(target);
             }
             Op::PrivateGet(i) => {
@@ -4487,47 +6974,14 @@ impl Vm {
                 if n >= 2 {
                     let value = frame.stack[n - 1].clone();
                     let key = frame.stack[n - 2].clone();
-                    if let Value::Object(f) = &value {
-                        if f.borrow().is_callable() {
-                            let base = match &key {
-                                Value::Symbol(sym) => match sym.description() {
-                                    Some(d) => format!("[{d}]"),
-                                    None => String::new(),
-                                },
-                                other => self.to_string_lossy(other),
-                            };
-                            let prefix = self.const_name(frame, *prefix);
-                            let name = if prefix.as_str().is_empty() {
-                                base
-                            } else {
-                                format!("{} {}", prefix.as_str(), base)
-                            };
-                            f.borrow_mut().props.insert(
-                                PropertyKey::str("name"),
-                                Property {
-                                    kind: PropertyKind::Data {
-                                        value: Value::str(name),
-                                        writable: false,
-                                    },
-                                    enumerable: false,
-                                    configurable: true,
-                                },
-                            );
-                        }
-                    }
+                    let prefix = self.const_name(frame, *prefix);
+                    self.set_function_name_from_key(&key, &value, prefix);
                 }
             }
             Op::SetProtoFromLiteral => {
                 let v = pop!();
                 let obj = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                if let Value::Object(o) = &obj {
-                    match v {
-                        Value::Object(p) => o.borrow_mut().proto = Some(p),
-                        Value::Null => o.borrow_mut().proto = None,
-                        // Non-object, non-null values are silently ignored.
-                        _ => {}
-                    }
-                }
+                Self::set_proto_from_literal(&obj, v);
             }
             Op::PushDisposeScope => {
                 frame.dispose_scopes.push(Vec::new());
@@ -4706,29 +7160,16 @@ impl Vm {
             Op::DeleteProp(i) => {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
-                // `delete base.x` does ToObject(base) (spec step 5.b): a
-                // nullish base is a TypeError before any delete is attempted.
-                self.require_object_coercible(&obj, "delete properties of")?;
-                let r = self.delete_prop(&obj, &PropertyKey::Str(name.clone()))?;
-                // Strict-mode `delete` that fails throws (spec 13.5.1.2 step 5.c).
-                if !r && frame.func.proto.is_strict {
-                    return Err(self.throw_type(&format!(
-                        "Cannot delete property '{}' in strict mode",
-                        name.as_str()
-                    )));
-                }
-                push!(Value::Bool(r));
+                let strict = frame.func.proto.is_strict;
+                let v = self.del_prop_named(obj, name, strict)?;
+                push!(v);
             }
             Op::DeletePropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
-                self.require_object_coercible(&obj, "delete properties of")?;
-                let key = self.to_property_key(&key_v)?;
-                let r = self.delete_prop(&obj, &key)?;
-                if !r && frame.func.proto.is_strict {
-                    return Err(self.throw_type("Cannot delete property in strict mode"));
-                }
-                push!(Value::Bool(r));
+                let strict = frame.func.proto.is_strict;
+                let v = self.del_prop_dynamic(obj, key_v, strict)?;
+                push!(v);
             }
             Op::ThrowConstAssign => {
                 return Err(self.throw_type("Assignment to constant variable."));
@@ -4837,7 +7278,7 @@ impl Vm {
                 let it = pop!();
                 let completion_is_throw =
                     matches!(frame.pending_completion, Some(Completion::Throw(_)));
-                let ret = match self.get_prop(&it, &PropertyKey::str("return")) {
+                let ret = match self.get_prop(&it, &crate::names::key_return()) {
                     Ok(r) => r,
                     Err(e) => {
                         if completion_is_throw {
@@ -4870,9 +7311,8 @@ impl Vm {
             }
             Op::ForInEnumerate => {
                 let v = pop!();
-                let keys = self.for_in_keys(&v)?;
-                frame.enumerators.push((keys, 0));
-                push!(Value::Number((frame.enumerators.len() - 1) as f64));
+                let idx = self.for_in_enumerate(frame, &v)?;
+                push!(idx);
             }
             Op::AsyncReturn => {
                 let v = pop!();
@@ -4891,7 +7331,11 @@ impl Vm {
                 let it = self.get_async_iterator(&v)?;
                 push!(it);
             }
-            _ => unreachable!("op handled inline in step: {op:?}"),
+            // Every op is either handled above or inline in the caller's
+            // dispatch loop. Reaching here means the compiler emitted an op
+            // this interpreter doesn't know — a tier bug that must stay
+            // inside the sandbox as a catchable error, not abort the host.
+            _ => return Err(self.throw_internal(&format!("unhandled op in step: {op:?}"))),
         }
         Ok(Ctl::Next)
     }
@@ -4932,7 +7376,7 @@ impl Vm {
         loop {
             let proto = {
                 let b = cur.borrow();
-                if b.props.contains_key(key) {
+                if b.own_contains_key(key) {
                     return true;
                 }
                 b.proto.clone()
@@ -4986,7 +7430,7 @@ impl Vm {
     /// definitions (`static ['prototype']() {}` must throw, not overwrite).
     fn check_redefinable(&mut self, obj: &Value, key: &PropertyKey) -> Result<(), Value> {
         if let Value::Object(o) = obj {
-            let non_config = o.borrow().props.get(key).is_some_and(|p| !p.configurable);
+            let non_config = o.borrow().own_get(key).is_some_and(|p| !p.configurable);
             if non_config {
                 return Err(self.throw_type(&format!("Cannot redefine property: {key:?}")));
             }
@@ -5035,7 +7479,7 @@ impl Vm {
     ) {
         if let Value::Object(o) = obj {
             let mut b = o.borrow_mut();
-            match b.props.get_mut(&key) {
+            match b.own_get_mut(&key) {
                 Some(Property {
                     kind: PropertyKind::Accessor { get: g, set: s },
                     ..
@@ -5048,7 +7492,7 @@ impl Vm {
                     }
                 }
                 _ => {
-                    b.props.insert(
+                    b.own_insert(
                         key,
                         Property {
                             kind: PropertyKind::Accessor { get, set },
@@ -5100,7 +7544,7 @@ impl Vm {
         ));
         {
             let mut b = obj.borrow_mut();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -5111,7 +7555,7 @@ impl Vm {
                     configurable: true,
                 },
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("name"),
                 Property {
                     kind: PropertyKind::Data {
@@ -5129,11 +7573,11 @@ impl Vm {
             FuncKind::Normal | FuncKind::ClassCtor | FuncKind::DerivedCtor
         ) {
             let proto_obj = self.new_object();
-            proto_obj.borrow_mut().props.insert(
+            proto_obj.borrow_mut().own_insert(
                 PropertyKey::str("constructor"),
                 Property::builtin(Value::Object(obj.clone())),
             );
-            obj.borrow_mut().props.insert(
+            obj.borrow_mut().own_insert(
                 PropertyKey::str("prototype"),
                 Property {
                     kind: PropertyKind::Data {
@@ -5163,7 +7607,7 @@ impl Vm {
                 self.realm.generator_proto.clone()
             };
             let proto_obj = self.alloc_ordinary(Some(instance_proto));
-            obj.borrow_mut().props.insert(
+            obj.borrow_mut().own_insert(
                 PropertyKey::str("prototype"),
                 Property {
                     kind: PropertyKind::Data {
@@ -5189,6 +7633,49 @@ impl Vm {
         // is by far the most common `+` in numeric code (loop counters, sums).
         if let (Value::Number(x), Value::Number(y)) = (&a, &b) {
             return Ok(Value::Number(x + y));
+        }
+        // Fast path: String + String. Both operands are already primitive —
+        // ToPrimitive and ToString are identities — so the result is their
+        // concatenation, with the same length cap and the same `concat` as
+        // the generic route below; skipped are two identity-clone
+        // ToPrimitive calls and two identity ToString round-trips (the glue
+        // idiom `label + ":" + v` pays this twice per join).
+        if let (Value::String(sa), Value::String(sb)) = (&a, &b) {
+            if sa.byte_len() + sb.byte_len() > crate::value::MAX_STRING_LEN {
+                return Err(self.throw_range("invalid string length"));
+            }
+            return Ok(Value::String(sa.concat(sb)));
+        }
+        // Fast path: a small plain string ⊕ a Number. Both operands are
+        // already primitive (ToPrimitive is the identity) and the result is
+        // the concatenation with the number's decimal form —
+        // `push_number_string` produces the EXACT digits `to_js_string`
+        // would. Formatting straight into the once-allocated result buffer
+        // skips two intermediate allocations and copies per `+`. Restricted
+        // to sub-rope-threshold flat strings so a big accumulator keeps
+        // `concat`'s O(1) rope path (a number string is ≤ 24 bytes, so the
+        // bound keeps the total in eager-copy territory either way).
+        {
+            let sn = match (&a, &b) {
+                (Value::String(s), Value::Number(n)) => Some((s, *n, true)),
+                (Value::Number(n), Value::String(s)) => Some((s, *n, false)),
+                _ => None,
+            };
+            if let Some((s, n, str_first)) = sn {
+                if let Some(flat) = s.as_flat_utf8() {
+                    if flat.len() + 24 < crate::value::ROPE_MIN_BYTES {
+                        let mut out = String::with_capacity(flat.len() + 24);
+                        if str_first {
+                            out.push_str(flat);
+                            crate::vm::push_number_string(n, &mut out);
+                        } else {
+                            crate::vm::push_number_string(n, &mut out);
+                            out.push_str(flat);
+                        }
+                        return Ok(Value::String(JsString::from(out)));
+                    }
+                }
+            }
         }
         let pa = self.to_primitive(&a, Hint::Default)?;
         let pb = self.to_primitive(&b, Hint::Default)?;
@@ -5484,7 +7971,7 @@ impl Vm {
         let has_inst = self.realm.symbol_has_instance.clone();
         let method = self.get_prop(ctor, &PropertyKey::Sym(has_inst))?;
         if self.is_callable(&method) {
-            let r = self.call(method, ctor.clone(), &[obj.clone()])?;
+            let r = self.call(method, ctor.clone(), std::slice::from_ref(obj))?;
             return Ok(self.to_boolean(&r));
         }
         if !cobj.borrow().is_callable() {
@@ -5516,12 +8003,26 @@ impl Vm {
     }
 }
 
+/// Integral array-index probe without libm: `Some(i as usize)` exactly when
+/// `i.fract() == 0.0 && (0.0..4294967295.0).contains(&i)` — i.e. `i` is a
+/// non-negative integral f64 strictly below 2^32-1 (the array-index bound).
+/// The saturating u32 cast round-trip IS the integrality+range test (`-0.0`
+/// round-trips to `0` and compares equal, negatives/NaN/too-large all fail
+/// the equality), so no libm `trunc` call is emitted.
+#[inline]
+fn dense_index(i: f64) -> Option<usize> {
+    let iu = i as u32;
+    if iu as f64 == i && iu != u32::MAX {
+        Some(iu as usize)
+    } else {
+        None
+    }
+}
+
 fn js_mod(a: f64, b: f64) -> f64 {
     if b == 0.0 || a.is_nan() || b.is_nan() || a.is_infinite() {
         f64::NAN
-    } else if b.is_infinite() {
-        a
-    } else if a == 0.0 {
+    } else if b.is_infinite() || a == 0.0 {
         a
     } else {
         // Fast path: both operands integral and exactly representable (|x| <=
@@ -5530,8 +8031,11 @@ fn js_mod(a: f64, b: f64) -> f64 {
         // zero result must carry the dividend's sign (-6 % 3 is -0 in JS, as
         // fmod also returns); restore that explicitly.
         const MAX_EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
-        if a.fract() == 0.0 && b.fract() == 0.0 && a.abs() <= MAX_EXACT && b.abs() <= MAX_EXACT {
-            let r = (a as i64) % (b as i64);
+                                                        // Integrality via cast round-trip (no libm trunc): within ±2^53 the
+                                                        // i64 cast is exact, so equality holds iff the value is integral.
+        let (ai, bi) = (a as i64, b as i64);
+        if ai as f64 == a && bi as f64 == b && a.abs() <= MAX_EXACT && b.abs() <= MAX_EXACT {
+            let r = ai % bi;
             if r == 0 {
                 return if a.is_sign_negative() { -0.0 } else { 0.0 };
             }
@@ -5600,7 +8104,7 @@ fn writeback_kernel_props(
             continue;
         }
         let mut b = objs[p.oslot as usize].borrow_mut();
-        match b.props.get_index_mut(prop_slots[i] as usize) {
+        match b.own_get_index_mut(prop_slots[i] as usize) {
             Some((
                 _,
                 Property {
@@ -5608,23 +8112,119 @@ fn writeback_kernel_props(
                     ..
                 },
             )) => *value = Value::Number(regs[prop_base + i]),
-            _ => unreachable!("kernel prop slot invariant"),
+            // The entry guard pinned this slot to a Number data property and
+            // nothing in-region can restructure a property map; a mismatch is
+            // a tier bug. Land the value on the right property by KEY instead
+            // of aborting the process — best-effort, but never silent loss.
+            _ => {
+                b.own_insert(
+                    PropertyKey::str(&p.key),
+                    Property::data(Value::Number(regs[prop_base + i])),
+                );
+            }
         }
     }
+}
+
+/// Belt-and-braces alias check for a cell-writing function kernel
+/// ([`crate::bytecode::Kernel::uv_writes`]): distinct upvalue indices are
+/// distinct bindings by construction, but the buffered writes must never be
+/// able to diverge from the generic write-through order, so a written cell
+/// aliasing any other captured cell declines the call. Out of line to keep
+/// `run_fn_kernel` small (write-free kernels skip it entirely).
+#[inline(never)]
+fn uv_write_cells_alias(k: &crate::bytecode::Kernel, bf: &BytecodeFunction) -> bool {
+    k.uv_writes.iter().any(|&(_, u)| {
+        let cell = &bf.upvalues[u as usize];
+        k.locals.iter().any(|slot| {
+            matches!(slot, crate::bytecode::KSlot::Upvalue(u2)
+                if *u2 != u && Rc::ptr_eq(cell, &bf.upvalues[*u2 as usize]))
+        })
+    })
+}
+
+/// Flush a cell-writing kernel's written registers back to their cells, on
+/// BOTH completions. On return this is the generic path's final cell state.
+/// On an interrupt the registers hold every completed store (an upvalue
+/// register is written only by translated stores), so the flush leaves
+/// exactly the generic prefix state at that poll point — the same contract
+/// as the loop kernels' local write-back on the interrupt unwind.
+#[inline(never)]
+fn flush_uv_writes(k: &crate::bytecode::Kernel, bf: &BytecodeFunction, regs: &[f64; KWIN]) {
+    for &(r, u) in k.uv_writes.iter() {
+        *bf.upvalues[u as usize].borrow_mut() = Value::Number(regs[usize::from(r) & KWIN_MASK]);
+    }
+}
+
+/// Cross-window alias check for the pinned-callee path when any callee
+/// writes cells: a written cell captured by ANOTHER callee window (whose
+/// upvalue snapshot loads once per activation) or by the CALLER kernel's
+/// own upvalue registers would go stale after the first flush, so any such
+/// overlap declines the activation. Distinct bindings are distinct cells —
+/// this only fires when the same closure (or a shared captured binding) is
+/// pinned more than once. Out of line: write-free activations never call it.
+#[inline(never)]
+fn callee_cell_writes_alias(
+    callee_bfs: &[(Rc<BytecodeFunction>, u32)],
+    caller: &crate::bytecode::Kernel,
+    caller_upvalues: &[Rc<RefCell<Value>>],
+) -> bool {
+    for (i, (bf, _)) in callee_bfs.iter().enumerate() {
+        let ck = bf.proto.fn_kernel.as_ref().expect("guarded");
+        for &(_, u) in ck.uv_writes.iter() {
+            let cell = &bf.upvalues[u as usize];
+            // The caller kernel's own upvalue snapshots.
+            for slot in caller.locals.iter() {
+                if let crate::bytecode::KSlot::Upvalue(cu) = slot {
+                    if Rc::ptr_eq(cell, &caller_upvalues[*cu as usize]) {
+                        return true;
+                    }
+                }
+            }
+            // Every OTHER callee window's captured cells (the same callee's
+            // own aliases were declined per-callee at entry).
+            for (j, (bf2, _)) in callee_bfs.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let ck2 = bf2.proto.fn_kernel.as_ref().expect("guarded");
+                for slot in ck2.locals.iter() {
+                    if let crate::bytecode::KSlot::Upvalue(u2) = slot {
+                        if Rc::ptr_eq(cell, &bf2.upvalues[*u2 as usize]) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Outcome of a frameless function-kernel body ([`exec_fn_kernel_code`] /
+/// [`run_callee_window`]). `BadOp` reports an op fn-mode translation promised
+/// it never emits — a TIER BUG, but one the caller can survive: function
+/// kernels are pure (registers only; cell flushes happen after the executor
+/// returns), so a caller with a generic path re-runs there, and one without
+/// throws a catchable internal error. Never a process abort.
+enum FnKernelOut {
+    Ret(Value),
+    Interrupted,
+    BadOp,
 }
 
 /// Execute a plain (non-recursive, frameless) FUNCTION kernel body over
 /// `regs`, returning the call's result — `Value::Number`, or `Value::Bool`
 /// for a boolean-typed `Ret`. Shared by the per-call [`Vm::run_fn_kernel`]
 /// entry and the prepared-callback path ([`Vm::exec_prepared_kernel`]).
-/// Returns `None` when the cooperative interrupt flag latched on a back-edge
-/// poll — the caller owns the budget-zeroing unwind.
+/// Returns `Interrupted` when the cooperative interrupt flag latched on a
+/// back-edge poll — the caller owns the budget-zeroing unwind.
 fn exec_fn_kernel_code(
     code: &[KOp],
-    regs: &mut [f64],
+    regs: &mut [f64; KWIN],
     interrupt: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     poll: &mut u32,
-) -> Option<Value> {
+) -> FnKernelOut {
     let mut pc = 0usize;
     loop {
         macro_rules! branch {
@@ -5635,7 +8235,7 @@ fn exec_fn_kernel_code(
                     if *poll & 0xFF == 0 {
                         if let Some(flag) = interrupt {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                return None;
+                                return FnKernelOut::Interrupted;
                             }
                         }
                     }
@@ -5645,19 +8245,34 @@ fn exec_fn_kernel_code(
             }};
         }
         match code[pc] {
-            KOp::Mov { dst, src } => regs[dst as usize] = regs[src as usize],
-            KOp::Const { dst, k } => regs[dst as usize] = k,
-            KOp::Add { dst, a, b } => regs[dst as usize] = regs[a as usize] + regs[b as usize],
-            KOp::AddK { dst, a, k } => regs[dst as usize] = regs[a as usize] + k,
+            KOp::Mov { dst, src } => {
+                regs[dst as usize & KWIN_MASK] = regs[src as usize & KWIN_MASK]
+            }
+            KOp::Const { dst, k } => regs[dst as usize & KWIN_MASK] = k,
+            KOp::Add { dst, a, b } => {
+                regs[dst as usize & KWIN_MASK] =
+                    regs[a as usize & KWIN_MASK] + regs[b as usize & KWIN_MASK]
+            }
+            KOp::AddK { dst, a, k } => {
+                regs[dst as usize & KWIN_MASK] = regs[a as usize & KWIN_MASK] + k
+            }
             KOp::Arith { kind, dst, a, b } => {
-                regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind)
+                regs[dst as usize & KWIN_MASK] = number_arith_raw(
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                    kind,
+                )
             }
             KOp::ArithK { kind, dst, a, k } => {
-                regs[dst as usize] = number_arith_raw(regs[a as usize], k, kind)
+                regs[dst as usize & KWIN_MASK] =
+                    number_arith_raw(regs[a as usize & KWIN_MASK], k, kind)
             }
-            KOp::Neg { dst, src } => regs[dst as usize] = -regs[src as usize],
+            KOp::Neg { dst, src } => {
+                regs[dst as usize & KWIN_MASK] = -regs[src as usize & KWIN_MASK]
+            }
             KOp::BitNot { dst, src } => {
-                regs[dst as usize] = !crate::vm::to_int32(regs[src as usize]) as f64
+                regs[dst as usize & KWIN_MASK] =
+                    !crate::vm::to_int32(regs[src as usize & KWIN_MASK]) as f64
             }
             KOp::Br { target } => branch!(target),
             KOp::BrCmp {
@@ -5667,7 +8282,12 @@ fn exec_fn_kernel_code(
                 if_true,
                 target,
             } => {
-                if knum_cmp(cmp, regs[a as usize], regs[b as usize]) == if_true {
+                if knum_cmp(
+                    cmp,
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                ) == if_true
+                {
                     branch!(target)
                 }
             }
@@ -5678,41 +8298,51 @@ fn exec_fn_kernel_code(
                 if_true,
                 target,
             } => {
-                if knum_cmp(cmp, regs[a as usize], k) == if_true {
+                if knum_cmp(cmp, regs[a as usize & KWIN_MASK], k) == if_true {
                     branch!(target)
                 }
             }
             KOp::BrFalsy { src, target } => {
-                if !knum_truthy(regs[src as usize]) {
+                if !knum_truthy(regs[src as usize & KWIN_MASK]) {
                     branch!(target)
                 }
             }
             KOp::BrTruthy { src, target } => {
-                if knum_truthy(regs[src as usize]) {
+                if knum_truthy(regs[src as usize & KWIN_MASK]) {
                     branch!(target)
                 }
             }
             KOp::CmpSet { cmp, dst, a, b } => {
-                regs[dst as usize] = if knum_cmp(cmp, regs[a as usize], regs[b as usize]) {
+                regs[dst as usize & KWIN_MASK] = if knum_cmp(
+                    cmp,
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                ) {
                     1.0
                 } else {
                     0.0
                 }
             }
             KOp::BoolNot { dst, src } => {
-                regs[dst as usize] = if knum_truthy(regs[src as usize]) {
+                regs[dst as usize & KWIN_MASK] = if knum_truthy(regs[src as usize & KWIN_MASK]) {
                     0.0
                 } else {
                     1.0
                 }
             }
-            KOp::Math1 { kind, dst, src } => regs[dst as usize] = kmath1(kind, regs[src as usize]),
+            KOp::Math1 { kind, dst, src } => {
+                regs[dst as usize & KWIN_MASK] = kmath1(kind, regs[src as usize & KWIN_MASK])
+            }
             KOp::Math2 { kind, dst, a, b } => {
-                regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
+                regs[dst as usize & KWIN_MASK] = kmath2(
+                    kind,
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                )
             }
             KOp::Mov2 { d1, s1, d2, s2 } => {
-                regs[d1 as usize] = regs[s1 as usize];
-                regs[d2 as usize] = regs[s2 as usize];
+                regs[d1 as usize & KWIN_MASK] = regs[s1 as usize & KWIN_MASK];
+                regs[d2 as usize & KWIN_MASK] = regs[s2 as usize & KWIN_MASK];
                 // The unfused second op remains in the next slot as a
                 // branch-target landing pad; skip it.
                 pc += 1;
@@ -5726,47 +8356,84 @@ fn exec_fn_kernel_code(
                 a2,
                 b2,
             } => {
-                regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind);
-                regs[d2 as usize] = regs[a2 as usize] + regs[b2 as usize];
+                regs[dst as usize & KWIN_MASK] = number_arith_raw(
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                    kind,
+                );
+                regs[d2 as usize & KWIN_MASK] =
+                    regs[a2 as usize & KWIN_MASK] + regs[b2 as usize & KWIN_MASK];
                 pc += 1;
             }
             KOp::AddKBr { dst, a, k, target } => {
-                regs[dst as usize] = regs[a as usize] + k;
+                regs[dst as usize & KWIN_MASK] = regs[a as usize & KWIN_MASK] + k;
                 branch!(target)
             }
+            KOp::ArithKAdd {
+                kind,
+                dst,
+                a,
+                k,
+                d2,
+                a2,
+                b2,
+            } => {
+                regs[dst as usize & KWIN_MASK] =
+                    number_arith_raw(regs[a as usize & KWIN_MASK], k, kind);
+                regs[d2 as usize & KWIN_MASK] =
+                    regs[a2 as usize & KWIN_MASK] + regs[b2 as usize & KWIN_MASK];
+                pc += 1;
+            }
             KOp::Ret { src, boolean } => {
-                return Some(if boolean {
-                    Value::Bool(regs[src as usize] != 0.0)
+                return FnKernelOut::Ret(if boolean {
+                    Value::Bool(regs[src as usize & KWIN_MASK] != 0.0)
                 } else {
-                    Value::Number(regs[src as usize])
+                    Value::Number(regs[src as usize & KWIN_MASK])
                 })
             }
             // A frameless kernel has no bytecode frame to bail into;
             // fn-mode translation rejects anything needing one. A
             // SelfCall implies `self_global`, dispatched by the caller.
+            // Meeting one anyway is a translator bug — report it so the
+            // caller can fall back or throw, instead of aborting the process.
             KOp::ArrayPush { .. }
             | KOp::ArrayPop { .. }
             | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
+            | KOp::StrLen { .. }
+            | KOp::CharCodeAt { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. }
+            | KOp::LenBrCmp { .. }
             | KOp::LoadProp { .. }
             | KOp::StoreProp { .. }
             | KOp::Exit { .. }
             | KOp::CallKernel { .. }
-            | KOp::SelfCall { .. } => unreachable!("bail op in a function kernel"),
+            | KOp::SelfCall { .. } => return FnKernelOut::BadOp,
         }
         pc += 1;
     }
 }
 
+/// Outcome of a pinned-callee kernel window run (see [`FnKernelOut`] for the
+/// `BadOp` rationale).
+enum CalleeOut {
+    Ret(f64),
+    Interrupted,
+    BadOp,
+}
+
+/// Run a pinned-callee kernel over its own fixed window. Returns the callee's
+/// `Ret` value (Number-only — the caller guard rejected boolean returns), or
+/// `Interrupted` when the cooperative interrupt flag latched on a back-edge
+/// poll.
 fn run_callee_window(
-    regs: &mut [f64],
+    regs: &mut [f64; KWIN],
     ck: &crate::bytecode::Kernel,
-    win: usize,
-    dst: usize,
     interrupt: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     poll: &mut u32,
-) -> bool {
+) -> CalleeOut {
     let code = &ck.code;
     let mut pc = 0usize;
     loop {
@@ -5778,7 +8445,7 @@ fn run_callee_window(
                     if *poll & 0xFF == 0 {
                         if let Some(flag) = interrupt {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                return false;
+                                return CalleeOut::Interrupted;
                             }
                         }
                     }
@@ -5788,22 +8455,34 @@ fn run_callee_window(
             }};
         }
         match code[pc] {
-            KOp::Mov { dst, src } => regs[win + dst as usize] = regs[win + src as usize],
-            KOp::Const { dst, k } => regs[win + dst as usize] = k,
-            KOp::Add { dst, a, b } => {
-                regs[win + dst as usize] = regs[win + a as usize] + regs[win + b as usize]
+            KOp::Mov { dst, src } => {
+                regs[dst as usize & KWIN_MASK] = regs[src as usize & KWIN_MASK]
             }
-            KOp::AddK { dst, a, k } => regs[win + dst as usize] = regs[win + a as usize] + k,
+            KOp::Const { dst, k } => regs[dst as usize & KWIN_MASK] = k,
+            KOp::Add { dst, a, b } => {
+                regs[dst as usize & KWIN_MASK] =
+                    regs[a as usize & KWIN_MASK] + regs[b as usize & KWIN_MASK]
+            }
+            KOp::AddK { dst, a, k } => {
+                regs[dst as usize & KWIN_MASK] = regs[a as usize & KWIN_MASK] + k
+            }
             KOp::Arith { kind, dst, a, b } => {
-                regs[win + dst as usize] =
-                    number_arith_raw(regs[win + a as usize], regs[win + b as usize], kind)
+                regs[dst as usize & KWIN_MASK] = number_arith_raw(
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                    kind,
+                )
             }
             KOp::ArithK { kind, dst, a, k } => {
-                regs[win + dst as usize] = number_arith_raw(regs[win + a as usize], k, kind)
+                regs[dst as usize & KWIN_MASK] =
+                    number_arith_raw(regs[a as usize & KWIN_MASK], k, kind)
             }
-            KOp::Neg { dst, src } => regs[win + dst as usize] = -regs[win + src as usize],
+            KOp::Neg { dst, src } => {
+                regs[dst as usize & KWIN_MASK] = -regs[src as usize & KWIN_MASK]
+            }
             KOp::BitNot { dst, src } => {
-                regs[win + dst as usize] = !crate::vm::to_int32(regs[win + src as usize]) as f64
+                regs[dst as usize & KWIN_MASK] =
+                    !crate::vm::to_int32(regs[src as usize & KWIN_MASK]) as f64
             }
             KOp::Br { target } => branch!(target),
             KOp::BrCmp {
@@ -5813,7 +8492,12 @@ fn run_callee_window(
                 if_true,
                 target,
             } => {
-                if knum_cmp(cmp, regs[win + a as usize], regs[win + b as usize]) == if_true {
+                if knum_cmp(
+                    cmp,
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                ) == if_true
+                {
                     branch!(target)
                 }
             }
@@ -5824,45 +8508,51 @@ fn run_callee_window(
                 if_true,
                 target,
             } => {
-                if knum_cmp(cmp, regs[win + a as usize], k) == if_true {
+                if knum_cmp(cmp, regs[a as usize & KWIN_MASK], k) == if_true {
                     branch!(target)
                 }
             }
             KOp::BrFalsy { src, target } => {
-                if !knum_truthy(regs[win + src as usize]) {
+                if !knum_truthy(regs[src as usize & KWIN_MASK]) {
                     branch!(target)
                 }
             }
             KOp::BrTruthy { src, target } => {
-                if knum_truthy(regs[win + src as usize]) {
+                if knum_truthy(regs[src as usize & KWIN_MASK]) {
                     branch!(target)
                 }
             }
             KOp::CmpSet { cmp, dst, a, b } => {
-                regs[win + dst as usize] =
-                    if knum_cmp(cmp, regs[win + a as usize], regs[win + b as usize]) {
-                        1.0
-                    } else {
-                        0.0
-                    }
+                regs[dst as usize & KWIN_MASK] = if knum_cmp(
+                    cmp,
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                ) {
+                    1.0
+                } else {
+                    0.0
+                }
             }
             KOp::BoolNot { dst, src } => {
-                regs[win + dst as usize] = if knum_truthy(regs[win + src as usize]) {
+                regs[dst as usize & KWIN_MASK] = if knum_truthy(regs[src as usize & KWIN_MASK]) {
                     0.0
                 } else {
                     1.0
                 }
             }
             KOp::Math1 { kind, dst, src } => {
-                regs[win + dst as usize] = kmath1(kind, regs[win + src as usize])
+                regs[dst as usize & KWIN_MASK] = kmath1(kind, regs[src as usize & KWIN_MASK])
             }
             KOp::Math2 { kind, dst, a, b } => {
-                regs[win + dst as usize] =
-                    kmath2(kind, regs[win + a as usize], regs[win + b as usize])
+                regs[dst as usize & KWIN_MASK] = kmath2(
+                    kind,
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                )
             }
             KOp::Mov2 { d1, s1, d2, s2 } => {
-                regs[win + d1 as usize] = regs[win + s1 as usize];
-                regs[win + d2 as usize] = regs[win + s2 as usize];
+                regs[d1 as usize & KWIN_MASK] = regs[s1 as usize & KWIN_MASK];
+                regs[d2 as usize & KWIN_MASK] = regs[s2 as usize & KWIN_MASK];
                 pc += 1;
             }
             KOp::ArithAdd {
@@ -5874,32 +8564,56 @@ fn run_callee_window(
                 a2,
                 b2,
             } => {
-                regs[win + dst as usize] =
-                    number_arith_raw(regs[win + a as usize], regs[win + b as usize], kind);
-                regs[win + d2 as usize] = regs[win + a2 as usize] + regs[win + b2 as usize];
+                regs[dst as usize & KWIN_MASK] = number_arith_raw(
+                    regs[a as usize & KWIN_MASK],
+                    regs[b as usize & KWIN_MASK],
+                    kind,
+                );
+                regs[d2 as usize & KWIN_MASK] =
+                    regs[a2 as usize & KWIN_MASK] + regs[b2 as usize & KWIN_MASK];
                 pc += 1;
             }
             KOp::AddKBr { dst, a, k, target } => {
-                regs[win + dst as usize] = regs[win + a as usize] + k;
+                regs[dst as usize & KWIN_MASK] = regs[a as usize & KWIN_MASK] + k;
                 branch!(target)
             }
+            KOp::ArithKAdd {
+                kind,
+                dst,
+                a,
+                k,
+                d2,
+                a2,
+                b2,
+            } => {
+                regs[dst as usize & KWIN_MASK] =
+                    number_arith_raw(regs[a as usize & KWIN_MASK], k, kind);
+                regs[d2 as usize & KWIN_MASK] =
+                    regs[a2 as usize & KWIN_MASK] + regs[b2 as usize & KWIN_MASK];
+                pc += 1;
+            }
             KOp::Ret { src, boolean: _ } => {
-                // Number-only (the caller guard rejected boolean returns).
-                regs[dst] = regs[win + src as usize];
-                return true;
+                return CalleeOut::Ret(regs[src as usize & KWIN_MASK]);
             }
             // Impossible in a guarded callee: no bails, no exits, no
-            // recursion, no nested closure calls.
+            // recursion, no nested closure calls. Meeting one is a tier bug;
+            // report it (the caller throws a catchable internal error)
+            // instead of aborting the process.
             KOp::ArrayPush { .. }
             | KOp::ArrayPop { .. }
             | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
+            | KOp::StrLen { .. }
+            | KOp::CharCodeAt { .. }
+            | KOp::LoadElemAdd { .. }
+            | KOp::LoadElemArith { .. }
+            | KOp::LenBrCmp { .. }
             | KOp::LoadProp { .. }
             | KOp::StoreProp { .. }
             | KOp::Exit { .. }
             | KOp::SelfCall { .. }
-            | KOp::CallKernel { .. } => unreachable!("unsupported op in a callee kernel"),
+            | KOp::CallKernel { .. } => return CalleeOut::BadOp,
         }
         pc += 1;
     }

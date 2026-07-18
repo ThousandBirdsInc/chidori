@@ -184,9 +184,9 @@ impl Vfs {
                 if force {
                     return Ok(());
                 }
-                return Err(format!(
+                Err(format!(
                     "ENOENT: no such file or directory, unlink '{path}'"
-                ));
+                ))
             }
             Some(VfsNode::File { .. }) => {
                 self.nodes.remove(&path);

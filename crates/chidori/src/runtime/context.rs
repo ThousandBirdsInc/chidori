@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -10,9 +11,9 @@ use crate::runtime::capability::{Capability, CapabilityLedger};
 use crate::runtime::otel::RunSpan;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseTable, PendingHostOperation,
-    PendingHostOperationKind, QueuedSignal, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
-    SIGNAL_INBOX_FILE,
+    PendingHostOperationKind, QueuedSignal, PENDING_HOST_OPERATION_FILE, SIGNAL_INBOX_FILE,
 };
+use crate::runtime::store::{FsRunStore, RunStore};
 use crate::runtime::vfs::Vfs;
 
 /// A streaming event the runtime emits while an agent runs. CallRecord is
@@ -102,23 +103,165 @@ impl HostOperationCompletionSafepoint {
     }
 }
 
+/// A pre-loaded replay journal with lookup indexes built once at
+/// construction. A resume calls `try_replay` (and, on every hit,
+/// `absorb_replayed_subtree`) once per recorded effect, so without the
+/// indexes a full resume sweep scans — and the absorb path deep-cloned —
+/// the entire journal per effect: O(N²) in run history. The journal is
+/// immutable after construction, so the indexes never need maintenance.
+#[derive(Debug)]
+struct ReplayJournal {
+    records: Vec<CallRecord>,
+    /// seq → index of its first record (first occurrence wins, mirroring the
+    /// linear scan this replaces).
+    by_seq: HashMap<u64, usize>,
+    /// parent seq → indices of its direct children, in journal order.
+    children: HashMap<u64, Vec<usize>>,
+}
+
+impl ReplayJournal {
+    fn new(records: Vec<CallRecord>) -> Self {
+        let mut by_seq = HashMap::with_capacity(records.len());
+        let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, r) in records.iter().enumerate() {
+            by_seq.entry(r.seq).or_insert(i);
+            if let Some(parent) = r.parent_seq {
+                children.entry(parent).or_default().push(i);
+            }
+        }
+        Self {
+            records,
+            by_seq,
+            children,
+        }
+    }
+}
+
+/// Outcome of a warm input pause ([`WarmInputBridge`]).
+pub enum WarmInputWait {
+    /// The `input()` response arrived while the VM stayed live: continue with
+    /// it in place.
+    Delivered(String),
+    /// Park (no supervisor waiting, eviction deadline, capacity): unwind via
+    /// the ordinary PAUSE_MARKER path and resume by replay later.
+    Park,
+}
+
+/// Warm-resume bridge installed by the session server: when an `input()`
+/// listen point in Pause mode has no cached response, the bridge surfaces the
+/// pause to the server (which answers the HTTP request) and BLOCKS the engine
+/// thread until the response is delivered — the continuation then costs O(1)
+/// instead of an O(history) replay re-execution. The pending operation is
+/// durable on disk BEFORE the bridge is consulted, so a crash while parked
+/// resumes by replay exactly as an unwound pause would; `Park` (eviction,
+/// capacity, shutdown) degrades to that same path at any time.
+#[derive(Clone)]
+pub struct WarmInputBridge(
+    Arc<dyn Fn(&RuntimeContext, &PendingInput) -> WarmInputWait + Send + Sync>,
+);
+
+impl std::fmt::Debug for WarmInputBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WarmInputBridge").finish_non_exhaustive()
+    }
+}
+
+impl WarmInputBridge {
+    pub fn new(
+        callback: impl Fn(&RuntimeContext, &PendingInput) -> WarmInputWait + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn wait(&self, ctx: &RuntimeContext, pending: &PendingInput) -> WarmInputWait {
+        (self.0)(ctx, pending)
+    }
+}
+
+/// Outcome of an actor's inline listen-point wait ([`ActorSignalWaiter`]).
+pub enum ActorSignalWait {
+    /// A matching message reached the actor's shared mailbox; the caller
+    /// should pump the mailbox into the run-level inbox and retry the drain.
+    Delivered,
+    /// The listen point's own `timeoutMs` deadline elapsed: resolve with the
+    /// timeout sentinel in place.
+    TimedOut,
+    /// Park the actor (stop requested or idle cap reached): fall back to the
+    /// pause/hibernate path.
+    Park,
+}
+
+/// Inline mailbox wait installed by the actor supervisor
+/// (`host_actor::supervise`). When present, a `chidori.signal`-family listen
+/// point with an empty inbox BLOCKS here for the next matching delivery and
+/// resumes in place — the actor's history is not re-executed per message,
+/// which is what made a signal-driven actor O(messages²) over its lifetime.
+/// Stop and idle still park through the ordinary pause path (`Park`), so
+/// hibernation and supervision semantics are unchanged. Args: the listen
+/// names and the listen point's `timeoutMs`.
+#[derive(Clone)]
+pub struct ActorSignalWaiter(Arc<dyn Fn(&[String], Option<u64>) -> ActorSignalWait + Send + Sync>);
+
+impl std::fmt::Debug for ActorSignalWaiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorSignalWaiter").finish_non_exhaustive()
+    }
+}
+
+impl ActorSignalWaiter {
+    pub fn new(
+        callback: impl Fn(&[String], Option<u64>) -> ActorSignalWait + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn wait(&self, names: &[String], timeout_ms: Option<u64>) -> ActorSignalWait {
+        (self.0)(names, timeout_ms)
+    }
+}
+
 #[derive(Debug)]
 struct RuntimeContextInner {
     /// Agent-level defaults set via config().
     pub config: AgentConfig,
     /// Accumulated call log for checkpointing / tracing.
     pub call_log: CallLog,
+    /// True when `call_log` holds records that never went through
+    /// `RunStore::append_record` — records pushed while replaying a resume
+    /// (`try_replay` / `absorb_replayed_subtree`), including the synthetic
+    /// resume record. The durable safepoints write the full `checkpoint.json`
+    /// only while this is set (or at explicit compaction points); live
+    /// records are already durable via the O(1) journal append in
+    /// `record_call`, so steady-state safepoints skip the O(history) rewrite.
+    pub call_log_dirty: bool,
+    /// How many records in `call_log` were served from the replay journal
+    /// (`try_replay` / `absorb_replayed_subtree`) rather than executed live.
+    /// Surfaced after a resume so the consumer can audit what a recovery
+    /// actually replayed vs. re-executed (and re-billed).
+    pub replay_hits: u64,
     /// Sequence counter for call log entries.
     pub seq: u64,
     /// Pre-loaded call log for replay mode. When set, host functions
     /// return cached results instead of executing for matching sequence numbers.
-    pub replay_log: Option<Vec<CallRecord>>,
+    pub replay_log: Option<ReplayJournal>,
     /// Unique identifier for this run. Used as the subdirectory name
     /// under `.chidori/runs/` when persistence is enabled.
     pub run_id: String,
-    /// Directory into which the checkpoint file is written after each call.
-    /// None disables on-disk persistence.
+    /// Directory into which the run's durable artifacts are written.
+    /// None disables persistence. Kept alongside `store` because branch
+    /// stores and out-of-band tooling still address artifacts by path.
     pub persist_dir: Option<PathBuf>,
+    /// The persistence handle every durable write goes through. Filesystem by
+    /// default (`enable_persistence`); a configured durable mirror rides along
+    /// via `enable_persistence_with_store` (`docs/durable-storage.md`).
+    pub store: Option<Arc<dyn RunStore>>,
+    /// First persistence failure observed on this run, when the durability
+    /// policy is strict. Checked before the next live host effect executes so
+    /// a run cannot keep taking side effects its journal isn't recording.
+    pub persist_failure: Option<String>,
+    /// Whether persistence failures poison the run (`CHIDORI_DURABILITY=strict`)
+    /// or are logged and tolerated (default, the pre-store behavior).
+    pub strict_durability: bool,
     /// How `input()` should behave when there is no cached response:
     /// read from stdin, or pause the run and surface the prompt to the caller.
     pub input_mode: InputMode,
@@ -164,6 +307,12 @@ struct RuntimeContextInner {
     /// Optional durable safepoint invoked after a host operation result is
     /// persisted and recorded, before control returns to JavaScript.
     pub host_operation_completion_safepoint: Option<HostOperationCompletionSafepoint>,
+    /// Optional inline mailbox wait for actor listen points (see
+    /// [`ActorSignalWaiter`]); installed per supervision iteration.
+    pub actor_signal_waiter: Option<ActorSignalWaiter>,
+    /// Optional warm-resume bridge for `input()` pauses (see
+    /// [`WarmInputBridge`]); installed by the session server's run legs.
+    pub warm_input_bridge: Option<WarmInputBridge>,
     /// Optional scoped workspace root exposed through `chidori.workspace`.
     pub workspace_root: Option<PathBuf>,
     /// Seqs of host calls currently executing (their `live()` is on the
@@ -191,11 +340,6 @@ struct RuntimeContextInner {
     /// `chidori.branch_label` on its span so a fan-out's subtrees are
     /// filterable per variant in the backend.
     pub otel_branch: Option<crate::runtime::otel::BranchTag>,
-    /// Strict replay (the `chidori resume --ci` regression mode): a cached
-    /// call whose recorded args differ from what the agent passes now is
-    /// divergence, not a silent cache hit. Off by default — normal replay is
-    /// deliberately tolerant of cosmetic arg changes.
-    pub strict_replay_args: bool,
     /// Optional host-supplied model override (Pi-style save point). When set,
     /// every prompt host call (`execute_prompt_text` / `execute_prompt_response`)
     /// consults it just before sending and, if it yields `Some(model)`, swaps
@@ -203,6 +347,15 @@ struct RuntimeContextInner {
     /// for *every* execution path that runs through the prompt bindings — the
     /// native agent loop and the TypeScript interactive engine alike.
     pub model_override: Option<ModelOverride>,
+    /// The run's actor hub (spawned actor sub-runs, their mailboxes, and the
+    /// name registry — `docs/actors.md`). Created lazily by the first
+    /// `chidori.actors.spawn`; actor sub-run contexts share the spawning run's
+    /// hub so sends, receives, and lookups all address one table.
+    pub actor_hub: Option<Arc<crate::runtime::host_actor::ActorHub>>,
+    /// Set on actor sub-run contexts: this context's pid in the hub. Routes
+    /// `chidori.receive` to the actor's own mailbox, stamps outgoing message
+    /// senders, and scopes join/stop to the owning spawner.
+    pub actor_id: Option<String>,
 }
 
 /// Host-supplied callback returning the current model override, or `None` to
@@ -218,6 +371,7 @@ impl std::fmt::Debug for ModelOverride {
 }
 
 impl ModelOverride {
+    #[allow(dead_code)] // Exercised only by tests today; the lib target sees it as dead.
     pub fn new(callback: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
         Self(Arc::new(callback))
     }
@@ -241,6 +395,11 @@ pub enum InputMode {
 pub struct PendingInput {
     pub seq: u64,
     pub prompt: String,
+    /// The artifact under review (`input()`'s `opts.details`) — surfaced to
+    /// whoever answers (CLI render, server `pending_details`) so an approval
+    /// gate can show what it is approving. Never part of the durable record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 
 /// Set by `execute_signal` / `execute_signal_any` when a listen point has no
@@ -256,7 +415,7 @@ pub struct PendingSignal {
     /// (`signalAny`). Kept as the primary name for views and messages.
     pub name: String,
     /// The full awaited name set. `[name]` for `chidori.signal(name)`; the
-    /// listen set for `chidori.signalAny(names)`. A delivery matching ANY of
+    /// listen set for the fan-in `chidori.signal(names[])`. A delivery matching ANY of
     /// these resolves the pause.
     #[serde(default)]
     pub names: Vec<String>,
@@ -305,8 +464,81 @@ pub struct PendingApproval {
 }
 
 /// Marker text used to tag the pause sentinel error so the engine can
-/// distinguish it from a genuine failure.
-pub const PAUSE_MARKER: &str = "__CHIDORI_PAUSED_FOR_INPUT__";
+/// distinguish it from a genuine failure. Lives in [`crate::runtime::errors`]
+/// with the typed [`crate::runtime::errors::RunInterrupt`] taxonomy;
+/// re-exported here for the historical import path.
+#[allow(unused_imports)]
+// Historical-path re-export; the bin target compiles the module tree separately and never uses it.
+pub use crate::runtime::errors::PAUSE_MARKER;
+
+/// True when `CHIDORI_REPLAY_LAX=1`: argument-level replay divergences are
+/// downgraded to warnings that restore the historical best-effort behavior
+/// (serve the cached result on the sync path, silently re-execute live on the
+/// async host-operation path). Function-name and operation-kind mismatches
+/// remain fatal regardless.
+pub(crate) fn replay_lax() -> bool {
+    std::env::var("CHIDORI_REPLAY_LAX").ok().as_deref() == Some("1")
+}
+
+/// Render call args for a divergence message without flooding the error with
+/// a multi-kilobyte prompt payload.
+/// Name the top-level keys that actually differ between a recorded call's
+/// args and the args the agent is calling with now — "the agent code changed"
+/// is the wrong diagnosis when the only drift is configuration (e.g. resuming
+/// under a different default model), so the error should say which knob moved.
+pub(crate) fn describe_args_divergence(
+    recorded: &serde_json::Value,
+    current: &serde_json::Value,
+) -> String {
+    let (Some(recorded), Some(current)) = (recorded.as_object(), current.as_object()) else {
+        return String::new();
+    };
+    let mut keys: Vec<&String> = recorded
+        .keys()
+        .chain(current.keys())
+        .filter(|k| *k != "request_digest" && recorded.get(*k) != current.get(*k))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        return String::new();
+    }
+    let mut description = format!(
+        " Differing field(s): {}.",
+        keys.iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if keys.iter().any(|k| *k == "model") {
+        let recorded_model = recorded
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unset>");
+        let current_model = current
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unset>");
+        description.push_str(&format!(
+            " The run was recorded with model `{recorded_model}` but is replaying under \
+             `{current_model}` — a configuration mismatch, not a code change; pass \
+             `--model {recorded_model}` (or leave `--model`/CHIDORI_MODEL unset so the \
+             model recorded in the run's manifest applies)."
+        ));
+    }
+    description
+}
+
+pub(crate) fn truncate_json_for_error(value: &serde_json::Value) -> String {
+    let s = serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string());
+    if s.chars().count() > 300 {
+        let mut t: String = s.chars().take(300).collect();
+        t.push('…');
+        t
+    } else {
+        s
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -330,16 +562,27 @@ impl Default for AgentConfig {
     }
 }
 
+impl Default for RuntimeContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuntimeContext {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
                 call_log: CallLog::new(),
+                call_log_dirty: false,
+                replay_hits: 0,
                 seq: 0,
                 replay_log: None,
                 run_id: uuid::Uuid::new_v4().to_string(),
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -352,6 +595,8 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -359,7 +604,8 @@ impl RuntimeContext {
                 is_branch: false,
                 model_override: None,
                 otel_branch: None,
-                strict_replay_args: false,
+                actor_hub: None,
+                actor_id: None,
             })),
         }
     }
@@ -405,10 +651,15 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
                 call_log: CallLog::new(),
+                call_log_dirty: false,
+                replay_hits: 0,
                 seq: 0,
-                replay_log: Some(replay_log),
+                replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id: uuid::Uuid::new_v4().to_string(),
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -421,6 +672,8 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -428,7 +681,8 @@ impl RuntimeContext {
                 is_branch: false,
                 model_override: None,
                 otel_branch: None,
-                strict_replay_args: false,
+                actor_hub: None,
+                actor_id: None,
             })),
         }
     }
@@ -444,10 +698,17 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
                 call_log,
+                // Seeded records never went through this context's store
+                // handle; the first checkpoint write must include them.
+                call_log_dirty: true,
+                replay_hits: 0,
                 seq,
                 replay_log: None,
                 run_id,
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -460,6 +721,8 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -467,7 +730,8 @@ impl RuntimeContext {
                 is_branch: false,
                 model_override: None,
                 otel_branch: None,
-                strict_replay_args: false,
+                actor_hub: None,
+                actor_id: None,
             })),
         }
     }
@@ -493,10 +757,15 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: parent_inner.config.clone(),
                 call_log: CallLog::new(),
+                call_log_dirty: false,
+                replay_hits: 0,
                 seq: base_seq,
                 replay_log: None,
                 run_id,
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: parent_inner.input_mode,
                 pending_input: None,
                 pending_approval: None,
@@ -509,6 +778,8 @@ impl RuntimeContext {
                 otel_run: parent_inner.otel_run.clone(),
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: parent_inner.workspace_root.clone(),
                 call_stack: vec![parent_branch_seq],
                 capabilities: CapabilityLedger::new(),
@@ -516,7 +787,8 @@ impl RuntimeContext {
                 is_branch: true,
                 model_override: parent_inner.model_override.clone(),
                 otel_branch: None,
-                strict_replay_args: false,
+                actor_hub: None,
+                actor_id: None,
             })),
         }
     }
@@ -543,10 +815,15 @@ impl RuntimeContext {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
                 call_log: CallLog::new(),
+                call_log_dirty: false,
+                replay_hits: 0,
                 seq: base_seq,
-                replay_log: Some(replay_log),
+                replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id,
                 persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
                 input_mode: InputMode::Pause,
                 pending_input: None,
                 pending_approval: None,
@@ -559,6 +836,8 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
+                warm_input_bridge: None,
                 workspace_root: default_workspace_root(),
                 call_stack: vec![parent_branch_seq],
                 capabilities: CapabilityLedger::new(),
@@ -566,7 +845,77 @@ impl RuntimeContext {
                 is_branch: true,
                 model_override: None,
                 otel_branch: None,
-                strict_replay_args: false,
+                actor_hub: None,
+                actor_id: None,
+            })),
+        }
+    }
+
+    /// Build the context for one iteration of a spawned actor sub-run
+    /// (`docs/actors.md`). Like [`for_branch`](Self::for_branch), the parent's
+    /// config, workspace root, model override, streaming sink, and OTEL run are
+    /// inherited and the sequence counter starts at `base_seq` (the actor's
+    /// reserved range start minus one). Unlike a branch:
+    /// - `replay_log` carries the actor's own accumulated records, because the
+    ///   actor's supervision loop re-enters the source module on every message
+    ///   wait and restart (the standard resume-by-replay model);
+    /// - `signal_inbox` carries the actor mailbox entries left unconsumed by
+    ///   the previous iteration;
+    /// - the parent's `actor_hub` is shared, so the actor can send to siblings
+    ///   and to the parent;
+    /// - the call stack starts empty: top-level records are stamped with the
+    ///   parent's `join_actor` seq when they merge, not at record time (the
+    ///   join seq is unknown while the actor runs).
+    ///
+    /// Input mode is `Pause` so a `chidori.input()` inside an actor surfaces as
+    /// a paused outcome instead of reading stdin on a background thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_actor(
+        parent: &RuntimeContext,
+        actor_id: String,
+        base_seq: u64,
+        replay_log: Vec<CallRecord>,
+        vfs: Vfs,
+        signal_inbox: Vec<QueuedSignal>,
+        hub: Arc<crate::runtime::host_actor::ActorHub>,
+    ) -> Self {
+        let parent_inner = parent.inner.lock().unwrap();
+        Self {
+            inner: Arc::new(Mutex::new(RuntimeContextInner {
+                config: parent_inner.config.clone(),
+                call_log: CallLog::new(),
+                call_log_dirty: false,
+                replay_hits: 0,
+                seq: base_seq,
+                replay_log: Some(ReplayJournal::new(replay_log)),
+                run_id: actor_id.clone(),
+                persist_dir: None,
+                store: None,
+                persist_failure: None,
+                strict_durability: crate::runtime::store::strict_durability(),
+                input_mode: InputMode::Pause,
+                pending_input: None,
+                pending_approval: None,
+                pending_signal: None,
+                active_step: None,
+                signal_inbox,
+                host_promises: HostPromiseTable::new(),
+                event_sender: parent_inner.event_sender.clone(),
+                emit_call_events: parent_inner.emit_call_events,
+                otel_run: parent_inner.otel_run.clone(),
+                host_operation_safepoint: None,
+                host_operation_completion_safepoint: None,
+                actor_signal_waiter: None,
+                warm_input_bridge: None,
+                workspace_root: parent_inner.workspace_root.clone(),
+                call_stack: Vec::new(),
+                capabilities: CapabilityLedger::new(),
+                vfs,
+                is_branch: false,
+                model_override: parent_inner.model_override.clone(),
+                otel_branch: parent_inner.otel_branch.clone(),
+                actor_hub: Some(hub),
+                actor_id: Some(actor_id),
             })),
         }
     }
@@ -574,6 +923,26 @@ impl RuntimeContext {
     /// Whether this context belongs to a `chidori.branch` sub-run.
     pub fn is_branch(&self) -> bool {
         self.inner.lock().unwrap().is_branch
+    }
+
+    /// The pid of the actor sub-run this context belongs to, if any.
+    pub fn actor_id(&self) -> Option<String> {
+        self.inner.lock().unwrap().actor_id.clone()
+    }
+
+    /// The run's actor hub, if one has been created.
+    pub fn actor_hub(&self) -> Option<Arc<crate::runtime::host_actor::ActorHub>> {
+        self.inner.lock().unwrap().actor_hub.clone()
+    }
+
+    /// The run's actor hub, created on first use (the first
+    /// `chidori.actors.spawn` in the run).
+    pub fn ensure_actor_hub(&self) -> Arc<crate::runtime::host_actor::ActorHub> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .actor_hub
+            .get_or_insert_with(|| Arc::new(crate::runtime::host_actor::ActorHub::new()))
+            .clone()
     }
 
     /// The run's persistence directory, when persistence is enabled. Branch
@@ -594,22 +963,69 @@ impl RuntimeContext {
             inner.seq = inner.seq.max(record.seq);
             inner.call_log.push(record);
         }
-        if let Some(ref dir) = inner.persist_dir {
-            if let Ok(json) = inner.call_log.to_json() {
-                let _ = std::fs::write(dir.join("checkpoint.json"), json);
+        // Merged branch records bypass `record_call`'s journal append, so the
+        // log is checkpoint-dirty until the full write below (or, when this
+        // context has no store, a later safepoint) covers them.
+        inner.call_log_dirty = true;
+        if let Some(store) = inner.store.clone() {
+            let result = store.write_call_log(inner.call_log.records());
+            if result.is_ok() {
+                inner.call_log_dirty = false;
             }
+            note_persist_result(&mut inner, result);
         }
     }
 
-    /// Enable on-disk persistence. Each `record_call` will rewrite
-    /// `<base_dir>/<run_id>/checkpoint.json` with the full log.
-    /// Returns the run directory path.
+    /// Enable persistence with the default filesystem layout. Each
+    /// `record_call` appends the record to `<base_dir>/<run_id>/records.jsonl`;
+    /// the full `checkpoint.json` is rewritten only at compaction points (run
+    /// start, pause, settle) or when the log is checkpoint-dirty. Returns the
+    /// run directory path.
+    #[allow(dead_code)] // Exercised only by tests today; the lib target sees it as dead.
     pub fn enable_persistence(&self, base_dir: PathBuf) -> PathBuf {
-        let mut inner = self.inner.lock().unwrap();
-        let run_dir = base_dir.join(&inner.run_id);
+        let run_dir = base_dir.join(self.run_id());
         let _ = std::fs::create_dir_all(&run_dir);
-        inner.persist_dir = Some(run_dir.clone());
+        self.enable_persistence_with_store(run_dir.clone(), Arc::new(FsRunStore::new(&run_dir)));
         run_dir
+    }
+
+    /// Enable persistence through an explicit [`RunStore`] handle (e.g. the
+    /// filesystem teed with a durable SQLite/HTTP mirror). `run_dir` remains
+    /// the filesystem address of the run's artifacts for path-based consumers.
+    pub fn enable_persistence_with_store(&self, run_dir: PathBuf, store: Arc<dyn RunStore>) {
+        let _ = std::fs::create_dir_all(&run_dir);
+        let mut inner = self.inner.lock().unwrap();
+        inner.persist_dir = Some(run_dir);
+        inner.store = Some(store);
+    }
+
+    /// The run's persistence handle, when persistence is enabled.
+    pub fn store(&self) -> Option<Arc<dyn RunStore>> {
+        self.inner.lock().unwrap().store.clone()
+    }
+
+    /// The first persistence failure recorded under strict durability, if any.
+    /// Host dispatch checks this before executing a live effect so a run whose
+    /// journal writes are failing stops taking side effects.
+    pub fn persist_failure(&self) -> Option<String> {
+        self.inner.lock().unwrap().persist_failure.clone()
+    }
+
+    /// Durability barrier for the run's store: every buffered write is durable
+    /// when this returns. Called by the engine before a run settles or pauses
+    /// (the output-gate point). Surfaces a strict-mode persistence failure.
+    pub fn flush_store(&self) -> anyhow::Result<()> {
+        let (store, failure) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.store.clone(), inner.persist_failure.clone())
+        };
+        if let Some(failure) = failure {
+            anyhow::bail!("durable journal write failed: {failure}");
+        }
+        if let Some(store) = store {
+            store.flush()?;
+        }
+        Ok(())
     }
 
     /// Override the run id. Used by the server's replay-based resume to keep the
@@ -627,6 +1043,14 @@ impl RuntimeContext {
 
     pub fn config(&self) -> AgentConfig {
         self.inner.lock().unwrap().config.clone()
+    }
+
+    /// Override the default model for prompts that don't set one in code —
+    /// used to make a run's recorded model travel with it (manifest on
+    /// resume, descriptor on a detached-agent wake) instead of being
+    /// re-derived from whatever environment happens to host the wake.
+    pub fn set_default_model(&self, model: String) {
+        self.inner.lock().unwrap().config.model = model;
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -661,52 +1085,79 @@ impl RuntimeContext {
     /// Check if there is a cached result for the given sequence number.
     /// If so, return it (and record the replayed call in the new log).
     /// If not, return None — the host function should execute normally.
+    /// Whether the NEXT durable call will be served from the replay journal.
+    /// A replayed call executes no side effect — its recorded result returns
+    /// from cache (or the divergence check refuses loudly) — so policy gates,
+    /// which exist to guard live effects, skip asking for it.
+    pub fn next_call_is_replayed(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let next = inner.seq + 1;
+        inner
+            .replay_log
+            .as_ref()
+            .is_some_and(|journal| journal.by_seq.contains_key(&next))
+    }
+
     pub fn try_replay(&self, seq: u64) -> Option<CallRecord> {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(ref replay_log) = inner.replay_log {
-            if let Some(record) = replay_log.iter().find(|r| r.seq == seq) {
-                let mut record = record.clone();
-                // Nest a replayed call under the call currently executing, exactly
-                // as `record_call` does for live calls. Without this a replayed
-                // *nested* host call — e.g. a tool's inner `input`, injected as a
-                // synthetic resume record with no parent — would record at top
-                // level, so a later resume's `absorb_replayed_subtree` wouldn't
-                // recognize it as part of the container's subtree and the
-                // sequence counter would collide with the next call (replay
-                // divergence on a second suspension).
-                if record.parent_seq.is_none() {
-                    record.parent_seq = inner.call_stack.last().copied();
-                }
-                // Record the replayed call in the new call log.
-                inner.call_log.push(record.clone());
-                return Some(record);
-            }
+        let mut record = {
+            let journal = inner.replay_log.as_ref()?;
+            let &i = journal.by_seq.get(&seq)?;
+            journal.records[i].clone()
+        };
+        // Nest a replayed call under the call currently executing, exactly
+        // as `record_call` does for live calls. Without this a replayed
+        // *nested* host call — e.g. a tool's inner `input`, injected as a
+        // synthetic resume record with no parent — would record at top
+        // level, so a later resume's `absorb_replayed_subtree` wouldn't
+        // recognize it as part of the container's subtree and the
+        // sequence counter would collide with the next call (replay
+        // divergence on a second suspension).
+        if record.parent_seq.is_none() {
+            record.parent_seq = inner.call_stack.last().copied();
         }
-        None
+        // Record the replayed call in the new call log. Replay bypasses
+        // `record_call`'s journal append (the record is already durable from
+        // the turn that ran it live), so mark the log checkpoint-dirty: the
+        // first safepoint past the replay frontier writes one full checkpoint
+        // covering the replayed prefix plus any synthetic resume records.
+        inner.call_log.push(record.clone());
+        inner.call_log_dirty = true;
+        inner.replay_hits += 1;
+        Some(record)
+    }
+
+    /// How many call-log records were served from the replay journal rather
+    /// than executed live. After a resume this is the audited "replayed"
+    /// count; `call_log_len() - replay_hit_count()` is what actually
+    /// re-executed (and re-billed).
+    pub fn replay_hit_count(&self) -> u64 {
+        self.inner.lock().unwrap().replay_hits
     }
 
     /// Replay-cache lookup with divergence check. Returns:
-    ///   Ok(Some(record)) — cached and the cached record's function name
-    ///                      matches `expected_fn`. Safe to use.
+    ///   Ok(Some(record)) — cached, and the cached record's function name AND
+    ///                      arguments match the call the agent is making now.
+    ///                      Safe to use.
     ///   Ok(None)         — no cache hit; caller should execute live.
-    ///   Err(msg)         — cached, but the recorded function differs from
-    ///                      what the agent is calling now. The agent code
-    ///                      changed since the checkpoint was saved. The
-    ///                      engine should abort the replay with a clear error.
+    ///   Err(msg)         — cached, but the recorded call differs from what
+    ///                      the agent is calling now. The agent code (or its
+    ///                      inputs) changed since the checkpoint was saved.
+    ///                      The engine should abort the replay with a clear
+    ///                      error rather than pair cached results with
+    ///                      different code.
     ///
-    /// `live_args` are the arguments the agent is passing *now*. Normally
-    /// ignored (replay is keyed on seq + function so cosmetic arg changes
-    /// don't invalidate a checkpoint), but under strict replay
-    /// ([`set_strict_replay_args`](Self::set_strict_replay_args) — the
-    /// `chidori resume --ci` regression mode) a mismatch against the recorded
-    /// args is divergence: the agent no longer makes the same call.
+    /// A name mismatch is always fatal. An argument mismatch (same function,
+    /// different args — compared with the derived `request_digest` field
+    /// stripped, like the async host-operation path) is fatal by default and
+    /// downgraded to a warning under `CHIDORI_REPLAY_LAX=1`, which restores
+    /// the historical best-effort behavior of serving the cached result.
     pub fn try_replay_checked(
         &self,
         seq: u64,
         expected_fn: &str,
-        live_args: Option<&serde_json::Value>,
+        expected_args: &serde_json::Value,
     ) -> Result<Option<CallRecord>, String> {
-        let strict = self.inner.lock().unwrap().strict_replay_args;
         match self.try_replay(seq) {
             None => Ok(None),
             Some(record) if record.function != expected_fn => Err(format!(
@@ -715,30 +1166,32 @@ impl RuntimeContext {
                  re-run without replay to regenerate.",
                 seq, record.function, expected_fn
             )),
-            Some(record) => {
-                if strict {
-                    if let Some(live) = live_args {
-                        if *live != record.args {
-                            return Err(format!(
-                                "Replay divergence at seq {} (`{}`): the agent now passes \
-                                 different arguments than the checkpoint recorded. \
-                                 recorded: {} — live: {}",
-                                seq, expected_fn, record.args, live
-                            ));
-                        }
-                    }
+            Some(record)
+                if !crate::runtime::snapshot::completed_args_match(&record.args, expected_args) =>
+            {
+                if replay_lax() {
+                    tracing::warn!(
+                        "replay divergence at seq {seq} tolerated (CHIDORI_REPLAY_LAX=1): \
+                         `{expected_fn}` was recorded with different arguments; \
+                         serving the cached result"
+                    );
+                    return Ok(Some(record));
                 }
-                Ok(Some(record))
+                Err(format!(
+                    "Replay divergence at seq {}: `{}` was recorded with arguments {} but the \
+                     agent now calls it with {}.{} The agent code (or its inputs/configuration) \
+                     changed since the checkpoint was saved — re-run without replay to \
+                     regenerate, or set CHIDORI_REPLAY_LAX=1 to tolerate argument drift and \
+                     serve cached results.",
+                    seq,
+                    expected_fn,
+                    truncate_json_for_error(&record.args),
+                    truncate_json_for_error(expected_args),
+                    describe_args_divergence(&record.args, expected_args)
+                ))
             }
+            Some(record) => Ok(Some(record)),
         }
-    }
-
-    /// Enable strict replay: a cached call whose recorded args differ from the
-    /// args the agent passes now is treated as divergence instead of silently
-    /// returning the recorded result. Used by `chidori resume --ci` so a
-    /// checkpoint doubles as a byte-identical regression fixture.
-    pub fn set_strict_replay_args(&self, strict: bool) {
-        self.inner.lock().unwrap().strict_replay_args = strict;
     }
 
     /// Reconcile the sequence counter (and active log) with the nested host
@@ -759,33 +1212,39 @@ impl RuntimeContext {
     /// is safe to call unconditionally on every replay hit.
     pub fn absorb_replayed_subtree(&self, root_seq: u64) {
         let mut inner = self.inner.lock().unwrap();
-        let Some(replay_log) = inner.replay_log.clone() else {
+        // Borrow the journal in place (field-disjoint from the fields
+        // mutated below): this runs on EVERY replay hit, and a deep clone of
+        // the whole history made each resume re-execution O(history²).
+        let inner = &mut *inner;
+        let Some(journal) = &inner.replay_log else {
             return;
         };
-        // Transitive descendants of `root_seq` via `parent_seq`. Records may be
-        // in any order, so iterate to a fixpoint.
+        // Transitive descendants of `root_seq` via the prebuilt children map.
         let mut subtree: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         subtree.insert(root_seq);
-        loop {
-            let mut grew = false;
-            for r in &replay_log {
-                if let Some(parent) = r.parent_seq {
-                    if subtree.contains(&parent) && subtree.insert(r.seq) {
-                        grew = true;
-                    }
+        let mut queue: Vec<u64> = vec![root_seq];
+        while let Some(parent) = queue.pop() {
+            for &i in journal.children.get(&parent).into_iter().flatten() {
+                let seq = journal.records[i].seq;
+                if subtree.insert(seq) {
+                    queue.push(seq);
                 }
-            }
-            if !grew {
-                break;
             }
         }
         let mut max_seq = root_seq;
-        for r in &replay_log {
-            if r.seq != root_seq && subtree.contains(&r.seq) {
-                // Keep the nested record in the replayed trace and advance the
-                // counter past it so the next outer call can't reuse its seq.
-                inner.call_log.push(r.clone());
-                max_seq = max_seq.max(r.seq);
+        if subtree.len() > 1 {
+            // A container call: keep its nested records in the replayed trace,
+            // in journal order, and advance the counter past them so the next
+            // outer call can't reuse their seqs. Same checkpoint-dirty
+            // contract as `try_replay`: these pushes bypass the journal
+            // append.
+            for r in &journal.records {
+                if r.seq != root_seq && subtree.contains(&r.seq) {
+                    inner.call_log.push(r.clone());
+                    inner.call_log_dirty = true;
+                    inner.replay_hits += 1;
+                    max_seq = max_seq.max(r.seq);
+                }
             }
         }
         inner.seq = inner.seq.max(max_seq);
@@ -801,10 +1260,39 @@ impl RuntimeContext {
             record.parent_seq = inner.call_stack.last().copied();
         }
         inner.seq = inner.seq.max(record.seq);
-        inner.call_log.push(record.clone());
-        if let Some(ref dir) = inner.persist_dir {
-            if let Ok(json) = inner.call_log.to_json() {
-                let _ = std::fs::write(dir.join("checkpoint.json"), json);
+        let store = inner.store.clone();
+        let otel = inner.otel_run.clone();
+        let otel_branch = inner.otel_branch.clone();
+        let event_tx = if inner.emit_call_events {
+            inner.event_sender.clone()
+        } else {
+            None
+        };
+        // A record's args/result can be large (a whole LLM response), so the
+        // record MOVES into the call log; only a consumer outside the lock —
+        // the journal append, the event stream, OTEL — forces one copy.
+        let record = if store.is_some() || otel.is_some() || event_tx.is_some() {
+            let copy = record.clone();
+            inner.call_log.push(record);
+            copy
+        } else {
+            inner.call_log.push(record);
+            return;
+        };
+        drop(inner);
+        // O(1) append to the journal (`records.jsonl` + any durable mirror),
+        // OUTSIDE the context lock: under strict durability this write fsyncs,
+        // and a configured mirror adds a network round-trip — holding the lock
+        // across it would stall every other runtime-context access for the
+        // duration of the I/O. Concurrent appends may land out of seq order in
+        // the file; the loader's union sorts the tail by seq, so order on disk
+        // is not load-bearing. The append still happens BEFORE the record is
+        // surfaced on the event stream below, preserving the
+        // durable-before-visible ordering.
+        if let Some(store) = store {
+            let result = store.append_record(&record);
+            if result.is_err() {
+                note_persist_result(&mut self.inner.lock().unwrap(), result);
             }
         }
         // Stream this call's OTEL span now (buffered until its parent span
@@ -812,14 +1300,9 @@ impl RuntimeContext {
         // tree at the end. Only live-executed calls reach `record_call`; replayed
         // calls (try_replay / absorb_replayed_subtree) don't re-emit. The
         // `RuntimeEvent::Call` stream below is the other real-time surface.
-        let otel = inner.otel_run.clone();
-        let otel_branch = inner.otel_branch.clone();
-        if inner.emit_call_events {
-            if let Some(ref tx) = inner.event_sender {
-                let _ = tx.send(RuntimeEvent::Call(record.clone()));
-            }
+        if let Some(tx) = event_tx {
+            let _ = tx.send(RuntimeEvent::Call(record.clone()));
         }
-        drop(inner);
         if let Some(otel) = otel {
             otel.stream_record_tagged(record, otel_branch);
         }
@@ -1009,6 +1492,7 @@ impl RuntimeContext {
     /// Install a model-override hook consulted before every prompt host call,
     /// so a mid-run model change refreshes the model on the next provider
     /// request across all execution paths.
+    #[allow(dead_code)] // Exercised only by tests today; the lib target sees it as dead.
     pub fn set_model_override(&self, model_override: ModelOverride) {
         self.inner.lock().unwrap().model_override = Some(model_override);
     }
@@ -1041,6 +1525,22 @@ impl RuntimeContext {
     }
 
     #[allow(dead_code)]
+    pub fn set_warm_input_bridge(&self, bridge: WarmInputBridge) {
+        self.inner.lock().unwrap().warm_input_bridge = Some(bridge);
+    }
+
+    pub fn warm_input_bridge(&self) -> Option<WarmInputBridge> {
+        self.inner.lock().unwrap().warm_input_bridge.clone()
+    }
+
+    pub fn set_actor_signal_waiter(&self, waiter: ActorSignalWaiter) {
+        self.inner.lock().unwrap().actor_signal_waiter = Some(waiter);
+    }
+
+    pub fn actor_signal_waiter(&self) -> Option<ActorSignalWaiter> {
+        self.inner.lock().unwrap().actor_signal_waiter.clone()
+    }
+
     pub fn set_host_operation_completion_safepoint(
         &self,
         safepoint: HostOperationCompletionSafepoint,
@@ -1062,6 +1562,31 @@ impl RuntimeContext {
 
     pub fn call_log(&self) -> CallLog {
         self.inner.lock().unwrap().call_log.clone()
+    }
+
+    /// Number of records in the accumulated call log, without cloning it.
+    pub fn call_log_len(&self) -> usize {
+        self.inner.lock().unwrap().call_log.records().len()
+    }
+
+    /// Whether the call log holds records the O(1) journal appends did not
+    /// cover (replayed/synthetic records pushed during resume). While set,
+    /// the durable safepoints must write the full checkpoint; once cleared,
+    /// they can skip the O(history) rewrite because `record_call` keeps the
+    /// append-only journal complete on its own.
+    pub fn call_log_checkpoint_dirty(&self) -> bool {
+        self.inner.lock().unwrap().call_log_dirty
+    }
+
+    /// Clear the checkpoint-dirty flag after a successful full-checkpoint
+    /// write of a log snapshot taken at `persisted_len` records. Guarded by
+    /// length so records pushed between the snapshot and this call keep the
+    /// log dirty.
+    pub(crate) fn clear_call_log_checkpoint_dirty(&self, persisted_len: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.call_log.records().len() == persisted_len {
+            inner.call_log_dirty = false;
+        }
     }
 
     pub fn set_input_mode(&self, mode: InputMode) {
@@ -1149,7 +1674,7 @@ impl RuntimeContext {
     }
 
     /// As [`take_queued_signal`](Self::take_queued_signal), but matching ANY of
-    /// `names` (the `chidori.signalAny` fan-in drain). The lowest-`delivery_seq`
+    /// `names` (the `chidori.signal(names[])` fan-in drain). The lowest-`delivery_seq`
     /// entry across the whole set wins, so two queued candidates with different
     /// names are consumed in arrival order — and that choice is frozen into the
     /// recorded result.
@@ -1163,7 +1688,7 @@ impl RuntimeContext {
             .min_by_key(|(_, s)| s.delivery_seq)
             .map(|(i, _)| i)?;
         let signal = inner.signal_inbox.remove(idx);
-        persist_signal_inbox(&inner);
+        persist_signal_inbox(&mut inner);
         Some(signal)
     }
 
@@ -1181,7 +1706,7 @@ impl RuntimeContext {
             .iter()
             .position(|s| s.delivery_seq == delivery_seq)?;
         let signal = inner.signal_inbox.remove(idx);
-        persist_signal_inbox(&inner);
+        persist_signal_inbox(&mut inner);
         Some(signal)
     }
 
@@ -1214,7 +1739,7 @@ impl RuntimeContext {
             enqueued_at: chrono::Utc::now(),
         };
         inner.signal_inbox.push(queued.clone());
-        persist_signal_inbox(&inner);
+        persist_signal_inbox(&mut inner);
         queued
     }
 
@@ -1253,7 +1778,7 @@ impl RuntimeContext {
         let id = inner
             .host_promises
             .create_with_function(seq, kind, function, args);
-        persist_host_promises(&inner);
+        persist_host_promise_change(&mut inner, id);
         id
     }
 
@@ -1301,7 +1826,7 @@ impl RuntimeContext {
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.host_promises.resolve(id, value)?;
-        persist_host_promises(&inner);
+        persist_host_promise_change(&mut inner, id);
         Ok(())
     }
 
@@ -1312,7 +1837,7 @@ impl RuntimeContext {
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.host_promises.reject(id, error)?;
-        persist_host_promises(&inner);
+        persist_host_promise_change(&mut inner, id);
         Ok(())
     }
 
@@ -1367,13 +1892,12 @@ impl RuntimeContext {
         &self,
         seq: u64,
         kind: PendingHostOperationKind,
-        args: &serde_json::Value,
     ) -> Option<HostPromiseRecord> {
         self.inner
             .lock()
             .unwrap()
             .host_promises
-            .completed_operation(seq, kind, args)
+            .completed_operation(seq, kind)
     }
 
     #[allow(dead_code)]
@@ -1382,46 +1906,58 @@ impl RuntimeContext {
     }
 }
 
-fn persist_host_promises(inner: &RuntimeContextInner) {
-    let Some(dir) = inner.persist_dir.as_ref() else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(dir);
-    let records = inner.host_promises.records();
-    if let Ok(json) = serde_json::to_vec_pretty(&records) {
-        let _ = std::fs::write(dir.join(HOST_PROMISE_TABLE_FILE), json);
-    }
-
-    let pending = inner.host_promises.active_pending_operation();
-    let pending_path = dir.join(PENDING_HOST_OPERATION_FILE);
-    match pending {
-        Some(pending) => {
-            if let Ok(json) = serde_json::to_vec_pretty(&pending) {
-                let _ = std::fs::write(pending_path, json);
+/// Record a persistence outcome on the context: strict durability latches the
+/// first failure (host dispatch refuses further live effects); the default
+/// policy logs and continues, preserving the pre-store behavior.
+fn note_persist_result(inner: &mut RuntimeContextInner, result: anyhow::Result<()>) {
+    if let Err(err) = result {
+        if inner.strict_durability {
+            if inner.persist_failure.is_none() {
+                inner.persist_failure = Some(err.to_string());
             }
-        }
-        None => {
-            if pending_path.exists() {
-                let _ = std::fs::remove_file(pending_path);
-            }
+        } else {
+            tracing::warn!(run_id = %inner.run_id, error = %err, "run persistence write failed");
         }
     }
 }
 
-/// Persist the in-memory signal mailbox to `SIGNAL_INBOX_FILE` under the run's
-/// persist dir. The inbox lives in a `signals/` subdirectory, so the parent dir
-/// is created first. No-op when persistence is disabled.
-fn persist_signal_inbox(inner: &RuntimeContextInner) {
-    let Some(dir) = inner.persist_dir.as_ref() else {
+fn persist_host_promise_change(inner: &mut RuntimeContextInner, id: HostOperationId) {
+    let Some(store) = inner.store.clone() else {
         return;
     };
-    let inbox_path = dir.join(SIGNAL_INBOX_FILE);
-    if let Some(parent) = inbox_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    // One O(1) blob per state change (`host_promises/<id>.json`) instead of
+    // rewriting the whole table — which made every host call O(history) and
+    // every run O(history²). Compaction points fold the blobs back into
+    // `host_promises.json`; readers union both (`load_host_promise_records`).
+    if let Some(record) = inner.host_promises.record(id).cloned() {
+        let result = serde_json::to_vec_pretty(&record)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| {
+                store.put_blob(&crate::runtime::snapshot::host_promise_blob_key(id), &json)
+            });
+        note_persist_result(inner, result);
     }
-    if let Ok(json) = serde_json::to_vec_pretty(&inner.signal_inbox) {
-        let _ = std::fs::write(inbox_path, json);
-    }
+
+    let pending = inner.host_promises.active_pending_operation();
+    let result = match pending {
+        Some(pending) => serde_json::to_vec_pretty(&pending)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| store.put_blob(PENDING_HOST_OPERATION_FILE, &json)),
+        None => store.delete_blob(PENDING_HOST_OPERATION_FILE),
+    };
+    note_persist_result(inner, result);
+}
+
+/// Persist the in-memory signal mailbox to `SIGNAL_INBOX_FILE` through the
+/// run's store. No-op when persistence is disabled.
+fn persist_signal_inbox(inner: &mut RuntimeContextInner) {
+    let Some(store) = inner.store.clone() else {
+        return;
+    };
+    let result = serde_json::to_vec_pretty(&inner.signal_inbox)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| store.put_blob(SIGNAL_INBOX_FILE, &json));
+    note_persist_result(inner, result);
 }
 
 /// Load the durable signal mailbox from a run directory. Returns an empty vec
@@ -1502,9 +2038,7 @@ fn vfs_from_seed_env() -> Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::snapshot::{
-        HostPromiseState, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
-    };
+    use crate::runtime::snapshot::{HostPromiseState, PENDING_HOST_OPERATION_FILE};
 
     #[test]
     fn runtime_context_tracks_host_promise_lifecycle() {
@@ -1562,20 +2096,24 @@ mod tests {
         );
 
         let pending_path = run_dir.join(PENDING_HOST_OPERATION_FILE);
-        let table_path = run_dir.join(HOST_PROMISE_TABLE_FILE);
         assert!(pending_path.exists());
-        assert!(table_path.exists());
         let pending: PendingHostOperation =
             serde_json::from_slice(&std::fs::read(&pending_path).unwrap()).unwrap();
         assert_eq!(pending.id, id);
         assert_eq!(pending.kind, PendingHostOperationKind::Prompt);
+        // The pending state is durable BEFORE the effect runs, via the O(1)
+        // per-op blob; the union loader is the read surface for the compacted
+        // table + blobs.
+        let store = crate::runtime::store::FsRunStore::new(&run_dir);
+        let records = crate::runtime::snapshot::load_host_promise_records(&store).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].state, HostPromiseState::Pending));
 
         ctx.resolve_host_operation(id, serde_json::json!("done"))
             .unwrap();
 
         assert!(!pending_path.exists());
-        let records: Vec<HostPromiseRecord> =
-            serde_json::from_slice(&std::fs::read(&table_path).unwrap()).unwrap();
+        let records = crate::runtime::snapshot::load_host_promise_records(&store).unwrap();
         assert_eq!(records.len(), 1);
         assert!(matches!(
             records[0].state,

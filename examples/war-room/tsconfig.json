@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "types": ["@1kbirds/chidori/agent-env"]
+  },
+  "include": ["commander.ts"]
+}

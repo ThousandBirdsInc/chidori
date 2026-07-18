@@ -10,25 +10,29 @@ and tools.
 
 ## Agent Shape
 
-An agent is a `.ts` file that exports `agent(input, chidori)`:
+An agent is a `.ts` file that imports `{ chidori, run }` from the virtual
+`chidori:agent` module and registers its handler with `run(...)`:
 
 ```ts
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { document: string }, chidori: Chidori) {
+run(async (input: { document: string }) => {
   const summary = await chidori.prompt(
     "Summarize in three bullets:\n\n" + input.document,
     { type: "final" },
   );
   return { summary };
-}
+});
 ```
 
 Rules:
 
-- Export `async function agent(input, chidori)`, or import `{ run }` from
-  `chidori:agent` and call `run(handler)` — the `agent` export is the fallback
-  entrypoint when `run(...)` wasn't called.
+- Import `{ chidori, run }` from `chidori:agent` and call `run(handler)` at the
+  top level. (Legacy fallback: `export async function agent(input, chidori)`
+  is still accepted when `run(...)` wasn't called.)
+- Type the input with an inline object type or a `type` alias, never an
+  `interface` — interfaces have no implicit index signature, so they fail the
+  handler's `AgentJson` constraint with a confusing type error.
 - Return JSON-compatible values only.
 - Use `chidori.*` for LLMs, tools, input, signals, memory, templates, workspace
   files, and logging. HTTP goes through the standard `fetch`, which the runtime
@@ -45,30 +49,43 @@ chidori init my-agent --template chat      # scaffold a starter project (or: doc
 chidori check agents/my_agent.ts
 chidori run agents/my_agent.ts --input key=value
 chidori run agents/my_agent.ts --input '{"document": "text"}'
+chidori run agents/my_agent.ts --model deepseek-chat   # default model for prompts (or CHIDORI_MODEL)
 chidori run agents/my_agent.ts --stream
 chidori run agents/my_agent.ts --trace
 chidori chat --system "You are a concise assistant." --model claude-sonnet
 chidori chat agents/chat.ts                 # chat through a conversational agent file
 chidori serve agents/webhook.ts --port 8080 --trusted
-chidori resume agents/my_agent.ts <run_id>  # replay a recorded run byte-for-byte with zero model calls (durable resume)
+chidori serve --port 8080                   # no FILE: fleet-only server (detached agents; sessions must name an agent)
+chidori resume agents/my_agent.ts <run_id>  # replay a recorded run byte-for-byte with zero model calls (durable resume);
+                                            # the run's recorded model applies automatically (override with --model)
+chidori resume agents/my_agent.ts <run_id> --trusted  # crash recovery of a trusted tool-using run:
+                                            # same posture flags as `run`; continuation journals into the same run dir
+chidori resume agents/my_agent.ts <run_id> --allow-source-change  # edit-and-resume: replay against edited code (divergence-checked)
+chidori verify agents/my_agent.ts <run_id>  # checkpoint-as-test: replay with NO provider and a deny-all policy;
+                                            # asserts completion with byte-identical output. Exit 0 = pass. Built for CI.
+                                            # Journaled workspace writes DO re-materialize on disk (reported as
+                                            # "N workspace re-materialization(s)") — same bytes, fresh mtime.
 chidori trace <run_id>
 chidori snapshot <run_id>
 ```
 
 `chidori init [dir] --template docs|chat|worker` scaffolds a starter project
-(agent + README, plus a `tools/` dir for `worker` and a bundled docs corpus for
-`docs`); omit `--template` to pick interactively. The `docs` template chats
+(agent + README, plus a bundled docs corpus for `docs`); omit `--template` to pick interactively. The `docs` template chats
 with the bundled Chidori docs; the `chat` template is a conversational agent;
 the `worker` template is an autonomous tool-using loop (see
 `examples/agents/worker.ts`).
 
 `chidori chat` is an interactive multi-turn REPL backed by `conversation()`. With
 no agent file it chats with the model directly; pass a conversational agent file
-(one accepting `{ messages, system?, model?, tools? }` and returning
+(one accepting `{ messages, system?, model? }` and returning
 `{ transcript }` or `{ history }`, like the `chat` template) to chat through it.
 Each turn is a durable host call and streams its reply token-by-token; the prior
 turns replay for free, so only your newest message reaches the provider. Flags:
-`--system`, `--model`, `--tools <dir>`. Type `exit`/`quit` or Ctrl-D to end.
+`--system`, `--model`. Type `exit`/`quit` or Ctrl-D to end. Sessions are durable
+runs journaled under `.chidori/runs/<session_id>`; `chidori chat [FILE]
+--resume <session_id>` reprints the transcript for $0 (completing a
+crash-interrupted turn live) and continues the same session; `chidori trace
+<session_id>` inspects it like any run.
 
 `chidori snapshot <run_id>` prints `runtime.snapshot.json` metadata without
 printing raw VM snapshot bytes.
@@ -93,17 +110,53 @@ Options:
 
 - `type`: label for streamed prompt output, such as `"progress"`, `"draft"`,
   `"subagent"`, or `"final"`.
-- `model`: provider model override.
+- `model`: provider model override. Prompts that don't set it use the run's
+  default model (`--model` / `CHIDORI_MODEL`, falling back to
+  `claude-sonnet-4-6`). The resolved default is recorded in the run's
+  manifest, so `resume`/`branch-rerun` re-run under the same model
+  automatically.
 - `system`: system prompt for this call.
-- `maxTokens` or `max_tokens`: output token cap.
-- `maxTurns` or `max_turns`: cap on provider tool-use turns.
+- `maxTokens`: output token cap.
+- `maxTurns`: cap on provider tool-use turns — with `tools` set, `prompt()`
+  runs a COMPLETE provider tool-use loop internally (call tools, feed back
+  results, repeat up to `maxTurns`) and returns the final text. Reach for
+  the manual `context().respond()`/`toolResult()` loop only when you need
+  per-step control (inspecting calls, streaming progress between steps,
+  custom budgets).
 - `temperature`: sampling temperature.
-- `tools`: registered tool names available to provider tool-use loops.
-- `format`: `"json"` parses the reply as JSON (falls back to the raw string).
+- `tools`: the tools available to the loop — registered tool NAMES (from the
+  MCP/native registry) and/or `defineTool(...)` HANDLES, freely
+  mixed. Handles are plain objects defined inline or imported from any
+  module; their `run` executes in the agent's own VM (closures + captured
+  effects work, replay is deterministic), each invocation journaled as a
+  `mark("tool:<name>")` record:
+
+    import { chidori, run, defineTool } from "chidori:agent";
+    const search = defineTool({
+      name: "search",
+      description: "Search the corpus.",
+      parameters: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+      run: async ({ q }) => corpus.filter((d) => d.includes(q)),
+    });
+    const answer = await chidori.prompt("find it", { tools: [search], maxTurns: 6 });
+
+- `format`: `"json"` parses the reply as JSON (a single wrapping markdown
+  fence is tolerated). Unparseable output — e.g. a reply truncated by
+  `maxTokens` — THROWS by default so it can't masquerade as a structured
+  result; pass `strict: false` to fall back to the raw string instead.
+- `strict`: applies to `format: "json"`. `true` (default) throws on
+  unparseable output with the parse error and reply head; `false` restores
+  the lenient raw-string fallback.
 - `cache`: prompt-cache posture. Defaults to on (`"5m"`): the runtime marks
   the stable request head (system, tools, conversation prefix) so providers
   bill repeated prefixes at the cached rate. `false` disables for this call;
   `"1h"` requests the extended TTL. Caching never changes a response.
+
+`prompt()` returns only the text. If the response was cut off by the
+`maxTokens` cap the runtime prints a truncation warning to stderr (reasoning
+models spend the same budget on hidden reasoning first, so budget generously
+for them); use `context().respond()` when you need the structured
+`stopReason` / token counts / `reasoning` yourself.
 
 When streaming is enabled, prompt events include `prompt_type`, `stream_id`,
 and `seq` so UIs can filter progress streams separately from final-answer
@@ -137,7 +190,7 @@ first reads the shared prefix at the discounted cached rate.
 - `prompt(options?)` → `{ text, context }`: send, return the answer plus the
   context extended with the assistant turn (including any tool-use exchange).
 - `respond(options?)` → `{ response, context }`: one structured turn for
-  author-driven tool loops (`response.tool_calls`, `response.blocks`).
+  author-driven tool loops (`response.toolCalls`, `response.blocks`; reasoning models also expose `response.reasoning`).
 - `digest()` → stable content hash of the assembled request, also recorded in
   each prompt's call-log args as `request_digest`.
 - `estimateTokens()` → rough local size estimate for window budgeting.
@@ -182,7 +235,7 @@ shared prefix at the cached rate each turn.
   assistant reply text; the dialogue advances in place. `options` are
   per-turn `PromptOptions` (override the conversation defaults).
 - `respond(message, options?)` → `Promise<LlmResponseJson>`: like `say()` but
-  returns the structured response (`tool_calls`, `blocks`) for author-driven
+  returns the structured response (`toolCalls`, `blocks`) for author-driven
   tool loops; append results with `chat.context.toolResult(...)`, then `say()`.
 - `loop(options?)` → `Promise<{role,text}[]>`: drive an interactive dialogue —
   read each human message via `chidori.input()` (terminal stdin under
@@ -211,13 +264,24 @@ const answer = await chidori.input("Approve this request?", {
   type: "approval",
   choices: ["yes", "no"],
   default: "no",
+  details: draft,   // the artifact under review — shown to the human
 });
 ```
+
+`details` carries the thing being approved (a draft, a diff, a report): the
+CLI prints it above the prompt, and a paused session exposes it as
+`pending_details` alongside `pending_prompt` — so approval gates are never
+blind. It is display-only and never part of the durable record.
 
 In server mode, `input()` pauses the session. Resume it with
 `POST /sessions/{id}/resume` or `AgentClient.resume(id, response)`.
 
-### signal / pollSignal / signalAny
+Under `chidori run`, `input()` reads one line from stdin. An empty answer —
+blank enter, or end-of-file in a non-interactive run — resolves to the
+declared `default`; EOF with no `default` fails the run rather than silently
+returning an empty string.
+
+### signal / pollSignal
 
 ```ts
 // Pause at a named listen point until an outside party (human or agent)
@@ -227,13 +291,14 @@ const review = await chidori.signal("review");
 
 // With timeoutMs, resolves to { timedOut: true } after the deadline.
 const r = await chidori.signal("review", { timeoutMs: 60000 });
-if ("timedOut" in r && r.timedOut) { /* nobody answered */ }
+if (r.timedOut) { /* nobody answered */ }
 
 // Non-blocking: consume a queued signal or get null (recorded, replayable).
 const steer = await chidori.pollSignal("steer");
 
-// Fan-in: pause until ANY listed name fires; result.name says which.
-const fired = await chidori.signalAny(["review", "steer"]);
+// Fan-in: pass an array to pause until ANY listed name fires; result.name
+// says which.
+const fired = await chidori.signal(["review", "steer"]);
 ```
 
 Every consumed signal is recorded in the call log, so multiplayer sessions
@@ -243,12 +308,26 @@ resume a matching pause in-process. See `docs/signals.md`.
 
 ### tool
 
+A tool is merely a function with a documented signature — a `name`, a
+`description`, and JSON-schema `parameters` — nothing more. Agent tools are
+defined in-VM with `defineTool`, which wraps that signature around a `run`
+function, and passed to `prompt` / `context().tools` as handles (see the
+`tools` prompt option above). The
+`chidori.tool(name, args)` host effect is for tools sourced from OUTSIDE the
+agent — MCP-server tools (configured via `CHIDORI_MCP_*`) and Rust-native
+tools registered by an embedding application — dispatched by name:
+
 ```ts
 const result = await chidori.tool("web_search", { query: "snapshot runtime" });
 ```
 
-Tools discovered from disk are TypeScript `.ts` modules or MCP-backed remote
-tools. Tool directory discovery ignores `.star` files.
+A tool's `fetch` is SSRF-guarded by default: requests to hosts that resolve
+to non-public addresses (localhost, RFC-1918 ranges) are refused even under
+`--trusted`. Tools that talk to local services (an Ollama sidecar, a local
+index) need `CHIDORI_HTTP_ALLOW_HOSTS=127.0.0.1` (comma-separated hosts,
+IPs, or CIDRs; `*` disables the guard). Provider endpoints
+(`CHIDORI_OPENAI_COMPAT_URL=http://localhost:11434`) are NOT affected — the
+guard covers only agent/tool-initiated http effects.
 
 ### callAgent
 
@@ -259,18 +338,19 @@ const child = await chidori.callAgent("child.ts", { topic: "snapshots" });
 Sub-agents share the parent runtime context and call log. Runtime dispatch
 accepts TypeScript `.ts` sub-agents only.
 
-### parallel
+### util.parallel
 
 ```ts
-const [a, b] = await chidori.parallel([
+const [a, b] = await chidori.util.parallel([
   () => chidori.prompt("Draft option A", { type: "draft" }),
   () => chidori.prompt("Draft option B", { type: "draft" }),
 ]);
 ```
 
-The TypeScript helper uses `Promise.all` semantics;
-`options.concurrency` caps in-flight tasks. Host execution is not durably
-parallel.
+An in-VM helper with `Promise.all` semantics; `options.concurrency` caps
+in-flight tasks. Everything under `chidori.util` is pure JavaScript control
+flow and records nothing itself — only the durable calls made inside the
+tasks appear in the journal.
 
 ### branch
 
@@ -307,6 +387,115 @@ chidori branch-rerun <run-id> <branch-id>                   # re-run edited sour
 A resumed or re-run branch updates only its own store; the parent's recorded
 `branch` outcome is immutable history. See `docs/branching-execution.md`.
 
+### actors: spawn / send / receive / join / stop / status / lookup
+
+```ts
+// Start an agent module as a supervised, addressable, concurrent process.
+// spawn returns a HANDLE: the actor's address plus its lifecycle methods.
+const worker = await chidori.actors.spawn("workers/researcher.ts", { topic }, {
+  name: "researcher",      // optional registry name for actors.lookup / actors.send
+  restart: "resume",       // "never" (default) | "clean" | "resume"
+  maxRestarts: 3,
+  backoffMs: 500,          // doubles per attempt
+});
+
+// Message passing (never blocks). String-addressed sends take a pid, a
+// registered name, or "parent" (the sender's spawner).
+await worker.send("focus", { region: "EU" });
+await chidori.actors.send("researcher", "focus", { region: "EU" });
+
+// Blocking in-place consumption, in delivery order; fan-in via an array.
+const msg = await chidori.receive("draft");   // { name, payload, from: { kind, id } }
+const any = await chidori.receive(["draft", "cancel"], { timeoutMs: 60000 });
+if (any.timedOut) { /* deadline passed */ }
+
+// Settle: fold the actor's records into this run's log and get the outcome.
+const outcome = await worker.join();
+// → { pid, status: "completed"|"failed"|"paused"|"stopped", output?, error?, restarts }
+await worker.stop();                          // cooperative stop, then join
+await worker.status();                        // { pid, status, restarts, mailbox, waitingFor? }
+await chidori.actors.lookup("researcher");    // a handle, or null
+```
+
+Actors are supervised siblings of branches (`docs/actors.md`): each runs its
+own source module on an isolated VM and its records occupy a reserved,
+disjoint sequence range, but an actor is detached and addressable — it runs
+concurrently on its own thread with a durable mailbox. Inside an actor,
+`chidori.signal`/`pollSignal` consume actor messages too (the mailbox uses
+the signal envelope; `from.id` is the sending actor's pid, or `"run"`), and
+`receive` waits in place without pausing the run. Restart strategies:
+`clean` re-runs from scratch; `resume` replays the actor's accumulated log
+minus the trailing failed records (including their nested effects — a failed
+tool call's inner http record retries live, not from cache), so completed
+work returns from cache and only the failing call retries. Every primitive
+is a durable call — replay of the spawning run re-runs nothing — and a crash
+before a join re-creates the actor on resume from the recorded spawn/send
+records.
+
+Actor death is observable: a `failed` or `paused` settle delivers a
+`"__chidori.down__"` message to the owner's mailbox
+(`{ pid, name, status, error?, pendingPrompt?, restarts }`) — include it in
+fan-in receives (`receive(["result", "__chidori.down__"])`). A `receive`
+(even with `timeoutMs`) fails fast once every spawned actor has settled and
+nothing matching is queued.
+
+Actors form **supervision trees**: an actor can spawn its own supervised
+children (each level carves child sequence ranges out of its own, bounding
+depth at four actor levels), `"parent"` addresses the sender's spawner (the
+owning actor, or the run for a top-level actor), and join/stop are owner-only
+— an actor is settled by whoever spawned it. Supervisors reap their children:
+when an actor settles (or discards its log on a `clean` restart) its
+still-live children are cooperatively stopped and their registered names
+released; a `resume` restart keeps children (cached spawn records return the
+same live pids). A run may spawn at most 128 actors in total, restarted
+children included.
+
+### agents: detached durable processes (spawn / send / join / stop / status / lookup)
+
+```ts
+// Start an agent module as a DETACHED durable process: its own run id and
+// journal, a registered name that outlives this run, a durable mailbox, and
+// a hibernate/wake lifecycle. spawn returns a handle like actors.spawn.
+const svc = await chidori.agents.spawn("services/inbox-triager.ts", {}, {
+  name: "inbox-triager",   // registry name; generated when omitted
+  restart: "resume",       // "never" | "clean" | "resume" (default)
+  maxRestarts: 3,
+  backoffMs: 500,
+  model: "deepseek-chat",  // optional; defaults to the spawner's resolved model
+                           // and travels with the agent across wakes/restarts
+});
+
+await svc.send("email", { from: "a@x.com" });          // durable delivery; wakes a
+await chidori.agents.send("inbox-triager", "email", p); // hibernating agent on match
+await svc.status();   // { name, runId, status, restarts, waitingFor?, deadline?, output?, error? }
+await svc.join({ timeoutMs: 30000 });   // waits for completed|failed|stopped|paused
+await svc.stop();                        // cooperative stop
+await chidori.agents.lookup("inbox-triager");   // { name, runId, status } handle, or null
+```
+
+Detached agents vs actors: an actor lives inside its spawning run (records
+fold into the parent at a join; unjoined work dies with the run); a detached
+agent is its own durable run and **outlives the spawner**. Inside the agent,
+`chidori.signal(name)` is a hibernate point — the agent holds no thread and
+no VM while waiting; a matching send (from any run, or `POST
+/agents/detached/{name}/send` on the server) wakes it under resume-by-replay.
+The fleet survives process restarts: `chidori serve` re-arms every
+registered agent at boot. Requires persistence. Statuses: `running`,
+`hibernating`, `paused` (interactive input/approval — no interactive
+counterpart yet), `completed`, `failed`, `stopped`. See
+`docs/detached-agents.md`.
+
+### alarm
+
+```ts
+const fired = await chidori.alarm(24 * 60 * 60 * 1000);  // → { timedOut: true }
+```
+
+A durable timer on the signal machinery: the run (or detached agent)
+hibernates and is woken at the deadline, surviving process restarts — the
+deadline is persisted and re-armed at boot. In a detached agent this is the
+idiomatic "do maintenance every N hours even with no traffic" primitive.
+
 ### http (fetch / node:http)
 
 There is no `chidori.http`. Use the standard `fetch` API (or the
@@ -340,14 +529,19 @@ Use templates for reusable prompt text. Inline templates are also supported.
 ### memory
 
 ```ts
-await chidori.memory("set", "draft", { text: "..." });
-const draft = await chidori.memory("get", "draft");
-const keys = await chidori.memory("list");
-await chidori.memory("delete", "draft");
-await chidori.memory("clear");
+await chidori.memory.set("draft", { text: "..." });
+const draft = await chidori.memory.get("draft");
+const keys = await chidori.memory.list();
+await chidori.memory.delete("draft");
+await chidori.memory.clear();
 ```
 
-Memory actions are logged and replay-aware.
+Memory actions are logged and replay-aware. The store lives at
+`<root>/.chidori/memory/<namespace>.json`, where `<root>` is the run's
+workspace root (the agent file's directory under `run`/`resume`/`serve`, or
+`CHIDORI_WORKSPACE_ROOT`) — so memory is anchored to the agent, like runs and
+workspace, and persists across sessions regardless of the process's current
+directory. `CHIDORI_MEMORY_DIR` overrides the root.
 
 ### workspace
 
@@ -359,9 +553,10 @@ await chidori.workspace.delete("notes/draft.md", "superseded");
 const manifest = await chidori.workspace.manifest();
 ```
 
-Durable file store rooted at the run's workspace directory
-(`CHIDORI_WORKSPACE_ROOT` when set). Entries carry `{ path, status, sha256,
-bytes }`. Every action is policy-gated (`workspace:write` /
+Durable file store rooted at the project directory (the agent file's dir)
+under `run`, `resume`, `serve`, and detached agents alike;
+`CHIDORI_WORKSPACE_ROOT` overrides the root. Entries carry `{ path, status,
+sha256, bytes }`. Every action is policy-gated (`workspace:write` /
 `workspace:delete` are refused under `untrusted`) and recorded in the call
 log. `remove` is an alias for `delete`.
 
@@ -389,14 +584,15 @@ Agents get a virtual `document` / `window`. `renderDOM()` flushes the pending
 DOM mutation batch as a journaled `dom_render` effect — recorded live, served
 from the journal on replay. See `docs/dom-runtime-prototype.md`.
 
-### checkpoint
+### mark
 
 ```ts
-await chidori.checkpoint("after-draft", { tokens: 120 });
+await chidori.mark("after-draft", { tokens: 120 });
 ```
 
-`checkpoint()` records an explicit call-log marker. Persisted runs also refresh
-snapshot manifest metadata at durable host safepoints.
+`mark()` records a labelled call-log marker — an annotation for the trace,
+nothing more (the durable VALUE checkpoint is `chidori.step`). Persisted runs
+also refresh snapshot manifest metadata at durable host safepoints.
 
 ### step
 
@@ -420,15 +616,15 @@ await chidori.log("Fetched candidates", { count: 3 });
 
 Use structured logs for progress and debugging. Logs are call-log records.
 
-### retry and tryCall
+### util.retry and util.tryCall
 
 ```ts
-const value = await chidori.retry(
+const value = await chidori.util.retry(
   () => fetch("https://example.com").then((r) => r.json()),
   { attempts: 3 },
 );
 
-const result = await chidori.tryCall(() => chidori.tool("maybe_fails", {}));
+const result = await chidori.util.tryCall(() => chidori.tool("maybe_fails", {}));
 if (!result.ok) {
   await chidori.log("Tool failed", { error: result.error });
 }
@@ -475,6 +671,12 @@ CLI:
 chidori run examples/agents/streaming_progress.ts --stream
 ```
 
+`--stream` changes only how progress is reported (NDJSON events on stdout):
+the run keeps the plain `run` posture — implicit workspace root at the agent's
+directory, journaled under `.chidori/runs/<run_id>` — and the final `done`
+event carries `run_id` and `status` (`completed`, `paused` with
+`pending_signal`, or `failed`).
+
 HTTP:
 
 ```ts
@@ -491,7 +693,7 @@ Stream event types:
 - `prompt_start`: prompt stream started.
 - `prompt_delta`: incremental token text.
 - `prompt_end`: prompt stream ended.
-- `paused`: the run paused at a `signal()` / `signalAny()` listen point and
+- `paused`: the run paused at a `signal()` listen point and
   stays live; a delivered signal (or the timeout deadline) resumes it on the
   same stream.
 - `done`: run completed, failed, or paused.
@@ -509,10 +711,13 @@ chidori serve examples/agents/webhook.ts --port 8080 --trusted
 
 `chidori serve` is deny-by-default: without `--trusted` or explicit
 `CHIDORI_POLICY*` configuration, gated effects (network requests via
-`fetch`/`node:http`, workspace mutations) are refused under the built-in
-`untrusted` profile (read-only
-workspace introspection stays allowed). `--untrusted` forces that profile over
-any env configuration; `chidori run` keeps the permissive default.
+`fetch`/`node:http`, tool calls, workspace mutations) are refused under the
+built-in `untrusted` profile (read-only workspace introspection stays
+allowed). `--untrusted` forces that profile over any env configuration.
+`chidori run` is ask-by-default: gated effects prompt for a y/a/N approval (`a` = allow that target for the rest of the run) at
+the terminal, and fail closed when no terminal is available (scripts, CI) —
+pass `--trusted` there for the permissive allow-all behavior. LLM prompts and
+pure compute are never gated.
 
 Session endpoints:
 
@@ -531,9 +736,15 @@ Session endpoints:
 - `POST /sessions/{id}/cancel`: cancel a running session.
 - `POST /sessions/{id}/replay`: replay from a call-log checkpoint.
 - `POST /sessions/stream`: run with SSE events.
+- `ANY /*` (any other route): the request is folded into
+  `{event: {method, path, headers, query, body}}` and run as the agent's
+  input. `{status, body, headers?}` output shapes the HTTP response; a run
+  that PAUSES (signal/input/approval) is stored as a real session and
+  answered 202 with the session view, so the caller can deliver/resume it.
 
-Use `CHIDORI_DB_PATH=/path/to/chidori.sqlite` to persist sessions across server
-restarts.
+Sessions persist across server restarts by default (SQLite at
+`.chidori/sessions.sqlite3` next to the agent). `CHIDORI_DB_PATH` overrides
+the path; `CHIDORI_DB_PATH=:memory:` opts out of durable sessions.
 
 ## TypeScript SDK
 
@@ -541,6 +752,8 @@ restarts.
 import { AgentClient, Checkpoint } from "@1kbirds/chidori";
 
 const client = new AgentClient("http://localhost:8080");
+// Production server (CHIDORI_API_KEY set): pass { apiKey } — sent as a
+// bearer token on every request including stream(). Python: api_key=...
 const session = await client.run({ document: "Rust is a systems language." });
 
 const checkpoint = await session.checkpoint();
@@ -555,6 +768,41 @@ const manifest = await client.getSnapshotManifest(session.id);
 
 `Checkpoint` contains the replay call log and optional snapshot manifest
 metadata. It does not contain raw VM snapshot bytes.
+
+## Providers & Model Selection
+
+Providers register from environment variables (all can coexist; requests
+route by model name, first match wins):
+
+- `ANTHROPIC_API_KEY` — Anthropic (`claude-*` models).
+- `OPENAI_API_KEY` — OpenAI; `OPENAI_BASE_URL` redirects it at any
+  OpenAI-compatible endpoint and widens it to match all model names.
+- `CHIDORI_OPENAI_COMPAT_URL` + `CHIDORI_OPENAI_COMPAT_KEY` — any
+  OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, LiteLLM…),
+  matching all model names. `/v1` and bare hosts both work.
+  (`LITELLM_API_URL`/`LITELLM_API_KEY` are legacy aliases.)
+- `chidori model-login` — zero-setup OpenRouter fallback.
+
+The default model for prompts that don't set `model` in code is
+`CHIDORI_MODEL` (or `--model` on `run`/`resume`), falling back to
+`claude-sonnet-4-6`. The resolved default is recorded in each run's
+manifest, so `resume`, `branch-resume`/`branch-rerun`, and server
+resume/replay routes re-run under the run's own model with no flags.
+Detached agents likewise carry their model in their registry descriptor.
+
+Cost estimation covers Anthropic/OpenAI models out of the box; teach it
+other models with `CHIDORI_PRICING` (JSON, model prefix → USD per MTok,
+consulted before the built-in table):
+
+```bash
+CHIDORI_PRICING='{"deepseek-v4-flash":{"input_per_mtok":0.28,"output_per_mtok":0.42,"cache_read_multiplier":0.1}}'
+```
+
+`chidori trace` and `chidori stats` display prompt-cache read/write token
+totals alongside cost.
+
+`chidori.workspace.*` roots at the project directory under `run`, `resume`,
+and `serve`; `CHIDORI_WORKSPACE_ROOT` overrides the location.
 
 ## Runtime Policy
 

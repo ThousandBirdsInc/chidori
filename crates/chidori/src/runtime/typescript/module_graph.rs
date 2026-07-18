@@ -15,35 +15,48 @@ use anyhow::{Context, Result};
 use crate::runtime::snapshot::{
     RuntimePolicy, SnapshotModuleGraphEntry, SnapshotModuleImport, SourceFingerprint,
 };
-use crate::runtime::typescript::transpile::validate_imports;
+use crate::runtime::typescript::transpile::module_graph_imports;
 
 /// Module fingerprints for every dependency of `path` (excluding the entry
 /// itself), used to detect source drift on resume.
+#[allow(dead_code)] // Not yet wired into a call path; staged API.
 pub fn snapshot_module_fingerprints(
     path: &Path,
     source: &str,
     policy: &RuntimePolicy,
 ) -> Result<Vec<SourceFingerprint>> {
-    let entry_path = stable_path(path);
-    let mut builder = SnapshotModuleBuilder::new(policy);
-    builder.collect(path, source)?;
-    Ok(builder
-        .modules
-        .iter()
-        .filter(|module| module.path != entry_path)
-        .map(|module| SourceFingerprint::from_source(module.path.clone(), &module.source))
-        .collect())
+    Ok(snapshot_modules(path, source, policy)?.0)
 }
 
 /// The full module import graph (entry + dependencies) for the manifest.
+#[allow(dead_code)] // Not yet wired into a call path; staged API.
 pub fn snapshot_module_graph(
     path: &Path,
     source: &str,
     policy: &RuntimePolicy,
 ) -> Result<Vec<SnapshotModuleGraphEntry>> {
+    Ok(snapshot_modules(path, source, policy)?.1)
+}
+
+/// Both manifest views of the module walk — dependency fingerprints and the
+/// full import graph — from a single collection pass, so callers that need
+/// both (the per-run scaffold persister) read each module file once instead
+/// of twice.
+pub fn snapshot_modules(
+    path: &Path,
+    source: &str,
+    policy: &RuntimePolicy,
+) -> Result<(Vec<SourceFingerprint>, Vec<SnapshotModuleGraphEntry>)> {
+    let entry_path = stable_path(path);
     let mut builder = SnapshotModuleBuilder::new(policy);
     builder.collect(path, source)?;
-    Ok(builder
+    let fingerprints = builder
+        .modules
+        .iter()
+        .filter(|module| module.path != entry_path)
+        .map(|module| SourceFingerprint::from_source(module.path.clone(), &module.source))
+        .collect();
+    let graph = builder
         .modules
         .iter()
         .map(|module| SnapshotModuleGraphEntry {
@@ -57,7 +70,8 @@ pub fn snapshot_module_graph(
                 })
                 .collect(),
         })
-        .collect())
+        .collect();
+    Ok((fingerprints, graph))
 }
 
 struct SnapshotModuleBuilder<'policy> {
@@ -65,7 +79,6 @@ struct SnapshotModuleBuilder<'policy> {
     modules: Vec<SnapshotModule>,
     module_keys: HashMap<PathBuf, String>,
     seen: HashSet<PathBuf>,
-    visiting: HashSet<PathBuf>,
 }
 
 struct SnapshotModule {
@@ -89,20 +102,18 @@ impl<'policy> SnapshotModuleBuilder<'policy> {
             modules: Vec::new(),
             module_keys: HashMap::new(),
             seen: HashSet::new(),
-            visiting: HashSet::new(),
         }
     }
 
     fn collect(&mut self, path: &Path, source: &str) -> Result<()> {
         let path = stable_path(path);
-        if self.seen.contains(&path) {
+        // Mark BEFORE recursing so cyclic imports terminate. Cycles are legal
+        // ES modules (the engine links them with live bindings — common in
+        // real npm packages), and the manifest walk merely *describes* the
+        // graph, so a back-edge is nothing to reject: the module is already
+        // being collected further up the stack.
+        if !self.seen.insert(path.clone()) {
             return Ok(());
-        }
-        if !self.visiting.insert(path.clone()) {
-            anyhow::bail!(
-                "{}: cyclic TypeScript imports are not supported by the snapshot scaffold",
-                path.display()
-            );
         }
 
         let imports = resolved_snapshot_imports(&path, source, self.policy)?;
@@ -123,8 +134,6 @@ impl<'policy> SnapshotModuleBuilder<'policy> {
             self.collect(module_path, &module_source)?;
         }
 
-        self.visiting.remove(&path);
-        self.seen.insert(path.clone());
         let key = snapshot_module_key(&path);
         self.module_keys.insert(path.clone(), key.clone());
         self.modules.push(SnapshotModule {
@@ -142,7 +151,7 @@ fn resolved_snapshot_imports(
     source: &str,
     policy: &RuntimePolicy,
 ) -> Result<Vec<ResolvedSnapshotImport>> {
-    validate_imports(path, source, policy.typescript_imports).map(|imports| {
+    module_graph_imports(path, source, policy.typescript_imports).map(|imports| {
         imports
             .into_iter()
             .map(|import| ResolvedSnapshotImport {

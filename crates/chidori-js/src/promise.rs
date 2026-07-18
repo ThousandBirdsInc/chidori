@@ -17,13 +17,13 @@ impl Vm {
     pub fn new_promise(&self) -> JsObject {
         self.alloc(ObjectData::new(
             Some(self.realm.promise_proto.clone()),
-            Internal::Promise(PromiseData {
+            Internal::Promise(Box::new(PromiseData {
                 state: PromiseState::Pending,
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
                 handled: false,
                 host_id: None,
-            }),
+            })),
         ))
     }
 
@@ -66,7 +66,7 @@ impl Vm {
             }
             // `Get(value, "then")` is observable, and an abrupt completion
             // REJECTS the promise (spec PromiseResolveFunctions step 9).
-            let then = match self.get_prop(&value, &PropertyKey::str("then")) {
+            let then = match self.get_prop(&value, &crate::names::key_then()) {
                 Ok(t) => t,
                 Err(e) => {
                     self.reject_promise(promise, e);
@@ -80,8 +80,7 @@ impl Vm {
                 .realm
                 .promise_proto
                 .borrow()
-                .props
-                .get(&PropertyKey::str("then"))
+                .own_get(&StrKeyRef("then"))
                 .and_then(|p| p.value().cloned());
             let is_intrinsic_then = matches!(
                 (&then, &builtin_then),
@@ -125,12 +124,12 @@ impl Vm {
         let p1 = promise.clone();
         let p2 = promise.clone();
         let resolve = self.new_native("", 1, move |vm, _this, args| {
-            let v = args.get(0).cloned().unwrap_or(Value::Undefined);
+            let v = args.first().cloned().unwrap_or(Value::Undefined);
             vm.resolve_promise(&p1, v);
             Ok(Value::Undefined)
         });
         let reject = self.new_native("", 1, move |vm, _this, args| {
-            let v = args.get(0).cloned().unwrap_or(Value::Undefined);
+            let v = args.first().cloned().unwrap_or(Value::Undefined);
             vm.reject_promise(&p2, v);
             Ok(Value::Undefined)
         });
@@ -329,6 +328,11 @@ impl Vm {
         while let Some(task) = self.microtasks.pop_front() {
             self.run_microtask(task);
         }
+        // The queue is drained and no JS frame is on the Rust stack — the
+        // natural quiescence point for automatic cycle collection. Without
+        // this, a long-lived VM with continuous churn leaks every cycle it
+        // creates unless the host calls collect_cycles by hand.
+        self.maybe_collect_cycles();
         if let Some((id, _)) = self.pending_host.first() {
             return RunOutcome::BlockedOnHost(*id);
         }

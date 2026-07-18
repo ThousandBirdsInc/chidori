@@ -59,8 +59,10 @@ impl Capability {
 
     /// Parse the JS-side flag string emitted by the prelude host shims back
     /// into a `Capability`. Returns `None` for unknown strings so a forward-
-    /// compatible prelude can't crash an older runtime.
-    pub fn from_str(value: &str) -> Option<Self> {
+    /// compatible prelude can't crash an older runtime. (Named `parse`, not
+    /// `from_str`, because the fallible-by-`Option` shape doesn't fit the
+    /// `FromStr` trait contract.)
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "fs_read" => Some(Capability::FsRead),
             "fs_write" => Some(Capability::FsWrite),
@@ -145,9 +147,9 @@ mod tests {
             Capability::Timer,
             Capability::Microtask,
         ] {
-            assert_eq!(Capability::from_str(cap.as_str()), Some(cap));
+            assert_eq!(Capability::parse(cap.as_str()), Some(cap));
         }
-        assert_eq!(Capability::from_str("nope"), None);
+        assert_eq!(Capability::parse("nope"), None);
     }
 
     #[test]

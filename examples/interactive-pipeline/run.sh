@@ -29,5 +29,8 @@ else
   echo "  (start tael, then re-run; or set OTEL_EXPORTER_OTLP_ENDPOINT yourself)" >&2
 fi
 
+# --trusted runs this in-repo code without ask-by-default prompts. This agent
+# only logs/checkpoints (no gated effects), so it runs the same either way —
+# the flag is for consistency with the other examples.
 exec cargo run --quiet --manifest-path "$REPO/Cargo.toml" \
-  -- run "$AGENT" -i "$INPUT"
+  -- run "$AGENT" -i "$INPUT" --trusted

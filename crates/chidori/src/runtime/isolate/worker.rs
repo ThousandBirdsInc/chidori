@@ -83,6 +83,7 @@ pub fn run() -> io::Result<()> {
 /// applying any per-process resource limits. Factored out of [`run`] so tests
 /// can drive the worker over an in-process socket without a subprocess — and
 /// without the worker's `setrlimit` floor leaking onto the test process.
+#[allow(dead_code)] // Exercised only by tests today; the lib target sees it as dead.
 pub fn serve<R: Read + 'static, W: Write + 'static>(reader: R, writer: W) -> io::Result<()> {
     serve_inner(reader, writer, false)
 }
@@ -138,8 +139,20 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
         let _ = &limits;
         super::sandbox::SandboxOutcome::default()
     };
-    for note in &sandbox.notes {
-        eprintln!("isolate worker: sandbox: {note}");
+    // Degradation notes (e.g. "landlock not enforced: no kernel support" on
+    // older kernels and most containers) are diagnostics, not alarms: printed
+    // only under --verbose (CHIDORI_VERBOSE) or CHIDORI_ISOLATE_VERBOSE —
+    // unconditional, they were the first line every containerized user ever
+    // saw from chidori. Even then they print once per parent process, not
+    // once per run: the supervisor marks every worker after its first (see
+    // `run_agent_isolated`). Enforcement, as opposed to diagnostics, is
+    // CHIDORI_ISOLATE_REQUIRE_SANDBOX below.
+    if (env_truthy("CHIDORI_VERBOSE") || env_truthy("CHIDORI_ISOLATE_VERBOSE"))
+        && !env_truthy("CHIDORI_ISOLATE_SANDBOX_NOTES_QUIET")
+    {
+        for note in &sandbox.notes {
+            eprintln!("isolate worker: sandbox: {note}");
+        }
     }
     if apply_limits && env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") && !sandbox.core_confined() {
         let mut guard = io.borrow_mut();

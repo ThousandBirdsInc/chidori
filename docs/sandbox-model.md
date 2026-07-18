@@ -1,9 +1,10 @@
 # Sandbox model of the chidori-js runtime
 
-> Two layers ship: the default **in-process** capability-confinement
-> sandbox, and an **opt-in OS-level isolation** mode (`--isolate`) that runs each
-> agent in a confined child process — see
-> [OS-level isolation](#os-level-isolation-opt-in---isolate). Known limitations
+> Two layers ship: the **in-process** capability-confinement sandbox, and an
+> **OS-level isolation** mode that runs each agent in a confined child
+> process — on by default for the `chidori` CLI on Unix, opt-in elsewhere
+> (`--isolate`) — see
+> [OS-level isolation](#os-level-isolation---isolate). Known limitations
 > are documented in [Current gaps](#current-gaps).
 > **Engine:** the pure-Rust `chidori-js` engine — the only JS engine in
 > the tree.
@@ -35,15 +36,16 @@ the host *does* inject (`http`, `workspace.*`). Those are real capabilities;
 whether granting them is "safe" depends entirely on whether the agent code is
 trusted.
 
-For that case there is an **opt-in OS-level isolation mode**
-(`--isolate` / `CHIDORI_ISOLATE=process`): each run executes in a disposable
+For that case there is an **OS-level isolation mode** — on by default for the
+CLI on Unix, opt-in for embedders and elsewhere (`--isolate` /
+`CHIDORI_ISOLATE=process`): each run executes in a disposable
 child process that holds *only* the JS engine and brokers every effect back to
 the trusted parent over a pipe. The child runs under a per-OS sandbox (Linux:
 empty network namespace + Landlock read-only filesystem + seccomp syscall
 denylist; macOS: a Seatbelt deny profile) plus a `setrlimit` floor and a
 parent-side deadline-kill — so even a total compromise of the interpreter has no
 ambient network, filesystem, or sibling-run to reach. See
-[OS-level isolation](#os-level-isolation-opt-in---isolate).
+[OS-level isolation](#os-level-isolation---isolate).
 
 ## Threat model
 
@@ -69,7 +71,7 @@ remaining distance.
 | Crash the host with a panic | ✅ Yes — `catch_unwind` boundary |
 | Abuse an injected powerful effect (`http`, `workspace`) | ✅ On the server (deny-by-default unless the operator opts out); ⚠️ on the bare CLI only if the operator gates it — see [gaps](#current-gaps) |
 | Starve co-tenant agents / exceed a per-agent memory quota | ✅ Per-run meter (thread-attributed; small cross-thread drift) — see [gaps](#current-gaps) |
-| Break out of the process / OS | ⚠️ Default: none (in-process). ✅ With `--isolate`: confined child process — seccomp/Seatbelt + netns/Landlock + rlimits — see [OS-level isolation](#os-level-isolation-opt-in---isolate) |
+| Break out of the process / OS | ✅ CLI on Unix (isolation on by default): confined child process — seccomp/Seatbelt + netns/Landlock + rlimits — see [OS-level isolation](#os-level-isolation---isolate). ⚠️ Embedders / `--no-isolate` / non-Unix: none (in-process) |
 
 ## Architecture: capability injection, not ambient authority
 
@@ -150,11 +152,11 @@ Two complementary layers:
 
 1. **Per-op string cap (always on, in-engine).** `op_add` and `ConcatStrings`
    (template join) throw `RangeError` when a single concatenation would exceed
-   `MAX_STRING_LEN` (16M code units, `crates/chidori-js/src/value.rs`). This closes the
-   exponential `s += s` / `` s = `${s}${s}` `` OOM
+   `MAX_STRING_LEN` (2^28 = ~268M code units, `crates/chidori-js/src/value.rs`). This
+   closes the exponential `s += s` / `` s = `${s}${s}` `` OOM
    and matches the caps on `repeat`/`padStart`/`padEnd` and on
-   dense-array allocation (`MAX_DENSE_ARRAY` = 1M). With these caps, no *single*
-   opcode can allocate without bound.
+   dense-array allocation (`MAX_DENSE_ARRAY` = 2^25 = ~33.5M elements). With these
+   caps, no *single* opcode can allocate without bound.
 
 2. **Per-run live-heap ceiling (watchdog).** A `CountingAllocator`
    (`src/mem_guard.rs`) is installed as the binary's `#[global_allocator]`. Each
@@ -204,19 +206,20 @@ The same watchdog can enforce a wall-clock deadline, also via `vm.interrupt`.
 | Memory ceiling (MB, per-run meter) | `CHIDORI_JS_MEM_CAP_MB` | `4096` | `0` |
 | Memory watchdog poll interval (ms) | `CHIDORI_JS_MEM_POLL_MS` | `10` | — |
 | Wall-clock deadline (ms) | `CHIDORI_JS_DEADLINE_MS` | off | — |
-| String length | (compile constant) | 16M code units | — |
+| String length | (compile constant) | 2^28 (~268M) code units | — |
 | Dense array length | (compile constant) | 1,000,000 | — |
 | Call depth | (compile constant) | 2,000 | — |
 | Regex steps | (compile constant) | 100,000 | — |
 
-## OS-level isolation (opt-in: `--isolate`)
+## OS-level isolation (`--isolate`)
 
-Everything above confines the *language* and bounds resources, but by default the
-VM runs **in-process** with the host: there is no OS boundary, so a hypothetical
-interpreter RCE would land in the host process. The `--isolate` mode adds that
-boundary. It is **off by default** (in-process stays the default for trusted
-local dev) and **additive** — agent code, the SDKs, the durable call log, and
-replay semantics are byte-for-byte unchanged (asserted by
+Everything above confines the *language* and bounds resources, but in-process
+the VM shares its address space with the host: there is no OS boundary, so a
+hypothetical interpreter RCE would land in the host process. Isolation adds
+that boundary. It is **on by default for the `chidori` CLI on Unix** (see
+[Enabling it](#enabling-it) — embedders and non-Unix platforms keep the
+historical opt-in) and **additive** — agent code, the SDKs, the durable call
+log, and replay semantics are byte-for-byte unchanged (asserted by
 `rust_engine::tests::isolated_run_matches_in_process_byte_for_byte`). The full
 design lives in [`docs/os-isolation-plan.md`](./os-isolation-plan.md); this
 is the operator-facing summary. Code: `crates/chidori/src/runtime/isolate/`.
@@ -284,7 +287,14 @@ in-engine `CHIDORI_JS_DEADLINE_MS`.
 
 Because brokering means the child needs *no* outward capability on any platform,
 even a coarse per-OS sandbox is meaningfully strong — there is nothing wired for
-it to abuse. Each layer is **best-effort**: a layer that cannot be applied (older
+it to abuse. Note the flip side: brokered `http` executes in the *parent*, with
+the parent's network reach, so the OS sandbox alone is no defense against
+server-side request forgery. That is the SSRF guard's job (`runtime::ssrf`):
+the parent refuses `http` destinations that resolve to non-public addresses
+(loopback, RFC 1918, the 169.254.169.254 cloud-metadata range, and their IPv6
+equivalents), checked at DNS-resolution time and on every redirect hop, with
+`CHIDORI_HTTP_ALLOW_HOSTS` as the deliberate allowlist.
+Each layer is **best-effort**: a layer that cannot be applied (older
 kernel, rootless container) logs a skip note and degrades rather than breaking
 the run. Set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to **fail closed** if the
 platform's core layer (seccomp on Linux, Seatbelt on macOS) cannot be applied.
@@ -349,16 +359,21 @@ a structured error frame from its `catch_unwind` boundary before exiting):
 
 ### Enabling it
 
-`--isolate` is accepted on both `chidori run` and `chidori serve` (equivalently
-`CHIDORI_ISOLATE=process`); the worker child always has the env var stripped so
-it never recursively re-isolates. The startup banner prints an `Isolation:` line
-describing the active posture. Isolation (process sandbox) and `--untrusted`
-(policy) are **orthogonal but composable** — running untrusted *without*
-isolation prints a nudge rather than silently changing behavior.
+Isolation is **on by default** for the CLI on Unix (Linux and macOS get an OS
+sandbox layer; other Unixes get process separation + rlimits): when
+`CHIDORI_ISOLATE` is unset, `chidori run`/`chidori serve` isolate each run.
+Opt out with `--no-isolate` or `CHIDORI_ISOLATE=off`; `--isolate` remains as an
+explicit override of an ambient `off`. Embedders of the library keep the
+historical opt-in behavior (unset means off) — only the `chidori` binary flips
+the default. The worker child always has the env var explicitly set to `off`
+so it never recursively re-isolates. The startup banner prints an `Isolation:`
+line describing the active posture. Isolation (process sandbox) and
+`--untrusted` (policy) are **orthogonal but composable** — running untrusted
+*without* isolation prints a nudge rather than silently changing behavior.
 
 | Env var | Default | Effect |
 |---|---|---|
-| `CHIDORI_ISOLATE` | unset (off) | `process` runs each agent in a confined child worker. Set by `--isolate`. |
+| `CHIDORI_ISOLATE` | unset (on for the CLI on Unix; off for embedders) | `process` runs each agent in a confined child worker; `off` disables. Set by `--isolate` / `--no-isolate`. |
 | `CHIDORI_ISOLATE_REQUIRE_SANDBOX` | off | Fail the run closed if the platform's core confinement (seccomp/Seatbelt) can't be applied. |
 | `CHIDORI_ISOLATE_DEADLINE_MS` | off | Parent-side wall-clock `SIGKILL` of a wedged worker. |
 | `CHIDORI_ISOLATE_CPU_SECS` | off | Hard `RLIMIT_CPU` ceiling on worker compute. |
@@ -396,7 +411,7 @@ resource-precision gaps.
    charged (the meter clamps at zero in the other direction). For a
    single-threaded VM run this drift is small; only true ownership accounting
    (charge at string/object allocation, credit on `Drop` inside the engine)
-   would eliminate it. **Under [`--isolate`](#os-level-isolation-opt-in---isolate) this
+   would eliminate it. **Under [`--isolate`](#os-level-isolation---isolate) this
    drift disappears**: each run is its own process, so the meter is a clean
    per-process measure with no cross-tenant attribution.
 
@@ -406,15 +421,17 @@ resource-precision gaps.
    unwinding. Bounded in practice because the per-op size caps mean no single
    opcode allocates more than ~16 MB, but it is not a hard instantaneous ceiling.
    A *hard*, kernel-enforced ceiling (cgroup v2 `memory.max`) under
-   [`--isolate`](#os-level-isolation-opt-in---isolate) is not yet wired — see
+   [`--isolate`](#os-level-isolation---isolate) is not yet wired — see
    gap #4.
 
-4. **OS-level isolation is opt-in, not the default.** By default the engine runs
-   in-process with the host — no seccomp, namespace, or separate-process boundary
-   — so the default posture is purely capability-confinement plus Rust memory
-   safety. The [`--isolate` mode](#os-level-isolation-opt-in---isolate)
-   *provides* that boundary, but the operator must enable it; in-process is
-   the default for trusted local dev. Sub-gaps within the isolated path:
+4. **OS-level isolation is default-on only for the CLI on Unix.** Embedders of
+   the library, `--no-isolate` runs, and non-Unix platforms run the engine
+   in-process with the host — no seccomp, namespace, or separate-process
+   boundary — so that posture is purely capability-confinement plus Rust
+   memory safety. The [`--isolate` mode](#os-level-isolation---isolate)
+   *provides* the boundary (and the `chidori` binary enables it by default on
+   Unix); everywhere else the operator must enable it. Sub-gaps within the
+   isolated path:
    - **No hard memory ceiling.** cgroup v2 `memory.max` needs delegation and
      is not yet wired; `RLIMIT_AS` is too blunt for a multi-threaded VM. The polled
      heap watchdog (cleaner per-process under isolation) is the stand-in.
@@ -427,7 +444,7 @@ resource-precision gaps.
      macOS CI host yet); it degrades to a logged skip on failure.
 
 5. **Container element counts beyond arrays are uncapped.** Arrays are bounded by
-   `MAX_DENSE_ARRAY` (1M), but `Map`/`Set`/object property counts are not
+   `MAX_DENSE_ARRAY` (2^25, ~33.5M), but `Map`/`Set`/object property counts are not
    individually capped. The memory ceiling (gap 2) is the backstop for the bytes
    they consume; there is no separate per-container element limit.
 
@@ -440,7 +457,7 @@ resource-precision gaps.
    `crates/chidori-js/src/gc.rs`) but is not wired into the run loop, so
    within a run cycles accumulate until teardown. The per-run memory cap is
    the backstop for the bytes involved. **The
-   [`--isolate`](#os-level-isolation-opt-in---isolate) path sidesteps this
+   [`--isolate`](#os-level-isolation---isolate) path sidesteps this
    entirely**: the child process exits after one run (spawn-per-run, no warm
    pool), so no state — leaked or otherwise — survives across runs.
 
@@ -504,7 +521,55 @@ Selection order is the `--untrusted` flag first, then env-driven resolution:
   banner's `Policy:` line reports the active posture either way).
 
 To customize further, copy the profile's shape into your own `CHIDORI_POLICY`
-JSON (rules + `"default": "never_allow"`).
+JSON (rules + `"default": "never_allow"`) — full schema below.
+
+### Writing a policy file (`CHIDORI_POLICY_FILE` / `CHIDORI_POLICY`)
+
+The deployment checklist asks for a configured policy; this is the file's
+complete shape (`src/policy.rs::PolicyConfig`):
+
+```jsonc
+{
+  "rules": [
+    // Tried in order; the FIRST rule whose target and match_args both
+    // match wins. No rule matches → the "default" decision applies.
+    {
+      "target": "http",                 // "http" | "workspace:<action>" | "tool:<name>" | "app_data:<action>" | "*"
+                                        //   workspace actions: list | read | write | delete | manifest
+      "decision": "always_allow",       // "always_allow" | "ask_before" | "never_allow"
+      "match_args": {                   // optional JSON subset matched against the call's args
+        "url_prefix": "http://ops.internal:9911/"
+      },
+      "reason": "ops API only"          // optional; shown in the denial/approval message
+    },
+    { "target": "workspace:write", "decision": "always_allow" },
+    { "target": "workspace:read",  "decision": "always_allow" },
+    { "target": "workspace:list",  "decision": "always_allow" }
+  ],
+  "default": "never_allow",             // fallback when no rule matches (default: "always_allow")
+  "default_reason": "this server allows only the ops API and workspace writes"
+}
+```
+
+`match_args` semantics:
+
+- **Objects** match as subsets: every key in the pattern must exist in the
+  call args and match recursively.
+- **Strings substring-match**: `{"url": "/status/"}` matches any URL
+  containing it. Convenient for tool args — but **never use a plain string
+  to scope `http` by host**: the host text appearing anywhere (e.g. inside
+  a hostile URL's query string) would satisfy it.
+- **`url_prefix` anchors**: the reserved key matches when the call's `url`
+  *starts with* the given string — the right shape for "this agent talks
+  to this host only" (`{"url_prefix": "https://api.example.com/"}`).
+  Combine with the [SSRF guard](#per-os-confinement-isolatesandboxrs)'s
+  `CHIDORI_HTTP_ALLOW_HOSTS` for internal hosts.
+- Other JSON values must be equal.
+
+A malformed file **fails closed**: `chidori serve` logs a parse warning and
+falls back to the deny-by-default `untrusted` profile, never to allow-all.
+Every denied gated call is reported on the server's stderr (as well as in
+the run journal), so a misconfigured policy is audible, not silent.
 
 ### The `supervised` profile (ask-by-default)
 
@@ -567,7 +632,7 @@ If you intend to run code you do not trust on this engine today:
    ambient process to land in. Layers are best-effort — set
    `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed if the platform's core
    confinement can't be applied. See
-   [OS-level isolation](#os-level-isolation-opt-in---isolate) for the full
+   [OS-level isolation](#os-level-isolation---isolate) for the full
    posture. (Running each agent in its own container is still complementary.)
 4. Keep `node:fs` on `FsPolicy::Captured` (the VFS) and avoid `workspace.*`.
 

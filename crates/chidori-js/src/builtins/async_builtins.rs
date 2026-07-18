@@ -79,7 +79,7 @@ fn install_promise(vm: &mut Vm) {
     // Promise.prototype[Symbol.toStringTag] = "Promise" (non-writable,
     // non-enumerable, configurable) when the engine has Symbol.toStringTag.
     let to_string_tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(to_string_tag),
         Property {
             kind: PropertyKind::Data {
@@ -126,7 +126,7 @@ fn install_promise(vm: &mut Vm) {
     vm.define_method(&proto, "catch", 1, |vm, this, args| {
         // catch(onRejected) === Invoke(this, "then", [undefined, onRejected]) —
         // generic over any thenable, and routes through `then`'s species logic.
-        let then = vm.get_prop(&this, &PropertyKey::str("then"))?;
+        let then = vm.get_prop(&this, &crate::names::key_then())?;
         vm.call(then, this.clone(), &[Value::Undefined, arg(args, 0)])
     });
     vm.define_method(&proto, "finally", 1, |vm, this, args| {
@@ -229,11 +229,6 @@ fn install_promise(vm: &mut Vm) {
     });
 }
 
-/// Test-and-set an element's `alreadyCalled` flag. Returns `true` if the element
-/// has already settled (so the caller must bail out), `false` on the first call
-/// (and marks it settled). Mirrors the spec's per-element resolve/reject guard so
-/// a misbehaving thenable cannot double-count the combinator's pending counter.
-
 /// `IfAbruptCloseIterator`: on an abrupt completion mid-combinator, close the
 /// iterator (suppressing any close error — the original abrupt wins) and
 /// propagate.
@@ -333,13 +328,13 @@ fn get_promise_resolve(vm: &mut Vm, c: &Value) -> Result<Value, Value> {
 /// `Invoke(p, "then", [handler])` — exactly one argument (the spec's
 /// finally thunks call `then` unary, observable via `arguments.length`).
 fn invoke_then_one(vm: &mut Vm, p: &Value, handler: Value) -> Result<Value, Value> {
-    let then = vm.get_prop(p, &PropertyKey::str("then"))?;
+    let then = vm.get_prop(p, &crate::names::key_then())?;
     vm.call(then, p.clone(), &[handler])
 }
 
 /// `Invoke(p, "then", [onF, onR])`.
 fn invoke_then(vm: &mut Vm, p: &Value, on_f: Value, on_r: Value) -> Result<Value, Value> {
-    let then = vm.get_prop(p, &PropertyKey::str("then"))?;
+    let then = vm.get_prop(p, &crate::names::key_then())?;
     vm.call(then, p.clone(), &[on_f, on_r])
 }
 
@@ -431,11 +426,11 @@ fn perform_promise_all_settled(
                     let o = vm.new_object();
                     {
                         let mut b = o.borrow_mut();
-                        b.props.insert(
+                        b.own_insert(
                             PropertyKey::str("status"),
                             Property::data(Value::str(status)),
                         );
-                        b.props.insert(PropertyKey::str(key), Property::data(v));
+                        b.own_insert(PropertyKey::str(key), Property::data(v));
                     }
                     Value::Object(o)
                 };
@@ -599,11 +594,11 @@ fn make_aggregate_error(vm: &mut Vm, errors: Vec<Value>) -> Value {
     if let Value::Object(o) = &agg {
         let arr = vm.new_array(errors);
         let mut b = o.borrow_mut();
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("errors"),
             Property::data(Value::Object(arr)),
         );
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("name"),
             Property::builtin(Value::str("AggregateError")),
         );
@@ -611,6 +606,7 @@ fn make_aggregate_error(vm: &mut Vm, errors: Vec<Value>) -> Value {
     agg
 }
 
+#[allow(dead_code)] // Left from the pre-refactor combinator settle path; deletion candidate.
 fn settle_one(
     vm: &mut Vm,
     remaining: &Rc<RefCell<usize>>,
@@ -713,7 +709,7 @@ fn install_generator(vm: &mut Vm) {
         let promise = vm.new_promise();
         let (resolve, reject) = make_resolving_functions(vm, &promise);
         let outcome = (|| -> Result<Option<Value>, Value> {
-            let ret = vm.get_prop(&this, &PropertyKey::str("return"))?;
+            let ret = vm.get_prop(&this, &crate::names::key_return())?;
             if ret.is_nullish() {
                 return Ok(None);
             }
@@ -759,7 +755,7 @@ fn install_generator(vm: &mut Vm) {
     // %IteratorPrototype%[@@dispose]: GetMethod(this, "return"); call it when
     // present; the result is discarded (return undefined).
     let sync_dispose = vm.new_native("[Symbol.dispose]", 0, |vm, this, _a| {
-        let ret = vm.get_prop(&this, &PropertyKey::str("return"))?;
+        let ret = vm.get_prop(&this, &crate::names::key_return())?;
         if !ret.is_nullish() {
             if !vm.is_callable(&ret) {
                 return Err(vm.throw_type("iterator return is not a function"));

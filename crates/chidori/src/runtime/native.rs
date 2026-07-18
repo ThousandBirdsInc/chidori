@@ -105,6 +105,11 @@ pub struct PendingBatch {
     pub pending_index: usize,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "transient control-flow result, never stored in bulk; boxing the \
+              pause payload buys nothing"
+)]
 enum BatchOutcome {
     Completed,
     Paused {
@@ -482,6 +487,7 @@ impl NativeAgentRunner {
                 let input = PendingInput {
                     seq,
                     prompt: prompt.clone(),
+                    details: None,
                 };
                 ctx.begin_host_operation_with_function(
                     seq,

@@ -9,7 +9,7 @@
 //! round-trip a self-describing blob of `{bundle, effects, journal}` rather than
 //! threading the bundle through the trait signature.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -35,6 +35,7 @@ pub struct RustReplayEngine {
     effects: Vec<String>,
 }
 
+#[allow(dead_code)] // Embedding surface for the replay engine; only trait-side entry points are wired today.
 impl RustReplayEngine {
     /// Begin a fresh durable execution of `bundle`, exposing the named host
     /// effects as global async functions.
@@ -91,7 +92,7 @@ const JS_TRACE_MAX_DEPTH: usize = 64;
 /// [`HostBindingBackend`], with policy enforcement and MCP. Relative and `node:`
 /// multi-file imports are resolved and linked by the engine; nested TypeScript
 /// tools and sub-agents run natively on this same engine.
-pub fn run_agent(
+pub(crate) fn run_agent(
     path: &Path,
     source: &str,
     inputs: &Value,
@@ -116,60 +117,240 @@ pub fn run_agent(
     )
 }
 
+const ERROR_NAMES: &[&str] = &[
+    "Error",
+    "TypeError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "EvalError",
+    "URIError",
+    "AggregateError",
+];
+
 /// Reframe a chidori-js entrypoint error so an uncaught JS exception surfaces
 /// as `JavaScript exception: <message>` — the shape the durable format, the
 /// host-call span tree, and the SDKs expect. chidori-js stringifies a thrown
-/// `Error` as `"<Name>: <message>"`; we strip the standard error-class prefix
-/// to recover the bare message and apply the host framing. Pause sentinels pass through untouched — they are control
-/// flow, not exceptions, and `engine.rs` / `host_core` detect them by substring.
+/// `Error` as `"<Name>: <message>"`; for the classic single-line shape we
+/// strip the standard error-class prefix to recover the bare message and
+/// apply the host framing. An error carrying stack frames (recorded on
+/// `.stack` during unwinding) keeps its class name: the multi-line shape is
+/// new, nothing parses its head line as a bare message, and `TypeError` vs
+/// `RangeError` is diagnostic signal the CLI report should show.
+///
+/// Frames stay in their raw (transpiled-bundle) coordinates here; remapping to
+/// original TypeScript is a display concern applied ONCE at the human-facing
+/// boundary (`main::report_cli_error`, via [`remap_stack_frames`]). Doing it
+/// here instead would remap twice for nested execution — a tool/sub-agent
+/// error is framed by its own engine and then re-framed by the agent that
+/// awaited it — corrupting the already-remapped positions.
+///
+/// Idempotent: a nested error re-enters the awaiting engine as
+/// `Error: JavaScript exception: <inner>`, so an input already carrying this
+/// framing is collapsed rather than double-prefixed. Pause sentinels pass
+/// through untouched — control flow, not exceptions, detected by substring in
+/// `engine.rs` / `host_core`.
 fn js_exception_message(err: &str) -> String {
-    if err.contains(crate::runtime::context::PAUSE_MARKER) {
+    if crate::runtime::errors::RunInterrupt::from_message(err).is_some() {
         return err.to_string();
     }
-    const ERROR_NAMES: &[&str] = &[
-        "Error",
-        "TypeError",
-        "RangeError",
-        "ReferenceError",
-        "SyntaxError",
-        "EvalError",
-        "URIError",
-        "AggregateError",
-    ];
-    for name in ERROR_NAMES {
-        if let Some(rest) = err.strip_prefix(&format!("{name}: ")) {
-            return format!("JavaScript exception: {rest}");
+    let (head, rest) = err.split_once('\n').unwrap_or((err, ""));
+    let bare = ERROR_NAMES
+        .iter()
+        .find_map(|n| head.strip_prefix(&format!("{n}: ")))
+        .unwrap_or(head);
+    // Already framed by a nested tool/sub-agent engine: collapse the layers so
+    // exactly one `JavaScript exception:` prefix survives, frames intact.
+    if let Some(inner) = bare.strip_prefix("JavaScript exception: ") {
+        return join_message(&format!("JavaScript exception: {inner}"), rest);
+    }
+    if rest.is_empty() {
+        // Single line: strip the error class for the classic bare-message shape.
+        return format!("JavaScript exception: {bare}");
+    }
+    // Frame-carrying: keep the class name (diagnostic signal for the report).
+    format!("JavaScript exception: {err}")
+}
+
+/// Reattach a frame block (`rest`, everything after the first newline) to a
+/// rebuilt head line.
+fn join_message(head: &str, rest: &str) -> String {
+    if rest.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}\n{rest}")
+    }
+}
+
+thread_local! {
+    /// The directory tree stack-frame source reads are confined to (see
+    /// [`read_project_source`]). Set to the entry agent's workspace root as a
+    /// JS-running CLI command starts — on EVERY thread that renders errors:
+    /// the command thread (`--stream` failure events) and the process main
+    /// thread (`main::report_cli_error`), see `main::display_project_root_of`.
+    /// Deliberately thread-local rather than a process global so parallel
+    /// tests can each confine to their own temp root; unset (falls back to
+    /// the current directory) in the library and tests that don't establish
+    /// one.
+    static DISPLAY_PROJECT_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Confine stack-frame source reads to `root` (the entry agent's workspace
+/// root). Called once as a JS-running command starts, so error rendering can
+/// read the agent's own files — wherever on disk they live — while still
+/// refusing paths outside the project. See [`read_project_source`].
+#[allow(dead_code)] // Called from the `chidori` binary; dead in the lib-only build.
+pub(crate) fn set_display_project_root(root: PathBuf) {
+    DISPLAY_PROJECT_ROOT.with(|r| *r.borrow_mut() = Some(root));
+}
+
+/// Read a stack-frame's source file, but ONLY when it resolves inside the
+/// project (the entry agent's workspace root, or the current directory when no
+/// root was set). A frame's file comes from the thrown error's `.stack`, which
+/// agent code can overwrite with any string — an unconfined read would let a
+/// hostile agent dump an arbitrary file (`/etc/passwd`, an env-file) into the
+/// operator's terminal as a bogus "source snippet". Genuine engine frames name
+/// modules the run loaded, all under the workspace root, so they still
+/// resolve; `node:` shims and spoofed paths that escape the root do not.
+/// Returns `None` when the path is unreadable, escapes the root, or the root
+/// can't be determined.
+#[allow(dead_code)] // Used by the binary (main::report_cli_error) and tests.
+pub(crate) fn read_project_source(file: &str) -> Option<String> {
+    let root = DISPLAY_PROJECT_ROOT
+        .with(|r| r.borrow().clone())
+        .or_else(|| std::env::current_dir().ok())?;
+    read_project_source_within(&root, file)
+}
+
+/// As [`read_project_source`], but confined to an explicit `root` instead of
+/// the thread-local display root — for surfaces whose display boundary is not
+/// the CLI process's JS thread (the HTTP server's session errors). An empty
+/// root (the parent of a bare `agent.ts`) means the current directory.
+pub(crate) fn read_project_source_within(root: &Path, file: &str) -> Option<String> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
+    let root = root.canonicalize().ok()?;
+    let full = Path::new(file).canonicalize().ok()?;
+    full.starts_with(&root)
+        .then(|| std::fs::read_to_string(&full).ok())
+        .flatten()
+}
+
+// Used by the `chidori` binary (main::report_cli_error) and tests; the lib
+// target compiles the module tree without main.rs, so it sees these as dead.
+#[allow(dead_code)]
+/// One parsed `    at name (file:line:col)` stack-frame line. `file` is the
+/// engine's module key — the real path for agent files, `node:x` for builtin
+/// shims — and is `None` for unlabeled frames (`at f (3:1)` / bare `at f`).
+pub(crate) struct StackFrame<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) file: Option<&'a str>,
+    pub(crate) line: u32,
+    pub(crate) col: u32,
+}
+
+// Used by the `chidori` binary (main::report_cli_error) and tests; the lib
+// target compiles the module tree without main.rs, so it sees these as dead.
+#[allow(dead_code)]
+/// Parse one frame line as rendered by `chidori_js`'s unwind recorder.
+pub(crate) fn parse_stack_frame(line: &str) -> Option<StackFrame<'_>> {
+    let rest = line.strip_prefix("    at ")?;
+    let open = rest.rfind(" (")?;
+    let name = &rest[..open];
+    let pos = rest[open + 2..].strip_suffix(')')?;
+    // Split from the right: `col`, `line`, then everything left (which may
+    // itself contain `:`, e.g. `node:fs` or a Windows drive) is the file.
+    let (rest_pos, col) = pos.rsplit_once(':')?;
+    let col: u32 = col.parse().ok()?;
+    match rest_pos.rsplit_once(':') {
+        Some((file, line)) => match line.parse::<u32>() {
+            Ok(line) => Some(StackFrame {
+                name,
+                file: Some(file),
+                line,
+                col,
+            }),
+            // `node:fs:3` style keys parse above; a non-numeric middle means
+            // the whole `rest_pos` was a lineless label — not a frame we know.
+            Err(_) => None,
+        },
+        None => rest_pos.parse::<u32>().ok().map(|line| StackFrame {
+            name,
+            file: None,
+            line,
+            col,
+        }),
+    }
+}
+
+// Used by the `chidori` binary (main::report_cli_error) and tests; the lib
+// target compiles the module tree without main.rs, so it sees these as dead.
+#[allow(dead_code)]
+/// Rewrite the `    at name (file:line:col)` frames of an uncaught-exception
+/// message from transpiled coordinates into positions in the original
+/// TypeScript, via each module's codegen source map (see
+/// `transpile::remap_to_original`). Frames whose file can't be read (confined
+/// to the project root — see [`read_project_source`]) or remapped — `node:`
+/// shims, vendored modules, synthetic or agent-spoofed sources — pass through
+/// unchanged. Applied ONCE at the display boundary (the frames arrive here in
+/// uniform transpiled coordinates); error path only, so each distinct file
+/// re-runs the transpile pipeline once with map generation on.
+pub(crate) fn remap_stack_frames(err: &str) -> String {
+    remap_stack_frames_via(err, read_project_source)
+}
+
+/// As [`remap_stack_frames`], but confining frame source reads to an explicit
+/// project root — the server's variant, applied where a run error becomes a
+/// session's stored/returned `error` (the CLI resolves its root from the
+/// thread-local set at command startup; the server handlers run on tokio
+/// threads that never set it, so the agent's workspace root is passed in).
+pub(crate) fn remap_stack_frames_within(root: &Path, err: &str) -> String {
+    remap_stack_frames_via(err, |file| read_project_source_within(root, file))
+}
+
+fn remap_stack_frames_via(err: &str, read: impl Fn(&str) -> Option<String>) -> String {
+    use std::collections::HashMap;
+    let mut sources: HashMap<&str, Option<String>> = HashMap::new();
+    let mut out = String::with_capacity(err.len());
+    for (i, line) in err.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let remapped = parse_stack_frame(line).and_then(|frame| {
+            let file = frame.file?;
+            let source = sources
+                .entry(file)
+                .or_insert_with(|| read(file))
+                .as_deref()?;
+            let pos = crate::runtime::typescript::transpile::remap_to_original(
+                Path::new(file),
+                source,
+                frame.line,
+                frame.col,
+            )?;
+            Some(format!(
+                "    at {} ({file}:{}:{})",
+                frame.name, pos.line, pos.column
+            ))
+        });
+        match remapped {
+            Some(frame) => out.push_str(&frame),
+            None => out.push_str(line),
         }
     }
-    format!("JavaScript exception: {err}")
+    out
 }
 
 /// Run a nested TypeScript **tool** file natively on the rust engine (G4).
 ///
-/// Re-enters [`run_module`] with the tool's `run(args)` entrypoint. The
-/// same `backend` (hence the same `RuntimeContext`) is threaded through, so the
-/// tool's host effects nest under the parent tool call (`parent_seq`) and share
-/// the durable call log, policy, MCP, and OTEL span tree. A suspension inside
-/// the tool (e.g. `chidori.input()` in Pause mode) surfaces as the usual
-/// `PAUSE_MARKER` error and propagates to the parent run.
-pub(crate) fn run_tool_file(
-    path: &Path,
-    kwargs: &Value,
-    backend: &HostBindingBackend,
-) -> Result<Value> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("reading tool {}: {e}", path.display()))?;
-    run_module(
-        path,
-        &source,
-        "run",
-        kwargs,
-        Rc::new(InProcessHost::new(backend.clone())),
-    )
-}
-
 /// Run a nested TypeScript **sub-agent** file natively on the rust engine (G4).
-/// Mirrors [`run_tool_file`] but invokes the `agent(input)` entrypoint.
+/// Invokes the `agent(input)` entrypoint, threading the same `backend` (hence
+/// the same `RuntimeContext`) so the sub-agent's host effects nest under the
+/// parent call and share the durable call log, policy, MCP, and OTEL span tree.
 pub(crate) fn run_agent_file(
     path: &Path,
     input: &Value,
@@ -493,14 +674,14 @@ pub(crate) fn run_module(
         Rc::new(move |effect: &str, args: &Value| h.call(effect, args))
     };
     engine.install_chidori_effects(dispatch);
-    // Install the JS-level `chidori` SDK sugar (tryCall/retry/parallel + the
-    // memory.set/get/delete/clear wrappers).
-    // These are pure-JS helpers layered on top of the native host object, so they
-    // must run *after* `install_chidori_effects` (the memory sugar wraps the
-    // native `chidori.memory`, and the script's guarded workspace shim no-ops
-    // because the rust engine already exposes a native `chidori.workspace`).
-    // Without this the meta-agent's `chidori.retry(...)`/`chidori.parallel(...)`
-    // calls hit `undefined is not a function`.
+    // Install the JS-level `chidori` SDK sugar (chidori.util.{tryCall,retry,
+    // parallel}, the chidori.memory namespace, and the chidori.actors handle
+    // wrappers). These are pure-JS helpers layered on top of the native host
+    // object, so they must run *after* `install_chidori_effects` (the memory
+    // and actors sugar wrap their native bindings, and the script's guarded
+    // workspace shim no-ops because the rust engine already exposes a native
+    // `chidori.workspace`). Without this, `chidori.util.retry(...)` /
+    // `chidori.memory.set(...)` calls hit `undefined is not a function`.
     engine
         .eval_cached(crate::runtime::typescript::helpers::CHIDORI_JS_HELPERS_SCRIPT)
         .map_err(|e| anyhow::anyhow!("installing chidori JS SDK helpers: {e}"))?;
@@ -563,8 +744,13 @@ pub(crate) fn run_module(
             // Serve the shim by name under a stable synthetic key. The shim's own
             // `node:` imports (e.g. `node:buffer`) recurse through this same
             // branch; its body is plain JS, so it needs no transpilation.
-            let src = crate::runtime::typescript::builtins::shim_source(name)
-                .ok_or_else(|| format!("unsupported node: builtin '{specifier}'"))?;
+            let src = crate::runtime::typescript::builtins::shim_source(name).ok_or_else(|| {
+                format!(
+                    "unsupported node: builtin '{specifier}' (imported from {importer_key}); \
+                     the runtime shims only a small allowlist of node builtins — \
+                     see docs/package-management.md#compatibility"
+                )
+            })?;
             return Ok((format!("node:{name}"), src.to_string()));
         }
         // Vendored packages (react, react-dom/server, …): self-contained UMD
@@ -600,7 +786,15 @@ pub(crate) fn run_module(
     // realm + agent object graph in a long-lived server process.
     engine.vm.dispose();
     match outcome {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!(js_exception_message(&e))),
+        // A pause sentinel that unwound through the VM is a stringified JS
+        // exception here — re-type it immediately so everything upstream can
+        // downcast to `RunInterrupt` instead of re-parsing the message.
+        Ok(result) => result.map_err(
+            |e| match crate::runtime::errors::RunInterrupt::from_message(&e) {
+                Some(interrupt) => anyhow::Error::new(interrupt),
+                None => anyhow::anyhow!(js_exception_message(&e)),
+            },
+        ),
         Err(panic) => Err(anyhow::anyhow!(
             "rust engine panicked: {}",
             panic_payload_message(panic.as_ref())
@@ -608,30 +802,15 @@ pub(crate) fn run_module(
     }
 }
 
-/// Resolve `specifier` relative to `importer_key`'s directory, read the file, and
-/// transpile it to ES module source — the host half of the rust engine's module
-/// loader (the linker lives in `chidori-js`).
+/// Resolve `specifier` from `importer_key` (relative for agent code, full
+/// Node-style resolution for bare npm specifiers and node_modules-internal
+/// imports), read the file, and produce ES module source — the host half of
+/// the rust engine's module loader (the linker lives in `chidori-js`).
 fn load_module_source(
     specifier: &str,
     importer_key: &str,
 ) -> std::result::Result<(String, String), String> {
-    let importer = Path::new(importer_key);
-    let dir = importer.parent().unwrap_or_else(|| Path::new("."));
-    let resolved =
-        crate::runtime::typescript::transpile::resolve_relative_import(importer, dir, specifier, 0)
-            .map_err(|e| e.to_string())?;
-    let key = resolved.to_string_lossy().to_string();
-    let src = std::fs::read_to_string(&resolved)
-        .map_err(|e| format!("reading module {}: {e}", resolved.display()))?;
-    let js = transpile_module(
-        &resolved,
-        &src,
-        &TranspileOptions {
-            import_policy: TypeScriptImportPolicy::Node,
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    Ok((key, js))
+    crate::runtime::typescript::loader::load_module_source(specifier, importer_key)
 }
 
 /// The synchronous `__chidori_*` natives the `node:` builtin shims and the
@@ -693,7 +872,7 @@ fn execute_captured_random(
 ) -> std::result::Result<Vec<u8>, String> {
     use crate::runtime::capability::Capability;
     let seq = ctx.next_seq();
-    match ctx.try_replay_checked(seq, "crypto.random", None) {
+    match ctx.try_replay_checked(seq, "crypto.random", &serde_json::json!({ "n": n })) {
         Ok(Some(record)) => {
             ctx.note_capability(Capability::CryptoRandom, seq);
             let b64 = record
@@ -939,6 +1118,99 @@ impl SnapshotCapableJsEngine for RustReplayEngine {
 }
 
 #[cfg(test)]
+mod frame_tests {
+    use super::{js_exception_message, parse_stack_frame, read_project_source};
+
+    #[test]
+    fn parses_labeled_and_bare_and_node_frames() {
+        let f = parse_stack_frame("    at validate (agent.ts:6:10)").unwrap();
+        assert_eq!(
+            (f.name, f.file, f.line, f.col),
+            ("validate", Some("agent.ts"), 6, 10)
+        );
+        // A `node:` key contains its own colon — the file must survive intact.
+        let n = parse_stack_frame("    at read (node:fs:3:5)").unwrap();
+        assert_eq!(
+            (n.name, n.file, n.line, n.col),
+            ("read", Some("node:fs"), 3, 5)
+        );
+        // Unlabeled position (plain script / eval): file is None.
+        let b = parse_stack_frame("    at f (3:1)").unwrap();
+        assert_eq!((b.name, b.file, b.line, b.col), ("f", None, 3, 1));
+        // A method-name with spaces (`get x`) keeps the whole name.
+        let g = parse_stack_frame("    at get missing (c.ts:2:7)").unwrap();
+        assert_eq!(g.name, "get missing");
+        // Non-frame lines are rejected.
+        assert!(parse_stack_frame("TypeError: boom").is_none());
+        assert!(parse_stack_frame("    at nope").is_none());
+    }
+
+    #[test]
+    fn single_line_error_strips_class_to_bare_message() {
+        assert_eq!(
+            js_exception_message("TypeError: x is not a function"),
+            "JavaScript exception: x is not a function"
+        );
+        // A thrown non-Error string has no class prefix; it is framed verbatim.
+        assert_eq!(
+            js_exception_message("plain string"),
+            "JavaScript exception: plain string"
+        );
+    }
+
+    #[test]
+    fn frame_carrying_error_keeps_class_name() {
+        let framed = js_exception_message("TypeError: boom\n    at f (a.ts:1:1)");
+        assert_eq!(
+            framed,
+            "JavaScript exception: TypeError: boom\n    at f (a.ts:1:1)"
+        );
+    }
+
+    #[test]
+    fn nested_framing_is_idempotent_not_double_prefixed() {
+        // A tool/sub-agent error re-enters the awaiting engine wrapped as
+        // `Error: JavaScript exception: <inner>` — collapse to one prefix,
+        // frames preserved in their raw coordinates (remap is display-time).
+        let nested = "Error: JavaScript exception: RangeError: division by zero\n\
+                      \x20   at run (tools/divide.ts:7:23)\n\
+                      \x20   at <anonymous> (agent.ts:2:5)";
+        let out = js_exception_message(nested);
+        assert_eq!(
+            out,
+            "JavaScript exception: RangeError: division by zero\n\
+             \x20   at run (tools/divide.ts:7:23)\n\
+             \x20   at <anonymous> (agent.ts:2:5)"
+        );
+        // Feeding the result back in is a fixed point.
+        assert_eq!(js_exception_message(&out), out);
+    }
+
+    #[test]
+    fn project_source_read_is_confined_to_the_project_root() {
+        use super::set_display_project_root;
+        // Establish an explicit root (thread-local; not cwd-dependent, so it
+        // survives test-thread reuse) with one file inside it.
+        let root = std::env::temp_dir().join(format!("chidori-confine-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("agent.ts");
+        std::fs::write(&inside, "// hi\n").unwrap();
+        set_display_project_root(root.canonicalize().unwrap());
+
+        // A file inside the root resolves…
+        assert_eq!(
+            read_project_source(inside.to_str().unwrap()).as_deref(),
+            Some("// hi\n")
+        );
+        // …but an absolute path escaping the root (an agent-spoofed frame) is
+        // refused even though it exists and is readable.
+        assert!(read_project_source("/etc/hostname").is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -950,11 +1222,152 @@ mod tests {
     use crate::runtime::context::RuntimeContext;
     use crate::runtime::snapshot::RuntimePolicy;
     use crate::runtime::template::TemplateEngine;
-    use crate::tools::{ToolBackend, ToolRegistry};
+    use crate::tools::ToolRegistry;
 
     /// A fully-wired runtime backend over `ctx`/`tools` with default providers,
     /// template engine, tokio runtime, policy, and MCP — enough to exercise the
     /// full effect dispatch in tests.
+    /// A scripted provider for the defineTool loop: turn 1 requests the
+    /// `lookup` tool, turn 2 answers. Also asserts the inline (import-defined)
+    /// tool schema actually reached the provider request.
+    struct ScriptedToolProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        saw_inline_schema: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for ScriptedToolProvider {
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+        async fn send(
+            &self,
+            request: &crate::providers::LlmRequest,
+        ) -> anyhow::Result<crate::providers::LlmResponse> {
+            use crate::providers::{ContentBlock, LlmResponse, ToolCall};
+            if request.tools.iter().any(|t| t.name == "lookup") {
+                self.saw_inline_schema
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let call_index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_index == 0 {
+                return Ok(LlmResponse {
+                    content: String::new(),
+                    blocks: vec![ContentBlock::ToolUse {
+                        id: "call-1".to_string(),
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({ "key": "answer" }),
+                    }],
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({ "key": "answer" }),
+                    }],
+                    stop_reason: "tool_use".to_string(),
+                    ..LlmResponse::default()
+                });
+            }
+            Ok(LlmResponse {
+                content: "the value is 42".to_string(),
+                blocks: vec![ContentBlock::Text {
+                    text: "the value is 42".to_string(),
+                }],
+                ..LlmResponse::default()
+            })
+        }
+    }
+
+    #[test]
+    fn define_tool_import_pattern_runs_in_vm_and_journals() {
+        // The standard-pattern alternative to the tools/ directory: a tool is
+        // a plain object built with defineTool() (imported or defined inline),
+        // whose `run` executes in the agent's own VM via the JS-side loop.
+        // No registry, no magic directory, closures allowed.
+        let ctx = RuntimeContext::new();
+        let dir = std::env::temp_dir().join(format!("chidori-definetool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            import { chidori, run, defineTool } from "chidori:agent";
+
+            const seen: string[] = [];
+            const lookup = defineTool({
+                name: "lookup",
+                description: "Look up a value by key.",
+                parameters: {
+                    type: "object",
+                    properties: { key: { type: "string" } },
+                    required: ["key"],
+                },
+                run: async (args: { key: string }) => {
+                    seen.push(args.key); // closures over agent state work
+                    await chidori.log("in-vm tool ran", { key: args.key });
+                    return { value: 42 };
+                },
+            });
+
+            run(async () => {
+                const answer = await chidori.prompt("What is the value?", {
+                    tools: [lookup],
+                    maxTurns: 4,
+                });
+                return { answer, seen };
+            });
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let saw_inline_schema = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut providers = ProviderRegistry::new();
+        providers.register(Box::new(ScriptedToolProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            saw_inline_schema: saw_inline_schema.clone(),
+        }));
+        let backend = HostBindingBackend::for_runtime(
+            ctx.clone(),
+            Arc::new(providers),
+            Arc::new(TemplateEngine::new(".")),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            PolicyConfig::from_env(),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("rust-engine-test"),
+            Arc::new(ToolRegistry::new()), // registry stays EMPTY — no directory tools
+            Arc::new(McpManager::new()),
+        );
+
+        let output = run_agent(&path, src, &serde_json::json!({}), &backend).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({ "answer": "the value is 42", "seen": ["answer"] })
+        );
+        assert!(
+            saw_inline_schema.load(std::sync::atomic::Ordering::SeqCst),
+            "the defineTool schema reached the provider request"
+        );
+
+        let records = ctx.call_log().into_records();
+        // Two respond turns journaled as prompts; the in-VM invocation as a
+        // mark; the tool body's own log as an ordinary journaled effect.
+        assert_eq!(
+            records.iter().filter(|r| r.function == "prompt").count(),
+            2,
+            "records: {:?}",
+            records
+                .iter()
+                .map(|r| r.function.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(records
+            .iter()
+            .any(|r| r.function == "mark" && r.args["label"] == "tool:lookup"));
+        assert!(records
+            .iter()
+            .any(|r| r.function == "log" && r.args["fields"]["key"] == "answer"));
+        // And NO host-side `tool` record: the body ran in the agent's VM.
+        assert!(!records.iter().any(|r| r.function == "tool"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn test_backend(ctx: RuntimeContext, tools: Arc<ToolRegistry>) -> HostBindingBackend {
         HostBindingBackend::for_runtime(
             ctx,
@@ -1067,6 +1480,204 @@ mod tests {
     }
 
     #[test]
+    fn uncaught_exception_frames_carry_original_source_positions() {
+        let dir = std::env::temp_dir().join(format!("chidori-frames-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        // The interface block only exists in the original TypeScript — the
+        // frames must still point at the original lines (validate's throw on
+        // 7, lookup's call on 11), proving the source-map remap ran.
+        let src = "import { chidori, run } from \"chidori:agent\";\n\
+                   interface Row {\n\
+                   \x20 id: string;\n\
+                   }\n\n\
+                   function validate(row: Row): Row {\n\
+                   \x20 throw new TypeError(\"bad row: \" + row.id);\n\
+                   }\n\n\
+                   function lookup(row: Row): Row {\n\
+                   \x20 return validate(row);\n\
+                   }\n\n\
+                   run(async () => lookup({ id: \"x\" }));\n";
+        std::fs::write(&path, src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx, Arc::new(ToolRegistry::new()));
+        let err = run_agent(&path, src, &serde_json::json!({}), &backend)
+            .unwrap_err()
+            .to_string();
+        // Confine snippet reads to this run's temp dir, as the CLI confines to
+        // the agent's workspace root.
+        super::set_display_project_root(dir.clone());
+
+        assert!(
+            err.starts_with("JavaScript exception: TypeError: bad row: x"),
+            "frame-carrying errors keep the class name: {err}"
+        );
+        let path_str = path.to_string_lossy();
+        // The engine boundary carries raw (transpiled-bundle) frames with
+        // real file labels; remapping to original TypeScript is applied once
+        // at display. Both frames name the agent file with SOME position.
+        assert!(
+            err.contains(&format!("at validate ({path_str}:")),
+            "innermost frame is labeled with its module: {err}"
+        );
+        assert!(
+            err.contains(&format!("at lookup ({path_str}:")),
+            "caller frame is labeled too: {err}"
+        );
+
+        // Display-time remap lands both frames on their original lines — the
+        // throw statement (7) for the innermost frame and the call site (11)
+        // for its caller, past the interface block that only exists in the
+        // original TypeScript.
+        let remapped = remap_stack_frames(&err);
+        assert!(
+            remapped.contains(&format!("at validate ({path_str}:7:")),
+            "innermost frame remaps to the original throw line: {remapped}"
+        );
+        assert!(
+            remapped.contains(&format!("at lookup ({path_str}:11:")),
+            "caller frame remaps to its original call-site line: {remapped}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn policy_denied_effect_frame_anchors_at_the_gated_call_not_run() {
+        // Critique E3 regression (experiments/critique/RESULTS.md): the
+        // policy-denial error used to anchor at `run(` — the handler's
+        // definition line — instead of the gated call. Unlike a plain JS
+        // throw, the denial is raised by the HOST binding (an `Err(String)`
+        // crossing back into the VM mid-await), so this pins the one path
+        // where the frame position must come from the per-op position table
+        // at the awaiting call site rather than the proto's definition site.
+        let dir = std::env::temp_dir().join(format!("chidori-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        // `run(` sits on line 3; the gated `fetch(...)` call (which routes
+        // through the policy-checked `__chidori_http` host op) on line 4.
+        let src = "import { chidori, run } from \"chidori:agent\";\n\n\
+                   run(async () => {\n\
+                   \x20 const res = await fetch(\"https://denied.test/\");\n\
+                   \x20 return res.status;\n\
+                   });\n";
+        std::fs::write(&path, src).unwrap();
+
+        let policy = PolicyConfig {
+            rules: vec![crate::policy::PolicyRule {
+                target: "http".to_string(),
+                decision: crate::policy::Decision::NeverAllow,
+                match_args: None,
+                reason: Some("network disabled in this test".to_string()),
+            }],
+            ..PolicyConfig::default()
+        };
+        let backend = HostBindingBackend::for_runtime(
+            RuntimeContext::new(),
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(".")),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            Arc::new(policy),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("rust-engine-test"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(McpManager::new()),
+        );
+
+        let err = run_agent(&path, src, &serde_json::json!({}), &backend)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("policy: `http` denied"),
+            "the denial names the gated target: {err}"
+        );
+
+        // Frames arrive in transpiled coordinates; remap at the display
+        // boundary exactly as the CLI does, then the handler frame must land
+        // on the gated call (line 4), not the `run(` line (line 3).
+        super::set_display_project_root(dir.clone());
+        let remapped = remap_stack_frames(&err);
+        let path_str = path.to_string_lossy();
+        assert!(
+            remapped.contains(&format!("at <anonymous> ({path_str}:4:")),
+            "handler frame anchors at the gated fetch call: {remapped}"
+        );
+        assert!(
+            !remapped.contains(&format!("({path_str}:3:")),
+            "no frame anchors at the run( line: {remapped}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unknown_tool_error_frame_anchors_at_the_prompt_call() {
+        // Round-3 consumer review finding: `prompt({tools: ["missing"]})`
+        // failed with "Unknown tool ..." whose frame pointed at the NEXT
+        // await after the prompt (a `chidori.log` ten lines below), not the
+        // prompt call itself. Same contract as the policy-denial test above:
+        // a host-binding failure must anchor at the awaiting call site.
+        let dir =
+            std::env::temp_dir().join(format!("chidori-unknown-tool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        // The exact consumer shape that misattributed: a MULTI-LINE prompt
+        // call inside a for-loop, with a decoy `chidori.log` after it. The
+        // failing `await chidori.prompt(` sits on line 5; the decoy log on
+        // line 10. (A single-line prompt anchored correctly all along — the
+        // loop + multi-line argument span is what pushed the frame onto the
+        // next await.)
+        let src = "import { chidori, run } from \"chidori:agent\";\n\n\
+                   run(async () => {\n\
+                   \x20 for (const theme of [\"a\", \"b\"]) {\n\
+                   \x20   const s = await chidori.prompt(\n\
+                   \x20     `investigate ${theme}` +\n\
+                   \x20       `across multiple lines`,\n\
+                   \x20     { tools: [\"missing_tool\"], maxTurns: 8 },\n\
+                   \x20   );\n\
+                   \x20   await chidori.log(\"after\", { theme, s });\n\
+                   \x20 }\n\
+                   \x20 return null;\n\
+                   });\n";
+        std::fs::write(&path, src).unwrap();
+
+        let backend = HostBindingBackend::for_runtime(
+            RuntimeContext::new(),
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(".")),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            Arc::new(PolicyConfig::default()),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("rust-engine-test"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(McpManager::new()),
+        );
+
+        let err = run_agent(&path, src, &serde_json::json!({}), &backend)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Unknown tool"),
+            "the failure names the missing tool: {err}"
+        );
+
+        super::set_display_project_root(dir.clone());
+        let remapped = remap_stack_frames(&err);
+        let path_str = path.to_string_lossy();
+        assert!(
+            remapped.contains(&format!("at <anonymous> ({path_str}:5:")),
+            "frame anchors at the failing prompt call (line 5): {remapped}"
+        );
+        assert!(
+            !remapped.contains(&format!("({path_str}:10:")),
+            "no frame anchors at the unrelated chidori.log call (line 10): {remapped}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn run_agent_executes_ts_through_rust_engine_and_records_host_calls() {
         // A single-file TS agent that does JS work (a nested function call) and a
         // chidori.log host effect, then returns a value derived from its input.
@@ -1132,77 +1743,6 @@ mod tests {
     }
 
     #[test]
-    fn run_agent_nests_tool_internal_calls_under_the_tool_on_rust_engine() {
-        // A TypeScript tool whose `run` makes its own chidori.log calls: those
-        // must be recorded as CHILDREN of the tool call (parent_seq = tool seq),
-        // so the trace nests correctly.
-        let ctx = RuntimeContext::new();
-        let dir = std::env::temp_dir().join(format!("chidori-rust-tool-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("tools")).unwrap();
-
-        let tool_path = dir.join("tools").join("echo2.ts");
-        std::fs::write(
-            &tool_path,
-            r#"
-            export const tool = { name: "echo2", description: "doubles and logs", parameters: {} };
-            export async function run(args: { value: number }) {
-                chidori.log("tool: doubling " + args.value);
-                return { value: args.value * 2 };
-            }
-            "#,
-        )
-        .unwrap();
-
-        let agent_path = dir.join("agent.ts");
-        let agent_src = r#"
-            export async function agent(input: { value: number }) {
-                chidori.log("agent: before tool");
-                const r = await chidori.tool("echo2", { value: input.value });
-                return r;
-            }
-        "#;
-        std::fs::write(&agent_path, agent_src).unwrap();
-
-        let mut registry = ToolRegistry::new();
-        registry.register(crate::tools::ToolDef {
-            name: "echo2".to_string(),
-            description: "doubles and logs".to_string(),
-            params: Vec::new(),
-            source_path: tool_path,
-            source_fingerprint: None,
-            backend: ToolBackend::TypeScript,
-        });
-        let tools = Arc::new(registry);
-
-        let backend = test_backend(ctx.clone(), tools);
-        let output = run_agent(
-            &agent_path,
-            agent_src,
-            &serde_json::json!({ "value": 5 }),
-            &backend,
-        )
-        .unwrap();
-        assert_eq!(output, serde_json::json!({ "value": 10 }));
-
-        let records = ctx.call_log().into_records();
-        // agent log (top-level), tool's internal log (nested), tool call.
-        let tool = records.iter().find(|r| r.function == "tool").unwrap();
-        let tool_log = records
-            .iter()
-            .find(|r| r.function == "log" && r.args["message"] == "tool: doubling 5")
-            .unwrap();
-        let agent_log = records
-            .iter()
-            .find(|r| r.function == "log" && r.args["message"] == "agent: before tool")
-            .unwrap();
-        // The tool's log nests under the tool; the agent's log is top-level.
-        assert_eq!(tool_log.parent_seq, Some(tool.seq));
-        assert_eq!(agent_log.parent_seq, None);
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn run_agent_wires_template_checkpoint_and_memory_effects() {
         // Effects beyond log/input/tool now route through the shared host backend
         // on the rust engine: minijinja templates, durable checkpoints, and the
@@ -1216,10 +1756,10 @@ mod tests {
         // braces and TS object braces stay literal.
         let src = r#"
             export async function agent(input: { name: string }) {
-                await chidori.checkpoint("start", { n: 1 });
+                await chidori.mark("start", { n: 1 });
                 const greeting = await chidori.template("Hello {{ name }}", { name: input.name });
-                await chidori.memory("set", "greeting", greeting, { namespace: "__NS__" });
-                const back = await chidori.memory("get", "greeting", null, { namespace: "__NS__" });
+                await chidori.memory.set("greeting", greeting, { namespace: "__NS__" });
+                const back = await chidori.memory.get("greeting", { namespace: "__NS__" });
                 return { greeting, back };
             }
         "#
@@ -1242,7 +1782,7 @@ mod tests {
 
         let records = ctx.call_log().into_records();
         let fns: Vec<&str> = records.iter().map(|r| r.function.as_str()).collect();
-        assert!(fns.contains(&"checkpoint"), "missing checkpoint: {fns:?}");
+        assert!(fns.contains(&"mark"), "missing mark: {fns:?}");
         assert!(fns.contains(&"template"), "missing template: {fns:?}");
         assert_eq!(
             fns.iter().filter(|f| **f == "memory").count(),
@@ -1260,7 +1800,7 @@ mod tests {
         // clear) is loaded from CHIDORI_JS_HELPERS_SCRIPT and installed after
         // the native host object. The agent below never defines
         // these itself, so it only passes if the engine layered them on — a
-        // regression guard for the meta-agent's `chidori.retry`/`chidori.parallel`
+        // regression guard for `chidori.util.retry`/`chidori.util.parallel`
         // calls, which otherwise hit "undefined is not a function".
         let ctx = RuntimeContext::new();
         let dir = std::env::temp_dir().join(format!("chidori-rust-sdk-{}", uuid::Uuid::new_v4()));
@@ -1269,23 +1809,23 @@ mod tests {
         let src = r#"
             export async function agent() {
                 let attempts = 0;
-                const value = await chidori.retry(async () => {
+                const value = await chidori.util.retry(async () => {
                     attempts += 1;
                     if (attempts < 2) throw new Error("flaky");
                     return 42;
                 }, { attempts: 3 });
-                const par = await chidori.parallel([
+                const par = await chidori.util.parallel([
                     async () => "a",
                     async () => "b",
                 ], { concurrency: 2 });
                 // Promise.all idiom: promises and plain values are accepted
                 // alongside thunks instead of throwing "must be a function".
-                const parMixed = await chidori.parallel([
+                const parMixed = await chidori.util.parallel([
                     Promise.resolve("p"),
                     "v",
                     async () => "t",
                 ]);
-                const caught = await chidori.tryCall(async () => { throw new Error("boom"); });
+                const caught = await chidori.util.tryCall(async () => { throw new Error("boom"); });
                 return {
                     value,
                     attempts,
@@ -2268,7 +2808,9 @@ mod tests {
         use std::io::{Read, Write};
 
         // A one-shot local HTTP server so the request goes through the real
-        // captured networking host op (`__chidori_http`) end to end.
+        // captured networking host op (`__chidori_http`) end to end. Loopback
+        // must be trusted explicitly — the SSRF guard blocks it by default.
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {

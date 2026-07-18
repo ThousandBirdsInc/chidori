@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod mcp;
 pub mod mem_guard;
+pub mod pkg;
 pub mod policy;
 pub mod providers;
 pub mod recipes;
@@ -10,7 +11,7 @@ pub mod server;
 pub mod storage;
 pub mod tools;
 
-pub use scheduler::{new_tokio_runtime, JS_THREAD_STACK_BYTES};
+pub use scheduler::{new_tokio_runtime, shared_tokio_runtime, JS_THREAD_STACK_BYTES};
 
 pub mod framework {
     pub use crate::mcp::McpManager;
@@ -24,6 +25,7 @@ pub mod framework {
         ModelOverride, PendingApproval, PendingInput, RuntimeContext, RuntimeEvent,
     };
     pub use crate::runtime::engine::{Engine, RunResult};
+    pub use crate::runtime::errors::{RunErrorKind, RunInterrupt, PAUSE_MARKER};
     pub use crate::runtime::host_core::{
         execute_native_tool_call, execute_native_tool_call_at_seq,
     };

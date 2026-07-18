@@ -1,6 +1,6 @@
 [package]
 name = "chidori-js"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 # oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
@@ -19,10 +19,28 @@ path = "src/lib.rs"
 # nothing. Enable for analysis only: `cargo run --example opstats --features
 # op-histogram`. See docs/interpreter-optimization.md (Phase 0).
 op-histogram = []
+# Opt-in mimalloc global allocator for the `run` example binary — an
+# allocator EXPERIMENT knob, not a recommendation. OFF by default, twice
+# over: (a) it's a C library (vendored and built by libmimalloc-sys), and the
+# crate otherwise builds no C; (b) it measured net-negative here (2026-07).
+# Callgrind showed glibc malloc at ~23% of instructions on json_roundtrip/
+# string_build and mimalloc cut total instructions 10-13% there — but
+# interleaved wall-clock across the whole workload suite ran ~9% slower
+# geomean (glibc's tcache beats it on the interpreter's LIFO same-size
+# churn, and the instruction-count proxy misses that). Kept so the
+# experiment is one flag away on other hardware/allocator versions. Library
+# consumers are unaffected either way: a global allocator only takes effect
+# in a final binary, and this one is only installed in `examples/run.rs`.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 # Front end only: we consume the oxc AST and write no lexer/parser of our own.
 oxc = { version = "0.133", features = ["semantic", "transformer", "codegen"] }
+# Span→line/column resolution for parse-error rendering (oxc diagnostics carry
+# miette labeled spans; `SourceCode::read_span` turns a byte offset into a
+# position). Core only — no report-rendering features. Already in the tree
+# transitively, so this adds no new crates.
+miette = { version = "7", default-features = false }
 # Deterministic, insertion-ordered property maps. Object/Map/Set iteration order
 # must be address-independent for replay to be correct (see determinism contract).
 indexmap = "2"
@@ -31,7 +49,7 @@ indexmap = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Arbitrary-precision integers backing the JS BigInt primitive.
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
 num-integer = "0.1"
 unicode-normalization = "0.1.25"
@@ -49,6 +67,9 @@ icu_decimal = "2"
 # Temporal: the TC39 Temporal proposal implemented in Rust (calendars, time
 # zones, durations, and the spec arithmetic).
 temporal_rs = "0.2.3"
+# Optional, off by default (see the `mimalloc` feature above): faster global
+# allocator for the benchmark/`run` binary.
+mimalloc = { version = "0.1", optional = true, default-features = false }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -58,3 +79,14 @@ criterion = "0.5"
 [[bench]]
 name = "execution"
 harness = false
+
+# Heap-utilization benchmarks over the same workloads: realm footprint,
+# bytecode footprint, per-run peak/churn/retained, and a repeat-run leak
+# check. Run with `cargo bench -p chidori-js --bench memory`.
+[[bench]]
+name = "memory"
+harness = false
+
+# Workspace-wide lint levels (see [workspace.lints] in the root Cargo.toml).
+[lints]
+workspace = true

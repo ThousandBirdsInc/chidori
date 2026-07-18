@@ -100,6 +100,14 @@ pub struct Frame {
     pub pending_completion: Option<Completion>,
     /// Set when resuming a suspended frame with a rejection: raised at loop top.
     pub pending_throw: Option<Value>,
+    /// Source position of the throw currently unwinding through this frame's
+    /// `finally` blocks. Captured when the throw is first dispatched so the
+    /// frame it ultimately exits is attributed to the ORIGINAL throw site,
+    /// not the `EndFinally` / `IteratorClose` op that re-raised the parked
+    /// completion (e.g. a throw inside a `for-of` body, whose iterator-close
+    /// finalizer otherwise pins the frame to the loop's last op). Cleared
+    /// when a `catch` handles the throw.
+    pub unwind_pos: Option<u32>,
     /// Set when resuming a suspended generator via `.return(v)`: dispatched as a
     /// `Return` completion at loop top so enclosing `finally` blocks run.
     pub pending_return: Option<Value>,
@@ -258,6 +266,14 @@ pub struct Vm {
     /// Wrapping counter so [`Vm::native_tick`] only polls the interrupt flag
     /// every 256 iterations (same cadence as the interpreter loop).
     pub(crate) native_poll: u32,
+    /// Source position (byte offset) of the op the currently-propagating
+    /// exception left its frame at. Written by the interpreter tiers at every
+    /// `Flow::Throw` exit, consumed (`take`n) by `run_frame` when it records
+    /// that frame on the error's `.stack` — so the innermost frame reports
+    /// its throw site and each outer frame its call site, not the function's
+    /// definition line. `None` between unwinds and for tiers/exits that carry
+    /// no position (which then fall back to the definition site).
+    pub(crate) throw_pos: Option<u32>,
     /// Module evaluation: when set, `run_frame` snapshots the final cell vector of
     /// the frame whose proto pointer matches, into `module_capture`. This lets the
     /// module linker recover a module's top-level binding cells (its live exports)
@@ -288,6 +304,17 @@ pub struct Vm {
     /// Registry compaction threshold (dead weak entries are pruned when the
     /// registry length crosses it; doubled after each compaction).
     pub(crate) gc_compact_at: std::cell::Cell<usize>,
+    /// Objects allocated since the last cycle collection; drives the automatic
+    /// trigger in [`Vm::maybe_collect_cycles`].
+    pub(crate) gc_allocs_since_collect: std::cell::Cell<usize>,
+    /// Allocation count at which [`Vm::maybe_collect_cycles`] fires. Re-armed
+    /// after every collection to `max(floor, live)`, so collection work stays
+    /// amortized O(1) per allocation even as the live heap grows.
+    pub(crate) gc_auto_threshold: std::cell::Cell<usize>,
+    /// Automatic cycle collection at quiescence points (default ON). Without
+    /// it a long-lived VM that keeps creating cycles leaks unbounded unless
+    /// the host remembers to call `collect_cycles` itself.
+    pub gc_auto: bool,
     /// Value cells (`Rc<RefCell<Value>>`) held OUTSIDE the VM — e.g. a host's
     /// `ModuleRecord` cells — that also appear as closure upvalues inside it.
     /// `collect_cycles` treats their contents as roots; without registration,
@@ -343,7 +370,11 @@ pub struct Vm {
     /// across activations so entering a kernel allocates nothing. Kernels
     /// never nest (a region containing a `LoopKernel` op is not kernelized),
     /// and the generic interpreter running under a kernel's fallback path
-    /// never touches this, so one buffer per Vm suffices.
+    /// never touches this, so one buffer per Vm suffices. GROW-ONLY: the
+    /// buffer keeps its high-water length across activations and is never
+    /// re-zeroed — stale `f64`s are unreadable (every register is either
+    /// loaded at entry or store-before-read by translation proof), and
+    /// zero-filling deep recursion windows per outer call was measurable.
     pub(crate) kernel_regs: Vec<f64>,
     /// Scratch cache of the array-base objects for the active kernel (see
     /// `kernel_regs`); cleared after every activation so the pool never
@@ -355,6 +386,43 @@ pub struct Vm {
     /// Pooled entry-verified closure callees for kernel `CallKernel`:
     /// (callee function, register-window base).
     pub(crate) kernel_callees: Vec<(std::rc::Rc<crate::value::BytecodeFunction>, u32)>,
+    /// Cached recursion-family resolutions for the windowed recursive-kernel
+    /// executor (see `exec::RecFamily`): resolving a family allocates tables
+    /// and walks member code, which dominated shallow recursions when paid
+    /// per outer call. Bounded; validated per activation; a pure perf cache
+    /// (hit vs miss is unobservable).
+    pub(crate) rec_families: Vec<crate::exec::RecFamily>,
+    /// Pooled (caller, return-pc, dst, window) stack for
+    /// `run_fn_kernel_rec`; parked empty.
+    pub(crate) rec_calls: Vec<(u8, u16, u16, u32)>,
+    /// Pooled key buffers for `for-in` enumerators (`for_in_keys`): a
+    /// glue-code loop that for-ins a fresh object per iteration otherwise
+    /// pays a malloc/free per loop entry just to hold the keys. Parked
+    /// CLEARED at `ForInPop` (best-effort: an unwound frame drops its
+    /// enumerators without parking — a pool miss, never a stale key). Pure
+    /// perf: only the buffer allocation is reused. Bounded.
+    pub(crate) forin_pool: Vec<Vec<crate::value::JsString>>,
+    /// Pinned STRING bases for the active loop-kernel activation (mirrors
+    /// `kernel_objs`); cleared after every activation so the pool never
+    /// extends a string's lifetime.
+    pub(crate) kernel_strs: Vec<crate::value::JsString>,
+    /// Cross-parse JSON object-key intern cache: repeated `JSON.parse` of
+    /// same-shaped documents (the poll/roundtrip pattern) reuses one
+    /// `Rc<str>` per distinct key instead of allocating it per parse. Pure
+    /// perf: only the ALLOCATION IDENTITY of key strings is shared — content,
+    /// insertion order, and everything observable are unchanged. Bounded
+    /// (cleared at capacity), never serialized.
+    pub(crate) json_keys: std::collections::HashMap<
+        Box<str>,
+        crate::value::PropertyKey,
+        std::hash::BuildHasherDefault<crate::fxhash::FxHasher>,
+    >,
+}
+
+impl Default for Vm {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Vm {
@@ -375,12 +443,16 @@ impl Vm {
             op_budget: None,
             interrupt: None,
             native_poll: 0,
+            throw_pos: None,
             module_capture_proto: None,
             module_capture: None,
             trace_sink: None,
             dynamic_import: None,
             all_objects: std::cell::RefCell::new(Vec::new()),
             gc_compact_at: std::cell::Cell::new(1 << 12),
+            gc_allocs_since_collect: std::cell::Cell::new(0),
+            gc_auto_threshold: std::cell::Cell::new(crate::gc::GC_AUTO_FLOOR),
+            gc_auto: true,
             gc_cell_roots: Vec::new(),
             template_cache: std::collections::HashMap::new(),
             value_vec_pool: Vec::new(),
@@ -391,6 +463,11 @@ impl Vm {
             kernel_objs: Vec::new(),
             kernel_prop_slots: Vec::new(),
             kernel_callees: Vec::new(),
+            rec_families: Vec::new(),
+            rec_calls: Vec::new(),
+            forin_pool: Vec::new(),
+            kernel_strs: Vec::new(),
+            json_keys: std::collections::HashMap::default(),
             dummy_bf: Rc::new(BytecodeFunction {
                 proto: Rc::new(crate::bytecode::FuncProto::empty(
                     "",
@@ -427,7 +504,7 @@ impl Vm {
         let id = self.symbol_counter;
         self.symbol_counter += 1;
         JsSymbol(Rc::new(SymbolData {
-            description: description.map(|d| Rc::from(d)),
+            description: description.map(Rc::from),
             id,
         }))
     }
@@ -438,6 +515,44 @@ impl Vm {
 
     pub fn new_object(&self) -> JsObject {
         self.alloc_ordinary(Some(self.realm.object_proto.clone()))
+    }
+
+    /// Instantiate an object-literal TEMPLATE (see [`crate::bytecode::Op::NewObjectTpl`]):
+    /// clone the pre-built property map (bucket layout included — no hashing,
+    /// no growth) and overwrite slots `0..N` with the evaluated values in
+    /// source order. Identical to `new_object()` + N× CreateDataProperty on
+    /// a fresh ordinary extensible object, where nothing user-visible can
+    /// intervene or fail.
+    pub fn new_object_from_tpl(
+        &self,
+        tpl: &crate::bytecode::ObjTemplate,
+        values: impl Iterator<Item = Value>,
+    ) -> JsObject {
+        // Resolve (and memoize) this literal site's leaf shape in the
+        // current realm: after warm-up, instantiation is one slot-vec
+        // allocation + N value writes — no hashing, no per-key inserts.
+        let shape = {
+            let mut cache = tpl.shape_cache.borrow_mut();
+            match &*cache {
+                Some((root, leaf)) if Rc::ptr_eq(root, &self.realm.shape_root) => leaf.clone(),
+                _ => {
+                    let mut leaf = self.realm.shape_root.clone();
+                    for k in tpl.map.keys() {
+                        leaf = leaf.transition(k.clone());
+                    }
+                    *cache = Some((self.realm.shape_root.clone(), leaf.clone()));
+                    leaf
+                }
+            }
+        };
+        let mut slots = Vec::with_capacity(tpl.map.len());
+        slots.extend(values.map(Property::data));
+        debug_assert_eq!(slots.len(), tpl.map.len(), "template arity");
+        self.alloc(ObjectData::new_shaped_with(
+            Some(self.realm.object_proto.clone()),
+            shape,
+            slots,
+        ))
     }
 
     pub fn new_object_proto(&self, proto: Option<JsObject>) -> JsObject {
@@ -457,7 +572,7 @@ impl Vm {
             Some(self.realm.string_proto.clone()),
             Internal::StringObj(s),
         ));
-        o.borrow_mut().props.insert(
+        o.borrow_mut().own_insert(
             PropertyKey::str("length"),
             Property {
                 kind: PropertyKind::Data {
@@ -490,7 +605,7 @@ impl Vm {
         ));
         {
             let mut b = obj.borrow_mut();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -501,7 +616,7 @@ impl Vm {
                     configurable: true,
                 },
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("name"),
                 Property {
                     kind: PropertyKind::Data {
@@ -536,7 +651,7 @@ impl Vm {
         ));
         {
             let mut b = obj.borrow_mut();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -547,7 +662,7 @@ impl Vm {
                     configurable: true,
                 },
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("name"),
                 Property {
                     kind: PropertyKind::Data {
@@ -565,7 +680,7 @@ impl Vm {
     /// Wire `ctor.prototype = proto` (non-enumerable) and `proto.constructor =
     /// ctor` (non-enumerable), then bind `ctor` as a global of the given name.
     pub fn install_ctor(&self, name: &str, ctor: &JsObject, proto: &JsObject) {
-        ctor.borrow_mut().props.insert(
+        ctor.borrow_mut().own_insert(
             PropertyKey::str("prototype"),
             Property {
                 kind: PropertyKind::Data {
@@ -576,7 +691,7 @@ impl Vm {
                 configurable: false,
             },
         );
-        proto.borrow_mut().props.insert(
+        proto.borrow_mut().own_insert(
             PropertyKey::str("constructor"),
             Property::builtin(Value::Object(ctor.clone())),
         );
@@ -594,30 +709,26 @@ impl Vm {
         let f = self.new_native(name, length, func);
         target
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str(name), Property::builtin(Value::Object(f)));
+            .own_insert(PropertyKey::str(name), Property::builtin(Value::Object(f)));
     }
 
     pub fn define_value(&self, target: &JsObject, name: &str, value: Value) {
         target
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str(name), Property::builtin(value));
+            .own_insert(PropertyKey::str(name), Property::builtin(value));
     }
 
     /// Define a frozen constant (non-writable, non-enumerable, non-configurable).
     pub fn define_constant(&self, target: &JsObject, name: &str, value: Value) {
         target
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str(name), Property::frozen(value));
+            .own_insert(PropertyKey::str(name), Property::frozen(value));
     }
 
     pub fn define_value_sym(&self, target: &JsObject, key: JsSymbol, value: Value) {
         target
             .borrow_mut()
-            .props
-            .insert(PropertyKey::Sym(key), Property::builtin(value));
+            .own_insert(PropertyKey::Sym(key), Property::builtin(value));
     }
 
     // ---------------------------------------------------------------------
@@ -634,15 +745,77 @@ impl Vm {
             ErrorKind::Uri => &self.realm.uri_error_proto,
         };
         let obj = self.alloc(ObjectData::new(Some(proto.clone()), Internal::Error));
-        obj.borrow_mut().props.insert(
+        obj.borrow_mut().own_insert(
             PropertyKey::str("message"),
             Property::builtin(Value::str(message)),
         );
-        obj.borrow_mut().props.insert(
+        obj.borrow_mut().own_insert(
             PropertyKey::str("stack"),
-            Property::builtin(Value::str(&format!("{}: {}", kind.name(), message))),
+            Property::builtin(Value::str(format!("{}: {}", kind.name(), message))),
         );
         Value::Object(obj)
+    }
+
+    /// Append `proto`'s activation to the `.stack` of a propagating exception.
+    /// Called by `run_frame` as a throw unwinds out of a frame, so an uncaught
+    /// error accumulates one `    at name (line:col)` line per JS frame it
+    /// crossed, innermost first — a stack trace built entirely on the unwind
+    /// path (the happy path pays nothing). `pos` is the source offset the
+    /// throw left the frame at (see [`Vm::throw_pos`]): the throwing statement
+    /// for the innermost frame, the active call site for outer frames. When
+    /// it is absent or the proto carries no source, the function's
+    /// *definition* site is the fallback. Only `Error` objects whose `stack`
+    /// is still a plain string are annotated, and frames stop accumulating
+    /// once the trace is `MAX_UNWIND_FRAMES` deep (a rethrow loop must not
+    /// grow the string unboundedly).
+    pub(crate) fn record_unwind_frame(
+        &self,
+        err: &Value,
+        proto: &crate::bytecode::FuncProto,
+        pos: Option<u32>,
+    ) {
+        const MAX_UNWIND_FRAMES: usize = 32;
+        let Value::Object(o) = err else { return };
+        let mut b = o.borrow_mut();
+        if !matches!(b.internal, Internal::Error) {
+            return;
+        }
+        let Some(prop) = b.own_get_mut(&crate::value::StrKeyRef("stack")) else {
+            return;
+        };
+        let PropertyKind::Data { value, .. } = &mut prop.kind else {
+            return;
+        };
+        let Value::String(s) = &*value else { return };
+        let cur = s.as_str();
+        if cur.matches("\n    at ").count() >= MAX_UNWIND_FRAMES {
+            return;
+        }
+        let name: &str = if proto.name.is_empty() {
+            "<anonymous>"
+        } else {
+            &proto.name
+        };
+        let (line, col) = match (pos, &proto.source_info) {
+            (Some(off), Some(si)) => si.line_col_of(off),
+            _ => (proto.source_line, proto.source_col),
+        };
+        let mut out = String::with_capacity(cur.len() + name.len() + 24);
+        out.push_str(cur);
+        out.push_str("\n    at ");
+        out.push_str(name);
+        if line > 0 {
+            use std::fmt::Write;
+            match &proto.source_label {
+                Some(label) => {
+                    let _ = write!(out, " ({label}:{line}:{col})");
+                }
+                None => {
+                    let _ = write!(out, " ({line}:{col})");
+                }
+            }
+        }
+        *value = Value::str(out);
     }
 
     pub fn throw_type(&self, msg: &str) -> Value {
@@ -656,6 +829,15 @@ impl Vm {
     }
     pub fn throw_syntax(&self, msg: &str) -> Value {
         self.make_error(ErrorKind::Syntax, msg)
+    }
+    /// A catchable Error for "an execution tier reached a state it promised
+    /// was impossible" (an op the dispatcher doesn't handle, a kernel slot
+    /// that violates its build-time invariant, …). These used to be
+    /// `unreachable!` — a process abort with no recourse for the host. A bug
+    /// in a tier must stay inside the sandbox: throw a loud, catchable,
+    /// reportable error instead of taking the embedder down.
+    pub fn throw_internal(&self, msg: &str) -> Value {
+        self.make_error(ErrorKind::Error, &format!("internal engine error: {msg}"))
     }
 
     // ---------------------------------------------------------------------
@@ -696,12 +878,12 @@ impl Vm {
             }
             return Ok(res);
         }
-        let order: [&str; 2] = match hint {
-            Hint::String => ["toString", "valueOf"],
-            _ => ["valueOf", "toString"],
+        let order: [PropertyKey; 2] = match hint {
+            Hint::String => [crate::names::key_to_string(), crate::names::key_value_of()],
+            _ => [crate::names::key_value_of(), crate::names::key_to_string()],
         };
-        for name in order {
-            let method = self.get_prop(&Value::Object(obj.clone()), &PropertyKey::str(name))?;
+        for name in &order {
+            let method = self.get_prop(&Value::Object(obj.clone()), name)?;
             if self.is_callable(&method) {
                 let res = self.call(method, Value::Object(obj.clone()), &[])?;
                 if !matches!(res, Value::Object(_)) {
@@ -919,7 +1101,7 @@ impl Vm {
         if let Value::Object(o) = base {
             let b = o.borrow();
             if let Internal::Array(arr) = &b.internal {
-                if b.props.is_empty() {
+                if b.own_is_empty() {
                     if let Some(v) = arr.get(idx as usize) {
                         if !matches!(v, Value::Hole) {
                             return Ok(v.clone());
@@ -934,36 +1116,35 @@ impl Vm {
     pub fn get_prop(&mut self, base: &Value, key: &PropertyKey) -> Result<Value, Value> {
         // Fast paths for primitives without boxing.
         match base {
-            Value::Undefined | Value::Uninitialized | Value::Hole | Value::Null => {
-                return Err(self.throw_type(&format!(
+            Value::Undefined | Value::Uninitialized | Value::Hole | Value::Null => Err(self
+                .throw_type(&format!(
                     "Cannot read properties of {} (reading '{}')",
                     if base.is_null() { "null" } else { "undefined" },
                     key_display(key)
-                )))
-            }
+                ))),
             Value::String(s) => {
                 if let Some(v) = self.string_own_prop(s, key) {
                     return Ok(v);
                 }
                 // fall through to String.prototype
                 let proto = self.realm.string_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::Number(_) => {
                 let proto = self.realm.number_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::Bool(_) => {
                 let proto = self.realm.boolean_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::Symbol(_) => {
                 let proto = self.realm.symbol_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::BigInt(_) => {
                 let proto = self.realm.bigint_proto.clone();
-                return self.get_from_object(&proto, key, base.clone());
+                self.get_from_object(&proto, key, base.clone())
             }
             Value::Object(o) => self.get_from_object(o, key, base.clone()),
         }
@@ -1023,7 +1204,7 @@ impl Vm {
         // Ordinary own-property resolution shared by every (non-exotic) level.
         // A reified `props` entry shadows any dense array/string element.
         let ordinary = |b: &ObjectData| -> Step {
-            match b.props.get(key) {
+            match b.own_get(key) {
                 Some(prop) => match &prop.kind {
                     PropertyKind::Data { value, .. } => Step::Value(value.clone()),
                     PropertyKind::Accessor { get, .. } => match get {
@@ -1063,7 +1244,7 @@ impl Vm {
                     // parameter CELL, not the stale `props` value.
                     Internal::Arguments(map) => {
                         let aliased = key.array_index().and_then(|idx| {
-                            if b.props.contains_key(key) {
+                            if b.own_contains_key(key) {
                                 map.get(idx as usize).and_then(|c| c.clone())
                             } else {
                                 None
@@ -1079,13 +1260,13 @@ impl Vm {
                     // an absent index (climb the chain → undefined).
                     Internal::Array(arr) => {
                         if let Some("length") = key.as_str() {
-                            if b.props.contains_key(key) {
+                            if b.own_contains_key(key) {
                                 ordinary(&b)
                             } else {
                                 Step::Value(Value::Number(arr.len() as f64))
                             }
                         } else if let Some(idx) = key.array_index() {
-                            if b.props.contains_key(key) {
+                            if b.own_contains_key(key) {
                                 ordinary(&b)
                             } else {
                                 match arr.get(idx as usize) {
@@ -1266,7 +1447,7 @@ impl Vm {
             }
             let accessor = {
                 let b = cur.borrow();
-                match b.props.get(key) {
+                match b.own_get(key) {
                     Some(Property {
                         kind: PropertyKind::Accessor { set, .. },
                         ..
@@ -1313,7 +1494,7 @@ impl Vm {
                         let dense_own = match &b.internal {
                             Internal::Array(arr) => match key.as_str() {
                                 Some("length") => true,
-                                _ => key.array_index().map_or(false, |i| {
+                                _ => key.array_index().is_some_and(|i| {
                                     (i as usize) < arr.len()
                                         && !matches!(arr[i as usize], Value::Hole)
                                 }),
@@ -1369,7 +1550,7 @@ impl Vm {
         // CELL too (the ordinary props entry below stays in sync).
         if let Internal::Arguments(map) = &b.internal {
             if let Some(idx) = key.array_index() {
-                if b.props.contains_key(key) {
+                if b.own_contains_key(key) {
                     if let Some(Some(cell)) = map.get(idx as usize) {
                         *cell.borrow_mut() = value.clone();
                     }
@@ -1379,11 +1560,11 @@ impl Vm {
         // Array exotic write. A reified `props` entry for an index/length shadows
         // the dense store, so route the write through the ordinary props path
         // below (which honours its writable flag) when such an entry exists.
-        let has_props_entry = b.props.contains_key(key);
+        let has_props_entry = b.own_contains_key(key);
         let extensible = b.extensible;
         // A non-writable `length` marker blocks index writes past the end.
         let len_not_writable = matches!(
-            b.props.get(&PropertyKey::str("length")),
+            b.own_get(&PropertyKey::str("length")),
             Some(Property {
                 kind: PropertyKind::Data {
                     writable: false,
@@ -1451,7 +1632,7 @@ impl Vm {
                 }
             }
         }
-        match b.props.get_mut(key) {
+        match b.own_get_mut(key) {
             Some(p) => match &mut p.kind {
                 PropertyKind::Data {
                     value: slot,
@@ -1476,7 +1657,7 @@ impl Vm {
                     }
                     return Ok(());
                 }
-                b.props.insert(key.clone(), Property::data(value));
+                b.own_insert(key.clone(), Property::data(value));
             }
         }
         Ok(())
@@ -1509,7 +1690,7 @@ impl Vm {
         let mut b = obj.borrow_mut();
         // A reified `props` entry for an index shadows the dense slot; honour its
         // configurable flag and fall through to the ordinary delete below.
-        let has_props_entry = b.props.contains_key(key);
+        let has_props_entry = b.own_contains_key(key);
         if !has_props_entry {
             if let Internal::Array(arr) = &mut b.internal {
                 if let Some(idx) = key.array_index() {
@@ -1540,10 +1721,10 @@ impl Vm {
                 _ => {}
             }
         }
-        match b.props.get(key) {
+        match b.own_get(key) {
             Some(p) if !p.configurable => Ok(false),
             Some(_) => {
-                b.props.shift_remove(key);
+                b.own_remove(key);
                 // Removing a reified array-index override exposes the stale dense
                 // slot it shadowed; clear it so the deleted index reads as a hole.
                 if let Internal::Array(arr) = &mut b.internal {
@@ -1588,7 +1769,7 @@ impl Vm {
             }
             let (has, proto) = {
                 let b = cur.borrow();
-                let mut has = b.props.contains_key(key);
+                let mut has = b.own_contains_key(key);
                 // Module Namespace exotic [[HasProperty]]: export names are
                 // present (symbols consult the ordinary props above).
                 if let Internal::ModuleNamespace(ns) = &b.internal {
@@ -1690,7 +1871,7 @@ impl Vm {
         // before the other string keys — unless it has already been reified
         // into `props` (e.g. by freeze/seal, where the props loop emits it).
         if matches!(b.internal, Internal::Array(_) | Internal::StringObj(_))
-            && !b.props.contains_key(&PropertyKey::str("length"))
+            && !b.own_contains_key(&PropertyKey::str("length"))
         {
             str_keys.push(PropertyKey::str("length"));
         }
@@ -1701,7 +1882,7 @@ impl Vm {
                 str_keys.push(PropertyKey::Str(name.clone()));
             }
         }
-        for k in b.props.keys() {
+        for k in b.own_keys_iter() {
             // Engine-internal slots (a buffer's `[[ArrayBufferMaxByteLength]]`,
             // the SharedArrayBuffer brand) are not real properties: they never
             // surface through `[[OwnPropertyKeys]]`.
@@ -1774,7 +1955,7 @@ impl Vm {
                 }
             } else {
                 let b = o.borrow();
-                match b.props.get(&k) {
+                match b.own_get(&k) {
                     Some(p) => p.enumerable,
                     None => match &b.internal {
                         Internal::Array(arr) => k
@@ -1813,7 +1994,7 @@ impl Vm {
             });
         }
         let b = obj.borrow();
-        Ok(match b.props.get(key) {
+        Ok(match b.own_get(key) {
             Some(p) => p.enumerable,
             None => match &b.internal {
                 Internal::Array(arr) => key
@@ -1839,7 +2020,7 @@ impl Vm {
             if let PropertyKey::Str(s) = &k {
                 // A reified `props` entry shadows the exotic index slot, so its
                 // enumerable flag wins over the implicit dense-element default.
-                let enumerable = match b.props.get(&k) {
+                let enumerable = match b.own_get(&k) {
                     Some(p) => p.enumerable,
                     None => match &b.internal {
                         Internal::Array(_) if k.array_index().is_some() => true,
@@ -1915,7 +2096,7 @@ impl Vm {
             if let Some(p) = b.proto.take() {
                 stack.push(p);
             }
-            for (_k, prop) in std::mem::take(&mut b.props) {
+            for prop in b.take_props_values() {
                 match prop.kind {
                     PropertyKind::Data { value, .. } => push_dispose_obj(value, &mut stack),
                     PropertyKind::Accessor { get, set } => {
@@ -2152,6 +2333,16 @@ pub fn number_to_string(n: f64) -> String {
     if n.is_infinite() {
         return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
+    // Integral |n| <= 2^53: exact, and the plain decimal digits ARE the
+    // spec's shortest round-trip form (same reasoning as
+    // `push_number_string`). This is the common case — loop counters,
+    // indices, string concatenation with integers — and skips the grisu
+    // `format!("{:e}")` + mantissa-filter + format_decimal allocations.
+    if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_992.0 {
+        let mut out = String::new();
+        push_number_string(n, &mut out);
+        return out;
+    }
     let neg = n < 0.0;
     let abs = n.abs();
     // Rust's `{:e}` is a correct shortest round-trip representation, giving the
@@ -2179,7 +2370,7 @@ fn format_decimal(s: &str, k: i32, n: i32) -> String {
         // Integer: all digits followed by n-k zeros.
         let mut out = String::with_capacity(n as usize);
         out.push_str(s);
-        out.extend(std::iter::repeat('0').take((n - k) as usize));
+        out.extend(std::iter::repeat_n('0', (n - k) as usize));
         out
     } else if 0 < n && n <= 21 {
         // Decimal point inside the digits.

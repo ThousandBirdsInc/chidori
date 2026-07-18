@@ -151,8 +151,7 @@ pub fn install(vm: &mut Vm) {
     for (name, slot) in [("push", 0), ("pop", 1)] {
         let f = proto
             .borrow()
-            .props
-            .get(&PropertyKey::str(name))
+            .own_get(&PropertyKey::str(name))
             .and_then(|p| p.value().cloned());
         if let Some(Value::Object(o)) = f {
             if slot == 0 {
@@ -261,7 +260,7 @@ fn has_get_elem(vm: &mut Vm, base: &Value, idx: f64) -> Result<Option<Value>, Va
         if let Value::Object(o) = base {
             let b = o.borrow();
             if let Internal::Array(arr) = &b.internal {
-                if b.props.is_empty() {
+                if b.own_is_empty() {
                     if let Some(v) = arr.get(idx as usize) {
                         if !matches!(v, Value::Hole) {
                             return Ok(Some(v.clone()));
@@ -304,7 +303,7 @@ fn set_elem(vm: &mut Vm, base: &Value, idx: f64, v: Value) -> Result<(), Value> 
     if idx >= 0.0 && idx <= u32::MAX as f64 {
         if let Value::Object(o) = base {
             let mut b = o.borrow_mut();
-            if b.props.is_empty() {
+            if b.own_is_empty() {
                 if let Internal::Array(arr) = &mut b.internal {
                     if let Some(slot) = arr.get_mut(idx as usize) {
                         if !matches!(slot, Value::Hole) {
@@ -365,7 +364,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         if let Value::Object(o) = &this {
             let start = {
                 let b = o.borrow();
-                if b.props.is_empty() && b.extensible {
+                if b.own_is_empty() && b.extensible {
                     match &b.internal {
                         Internal::Array(arr)
                             if arr.len() + args.len() <= crate::value::MAX_DENSE_ARRAY =>
@@ -413,7 +412,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // prototype chain), as does an empty array's length write-back.
         if let Value::Object(o) = &this {
             let mut b = o.borrow_mut();
-            if b.props.is_empty() && b.extensible {
+            if b.own_is_empty() && b.extensible {
                 if let Internal::Array(arr) = &mut b.internal {
                     match arr.last() {
                         Some(v) if !matches!(v, Value::Hole) => {
@@ -1161,7 +1160,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let dense_ok = {
             let b = o.borrow();
             matches!(b.internal, Internal::Array(_))
-                && !b.props.keys().any(|k| k.array_index().is_some())
+                && !b.own_keys_iter().any(|k| k.array_index().is_some())
                 && matches!(&b.internal, Internal::Array(a) if !a.iter().any(|v| matches!(v, Value::Hole)))
         };
         if dense_ok {
@@ -1315,7 +1314,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         defined.retain(|v| !v.is_undefined());
         let undef_count = item_count - defined.len();
         merge_sort(vm, &mut defined, &cmp, has_cmp)?;
-        defined.extend(std::iter::repeat(Value::Undefined).take(undef_count));
+        defined.extend(std::iter::repeat_n(Value::Undefined, undef_count));
         Ok(Value::Object(vm.new_array(defined)))
     });
     vm.define_method(proto, "toReversed", 0, |vm, this, _args| {
@@ -1464,12 +1463,11 @@ fn install_unscopables(vm: &mut Vm, proto: &JsObject) {
             "toSpliced",
             "values",
         ] {
-            b.props
-                .insert(PropertyKey::str(name), Property::data(Value::Bool(true)));
+            b.own_insert(PropertyKey::str(name), Property::data(Value::Bool(true)));
         }
     }
     let sym = vm.realm.symbol_unscopables.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(sym),
         Property {
             kind: PropertyKind::Data {
@@ -1540,12 +1538,7 @@ fn flatten_into(
     Ok(target_index)
 }
 
-fn merge_sort(
-    vm: &mut Vm,
-    items: &mut Vec<Value>,
-    cmp: &Value,
-    has_cmp: bool,
-) -> Result<(), Value> {
+fn merge_sort(vm: &mut Vm, items: &mut [Value], cmp: &Value, has_cmp: bool) -> Result<(), Value> {
     if items.len() <= 1 {
         return Ok(());
     }
@@ -1584,12 +1577,108 @@ fn merge_sort(
             }
         }
     }
+    // Default (no-comparator) SortCompare over an ALL-PRIMITIVE snapshot:
+    // ToString of a Number/String/Bool/Null/BigInt is pure — no user code,
+    // no throw — so the string keys can be computed ONCE per element
+    // (n conversions) instead of twice per comparison (~2·n·log n, each
+    // allocating). The permutation is computed by the IDENTICAL stable
+    // merge recursion over precomputed keys, so the result is bit-identical
+    // to the per-comparison path. Objects (toString/valueOf run user code,
+    // observable in call order and count) and Symbols (must throw
+    // TypeError from the comparison) keep the exact spec sequence below.
+    if !has_cmp
+        && items.iter().all(|v| {
+            matches!(
+                v,
+                Value::Number(_)
+                    | Value::String(_)
+                    | Value::Bool(_)
+                    | Value::Null
+                    | Value::BigInt(_)
+            )
+        })
+    {
+        return sort_default_primitive(vm, items);
+    }
     // One scratch buffer for the whole sort (max use: the larger half) instead
     // of two fresh Vec clones per recursion node — the naive version's
     // malloc/free + refcount churn was a measurable slice of sort-heavy runs.
     let mut aux: Vec<Value> = Vec::with_capacity(items.len() / 2 + 1);
     let n = items.len();
     merge_sort_range(vm, items, &mut aux, 0, n, cmp, has_cmp, &mut prep)
+}
+
+/// Default-comparator sort of an all-primitive snapshot by precomputed
+/// ToString keys (see the call site in [`merge_sort`] for why this is
+/// unobservable). The index-permutation merge mirrors `merge_sort_range`'s
+/// recursion and take-left-on-ties merge exactly, so equal keys keep their
+/// original relative order and the output matches the generic path
+/// element-for-element. When every key is ASCII (the overwhelming case —
+/// number-to-string output always is), the UTF-16 code-unit comparison
+/// collapses to a byte comparison.
+fn sort_default_primitive(vm: &mut Vm, items: &mut [Value]) -> Result<(), Value> {
+    let n = items.len();
+    let mut keys: Vec<JsString> = Vec::with_capacity(n);
+    for v in items.iter() {
+        keys.push(vm.to_js_string(v)?);
+    }
+    let all_ascii = keys.iter().all(|k| k.as_str().is_ascii());
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    let mut aux: Vec<u32> = Vec::with_capacity(n / 2 + 1);
+    fn rec(
+        idx: &mut [u32],
+        aux: &mut Vec<u32>,
+        lo: usize,
+        hi: usize,
+        keys: &[JsString],
+        ascii: bool,
+    ) {
+        let n = hi - lo;
+        if n <= 1 {
+            return;
+        }
+        let mid = lo + n / 2;
+        rec(idx, aux, lo, mid, keys, ascii);
+        rec(idx, aux, mid, hi, keys, ascii);
+        aux.clear();
+        aux.extend_from_slice(&idx[lo..mid]);
+        let (mut i, mut j, mut k) = (0, mid, lo);
+        while i < aux.len() && j < hi {
+            let (a, b) = (&keys[aux[i] as usize], &keys[idx[j] as usize]);
+            let order = if ascii {
+                match a.as_str().as_bytes().cmp(b.as_str().as_bytes()) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }
+            } else {
+                utf16_cmp(a.as_str(), b.as_str())
+            };
+            if order <= 0 {
+                idx[k] = aux[i];
+                i += 1;
+            } else {
+                idx[k] = idx[j];
+                j += 1;
+            }
+            k += 1;
+        }
+        while i < aux.len() {
+            idx[k] = aux[i];
+            i += 1;
+            k += 1;
+        }
+    }
+    rec(&mut idx, &mut aux, 0, n, &keys, all_ascii);
+    // Apply the permutation: every value moves exactly once.
+    let sorted: Vec<Value> = idx
+        .iter()
+        .map(|&i| std::mem::replace(&mut items[i as usize], Value::Undefined))
+        .collect();
+    for (slot, v) in items.iter_mut().zip(sorted) {
+        *slot = v;
+    }
+    Ok(())
 }
 
 /// [`merge_sort_range`] over raw `f64`s for the all-Number/kernel-comparator
@@ -1718,7 +1807,13 @@ fn compare_values(
                             0.0
                         }
                     }
-                    _ => unreachable!("fn kernels return Number or Bool"),
+                    // Tier bug: throw a catchable internal error rather than
+                    // aborting the process.
+                    _ => {
+                        return Err(vm.throw_internal(
+                            "function kernel returned a non-Number, non-Bool value",
+                        ))
+                    }
                 };
                 return Ok(if n < 0.0 {
                     -1
@@ -1895,17 +1990,24 @@ fn install_iterator_protos(vm: &mut Vm) {
         (vm.realm.map_iterator_proto.clone(), "Map Iterator"),
         (vm.realm.set_iterator_proto.clone(), "Set Iterator"),
     ] {
-        vm.define_method(&proto, "next", 0, |vm, this, _args| {
+        let next_fn = vm.new_native("next", 0, |vm, this, _args| {
             let o = match &this {
                 Value::Object(o) => o.clone(),
                 _ => return Err(vm.throw_type("Iterator.next called on non-object")),
             };
             vm.builtin_iterator_next(&o)
         });
+        proto.borrow_mut().own_insert(
+            PropertyKey::str("next"),
+            Property::builtin(Value::Object(next_fn.clone())),
+        );
+        // Pin the canonical `next` so `Op::IteratorStepValue` can step this
+        // iterator inline (see `Realm::builtin_iter_next`).
+        vm.realm.builtin_iter_next.push(next_fn);
         // %XIteratorPrototype%[@@toStringTag] — non-writable, non-enumerable,
         // configurable.
         let sym = vm.realm.symbol_to_string_tag.clone();
-        proto.borrow_mut().props.insert(
+        proto.borrow_mut().own_insert(
             PropertyKey::Sym(sym),
             Property {
                 kind: PropertyKind::Data {

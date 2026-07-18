@@ -53,11 +53,32 @@ pub struct ReMatch {
     pub groups: Vec<Option<(usize, usize)>>,
 }
 
+/// The matcher ran out of budget (backtracking steps or recursion depth)
+/// before it could *prove* a match or a non-match. Callers must surface this
+/// as a catchable error — treating it as "no match" would silently return a
+/// wrong answer for legitimate patterns that simply need more work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetExceeded;
+
+impl BudgetExceeded {
+    pub fn message(&self) -> &'static str {
+        "regular expression exceeded its execution budget (pattern too complex for this input)"
+    }
+}
+
 /// Compile `pattern`/`flags` and search `input` for a match at or after `start`
 /// (unless the `y` sticky flag forces a match exactly at `start`). Returns
-/// `None` if the pattern is unsupported or no match is found.
-pub fn regex_exec(pattern: &str, flags: &str, input: &[u16], start: usize) -> Option<ReMatch> {
-    let re = compile_cached(pattern, flags).ok()?;
+/// `Ok(None)` if the pattern is unsupported or no match is found, and
+/// `Err(BudgetExceeded)` if the matcher could not decide within its budget.
+pub fn regex_exec(
+    pattern: &str,
+    flags: &str,
+    input: &[u16],
+    start: usize,
+) -> Result<Option<ReMatch>, BudgetExceeded> {
+    let Ok(re) = compile_cached(pattern, flags) else {
+        return Ok(None);
+    };
     re.exec(input, start)
 }
 
@@ -108,10 +129,12 @@ pub fn regex_exec_named(
     flags: &str,
     input: &[u16],
     start: usize,
-) -> Option<(ReMatch, Vec<(String, usize)>)> {
-    let re = compile_cached(pattern, flags).ok()?;
+) -> Result<Option<(ReMatch, Vec<(String, usize)>)>, BudgetExceeded> {
+    let Ok(re) = compile_cached(pattern, flags) else {
+        return Ok(None);
+    };
     let names = re.group_names.clone();
-    re.exec(input, start).map(|m| (m, names))
+    Ok(re.exec(input, start)?.map(|m| (m, names)))
 }
 
 /// Returns the `name -> group index` mapping for any named capture groups in
@@ -1238,30 +1261,42 @@ impl Regex {
         })
     }
 
-    fn exec(&self, input: &[u16], start: usize) -> Option<ReMatch> {
+    fn exec(&self, input: &[u16], start: usize) -> Result<Option<ReMatch>, BudgetExceeded> {
         let mut at = start.min(input.len() + 1);
         // One shared step budget across the whole search bounds catastrophic
         // backtracking (e.g. /(a*)*b/ on a long non-matching input).
+        let stack_base = &at as *const _ as usize;
         let ctx = MatchCtx {
             input,
             flags: self.flags,
             steps: std::cell::Cell::new(0),
+            stack_base,
+            exhausted: std::cell::Cell::new(false),
         };
         loop {
-            if at > input.len() || ctx.steps.get() > REGEX_STEP_LIMIT {
-                return None;
+            if at > input.len() {
+                return Ok(None);
             }
             let mut caps: Caps = vec![None; self.group_count + 1];
-            if let Some(end) = ctx.match_node(&self.root, at, &mut caps, &|pos, _caps| Some(pos)) {
+            let attempt = ctx.match_node(&self.root, at, &mut caps, &|pos, _caps| Some(pos));
+            // A blown budget poisons the whole attempt, whichever way it came
+            // out: a `None` may be a match we never got to, and a `Some` may
+            // have been fabricated by a budget-starved negative lookaround
+            // (its inner failure is indistinguishable from a real non-match).
+            // The only sound answer is a catchable error.
+            if ctx.exhausted.get() {
+                return Err(BudgetExceeded);
+            }
+            if let Some(end) = attempt {
                 caps[0] = Some((at, end));
-                return Some(ReMatch {
+                return Ok(Some(ReMatch {
                     start: at,
                     end,
                     groups: caps,
-                });
+                }));
             }
             if self.flags.sticky {
-                return None;
+                return Ok(None);
             }
             // Advance the search start by a whole code point. In unicode mode
             // this steps over a surrogate pair so the scan never starts
@@ -1272,8 +1307,20 @@ impl Regex {
     }
 }
 
-/// Backtracking-step ceiling per `exec` call. Bounds pathological patterns.
-const REGEX_STEP_LIMIT: u64 = 100_000;
+/// Backtracking-step ceiling per `exec` call. Bounds pathological patterns
+/// (which now surface as a catchable [`BudgetExceeded`] error rather than a
+/// silent wrong "no match").
+const REGEX_STEP_LIMIT: u64 = 10_000_000;
+
+/// Ceiling on native-stack bytes the CPS backtracker may consume below its
+/// `exec` entry point, measured by address-of-local (the V8 technique). The
+/// backtracker recurses once per pending continuation, so without this guard
+/// a large input under a non-simple quantifier overflows the native stack — a
+/// process abort with no catchable error. Measuring bytes (not recursion
+/// depth) self-calibrates across debug/release frame sizes. Kept well under
+/// the 2 MiB default test-thread stack, leaving headroom for the caller's own
+/// frames; exceeding it reports [`BudgetExceeded`] like the step ceiling.
+const REGEX_STACK_LIMIT_BYTES: usize = 512 * 1024;
 
 struct MatchCtx<'a> {
     /// The subject as UTF-16 code units. All match positions and reported
@@ -1284,6 +1331,13 @@ struct MatchCtx<'a> {
     input: &'a [u16],
     flags: Flags,
     steps: std::cell::Cell<u64>,
+    /// Address of a stack local at `exec` entry; `match_node` compares it
+    /// against its own locals to bound native-stack consumption.
+    stack_base: usize,
+    /// Latched when either budget trips: from that point every `match_node`
+    /// call fails fast, unwinding the whole attempt, and `exec` reports
+    /// [`BudgetExceeded`] instead of trusting the unwound result.
+    exhausted: std::cell::Cell<bool>,
 }
 
 impl MatchCtx<'_> {
@@ -1330,10 +1384,25 @@ impl<'a> MatchCtx<'a> {
 
     fn match_node(&self, node: &Node, pos: usize, caps: &mut Caps, k: &Cont<'_>) -> Option<usize> {
         let s = self.steps.get();
-        if s > REGEX_STEP_LIMIT {
+        let here = &s as *const _ as usize;
+        if s >= REGEX_STEP_LIMIT
+            || self.stack_base.saturating_sub(here) >= REGEX_STACK_LIMIT_BYTES
+            || self.exhausted.get()
+        {
+            self.exhausted.set(true);
             return None;
         }
         self.steps.set(s + 1);
+        self.match_node_inner(node, pos, caps, k)
+    }
+
+    fn match_node_inner(
+        &self,
+        node: &Node,
+        pos: usize,
+        caps: &mut Caps,
+        k: &Cont<'_>,
+    ) -> Option<usize> {
         match node {
             Node::Empty => k(pos, caps),
             Node::Char(c) => {
@@ -1492,7 +1561,7 @@ impl<'a> MatchCtx<'a> {
             let mut j = pos + 1;
             while j > 0 {
                 j -= 1;
-                if self.steps.get() > REGEX_STEP_LIMIT {
+                if self.exhausted.get() {
                     break;
                 }
                 let stop = move |p: usize, _c: &mut Caps| {
@@ -1561,9 +1630,24 @@ impl<'a> MatchCtx<'a> {
             Node::Class { negated, items } => {
                 class_matches(items, cp, self.flags.ignore_case, self.flags.unicode) != *negated
             }
+            // A group/alternation of one-char atoms: whichever branch matches,
+            // it consumes exactly the code point at `pos` (same width), so
+            // branch choice cannot affect any later state — deterministic.
+            Node::Group { idx: None, node } => return self.node_matches_one(node, pos),
+            Node::Alt(bs) => return bs.iter().find_map(|b| self.node_matches_one(b, pos)),
             _ => false,
         };
         ok.then_some(w)
+    }
+
+    /// If the whole simple-atom sequence in `node` (see [`repeat_body_atoms`])
+    /// matches starting at `pos`, the total code units consumed; else `None`.
+    fn seq_matches_at(&self, atoms: &[Node], pos: usize) -> Option<usize> {
+        let mut p = pos;
+        for a in atoms {
+            p += self.node_matches_one(a, p)?;
+        }
+        Some(p - pos)
     }
 
     fn match_repeat(
@@ -1577,14 +1661,15 @@ impl<'a> MatchCtx<'a> {
         caps: &mut Caps,
         k: &Cont<'_>,
     ) -> Option<usize> {
-        // Fast path: a quantifier over a single-char-consuming atom (a literal,
-        // `.`, or a character class — none of which capture or backtrack
-        // internally) is matched in a tight iterative loop instead of the
-        // per-repetition CPS recursion below. The recursion both overflows the
-        // native stack and burns the step budget on large inputs (the
-        // property-escape sweeps run `/^\p{...}+$/u` over ~1M chars), so this is
-        // what makes those matches feasible at all.
-        if is_simple_one_char(node) {
+        // Fast path: a quantifier over a sequence of single-char-consuming
+        // atoms (literals, `.`, or character classes — none of which capture or
+        // backtrack internally, e.g. `a*`, `(?:ab)+`, `(?:\d\.)+`) is matched
+        // in a tight iterative loop instead of the per-repetition CPS recursion
+        // below. The recursion both overflows the native stack (now bounded by
+        // REGEX_STACK_LIMIT_BYTES) and burns the step budget on large inputs
+        // (the property-escape sweeps run `/^\p{...}+$/u` over ~1M chars), so
+        // this is what makes those matches feasible at all.
+        if let Some(atoms) = repeat_body_atoms(node) {
             let cap = max.unwrap_or(usize::MAX);
             // `bounds[i]` is the code-unit position after `done + i` repetitions.
             // Atoms can consume two code units (an astral pair in unicode mode),
@@ -1593,7 +1678,7 @@ impl<'a> MatchCtx<'a> {
             let mut p = pos;
             let mut total = done;
             while total < cap {
-                match self.node_matches_one(node, p) {
+                match self.seq_matches_at(atoms, p) {
                     Some(w) => {
                         p += w;
                         total += 1;
@@ -1676,10 +1761,32 @@ impl<'a> MatchCtx<'a> {
     }
 }
 
-/// A node that consumes exactly one input char with no internal backtracking,
-/// so a `*`/`+`/`{n,m}` over it can be matched iteratively (see `match_repeat`).
+/// A node that consumes exactly one code point with no observable choice
+/// points (no captures; any matching alternative consumes the same width), so
+/// a `*`/`+`/`{n,m}` over it can be matched iteratively (see `match_repeat`).
 fn is_simple_one_char(node: &Node) -> bool {
-    matches!(node, Node::Char(_) | Node::AnyChar | Node::Class { .. })
+    match node {
+        Node::Char(_) | Node::AnyChar | Node::Class { .. } => true,
+        Node::Group { idx: None, node } => is_simple_one_char(node),
+        Node::Alt(bs) => !bs.is_empty() && bs.iter().all(is_simple_one_char),
+        _ => false,
+    }
+}
+
+/// If a quantifier body is a (possibly non-capturing-group-wrapped) sequence
+/// of simple one-char atoms, return those atoms: each repetition is then fully
+/// deterministic (every atom consumes exactly one code point, no captures, no
+/// internal choice points), so the quantifier can run iteratively and
+/// backtrack by whole repetitions (see `match_repeat`'s fast path).
+fn repeat_body_atoms(node: &Node) -> Option<&[Node]> {
+    match node {
+        Node::Group { idx: None, node } => repeat_body_atoms(node),
+        Node::Concat(items) if !items.is_empty() && items.iter().all(is_simple_one_char) => {
+            Some(items)
+        }
+        n if is_simple_one_char(n) => Some(std::slice::from_ref(n)),
+        _ => None,
+    }
 }
 
 fn class_matches(items: &[ClassItem], ch: u32, ignore_case: bool, unicode: bool) -> bool {
@@ -1859,7 +1966,7 @@ impl Vm {
         {
             let mut b = o.borrow_mut();
             // Hidden brand marker.
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str(REGEXP_MARK),
                 Property {
                     kind: PropertyKind::Data {
@@ -1871,7 +1978,7 @@ impl Vm {
                 },
             );
             // Internal source/flags strings used by exec to re-parse per call.
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("[[Source]]"),
                 Property {
                     kind: PropertyKind::Data {
@@ -1882,7 +1989,7 @@ impl Vm {
                     configurable: false,
                 },
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("[[Flags]]"),
                 Property {
                     kind: PropertyKind::Data {
@@ -1894,7 +2001,7 @@ impl Vm {
                 },
             );
             // The writable lastIndex data property.
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("lastIndex"),
                 Property {
                     kind: PropertyKind::Data {
@@ -1913,10 +2020,7 @@ impl Vm {
 /// True if `v` is a RegExp object built by `make_regexp`.
 pub fn is_regexp(v: &Value) -> bool {
     if let Value::Object(o) = v {
-        return o
-            .borrow()
-            .props
-            .contains_key(&PropertyKey::str(REGEXP_MARK));
+        return o.borrow().own_contains_key(&PropertyKey::str(REGEXP_MARK));
     }
     false
 }
@@ -1925,15 +2029,13 @@ pub fn is_regexp(v: &Value) -> bool {
 pub fn regexp_source_flags(o: &JsObject) -> (String, String) {
     let b = o.borrow();
     let source = b
-        .props
-        .get(&PropertyKey::str("[[Source]]"))
+        .own_get(&PropertyKey::str("[[Source]]"))
         .and_then(|p| p.value())
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     let flags = b
-        .props
-        .get(&PropertyKey::str("[[Flags]]"))
+        .own_get(&PropertyKey::str("[[Flags]]"))
         .and_then(|p| p.value())
         .and_then(|v| v.as_str())
         .unwrap_or("")

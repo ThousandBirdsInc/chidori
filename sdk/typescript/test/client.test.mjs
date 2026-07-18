@@ -9,8 +9,12 @@ import { after, before, beforeEach, describe, it } from "node:test";
 
 import {
   AgentClient,
+  AgentClientError,
   Checkpoint,
+  ConnectionError,
+  HttpError,
   Session,
+  TimeoutError,
   isSignalQueued,
 } from "../dist/index.js";
 
@@ -57,6 +61,49 @@ describe("health", () => {
     });
     assert.deepEqual(await client.health(), { status: "ok" });
     assert.deepEqual(server.requestsFor("/health").length, 1);
+  });
+});
+
+describe("auth", () => {
+  it("sends Authorization: Bearer on GET, POST, and stream when apiKey is set", async () => {
+    const authed = new AgentClient(server.baseUrl, { apiKey: "secret-1" });
+    const seen = [];
+    server.on((req, res, { url }) => {
+      seen.push([url.pathname, req.headers.authorization]);
+      if (url.pathname === "/sessions/stream") {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write('event: done\ndata: {"id":"s","status":"completed"}\n\n');
+        res.end();
+        return;
+      }
+      sendJson(res, 200, { id: "s", status: "completed" });
+    });
+
+    await authed.health();
+    await authed.run({});
+    for await (const _evt of authed.stream({})) {
+      // drain
+    }
+    assert.deepEqual(
+      seen.map(([, auth]) => auth),
+      ["Bearer secret-1", "Bearer secret-1", "Bearer secret-1"],
+    );
+  });
+
+  it("lets an explicit headers.Authorization override apiKey, and sends none by default", async () => {
+    const overridden = new AgentClient(server.baseUrl, {
+      apiKey: "ignored",
+      headers: { Authorization: "Bearer winner" },
+    });
+    const plain = new AgentClient(server.baseUrl);
+    const seen = [];
+    server.on((req, res) => {
+      seen.push(req.headers.authorization);
+      sendJson(res, 200, { status: "ok" });
+    });
+    await overridden.health();
+    await plain.health();
+    assert.deepEqual(seen, ["Bearer winner", undefined]);
   });
 });
 
@@ -332,11 +379,93 @@ describe("Checkpoint serialization", () => {
 });
 
 describe("error handling", () => {
-  it("throws HTTP <status>: <body> on a non-2xx response", async () => {
-    server.on((_req, res) => sendJson(res, 500, { error: "kaboom" }));
+  it("throws a typed HttpError carrying status, body, and detail", async () => {
+    // 400 is not retryable, so a single handler suffices.
+    server.on((_req, res) => sendJson(res, 400, { error: "kaboom" }));
     await assert.rejects(() => client.health(), (err) => {
-      assert.match(err.message, /HTTP 500/);
+      assert.ok(err instanceof HttpError);
+      assert.ok(err instanceof AgentClientError);
+      assert.equal(err.status, 400);
+      assert.equal(err.detail, "kaboom");
+      assert.match(err.body, /kaboom/);
+      assert.match(err.message, /HTTP 400/);
       assert.match(err.message, /kaboom/);
+      return true;
+    });
+  });
+
+  it("distinguishes 400/404/409 via err.status", async () => {
+    for (const status of [400, 404, 409]) {
+      server.reset();
+      server.on((_req, res) => sendJson(res, status, { error: `status ${status}` }));
+      await assert.rejects(
+        () => client.signal("run-x", { name: "review" }),
+        (err) => err instanceof HttpError && err.status === status,
+      );
+    }
+  });
+
+  it("does not retry POSTs on a retryable status", async () => {
+    server.on((_req, res) => sendJson(res, 503, { error: "overloaded" }));
+    await assert.rejects(() => client.run({ q: 1 }), (err) => {
+      assert.ok(err instanceof HttpError);
+      assert.equal(err.status, 503);
+      return true;
+    });
+    assert.equal(server.requestsFor("/sessions").length, 1);
+  });
+
+  it("retries GETs on a retryable status and succeeds", async () => {
+    const fastClient = new AgentClient(server.baseUrl, { retries: 2, retryDelayMs: 1 });
+    let calls = 0;
+    server.on((_req, res) => {
+      calls += 1;
+      if (calls < 3) return sendJson(res, 503, { error: "warming up" });
+      sendJson(res, 200, { status: "ok" });
+    });
+    assert.deepEqual(await fastClient.health(), { status: "ok" });
+    assert.equal(calls, 3);
+  });
+
+  it("gives up retrying GETs after `retries` attempts", async () => {
+    const fastClient = new AgentClient(server.baseUrl, { retries: 1, retryDelayMs: 1 });
+    server.on((_req, res) => sendJson(res, 503, { error: "still down" }));
+    await assert.rejects(() => fastClient.health(), (err) => {
+      assert.ok(err instanceof HttpError);
+      assert.equal(err.status, 503);
+      return true;
+    });
+    assert.equal(server.requestsFor("/health").length, 2);
+  });
+
+  it("does not retry GETs on a non-retryable status", async () => {
+    server.on((_req, res) => sendJson(res, 404, { error: "no such session" }));
+    await assert.rejects(() => client.getSession("nope"), (err) => {
+      assert.ok(err instanceof HttpError);
+      assert.equal(err.status, 404);
+      return true;
+    });
+    assert.equal(server.requestsFor("/sessions/nope").length, 1);
+  });
+
+  it("throws a TimeoutError when the server never responds", async () => {
+    const impatient = new AgentClient(server.baseUrl, { timeoutMs: 50, retries: 0 });
+    server.on(() => {
+      // Never respond; the client should abort.
+    });
+    await assert.rejects(() => impatient.run({ q: 1 }), (err) => {
+      assert.ok(err instanceof TimeoutError);
+      assert.ok(err instanceof AgentClientError);
+      assert.equal(err.timeoutMs, 50);
+      return true;
+    });
+  });
+
+  it("throws a ConnectionError when nothing is listening", async () => {
+    const nowhere = new AgentClient("http://127.0.0.1:1", { retries: 0, timeoutMs: 1000 });
+    await assert.rejects(() => nowhere.health(), (err) => {
+      assert.ok(err instanceof ConnectionError);
+      assert.ok(err instanceof AgentClientError);
       return true;
     });
   });
@@ -395,13 +524,17 @@ describe("stream", () => {
     assert.deepEqual(events[0].output, { v: 1 });
   });
 
-  it("throws when the stream request fails", async () => {
+  it("throws an HttpError when the stream request fails", async () => {
     server.on((_req, res) => res.writeHead(500).end());
     await assert.rejects(async () => {
       // eslint-disable-next-line no-unused-vars
       for await (const _ of client.stream({})) {
         // no-op
       }
-    }, /stream request failed: 500/);
+    }, (err) => {
+      assert.ok(err instanceof HttpError);
+      assert.equal(err.status, 500);
+      return true;
+    });
   });
 });

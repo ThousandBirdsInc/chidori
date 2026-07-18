@@ -23,7 +23,12 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
 (() => {
     globalThis.chidori = globalThis.chidori || {};
 
-    globalThis.chidori.tryCall = async function tryCall(fn) {
+    // In-VM convenience helpers live under chidori.util, NOT flat on the host
+    // object: everything else on `chidori` is a recorded durable host call,
+    // and these three are pure JS control flow that records nothing.
+    globalThis.chidori.util = globalThis.chidori.util || {};
+
+    globalThis.chidori.util.tryCall = async function tryCall(fn) {
         try {
             return { ok: true, value: await fn() };
         } catch (err) {
@@ -34,7 +39,7 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
         }
     };
 
-    globalThis.chidori.retry = async function retry(fn, options) {
+    globalThis.chidori.util.retry = async function retry(fn, options) {
         const attempts = Math.max(1, Number(options && options.attempts) || 3);
         let lastErr;
         for (let i = 0; i < attempts; i += 1) {
@@ -47,9 +52,9 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
         throw lastErr;
     };
 
-    globalThis.chidori.parallel = async function parallel(tasks, options) {
+    globalThis.chidori.util.parallel = async function parallel(tasks, options) {
         if (!Array.isArray(tasks)) {
-            throw new Error("chidori.parallel expects an array of task functions");
+            throw new Error("chidori.util.parallel expects an array of task functions");
         }
         // Accept the Promise.all idiom too: a task may be a thunk (preferred —
         // it lets the scheduler control start time and concurrency), an
@@ -80,32 +85,148 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
         return results;
     };
 
+    // chidori.memory.<method> — the persistent KV store as a plain namespace.
+    // The native binding is a single action-dispatch function; it is wrapped
+    // here so authors never see the positional (action, key, value, options)
+    // form.
     globalThis.__chidori_install_memory_helpers = function installMemoryHelpers() {
         const current = globalThis.chidori && globalThis.chidori.memory;
         if (typeof current !== "function") {
             return null;
         }
         const memoryCall = current.__chidori_call || current;
-        function memory(...args) {
-            return memoryCall.call(globalThis.chidori, ...args);
-        }
-        memory.__chidori_call = memoryCall;
-        memory.set = memory.set || function set(key, value, options) {
-            return memory("set", key, value, options);
+        const call = (...args) => memoryCall.call(globalThis.chidori, ...args);
+        globalThis.chidori.memory = {
+            __chidori_call: memoryCall,
+            set(key, value, options) {
+                return call("set", key, value, options);
+            },
+            get(key, options) {
+                return call("get", key, null, options);
+            },
+            delete(key, options) {
+                return call("delete", key, null, options);
+            },
+            list(options) {
+                return call("list", null, null, options);
+            },
+            clear(options) {
+                return call("clear", null, null, options);
+            },
         };
-        memory.get = memory.get || function get(key, options) {
-            return memory("get", key, null, options);
-        };
-        memory.delete = memory.delete || function deleteKey(key, options) {
-            return memory("delete", key, null, options);
-        };
-        memory.clear = memory.clear || function clear(options) {
-            return memory("clear", null, null, options);
-        };
-        globalThis.chidori.memory = memory;
         return null;
     };
     globalThis.__chidori_install_memory_helpers();
+
+    // chidori.actors: wrap the native durable ops so spawn/lookup hand back a
+    // HANDLE — an object with the actor's address plus send/join/stop/status
+    // methods — instead of making authors thread pid strings around. The
+    // string-addressed forms remain on the namespace for actors known only by
+    // pid or registered name. Handles are plain in-VM sugar: every method
+    // still bottoms out in one recorded durable host call.
+    globalThis.__chidori_install_actor_helpers = function installActorHelpers() {
+        const native = globalThis.chidori && globalThis.chidori.actors;
+        if (!native || typeof native.spawn !== "function" || native.__chidori_wrapped) {
+            return null;
+        }
+        function makeHandle(info) {
+            const pid = info.pid;
+            const handle = {
+                pid,
+                name: info.name ?? null,
+                send(name, payload) {
+                    return native.send(pid, name, payload);
+                },
+                join(options) {
+                    return native.join(pid, options);
+                },
+                stop(options) {
+                    return native.stop(pid, options);
+                },
+                status() {
+                    return native.status(pid);
+                },
+            };
+            return handle;
+        }
+        globalThis.chidori.actors = {
+            __chidori_wrapped: true,
+            async spawn(source, input, options) {
+                return makeHandle(await native.spawn(source, input, options));
+            },
+            send(to, name, payload) {
+                return native.send(to, name, payload);
+            },
+            join(target, options) {
+                return native.join(target, options);
+            },
+            stop(target, options) {
+                return native.stop(target, options);
+            },
+            status(target) {
+                return native.status(target);
+            },
+            async lookup(name) {
+                const found = await native.lookup(name);
+                return found && found.pid ? makeHandle({ pid: found.pid, name }) : null;
+            },
+        };
+        return null;
+    };
+    globalThis.__chidori_install_actor_helpers();
+
+    // chidori.agents: same handle sugar as chidori.actors, addressed by the
+    // agent's registered name. Every method bottoms out in one recorded
+    // durable host call.
+    globalThis.__chidori_install_agent_helpers = function installAgentHelpers() {
+        const native = globalThis.chidori && globalThis.chidori.agents;
+        if (!native || typeof native.spawn !== "function" || native.__chidori_wrapped) {
+            return null;
+        }
+        function makeHandle(info) {
+            const name = info.name;
+            return {
+                name,
+                runId: info.runId ?? null,
+                send(message, payload) {
+                    return native.send(name, message, payload);
+                },
+                join(options) {
+                    return native.join(name, options);
+                },
+                stop(options) {
+                    return native.stop(name, options);
+                },
+                status() {
+                    return native.status(name);
+                },
+            };
+        }
+        globalThis.chidori.agents = {
+            __chidori_wrapped: true,
+            async spawn(source, input, options) {
+                return makeHandle(await native.spawn(source, input, options));
+            },
+            send(to, message, payload) {
+                return native.send(to, message, payload);
+            },
+            join(target, options) {
+                return native.join(target, options);
+            },
+            stop(target, options) {
+                return native.stop(target, options);
+            },
+            status(target) {
+                return native.status(target);
+            },
+            async lookup(name) {
+                const found = await native.lookup(name);
+                return found && found.name ? makeHandle(found) : null;
+            },
+        };
+        return null;
+    };
+    globalThis.__chidori_install_agent_helpers();
 
     // chidori.context(): an immutable, turn-structured prompt builder. Each
     // builder call allocates ONE new node pointing at its parent, so contexts
@@ -196,11 +317,27 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             system(text) {
                 return append(this, { kind: "system", text: String(text) });
             },
-            tools(names) {
-                return append(this, {
-                    kind: "tools",
-                    names: (names || []).map(String),
-                });
+            tools(list) {
+                // Mixed input: tool NAMES (strings, resolved by the host
+                // against the MCP/native registry) and import-defined tool
+                // HANDLES from defineTool(). Handles contribute their schema
+                // inline; their run() functions never enter the segment (it
+                // crosses the host boundary as JSON) — the JS-side loop that
+                // executes them keeps the handles itself.
+                const names = [];
+                const schemas = [];
+                for (const t of list || []) {
+                    if (t && typeof t === "object" && t.__chidoriTool === true) {
+                        schemas.push({
+                            name: t.name,
+                            description: t.description,
+                            parameters: t.parameters,
+                        });
+                    } else {
+                        names.push(String(t));
+                    }
+                }
+                return append(this, { kind: "tools", names, schemas });
             },
             doc(label, text) {
                 return append(this, {
@@ -347,6 +484,14 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             // budgeted `context.compact()` no-op until the tail exceeds budget.
             const compactOptions =
                 opts.compact && typeof opts.compact === "object" ? opts.compact : null;
+            // Import-defined tools (defineTool handles) configured on the
+            // conversation: say() drives the in-VM tool loop for these.
+            const toolSplit = globalThis.chidori.__splitTools
+                ? globalThis.chidori.__splitTools(opts.tools)
+                : { names: [], handles: new Map() };
+            const fnToolMaxTurns = Number.isFinite(Number(opts.maxTurns))
+                ? Number(opts.maxTurns)
+                : 8;
 
             let ctx = globalThis.chidori.context({
                 system: opts.system,
@@ -385,12 +530,26 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                     if (compactOptions) ctx = await ctx.compact(compactOptions);
                     ctx = ctx.user(text);
                     turns.push({ role: "user", text });
-                    const result = await ctx.prompt(turnOptions(perTurn));
+                    let result;
+                    if (toolSplit.handles.size > 0) {
+                        const respondOptions = turnOptions(perTurn);
+                        delete respondOptions.format;
+                        delete respondOptions.strict;
+                        const loop = await globalThis.chidori.__fnToolLoop(
+                            ctx,
+                            respondOptions,
+                            toolSplit.handles,
+                            fnToolMaxTurns,
+                        );
+                        result = { text: loop.text, context: loop.context };
+                    } else {
+                        result = await ctx.prompt(turnOptions(perTurn));
+                    }
                     ctx = result.context;
                     turns.push({ role: "assistant", text: result.text });
                     return result.text;
                 },
-                // Like say(), but returns the structured response (tool_calls,
+                // Like say(), but returns the structured response (toolCalls,
                 // blocks) for author-driven tool loops. Append tool results with
                 // `chat.context.toolResult(...)` then call `chat.say(...)` again.
                 async respond(message, perTurn) {
@@ -475,6 +634,170 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             },
         };
     }
+
+
+    // ---- Import-defined tools: defineTool() + the in-VM function-tool loop.
+    // A tool is merely a function with a documented signature: defineTool()
+    // pairs a `run` function with the `name`/`description`/`parameters` the
+    // model reads to call it. The result is a plain object you import (or
+    // define inline) — no tools/ directory, no registry. The `run` function
+    // executes in the AGENT'S OWN VM, so its side effects (fetch, workspace,
+    // node:fs, ...) are the captured effects every agent already has, so
+    // journaling and deterministic replay come for free; each model turn of
+    // the loop is a durable respond() call, and each tool invocation is
+    // journaled as a `mark` record for the trace.
+    (() => {
+        const isHandle = (t) => t && typeof t === "object" && t.__chidoriTool === true;
+
+        globalThis.defineTool = function defineTool(def) {
+            if (!def || typeof def.name !== "string" || def.name === "") {
+                throw new Error("defineTool: `name` (non-empty string) is required");
+            }
+            if (typeof def.run !== "function") {
+                throw new Error(
+                    "defineTool: `run` (function) is required — the tool body runs in the agent's own VM",
+                );
+            }
+            return Object.freeze({
+                __chidoriTool: true,
+                name: def.name,
+                description: typeof def.description === "string" ? def.description : "",
+                parameters: def.parameters || { type: "object", properties: {} },
+                run: def.run,
+            });
+        };
+        globalThis.chidori.defineTool = globalThis.defineTool;
+
+        function splitTools(list) {
+            const names = [];
+            const handles = new Map();
+            for (const t of list || []) {
+                if (isHandle(t)) handles.set(t.name, t);
+                else names.push(String(t));
+            }
+            return { names, handles };
+        }
+
+        // Mirror of the host's strict format:"json" contract (a wrapping
+        // markdown fence tolerated; unparseable throws unless strict:false).
+        // Duplicated here because the function-tool loop's final text never
+        // flows back through the native prompt path.
+        function parseJsonReply(text, strict) {
+            let candidate = String(text == null ? "" : text).trim();
+            if (candidate.startsWith("```")) {
+                let rest = candidate.slice(3);
+                if (rest.startsWith("json")) rest = rest.slice(4);
+                rest = rest.replace(/^\r?\n/, "");
+                if (rest.endsWith("```")) candidate = rest.slice(0, -3).trim();
+            }
+            try {
+                return JSON.parse(candidate);
+            } catch (e) {
+                if (strict === false) return String(text);
+                const head =
+                    candidate === ""
+                        ? "(empty - was the response truncated? reasoning models spend the maxTokens budget on hidden reasoning first)"
+                        : "reply starts: " + JSON.stringify(candidate.slice(0, 120));
+                throw new Error(
+                    'format:"json": the model reply is not valid JSON (' +
+                        (e && e.message ? e.message : e) +
+                        "); " +
+                        head +
+                        ". Pass `strict: false` in the prompt options to get the raw string instead.",
+                );
+            }
+        }
+
+        function stringifyResult(value) {
+            return typeof value === "string" ? value : JSON.stringify(value);
+        }
+
+        // Drive the tool loop from `ctx` (which already carries the tools
+        // head): respond -> execute requested tools -> feed results back,
+        // until a turn makes no tool calls or maxTurns is exhausted.
+        // Import-defined tools run in-VM; registered names still dispatch to
+        // the host's journaled `chidori.tool` effect. Returns {text, context}.
+        async function runToolLoop(ctx, respondOptions, handles, maxTurns) {
+            let current = ctx;
+            let lastText = "";
+            for (let turn = 0; turn < maxTurns; turn++) {
+                const { response, context } = await current.respond(respondOptions);
+                current = context;
+                lastText =
+                    response && typeof response.content === "string" ? response.content : "";
+                const calls = (response && response.toolCalls) || [];
+                if (calls.length === 0) break;
+                for (const call of calls) {
+                    let content;
+                    let isError = false;
+                    const handle = handles.get(call.name);
+                    try {
+                        if (handle) {
+                            // Journal the in-VM invocation so the trace shows
+                            // the tool call (the body's own captured effects
+                            // journal themselves).
+                            await globalThis.chidori.mark("tool:" + call.name, {
+                                args: call.input,
+                            });
+                            content = stringifyResult(
+                                await handle.run(call.input, globalThis.chidori),
+                            );
+                        } else {
+                            content = stringifyResult(
+                                await globalThis.chidori.tool(call.name, call.input),
+                            );
+                        }
+                    } catch (e) {
+                        content = String(e && e.message ? e.message : e);
+                        isError = true;
+                    }
+                    current = current.toolResult(call.id, content, isError);
+                }
+            }
+            return { text: lastText, context: current };
+        }
+        // Shared with conversation() below.
+        globalThis.chidori.__fnToolLoop = runToolLoop;
+        globalThis.chidori.__splitTools = splitTools;
+        globalThis.chidori.__parseJsonReply = parseJsonReply;
+
+        // Wrap chidori.prompt: when options.tools contains defineTool handles,
+        // lower to a context + tool loop entirely in-VM. Name-only tools (and
+        // tool-less prompts) delegate to the native host path unchanged.
+        const nativePrompt = globalThis.chidori.prompt;
+        globalThis.chidori.prompt = function prompt(text, options) {
+            const opts = options || {};
+            const list = Array.isArray(opts.tools) ? opts.tools : [];
+            if (!list.some(isHandle)) {
+                return nativePrompt.call(globalThis.chidori, text, options);
+            }
+            return (async () => {
+                const maxTurns = Number.isFinite(Number(opts.maxTurns))
+                    ? Number(opts.maxTurns)
+                    : 8;
+                let ctx = globalThis.chidori.context();
+                if (typeof opts.system === "string") ctx = ctx.system(opts.system);
+                ctx = ctx.tools(list).user(String(text == null ? "" : text));
+                const respondOptions = Object.assign({}, opts);
+                delete respondOptions.tools;
+                delete respondOptions.system;
+                delete respondOptions.format;
+                delete respondOptions.strict;
+                delete respondOptions.maxTurns;
+                const { handles } = splitTools(list);
+                const { text: reply } = await runToolLoop(
+                    ctx,
+                    respondOptions,
+                    handles,
+                    maxTurns,
+                );
+                if (opts.format === "json") {
+                    return parseJsonReply(reply, opts.strict);
+                }
+                return reply;
+            })();
+        };
+    })();
 
     return null;
 })()
@@ -811,42 +1134,6 @@ pub(crate) const FETCH_POLYFILL: &str = r#"
     globalThis.Request = Request;
     globalThis.Response = Response;
 })();
-"#;
-
-pub(crate) const URL_SEARCH_PARAMS_POLYFILL: &str = r#"
-globalThis.URLSearchParams = class URLSearchParams {
-    constructor(init) {
-        this._p = [];
-        if (typeof init === "string") {
-            const s = init.charAt(0) === "?" ? init.slice(1) : init;
-            if (s.length) {
-                for (const pair of s.split("&")) {
-                    const i = pair.indexOf("=");
-                    const k = i === -1 ? pair : pair.slice(0, i);
-                    const v = i === -1 ? "" : pair.slice(i + 1);
-                    this._p.push([decodeURIComponent(k), decodeURIComponent(v.replace(/\+/g, " "))]);
-                }
-            }
-        } else if (init && typeof init === "object") {
-            const entries = typeof init.forEach === "function" && !Array.isArray(init)
-                ? Array.from(init)
-                : (Array.isArray(init) ? init : Object.entries(init));
-            for (const [k, v] of entries) this._p.push([String(k), String(v)]);
-        }
-    }
-    append(k, v) { this._p.push([String(k), String(v)]); }
-    set(k, v) { this.delete(k); this._p.push([String(k), String(v)]); }
-    get(k) { const e = this._p.find((p) => p[0] === k); return e ? e[1] : null; }
-    getAll(k) { return this._p.filter((p) => p[0] === k).map((p) => p[1]); }
-    has(k) { return this._p.some((p) => p[0] === k); }
-    delete(k) { this._p = this._p.filter((p) => p[0] !== k); }
-    forEach(cb) { for (const [k, v] of this._p) cb(v, k, this); }
-    toString() {
-        return this._p
-            .map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v))
-            .join("&");
-    }
-};
 "#;
 
 /// Virtual timer queue: deterministic, driven by the logical clock. Timers fire

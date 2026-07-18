@@ -53,7 +53,7 @@ fn get_increment(vm: &mut Vm, obj: &Value) -> Result<Option<RoundingIncrement>, 
         return Ok(None);
     }
     let n = vm.to_number(&v)?;
-    if !n.is_finite() || n.fract() != 0.0 || n < 1.0 || n > 1.0e9 {
+    if !n.is_finite() || n.fract() != 0.0 || !(1.0..=1.0e9).contains(&n) {
         return Err(vm.throw_range("invalid roundingIncrement"));
     }
     RoundingIncrement::try_new(n as u32)
@@ -156,7 +156,7 @@ pub fn install(vm: &mut Vm) {
 
     // Temporal[Symbol.toStringTag] = "Temporal" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -227,7 +227,7 @@ fn this_duration(vm: &mut Vm, this: &Value) -> Result<Duration, Value> {
     if let Value::Object(o) = this {
         if let Internal::Temporal(slot) = &o.borrow().internal {
             if let TemporalSlot::Duration(d) = slot.as_ref() {
-                return Ok(d.clone());
+                return Ok(*d);
             }
         }
     }
@@ -289,7 +289,7 @@ fn to_temporal_duration(vm: &mut Vm, v: &Value) -> Result<Duration, Value> {
     if let Value::Object(o) = v {
         if let Internal::Temporal(slot) = &o.borrow().internal {
             if let TemporalSlot::Duration(d) = slot.as_ref() {
-                return Ok(d.clone());
+                return Ok(*d);
             }
         }
     }
@@ -327,7 +327,7 @@ fn install_duration(vm: &mut Vm, temporal: &JsObject) {
         |vm, _t, _a| Err(vm.throw_type("Constructor Temporal.Duration requires 'new'")),
         move |vm, _this, args| construct_duration(vm, args, &ctor_proto),
     );
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -338,7 +338,7 @@ fn install_duration(vm: &mut Vm, temporal: &JsObject) {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ctor.clone())),
     );
@@ -523,7 +523,7 @@ fn install_duration(vm: &mut Vm, temporal: &JsObject) {
 
     // Temporal.Duration.prototype[Symbol.toStringTag] = "Temporal.Duration"
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -535,7 +535,7 @@ fn install_duration(vm: &mut Vm, temporal: &JsObject) {
         },
     );
 
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::str("Duration"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -772,7 +772,7 @@ fn install_plain_time(vm: &mut Vm, temporal: &JsObject) {
         |vm, _t, _a| Err(vm.throw_type("Constructor Temporal.PlainTime requires 'new'")),
         move |vm, _this, args| construct_plain_time(vm, args, &ctor_proto),
     );
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -783,7 +783,7 @@ fn install_plain_time(vm: &mut Vm, temporal: &JsObject) {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ctor.clone())),
     );
@@ -898,7 +898,7 @@ fn install_plain_time(vm: &mut Vm, temporal: &JsObject) {
     });
 
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -910,7 +910,7 @@ fn install_plain_time(vm: &mut Vm, temporal: &JsObject) {
         },
     );
 
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::str("PlainTime"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -1065,7 +1065,7 @@ fn install_plain_date(vm: &mut Vm, temporal: &JsObject) {
         |vm, _t, _a| Err(vm.throw_type("Constructor Temporal.PlainDate requires 'new'")),
         move |vm, _this, args| construct_plain_date(vm, args, &ctor_proto),
     );
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -1076,7 +1076,7 @@ fn install_plain_date(vm: &mut Vm, temporal: &JsObject) {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ctor.clone())),
     );
@@ -1230,7 +1230,7 @@ fn install_plain_date(vm: &mut Vm, temporal: &JsObject) {
     });
 
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -1242,7 +1242,7 @@ fn install_plain_date(vm: &mut Vm, temporal: &JsObject) {
         },
     );
 
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::str("PlainDate"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -1319,7 +1319,7 @@ fn install_instant(vm: &mut Vm, temporal: &JsObject) {
         |vm, _t, _a| Err(vm.throw_type("Constructor Temporal.Instant requires 'new'")),
         move |vm, _this, args| construct_instant(vm, args, &ctor_proto),
     );
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -1330,7 +1330,7 @@ fn install_instant(vm: &mut Vm, temporal: &JsObject) {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ctor.clone())),
     );
@@ -1456,7 +1456,7 @@ fn install_instant(vm: &mut Vm, temporal: &JsObject) {
     });
 
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -1468,7 +1468,7 @@ fn install_instant(vm: &mut Vm, temporal: &JsObject) {
         },
     );
 
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::str("Instant"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -1583,7 +1583,7 @@ fn install_plain_date_time(vm: &mut Vm, temporal: &JsObject) {
         |vm, _t, _a| Err(vm.throw_type("Constructor Temporal.PlainDateTime requires 'new'")),
         move |vm, _this, args| construct_plain_date_time(vm, args, &ctor_proto),
     );
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -1594,7 +1594,7 @@ fn install_plain_date_time(vm: &mut Vm, temporal: &JsObject) {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ctor.clone())),
     );
@@ -1789,7 +1789,7 @@ fn install_plain_date_time(vm: &mut Vm, temporal: &JsObject) {
     });
 
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -1801,7 +1801,7 @@ fn install_plain_date_time(vm: &mut Vm, temporal: &JsObject) {
         },
     );
 
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::str("PlainDateTime"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -2121,7 +2121,7 @@ fn install_year_month(vm: &mut Vm, temporal: &JsObject) {
         Err(vm.throw_type("Temporal.PlainYearMonth: use compare() instead of relational operators"))
     });
     set_tag(vm, &proto, "Temporal.PlainYearMonth");
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::str("PlainYearMonth"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -2236,7 +2236,7 @@ fn install_month_day(vm: &mut Vm, temporal: &JsObject) {
         Err(vm.throw_type("Temporal.PlainMonthDay: use equals() instead of relational operators"))
     });
     set_tag(vm, &proto, "Temporal.PlainMonthDay");
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::str("PlainMonthDay"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -2245,7 +2245,7 @@ fn install_month_day(vm: &mut Vm, temporal: &JsObject) {
 /// Wire `ctor.prototype` / `proto.constructor` (non-enumerable).
 fn install_ctor_proto(vm: &Vm, ctor: &JsObject, proto: &JsObject) {
     let _ = vm;
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -2256,7 +2256,7 @@ fn install_ctor_proto(vm: &Vm, ctor: &JsObject, proto: &JsObject) {
             configurable: false,
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("constructor"),
         Property::builtin(Value::Object(ctor.clone())),
     );
@@ -2265,7 +2265,7 @@ fn install_ctor_proto(vm: &Vm, ctor: &JsObject, proto: &JsObject) {
 /// Set a prototype's `[Symbol.toStringTag]`.
 fn set_tag(vm: &Vm, proto: &JsObject, tag: &str) {
     let sym = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(sym),
         Property {
             kind: PropertyKind::Data {
@@ -2620,7 +2620,7 @@ fn install_zoned_date_time(vm: &mut Vm, temporal: &JsObject) {
         Err(vm.throw_type("Temporal.ZonedDateTime: use compare() instead of relational operators"))
     });
     set_tag(vm, &proto, "Temporal.ZonedDateTime");
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::str("ZonedDateTime"),
         Property::builtin(Value::Object(ctor)),
     );
@@ -2651,7 +2651,7 @@ fn define_zdt_getter(
 /// A fresh system-clock `Now` (the bare conformance context reads real time,
 /// like `Date`; the durable runtime captures this as an effect at a higher layer).
 fn now_clock() -> temporal_rs::now::Now<temporal_rs::sys::LocalHostSystem> {
-    temporal_rs::Temporal::now()
+    temporal_rs::Temporal::local_now()
 }
 
 /// The optional `temporalTimeZoneLike` argument of the `Now` methods.
@@ -2710,7 +2710,7 @@ fn install_now(vm: &mut Vm, temporal: &JsObject) {
     });
 
     set_tag(vm, &now, "Temporal.Now");
-    temporal.borrow_mut().props.insert(
+    temporal.borrow_mut().own_insert(
         PropertyKey::str("Now"),
         Property::builtin(Value::Object(now)),
     );

@@ -244,6 +244,7 @@ impl RunSpan {
     /// during the run, with the OTLP batch processor handling the wire batching,
     /// instead of all at once at the end. Idempotent per seq; safe to call from
     /// `record_call`.
+    #[cfg_attr(not(test), allow(dead_code))] // Production spans go through `stream_record_tagged`.
     pub fn stream_record(&self, record: CallRecord) {
         self.stream_record_tagged(record, None);
     }
@@ -266,7 +267,7 @@ impl RunSpan {
         while let Some(pos) = state
             .pending
             .iter()
-            .position(|(r, _)| r.parent_seq.map_or(true, |p| state.emitted.contains(&p)))
+            .position(|(r, _)| r.parent_seq.is_none_or(|p| state.emitted.contains(&p)))
         {
             let (record, branch) = state.pending.remove(pos);
             self.emit_one(state, &record, branch.as_ref());
@@ -282,7 +283,7 @@ impl RunSpan {
             let pos = state
                 .pending
                 .iter()
-                .position(|(r, _)| r.parent_seq.map_or(true, |p| state.emitted.contains(&p)))
+                .position(|(r, _)| r.parent_seq.is_none_or(|p| state.emitted.contains(&p)))
                 .unwrap_or(0);
             let (record, branch) = state.pending.remove(pos);
             self.emit_one(state, &record, branch.as_ref());
@@ -866,7 +867,7 @@ mod tests {
                 "{f} should map to SpanKind::Client"
             );
         }
-        for f in ["input", "template", "log", "checkpoint", "workspace"] {
+        for f in ["input", "template", "log", "mark", "workspace"] {
             assert!(
                 matches!(span_kind_for(f), SpanKind::Internal),
                 "{f} should map to SpanKind::Internal"

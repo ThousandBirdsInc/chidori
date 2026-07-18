@@ -23,6 +23,13 @@ pub struct JournalEntry {
     pub site: String,
     /// Per-site invocation index.
     pub seq: u64,
+    /// The call's JSON arguments as recorded, so replay can detect an edit
+    /// that kept the effect order but changed what an already-executed call
+    /// asked for. `Null` for entries that carry no comparable args
+    /// (`durableStep` memoization, journals written before args were
+    /// recorded) — those skip the comparison.
+    #[serde(default)]
+    pub args: Json,
     pub outcome: EffectOutcome,
 }
 
@@ -50,10 +57,11 @@ impl Journal {
             .map(|e| &e.outcome)
     }
 
-    pub fn append(&mut self, key: &HostKey, outcome: EffectOutcome) {
+    pub fn append(&mut self, key: &HostKey, args: Json, outcome: EffectOutcome) {
         self.entries.push(JournalEntry {
             site: key.site.clone(),
             seq: key.seq,
+            args,
             outcome,
         });
     }

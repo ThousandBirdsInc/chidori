@@ -13,9 +13,58 @@ outputs.
 2. **Checkpoint:** The call log is a JSON array — save it to disk, send it over the wire, commit it to git.
 3. **Replay:** Re-run the agent with the call log pre-loaded. Each host function call checks the log for its seq number — hit returns the cached result instantly, miss executes normally.
 
+Replay is guarded, not best-effort:
+
+- **Source verification:** every resume surface (the server's resume/approve
+  routes *and* `chidori resume`) verifies the agent's entry + module source
+  fingerprints against the run's snapshot manifest before replaying, and
+  refuses on mismatch — cached results are never paired with changed code
+  *silently*. (Runs persisted before manifests existed skip with a warning.)
+- **Edit-and-resume is an explicit opt-in:** pass `--allow-source-change` to
+  `chidori resume` (or `"allow_source_change": true` on the server's
+  resume/signal/approve routes) to replay a recorded run against edited code.
+  The divergence checks below still guard the journaled prefix — an edit that
+  changes an already-recorded call fails loudly, an edit past the pause point
+  resumes cleanly. ABI/policy mismatches are environment drift, not edits,
+  and always refuse.
+- **Divergence checks compare arguments, not just names:** a replayed call
+  must match the recorded call's function *and* arguments (the derived
+  `request_digest` field is ignored). A completed async host operation whose
+  recorded arguments differ from the re-executed call's is a hard divergence
+  error instead of a silent live re-execution of the side effect.
+- **Escape hatch:** `CHIDORI_REPLAY_LAX=1` downgrades argument-level
+  divergence to a warning (serving the cached result / re-executing live,
+  the historical behavior). Function-name mismatches are always fatal.
+
+`chidori resume` carries the run's own configuration so recovery needs no
+flag archaeology:
+
+- **The model travels with the run.** The run's resolved default model is
+  recorded in its manifest; `resume` (and `branch-resume`/`branch-rerun`,
+  and the server's resume/replay/approve routes) default to it. A bare
+  `chidori resume agent.ts <run-id>` replays a `--model`-started run
+  byte-for-byte; an explicit `--model`/`CHIDORI_MODEL` still overrides —
+  and a divergence error that stems from a model mismatch says so, naming
+  both models, instead of blaming "changed code".
+- **Trust mirrors `run`.** `resume` accepts `--trusted` / `--untrusted` so
+  live continuation past the replay frontier (crash recovery) executes under
+  the same posture the original `chidori run --trusted` had. Without
+  `--trusted`, gated effects re-ask at the terminal exactly like `run`.
+- **Continuation is journaled.** Live records past the frontier persist
+  into the same run directory, so a resume that itself crashes resumes from
+  the *new* frontier — and the run's lease (`lease.json`) refuses a second
+  concurrent driver of the same run dir.
+
 This means you can:
 - **Debug without spending money:** save a failing session, replay locally with breakpoints.
-- **Run deterministic tests:** check in a checkpoint, assert the agent's behavior hasn't changed.
+- **Run deterministic tests:** check in a run directory, and `chidori verify
+  <agent.ts> <run_id>` asserts it still replays cleanly: no provider
+  configured, deny-all policy, no writes to the run directory, output must be
+  identical to the recorded one and every call must come from the journal
+  (top-level workspace effects re-materialize their recorded artifacts —
+  workspace state is real disk, not journal-served).
+  Exit 0 on pass — a full integration test that costs $0 and runs in
+  milliseconds, built for CI.
 - **Resume after crashes:** the runtime can persist checkpoints after each call; on restart, replay picks up where it left off.
 - **Pause for human approval:** `input()` suspends execution; when the human responds, the agent replays to that point and continues.
 

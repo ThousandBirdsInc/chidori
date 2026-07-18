@@ -239,16 +239,19 @@ fn rfind_units(hay: &[u16], needle: &[u16], last: usize) -> Option<usize> {
 }
 
 /// The code point at code-unit index `i`, combining a surrogate pair.
-fn code_point_at_units(units: &[u16], i: usize) -> u32 {
-    let u = units[i];
-    if (0xD800..=0xDBFF).contains(&u)
-        && i + 1 < units.len()
-        && (0xDC00..=0xDFFF).contains(&units[i + 1])
-    {
-        0x1_0000 + (((u as u32 - 0xD800) << 10) | (units[i + 1] as u32 - 0xDC00))
-    } else {
-        u as u32
+/// Code point at code-unit index `i` (which the caller has bounds-checked),
+/// combining a surrogate pair — reading through `code_unit_at`, so no
+/// whole-string materialization.
+fn code_point_at_str(s: &JsString, i: usize) -> u32 {
+    let u = s.code_unit_at(i).expect("caller checked index");
+    if (0xD800..=0xDBFF).contains(&u) {
+        if let Some(next) = s.code_unit_at(i + 1) {
+            if (0xDC00..=0xDFFF).contains(&next) {
+                return 0x1_0000 + (((u as u32 - 0xD800) << 10) | (next as u32 - 0xDC00));
+            }
+        }
     }
+    u as u32
 }
 
 /// `ToIntegerOrInfinity(value)` as an f64 (NaN -> 0, truncation towards 0,
@@ -316,50 +319,69 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "valueOf", 0, |vm, this, _a| {
         this_string_value(vm, &this)
     });
+    // The single-unit accessors (`charAt`/`charCodeAt`/`codePointAt`/`at`)
+    // read via `JsString::code_unit_at` instead of materializing the whole
+    // string as a `Vec<u16>` per call — a `charCodeAt` scan loop (the
+    // tokenizer/hash idiom, `string_scan` in the benchmarks) was O(n²) with n
+    // full-string allocations. `code_unit_at` is O(1) on ASCII strings.
     vm.define_method(proto, "charAt", 1, |vm, this, args| {
-        let s = units_this(vm, &this)?;
+        let s = jsstr_this(vm, &this)?;
         let i = to_integer_or_infinity(vm, &arg(args, 0))?;
-        Ok(if i >= 0.0 && i < s.len() as f64 {
-            Value::String(JsString::from_code_units(&[s[i as usize]]))
+        Ok(if i >= 0.0 && i < s.len_utf16() as f64 {
+            let unit = s.code_unit_at(i as usize).expect("index checked in range");
+            Value::String(JsString::from_code_units(&[unit]))
         } else {
             Value::str("")
         })
     });
     vm.define_method(proto, "charCodeAt", 1, |vm, this, args| {
-        let s = units_this(vm, &this)?;
+        let s = jsstr_this(vm, &this)?;
         let i = to_integer_or_infinity(vm, &arg(args, 0))?;
-        if i >= 0.0 && i < s.len() as f64 {
-            Ok(Value::Number(s[i as usize] as f64))
+        if i >= 0.0 && i < s.len_utf16() as f64 {
+            let unit = s.code_unit_at(i as usize).expect("index checked in range");
+            Ok(Value::Number(unit as f64))
         } else {
             Ok(Value::Number(f64::NAN))
         }
     });
+    // Pin the canonical `charCodeAt` for the kernel `CharCodeAt` entry
+    // guard (identity check + bail-shape reconstruction), exactly like
+    // `Array.prototype.push`.
+    let ccode = proto
+        .borrow()
+        .own_get(&PropertyKey::str("charCodeAt"))
+        .and_then(|p| p.value().cloned());
+    if let Some(Value::Object(o)) = ccode {
+        vm.realm.string_char_code_at = Some(o);
+    }
     vm.define_method(proto, "codePointAt", 1, |vm, this, args| {
-        let s = units_this(vm, &this)?;
+        let s = jsstr_this(vm, &this)?;
         let i = to_integer_or_infinity(vm, &arg(args, 0))?;
-        if i >= 0.0 && i < s.len() as f64 {
+        if i >= 0.0 && i < s.len_utf16() as f64 {
             // Code point at the code-unit index, combining a surrogate pair.
-            Ok(Value::Number(code_point_at_units(&s, i as usize) as f64))
+            Ok(Value::Number(code_point_at_str(&s, i as usize) as f64))
         } else {
             Ok(Value::Undefined)
         }
     });
     vm.define_method(proto, "at", 1, |vm, this, args| {
-        let s = units_this(vm, &this)?;
+        let s = jsstr_this(vm, &this)?;
         let rel = to_integer_or_infinity(vm, &arg(args, 0))?;
         if !rel.is_finite() && rel > 0.0 {
             return Ok(Value::Undefined);
         }
+        let len = s.len_utf16();
         let mut i = if rel.is_finite() {
             rel as isize
         } else {
             isize::MIN / 2
         };
         if i < 0 {
-            i += s.len() as isize;
+            i += len as isize;
         }
-        if i >= 0 && (i as usize) < s.len() {
-            Ok(Value::String(JsString::from_code_units(&[s[i as usize]])))
+        if i >= 0 && (i as usize) < len {
+            let unit = s.code_unit_at(i as usize).expect("index checked in range");
+            Ok(Value::String(JsString::from_code_units(&[unit])))
         } else {
             Ok(Value::Undefined)
         }
@@ -496,21 +518,15 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         Ok(Value::str(str_this(vm, &this)?.to_lowercase()))
     });
     vm.define_method(proto, "trim", 0, |vm, this, _a| {
-        Ok(Value::str(
-            str_this(vm, &this)?.trim_matches(is_js_ws).to_string(),
-        ))
+        Ok(Value::str(str_this(vm, &this)?.trim_matches(is_js_ws)))
     });
     vm.define_method(proto, "trimStart", 0, |vm, this, _a| {
         Ok(Value::str(
-            str_this(vm, &this)?
-                .trim_start_matches(is_js_ws)
-                .to_string(),
+            str_this(vm, &this)?.trim_start_matches(is_js_ws),
         ))
     });
     vm.define_method(proto, "trimEnd", 0, |vm, this, _a| {
-        Ok(Value::str(
-            str_this(vm, &this)?.trim_end_matches(is_js_ws).to_string(),
-        ))
+        Ok(Value::str(str_this(vm, &this)?.trim_end_matches(is_js_ws)))
     });
     vm.define_method(proto, "repeat", 1, |vm, this, args| {
         let s = str_this(vm, &this)?;
@@ -724,7 +740,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         if matches!(regexp, Value::Object(_)) {
             let key = PropertyKey::Sym(vm.realm.symbol_search.clone());
             if let Some(m) = get_method(vm, &regexp, &key)? {
-                return vm.call(m, regexp.clone(), &[this.clone()]);
+                return vm.call(m, regexp.clone(), std::slice::from_ref(&this));
             }
         }
         // Fall back: RegExpCreate then Invoke(rx, @@search, «S»).
@@ -745,7 +761,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         if matches!(regexp, Value::Object(_)) {
             let key = PropertyKey::Sym(vm.realm.symbol_match.clone());
             if let Some(m) = get_method(vm, &regexp, &key)? {
-                return vm.call(m, regexp.clone(), &[this.clone()]);
+                return vm.call(m, regexp.clone(), std::slice::from_ref(&this));
             }
         }
         let s = str_this(vm, &this)?;
@@ -776,7 +792,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
             }
             let key = PropertyKey::Sym(vm.realm.symbol_match_all.clone());
             if let Some(m) = get_method(vm, &regexp, &key)? {
-                return vm.call(m, regexp.clone(), &[this.clone()]);
+                return vm.call(m, regexp.clone(), std::slice::from_ref(&this));
             }
         }
         // Fall back: S = ToString(this), then RegExpCreate(regexp, "g") and
@@ -805,8 +821,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         .unwrap();
     proto
         .borrow_mut()
-        .props
-        .shift_remove(&PropertyKey::str("[Symbol.iterator]"));
+        .own_remove(&PropertyKey::str("[Symbol.iterator]"));
     vm.define_value_sym(proto, sym, it);
 }
 

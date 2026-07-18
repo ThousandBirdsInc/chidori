@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use std::sync::Arc;
@@ -301,6 +301,7 @@ impl LlmProvider for AnthropicProvider {
                 output_tokens: parsed.usage.output_tokens,
                 cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
                 cache_read_tokens: parsed.usage.cache_read_input_tokens,
+                reasoning: None,
             });
         }
     }
@@ -529,6 +530,7 @@ impl LlmProvider for AnthropicProvider {
             output_tokens,
             cache_creation_tokens,
             cache_read_tokens,
+            reasoning: None,
         })
     }
 }
@@ -542,6 +544,39 @@ fn retry_after_duration(headers: &reqwest::header::HeaderMap, attempt: u32) -> D
         }
     }
     Duration::from_secs(1u64 << attempt.min(6))
+}
+
+fn content_block_to_anthropic_json(block: &ContentBlock) -> Value {
+    match block {
+        ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
+        ContentBlock::ToolUse { id, name, input } => {
+            // Anthropic requires `input` to be an object. Defense in depth
+            // against any already-stored history (or non-streaming producer)
+            // that left a null / non-object here; see the parse-time guard
+            // in the stream handler for the original failure mode.
+            let input_obj = if input.is_object() {
+                input.clone()
+            } else {
+                json!({})
+            };
+            json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input_obj,
+            })
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "is_error": is_error,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -651,38 +686,5 @@ mod tests {
             serde_json::from_str(r#"{ "input_tokens": 10, "output_tokens": 5 }"#).unwrap();
         assert_eq!(without.cache_creation_input_tokens, 0);
         assert_eq!(without.cache_read_input_tokens, 0);
-    }
-}
-
-fn content_block_to_anthropic_json(block: &ContentBlock) -> Value {
-    match block {
-        ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-        ContentBlock::ToolUse { id, name, input } => {
-            // Anthropic requires `input` to be an object. Defense in depth
-            // against any already-stored history (or non-streaming producer)
-            // that left a null / non-object here; see the parse-time guard
-            // in the stream handler for the original failure mode.
-            let input_obj = if input.is_object() {
-                input.clone()
-            } else {
-                json!({})
-            };
-            json!({
-                "type": "tool_use",
-                "id": id,
-                "name": name,
-                "input": input_obj,
-            })
-        }
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-        } => json!({
-            "type": "tool_result",
-            "tool_use_id": tool_use_id,
-            "content": content,
-            "is_error": is_error,
-        }),
     }
 }

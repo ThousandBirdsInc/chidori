@@ -138,6 +138,11 @@ pub struct LlmResponse {
     /// `cache_read_input_tokens` / OpenAI `cached_tokens`; billed at a steep
     /// discount).
     pub cache_read_tokens: u64,
+    /// Hidden reasoning text reported by reasoning models (OpenAI-compatible
+    /// `reasoning_content`, e.g. DeepSeek). Never fed back into the
+    /// conversation; surfaced so authors can inspect why a model spent
+    /// output budget before its visible answer.
+    pub reasoning: Option<String>,
 }
 
 impl Default for LlmResponse {
@@ -151,6 +156,7 @@ impl Default for LlmResponse {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            reasoning: None,
         }
     }
 }
@@ -181,6 +187,17 @@ pub trait LlmProvider: Send + Sync {
             on_delta(&response.content);
         }
         Ok(response)
+    }
+}
+
+/// Normalize a user-supplied base URL to its chat-completions endpoint:
+/// `https://api.deepseek.com` and `https://api.deepseek.com/v1` both work,
+/// as does a full `/chat/completions` URL.
+fn chat_completions_url(base_url: String) -> String {
+    if base_url.ends_with("/chat/completions") {
+        base_url
+    } else {
+        format!("{}/chat/completions", base_url.trim_end_matches('/'))
     }
 }
 
@@ -255,6 +272,149 @@ fn request_has_tool_result(request: &LlmRequest) -> bool {
     })
 }
 
+impl Default for ProviderRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProviderRegistry {
+    pub fn new() -> Self {
+        Self {
+            providers: Vec::new(),
+        }
+    }
+
+    pub fn register(&mut self, provider: Box<dyn LlmProvider>) {
+        self.providers.push(provider);
+    }
+
+    /// Build a registry from environment variables, registering all available providers.
+    ///
+    /// Checks for:
+    ///   ANTHROPIC_API_KEY — registers the Anthropic provider
+    ///   OPENAI_API_KEY — registers the OpenAI provider; OPENAI_BASE_URL
+    ///     (the de-facto ecosystem convention) redirects it at any
+    ///     OpenAI-compatible endpoint and widens it to match all model names
+    ///   CHIDORI_OPENAI_COMPAT_URL + CHIDORI_OPENAI_COMPAT_KEY — registers an
+    ///     OpenAI-compatible provider (DeepSeek, Groq, Ollama, vLLM, LiteLLM,
+    ///     …) that matches all model names (acts as a catch-all fallback).
+    ///     LITELLM_API_URL + LITELLM_API_KEY are accepted as legacy aliases.
+    pub fn from_env() -> Self {
+        let mut registry = Self::new();
+
+        if let Ok(response) = std::env::var("CHIDORI_TEST_LLM_RESPONSE") {
+            let tool_call = std::env::var("CHIDORI_TEST_LLM_TOOL_CALL")
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok());
+            registry.register(Box::new(StaticProvider {
+                response,
+                tool_call,
+                calls: AtomicUsize::new(0),
+            }));
+            return registry;
+        }
+
+        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+            let mut p = anthropic::AnthropicProvider::new(api_key);
+            if let Some(rpm) = rpm_env("CHIDORI_ANTHROPIC_RPM") {
+                p = p.with_rate_limit(rpm);
+            }
+            registry.register(Box::new(p));
+        }
+
+        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+            // OPENAI_BASE_URL is the ecosystem-wide convention for pointing
+            // OpenAI clients at a compatible endpoint (DeepSeek, Groq, Ollama,
+            // vLLM…). When set, the provider targets it and matches every
+            // model name, since the endpoint's model namespace is its own.
+            let mut p = match std::env::var("OPENAI_BASE_URL") {
+                Ok(base_url) if !base_url.trim().is_empty() => {
+                    openai::OpenAiProvider::with_base_url(
+                        api_key,
+                        chat_completions_url(base_url),
+                        vec!["".to_string()],
+                    )
+                }
+                _ => openai::OpenAiProvider::new(api_key),
+            };
+            if let Some(rpm) = rpm_env("CHIDORI_OPENAI_RPM") {
+                p = p.with_rate_limit(rpm);
+            }
+            registry.register(Box::new(p));
+        }
+
+        // Vendor-neutral OpenAI-compatible endpoint. CHIDORI_OPENAI_COMPAT_*
+        // is the documented pair; LITELLM_API_URL/LITELLM_API_KEY remain as
+        // legacy aliases from when a LiteLLM proxy was the only tested shape.
+        let compat_url = std::env::var("CHIDORI_OPENAI_COMPAT_URL")
+            .or_else(|_| std::env::var("LITELLM_API_URL"))
+            .ok()
+            .filter(|u| !u.trim().is_empty());
+        if let Some(base_url) = compat_url {
+            let api_key = std::env::var("CHIDORI_OPENAI_COMPAT_KEY")
+                .or_else(|_| std::env::var("LITELLM_API_KEY"))
+                .unwrap_or_default();
+            let mut p = openai::OpenAiProvider::with_base_url(
+                api_key,
+                chat_completions_url(base_url),
+                vec!["".to_string()],
+            );
+            if let Some(rpm) =
+                rpm_env("CHIDORI_OPENAI_COMPAT_RPM").or_else(|| rpm_env("CHIDORI_LITELLM_RPM"))
+            {
+                p = p.with_rate_limit(rpm);
+            }
+            registry.register(Box::new(p));
+        }
+
+        // OpenRouter is the zero-config fallback: an `OPENROUTER_API_KEY`, or a
+        // key saved by a prior `chidori model-login` / demo OAuth sign-in. Registered
+        // last and matching every model, so it only handles requests no
+        // explicit provider above claimed. See [`openrouter`] for the flow.
+        if let Some(api_key) = openrouter::saved_api_key() {
+            let mut p = openrouter::OpenRouterProvider::new(api_key);
+            if let Some(rpm) = rpm_env("CHIDORI_OPENROUTER_RPM") {
+                p = p.with_rate_limit(rpm);
+            }
+            registry.register(Box::new(p));
+        }
+
+        registry
+    }
+
+    /// Send a request, routing to the appropriate provider based on model name.
+    pub async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
+        for provider in &self.providers {
+            if provider.supports_model(&request.model) {
+                return provider.send(request).await;
+            }
+        }
+        bail!(
+            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, point CHIDORI_OPENAI_COMPAT_URL + CHIDORI_OPENAI_COMPAT_KEY at any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, ...), or run `chidori model-login` to sign in with OpenRouter.",
+            request.model
+        );
+    }
+
+    /// Streaming send: routes to the provider's `stream()` implementation
+    /// (which falls back to `send()` for providers that don't override it).
+    pub async fn stream(
+        &self,
+        request: &LlmRequest,
+        on_delta: &mut TokenSink,
+    ) -> Result<LlmResponse> {
+        for provider in &self.providers {
+            if provider.supports_model(&request.model) {
+                return provider.stream(request, on_delta).await;
+            }
+        }
+        bail!(
+            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, point CHIDORI_OPENAI_COMPAT_URL + CHIDORI_OPENAI_COMPAT_KEY at any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, ...), or run `chidori model-login` to sign in with OpenRouter.",
+            request.model
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,115 +476,5 @@ mod tests {
         assert_eq!(second.content, "done");
         assert_eq!(second.stop_reason, "end_turn");
         assert!(second.tool_calls.is_empty());
-    }
-}
-
-impl ProviderRegistry {
-    pub fn new() -> Self {
-        Self {
-            providers: Vec::new(),
-        }
-    }
-
-    pub fn register(&mut self, provider: Box<dyn LlmProvider>) {
-        self.providers.push(provider);
-    }
-
-    /// Build a registry from environment variables, registering all available providers.
-    ///
-    /// Checks for:
-    ///   ANTHROPIC_API_KEY — registers the Anthropic provider
-    ///   OPENAI_API_KEY — registers the OpenAI provider
-    ///   LITELLM_API_URL + LITELLM_API_KEY — registers an OpenAI-compatible provider
-    ///     that matches all model names (acts as a catch-all fallback)
-    pub fn from_env() -> Self {
-        let mut registry = Self::new();
-
-        if let Ok(response) = std::env::var("CHIDORI_TEST_LLM_RESPONSE") {
-            let tool_call = std::env::var("CHIDORI_TEST_LLM_TOOL_CALL")
-                .ok()
-                .and_then(|value| serde_json::from_str(&value).ok());
-            registry.register(Box::new(StaticProvider {
-                response,
-                tool_call,
-                calls: AtomicUsize::new(0),
-            }));
-            return registry;
-        }
-
-        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            let mut p = anthropic::AnthropicProvider::new(api_key);
-            if let Some(rpm) = rpm_env("CHIDORI_ANTHROPIC_RPM") {
-                p = p.with_rate_limit(rpm);
-            }
-            registry.register(Box::new(p));
-        }
-
-        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            let mut p = openai::OpenAiProvider::new(api_key);
-            if let Some(rpm) = rpm_env("CHIDORI_OPENAI_RPM") {
-                p = p.with_rate_limit(rpm);
-            }
-            registry.register(Box::new(p));
-        }
-
-        if let Ok(base_url) = std::env::var("LITELLM_API_URL") {
-            let api_key = std::env::var("LITELLM_API_KEY").unwrap_or_default();
-            let url = if base_url.ends_with("/chat/completions") {
-                base_url
-            } else {
-                format!("{}/chat/completions", base_url.trim_end_matches('/'))
-            };
-            let mut p = openai::OpenAiProvider::with_base_url(api_key, url, vec!["".to_string()]);
-            if let Some(rpm) = rpm_env("CHIDORI_LITELLM_RPM") {
-                p = p.with_rate_limit(rpm);
-            }
-            registry.register(Box::new(p));
-        }
-
-        // OpenRouter is the zero-config fallback: an `OPENROUTER_API_KEY`, or a
-        // key saved by a prior `chidori model-login` / demo OAuth sign-in. Registered
-        // last and matching every model, so it only handles requests no
-        // explicit provider above claimed. See [`openrouter`] for the flow.
-        if let Some(api_key) = openrouter::saved_api_key() {
-            let mut p = openrouter::OpenRouterProvider::new(api_key);
-            if let Some(rpm) = rpm_env("CHIDORI_OPENROUTER_RPM") {
-                p = p.with_rate_limit(rpm);
-            }
-            registry.register(Box::new(p));
-        }
-
-        registry
-    }
-
-    /// Send a request, routing to the appropriate provider based on model name.
-    pub async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
-        for provider in &self.providers {
-            if provider.supports_model(&request.model) {
-                return provider.send(request).await;
-            }
-        }
-        bail!(
-            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run `chidori model-login` to sign in with OpenRouter.",
-            request.model
-        );
-    }
-
-    /// Streaming send: routes to the provider's `stream()` implementation
-    /// (which falls back to `send()` for providers that don't override it).
-    pub async fn stream(
-        &self,
-        request: &LlmRequest,
-        on_delta: &mut TokenSink,
-    ) -> Result<LlmResponse> {
-        for provider in &self.providers {
-            if provider.supports_model(&request.model) {
-                return provider.stream(request, on_delta).await;
-            }
-        }
-        bail!(
-            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run `chidori model-login` to sign in with OpenRouter.",
-            request.model
-        );
     }
 }

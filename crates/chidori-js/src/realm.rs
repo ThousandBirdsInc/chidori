@@ -20,6 +20,12 @@ pub struct Realm {
     /// exact objects; anything else declines to the generic path.
     pub math_object: Option<JsObject>,
     pub math_kernel: Vec<JsObject>,
+    /// The canonical `%TypedArray%.prototype.length` getter function, pinned
+    /// at install so the loop-kernel entry guard can identity-check that a
+    /// typed-array base still resolves `.length` to it (an own shadow, a
+    /// patched prototype accessor, or a re-proto'd receiver declines to the
+    /// generic path).
+    pub ta_length_getter: Option<JsObject>,
     /// The canonical `Array.prototype.push` function object, pinned at
     /// install so the kernel `ArrayPush` entry guard can identity-check the
     /// live `push` property (and a bail can reconstruct the method on the
@@ -27,6 +33,17 @@ pub struct Realm {
     pub array_push: Option<JsObject>,
     /// As `array_push`, for `Array.prototype.pop` (`KOp::ArrayPop`).
     pub array_pop: Option<JsObject>,
+    /// The canonical `String.prototype.charCodeAt`, pinned at install for
+    /// the kernel `CharCodeAt` entry guard (and bail-shape reconstruction).
+    pub string_char_code_at: Option<JsObject>,
+    /// The canonical `next` function objects of the four builtin iterator
+    /// prototypes (array/string/map/set), pinned at install.
+    /// `Op::IteratorStepValue` identity-checks the loop's iterator-record
+    /// `next` against these: a match means the step can run inline
+    /// (`builtin_iterator_step`) without a call frame or a `{value, done}`
+    /// result object. A replaced or wrapped `next` never matches and takes
+    /// the generic, fully observable path.
+    pub builtin_iter_next: Vec<JsObject>,
 
     pub object_proto: JsObject,
     pub function_proto: JsObject,
@@ -112,6 +129,12 @@ pub struct Realm {
 
     /// Registry for `Symbol.for`.
     pub symbol_registry: indexmap::IndexMap<String, JsSymbol>,
+    /// The empty root of this realm's shape transition tree (see
+    /// [`crate::shape::Shape`]): every plain object born in this realm
+    /// starts here, so same-literal / same-record objects share key
+    /// layouts. Per-realm (not global) so shape identity checks stay
+    /// realm-local, mirroring the proto-identity inline caches.
+    pub shape_root: Rc<crate::shape::Shape>,
 }
 
 impl Realm {
@@ -180,8 +203,11 @@ impl Realm {
             eval_fn: None,
             math_object: None,
             math_kernel: Vec::new(),
+            ta_length_getter: None,
             array_push: None,
+            string_char_code_at: None,
             array_pop: None,
+            builtin_iter_next: Vec::new(),
             object_proto: bare(),
             function_proto: bare(),
             array_proto: bare(),
@@ -239,6 +265,7 @@ impl Realm {
             symbol_intl_plural_rules: bare_symbol(19, "[[InitializedPluralRules]]"),
             symbol_intl_number_format: bare_symbol(20, "[[InitializedNumberFormat]]"),
             symbol_registry: indexmap::IndexMap::new(),
+            shape_root: crate::shape::Shape::new_root(),
         }
     }
 }

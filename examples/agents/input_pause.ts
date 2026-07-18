@@ -1,6 +1,6 @@
-import type { Chidori } from "chidori:agent";
+import { chidori, run } from "chidori:agent";
 
-export async function agent(input: { request: string }, chidori: Chidori) {
+run(async (input: { request: string }) => {
   const approval = await chidori.input("Approve this request?", {
     type: "approval",
     choices: ["yes", "no"],
@@ -9,4 +9,4 @@ export async function agent(input: { request: string }, chidori: Chidori) {
     request: input.request,
     approved: approval.toLowerCase() === "yes",
   };
-}
+});

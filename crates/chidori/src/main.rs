@@ -3,6 +3,7 @@ mod deploy;
 mod init;
 mod mcp;
 mod mem_guard;
+mod pkg;
 mod policy;
 mod providers;
 mod recipes;
@@ -12,7 +13,7 @@ mod server;
 mod storage;
 mod tools;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -70,10 +71,11 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
-        /// Extra directories to scan for tool files.
-        /// Defaults to `<agent file's parent>/tools/` only.
+        /// Default model for prompts that don't set one in code (equivalent
+        /// to CHIDORI_MODEL). Any model name your configured provider
+        /// accepts, e.g. `claude-sonnet-4-6`, `gpt-4o`, `deepseek-chat`.
         #[arg(long)]
-        tools: Vec<PathBuf>,
+        model: Option<String>,
 
         /// Stream each host-function call as a newline-delimited JSON event to
         /// stdout as it executes. Each line is either:
@@ -89,15 +91,27 @@ enum Commands {
         /// gated effects (http, workspace mutations) are refused unless
         /// allowlisted. Equivalent to CHIDORI_POLICY_PROFILE=untrusted, but
         /// takes precedence over all CHIDORI_POLICY* env vars.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "trusted")]
         untrusted: bool,
+
+        /// Opt out of the ask-before-powerful-effects default: with no
+        /// CHIDORI_POLICY* configuration, gated effects (http, workspace
+        /// mutations, tools) run without prompts. Explicit CHIDORI_POLICY*
+        /// configuration still applies. Use for agents you wrote yourself.
+        #[arg(long)]
+        trusted: bool,
 
         /// Run the agent in an isolated child process, brokering its host
         /// effects back over a pipe (see docs/os-isolation-plan.md). Equivalent
-        /// to CHIDORI_ISOLATE=process. Phase 1: process separation + brokering;
-        /// per-OS syscall sandboxing lands in a later phase.
-        #[arg(long)]
+        /// to CHIDORI_ISOLATE=process. This is the default on Unix; the flag
+        /// remains as an explicit override of CHIDORI_ISOLATE=off.
+        #[arg(long, conflicts_with = "no_isolate")]
         isolate: bool,
+
+        /// Run the agent in-process, without the isolated worker sandbox.
+        /// Equivalent to CHIDORI_ISOLATE=off.
+        #[arg(long)]
+        no_isolate: bool,
     },
 
     /// Internal: the isolate worker. Runs one agent over a stdin/stdout frame
@@ -112,6 +126,49 @@ enum Commands {
         file: PathBuf,
     },
 
+    /// Add npm packages to package.json and install them into node_modules.
+    /// Packages come from the npm registry (or CHIDORI_NPM_REGISTRY), are
+    /// verified against their SHA-512 integrity, cached once per machine in a
+    /// content-addressed store (~/.chidori/cache/packages), and hardlinked
+    /// into the project. Lifecycle scripts never run.
+    Add {
+        /// Packages to add: `name`, `name@1.2.3`, `name@^2`, `@scope/name@tag`
+        packages: Vec<String>,
+
+        /// Add to devDependencies instead of dependencies
+        #[arg(short = 'D', long)]
+        dev: bool,
+
+        /// Project directory (defaults to the current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Install dependencies from chidori.lock.jsonl (or resolve them from
+    /// package.json when the lockfile is missing or out of date). Warm
+    /// installs are fully offline: every package materializes from the
+    /// content-addressed store by hardlink.
+    Install {
+        /// Fail instead of re-resolving when the lockfile is missing or out
+        /// of sync with package.json (for CI).
+        #[arg(long)]
+        frozen: bool,
+
+        /// Project directory (defaults to the current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Remove npm packages from package.json, the lockfile, and node_modules.
+    Remove {
+        /// Package names to remove
+        packages: Vec<String>,
+
+        /// Project directory (defaults to the current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
     /// Scaffold a new agent project from a starter template.
     Init {
         /// Directory to scaffold into (defaults to the current directory).
@@ -124,8 +181,10 @@ enum Commands {
 
     /// Start an interactive multi-turn chat. With no AGENT it chats with the
     /// model directly (no agent file); pass a conversational agent file to chat
-    /// through it. Each turn is a durable host call; replaying the prior turns
-    /// is free, so only your newest message hits the provider.
+    /// through it. Each turn is a durable host call journaled under
+    /// `.chidori/runs/<session_id>`, so the conversation survives crashes, is
+    /// inspectable with `chidori trace`, and continues with `--resume`; prior
+    /// turns replay for free, so only your newest message hits the provider.
     Chat {
         /// Optional conversational agent .ts file to chat through. It must accept
         /// `{ messages, system?, model?, tools? }` and return `{ transcript }`
@@ -140,21 +199,19 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
 
-        /// Extra directories to scan for tool files (defaults to ./tools/).
-        /// Discovered tools are offered to the model on every turn.
-        #[arg(long)]
-        tools: Vec<PathBuf>,
+        /// Continue a previous chat session by its session id (printed when the
+        /// session starts, and again at exit). Prior turns replay from the
+        /// journal for $0; only new messages reach the provider.
+        #[arg(long, value_name = "SESSION_ID")]
+        resume: Option<String>,
 
         /// Run under the built-in deny-by-default `untrusted` policy profile.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "trusted")]
         untrusted: bool,
-    },
 
-    /// List all available tools
-    Tools {
-        /// Tool directories to search (defaults to ./tools/)
-        #[arg(short, long)]
-        dir: Vec<PathBuf>,
+        /// Opt out of the ask-before-powerful-effects default (see `run --trusted`).
+        #[arg(long)]
+        trusted: bool,
     },
 
     /// Replay a persisted run from its checkpoint. Re-runs the agent with
@@ -171,13 +228,70 @@ enum Commands {
         #[arg(short, long)]
         dir: Option<PathBuf>,
 
+        /// Time travel: replay only the records with seq <= N, then continue
+        /// live from that frontier — re-driving the run's logic from an
+        /// earlier point in its history (`docs/durable-storage.md`).
+        #[arg(long)]
+        until_seq: Option<u64>,
+
+        /// Edit-and-resume: proceed even though the agent source changed
+        /// since this run was recorded. Recorded calls replay positionally
+        /// against the edited code; an edit that touches already-replayed
+        /// calls fails loudly as a divergence, an edit past the pause point
+        /// resumes cleanly.
+        #[arg(long)]
+        allow_source_change: bool,
+
+        /// Default model for prompts executed live past the replay frontier.
+        /// Defaults to the model recorded in the run's manifest, so a run
+        /// started with `--model` resumes under the same model with no extra
+        /// flags. Already-recorded prompts keep their recorded model; a
+        /// recorded prompt whose model would change is a divergence and
+        /// fails loudly.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Deny gated effects (tool calls, network, workspace writes) that
+        /// live continuation past the replay frontier would perform.
+        #[arg(long, conflicts_with = "trusted")]
+        untrusted: bool,
+
+        /// Allow gated effects without asking during live continuation — the
+        /// same trust the original `chidori run --trusted` had. Without it, a
+        /// crash-resumed run re-asks at the terminal (and fails closed in
+        /// scripts), even though the original run was trusted.
+        #[arg(long)]
+        trusted: bool,
+
         /// CI mode: emit a machine-readable JSON report to stdout and use
         /// stable exit codes — 0 the replay matched the checkpoint exactly
-        /// (byte-identical, $0), 3 the replay diverged (the agent made calls
-        /// the checkpoint doesn't have, or the recorded shape changed), 1 on
-        /// any other error. Designed for `tael eval run --cmd`.
+        /// (byte-identical, $0), 3 the replay diverged (the agent's calls or
+        /// output no longer match the recording), 1 on any other error.
+        /// Designed for `tael eval run --cmd`. A superset of `chidori verify`
+        /// (same gates), reported machine-readably.
         #[arg(long)]
         ci: bool,
+    },
+
+    /// Replay a recorded run as a deterministic test: re-run the agent with
+    /// every host call served from the journal, with NO provider configured
+    /// and NO writes to the run directory (top-level workspace effects
+    /// re-materialize their recorded artifacts, byte-identical), and assert
+    /// the run completes with output identical to the recorded one. Exit 0 on pass; non-zero with a
+    /// diagnosis on drift (changed source refuses, a diverging call fails
+    /// loudly, a run that tries to execute anything live fails). Commit a run
+    /// directory to git and run this in CI — a full integration test that
+    /// costs $0 and takes milliseconds.
+    Verify {
+        /// Agent .ts file (same one the run was created from)
+        file: PathBuf,
+
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to agent file's parent)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
     },
 
     /// Operate on persisted run checkpoints as portable artifacts.
@@ -213,6 +327,19 @@ enum Commands {
         /// Project dir containing `.chidori/runs/` (defaults to current dir)
         #[arg(short, long)]
         dir: Option<PathBuf>,
+
+        /// Default model for the branch's live prompts. Defaults to the model
+        /// recorded in the parent run's manifest.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Deny gated effects (tool calls, network, workspace writes).
+        #[arg(long, conflicts_with = "trusted")]
+        untrusted: bool,
+
+        /// Allow gated effects without asking.
+        #[arg(long)]
+        trusted: bool,
     },
 
     /// Re-run a branch sub-run fresh from its parent anchor, using its stored
@@ -229,6 +356,19 @@ enum Commands {
         /// Project dir containing `.chidori/runs/` (defaults to current dir)
         #[arg(short, long)]
         dir: Option<PathBuf>,
+
+        /// Default model for the branch's live prompts. Defaults to the model
+        /// recorded in the parent run's manifest.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Deny gated effects (tool calls, network, workspace writes).
+        #[arg(long, conflicts_with = "trusted")]
+        untrusted: bool,
+
+        /// Allow gated effects without asking.
+        #[arg(long)]
+        trusted: bool,
     },
 
     /// Pretty-print a persisted run's call log.
@@ -262,16 +402,33 @@ enum Commands {
     /// Serve an agent as an HTTP server.
     /// Every incoming request is passed to agent(event) as a structured event dict.
     Serve {
-        /// Path to the agent .ts file
-        file: PathBuf,
+        /// Path to the agent .ts file. Optional: without it the server hosts
+        /// only the detached-agent fleet (re-armed from `.chidori/runs/` in
+        /// the current directory) — sessions must then name an agent per
+        /// request via the `agent` field.
+        file: Option<PathBuf>,
 
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
         port: u16,
 
+        /// Address to bind. Defaults to loopback (127.0.0.1) so the server —
+        /// which executes agent code — is not reachable from the network
+        /// unless you opt in. Pass `--host 0.0.0.0` (or set CHIDORI_HOST) to
+        /// expose it; a non-loopback bind requires CHIDORI_API_KEY to be set
+        /// unless CHIDORI_ALLOW_UNAUTHENTICATED=1 explicitly opts out. The
+        /// server speaks plain HTTP either way — terminate TLS in front of it.
+        #[arg(long)]
+        host: Option<String>,
+
         /// Print host function calls to stderr during execution
         #[arg(short, long)]
         verbose: bool,
+
+        /// Default model for prompts that don't set one in code (equivalent
+        /// to CHIDORI_MODEL), applied to every session this server runs.
+        #[arg(long)]
+        model: Option<String>,
 
         /// Serve under the built-in deny-by-default `untrusted` policy profile:
         /// gated effects (http, workspace mutations) are refused unless
@@ -286,16 +443,23 @@ enum Commands {
 
         /// Opt out of the server's deny-by-default posture: with no
         /// CHIDORI_POLICY* configuration, gated effects (http, workspace
-        /// mutations) run without restriction, as `chidori run` does.
-        /// Explicit CHIDORI_POLICY* configuration still applies.
+        /// mutations) run without restriction. Explicit CHIDORI_POLICY*
+        /// configuration still applies.
         #[arg(long)]
         trusted: bool,
 
         /// Run each request in an isolated child process, brokering its host
         /// effects back over a pipe (see docs/os-isolation-plan.md). Equivalent
-        /// to CHIDORI_ISOLATE=process. Composes with --untrusted.
-        #[arg(long)]
+        /// to CHIDORI_ISOLATE=process. This is the default on Unix; the flag
+        /// remains as an explicit override of CHIDORI_ISOLATE=off. Composes
+        /// with --untrusted.
+        #[arg(long, conflicts_with = "no_isolate")]
         isolate: bool,
+
+        /// Serve requests in-process, without the isolated worker sandbox.
+        /// Equivalent to CHIDORI_ISOLATE=off.
+        #[arg(long)]
+        no_isolate: bool,
     },
 
     /// Deploy an agent to a Chidori Deploy server (like Val Town's `vt`): a
@@ -351,7 +515,7 @@ fn main() {
     // The isolate worker speaks a binary frame protocol over stdout, so it must
     // short-circuit before any of the normal startup path can write there.
     if let Commands::RunWorker = cli.command {
-        std::process::exit(match crate::runtime::isolate::worker::run() {
+        std::process::exit(match on_js_stack(crate::runtime::isolate::worker::run) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("isolate worker error: {e}");
@@ -360,35 +524,139 @@ fn main() {
         });
     }
 
+    // OS isolation is default-on for the CLI on platforms with a worker
+    // sandbox: when CHIDORI_ISOLATE is unset, agent-running commands spawn a
+    // confined child process per run. Explicit env values and the
+    // --isolate/--no-isolate flags (handled per command below) always win.
+    crate::runtime::isolate::default_on_if_unset();
+
+    // Confine error-report source reads (snippets, stack-frame remaps) to the
+    // entry agent's workspace root. The root lives in a THREAD-local (tests
+    // need per-thread isolation), and error display spans two threads: the
+    // command thread emits `--stream` failure events, while `report_cli_error`
+    // below renders on this main thread — so the root must be stamped on
+    // both, or the main-thread reporter silently falls back to the current
+    // directory and absolute-path invocations lose their remap and snippet.
+    let display_root = display_project_root_of(&cli.command);
+    if let Some(root) = &display_root {
+        crate::runtime::rust_engine::set_display_project_root(root.clone());
+    }
+
     // Commands that only do parsing/validation return exit code 2 on failure;
     // everything else returns 1. Success is 0.
-    let (result, parse_only) = match cli.command {
+    let (result, parse_only) = on_js_stack(move || {
+        if let Some(root) = display_root {
+            crate::runtime::rust_engine::set_display_project_root(root);
+        }
+        dispatch_command(cli.command)
+    });
+
+    // Flush any buffered OTLP spans before the process exits. No-op when
+    // OTEL_EXPORTER_OTLP_ENDPOINT wasn't set.
+    crate::runtime::otel::shutdown_on_exit();
+
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            report_cli_error(&e);
+            std::process::exit(if parse_only { 2 } else { 1 });
+        }
+    }
+}
+
+/// Run `f` on a thread with [`scheduler::JS_THREAD_STACK_BYTES`] of stack.
+/// The interpreter recurses on the native stack (its depth guard allows 2000
+/// JS frames), and the default main-thread stack aborts the whole process on
+/// deep-but-legal recursion instead of letting the guard throw its catchable
+/// RangeError — so every command body (and the isolate worker, whose agent
+/// also runs on its process main thread) executes on one big-stack thread.
+/// One thread per process: the thread-local compile/transpile caches stay
+/// warm for the command's whole lifetime.
+fn on_js_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .name("chidori-cmd".to_string())
+        .stack_size(scheduler::JS_THREAD_STACK_BYTES)
+        .spawn(f)
+        .expect("spawning the command thread")
+        .join()
+        .expect("command thread panicked")
+}
+
+/// Dispatch one parsed CLI command to its handler, returning its result and
+/// whether it is a parse/validation-only command (exit code 2 on failure).
+/// The workspace root error display is confined to (see
+/// `rust_engine::read_project_source`): a run/check names a `.ts` file, whose
+/// workspace root is where its modules live. `None` for commands that run no
+/// agent file.
+fn display_project_root_of(command: &Commands) -> Option<PathBuf> {
+    let file = match command {
+        Commands::Run { file, .. }
+        | Commands::Check { file }
+        | Commands::Resume { file, .. }
+        | Commands::Verify { file, .. } => file.clone(),
+        Commands::Serve { file, .. } => file.clone()?,
+        Commands::Chat { agent, .. } => agent.clone()?,
+        _ => return None,
+    };
+    Some(crate::runtime::typescript::transpile::find_workspace_root(
+        &file,
+    ))
+}
+
+fn dispatch_command(command: Commands) -> (Result<()>, bool) {
+    match command {
         Commands::Run {
             file,
             input,
             trace,
             verbose,
-            tools,
+            model,
             stream,
             untrusted,
+            trusted,
             isolate,
+            no_isolate,
         } => {
             // `run_agent` reads this env var to decide whether to spawn a worker;
             // setting it here keeps the isolation decision in one place.
             if isolate {
                 crate::runtime::isolate::enable();
+            } else if no_isolate {
+                crate::runtime::isolate::disable();
+            }
+            // The runtime (and any isolate worker child) resolves the default
+            // model from CHIDORI_MODEL; the flag is a spelling of the env var.
+            if let Some(ref model) = model {
+                std::env::set_var("CHIDORI_MODEL", model);
+            }
+            // Propagate verbosity to the isolate worker child so its sandbox
+            // degradation notes surface under -v.
+            if verbose {
+                std::env::set_var("CHIDORI_VERBOSE", "1");
             }
             crate::runtime::isolate::warn_if_untrusted_without_isolation(untrusted);
             let result = if stream {
-                cmd_run_stream(&file, &input, verbose, &tools, untrusted)
+                cmd_run_stream(&file, &input, verbose, untrusted, trusted)
             } else {
-                cmd_run(&file, &input, trace, verbose, &tools, untrusted)
+                cmd_run(&file, &input, trace, verbose, untrusted, trusted)
             };
             (result, false)
         }
         Commands::RunWorker => unreachable!("handled before the dispatch match"),
         Commands::Demo => (cmd_demo(), false),
         Commands::ModelLogin => (cmd_login(), false),
+        Commands::Add { packages, dev, dir } => (
+            pkg::cmd_add(&dir.unwrap_or_else(|| PathBuf::from(".")), &packages, dev),
+            false,
+        ),
+        Commands::Install { frozen, dir } => (
+            pkg::cmd_install(&dir.unwrap_or_else(|| PathBuf::from(".")), frozen),
+            false,
+        ),
+        Commands::Remove { packages, dir } => (
+            pkg::cmd_remove(&dir.unwrap_or_else(|| PathBuf::from(".")), &packages),
+            false,
+        ),
         Commands::Init { dir, template } => (
             init::run(
                 &dir.unwrap_or_else(|| PathBuf::from(".")),
@@ -400,19 +668,24 @@ fn main() {
             agent,
             system,
             model,
-            tools,
+            resume,
             untrusted,
+            trusted,
         } => (
-            cmd_chat(agent.as_deref(), system, model, &tools, untrusted),
+            cmd_chat(agent.as_deref(), system, model, resume, untrusted, trusted),
             false,
         ),
         Commands::Check { file } => (cmd_check(&file), true),
-        Commands::Tools { dir } => (cmd_tools(&dir), false),
         Commands::Stats { dir } => (cmd_stats(dir.as_deref()), false),
         Commands::Resume {
             file,
             run_id,
             dir,
+            until_seq,
+            allow_source_change,
+            model,
+            untrusted,
+            trusted,
             ci,
         } => {
             if ci {
@@ -422,7 +695,25 @@ fn main() {
                 crate::runtime::otel::shutdown_on_exit();
                 std::process::exit(code);
             }
-            (cmd_resume(&file, &run_id, dir.as_deref()), false)
+            if let Some(ref model) = model {
+                std::env::set_var("CHIDORI_MODEL", model);
+            }
+            (
+                cmd_resume(
+                    &file,
+                    &run_id,
+                    dir.as_deref(),
+                    until_seq,
+                    allow_source_change,
+                    model,
+                    untrusted,
+                    trusted,
+                ),
+                false,
+            )
+        }
+        Commands::Verify { file, run_id, dir } => {
+            (cmd_verify(&file, &run_id, dir.as_deref()), false)
         }
         Commands::Checkpoint { action } => match action {
             CheckpointAction::Export {
@@ -443,44 +734,196 @@ fn main() {
             branch_id,
             value,
             dir,
+            model,
+            untrusted,
+            trusted,
         } => (
-            cmd_branch_resume(&run_id, &branch_id, &value, dir.as_deref()),
+            cmd_branch_resume(
+                &run_id,
+                &branch_id,
+                &value,
+                dir.as_deref(),
+                model,
+                untrusted,
+                trusted,
+            ),
             false,
         ),
         Commands::BranchRerun {
             run_id,
             branch_id,
             dir,
-        } => (cmd_branch_rerun(&run_id, &branch_id, dir.as_deref()), false),
+            model,
+            untrusted,
+            trusted,
+        } => (
+            cmd_branch_rerun(
+                &run_id,
+                &branch_id,
+                dir.as_deref(),
+                model,
+                untrusted,
+                trusted,
+            ),
+            false,
+        ),
         Commands::Trace { run_id, dir } => (cmd_trace(&run_id, dir.as_deref()), false),
         Commands::Snapshot { run_id, dir } => (cmd_snapshot(&run_id, dir.as_deref()), false),
         Commands::Serve {
             file,
             port,
+            host,
             verbose,
+            model,
             untrusted,
             trusted,
             isolate,
+            no_isolate,
         } => {
             if isolate {
                 crate::runtime::isolate::enable();
+            } else if no_isolate {
+                crate::runtime::isolate::disable();
             }
-            (cmd_serve(&file, port, verbose, untrusted, trusted), false)
+            if let Some(ref model) = model {
+                std::env::set_var("CHIDORI_MODEL", model);
+            }
+            (
+                cmd_serve(
+                    file.as_deref(),
+                    host.as_deref(),
+                    port,
+                    verbose,
+                    untrusted,
+                    trusted,
+                ),
+                false,
+            )
         }
         Commands::Deploy(args) => (deploy::run(args), false),
+    }
+}
+
+/// Print a failed command's error to stderr. An uncaught JavaScript exception
+/// (the `JavaScript exception:` framing from `runtime::rust_engine`, carrying
+/// the stack frames recorded on the thrown error's `.stack`, already remapped
+/// to original-source coordinates) renders through miette's graphical report
+/// handler — the same presentation TypeScript parse errors already get. The
+/// innermost frames that live in a readable source file additionally render
+/// as a labeled snippet of that file, one caret per frame, the way rustc
+/// points at code. Every other error keeps the plain anyhow context chain.
+/// This is presentation only: the compact `JavaScript exception: …` string is
+/// what the durable records, `--stream` events, and server responses carry.
+fn report_cli_error(e: &anyhow::Error) {
+    use crate::runtime::rust_engine::parse_stack_frame;
+    use oxc::diagnostics::{
+        GraphicalReportHandler, GraphicalTheme, LabeledSpan, NamedSource, OxcDiagnostic,
     };
 
-    // Flush any buffered OTLP spans before the process exits. No-op when
-    // OTEL_EXPORTER_OTLP_ENDPOINT wasn't set.
-    crate::runtime::otel::shutdown_on_exit();
+    let text = format!("{e:#}");
+    let Some(idx) = text.find("JavaScript exception: ") else {
+        eprintln!("Error: {text}");
+        return;
+    };
+    // `{:#}` prints outer contexts first, so everything before the marker is
+    // context ("resume refused: …") and everything after it is the thrown
+    // error's `Name: message` line plus the recorded `    at …` frames. The
+    // frames arrive in transpiled-bundle coordinates; remap them to the
+    // original TypeScript here, at the single display boundary.
+    let body = crate::runtime::rust_engine::remap_stack_frames(
+        &text[idx + "JavaScript exception: ".len()..],
+    );
+    let body = body.as_str();
+    let context = text[..idx].trim_end().trim_end_matches(':');
 
-    match result {
-        Ok(()) => std::process::exit(0),
-        Err(e) => {
-            eprintln!("Error: {e:#}");
-            std::process::exit(if parse_only { 2 } else { 1 });
+    // Snippet: the innermost frame with a readable file anchors it, and every
+    // frame in that same file becomes a labeled caret (capped so a deep
+    // same-file recursion stays readable).
+    const MAX_SNIPPET_LABELS: usize = 6;
+    let frames: Vec<_> = body.lines().skip(1).filter_map(parse_stack_frame).collect();
+    let snippet_source = frames.iter().find_map(|f| {
+        let file = f.file?;
+        // Confined to the project root — see `read_project_source`. A frame's
+        // file is agent-controlled (via `.stack`); never render a snippet of
+        // something outside the project the operator is running.
+        Some((
+            file,
+            crate::runtime::rust_engine::read_project_source(file)?,
+        ))
+    });
+    let mut diagnostic = OxcDiagnostic::error(body.to_string());
+    if let Some((file, source)) = &snippet_source {
+        let mut seen = std::collections::HashSet::new();
+        let labels: Vec<LabeledSpan> = frames
+            .iter()
+            .filter(|f| f.file == Some(file))
+            .filter_map(|f| {
+                let offset = byte_offset_of(source, f.line, f.col)?;
+                seen.insert(offset).then(|| {
+                    LabeledSpan::new(
+                        Some(format!("at {}", f.name)),
+                        offset,
+                        identifier_len_at(source, offset).max(1),
+                    )
+                })
+            })
+            .take(MAX_SNIPPET_LABELS)
+            .collect();
+        if !labels.is_empty() {
+            diagnostic = diagnostic.with_labels(labels);
         }
     }
+
+    let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
+    let mut rendered = String::new();
+    let ok = match snippet_source {
+        Some((file, source)) if diagnostic.labels.is_some() => {
+            let report = diagnostic.with_source_code(NamedSource::new(file, source));
+            handler
+                .render_report(&mut rendered, report.as_ref())
+                .is_ok()
+        }
+        _ => handler.render_report(&mut rendered, &diagnostic).is_ok(),
+    };
+    if !ok {
+        eprintln!("Error: {text}");
+        return;
+    }
+    if context.is_empty() {
+        eprintln!("Error: uncaught JavaScript exception{rendered}");
+    } else {
+        eprintln!("Error: {context}: uncaught JavaScript exception{rendered}");
+    }
+}
+
+/// Byte offset of a 1-based (line, character-column) position in `src`.
+fn byte_offset_of(src: &str, line: u32, col: u32) -> Option<usize> {
+    let mut offset = 0usize;
+    for (i, l) in src.split_inclusive('\n').enumerate() {
+        if i + 1 == line as usize {
+            let mut bytes = 0usize;
+            for (n, c) in l.chars().enumerate() {
+                if n + 1 >= col as usize {
+                    break;
+                }
+                bytes += c.len_utf8();
+            }
+            return Some(offset + bytes);
+        }
+        offset += l.len();
+    }
+    None
+}
+
+/// Length in bytes of the identifier starting at `offset` (0 when the byte
+/// there doesn't start one) — so a frame label underlines the function name
+/// it points at rather than a single character.
+fn identifier_len_at(src: &str, offset: usize) -> usize {
+    src[offset..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .map(char::len_utf8)
+        .sum()
 }
 
 struct DemoExample {
@@ -497,7 +940,6 @@ enum DemoAction {
         input: &'static [&'static str],
         trace: bool,
         stream: bool,
-        tools: &'static [&'static str],
     },
     Serve {
         file: &'static str,
@@ -517,20 +959,18 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["name=Colton"],
                 trace: false,
                 stream: false,
-                tools: &[],
             },
         },
         DemoExample {
             title: "Tool call",
-            description: "Loads a local TypeScript tool and calls it from an agent.",
-            command: "chidori run examples/agents/tool_use.ts --input query=chidori --tools examples/tools",
+            description: "Defines a tool inline with defineTool and calls it from an agent.",
+            command: "chidori run examples/agents/tool_use.ts --input query=chidori",
             requires_provider: false,
             action: DemoAction::Run {
                 file: "examples/agents/tool_use.ts",
                 input: &["query=chidori"],
                 trace: false,
                 stream: false,
-                tools: &["examples/tools"],
             },
         },
         DemoExample {
@@ -543,7 +983,6 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["document=Rust is great."],
                 trace: true,
                 stream: false,
-                tools: &[],
             },
         },
         DemoExample {
@@ -556,7 +995,6 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["{\"topic\":\"runtime snapshots\"}"],
                 trace: false,
                 stream: false,
-                tools: &[],
             },
         },
         DemoExample {
@@ -569,7 +1007,6 @@ fn demo_examples() -> Vec<DemoExample> {
                 input: &["topic=runtime snapshots"],
                 trace: false,
                 stream: true,
-                tools: &[],
             },
         },
         DemoExample {
@@ -616,8 +1053,9 @@ fn cmd_demo() -> Result<()> {
         println!("or set one of:");
         println!("  export ANTHROPIC_API_KEY=sk-ant-...");
         println!("  export OPENAI_API_KEY=sk-...");
-        println!("  export LITELLM_API_URL=http://localhost:4401/v1");
-        println!("  export LITELLM_API_KEY=sk-litellm-master-key");
+        println!("  # any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, LiteLLM...):");
+        println!("  export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com");
+        println!("  export CHIDORI_OPENAI_COMPAT_KEY=sk-...");
         return Ok(());
     }
 
@@ -627,18 +1065,18 @@ fn cmd_demo() -> Result<()> {
             input,
             trace,
             stream,
-            tools,
         } => {
             let file = PathBuf::from(file);
             let inputs = input
                 .iter()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>();
-            let tool_dirs = tools.iter().map(PathBuf::from).collect::<Vec<_>>();
+            // The demo runs the repo's own example agents on the developer's
+            // machine — the trusted posture, like `run --trusted`.
             if *stream {
-                cmd_run_stream(&file, &inputs, false, &tool_dirs, false)
+                cmd_run_stream(&file, &inputs, false, false, true)
             } else {
-                cmd_run(&file, &inputs, *trace, false, &tool_dirs, false)
+                cmd_run(&file, &inputs, *trace, false, false, true)
             }
         }
         DemoAction::Serve { file, port } => {
@@ -646,8 +1084,9 @@ fn cmd_demo() -> Result<()> {
                 return Ok(());
             }
             // The demo serves the developer's own example agent on their own
-            // machine — the trusted posture, like `chidori run`.
-            cmd_serve(&PathBuf::from(file), *port, false, false, true)
+            // machine — the trusted posture, like `chidori run`, on the
+            // default loopback bind.
+            cmd_serve(Some(&PathBuf::from(file)), None, *port, false, false, true)
         }
     }
 }
@@ -701,6 +1140,7 @@ fn confirm_start_server(port: u16) -> Result<bool> {
 fn has_llm_provider() -> bool {
     std::env::var_os("ANTHROPIC_API_KEY").is_some()
         || std::env::var_os("OPENAI_API_KEY").is_some()
+        || std::env::var_os("CHIDORI_OPENAI_COMPAT_URL").is_some()
         || std::env::var_os("LITELLM_API_URL").is_some()
         || providers::openrouter::saved_api_key().is_some()
 }
@@ -745,7 +1185,10 @@ fn ensure_llm_provider_interactive() -> bool {
     }
 
     println!();
-    println!("No LLM provider key found (ANTHROPIC_API_KEY / OPENAI_API_KEY).");
+    println!(
+        "No LLM provider key found (ANTHROPIC_API_KEY / OPENAI_API_KEY / \
+         CHIDORI_OPENAI_COMPAT_URL)."
+    );
     println!("You can sign in with OpenRouter to try this out — no API key setup needed.");
     if !providers::openrouter::confirm_login() {
         return false;
@@ -759,16 +1202,27 @@ fn ensure_llm_provider_interactive() -> bool {
     }
 }
 
-/// Resolve the permission policy for a CLI invocation. `--untrusted` selects
-/// the built-in deny-by-default profile and wins over every CHIDORI_POLICY*
-/// env var (an explicit flag beats ambient configuration); otherwise the
-/// usual env-driven resolution applies.
-fn cli_policy(untrusted: bool) -> Arc<policy::PolicyConfig> {
+/// Resolve the permission policy for a CLI invocation. Precedence:
+///   1. `--untrusted` — deny-by-default, wins over all CHIDORI_POLICY* env
+///      (an explicit flag beats ambient configuration).
+///   2. `--trusted` — the historical permissive resolution: env-driven,
+///      allow-all when nothing is configured.
+///   3. Explicit, valid CHIDORI_POLICY* configuration — as configured.
+///   4. Nothing configured — ask-before-powerful-effects
+///      ([`policy::run_default_profile`]): the operator approves gated
+///      effects at a terminal prompt, and non-interactive runs fail closed
+///      with a reason naming `--trusted` and the env knobs.
+fn cli_policy(untrusted: bool, trusted: bool) -> Arc<policy::PolicyConfig> {
     if untrusted {
-        Arc::new(policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"))
-    } else {
-        policy::PolicyConfig::from_env()
+        return Arc::new(
+            policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
+        );
     }
+    if trusted {
+        return policy::PolicyConfig::from_env();
+    }
+    policy::PolicyConfig::from_env_configured()
+        .unwrap_or_else(|| Arc::new(policy::run_default_profile()))
 }
 
 /// Resolve the permission policy for `chidori serve`. Unlike `chidori run`
@@ -781,6 +1235,7 @@ fn cli_policy(untrusted: bool) -> Arc<policy::PolicyConfig> {
 ///   3. Explicit, valid CHIDORI_POLICY* configuration — as configured.
 ///   4. Nothing configured (or only malformed configuration, which fails
 ///      closed) — the deny-by-default serve profile.
+///
 /// Returns the policy plus a posture label for the startup banner.
 fn serve_policy(untrusted: bool, trusted: bool) -> (Arc<policy::PolicyConfig>, String) {
     if untrusted {
@@ -820,12 +1275,12 @@ fn abs_dir(dir: &std::path::Path) -> PathBuf {
 }
 
 fn cmd_run(
-    file: &PathBuf,
+    file: &Path,
     inputs: &[String],
     trace: bool,
     verbose: bool,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
+    trusted: bool,
 ) -> Result<()> {
     // Set up tracing.
     if verbose {
@@ -839,6 +1294,22 @@ fn cmd_run(
     // Parse inputs into a JSON object.
     let input_value = parse_inputs(inputs)?;
 
+    // The durable defaults pin the clock to the epoch and seed Math.random()
+    // so replay is byte-identical — powerful, but invisible: 1970 timestamps
+    // and repeating "random" values look like bugs to a first-time author.
+    // Say it once, only when the defaults are in effect.
+    // Terminal-only: interactive authors get the hint, scripts and CI stay quiet.
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal()
+        && std::env::var_os("CHIDORI_TS_DATE").is_none()
+        && std::env::var_os("CHIDORI_TS_RANDOM").is_none()
+    {
+        eprintln!(
+            "determinism: clock pinned to epoch, Math.random() seeded (replay-safe defaults; \
+             override with CHIDORI_TS_DATE / CHIDORI_TS_RANDOM, see docs/replay.md)"
+        );
+    }
+
     // Resolve the project base directory.
     let base_dir = file
         .parent()
@@ -851,20 +1322,20 @@ fn cmd_run(
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
-    // Auto-discover tools from `<project>/tools/` plus any `--tools` dirs.
-    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    // Agent tools are defined in-VM with `defineTool`; the registry is for
+    // externally-sourced tools only (MCP), unused on the plain CLI path.
+    let tools = Arc::new(ToolRegistry::new());
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
-        .with_policy(cli_policy(untrusted))
+        .with_policy(cli_policy(untrusted, trusted))
         .with_persist_base(base_dir.join(".chidori").join("runs"))
         .with_workspace_root(abs_dir(&base_dir));
 
     // Run the agent.
-    let result = engine.run(file, &input_value)?;
+    // Announce the run id up front (stderr): after a crash — where buffered
+    // stdout is lost — the id `chidori resume` needs is already on record.
+    let result = engine.run_announced(file, &input_value)?;
 
     // A `chidori.signal(name)` listen point with an empty mailbox pauses the run
     // (there is no stdin fallback for signals, unlike `input()`). The engine has
@@ -921,11 +1392,11 @@ fn cmd_run(
 /// event to stdout as the agent executes, then a final `done` event. Used by
 /// the builder server's SSE streaming bridge.
 fn cmd_run_stream(
-    file: &PathBuf,
+    file: &Path,
     inputs: &[String],
     verbose: bool,
-    extra_tool_dirs: &[PathBuf],
     untrusted: bool,
+    trusted: bool,
 ) -> Result<()> {
     use tokio::sync::mpsc;
 
@@ -948,14 +1419,17 @@ fn cmd_run_stream(
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
-    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tools = Arc::new(ToolRegistry::new());
 
+    // Same posture as the plain `run` path: the agent's project directory is
+    // the implicit workspace root, and the run journals under
+    // `.chidori/runs/<run_id>` — `--stream` changes how progress is reported,
+    // never what the runtime can do or what survives a crash.
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
-        .with_policy(cli_policy(untrusted));
+        .with_policy(cli_policy(untrusted, trusted))
+        .with_persist_base(base_dir.join(".chidori").join("runs"))
+        .with_workspace_root(abs_dir(&base_dir));
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<crate::runtime::context::RuntimeEvent>();
 
@@ -1010,7 +1484,7 @@ fn cmd_run_stream(
         }
     });
 
-    let result = engine.run_streaming(file, &input_value, event_tx);
+    let result = engine.run_streaming_announced(file, &input_value, event_tx);
 
     // event_tx was moved into the engine; it is dropped when run_streaming
     // returns, which causes blocking_recv() in the drain thread to return None.
@@ -1018,19 +1492,37 @@ fn cmd_run_stream(
 
     match result {
         Ok(r) => {
-            let line = serde_json::json!({
-                "type": "done",
-                "status": "completed",
-                "output": r.output,
-            });
+            // A `chidori.signal(...)` listen point with an empty mailbox pauses
+            // the run; the persisted scaffold is resumable exactly like the
+            // plain-run case, so report `paused` (with the pending names)
+            // rather than a `completed` with a null output.
+            let line = if let Some(signal) = &r.paused_signal {
+                serde_json::json!({
+                    "type": "done",
+                    "status": "paused",
+                    "run_id": r.run_id,
+                    "pending_signal": signal.listen_names(),
+                })
+            } else {
+                serde_json::json!({
+                    "type": "done",
+                    "status": "completed",
+                    "run_id": r.run_id,
+                    "output": r.output,
+                })
+            };
             println!("{line}");
             Ok(())
         }
         Err(e) => {
+            // Frames arrive in transpiled coordinates; the stream consumer
+            // sees the same original-TypeScript positions the CLI reporter
+            // shows. The returned error stays raw — report_cli_error remaps
+            // it once at its own display boundary.
             let line = serde_json::json!({
                 "type": "done",
                 "status": "failed",
-                "error": format!("{e:#}"),
+                "error": crate::runtime::rust_engine::remap_stack_frames(&format!("{e:#}")),
             });
             println!("{line}");
             Err(e)
@@ -1044,16 +1536,25 @@ fn cmd_run_stream(
 /// (prior turns are free), streams the newest assistant reply, and carries the
 /// merged call log forward.
 ///
+/// The whole session is one durable run: every turn journals into
+/// `.chidori/runs/<session_id>` under the agent's directory (the cwd for the
+/// built-in agent), the run's `input.json` always holds the full dialogue
+/// state, and `--resume <session_id>` replays the journal — restoring the
+/// transcript for $0 — and continues the conversation in place. A crash mid-
+/// generation loses at most the reply being streamed; `--resume` completes it
+/// live.
+///
 /// With no `agent`, a built-in conversational agent (`init::CHAT_AGENT_SRC`) is
 /// written to a temp file. With an `agent`, that file is used instead; it must
 /// follow the same contract — accept `{ messages, system?, model?, tools? }` and
 /// return `{ transcript }` or `{ history }` of `{ role, text }` turns.
 fn cmd_chat(
     agent: Option<&std::path::Path>,
-    system: Option<String>,
-    model: Option<String>,
-    extra_tool_dirs: &[PathBuf],
+    mut system: Option<String>,
+    mut model: Option<String>,
+    resume: Option<String>,
     untrusted: bool,
+    trusted: bool,
 ) -> Result<()> {
     use crate::runtime::context::RuntimeEvent;
     use std::io::Write;
@@ -1081,6 +1582,93 @@ fn cmd_chat(
         }
     };
 
+    // A chat session is an ordinary durable run: every turn journals into
+    // `.chidori/runs/<session_id>` next to the agent (the cwd for the built-in
+    // agent), so the conversation survives crashes, is inspectable with
+    // `chidori trace`/`verify`, and can be continued with `--resume`.
+    let run_base = base_dir.join(".chidori").join("runs");
+    let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    let lease_owner = format!("chidori-chat-{}", std::process::id());
+    let mut messages: Vec<String> = Vec::new();
+    let mut call_log: Vec<crate::runtime::call_log::CallRecord> = Vec::new();
+    let session_id = match &resume {
+        Some(session_id) => {
+            let run_dir = run_base.join(session_id);
+            // Load through the run store: hydrates from a durable mirror when
+            // configured, and unions the last checkpoint with any
+            // crash-stranded `records.jsonl` tail — same path as `resume`.
+            let _ = factory.hydrate(session_id);
+            call_log = factory
+                .store_for(session_id)
+                .load_call_log()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no chat session found under {}", run_dir.display())
+                })?;
+            // One driver per session journal, same guard (and same
+            // unrenewed-lease limitation) as `chidori resume`.
+            match crate::runtime::store::acquire_lease(
+                factory.store_for(session_id).as_ref(),
+                &lease_owner,
+                chrono::Duration::minutes(10),
+            ) {
+                Ok(Ok(_)) => {}
+                Ok(Err(holder)) => anyhow::bail!(
+                    "chat session {session_id} is already being driven by another process \
+                     (lease holder `{}`, expires {}). Two concurrent drivers would corrupt \
+                     the journal — close the other chat, or delete {} if the holder is dead.",
+                    holder.owner,
+                    holder.expires_at,
+                    run_dir.join("lease.json").display()
+                ),
+                Err(err) => {
+                    eprintln!("warning: could not take the session lease: {err}");
+                }
+            }
+            // Each turn rewrites the run's `input.json` with the full driven
+            // input, so it is the durable record of the dialogue state:
+            // restore the message list, and (unless overridden by flags) the
+            // session's system prompt and model.
+            if let Ok(text) = std::fs::read_to_string(run_dir.join("input.json")) {
+                if let Ok(saved) = serde_json::from_str::<Value>(&text) {
+                    if let Some(saved_messages) = saved.get("messages").and_then(Value::as_array) {
+                        messages = saved_messages
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect();
+                    }
+                    if system.is_none() {
+                        system = saved
+                            .get("system")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                    }
+                    if model.is_none() {
+                        model = saved.get("model").and_then(Value::as_str).map(String::from);
+                    }
+                }
+            }
+            // An explicit agent file must still match the recorded source
+            // fingerprints, exactly like `chidori resume`. The built-in agent
+            // is a compiled-in constant written to a fresh temp path each
+            // process, so path-keyed validation cannot apply to it.
+            if agent.is_some() {
+                crate::runtime::snapshot::validate_manifest_for_resume(
+                    &run_base,
+                    Some(session_id),
+                    &agent_path,
+                    false,
+                )
+                .context(
+                    "chat --resume refused: the agent source no longer matches this \
+                     session's journal",
+                )?;
+            }
+            session_id.clone()
+        }
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+
     // Chat always calls the model, so offer an OpenRouter sign-in up front when
     // no provider key is configured — building the registry after so it picks
     // up a freshly saved key.
@@ -1090,25 +1678,90 @@ fn cmd_chat(
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
-    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
-    tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools =
-        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tools = Arc::new(ToolRegistry::new());
     let tool_names: Vec<String> = tools.list().iter().map(|t| t.name.clone()).collect();
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
-        .with_policy(cli_policy(untrusted))
+        .with_policy(cli_policy(untrusted, trusted))
+        .with_persist_base(run_base)
         .with_workspace_root(abs_dir(&base_dir));
 
     eprintln!("chidori chat — type a message and press enter. Type 'exit' or Ctrl-D to quit.");
+    eprintln!(
+        "session {session_id}{}",
+        if resume.is_some() {
+            format!(" resumed with {} prior message(s)", messages.len())
+        } else {
+            String::new()
+        }
+    );
     if !tool_names.is_empty() {
         eprintln!("tools available: {}", tool_names.join(", "));
     }
 
-    let mut messages: Vec<String> = Vec::new();
-    let mut call_log: Vec<crate::runtime::call_log::CallRecord> = Vec::new();
     let stdin = std::io::stdin();
+
+    let build_input = |messages: &[String]| {
+        let mut input_value = serde_json::json!({ "messages": messages });
+        if let Some(system) = &system {
+            input_value["system"] = Value::String(system.clone());
+        }
+        if let Some(model) = &model {
+            input_value["model"] = Value::String(model.clone());
+        }
+        if !tool_names.is_empty() {
+            input_value["tools"] = serde_json::json!(tool_names);
+        }
+        input_value
+    };
+
+    // On `--resume`, re-drive the restored dialogue against the journal before
+    // reading new input: prior turns replay silently for $0, a final turn that
+    // was interrupted mid-generation completes live, and the transcript prints
+    // once, in order, so the human sees the conversation they are rejoining.
+    if resume.is_some() && !messages.is_empty() {
+        let input_value = build_input(&messages);
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+        // Discard deltas: the transcript dump below shows the whole dialogue,
+        // so streaming a completing tail turn here would print it twice.
+        let drain = std::thread::spawn(move || {
+            let mut rx = event_rx;
+            while rx.blocking_recv().is_some() {}
+        });
+        let result = engine.resume_run_streaming(
+            &agent_path,
+            &input_value,
+            call_log.clone(),
+            &session_id,
+            event_tx,
+        );
+        drain.join().ok();
+        match result {
+            Ok(result) => {
+                if let Some(turns) = result
+                    .output
+                    .get("transcript")
+                    .or_else(|| result.output.get("history"))
+                    .and_then(Value::as_array)
+                {
+                    for turn in turns {
+                        let text = turn.get("text").and_then(Value::as_str).unwrap_or("");
+                        match turn.get("role").and_then(Value::as_str) {
+                            Some("user") => println!("\nyou> {text}"),
+                            _ => println!("{text}"),
+                        }
+                    }
+                }
+                call_log = result.call_log.into_records();
+            }
+            Err(e) => {
+                // The journal on disk is untouched; the session can still
+                // continue (new turns replay the loaded log in memory).
+                eprintln!("\nerror: could not restore the session transcript: {e:#}");
+            }
+        }
+    }
 
     loop {
         print!("\nyou> ");
@@ -1129,16 +1782,7 @@ fn cmd_chat(
         }
 
         messages.push(message);
-        let mut input_value = serde_json::json!({ "messages": messages });
-        if let Some(system) = &system {
-            input_value["system"] = Value::String(system.clone());
-        }
-        if let Some(model) = &model {
-            input_value["model"] = Value::String(model.clone());
-        }
-        if !tool_names.is_empty() {
-            input_value["tools"] = serde_json::json!(tool_names);
-        }
+        let input_value = build_input(&messages);
 
         // Stream just the new turn's reply. The drain thread prints token
         // deltas while the engine runs; joining it before the next prompt is a
@@ -1159,8 +1803,13 @@ fn cmd_chat(
             streamed
         });
 
-        let result =
-            engine.run_with_replay_streaming(&agent_path, &input_value, call_log.clone(), event_tx);
+        let result = engine.resume_run_streaming(
+            &agent_path,
+            &input_value,
+            call_log.clone(),
+            &session_id,
+            event_tx,
+        );
         // event_tx was moved into the engine and is dropped when the run
         // returns, ending the drain loop; join flushes every queued delta
         // before we print anything else.
@@ -1189,12 +1838,31 @@ fn cmd_chat(
                 call_log = result.call_log.into_records();
             }
             Err(e) => {
-                // Drop the failed turn so the next message starts clean, and keep
-                // the prior call log (the failed turn left no durable record).
+                // Drop the failed turn so the next message starts clean, and
+                // keep the prior call log. The failed attempt may have
+                // journaled partial records on disk; the persister's
+                // monotonic floor lets the next successful turn rewrite the
+                // journal once its log grows past them.
                 messages.pop();
                 eprintln!("\nerror: {e:#}");
             }
         }
+    }
+
+    if resume.is_some() {
+        let _ = crate::runtime::store::release_lease(
+            factory.store_for(&session_id).as_ref(),
+            &lease_owner,
+        );
+    }
+    if !call_log.is_empty() {
+        let agent_arg = agent
+            .map(|p| format!("{} ", p.display()))
+            .unwrap_or_default();
+        eprintln!(
+            "session saved — continue with: chidori chat {agent_arg}--resume {session_id} \
+             (inspect: chidori trace {session_id})"
+        );
     }
 
     if let Some(temp_dir) = temp_dir {
@@ -1203,7 +1871,7 @@ fn cmd_chat(
     Ok(())
 }
 
-fn cmd_check(file: &PathBuf) -> Result<()> {
+fn cmd_check(file: &Path) -> Result<()> {
     let providers = Arc::new(ProviderRegistry::new());
     let template_engine = Arc::new(TemplateEngine::new("."));
     let tokio_rt =
@@ -1215,63 +1883,48 @@ fn cmd_check(file: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tools(dirs: &[PathBuf]) -> Result<()> {
-    let dirs = if dirs.is_empty() {
-        vec![PathBuf::from("tools")]
-    } else {
-        dirs.to_vec()
-    };
-
-    let registry = ToolRegistry::load_from_dirs(&dirs)?;
-    let tools = registry.list();
-
-    if tools.is_empty() {
-        println!(
-            "No tools found in: {}",
-            dirs.iter()
-                .map(|d| d.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        return Ok(());
-    }
-
-    for tool in tools {
-        println!("  {} — {}", tool.name, tool.description);
-        for param in &tool.params {
-            let req = if param.required { " (required)" } else { "" };
-            let default = param
-                .default
-                .as_ref()
-                .map(|d| format!(" [default: {d}]"))
-                .unwrap_or_default();
-            println!("    {}: {}{}{}", param.name, param.param_type, req, default);
-        }
-        println!();
-    }
-
-    Ok(())
-}
-
-fn cmd_resume(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_resume(
+    file: &Path,
+    run_id: &str,
+    dir: Option<&std::path::Path>,
+    until_seq: Option<u64>,
+    allow_source_change: bool,
+    model: Option<String>,
+    untrusted: bool,
+    trusted: bool,
+) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
         .or_else(|| file.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
-    let checkpoint_path = run_dir.join("checkpoint.json");
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
     let input_path = run_dir.join("input.json");
 
-    if !checkpoint_path.exists() {
-        anyhow::bail!("No checkpoint found at {}", checkpoint_path.display());
-    }
+    // Load through the run store: hydrates the run dir from a configured
+    // durable mirror when this machine has never seen the run, and unions the
+    // last checkpoint with any crash-stranded `records.jsonl` tail.
+    let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    let _ = factory.hydrate(run_id);
+    let mut records = factory
+        .store_for(run_id)
+        .load_call_log()?
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
 
-    let records: Vec<crate::runtime::call_log::CallRecord> = {
-        let text = std::fs::read_to_string(&checkpoint_path)
-            .with_context(|| format!("Failed to read {}", checkpoint_path.display()))?;
-        serde_json::from_str(&text).context("Failed to parse checkpoint.json")?
-    };
+    // Time travel: truncate the journal at the requested frontier; replay
+    // serves everything up to it from cache and the run continues live there.
+    if let Some(until) = until_seq {
+        let before = records.len();
+        records.retain(|r| r.seq <= until);
+        eprintln!(
+            "Time travel: replaying {} of {} records (seq <= {})",
+            records.len(),
+            before,
+            until
+        );
+    }
 
     let input_value: Value = if input_path.exists() {
         let text = std::fs::read_to_string(&input_path)?;
@@ -1280,24 +1933,241 @@ fn cmd_resume(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) -> Re
         Value::Object(Default::default())
     };
 
+    // Replay is positional: verify the agent code on disk still matches the
+    // source fingerprints recorded in the run's snapshot manifest, exactly as
+    // the server resume routes do, so cached results are never paired with
+    // changed code. (Runs persisted before manifests existed skip with a
+    // warning; `--allow-source-change` is the edit-and-resume opt-in.)
+    crate::runtime::snapshot::validate_manifest_for_resume(
+        &run_base,
+        Some(run_id),
+        file,
+        allow_source_change,
+    )
+    .context("resume refused: the agent source no longer matches this run's checkpoint")?;
+
+    // One driver per run dir: two concurrent resumes of the same run would
+    // interleave writes into one journal. The same lease file detached agents
+    // use guards the CLI; a dead holder's lease expires on its own.
+    let cli_lease_owner = format!("chidori-cli-{}", std::process::id());
+    match crate::runtime::store::acquire_lease(
+        factory.store_for(run_id).as_ref(),
+        &cli_lease_owner,
+        chrono::Duration::minutes(10),
+    ) {
+        Ok(Ok(_)) => {}
+        Ok(Err(holder)) => anyhow::bail!(
+            "run {run_id} is already being driven by another process (lease holder \
+             `{}`, expires {}). Two concurrent drivers would corrupt the journal — \
+             wait for it to finish, or delete {} if the holder is dead.",
+            holder.owner,
+            holder.expires_at,
+            run_dir.join("lease.json").display()
+        ),
+        Err(err) => {
+            eprintln!("warning: could not take the run lease: {err}");
+        }
+    }
+
+    // The run's model travels with it: an explicit `--model` (or a
+    // pre-existing CHIDORI_MODEL) wins, then the model recorded in the run's
+    // manifest — so the README's bare `chidori resume agent.ts <run-id>`
+    // replays a `--model`-started run without re-deriving flags.
+    let manifest_model = crate::runtime::snapshot::SnapshotStore::new(run_dir.clone())
+        .load_manifest()
+        .ok()
+        .and_then(|manifest| manifest.default_model);
+    let default_model = model
+        .or_else(|| std::env::var("CHIDORI_MODEL").ok())
+        .or(manifest_model);
+
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
-    let tools_dir = base_dir.join("tools");
-    let tools = Arc::new(
-        ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
-    );
-    let engine = Engine::new(providers, template_engine, tokio_rt).with_tools(tools);
+    let tools = Arc::new(ToolRegistry::new());
+    // Same implicit workspace root as `chidori run`: a run that wrote
+    // workspace files must replay/resume without extra configuration.
+    // CHIDORI_WORKSPACE_ROOT still takes precedence inside the runtime.
+    // Policy mirrors `run` (`--trusted`/`--untrusted`), and persistence stays
+    // enabled under the run's ORIGINAL id so live continuation past the
+    // frontier journals into the same run directory.
+    let engine = Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(tools)
+        .with_policy(cli_policy(untrusted, trusted))
+        .with_persist_base(run_base.clone())
+        .with_default_model(default_model)
+        .with_history_rewrite_allowed(until_seq.is_some())
+        .with_workspace_root(abs_dir(&base_dir));
 
-    let result = engine.run_with_replay(file, &input_value, records)?;
+    // Journaled top-level workspace records re-execute on every replay by
+    // design (the workspace is real disk state, re-materialized rather than
+    // served from the journal) — count them up front so the summary below can
+    // report them as what they are instead of folding them into "executed
+    // live", which reads as a re-fired side effect.
+    let journaled_workspace = records
+        .iter()
+        .filter(|r| r.function == "workspace" && r.parent_seq.is_none())
+        .count() as u64;
+    let result = engine.resume_run(file, &input_value, records, run_id);
+    let _ =
+        crate::runtime::store::release_lease(factory.store_for(run_id).as_ref(), &cli_lease_owner);
+    let result = result?;
+
+    // A resume that lands back on a `chidori.signal(...)` listen point has no
+    // stdin fallback: report the pause and how to deliver, exactly like
+    // `chidori run` does, instead of printing a bare `null` that reads as a
+    // completed run.
+    if let Some(signal) = &result.paused_signal {
+        let names = signal.listen_names();
+        eprintln!(
+            "Run {run_id} replayed to its pause and is still awaiting signal{} '{}'.",
+            if names.len() > 1 { " (any of)" } else { "" },
+            names.join("', '")
+        );
+        eprintln!(
+            "Deliver it with: POST /sessions/{{id}}/signal \
+             {{\"name\":\"{}\",\"payload\":...,\"from\":...}} against a `chidori serve` \
+             session for this run. (Signal delivery and `timeoutMs` deadlines are \
+             server-side — the bare CLI can neither deliver nor time out a signal.)",
+            signal.name
+        );
+        return Ok(());
+    }
 
     let output_str = serde_json::to_string_pretty(&result.output)?;
     println!("{output_str}");
+    // Report the replayed / re-materialized / live split — the total alone
+    // reads as "everything was replayed", and folding workspace
+    // re-materializations into "executed live" reads as a re-fired side
+    // effect. In-flight work at a crash re-executes by design
+    // (at-least-once), so the live count is the honest recovery cost.
+    let total = result.call_log.records().len() as u64;
+    let live = total.saturating_sub(result.replayed_calls);
+    let rematerialized = live.min(journaled_workspace);
+    let live_new = live.saturating_sub(rematerialized);
+    let remat_clause = if rematerialized > 0 {
+        format!(", {rematerialized} workspace re-materialization(s)")
+    } else {
+        String::new()
+    };
     eprintln!(
-        "\nResumed from {} ({} calls replayed)",
-        run_id,
-        result.call_log.total_duration_ms()
+        "\nResumed from {run_id} ({} recorded calls replayed{remat_clause}, {live_new} executed live)",
+        result.replayed_calls,
+    );
+    Ok(())
+}
+
+/// `chidori verify` — checkpoint-as-test as a first-class command. Replays a
+/// recorded run with no provider configured, a deny-all policy, and no
+/// persistence (the run directory is never written), then asserts the run
+/// completed with byte-identical output. Every drift mode fails loudly:
+/// changed source refuses via the manifest check, a diverging recorded call
+/// errors positionally, a run that reaches for anything live has no provider
+/// (and no allowed gated effects) to reach.
+fn cmd_verify(file: &Path, run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .or_else(|| file.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
+
+    use crate::runtime::store::RunStore as _;
+    let store = crate::runtime::store::FsRunStore::new(run_dir.clone());
+    let records = store
+        .load_call_log()?
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+    let recorded_output: Option<Value> = store
+        .get_blob("output.json")?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+
+    let input_path = run_dir.join("input.json");
+    let input_value: Value = if input_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&input_path)?)
+            .unwrap_or(Value::Object(Default::default()))
+    } else {
+        Value::Object(Default::default())
+    };
+
+    // Drift gate 1: the agent source must match the recorded fingerprints.
+    // No `--allow-source-change` escape here — a verify against edited code
+    // is not a verification.
+    crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file, false)
+        .context("verify refused: the agent source no longer matches this run's checkpoint")?;
+
+    // No providers, deny-all policy, no persistence: the replay must be able
+    // to answer EVERY effect from the journal or fail.
+    let providers = Arc::new(ProviderRegistry::new());
+    let template_engine = Arc::new(TemplateEngine::new(&base_dir));
+    let tokio_rt =
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
+    let tools = Arc::new(ToolRegistry::new());
+    let manifest_model = crate::runtime::snapshot::SnapshotStore::new(run_dir.clone())
+        .load_manifest()
+        .ok()
+        .and_then(|manifest| manifest.default_model);
+    let engine = Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(tools)
+        .with_policy(Arc::new(
+            policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
+        ))
+        .with_default_model(manifest_model)
+        .with_workspace_root(abs_dir(&base_dir));
+
+    let journal_len = records.len() as u64;
+    let result = engine
+        .resume_run(file, &input_value, records, run_id)
+        .context("verify FAILED: the recorded run did not replay cleanly")?;
+
+    if result.paused.is_some() || result.paused_approval.is_some() || result.paused_signal.is_some()
+    {
+        anyhow::bail!(
+            "verify FAILED: the run replayed to a pause instead of completing — \
+             only completed runs can be verified"
+        );
+    }
+    if let Some(recorded) = recorded_output {
+        if recorded != result.output {
+            anyhow::bail!(
+                "verify FAILED: replayed output differs from the recorded output.\n\
+                 recorded: {}\n\
+                 replayed: {}",
+                serde_json::to_string(&recorded).unwrap_or_default(),
+                serde_json::to_string(&result.output).unwrap_or_default()
+            );
+        }
+    } else {
+        eprintln!(
+            "chidori: warning: no recorded output.json under {} — verified replay \
+             consistency only, not output identity",
+            run_dir.display()
+        );
+    }
+    let records = result.call_log.records();
+    let total = records.len() as u64;
+    let live = total.saturating_sub(result.replayed_calls);
+    // Workspace effects re-execute by design on every replay (the workspace
+    // is real disk state, re-materialized rather than served from the
+    // journal; nested ones replay inside their container's subtree). Only
+    // top-level workspace records are expected live — anything else live
+    // means the replay reached past the journal.
+    let expected_live = records
+        .iter()
+        .filter(|r| r.function == "workspace" && r.parent_seq.is_none())
+        .count() as u64;
+    if live > expected_live {
+        anyhow::bail!(
+            "verify FAILED: {} call(s) executed live beyond the expected {expected_live} \
+             workspace re-materialization(s) ({} of {journal_len} journal records replayed)",
+            live - expected_live,
+            result.replayed_calls
+        );
+    }
+    println!(
+        "verified: {} calls replayed, {live} workspace re-materialization(s), \
+         output identical — $0",
+        result.replayed_calls
     );
     Ok(())
 }
@@ -1327,14 +2197,16 @@ fn cmd_resume_ci(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) ->
         .map(|d| d.to_path_buf())
         .or_else(|| file.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
-    let checkpoint_path = run_dir.join("checkpoint.json");
-    let input_path = run_dir.join("input.json");
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
 
+    use crate::runtime::store::RunStore as _;
+    let store = crate::runtime::store::FsRunStore::new(run_dir.clone());
     let load = || -> Result<(Vec<crate::runtime::call_log::CallRecord>, Value)> {
-        let text = std::fs::read_to_string(&checkpoint_path)
-            .with_context(|| format!("Failed to read {}", checkpoint_path.display()))?;
-        let records = serde_json::from_str(&text).context("Failed to parse checkpoint.json")?;
+        let records = store
+            .load_call_log()?
+            .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+        let input_path = run_dir.join("input.json");
         let input = if input_path.exists() {
             serde_json::from_str(&std::fs::read_to_string(&input_path)?)
                 .unwrap_or(Value::Object(Default::default()))
@@ -1355,23 +2227,48 @@ fn cmd_resume_ci(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) ->
         }
     };
 
+    // Source drift IS divergence for a regression gate: a fixture replayed
+    // against edited agent code is testing something else.
+    if let Err(e) =
+        crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file, false)
+    {
+        report(serde_json::json!({
+            "status": "diverged",
+            "run_id": run_id,
+            "checkpoint_path": run_dir.display().to_string(),
+            "live_cost_usd": 0.0,
+            "divergence": { "kind": "source_changed", "detail": format!("{e:#}") },
+        }));
+        return 3;
+    }
+
+    // Same posture as `chidori verify`: no providers, deny-all policy, no
+    // persistence — the replay must answer every effect from the journal (a
+    // record whose args drifted aborts as divergence), so live spend is $0
+    // by construction.
     let run = || -> Result<crate::runtime::engine::RunResult> {
-        let providers = Arc::new(ProviderRegistry::from_env());
+        let providers = Arc::new(ProviderRegistry::new());
         let template_engine = Arc::new(TemplateEngine::new(&base_dir));
         let tokio_rt =
             Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
-        let tools_dir = base_dir.join("tools");
-        let tools = Arc::new(
-            ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
-        );
-        let engine = Engine::new(providers, template_engine, tokio_rt).with_tools(tools);
-        engine.run_with_replay_strict(file, &input_value, records.clone())
+        let manifest_model = crate::runtime::snapshot::SnapshotStore::new(run_dir.clone())
+            .load_manifest()
+            .ok()
+            .and_then(|manifest| manifest.default_model);
+        let engine = Engine::new(providers, template_engine, tokio_rt)
+            .with_tools(Arc::new(ToolRegistry::new()))
+            .with_policy(Arc::new(
+                policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
+            ))
+            .with_default_model(manifest_model)
+            .with_workspace_root(abs_dir(&base_dir));
+        engine.resume_run(file, &input_value, records.clone(), run_id)
     };
     let result = match run() {
         Ok(r) => r,
         Err(e) => {
-            // A strict-replay abort IS the divergence signal: the agent no
-            // longer makes the recorded call (changed args or function).
+            // A replay-divergence abort IS the regression signal: the agent no
+            // longer makes the recorded call (changed function or args).
             let msg = format!("{e:#}");
             if msg.contains("Replay divergence") {
                 report(serde_json::json!({
@@ -1580,20 +2477,36 @@ fn branch_run_dir(run_id: &str, dir: Option<&std::path::Path>) -> Result<PathBuf
 }
 
 /// The engine for out-of-band branch operations, wired like `cmd_resume`'s:
-/// providers/policy from env, tools from `<base>/tools`.
-fn branch_engine(dir: Option<&std::path::Path>) -> Result<Engine> {
+/// providers from env, `--trusted`/`--untrusted` policy, tools from
+/// `<base>/tools`, and the parent run's recorded model as the default
+/// (`--model` / CHIDORI_MODEL still win).
+fn branch_engine(
+    run_dir: &std::path::Path,
+    dir: Option<&std::path::Path>,
+    model: Option<String>,
+    untrusted: bool,
+    trusted: bool,
+) -> Result<Engine> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+    let manifest_model = crate::runtime::snapshot::SnapshotStore::new(run_dir.to_path_buf())
+        .load_manifest()
+        .ok()
+        .and_then(|manifest| manifest.default_model);
+    let default_model = model
+        .or_else(|| std::env::var("CHIDORI_MODEL").ok())
+        .or(manifest_model);
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
         Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
-    let tools_dir = base_dir.join("tools");
-    let tools = Arc::new(
-        ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
-    );
-    Ok(Engine::new(providers, template_engine, tokio_rt).with_tools(tools))
+    let tools = Arc::new(ToolRegistry::new());
+    Ok(Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(tools)
+        .with_policy(cli_policy(untrusted, trusted))
+        .with_default_model(default_model)
+        .with_workspace_root(abs_dir(&base_dir)))
 }
 
 fn cmd_branches(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
@@ -1607,53 +2520,164 @@ fn cmd_branches(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_branch_resume(
     run_id: &str,
     branch_id: &str,
     value: &str,
     dir: Option<&std::path::Path>,
+    model: Option<String>,
+    untrusted: bool,
+    trusted: bool,
 ) -> Result<()> {
     let run_dir = branch_run_dir(run_id, dir)?;
-    let engine = branch_engine(dir)?;
+    let engine = branch_engine(&run_dir, dir, model, untrusted, trusted)?;
     let outcome = engine.resume_branch(&run_dir, branch_id, value)?;
     println!("{}", serde_json::to_string_pretty(&outcome)?);
     Ok(())
 }
 
-fn cmd_branch_rerun(run_id: &str, branch_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+fn cmd_branch_rerun(
+    run_id: &str,
+    branch_id: &str,
+    dir: Option<&std::path::Path>,
+    model: Option<String>,
+    untrusted: bool,
+    trusted: bool,
+) -> Result<()> {
     let run_dir = branch_run_dir(run_id, dir)?;
-    let engine = branch_engine(dir)?;
+    let engine = branch_engine(&run_dir, dir, model, untrusted, trusted)?;
     let outcome = engine.rerun_branch(&run_dir, branch_id)?;
     println!("{}", serde_json::to_string_pretty(&outcome)?);
     Ok(())
+}
+
+/// Label every record in a multi-process trace with its owner: `main` for the
+/// run's own records, the actor's registered name (or pid) for records folded
+/// in at a `join_actor`/`stop_actor`, and the branch variant's label for
+/// records under a `branch` fan-out. Ownership is derived from the
+/// `parent_seq` chain — a record with no chain belongs to the run itself,
+/// even when the fold advanced its seq into a reserved high range.
+fn trace_owner_label(
+    r: &crate::runtime::call_log::CallRecord,
+    by_seq: &std::collections::HashMap<u64, &crate::runtime::call_log::CallRecord>,
+    actor_names: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut anchor = r;
+    let mut hops = 0;
+    while let Some(parent) = anchor.parent_seq.and_then(|p| by_seq.get(&p)) {
+        anchor = parent;
+        hops += 1;
+        if hops > 128 {
+            break;
+        }
+    }
+    if anchor.seq == r.seq {
+        return "main".to_string();
+    }
+    match anchor.function.as_str() {
+        "join_actor" | "stop_actor" => {
+            let pid = anchor
+                .args
+                .get("pid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("actor");
+            match actor_names.get(pid) {
+                Some(name) => name.clone(),
+                None => pid.to_string(),
+            }
+        }
+        "branch" => {
+            // Branch k occupies [base + k·width, base + (k+1)·width) where
+            // base is the slot boundary — recover k to name the variant.
+            let variants = anchor.args.get("variants").and_then(|v| v.as_array());
+            let count = variants.map(|v| v.len() as u64).unwrap_or(1).max(1);
+            let width = 10_000u64;
+            let base = (r.seq / (width * count)) * (width * count);
+            let k = ((r.seq.saturating_sub(base)) / width).min(count.saturating_sub(1));
+            variants
+                .and_then(|v| v.get(k as usize))
+                .and_then(|v| v.get("label"))
+                .and_then(|v| v.as_str())
+                .map(|label| format!("branch:{label}"))
+                .unwrap_or_else(|| format!("branch-{k}"))
+        }
+        _ => "main".to_string(),
+    }
 }
 
 fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
-    let checkpoint_path = run_dir.join("checkpoint.json");
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
 
-    if !checkpoint_path.exists() {
-        anyhow::bail!("No checkpoint found at {}", checkpoint_path.display());
+    let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    let _ = factory.hydrate(run_id);
+    let records = factory
+        .store_for(run_id)
+        .load_call_log()?
+        .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+
+    // The run's manifest carries the CHIDORI_PRICING table that was live when
+    // it executed — install it as the cost fallback so the trace prices
+    // correctly in a shell that doesn't have the env var set.
+    if let Ok(manifest) = crate::runtime::snapshot::SnapshotStore::new(&run_dir).load_manifest() {
+        if let Some(ref pricing) = manifest.pricing {
+            crate::runtime::cost::install_journaled_pricing(pricing);
+        }
     }
-
-    let text = std::fs::read_to_string(&checkpoint_path)
-        .with_context(|| format!("Failed to read {}", checkpoint_path.display()))?;
-    let records: Vec<crate::runtime::call_log::CallRecord> =
-        serde_json::from_str(&text).context("Failed to parse checkpoint.json")?;
 
     println!("Run: {}", run_id);
     println!("Calls: {}", records.len());
+
+    let by_seq: std::collections::HashMap<u64, &crate::runtime::call_log::CallRecord> =
+        records.iter().map(|r| (r.seq, r)).collect();
+    let mut actor_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for r in &records {
+        if r.function == "spawn_actor" {
+            if let (Some(pid), Some(name)) = (
+                r.result.get("pid").and_then(|v| v.as_str()),
+                r.result.get("name").and_then(|v| v.as_str()),
+            ) {
+                actor_names.insert(pid.to_string(), format!("{name} ({pid})"));
+            }
+        }
+    }
+    let labels: Vec<String> = records
+        .iter()
+        .map(|r| trace_owner_label(r, &by_seq, &actor_names))
+        .collect();
+    // Announce the cast when the trace has more than the main run in it.
+    {
+        let mut owners: Vec<&String> = labels.iter().filter(|l| *l != "main").collect();
+        owners.sort();
+        owners.dedup();
+        if !owners.is_empty() {
+            println!(
+                "Owners: main, {}",
+                owners
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
     println!();
 
+    let owner_width = labels.iter().map(|l| l.len()).max().unwrap_or(4).max(4);
     let mut total_in = 0u64;
     let mut total_out = 0u64;
+    let mut total_cache_read = 0u64;
+    let mut total_cache_write = 0u64;
     let mut total_ms = 0u64;
     let mut total_cost = 0.0;
+    let mut unpriced_models: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    for r in &records {
+    for (r, label) in records.iter().zip(&labels) {
         let args_str = serde_json::to_string(&r.args).unwrap_or_default();
         let args_short = if args_str.len() > 100 {
             format!("{}…", &args_str[..100])
@@ -1668,19 +2692,88 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
         let token_tag = r
             .token_usage
             .as_ref()
-            .map(|u| format!(" [{}→{} tok]", u.input_tokens, u.output_tokens))
+            .map(|u| {
+                let cache = match (
+                    u.cache_read_tokens.unwrap_or(0),
+                    u.cache_creation_tokens.unwrap_or(0),
+                ) {
+                    (0, 0) => String::new(),
+                    (read, 0) => format!(", {read} cache-read"),
+                    (0, write) => format!(", {write} cache-write"),
+                    (read, write) => format!(", {read} cache-read, {write} cache-write"),
+                };
+                format!(" [{}→{} tok{}]", u.input_tokens, u.output_tokens, cache)
+            })
             .unwrap_or_default();
+        // Records folded in from actors/branches live in reserved high seq
+        // ranges; print the offset within the range (`·N`) instead of a
+        // 13-digit absolute for anything that has a named owner.
+        let seq_disp = if label == "main" && r.seq < 1_000_000_000_000 {
+            format!("#{}", r.seq)
+        } else if label.starts_with("branch") {
+            format!("#…{}", r.seq % 10_000)
+        } else if label == "main" {
+            format!("#{}", r.seq)
+        } else {
+            format!("·{}", r.seq % 1_000_000_000_000)
+        };
+        // Signals carry the interesting half — who answered, with what — in
+        // the RESULT (`{name, payload, from}`), which the generic args column
+        // never shows. Render it inline so `trace` is the multiplayer audit
+        // trail the signals docs promise, not just a list of listen points.
+        let signal_tag = if matches!(r.function.as_str(), "signal" | "signal_any" | "poll_signal") {
+            if r.result.is_null() {
+                "  ← empty (no queued signal)".to_string()
+            } else if r.result.get("timedOut").and_then(|v| v.as_bool()) == Some(true) {
+                "  ← timed out (sentinel)".to_string()
+            } else {
+                let name = r.result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let from = match r.result.get("from") {
+                    Some(serde_json::Value::Object(f)) => format!(
+                        "{}:{}",
+                        f.get("kind").and_then(|v| v.as_str()).unwrap_or("?"),
+                        f.get("id").and_then(|v| v.as_str()).unwrap_or("?")
+                    ),
+                    _ => "unattributed".to_string(),
+                };
+                let payload = r
+                    .result
+                    .get("payload")
+                    .map(|p| serde_json::to_string(p).unwrap_or_default())
+                    .unwrap_or_else(|| "null".to_string());
+                let payload_short = if payload.chars().count() > 80 {
+                    let head: String = payload.chars().take(80).collect();
+                    format!("{head}…")
+                } else {
+                    payload
+                };
+                format!("  ← {name} from {from}: {payload_short}")
+            }
+        } else {
+            String::new()
+        };
         println!(
-            "  #{:<3} {:>4}ms  {}  {}{}{}",
-            r.seq, r.duration_ms, r.function, args_short, token_tag, err_tag
+            "  {:<owner_width$}  {:<8} {:>6}ms  {}  {}{}{}{}",
+            label, seq_disp, r.duration_ms, r.function, args_short, token_tag, signal_tag, err_tag
         );
         if let Some(ref u) = r.token_usage {
             total_in += u.input_tokens;
             total_out += u.output_tokens;
+            total_cache_read += u.cache_read_tokens.unwrap_or(0);
+            total_cache_write += u.cache_creation_tokens.unwrap_or(0);
             if r.function == "prompt" {
                 let model = r.args.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                total_cost +=
-                    crate::runtime::cost::estimate_cost_usd(model, u.input_tokens, u.output_tokens);
+                if crate::runtime::cost::is_priced_model(model) {
+                    total_cost += crate::runtime::cost::estimate_cost_usd_with_cache(
+                        model,
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cache_creation_tokens.unwrap_or(0),
+                        u.cache_read_tokens.unwrap_or(0),
+                    );
+                } else {
+                    unpriced_models.insert(model.to_string());
+                }
             }
         }
         total_ms += r.duration_ms;
@@ -1689,7 +2782,32 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     println!();
     if total_in > 0 || total_out > 0 {
         println!("Tokens:   {} in / {} out", total_in, total_out);
-        println!("Est cost: ${:.6}", total_cost);
+        if total_cache_read > 0 || total_cache_write > 0 {
+            println!(
+                "Cache:    {} read / {} written (prompt-cache tokens)",
+                total_cache_read, total_cache_write
+            );
+        }
+        // "$0.000000" for a model missing from the pricing table would read
+        // as "free"; say "unknown" instead and name the unpriced models.
+        if unpriced_models.is_empty() {
+            println!("Est cost: ${:.6}", total_cost);
+        } else {
+            let names = unpriced_models.into_iter().collect::<Vec<_>>().join(", ");
+            if total_cost > 0.0 {
+                println!(
+                    "Est cost: ${:.6} + unknown (no pricing data for: {}; supply rates via \
+                     CHIDORI_PRICING)",
+                    total_cost, names
+                );
+            } else {
+                println!(
+                    "Est cost: unknown (no pricing data for: {}; supply rates via \
+                     CHIDORI_PRICING)",
+                    names
+                );
+            }
+        }
     }
     println!("Duration: {} ms", total_ms);
     Ok(())
@@ -1709,7 +2827,7 @@ fn cmd_snapshot(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
 
 fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
     use crate::runtime::call_log::CallLog;
-    use crate::runtime::cost::estimate_cost_usd;
+    use crate::runtime::cost::estimate_cost_usd_with_cache;
     use std::collections::BTreeMap;
 
     let runs_dir = dir
@@ -1728,6 +2846,8 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
     let mut tool_count: u64 = 0;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut total_cache_read: u64 = 0;
+    let mut total_cache_write: u64 = 0;
     let mut total_duration_ms: u64 = 0;
     let mut total_cost: f64 = 0.0;
 
@@ -1736,48 +2856,83 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
         calls: u64,
         input_tokens: u64,
         output_tokens: u64,
+        cache_read_tokens: u64,
         cost_usd: f64,
     }
     let mut per_model: BTreeMap<String, ModelStats> = BTreeMap::new();
 
     for entry in std::fs::read_dir(&runs_dir)? {
         let entry = entry?;
-        let checkpoint_path = entry.path().join("checkpoint.json");
-        if !checkpoint_path.exists() {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&checkpoint_path) else {
-            continue;
-        };
-        let Ok(records): Result<Vec<crate::runtime::call_log::CallRecord>, _> =
-            serde_json::from_str(&text)
+        // Union the last checkpoint with the append-only tail: mid-run and
+        // crashed runs have records in `records.jsonl` that the checkpoint —
+        // rewritten only at compaction points — doesn't carry yet.
+        use crate::runtime::store::RunStore as _;
+        let Ok(Some(records)) =
+            crate::runtime::store::FsRunStore::new(entry.path()).load_call_log()
         else {
             continue;
         };
+
+        // Price this run under the pricing table recorded in its manifest
+        // (env-set CHIDORI_PRICING still wins inside the cost module).
+        if let Ok(manifest) =
+            crate::runtime::snapshot::SnapshotStore::new(entry.path()).load_manifest()
+        {
+            if let Some(ref pricing) = manifest.pricing {
+                crate::runtime::cost::install_journaled_pricing(pricing);
+            }
+        }
 
         run_count += 1;
         let mut log = CallLog::new();
         for r in records {
             if r.function == "prompt" {
                 prompt_count += 1;
+                // Count the call under its model even when the record carries
+                // no token usage (e.g. a locally-cache-served or zero-usage
+                // prompt) — otherwise the top-line "Prompt calls" and the
+                // per-model rows silently disagree.
+                let model = r
+                    .args
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let ms = per_model.entry(model.clone()).or_default();
+                ms.calls += 1;
                 if let Some(ref usage) = r.token_usage {
                     total_input_tokens += usage.input_tokens;
                     total_output_tokens += usage.output_tokens;
-                    let model = r
-                        .args
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let cost = estimate_cost_usd(&model, usage.input_tokens, usage.output_tokens);
+                    let cache_read = usage.cache_read_tokens.unwrap_or(0);
+                    let cache_write = usage.cache_creation_tokens.unwrap_or(0);
+                    total_cache_read += cache_read;
+                    total_cache_write += cache_write;
+                    let cost = estimate_cost_usd_with_cache(
+                        &model,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        cache_write,
+                        cache_read,
+                    );
                     total_cost += cost;
                     let ms = per_model.entry(model).or_default();
-                    ms.calls += 1;
                     ms.input_tokens += usage.input_tokens;
                     ms.output_tokens += usage.output_tokens;
+                    ms.cache_read_tokens += cache_read;
                     ms.cost_usd += cost;
                 }
             } else if r.function == "tool" {
+                // Registry (MCP / Rust-native) tools dispatched by name.
+                tool_count += 1;
+            } else if r.function == "mark"
+                && r.args
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|l| l.starts_with("tool:"))
+            {
+                // In-VM `defineTool` invocations journal as `mark("tool:<name>")`
+                // records — the common case for single-file agents. Leaving them
+                // out reported "Tool calls: 0" for agents that made dozens.
                 tool_count += 1;
             }
             total_duration_ms += r.duration_ms;
@@ -1794,15 +2949,47 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
         total_output_tokens,
         total_input_tokens + total_output_tokens
     );
-    println!("Est. cost:         ${:.6}", total_cost);
+    let unpriced: Vec<&String> = per_model
+        .keys()
+        .filter(|m| !crate::runtime::cost::is_priced_model(m))
+        .collect();
+    if total_cache_read > 0 || total_cache_write > 0 {
+        println!(
+            "Prompt cache:      {} read / {} written",
+            total_cache_read, total_cache_write
+        );
+    }
+    if unpriced.is_empty() {
+        println!("Est. cost:         ${:.6}", total_cost);
+    } else if total_cost > 0.0 {
+        println!(
+            "Est. cost:         ${:.6} + unknown (unpriced models below; supply rates via \
+             CHIDORI_PRICING)",
+            total_cost
+        );
+    } else {
+        println!(
+            "Est. cost:         unknown (unpriced models below; supply rates via CHIDORI_PRICING)"
+        );
+    }
     println!("Total duration:    {} ms", total_duration_ms);
 
     if !per_model.is_empty() {
         println!("\nPer model:");
         for (model, s) in &per_model {
+            let cost = if crate::runtime::cost::is_priced_model(model) {
+                format!("${:.6}", s.cost_usd)
+            } else {
+                "cost unknown (no pricing data)".to_string()
+            };
+            let cache = if s.cache_read_tokens > 0 {
+                format!("  {:>8} cached", s.cache_read_tokens)
+            } else {
+                String::new()
+            };
             println!(
-                "  {:<24} {:>4} calls  {:>8} in  {:>8} out  ${:.6}",
-                model, s.calls, s.input_tokens, s.output_tokens, s.cost_usd
+                "  {:<24} {:>4} calls  {:>8} in  {:>8} out{}  {}",
+                model, s.calls, s.input_tokens, s.output_tokens, cache, cost
             );
         }
     }
@@ -1811,13 +2998,17 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
 }
 
 fn cmd_serve(
-    file: &PathBuf,
+    file: Option<&Path>,
+    host: Option<&str>,
     port: u16,
     verbose: bool,
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
     if verbose {
+        // Isolate worker children read this to decide whether to print
+        // sandbox degradation notes.
+        std::env::set_var("CHIDORI_VERBOSE", "1");
         tracing_subscriber::fmt()
             .with_env_filter("info")
             .with_target(false)
@@ -1825,16 +3016,19 @@ fn cmd_serve(
             .init();
     }
 
-    let base_dir = file
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
+    let base_dir = match file {
+        Some(file) => file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf(),
+        None => PathBuf::from("."),
+    };
 
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
 
     // Validate the agent file before starting the server.
-    {
+    if let Some(file) = file {
         let rt = Arc::new(
             scheduler::new_tokio_runtime().context("Failed to create validation runtime")?,
         );
@@ -1842,18 +3036,33 @@ fn cmd_serve(
         engine.check(file).context("Agent file validation failed")?;
     }
 
-    eprintln!("Agent: {}", file.display());
+    match file {
+        Some(file) => eprintln!("Agent: {}", file.display()),
+        None => eprintln!(
+            "Agent: none — fleet-only server (detached agents re-armed from the registry; \
+             sessions must name an agent via the `agent` field)"
+        ),
+    }
     eprintln!("Isolation: {}", crate::runtime::isolate::describe());
     // The server is deny-by-default unless explicitly trusted; if it is confining
     // callers by policy but not by process, point at --isolate.
     crate::runtime::isolate::warn_if_untrusted_without_isolation(!trusted);
+
+    // Bind-address precedence: --host flag, then CHIDORI_HOST, then the safe
+    // loopback default (the server refuses non-loopback binds without auth —
+    // see server::serve).
+    let host = host
+        .map(str::to_owned)
+        .or_else(|| std::env::var("CHIDORI_HOST").ok())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
 
     let (policy, policy_posture) = serve_policy(untrusted, trusted);
     let tokio_rt = scheduler::new_tokio_runtime().context("Failed to create server runtime")?;
     tokio_rt.block_on(server::serve(
         providers,
         template_engine,
-        file.clone(),
+        file.map(|f| f.to_path_buf()),
+        host,
         port,
         policy,
         policy_posture,

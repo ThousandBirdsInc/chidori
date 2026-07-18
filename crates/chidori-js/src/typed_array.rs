@@ -21,8 +21,9 @@ pub fn decode(bytes: &[u8], off: usize, kind: TAKind) -> f64 {
     macro_rules! rd {
         ($t:ty, $n:expr) => {{
             let mut a = [0u8; $n];
-            if off + $n <= bytes.len() {
-                a.copy_from_slice(&bytes[off..off + $n]);
+            let end = off + $n;
+            if end <= bytes.len() {
+                a.copy_from_slice(&bytes[off..end]);
             }
             <$t>::from_le_bytes(a)
         }};
@@ -91,8 +92,9 @@ pub fn encode(bytes: &mut [u8], off: usize, kind: TAKind, v: f64) {
     macro_rules! wr {
         ($e:expr, $n:expr) => {{
             let b = ($e).to_le_bytes();
-            if off + $n <= bytes.len() {
-                bytes[off..off + $n].copy_from_slice(&b);
+            let end = off + $n;
+            if end <= bytes.len() {
+                bytes[off..end].copy_from_slice(&b);
             }
         }};
     }
@@ -130,9 +132,7 @@ fn to_int(v: f64) -> i64 {
 }
 
 fn to_uint8_clamp(v: f64) -> u8 {
-    if v.is_nan() {
-        0
-    } else if v <= 0.0 {
+    if v.is_nan() || v <= 0.0 {
         0
     } else if v >= 255.0 {
         255
@@ -191,7 +191,7 @@ impl Vm {
     /// shared brand. (A SharedArrayBuffer shares the `Internal::ArrayBuffer`
     /// byte storage; only the brand and prototype distinguish it.)
     pub fn is_shared_buffer(&self, o: &JsObject) -> bool {
-        o.borrow().props.contains_key(&PropertyKey::Sym(
+        o.borrow().own_contains_key(&PropertyKey::Sym(
             self.realm.symbol_array_buffer_shared.clone(),
         ))
     }
@@ -214,12 +214,12 @@ impl Vm {
                 enumerable: false,
                 configurable: false,
             };
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::Sym(self.realm.symbol_array_buffer_shared.clone()),
                 slot(Value::Bool(true)),
             );
             if let Some(m) = max {
-                b.props.insert(
+                b.own_insert(
                     PropertyKey::str(ARRAY_BUFFER_MAX_SLOT),
                     slot(Value::Number(m as f64)),
                 );

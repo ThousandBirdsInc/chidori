@@ -1,4 +1,4 @@
-import { chidori, run } from "chidori:agent";
+import { chidori, run, defineTool } from "chidori:agent";
 
 type Input = {
   /** Name shown in logs and as the agent name in the OTEL trace. */
@@ -8,6 +8,35 @@ type Input = {
   /** Items each stage "reviews" — one logged step (one span) per item. */
   itemsPerStage?: number;
 };
+
+// The per-stage work, as an import-defined tool (`defineTool`). Its body runs
+// in the agent's own VM, so every `chidori.log` it makes is recorded as one of
+// the run's host calls — one span in the trace — right alongside the stage's
+// own logs.
+const reviewBatch = defineTool({
+  name: "review_batch",
+  description: "Review a batch of items for one pipeline stage, logging each step.",
+  parameters: {
+    type: "object",
+    properties: { stage: { type: "number" }, items: { type: "number" } },
+    required: ["stage", "items"],
+  },
+  run: async (args: { stage: number; items: number }) => {
+    const flagged: number[] = [];
+    for (let item = 1; item <= args.items; item++) {
+      await chidori.log(`review_batch: scanned item ${item}/${args.items}`, {
+        stage: args.stage,
+        item,
+      });
+      // Flag every third item as needing attention (an extra step).
+      if (item % 3 === 0) {
+        flagged.push(item);
+        await chidori.log(`review_batch: flagged item ${item}`, { stage: args.stage, item });
+      }
+    }
+    return { stage: args.stage, scanned: args.items, flagged };
+  },
+});
 
 /**
  * A long-running, human-in-the-loop pipeline (a toy "incident triage" run).
@@ -39,13 +68,14 @@ run(async (input: Input) => {
   for (let stage = 1; stage <= stages; stage++) {
     await chidori.log(`stage ${stage}/${stages}: begin`, { stage });
 
-    // Delegate the batch to a tool. The tool logs each item INTERNALLY, so those
-    // spans nest under this `tool.call review_batch` span — that's the nesting
-    // (parent_seq) in the trace, one level below the top-level agent calls.
-    const result = await chidori.tool<
-      { stage: number; items: number },
-      { stage: number; scanned: number; flagged: number[] }
-    >("review_batch", { stage, items: itemsPerStage });
+    // Delegate the batch to the tool. It runs in-VM, so its per-item logs are
+    // recorded as this run's host calls (spans), interleaved with the stage
+    // logs around it.
+    const result = (await reviewBatch.run({ stage, items: itemsPerStage }, chidori)) as {
+      stage: number;
+      scanned: number;
+      flagged: number[];
+    };
     const reviewed = result.scanned;
     totalReviewed += reviewed;
     if (result.flagged.length > 0) {
@@ -63,7 +93,7 @@ run(async (input: Input) => {
         `Type 'continue', 'rerun', 'stop', or a free-text note:`,
       { type: "checkpoint", choices: ["continue", "rerun", "stop"] },
     );
-    const decision = answer.trim().toLowerCase() || "continue";
+    const decision = String(answer).trim().toLowerCase() || "continue";
     await chidori.log(`stage ${stage}: operator said '${decision}'`, { stage, decision });
     journal.push({ stage, reviewed, decision });
 
@@ -82,7 +112,7 @@ run(async (input: Input) => {
   }
 
   await chidori.log(`pipeline '${pipeline}' complete`, { stages, totalReviewed });
-  return { pipeline, status: "completed", totalReviewed, journal };
+  return { pipeline, status: "completed", stoppedAt: null, totalReviewed, journal };
 });
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {

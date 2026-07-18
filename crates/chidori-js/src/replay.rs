@@ -41,6 +41,7 @@ struct PendingOp {
 
 struct JournalState {
     journal: Journal,
+    #[allow(dead_code)] // Recorded at construction; not yet read back.
     mode: Mode,
     counters: HashMap<String, u64>,
     pending: HashMap<u64, PendingOp>,
@@ -49,6 +50,11 @@ struct JournalState {
     cursor: usize,
     /// Divergence detected during replay (edit touched already-journaled code).
     divergence: Option<String>,
+    /// True when `restore` was given a bundle whose content hash differs from
+    /// the one the journal was recorded against (modify-and-resume). Legal,
+    /// but recorded so divergence errors can say *why* replay drifted and
+    /// callers can surface it.
+    bundle_changed: bool,
 }
 
 /// Outcome of driving the runtime.
@@ -84,6 +90,7 @@ impl ReplayRuntime {
             pending: HashMap::new(),
             cursor: 0,
             divergence: None,
+            bundle_changed: false,
         }));
         let mut rt = ReplayRuntime {
             vm: Vm::new(),
@@ -107,6 +114,10 @@ impl ReplayRuntime {
     ) -> Result<ReplayRuntime, String> {
         let journal = Journal::from_bytes(journal_bytes)?;
         let bundle_hash = Journal::hash_bundle(bundle);
+        // The journal pins the bundle it was recorded against; actually
+        // compare the pin. A changed bundle is legal (modify-and-resume is
+        // the feature) but must be *detectable*, not silently absorbed.
+        let bundle_changed = !journal.bundle_hash.is_empty() && journal.bundle_hash != bundle_hash;
         let state = Rc::new(RefCell::new(JournalState {
             journal,
             mode: Mode::Replay,
@@ -114,6 +125,7 @@ impl ReplayRuntime {
             pending: HashMap::new(),
             cursor: 0,
             divergence: None,
+            bundle_changed,
         }));
         let mut rt = ReplayRuntime {
             vm: Vm::new(),
@@ -138,6 +150,14 @@ impl ReplayRuntime {
     /// Whether replay detected an edit that diverged from the journal.
     pub fn divergence(&self) -> Option<String> {
         self.state.borrow().divergence.clone()
+    }
+
+    /// Whether this runtime was restored with a bundle whose content hash
+    /// differs from the one the journal was recorded against
+    /// (modify-and-resume). The journal has always stored the hash; this is
+    /// where it is actually checked.
+    pub fn bundle_changed(&self) -> bool {
+        self.state.borrow().bundle_changed
     }
 
     /// Install each named effect as a global async function backed by the
@@ -172,20 +192,34 @@ impl ReplayRuntime {
                         let cursor = s.cursor;
                         if cursor < s.journal.entries.len() {
                             let entry = s.journal.entries[cursor].clone();
-                            if entry.site == site && entry.seq == seq {
+                            if entry.site != site || entry.seq != seq {
+                                let msg = format!(
+                                "expected effect '{}'#{} from journal but program called '{}'#{} \
+                                 (an edit changed already-executed code before the resume point{})",
+                                entry.site, entry.seq, site, seq,
+                                if s.bundle_changed { "; the code bundle differs from the recorded one" } else { "" }
+                            );
+                                s.divergence = Some(msg.clone());
+                                Decision::Diverged(msg)
+                            } else if entry.args != Json::Null && entry.args != args_json {
+                                // Same effect, same position, different request:
+                                // replaying the recorded result would answer a
+                                // question the program no longer asks.
+                                let msg = format!(
+                                    "effect '{}'#{} was recorded with args {} but the program now \
+                                     calls it with {} (an edit changed an already-executed call's \
+                                     arguments before the resume point{})",
+                                    site, seq, entry.args, args_json,
+                                    if s.bundle_changed { "; the code bundle differs from the recorded one" } else { "" }
+                                );
+                                s.divergence = Some(msg.clone());
+                                Decision::Diverged(msg)
+                            } else {
                                 s.cursor += 1;
                                 match entry.outcome {
                                     EffectOutcome::Resolved(j) => Decision::Resolve(j),
                                     EffectOutcome::Rejected(m) => Decision::Reject(m),
                                 }
-                            } else {
-                                let msg = format!(
-                                "expected effect '{}'#{} from journal but program called '{}'#{} \
-                                 (an edit changed already-executed code before the resume point)",
-                                entry.site, entry.seq, site, seq
-                            );
-                                s.divergence = Some(msg.clone());
-                                Decision::Diverged(msg)
                             }
                         } else {
                             Decision::Frontier
@@ -232,7 +266,7 @@ impl ReplayRuntime {
         let state = self.state.clone();
         self.vm
             .define_method(&global, "durableStep", 1, move |vm, _this, args| {
-                let f = args.get(0).cloned().unwrap_or(Value::Undefined);
+                let f = args.first().cloned().unwrap_or(Value::Undefined);
                 let site = "durableStep".to_string();
                 let seq = {
                     let mut s = state.borrow_mut();
@@ -290,7 +324,11 @@ impl ReplayRuntime {
                             let j = vm.value_to_json(&v);
                             {
                                 let mut s = state.borrow_mut();
-                                s.journal.append(&key, EffectOutcome::Resolved(j.clone()));
+                                s.journal.append(
+                                    &key,
+                                    Json::Null,
+                                    EffectOutcome::Resolved(j.clone()),
+                                );
                                 s.cursor = s.journal.entries.len();
                             }
                             let rv = vm.json_to_value(&j);
@@ -300,7 +338,11 @@ impl ReplayRuntime {
                             let msg = vm.error_to_string(&e);
                             {
                                 let mut s = state.borrow_mut();
-                                s.journal.append(&key, EffectOutcome::Rejected(msg.clone()));
+                                s.journal.append(
+                                    &key,
+                                    Json::Null,
+                                    EffectOutcome::Rejected(msg.clone()),
+                                );
                                 s.cursor = s.journal.entries.len();
                             }
                             let err = vm.make_error(ErrorKind::Error, &msg);
@@ -371,8 +413,11 @@ impl ReplayRuntime {
                                 Ok(json) => {
                                     {
                                         let mut s = self.state.borrow_mut();
-                                        s.journal
-                                            .append(&key, EffectOutcome::Resolved(json.clone()));
+                                        s.journal.append(
+                                            &key,
+                                            op.args.clone(),
+                                            EffectOutcome::Resolved(json.clone()),
+                                        );
                                         s.cursor = s.journal.entries.len();
                                     }
                                     let v = self.vm.json_to_value(&json);
@@ -381,8 +426,11 @@ impl ReplayRuntime {
                                 Err(msg) => {
                                     {
                                         let mut s = self.state.borrow_mut();
-                                        s.journal
-                                            .append(&key, EffectOutcome::Rejected(msg.clone()));
+                                        s.journal.append(
+                                            &key,
+                                            op.args.clone(),
+                                            EffectOutcome::Rejected(msg.clone()),
+                                        );
                                         s.cursor = s.journal.entries.len();
                                     }
                                     let e = self.vm.make_error(ErrorKind::Error, &msg);
@@ -420,7 +468,7 @@ impl ReplayRuntime {
                 {
                     let mut s = self.state.borrow_mut();
                     s.journal
-                        .append(&key, EffectOutcome::Resolved(json.clone()));
+                        .append(&key, op.args.clone(), EffectOutcome::Resolved(json.clone()));
                     s.cursor = s.journal.entries.len();
                 }
                 let v = self.vm.json_to_value(&json);
@@ -429,7 +477,8 @@ impl ReplayRuntime {
             Err(msg) => {
                 {
                     let mut s = self.state.borrow_mut();
-                    s.journal.append(&key, EffectOutcome::Rejected(msg.clone()));
+                    s.journal
+                        .append(&key, op.args.clone(), EffectOutcome::Rejected(msg.clone()));
                     s.cursor = s.journal.entries.len();
                 }
                 let e = self.vm.make_error(ErrorKind::Error, &msg);
@@ -487,7 +536,7 @@ impl ReplayRuntime {
                 {
                     let mut s = self.state.borrow_mut();
                     s.journal
-                        .append(&key, EffectOutcome::Resolved(json.clone()));
+                        .append(&key, op.args.clone(), EffectOutcome::Resolved(json.clone()));
                     s.cursor = s.journal.entries.len();
                 }
                 let v = self.vm.json_to_value(&json);
@@ -496,7 +545,8 @@ impl ReplayRuntime {
             Err(msg) => {
                 {
                     let mut s = self.state.borrow_mut();
-                    s.journal.append(&key, EffectOutcome::Rejected(msg.clone()));
+                    s.journal
+                        .append(&key, op.args.clone(), EffectOutcome::Rejected(msg.clone()));
                     s.cursor = s.journal.entries.len();
                 }
                 let e = self.vm.make_error(ErrorKind::Error, &msg);

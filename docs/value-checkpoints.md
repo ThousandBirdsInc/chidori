@@ -111,7 +111,7 @@ correctness dependency.
 
 ## 5. Relation to neighbors
 
-- **`chidori.checkpoint(label, data)`** records an explicit *marker* you
+- **`chidori.mark(label, data)`** records an explicit *marker* you
   compute yourself; it doesn't skip anything. `step` is the memoizing version:
   the runtime decides record-vs-replay and the callback body is the thing
   being saved.

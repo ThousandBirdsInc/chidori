@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chidori"
-version = "3.6.0"
+version = "3.6.1"
 description = "Python SDK for the Chidori agent framework — HTTP client for running and replaying TypeScript agents."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -27,3 +27,8 @@ Repository = "https://github.com/ThousandBirdsInc/chidori"
 
 [tool.setuptools.packages.find]
 include = ["chidori*"]
+
+# PEP 561: ship the `py.typed` marker so type checkers (mypy, pyright) consume
+# the package's inline annotations instead of treating it as untyped.
+[tool.setuptools.package-data]
+chidori = ["py.typed"]

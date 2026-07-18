@@ -136,8 +136,7 @@ fn array_exotic_current(b: &ObjectData, key: &PropertyKey) -> Option<Property> {
                     value: Value::Number(arr.len() as f64),
                     // length is writable unless the props map records otherwise.
                     writable: b
-                        .props
-                        .get(key)
+                        .own_get(key)
                         .map(
                             |p| matches!(&p.kind, PropertyKind::Data { writable, .. } if *writable),
                         )
@@ -259,8 +258,11 @@ fn define_own_property_inner(
     // `current` afterwards so post-valueOf state is what gets validated.
     let obj_is_array = matches!(obj.borrow().internal, Internal::Array(_));
     let mut coerced_desc;
-    let d: &PropDesc = if obj_is_array && key.as_str() == Some("length") && d.value.is_some() {
-        let v = d.value.as_ref().unwrap();
+    let d: &PropDesc = if let Some(v) = d
+        .value
+        .as_ref()
+        .filter(|_| obj_is_array && key.as_str() == Some("length"))
+    {
         let new_len = vm.to_uint32(v)?;
         let number_len = vm.to_number(v)?;
         if (new_len as f64) != number_len {
@@ -275,7 +277,7 @@ fn define_own_property_inner(
     // Snapshot current state without holding the borrow across vm.* calls.
     let (current, extensible, is_array) = {
         let b = obj.borrow();
-        let cur = match b.props.get(key) {
+        let cur = match b.own_get(key) {
             Some(p) => Some(p.clone()),
             None => array_exotic_current(&b, key),
         };
@@ -303,7 +305,7 @@ fn define_own_property_inner(
                 };
                 (idx as usize) >= len
                     && matches!(
-                        b.props.get(&PropertyKey::str("length")),
+                        b.own_get(&PropertyKey::str("length")),
                         Some(Property {
                             kind: PropertyKind::Data {
                                 writable: false,
@@ -428,7 +430,7 @@ fn define_own_property_inner(
                 };
                 let mut block: Option<usize> = None;
                 if new_len < cur_len {
-                    for (k, p) in b.props.iter() {
+                    for (k, p) in b.own_iter() {
                         if let Some(idx) = k.array_index() {
                             let idx = idx as usize;
                             if idx >= new_len && idx < cur_len && !p.configurable {
@@ -445,19 +447,18 @@ fn define_own_property_inner(
                     arr.resize(k + 1, Value::Hole);
                 }
                 let drop_keys: Vec<PropertyKey> = b
-                    .props
-                    .keys()
+                    .own_keys_iter()
                     .filter(|kk| kk.array_index().is_some_and(|i| (i as usize) > k))
                     .cloned()
                     .collect();
                 for kk in drop_keys {
-                    b.props.shift_remove(&kk);
+                    b.own_remove(&kk);
                 }
                 // A deferred `writable: false` still applies — with the length
                 // where deletion stopped — even though the define FAILS
                 // (ArraySetLength steps 19.d.i-ii).
                 if d.writable == Some(false) {
-                    b.props.insert(
+                    b.own_insert(
                         PropertyKey::str("length"),
                         Property {
                             kind: PropertyKind::Data {
@@ -542,7 +543,7 @@ pub(crate) fn create_data_index(
 ) -> Result<(), Value> {
     {
         let mut b = obj.borrow_mut();
-        if b.extensible && b.props.is_empty() {
+        if b.extensible && b.own_is_empty() {
             if let Internal::Array(arr) = &mut b.internal {
                 let i = idx as usize;
                 match i.cmp(&arr.len()) {
@@ -697,7 +698,7 @@ fn store_property(
                 // Record non-writable length as a marker property so that
                 // freeze/isFrozen and the writable invariant are observable.
                 if !*writable {
-                    obj.borrow_mut().props.insert(
+                    obj.borrow_mut().own_insert(
                         key.clone(),
                         Property {
                             kind: PropertyKind::Data {
@@ -709,7 +710,7 @@ fn store_property(
                         },
                     );
                 } else {
-                    obj.borrow_mut().props.shift_remove(key);
+                    obj.borrow_mut().own_remove(key);
                 }
                 return Ok(());
             }
@@ -736,7 +737,7 @@ fn store_property(
                             }
                             arr[idx] = value.clone();
                         }
-                        b.props.shift_remove(key);
+                        b.own_remove(key);
                         return Ok(());
                     }
                 }
@@ -762,7 +763,7 @@ fn store_property(
             }
         }
     }
-    obj.borrow_mut().props.insert(key.clone(), prop);
+    obj.borrow_mut().own_insert(key.clone(), prop);
     Ok(())
 }
 
@@ -824,7 +825,7 @@ fn install_object(vm: &mut Vm) {
             return Ok(Value::Bool(false));
         }
         let b = o.borrow();
-        let e = match b.props.get(&key) {
+        let e = match b.own_get(&key) {
             Some(p) => p.enumerable,
             None => match &b.internal {
                 Internal::Array(arr) => key
@@ -915,7 +916,7 @@ fn install_object(vm: &mut Vm) {
         }
         Ok(Value::Undefined)
     });
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("__proto__"),
         Property {
             kind: PropertyKind::Accessor {
@@ -1028,8 +1029,7 @@ fn install_object(vm: &mut Vm) {
         for (key, elements) in groups {
             let arr = vm.new_array(elements);
             obj.borrow_mut()
-                .props
-                .insert(key, Property::data(Value::Object(arr)));
+                .own_insert(key, Property::data(Value::Object(arr)));
         }
         Ok(Value::Object(obj))
     });
@@ -1238,7 +1238,7 @@ fn install_object_extra(vm: &mut Vm) {
             let prop = own_property_descriptor(&o, &key);
             if let Some(p) = prop {
                 let desc = descriptor_to_object(vm, &p);
-                result.borrow_mut().props.insert(key, Property::data(desc));
+                result.borrow_mut().own_insert(key, Property::data(desc));
             }
         }
         Ok(Value::Object(result))
@@ -1358,11 +1358,10 @@ pub(crate) fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Re
         if let Internal::Array(arr) = &b.internal {
             let len = arr.len() as f64;
             let cur_writable = b
-                .props
-                .get(&PropertyKey::str("length"))
+                .own_get(&PropertyKey::str("length"))
                 .map(|p| matches!(&p.kind, PropertyKind::Data { writable, .. } if *writable))
                 .unwrap_or(true);
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -1461,7 +1460,7 @@ fn lookup_accessor(
         }
         let next = {
             let b = obj.borrow();
-            if let Some(p) = b.props.get(key) {
+            if let Some(p) = b.own_get(key) {
                 return Ok(match &p.kind {
                     PropertyKind::Accessor { get, set } => {
                         let f = if want_get { get } else { set };
@@ -1658,7 +1657,7 @@ fn enumerable_own_strings_dyn(vm: &mut Vm, o: &JsObject) -> Result<Vec<JsString>
 
 fn own_property_exists(o: &JsObject, key: &PropertyKey) -> bool {
     let b = o.borrow();
-    if b.props.contains_key(key) {
+    if b.own_contains_key(key) {
         return true;
     }
     match &b.internal {
@@ -1695,7 +1694,7 @@ fn own_property_exists(o: &JsObject, key: &PropertyKey) -> bool {
 /// index/length slots reified into `Property` values.
 pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option<Property> {
     let b = o.borrow();
-    if let Some(p) = b.props.get(key) {
+    if let Some(p) = b.own_get(key) {
         let mut p = p.clone();
         // Mapped arguments: the descriptor's value reads the parameter cell.
         if let Internal::Arguments(map) = &b.internal {
@@ -1813,31 +1812,6 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
             }
             None
         }
-        // Module Namespace exotic [[GetOwnProperty]] for an export name:
-        // a live {writable:true, enumerable:true, configurable:false} data
-        // property (an uninitialized binding reads as undefined here — the
-        // throwing TDZ check lives on the [[Get]] path).
-        Internal::ModuleNamespace(ns) => {
-            if let PropertyKey::Str(s) = key {
-                if let Some(cell) = ns.exports.get(s) {
-                    let v = cell.borrow().clone();
-                    let v = if matches!(v, Value::Uninitialized) {
-                        Value::Undefined
-                    } else {
-                        v
-                    };
-                    return Some(Property {
-                        kind: PropertyKind::Data {
-                            value: v,
-                            writable: true,
-                        },
-                        enumerable: true,
-                        configurable: false,
-                    });
-                }
-            }
-            None
-        }
         _ => None,
     }
 }
@@ -1860,7 +1834,7 @@ fn define_properties(vm: &mut Vm, obj: &JsObject, props: &Value) -> Result<(), V
             }
         } else {
             let b = po.borrow();
-            match b.props.get(&k) {
+            match b.own_get(&k) {
                 Some(p) => p.enumerable,
                 None => match &b.internal {
                     Internal::Array(arr) => k
@@ -1895,29 +1869,28 @@ pub(crate) fn descriptor_to_object(vm: &mut Vm, p: &Property) -> Value {
         let mut b = o.borrow_mut();
         match &p.kind {
             PropertyKind::Data { value, writable } => {
-                b.props
-                    .insert(PropertyKey::str("value"), Property::data(value.clone()));
-                b.props.insert(
+                b.own_insert(PropertyKey::str("value"), Property::data(value.clone()));
+                b.own_insert(
                     PropertyKey::str("writable"),
                     Property::data(Value::Bool(*writable)),
                 );
             }
             PropertyKind::Accessor { get, set } => {
-                b.props.insert(
+                b.own_insert(
                     PropertyKey::str("get"),
                     Property::data(get.clone().unwrap_or(Value::Undefined)),
                 );
-                b.props.insert(
+                b.own_insert(
                     PropertyKey::str("set"),
                     Property::data(set.clone().unwrap_or(Value::Undefined)),
                 );
             }
         }
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("enumerable"),
             Property::data(Value::Bool(p.enumerable)),
         );
-        b.props.insert(
+        b.own_insert(
             PropertyKey::str("configurable"),
             Property::data(Value::Bool(p.configurable)),
         );
@@ -1994,7 +1967,7 @@ fn install_function(vm: &mut Vm) {
         ));
         {
             let mut b = bound.borrow_mut();
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("length"),
                 Property {
                     kind: PropertyKind::Data {
@@ -2005,7 +1978,7 @@ fn install_function(vm: &mut Vm) {
                     configurable: true,
                 },
             );
-            b.props.insert(
+            b.own_insert(
                 PropertyKey::str("name"),
                 Property {
                     kind: PropertyKind::Data {
@@ -2044,7 +2017,7 @@ fn install_function(vm: &mut Vm) {
         Ok(Value::Bool(r))
     });
     // @@hasInstance is non-writable, non-enumerable, NON-configurable.
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(has_instance),
         Property {
             kind: PropertyKind::Data {
@@ -2063,7 +2036,7 @@ fn install_function(vm: &mut Vm) {
         } else {
             Value::str("")
         };
-        proto.borrow_mut().props.insert(
+        proto.borrow_mut().own_insert(
             PropertyKey::str(k),
             Property {
                 kind: PropertyKind::Data {
@@ -2137,7 +2110,7 @@ fn install_symbol(vm: &mut Vm) {
     ];
     for (name, sym) in pairs {
         // Well-known symbols are non-writable, non-enumerable, non-configurable.
-        ctor.borrow_mut().props.insert(
+        ctor.borrow_mut().own_insert(
             PropertyKey::str(name),
             Property {
                 kind: PropertyKind::Data {
@@ -2198,7 +2171,7 @@ fn install_symbol(vm: &mut Vm) {
                 _ => Err(vm.throw_type("Symbol.prototype.description requires a symbol")),
             }
         });
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("description"),
         Property {
             kind: PropertyKind::Accessor {
@@ -2220,7 +2193,7 @@ fn install_symbol(vm: &mut Vm) {
             _ => Err(vm.throw_type("Symbol.prototype[Symbol.toPrimitive] requires a symbol")),
         },
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(to_primitive_sym),
         Property {
             kind: PropertyKind::Data {
@@ -2234,7 +2207,7 @@ fn install_symbol(vm: &mut Vm) {
 
     // Symbol.prototype[Symbol.toStringTag] = "Symbol".
     let to_string_tag_sym = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::Sym(to_string_tag_sym),
         Property {
             kind: PropertyKind::Data {
@@ -2326,7 +2299,8 @@ fn install_errors(vm: &mut Vm) {
     // EvalError lacks a realm-resident prototype (nothing throws it internally);
     // create an ordinary prototype chaining to Error.prototype.
     let error_proto = vm.realm.error_proto.clone();
-    for name in ["EvalError"] {
+    {
+        let name = "EvalError";
         let proto = vm.alloc_ordinary(Some(error_proto.clone()));
         let ctor = install_error_kind(vm, &proto, name);
         // Subtype ctor inherits from the Error constructor.
@@ -2359,11 +2333,11 @@ fn install_errors(vm: &mut Vm) {
 fn install_suppressed_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
     let proto = vm.alloc_ordinary(Some(vm.realm.error_proto.clone()));
     proto.borrow_mut().internal = Internal::Error;
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("name"),
         Property::builtin(Value::str("SuppressedError")),
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("message"),
         Property::builtin(Value::str("")),
     );
@@ -2379,7 +2353,7 @@ fn install_suppressed_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
         let msg = arg(args, 2);
         if !msg.is_undefined() {
             let s = vm.to_js_string(&msg)?;
-            o.borrow_mut().props.insert(
+            o.borrow_mut().own_insert(
                 PropertyKey::str("message"),
                 Property::builtin(Value::String(s)),
             );
@@ -2387,9 +2361,8 @@ fn install_suppressed_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
         // `error` (1st arg) and `suppressed` (2nd arg) are non-enumerable,
         // writable, configurable own data properties.
         o.borrow_mut()
-            .props
-            .insert(PropertyKey::str("error"), Property::builtin(arg(args, 0)));
-        o.borrow_mut().props.insert(
+            .own_insert(PropertyKey::str("error"), Property::builtin(arg(args, 0)));
+        o.borrow_mut().own_insert(
             PropertyKey::str("suppressed"),
             Property::builtin(arg(args, 1)),
         );
@@ -2414,11 +2387,11 @@ fn install_suppressed_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
 fn install_error_kind(vm: &mut Vm, proto: &JsObject, name: &str) -> JsObject {
     proto.borrow_mut().internal = Internal::Error;
     // name and message are non-enumerable data properties on the prototype.
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("name"),
         Property::builtin(Value::str(name)),
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("message"),
         Property::builtin(Value::str("")),
     );
@@ -2473,7 +2446,7 @@ fn make_error_obj(vm: &mut Vm, proto: &JsObject, args: &[Value]) -> Result<Value
     if !msg.is_undefined() {
         // ToString(message) is observable and throws for e.g. a Symbol.
         let s = vm.to_js_string(&msg)?;
-        o.borrow_mut().props.insert(
+        o.borrow_mut().own_insert(
             PropertyKey::str("message"),
             Property::builtin(Value::String(s)),
         );
@@ -2491,8 +2464,7 @@ fn install_error_options(vm: &mut Vm, o: &JsObject, options: Value) -> Result<()
         if has_cause {
             let cause = vm.get_prop(&Value::Object(opts.clone()), &PropertyKey::str("cause"))?;
             o.borrow_mut()
-                .props
-                .insert(PropertyKey::str("cause"), Property::builtin(cause));
+                .own_insert(PropertyKey::str("cause"), Property::builtin(cause));
         }
     }
     Ok(())
@@ -2506,12 +2478,11 @@ fn install_error_stack(vm: &mut Vm, o: &JsObject) {
         .unwrap_or_else(|_| "Error".into());
     let m = o
         .borrow()
-        .props
-        .get(&PropertyKey::str("message"))
+        .own_get(&PropertyKey::str("message"))
         .and_then(|p| p.value().cloned())
         .map(|v| vm.to_string_lossy(&v))
         .unwrap_or_default();
-    o.borrow_mut().props.insert(
+    o.borrow_mut().own_insert(
         PropertyKey::str("stack"),
         Property::builtin(Value::str(if m.is_empty() {
             name
@@ -2525,11 +2496,11 @@ fn install_error_stack(vm: &mut Vm, o: &JsObject) {
 fn install_aggregate_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
     let proto = vm.alloc_ordinary(Some(vm.realm.error_proto.clone()));
     proto.borrow_mut().internal = Internal::Error;
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("name"),
         Property::builtin(Value::str("AggregateError")),
     );
-    proto.borrow_mut().props.insert(
+    proto.borrow_mut().own_insert(
         PropertyKey::str("message"),
         Property::builtin(Value::str("")),
     );
@@ -2545,7 +2516,7 @@ fn install_aggregate_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
         let msg = arg(args, 1);
         if !msg.is_undefined() {
             let s = vm.to_js_string(&msg)?;
-            o.borrow_mut().props.insert(
+            o.borrow_mut().own_insert(
                 PropertyKey::str("message"),
                 Property::builtin(Value::String(s)),
             );
@@ -2554,7 +2525,7 @@ fn install_aggregate_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
         // 1st argument is the iterable of errors.
         let errors = vm.iterate_to_vec(&arg(args, 0))?;
         let arr = vm.new_array(errors);
-        o.borrow_mut().props.insert(
+        o.borrow_mut().own_insert(
             PropertyKey::str("errors"),
             Property::builtin(Value::Object(arr)),
         );

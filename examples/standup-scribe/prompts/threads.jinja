@@ -1,0 +1,16 @@
+Now update the thread ledger for the week you just read.
+
+{% if prior_count > 0 %}You were given {{ prior_count }} carried-over threads
+from last week in the "thread-ledger" document at the top of this
+conversation. Update those (same ids) and add any new threads this week
+introduced.{% else %}This is the first week — create the ledger from
+scratch, with ids T1, T2, ... in order of first appearance.{% endif %}
+
+Reply with ONLY a JSON array, no prose, no markdown fence. Each element:
+{
+  "id": "T1",
+  "title": "short thread name",
+  "owner": "person most responsible",
+  "status": "open" | "blocked" | "resolved",
+  "note": "one sentence: where this thread stands at week's end"
+}

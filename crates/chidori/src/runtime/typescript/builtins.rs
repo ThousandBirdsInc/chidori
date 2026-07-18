@@ -16,6 +16,7 @@ use std::path::Path;
 
 /// Allowlisted builtin names. Kept in sync with `NODE_BUILTIN_ALLOWLIST` in
 /// `transpile.rs`.
+#[allow(dead_code)] // Reference copy of the allowlist; transpile.rs owns the enforced one.
 pub const BUILTIN_NAMES: &[&str] = &[
     "process",
     "buffer",
@@ -408,7 +409,22 @@ export default promises;
 // microtask, so listeners registered inside the response callback still fire.
 // `createHttpModule` is exported so `node:https` can reuse this implementation
 // with an `https:` default protocol.
-const HTTP_SHIM: &str = r#"
+//
+// Composed at first use rather than written as one literal: the shim's
+// error handler must recognize the pause sentinel by its marker text (the
+// sentinel reaches JS as a plain thrown string — see `runtime::errors`), and
+// splicing `PAUSE_MARKER` in keeps `errors.rs` the single home of that
+// marker's spelling.
+static HTTP_SHIM: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    [
+        HTTP_SHIM_HEAD,
+        crate::runtime::errors::PAUSE_MARKER,
+        HTTP_SHIM_TAIL,
+    ]
+    .concat()
+});
+
+const HTTP_SHIM_HEAD: &str = r#"
 class EventEmitter {
     constructor() { this._ev = {}; }
     on(type, cb) { (this._ev[type] = this._ev[type] || []).push(cb); return this; }
@@ -488,7 +504,9 @@ function createHttpModule(defaultProtocol) {
                 // Surface transport-style failures through the 'error' event, the
                 // node convention — but never swallow the pause sentinel, which
                 // must keep unwinding to the engine.
-                if (err && typeof err.message === "string" && err.message.indexOf("__CHIDORI_PAUSED_FOR_INPUT__") !== -1) {
+                if (err && typeof err.message === "string" && err.message.indexOf(""#;
+
+const HTTP_SHIM_TAIL: &str = r#"") !== -1) {
                     throw err;
                 }
                 const self = this;
@@ -1463,7 +1481,7 @@ pub fn shim_source(name: &str) -> Option<&'static str> {
         "fs" => Some(FS_SHIM),
         "fs/promises" => Some(FS_PROMISES_SHIM),
         "crypto" => Some(CRYPTO_SHIM),
-        "http" => Some(HTTP_SHIM),
+        "http" => Some(HTTP_SHIM.as_str()),
         "https" => Some(HTTPS_SHIM),
         "path" => Some(PATH_SHIM),
         "path/posix" => Some(PATH_POSIX_SHIM),
@@ -1498,6 +1516,67 @@ pub fn builtin_name_from_path(path: &Path) -> Option<String> {
     let joined = segments.join("/");
     let name = joined.strip_suffix(".js")?;
     Some(name.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Vendored packages: self-contained UMD bundles served as synthetic ES modules.
+//
+// npm `react` / `react-dom` are CommonJS (internal `require`), which the
+// ESM-only engine can't link. The official UMD builds are self-contained, so we
+// wrap them in an ESM shim that runs the bundle (which populates `globalThis`)
+// and re-exports — making `import React from 'react'` and
+// `import { renderToStaticMarkup } from 'react-dom/server'` resolve and link.
+// This is analogous to the `node:` builtin shims above.
+// ---------------------------------------------------------------------------
+
+const REACT_UMD: &str = include_str!("../vendor/react/react.js");
+const REACT_DOM_SERVER_UMD: &str = include_str!("../vendor/react/react-dom-server.js");
+
+/// True for bare specifiers served from the vendored-package registry.
+pub fn is_vendored_package(specifier: &str) -> bool {
+    matches!(
+        specifier,
+        "react" | "react-dom" | "react-dom/server" | "react-dom/server.browser"
+    )
+}
+
+/// Resolve a vendored bare specifier to `(module_key, esm_source)`, or `None`.
+/// The key is stable so the module graph evaluates each bundle exactly once.
+pub fn vendored_module(specifier: &str) -> Option<(String, String)> {
+    match specifier {
+        "react" | "react-dom" => Some((
+            "vendor:react".to_string(),
+            format!(
+                "globalThis.self = globalThis; globalThis.global = globalThis;\n\
+                 {REACT_UMD}\n\
+                 const __R = globalThis.React;\n\
+                 export default __R;\n\
+                 export const createElement = __R.createElement,\n\
+                   cloneElement = __R.cloneElement, createContext = __R.createContext,\n\
+                   Fragment = __R.Fragment, Children = __R.Children,\n\
+                   Component = __R.Component, PureComponent = __R.PureComponent,\n\
+                   memo = __R.memo, forwardRef = __R.forwardRef,\n\
+                   isValidElement = __R.isValidElement, version = __R.version,\n\
+                   useState = __R.useState, useEffect = __R.useEffect,\n\
+                   useLayoutEffect = __R.useLayoutEffect, useMemo = __R.useMemo,\n\
+                   useRef = __R.useRef, useCallback = __R.useCallback,\n\
+                   useContext = __R.useContext, useReducer = __R.useReducer,\n\
+                   useId = __R.useId;\n"
+            ),
+        )),
+        "react-dom/server" | "react-dom/server.browser" => Some((
+            "vendor:react-dom/server".to_string(),
+            format!(
+                "import 'react';\n\
+                 {REACT_DOM_SERVER_UMD}\n\
+                 const __S = globalThis.ReactDOMServer;\n\
+                 export default __S;\n\
+                 export const renderToString = __S.renderToString,\n\
+                   renderToStaticMarkup = __S.renderToStaticMarkup;\n"
+            ),
+        )),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1598,66 +1677,5 @@ mod tests {
         let path = PathBuf::from("/some/workspace/src/index.ts");
         assert_eq!(builtin_name_from_path(&path), None);
         assert_eq!(source_for(&path), None);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Vendored packages: self-contained UMD bundles served as synthetic ES modules.
-//
-// npm `react` / `react-dom` are CommonJS (internal `require`), which the
-// ESM-only engine can't link. The official UMD builds are self-contained, so we
-// wrap them in an ESM shim that runs the bundle (which populates `globalThis`)
-// and re-exports — making `import React from 'react'` and
-// `import { renderToStaticMarkup } from 'react-dom/server'` resolve and link.
-// This is analogous to the `node:` builtin shims above.
-// ---------------------------------------------------------------------------
-
-const REACT_UMD: &str = include_str!("../vendor/react/react.js");
-const REACT_DOM_SERVER_UMD: &str = include_str!("../vendor/react/react-dom-server.js");
-
-/// True for bare specifiers served from the vendored-package registry.
-pub fn is_vendored_package(specifier: &str) -> bool {
-    matches!(
-        specifier,
-        "react" | "react-dom" | "react-dom/server" | "react-dom/server.browser"
-    )
-}
-
-/// Resolve a vendored bare specifier to `(module_key, esm_source)`, or `None`.
-/// The key is stable so the module graph evaluates each bundle exactly once.
-pub fn vendored_module(specifier: &str) -> Option<(String, String)> {
-    match specifier {
-        "react" | "react-dom" => Some((
-            "vendor:react".to_string(),
-            format!(
-                "globalThis.self = globalThis; globalThis.global = globalThis;\n\
-                 {REACT_UMD}\n\
-                 const __R = globalThis.React;\n\
-                 export default __R;\n\
-                 export const createElement = __R.createElement,\n\
-                   cloneElement = __R.cloneElement, createContext = __R.createContext,\n\
-                   Fragment = __R.Fragment, Children = __R.Children,\n\
-                   Component = __R.Component, PureComponent = __R.PureComponent,\n\
-                   memo = __R.memo, forwardRef = __R.forwardRef,\n\
-                   isValidElement = __R.isValidElement, version = __R.version,\n\
-                   useState = __R.useState, useEffect = __R.useEffect,\n\
-                   useLayoutEffect = __R.useLayoutEffect, useMemo = __R.useMemo,\n\
-                   useRef = __R.useRef, useCallback = __R.useCallback,\n\
-                   useContext = __R.useContext, useReducer = __R.useReducer,\n\
-                   useId = __R.useId;\n"
-            ),
-        )),
-        "react-dom/server" | "react-dom/server.browser" => Some((
-            "vendor:react-dom/server".to_string(),
-            format!(
-                "import 'react';\n\
-                 {REACT_DOM_SERVER_UMD}\n\
-                 const __S = globalThis.ReactDOMServer;\n\
-                 export default __S;\n\
-                 export const renderToString = __S.renderToString,\n\
-                   renderToStaticMarkup = __S.renderToStaticMarkup;\n"
-            ),
-        )),
-        _ => None,
     }
 }

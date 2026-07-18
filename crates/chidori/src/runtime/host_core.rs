@@ -8,8 +8,9 @@ use crate::providers::{
 };
 use crate::runtime::call_log::{CallRecord, TokenUsage};
 use crate::runtime::context::{
-    InputMode, PendingInput, PendingSignal, RuntimeContext, PAUSE_MARKER,
+    ActorSignalWait, InputMode, PendingInput, PendingSignal, RuntimeContext, WarmInputWait,
 };
+use crate::runtime::errors::RunInterrupt;
 use crate::runtime::memory::execute_memory_action;
 use crate::runtime::snapshot::{HostPromiseState, PendingHostOperationKind};
 use crate::runtime::template::TemplateEngine;
@@ -33,7 +34,7 @@ pub fn execute_durable_json_call_at_seq(
     live: impl FnOnce() -> Result<Value>,
 ) -> Result<Value> {
     if let Some(record) = ctx
-        .try_replay_checked(seq, function, Some(&args))
+        .try_replay_checked(seq, function, &args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         // A replayed call's `live()` is skipped. If it was a container (a tool
@@ -50,6 +51,16 @@ pub fn execute_durable_json_call_at_seq(
         if let Some(result) = replay_completed_host_operation(ctx, seq, function, kind, &args)? {
             return Ok(result);
         }
+    }
+
+    // Strict-durability gate: once a journal write has failed, refuse to run
+    // further live side effects — the run would otherwise keep acting on the
+    // world without a recording of it (`docs/durable-storage.md`).
+    if let Some(failure) = ctx.persist_failure() {
+        anyhow::bail!(
+            "refusing live `{function}`: durable journal write failed earlier \
+             under CHIDORI_DURABILITY=strict: {failure}"
+        );
     }
 
     let host_operation = operation_kind.map(|kind| {
@@ -91,10 +102,14 @@ pub fn execute_durable_json_call_at_seq(
             Ok(result)
         }
         Err(err) => {
-            let message = err.to_string();
-            if message.contains(PAUSE_MARKER) {
-                return Err(anyhow::anyhow!(message));
+            // A pause is control flow, not a failure: don't record or reject
+            // anything, just keep unwinding. Re-type it here so everything
+            // upstream can downcast — the interrupt may arrive as a plain
+            // string when the effect ran on the other side of the JS engine.
+            if let Some(interrupt) = RunInterrupt::from_error(&err) {
+                return Err(anyhow::Error::new(interrupt));
             }
+            let message = err.to_string();
             if let Some(id) = host_operation {
                 ctx.reject_host_operation(id, message.clone())?;
             }
@@ -124,9 +139,35 @@ fn replay_completed_host_operation(
     kind: PendingHostOperationKind,
     args: &Value,
 ) -> Result<Option<Value>> {
-    let Some(record) = ctx.completed_host_operation(seq, kind, args) else {
+    let Some(record) = ctx.completed_host_operation(seq, kind) else {
         return Ok(None);
     };
+
+    // A completed operation exists at this (seq, kind) but was recorded with
+    // different arguments: the agent code (or its inputs) changed since the
+    // recording. Historically this silently fell through to a live
+    // re-execution of the side effect — surface it as a divergence instead,
+    // unless the operator explicitly opted into the lax behavior.
+    if !crate::runtime::snapshot::completed_args_match(&record.operation.args, args) {
+        if crate::runtime::context::replay_lax() {
+            tracing::warn!(
+                "replay divergence at seq {seq} tolerated (CHIDORI_REPLAY_LAX=1): completed \
+                 `{function}` was recorded with different arguments; re-executing live"
+            );
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "Replay divergence at seq {}: completed `{}` was recorded with arguments {} but the \
+             agent now calls it with {}.{} The agent code (or its inputs/configuration) changed \
+             since the checkpoint was saved — re-run without replay to regenerate, or set \
+             CHIDORI_REPLAY_LAX=1 to tolerate argument drift and re-execute the effect live.",
+            seq,
+            function,
+            crate::runtime::context::truncate_json_for_error(&record.operation.args),
+            crate::runtime::context::truncate_json_for_error(args),
+            crate::runtime::context::describe_args_divergence(&record.operation.args, args)
+        );
+    }
 
     match record.state {
         HostPromiseState::Resolved {
@@ -194,7 +235,7 @@ fn host_operation_kind(function: &str) -> Option<PendingHostOperationKind> {
         "http" => Some(PendingHostOperationKind::Http),
         "template" => Some(PendingHostOperationKind::Template),
         "memory" => Some(PendingHostOperationKind::Memory),
-        "checkpoint" => Some(PendingHostOperationKind::Checkpoint),
+        "mark" => Some(PendingHostOperationKind::Checkpoint),
         "log" => Some(PendingHostOperationKind::Log),
         "signal" | "poll_signal" | "signal_any" => Some(PendingHostOperationKind::Signal),
         _ => None,
@@ -207,17 +248,42 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("input requires string prompt"))?
         .to_string();
+    // Author-declared options (`type`, `choices`, `default`, `details`).
+    // Behavioral only: the durable shapes below stay normalized to
+    // `{"prompt"}` so existing checkpoints and pending-operation records
+    // replay unchanged.
+    let default_answer = args
+        .get("opts")
+        .and_then(|o| o.get("default"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // `details` is the artifact under review — a draft, a diff, a report —
+    // shown to the human alongside the question so an approval gate is never
+    // blind. Rendered by the CLI and carried on the server's pending state;
+    // never part of the durable record shape.
+    let details = args
+        .get("opts")
+        .and_then(|o| o.get("details"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let normalized = json!({ "prompt": prompt });
     let seq = ctx.next_seq();
+    // Both the live paths and the server's synthetic resume record store the
+    // normalized `{"prompt"}` shape, so that is what divergence compares.
     if let Some(record) = ctx
-        .try_replay_checked(seq, "input", None)
+        .try_replay_checked(seq, "input", &normalized)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
     }
 
-    if let Some(result) =
-        replay_completed_host_operation(ctx, seq, "input", PendingHostOperationKind::Input, args)?
-    {
+    if let Some(result) = replay_completed_host_operation(
+        ctx,
+        seq,
+        "input",
+        PendingHostOperationKind::Input,
+        &normalized,
+    )? {
         return Ok(result);
     }
 
@@ -225,15 +291,34 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         seq,
         PendingHostOperationKind::Input,
         Some("input".to_string()),
-        args.clone(),
+        normalized.clone(),
     );
     ctx.run_host_operation_safepoint(host_operation)?;
     match ctx.input_mode() {
         InputMode::Stdin => {
+            if let Some(ref details) = details {
+                eprintln!("--- details ---\n{details}\n---------------");
+            }
             eprintln!("{}", prompt);
             let mut line = String::new();
-            std::io::stdin().read_line(&mut line)?;
-            let response = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+            let bytes_read = std::io::stdin().read_line(&mut line)?;
+            let mut response = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+            // An empty answer — blank enter, or EOF in a non-interactive run —
+            // takes the author-declared default. EOF with no default is an
+            // error: silently proceeding with "" would send the agent down a
+            // branch the author never chose.
+            if response.is_empty() {
+                if let Some(default) = default_answer {
+                    response = default;
+                } else if bytes_read == 0 {
+                    anyhow::bail!(
+                        "input() reached end-of-file on stdin with no `default` declared \
+                         (prompt: {prompt:?}). Provide an answer on stdin, declare a \
+                         `default` in the input options, or run under `chidori serve` \
+                         where input() pauses the session instead."
+                    );
+                }
+            }
             ctx.resolve_host_operation(host_operation, Value::String(response.clone()))?;
             ctx.record_call(CallRecord {
                 seq,
@@ -250,11 +335,48 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
             Ok(Value::String(response))
         }
         InputMode::Pause => {
+            // Warm resume (server flow): keep the LIVE VM parked on this
+            // thread and wait for the response instead of unwinding — the
+            // continuation costs O(1) rather than an O(history) replay
+            // re-execution. Durability is unchanged: the pending op is
+            // already on disk (begin + safepoint above), so a crash while
+            // parked resumes by replay exactly as an unwound pause would,
+            // and `Park` (eviction / capacity / no supervisor) falls back
+            // to that path immediately. The record written here is the
+            // same one the replay path's synthetic injection produces.
+            if let Some(bridge) = ctx.warm_input_bridge() {
+                let pending = PendingInput {
+                    seq,
+                    prompt: prompt.clone(),
+                    details: details.clone(),
+                };
+                match bridge.wait(ctx, &pending) {
+                    WarmInputWait::Delivered(response) => {
+                        let result = Value::String(response);
+                        ctx.resolve_host_operation(host_operation, result.clone())?;
+                        ctx.record_call(CallRecord {
+                            seq,
+                            parent_seq: None,
+                            function: "input".to_string(),
+                            args: json!({ "prompt": prompt }),
+                            result: result.clone(),
+                            duration_ms: 0,
+                            token_usage: None,
+                            timestamp: Utc::now(),
+                            error: None,
+                        });
+                        ctx.run_host_operation_completion_safepoint(host_operation)?;
+                        return Ok(result);
+                    }
+                    WarmInputWait::Park => {}
+                }
+            }
             ctx.set_pending_input(PendingInput {
                 seq,
                 prompt: prompt.clone(),
+                details,
             });
-            Err(anyhow::anyhow!("{PAUSE_MARKER}: {prompt}"))
+            Err(anyhow::Error::new(RunInterrupt::Input { prompt }))
         }
     }
 }
@@ -281,10 +403,10 @@ fn signal_names(args: &Value) -> Result<Vec<String>> {
                 .map(|v| v.as_str().map(str::to_string))
                 .collect::<Option<Vec<_>>>()
         })
-        .ok_or_else(|| anyhow::anyhow!("chidori.signalAny requires an array of names"))?
-        .ok_or_else(|| anyhow::anyhow!("chidori.signalAny names must all be strings"))?;
+        .ok_or_else(|| anyhow::anyhow!("chidori.signal fan-in requires an array of names"))?
+        .ok_or_else(|| anyhow::anyhow!("chidori.signal fan-in names must all be strings"))?;
     if names.is_empty() {
-        anyhow::bail!("chidori.signalAny requires at least one name");
+        anyhow::bail!("chidori.signal fan-in requires at least one name");
     }
     Ok(names)
 }
@@ -330,15 +452,106 @@ pub fn signal_timeout_sentinel(names: &[String]) -> Value {
 ///      WITHOUT pausing, recording the `{name,payload,from}` result;
 ///   4. otherwise PAUSE: set `PendingSignal` and bail with `PAUSE_MARKER` (the
 ///      pause *type* is distinguished from `input` by which pending slot is set).
+///
 /// The durable match key is `{ "name": name }` only — the payload is unknown at
 /// pause time and rides in the result.
+///
+/// Resolve a signal-family listen point in place: mark the host op resolved,
+/// append the journal record (the same shape a queued drain, a server-side
+/// synthetic resolution, or a timeout sentinel produces), and run the
+/// completion safepoint. Shared by the queued-inbox hit, the actor inline
+/// wait, and the inline timeout.
+fn settle_signal_listen(
+    ctx: &RuntimeContext,
+    host_operation: crate::runtime::snapshot::HostOperationId,
+    seq: u64,
+    function: &str,
+    match_args: Value,
+    result: Value,
+) -> Result<Value> {
+    ctx.resolve_host_operation(host_operation, result.clone())?;
+    ctx.record_call(CallRecord {
+        seq,
+        parent_seq: None,
+        function: function.to_string(),
+        args: match_args,
+        result: result.clone(),
+        duration_ms: 0,
+        token_usage: None,
+        timestamp: Utc::now(),
+        error: None,
+    });
+    ctx.run_host_operation_completion_safepoint(host_operation)?;
+    Ok(result)
+}
+
+/// Actor fast path for a listen point whose inbox is empty: block in place
+/// for the next matching delivery on the actor's shared mailbox instead of
+/// parking the actor and re-executing its whole history per message (the
+/// O(messages²) supervision loop). Returns `Some(result)` when the wait
+/// settled the listen point inline (message or timeout sentinel); `None` when
+/// the actor should park through the ordinary pause path (stop/idle), or when
+/// no waiter is installed (non-actor contexts).
+fn actor_inline_signal_wait(
+    ctx: &RuntimeContext,
+    host_operation: crate::runtime::snapshot::HostOperationId,
+    seq: u64,
+    function: &str,
+    names: &[String],
+    timeout_ms: Option<u64>,
+    match_args: &Value,
+) -> Result<Option<Value>> {
+    let Some(waiter) = ctx.actor_signal_waiter() else {
+        return Ok(None);
+    };
+    match waiter.wait(names, timeout_ms) {
+        ActorSignalWait::Delivered => {
+            // The waiter observed a matching message in the shared mailbox;
+            // pump it into the run-level inbox and drain through the same
+            // path a pre-queued signal takes (ordering + durable-inbox
+            // semantics included).
+            crate::runtime::host_actor::pump_own_mailbox(ctx);
+            if let Some(queued) = ctx.take_queued_signal_any(names) {
+                let result = json!({
+                    "name": queued.name,
+                    "payload": queued.payload,
+                    "from": queued.from,
+                });
+                return settle_signal_listen(
+                    ctx,
+                    host_operation,
+                    seq,
+                    function,
+                    match_args.clone(),
+                    result,
+                )
+                .map(Some);
+            }
+            // Defensive: the drain missed (should not happen — the actor
+            // thread is the mailbox's only consumer). Park via the pause
+            // path, which handles it exactly as an empty mailbox.
+            Ok(None)
+        }
+        ActorSignalWait::TimedOut => settle_signal_listen(
+            ctx,
+            host_operation,
+            seq,
+            function,
+            match_args.clone(),
+            signal_timeout_sentinel(names),
+        )
+        .map(Some),
+        ActorSignalWait::Park => Ok(None),
+    }
+}
+
 pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let name = signal_name("signal", args)?;
     let match_args = json!({ "name": name });
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "signal", Some(&match_args))
+        .try_replay_checked(seq, "signal", &match_args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -384,17 +597,30 @@ pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         return Ok(result);
     }
 
+    let names = vec![name.clone()];
+    if let Some(result) = actor_inline_signal_wait(
+        ctx,
+        host_operation,
+        seq,
+        "signal",
+        &names,
+        signal_timeout_ms(args),
+        &match_args,
+    )? {
+        return Ok(result);
+    }
+
     ctx.set_pending_signal(PendingSignal {
         seq,
         name: name.clone(),
-        names: vec![name.clone()],
+        names,
         timeout_ms: signal_timeout_ms(args),
         id: host_operation,
     });
-    Err(anyhow::anyhow!("{PAUSE_MARKER}: signal {name}"))
+    Err(anyhow::Error::new(RunInterrupt::Signal { name }))
 }
 
-/// `chidori.signalAny(names, opts)` — the fan-in listen point (`docs/signals.md`
+/// `chidori.signal(names[], opts)` — the fan-in listen point (`docs/signals.md`
 /// §6.1): pause until ANY of the named signals is delivered (or one is already
 /// queued). Same shape as `execute_signal` with the match key `{ "names":
 /// [...] }` and function name `"signal_any"`. The result is the bare consumed
@@ -407,7 +633,7 @@ pub fn execute_signal_any(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "signal_any", Some(&match_args))
+        .try_replay_checked(seq, "signal_any", &match_args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -453,15 +679,26 @@ pub fn execute_signal_any(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         return Ok(result);
     }
 
-    let joined = names.join(", ");
+    if let Some(result) = actor_inline_signal_wait(
+        ctx,
+        host_operation,
+        seq,
+        "signal_any",
+        &names,
+        signal_timeout_ms(args),
+        &match_args,
+    )? {
+        return Ok(result);
+    }
+
     ctx.set_pending_signal(PendingSignal {
         seq,
         name: names[0].clone(),
-        names,
+        names: names.clone(),
         timeout_ms: signal_timeout_ms(args),
         id: host_operation,
     });
-    Err(anyhow::anyhow!("{PAUSE_MARKER}: signalAny [{joined}]"))
+    Err(anyhow::Error::new(RunInterrupt::SignalAny { names }))
 }
 
 /// `chidori.pollSignal(name)` — non-blocking signal consumption (`docs/signals.md`
@@ -477,7 +714,7 @@ pub fn execute_poll_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> 
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "poll_signal", Some(&match_args))
+        .try_replay_checked(seq, "poll_signal", &match_args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -537,6 +774,7 @@ pub fn execute_poll_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> 
 ///      `{cached: false}` — the binding runs the callback and reports its
 ///      result through [`execute_step_end`], which writes the record at this
 ///      same `seq`.
+///
 /// While the step is live, every other host effect is refused (the dispatchers
 /// check `active_step_name`), so the callback is guaranteed pure compute and
 /// skipping it on replay cannot desynchronize the journal. Steps never pause
@@ -557,7 +795,7 @@ pub fn execute_step_begin(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "step", None)
+        .try_replay_checked(seq, "step", &json!({ "name": name }))
         .map_err(|err| anyhow::anyhow!(err))?
     {
         let recorded_name = record
@@ -779,6 +1017,29 @@ fn complete_prompt_from_local_cache(
     Ok(())
 }
 
+/// Surface a hard-to-see failure mode: a response cut off by the output-token
+/// cap. `chidori.prompt()` returns a bare string, so without this the
+/// truncation is invisible — the cut-off text flows on as if complete.
+/// Reasoning models make this likely: hidden reasoning spends the same
+/// `maxTokens` budget before any visible output.
+fn warn_if_truncated(response: &LlmResponse, seq: u64, max_tokens: u64) {
+    if matches!(response.stop_reason.as_str(), "length" | "max_tokens") {
+        eprintln!(
+            "chidori: warning: prompt (seq {seq}) hit the {max_tokens}-token output cap \
+             (stop reason `{}`) — the response is truncated mid-generation. Raise \
+             `maxTokens` in the prompt options; reasoning models also spend this budget \
+             on hidden reasoning before visible output.",
+            response.stop_reason
+        );
+        tracing::warn!(
+            seq,
+            max_tokens,
+            stop_reason = %response.stop_reason,
+            "prompt response truncated at the output-token cap"
+        );
+    }
+}
+
 pub fn execute_prompt_text(
     ctx: &RuntimeContext,
     providers: &ProviderRegistry,
@@ -790,7 +1051,7 @@ pub fn execute_prompt_text(
     apply_model_override(ctx, &mut request);
     let seq = ctx.next_seq();
     if let Some(record) = ctx
-        .try_replay_checked(seq, "prompt", Some(&args))
+        .try_replay_checked(seq, "prompt", &args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -828,6 +1089,7 @@ pub fn execute_prompt_text(
 
     match response {
         Ok(response) => {
+            warn_if_truncated(&response, seq, request.max_tokens);
             if crate::runtime::prompt_cache::enabled() {
                 crate::runtime::prompt_cache::store(
                     &prompt_request_digest(&request),
@@ -881,7 +1143,7 @@ pub fn execute_prompt_response(
     apply_model_override(ctx, &mut request);
     let seq = ctx.next_seq();
     if let Some(record) = ctx
-        .try_replay_checked(seq, "prompt", Some(&args))
+        .try_replay_checked(seq, "prompt", &args)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return llm_response_from_json(&record.result).ok_or_else(|| {
@@ -922,6 +1184,7 @@ pub fn execute_prompt_response(
 
     match response {
         Ok(response) => {
+            warn_if_truncated(&response, seq, request.max_tokens);
             let result = llm_response_to_json(&response);
             if crate::runtime::prompt_cache::enabled() {
                 crate::runtime::prompt_cache::store(&prompt_request_digest(&request), &result);
@@ -1000,20 +1263,26 @@ fn send_prompt_request(
 }
 
 pub fn llm_response_to_json(response: &LlmResponse) -> Value {
-    json!({
+    let mut value = json!({
         "content": response.content,
         "blocks": response.blocks,
-        "tool_calls": response.tool_calls.iter().map(|call| json!({
+        "toolCalls": response.tool_calls.iter().map(|call| json!({
             "id": call.id,
             "name": call.name,
             "input": call.input,
         })).collect::<Vec<_>>(),
-        "stop_reason": response.stop_reason,
-        "input_tokens": response.input_tokens,
-        "output_tokens": response.output_tokens,
-        "cache_creation_tokens": response.cache_creation_tokens,
-        "cache_read_tokens": response.cache_read_tokens,
-    })
+        "stopReason": response.stop_reason,
+        "inputTokens": response.input_tokens,
+        "outputTokens": response.output_tokens,
+        "cacheCreationTokens": response.cache_creation_tokens,
+        "cacheReadTokens": response.cache_read_tokens,
+    });
+    // Only present for reasoning models; omitted otherwise so existing
+    // checkpoints and consumers see an unchanged shape.
+    if let Some(ref reasoning) = response.reasoning {
+        value["reasoning"] = json!(reasoning);
+    }
+    value
 }
 
 pub fn llm_response_from_json(value: &Value) -> Option<LlmResponse> {
@@ -1021,7 +1290,7 @@ pub fn llm_response_from_json(value: &Value) -> Option<LlmResponse> {
         content: value.get("content")?.as_str()?.to_string(),
         blocks: serde_json::from_value::<Vec<ContentBlock>>(value.get("blocks")?.clone()).ok()?,
         tool_calls: value
-            .get("tool_calls")?
+            .get("toolCalls")?
             .as_array()?
             .iter()
             .filter_map(|call| {
@@ -1032,22 +1301,25 @@ pub fn llm_response_from_json(value: &Value) -> Option<LlmResponse> {
                 })
             })
             .collect(),
-        stop_reason: value.get("stop_reason")?.as_str()?.to_string(),
-        input_tokens: value.get("input_tokens")?.as_u64()?,
-        output_tokens: value.get("output_tokens")?.as_u64()?,
-        // Absent in records written before prompt caching existed.
+        stop_reason: value.get("stopReason")?.as_str()?.to_string(),
+        input_tokens: value.get("inputTokens")?.as_u64()?,
+        output_tokens: value.get("outputTokens")?.as_u64()?,
         cache_creation_tokens: value
-            .get("cache_creation_tokens")
+            .get("cacheCreationTokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
         cache_read_tokens: value
-            .get("cache_read_tokens")
+            .get("cacheReadTokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        reasoning: value
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
-pub fn execute_memory(args: &Value) -> Result<Value> {
+pub fn execute_memory(base: &std::path::Path, args: &Value) -> Result<Value> {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
     let namespace = args
         .get("namespace")
@@ -1057,7 +1329,7 @@ pub fn execute_memory(args: &Value) -> Result<Value> {
     let value = args.get("value").filter(|value| !value.is_null());
     let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
 
-    execute_memory_action(action, namespace, key, value, prefix)
+    execute_memory_action(base, action, namespace, key, value, prefix)
 }
 
 pub fn execute_template(template_engine: &TemplateEngine, args: &Value) -> Result<Value> {
@@ -1149,6 +1421,37 @@ const DEFAULT_USER_AGENT: &str = concat!(
     " (+https://github.com/ThousandBirdsInc/chidori)",
 );
 
+/// The process-wide HTTP client for the `http`/`fetch` host effect. Building
+/// a `reqwest::Client` loads TLS roots and allocates a fresh connection pool
+/// (~7 ms measured in `benches/runtime.rs`), and a per-call client also means
+/// a fresh TCP+TLS handshake for every fetch — so it is built once and
+/// shared; repeat fetches to the same host reuse pooled connections. The
+/// default User-Agent is applied per request (not here) so callers can still
+/// override it.
+fn http_client() -> Result<reqwest::Client> {
+    use std::sync::OnceLock;
+
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    // `gzip(true)` (with the reqwest `gzip` feature) sends Accept-Encoding
+    // and transparently decompresses gzipped response bodies, so tools get
+    // readable text instead of a binary blob.
+    //
+    // The SSRF guard is baked into the client: the guarded DNS resolver
+    // filters non-public addresses at resolution time (so DNS rebinding and
+    // redirect hops are covered by the same check the connector dials from),
+    // and the redirect policy re-validates each hop's scheme and IP-literal
+    // host. See `runtime::ssrf`.
+    let built = reqwest::Client::builder()
+        .gzip(true)
+        .dns_resolver(crate::runtime::ssrf::dns_resolver())
+        .redirect(crate::runtime::ssrf::redirect_policy())
+        .build()?;
+    Ok(CLIENT.get_or_init(|| built).clone())
+}
+
 /// Rewrite `url` to the per-agent Mock Gateway when its host is listed in the
 /// `CHIDORI_INTEGRATION_BASE_URLS` env map (`{host: "http://127.0.0.1:port/__mock/<id>"}`),
 /// preserving path and query. Returns `None` (no rewrite) when the env var is
@@ -1187,6 +1490,24 @@ fn rewrite_to_override(
         parsed.path(),
         query
     ))
+}
+
+/// Render an error with its full source chain. reqwest's `Display` truncates
+/// the chain (a blocked destination shows up as just "error sending request"),
+/// but the guest needs the root cause — e.g. the SSRF guard's policy message —
+/// to act on the failure.
+fn error_chain_string(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !rendered.contains(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        source = cause.source();
+    }
+    rendered
 }
 
 pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<Value> {
@@ -1243,6 +1564,15 @@ fn execute_app_data_with_config(
         .filter(|value| !value.is_null())
         .cloned()
         .unwrap_or_else(|| json!([]));
+
+    // The endpoint is host-injected config (typically loopback agent-builder),
+    // so exempt its host from the SSRF guard before issuing the request.
+    if let Some(host) = url::Url::parse(&cfg.endpoint)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+    {
+        crate::runtime::ssrf::trust_host(&host);
+    }
 
     // The bearer is a placeholder; the secret broker substitutes the real
     // per-run token inside `execute_http`, locked to the endpoint's host.
@@ -1321,6 +1651,14 @@ fn execute_http_with_secrets(
     // substitute into a mock request (and in test mode none are injected
     // anyway). See app-agent-builder docs/design/mock-integrations-test-mode.md.
     if let Some(rewritten) = apply_base_url_override(&url) {
+        // The rewrite target is host-injected config (the loopback mock
+        // gateway), so exempt it from the SSRF guard before requesting.
+        if let Some(host) = url::Url::parse(&rewritten)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        {
+            crate::runtime::ssrf::trust_host(&host);
+        }
         url = rewritten;
     }
 
@@ -1366,25 +1704,30 @@ fn execute_http_with_secrets(
         }
     }
 
+    // SSRF pre-flight: reject non-http(s) schemes and blocked IP-literal
+    // destinations up front with a policy error (hostname destinations are
+    // checked by the guarded resolver at connect time, against the exact
+    // addresses the connector dials — see `runtime::ssrf`). An unparseable
+    // URL is left for reqwest to reject with its usual builder error.
+    if let Ok(parsed) = url::Url::parse(&url) {
+        crate::runtime::ssrf::preflight(&parsed).map_err(|message| anyhow::anyhow!(message))?;
+    }
+
     let caller_set_user_agent = headers
         .as_ref()
         .is_some_and(|map| map.keys().any(|key| key.eq_ignore_ascii_case("user-agent")));
 
     tokio_rt.block_on(async move {
-        // `gzip(true)` (with the reqwest `gzip` feature) sends Accept-Encoding
-        // and transparently decompresses gzipped response bodies, so tools get
-        // readable text instead of a binary blob.
-        let mut client_builder = reqwest::Client::builder().gzip(true);
+        let client = http_client()?;
+        let request_method =
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+        let mut req = client.request(request_method, &url);
         // Only install the default UA when the caller hasn't named their own —
         // reqwest's `header()` appends rather than replaces, so setting both
         // would put two User-Agent headers on the wire.
         if !caller_set_user_agent {
-            client_builder = client_builder.user_agent(DEFAULT_USER_AGENT);
+            req = req.header(reqwest::header::USER_AGENT, DEFAULT_USER_AGENT);
         }
-        let client = client_builder.build().map_err(|err| anyhow::anyhow!(err))?;
-        let request_method =
-            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-        let mut req = client.request(request_method, &url);
 
         if let Some(headers) = headers {
             for (name, value) in headers {
@@ -1433,13 +1776,13 @@ fn execute_http_with_secrets(
             Ok(resp) => resp,
             Err(err) => {
                 if err.is_builder() {
-                    return Err(anyhow::anyhow!(secrets.redact(&err.to_string())));
+                    return Err(anyhow::anyhow!(secrets.redact(&error_chain_string(&err))));
                 }
                 return Ok(json!({
                     "status": 0,
                     "headers": {},
                     "body": null,
-                    "error": secrets.redact(&err.to_string()),
+                    "error": secrets.redact(&error_chain_string(&err)),
                 }));
             }
         };
@@ -1465,7 +1808,7 @@ fn execute_http_with_secrets(
             }
         };
         let text = secrets.redact(&String::from_utf8_lossy(&bytes));
-        let body = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text));
+        let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
 
         Ok(json!({
             "status": status,
@@ -1492,6 +1835,9 @@ mod tests {
     /// address so the test can point `AppDataConfig::endpoint` at it.
     fn canned_http_endpoint(status: &'static str, body: &'static str) -> std::net::SocketAddr {
         use std::io::{Read, Write};
+        // Tests exercise the real http effect against loopback fixtures, which
+        // the SSRF guard would otherwise block.
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1614,7 +1960,7 @@ mod tests {
             seq: 1,
             parent_seq: None,
             function: "template".to_string(),
-            args: json!({ "template": "ignored", "vars": {} }),
+            args: json!({ "template": "{{ value }}", "vars": {} }),
             result: json!("cached"),
             duration_ms: 1,
             token_usage: None,
@@ -1626,13 +1972,51 @@ mod tests {
         let result = execute_durable_json_call(
             &ctx,
             "template",
-            json!({ "template": "{{ broken", "vars": {} }),
+            json!({ "template": "{{ value }}", "vars": {} }),
             || anyhow::bail!("live path should not run"),
         )
         .unwrap();
 
         assert_eq!(result, json!("cached"));
         assert_eq!(ctx.call_log().into_records().len(), 1);
+    }
+
+    #[test]
+    fn durable_json_call_arg_mismatch_is_a_divergence_error() {
+        // Same function name, different args: historically the cached result
+        // was served anyway (the divergence check compared name only). That
+        // silently paired cached results with changed code — it must now be a
+        // hard replay-divergence error.
+        let replay = vec![CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "template".to_string(),
+            args: json!({ "template": "recorded", "vars": {} }),
+            result: json!("cached"),
+            duration_ms: 1,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        }];
+        let ctx = RuntimeContext::with_replay(replay);
+
+        let err = execute_durable_json_call(
+            &ctx,
+            "template",
+            json!({ "template": "changed", "vars": {} }),
+            || anyhow::bail!("live path should not run on divergence"),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("Replay divergence"),
+            "expected divergence error, got: {message}"
+        );
+        assert!(
+            message.contains("CHIDORI_REPLAY_LAX"),
+            "error should name the escape hatch, got: {message}"
+        );
     }
 
     #[test]
@@ -1723,17 +2107,61 @@ mod tests {
         );
 
         let replay_ctx = RuntimeContext::with_replay(records);
-        let replayed = execute_native_tool_call(
-            &replay_ctx,
-            &registry,
-            "echo",
-            json!({ "value": "different live args" }),
-        )
-        .unwrap();
+        let replayed =
+            execute_native_tool_call(&replay_ctx, &registry, "echo", json!({ "value": 42 }))
+                .unwrap();
 
         assert_eq!(replayed, json!({ "value": 42 }));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(replay_ctx.call_log().into_records().len(), 1);
+    }
+
+    #[test]
+    fn completed_host_operation_arg_mismatch_is_a_divergence_error() {
+        // A completed host operation exists at (seq, kind) but was recorded
+        // with different arguments. Historically this silently fell through to
+        // a live re-execution of the side effect — it must now surface as a
+        // replay-divergence error naming the escape hatch.
+        let recorded_args = json!({ "name": "echo", "kwargs": { "value": 42 } });
+        let records = vec![HostPromiseRecord {
+            operation: PendingHostOperation::new(
+                HostOperationId(1),
+                1,
+                PendingHostOperationKind::Tool,
+                recorded_args,
+            ),
+            state: HostPromiseState::Resolved {
+                value: json!({ "value": 42 }),
+                completed_at: Utc::now(),
+            },
+        }];
+        let ctx = RuntimeContext::with_replay_and_host_promises(Vec::new(), records);
+
+        let live_ran = std::cell::Cell::new(false);
+        let err = execute_durable_json_call(
+            &ctx,
+            "tool",
+            json!({ "name": "echo", "kwargs": { "value": 43 } }),
+            || {
+                live_ran.set(true);
+                Ok(json!({ "value": 43 }))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            !live_ran.get(),
+            "the side effect must not silently re-execute live on arg mismatch"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("Replay divergence"),
+            "expected divergence error, got: {message}"
+        );
+        assert!(
+            message.contains("CHIDORI_REPLAY_LAX"),
+            "error should name the escape hatch, got: {message}"
+        );
     }
 
     #[test]
@@ -1963,6 +2391,7 @@ mod tests {
 
     #[test]
     fn execute_http_returns_status_zero_for_transport_error() {
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let tokio_rt = tokio::runtime::Runtime::new().unwrap();
         let result = execute_http(
             &tokio_rt,
@@ -1974,7 +2403,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["status"], json!(0));
-        assert!(result["error"].as_str().unwrap_or_default().len() > 0);
+        assert!(!result["error"].as_str().unwrap_or_default().is_empty());
         assert!(result["headers"].as_object().unwrap().is_empty());
         assert!(result["body"].is_null());
     }
@@ -1986,6 +2415,9 @@ mod tests {
     /// surface a transport error.
     async fn one_shot_http_capture() -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Tests exercise the real http effect against loopback fixtures, which
+        // the SSRF guard would otherwise block.
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}/ua-check");
@@ -2177,6 +2609,7 @@ mod tests {
     #[test]
     fn execute_http_redacts_echoed_secret_from_response() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        crate::runtime::ssrf::trust_host("127.0.0.1");
         let tokio_rt = tokio::runtime::Runtime::new().unwrap();
         let (url, server) = tokio_rt.block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2216,15 +2649,89 @@ mod tests {
     }
 
     #[test]
+    fn execute_http_blocks_metadata_ip_literal() {
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let err = execute_http(
+            &tokio_rt,
+            &json!({ "url": "http://169.254.169.254/latest/meta-data/", "method": "GET" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("SSRF protection"), "{err}");
+        assert!(err.contains("CHIDORI_HTTP_ALLOW_HOSTS"), "{err}");
+    }
+
+    #[test]
+    fn execute_http_blocks_hostname_resolving_to_loopback() {
+        // `localhost` resolves to a loopback address; the guarded resolver
+        // must refuse it even though `127.0.0.1` is trusted by other tests
+        // under its own (distinct) host key.
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let result = execute_http(
+            &tokio_rt,
+            &json!({ "url": "http://localhost:9/ssrf-check", "method": "GET" }),
+        )
+        .unwrap();
+        assert_eq!(result["status"], json!(0));
+        let err = result["error"].as_str().unwrap_or_default();
+        assert!(err.contains("SSRF protection"), "{err}");
+    }
+
+    #[test]
+    fn execute_http_blocks_redirect_to_private_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        crate::runtime::ssrf::trust_host("127.0.0.1");
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let url = tokio_rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://10.0.0.1/internal\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            });
+            format!("http://{addr}/redirect")
+        });
+        let result = execute_http(&tokio_rt, &json!({ "url": url, "method": "GET" })).unwrap();
+        assert_eq!(result["status"], json!(0));
+        let err = result["error"].as_str().unwrap_or_default();
+        assert!(err.contains("SSRF protection"), "{err}");
+    }
+
+    #[test]
+    fn execute_http_rejects_non_http_scheme() {
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let err = execute_http(
+            &tokio_rt,
+            &json!({ "url": "file:///etc/passwd", "method": "GET" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("scheme"), "{err}");
+    }
+
+    #[test]
     fn durable_json_call_pause_leaves_pending_host_operation_unrecorded() {
         let ctx = RuntimeContext::new();
+        // Raise the pause as a bare wire string, the shape it has after a JS
+        // round trip, so this also exercises the `from_message` fallback and
+        // the immediate re-typing in the dispatch error path.
         let err =
             execute_durable_json_call(&ctx, "tool", json!({ "name": "ask", "kwargs": {} }), || {
-                anyhow::bail!("{PAUSE_MARKER}: approval required")
+                anyhow::bail!(
+                    "{}: approval required",
+                    crate::runtime::errors::PAUSE_MARKER
+                )
             })
             .unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert!(err.downcast_ref::<RunInterrupt>().is_some());
         let pending = ctx.pending_host_operations();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, PendingHostOperationKind::Tool);
@@ -2332,14 +2839,15 @@ mod tests {
         ));
         let ctx = RuntimeContext::new();
         let run_dir = ctx.enable_persistence(base.clone());
-        let table_path = run_dir.join(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE);
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let completion_events = events.clone();
-        let completion_table_path = table_path.clone();
+        let completion_run_dir = run_dir.clone();
         ctx.set_host_operation_completion_safepoint(HostOperationCompletionSafepoint::new(
             move |record| {
-                let records: Vec<HostPromiseRecord> =
-                    serde_json::from_slice(&std::fs::read(&completion_table_path)?)?;
+                // The resolved state must be durable (per-op blob ∪ table)
+                // by the time the completion safepoint observes it.
+                let store = crate::runtime::store::FsRunStore::new(&completion_run_dir);
+                let records = crate::runtime::snapshot::load_host_promise_records(&store)?;
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].operation.id, record.operation.id);
                 assert!(matches!(
@@ -2506,7 +3014,12 @@ mod tests {
 
         let err = execute_input(&ctx, &json!({ "prompt": "Approve?" })).unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert_eq!(
+            RunInterrupt::from_error(&err),
+            Some(RunInterrupt::Input {
+                prompt: "Approve?".to_string()
+            })
+        );
         let pending = ctx.pending_host_operations();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, PendingHostOperationKind::Input);
@@ -2529,7 +3042,12 @@ mod tests {
 
         let err = execute_signal(&ctx, &json!({ "name": "review", "opts": null })).unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert_eq!(
+            RunInterrupt::from_error(&err),
+            Some(RunInterrupt::Signal {
+                name: "review".to_string()
+            })
+        );
         // The pending host op carries kind Signal and the name-only match key.
         let pending = ctx.pending_host_operations();
         assert_eq!(pending.len(), 1);
@@ -2738,7 +3256,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert!(RunInterrupt::from_error(&err).is_some());
         let pending = ctx.take_pending_signal().expect("pending signal set");
         assert_eq!(pending.timeout_ms, Some(1500));
         assert_eq!(pending.listen_names(), vec!["review".to_string()]);
@@ -2755,7 +3273,12 @@ mod tests {
         let err = execute_signal_any(&ctx, &json!({ "names": ["review", "steer"], "opts": null }))
             .unwrap_err();
 
-        assert!(err.to_string().contains(PAUSE_MARKER));
+        assert_eq!(
+            RunInterrupt::from_error(&err),
+            Some(RunInterrupt::SignalAny {
+                names: vec!["review".to_string(), "steer".to_string()]
+            })
+        );
         let pending = ctx.pending_host_operations();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, PendingHostOperationKind::Signal);
@@ -2840,6 +3363,89 @@ mod tests {
 
         let err = execute_signal_any(&ctx, &json!({ "names": null, "opts": null })).unwrap_err();
         assert!(err.to_string().contains("requires an array of names"));
+    }
+
+    /// The actor inline wait settles a listen point in place — message
+    /// consumed, journal record appended, NO pause — so a signal-driven actor
+    /// never re-executes its history per message.
+    #[test]
+    fn actor_inline_wait_settles_listen_point_without_pausing() {
+        let ctx = RuntimeContext::new();
+        let waiter_ctx = ctx.clone();
+        ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
+            move |names, _timeout_ms| {
+                // Simulate a delivery landing while the listen point waits.
+                waiter_ctx.enqueue_live_signal(&names[0], json!({ "n": 1 }), json!("tester"));
+                crate::runtime::context::ActorSignalWait::Delivered
+            },
+        ));
+        let result = execute_signal(&ctx, &json!({ "name": "go" })).unwrap();
+        assert_eq!(result["name"], json!("go"));
+        assert_eq!(result["payload"], json!({ "n": 1 }));
+        assert!(ctx.take_pending_signal().is_none(), "must not pause");
+        let log = ctx.call_log().into_records();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].function, "signal");
+        assert_eq!(log[0].result, result);
+    }
+
+    /// An inline wait that hits the listen point's own timeout resolves with
+    /// the sentinel in place — the same record the parked path's synthetic
+    /// injection produces, so replay is indistinguishable.
+    #[test]
+    fn actor_inline_wait_timeout_resolves_sentinel_inline() {
+        let ctx = RuntimeContext::new();
+        ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
+            |_names, timeout_ms| {
+                assert_eq!(timeout_ms, Some(5), "listen timeout must reach the waiter");
+                crate::runtime::context::ActorSignalWait::TimedOut
+            },
+        ));
+        let result =
+            execute_signal(&ctx, &json!({ "name": "go", "opts": { "timeoutMs": 5 } })).unwrap();
+        assert_eq!(result, signal_timeout_sentinel(&["go".to_string()]));
+        assert!(ctx.take_pending_signal().is_none(), "must not pause");
+        let log = ctx.call_log().into_records();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].function, "signal");
+    }
+
+    /// `Park` (stop requested / idle cap) falls back to the ordinary pause
+    /// path unchanged — pending signal set, PAUSE_MARKER raised.
+    #[test]
+    fn actor_inline_wait_park_falls_back_to_pause() {
+        let ctx = RuntimeContext::new();
+        ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
+            |_names, _timeout_ms| crate::runtime::context::ActorSignalWait::Park,
+        ));
+        let err = execute_signal(&ctx, &json!({ "name": "go" })).unwrap_err();
+        assert!(RunInterrupt::from_error(&err).is_some());
+        let pending = ctx
+            .take_pending_signal()
+            .expect("pause path must set pending");
+        assert_eq!(pending.names, vec!["go".to_string()]);
+    }
+
+    /// The fan-in listen point takes the same inline path, draining whichever
+    /// name the delivery matched.
+    #[test]
+    fn actor_inline_wait_settles_signal_any() {
+        let ctx = RuntimeContext::new();
+        let waiter_ctx = ctx.clone();
+        ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
+            move |names, _timeout_ms| {
+                assert_eq!(names.len(), 2);
+                waiter_ctx.enqueue_live_signal(&names[1], json!("payload-b"), json!(null));
+                crate::runtime::context::ActorSignalWait::Delivered
+            },
+        ));
+        let result = execute_signal_any(&ctx, &json!({ "names": ["a", "b"] })).unwrap();
+        assert_eq!(result["name"], json!("b"));
+        assert_eq!(result["payload"], json!("payload-b"));
+        assert!(ctx.take_pending_signal().is_none());
+        let log = ctx.call_log().into_records();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].function, "signal_any");
     }
 
     #[test]

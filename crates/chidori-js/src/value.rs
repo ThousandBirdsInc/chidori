@@ -32,7 +32,12 @@ pub struct JsString(Repr);
 #[derive(Clone)]
 enum Repr {
     /// No unpaired surrogate: the bytes are valid UTF-8 (== the legacy model).
-    Utf8(Rc<str>),
+    /// The `Cell` caches the UTF-16 code-unit count ([`UNITS_UNKNOWN`] until
+    /// first computed by `len_utf16`), so repeated `.length` reads are O(1)
+    /// and — because `units == byte len` iff the string is pure ASCII —
+    /// `code_unit_at` can index bytes directly on the overwhelmingly common
+    /// ASCII case instead of walking the prefix per access.
+    Utf8(Rc<str>, std::cell::Cell<u32>),
     /// Contains ≥1 unpaired surrogate. `bytes` is well-formed WTF-8; `lossy`
     /// is the U+FFFD-replaced UTF-8 view that backs `as_str()` (and the host
     /// boundary); `units` is the exact UTF-16 code-unit count.
@@ -67,7 +72,18 @@ struct Rope {
 /// Minimum combined size before `concat` builds a rope node instead of
 /// copying. Below this, an eager copy is cheaper than the node + eventual
 /// flatten bookkeeping, and short-string behavior stays exactly as before.
-const ROPE_MIN_BYTES: usize = 64;
+pub(crate) const ROPE_MIN_BYTES: usize = 64;
+
+/// Sentinel for a `Repr::Utf8` whose code-unit count has not been computed
+/// yet. Safe: [`MAX_STRING_LEN`] (2^28 units) keeps every real count far
+/// below `u32::MAX`.
+const UNITS_UNKNOWN: u32 = u32::MAX;
+
+/// A fresh `Utf8` arm with its unit count not yet computed. O(1) — callers on
+/// hot paths (bytecode constant loads) must not pay a scan here.
+fn utf8_repr(s: Rc<str>) -> Repr {
+    Repr::Utf8(s, std::cell::Cell::new(UNITS_UNKNOWN))
+}
 
 thread_local! {
     /// Shared empty backing for [`Rope`]'s iterative `Drop` (placeholder the
@@ -83,7 +99,7 @@ impl Rope {
         let mut stack: Vec<&JsString> = vec![&self.right, &self.left];
         while let Some(part) = stack.pop() {
             match &part.0 {
-                Repr::Utf8(s) => out.push_str(s),
+                Repr::Utf8(s, _) => out.push_str(s),
                 Repr::Rope(r) => match r.flat.get() {
                     Some(f) => out.push_str(f),
                     None => {
@@ -104,7 +120,7 @@ impl Drop for Rope {
     fn drop(&mut self) {
         let empty = EMPTY_RC_STR.with(|e| e.clone());
         let take =
-            |slot: &mut JsString| std::mem::replace(slot, JsString(Repr::Utf8(empty.clone())));
+            |slot: &mut JsString| std::mem::replace(slot, JsString(utf8_repr(empty.clone())));
         let mut stack = vec![take(&mut self.left), take(&mut self.right)];
         while let Some(part) = stack.pop() {
             if let Repr::Rope(r) = part.0 {
@@ -155,21 +171,23 @@ impl JsString {
     /// Build from valid UTF-8 (the source of nearly every string: literals,
     /// number/JSON conversions, host input). Always the cheap `Utf8` arm.
     pub fn new(s: impl AsRef<str>) -> Self {
-        JsString(Repr::Utf8(Rc::from(s.as_ref())))
+        JsString(utf8_repr(Rc::from(s.as_ref())))
     }
     /// Adopt an existing `Rc<str>` without reallocating — used for bytecode
     /// string-constant loads, which are a hot path.
     pub fn from_rc_str(s: Rc<str>) -> Self {
-        JsString(Repr::Utf8(s))
+        JsString(utf8_repr(s))
     }
     /// Build from a UTF-16 code-unit sequence, re-pairing adjacent surrogates.
     /// Takes the `Utf8` arm when the result is well-formed.
     pub fn from_code_units(units: &[u16]) -> Self {
         if crate::wtf8::is_well_formed(units) {
-            // Well-formed ⇒ `from_utf16` cannot fail.
-            JsString(Repr::Utf8(Rc::from(
-                String::from_utf16_lossy(units).as_str(),
-            )))
+            // Well-formed ⇒ `from_utf16` cannot fail. The unit count is the
+            // input length — record it rather than rediscovering it later.
+            JsString(Repr::Utf8(
+                Rc::from(String::from_utf16_lossy(units).as_str()),
+                std::cell::Cell::new(units.len() as u32),
+            ))
         } else {
             let bytes = crate::wtf8::encode_wtf8(units);
             let lossy = crate::wtf8::to_string_lossy(&bytes);
@@ -187,7 +205,7 @@ impl JsString {
     /// preserve surrogates use the code-unit API instead.
     pub fn as_str(&self) -> &str {
         match &self.0 {
-            Repr::Utf8(s) => s,
+            Repr::Utf8(s, _) => s,
             Repr::Wtf8(w) => &w.lossy,
             Repr::Rope(r) => r.flat.get_or_init(|| {
                 let mut out = String::with_capacity(r.bytes);
@@ -200,7 +218,7 @@ impl JsString {
     /// engine's string-size guard on every concatenation.
     pub fn byte_len(&self) -> usize {
         match &self.0 {
-            Repr::Utf8(s) => s.len(),
+            Repr::Utf8(s, _) => s.len(),
             Repr::Wtf8(w) => w.bytes.len(),
             Repr::Rope(r) => r.bytes,
         }
@@ -208,29 +226,49 @@ impl JsString {
     /// Canonical well-formed WTF-8 bytes — the basis for equality and hashing.
     pub fn wtf8_bytes(&self) -> &[u8] {
         match &self.0 {
-            Repr::Utf8(s) => s.as_bytes(),
+            Repr::Utf8(s, _) => s.as_bytes(),
             Repr::Wtf8(w) => &w.bytes,
             // A rope is well-formed UTF-8; observing its bytes flattens once.
             Repr::Rope(_) => self.as_str().as_bytes(),
         }
     }
-    /// Length in UTF-16 code units (the JS `.length`). O(n) for the `Utf8`
-    /// arm — same cost as the previous code-point `.length`.
+    /// Length in UTF-16 code units (the JS `.length`). O(n) once for the
+    /// `Utf8` arm, then served from the per-handle cache — an `s.length`
+    /// read in a loop condition must not rescan the string per iteration.
     pub fn len_utf16(&self) -> usize {
         match &self.0 {
-            Repr::Utf8(s) => s.chars().map(|c| c.len_utf16()).sum(),
+            Repr::Utf8(s, units) => {
+                let cached = units.get();
+                if cached != UNITS_UNKNOWN {
+                    return cached as usize;
+                }
+                let n: usize = s.chars().map(|c| c.len_utf16()).sum();
+                units.set(n as u32);
+                n
+            }
             Repr::Wtf8(w) => w.units as usize,
             Repr::Rope(r) => r.units,
         }
     }
-    /// The UTF-16 code unit at index `i`, or `None` if out of range.
+    /// The UTF-16 code unit at index `i`, or `None` if out of range. O(1) for
+    /// pure-ASCII strings (unit count == byte count ⇔ every unit is one
+    /// ASCII byte); O(i) otherwise. The `charCodeAt`-class builtins loop over
+    /// this, so the ASCII case must not walk the prefix per call.
     pub fn code_unit_at(&self, i: usize) -> Option<u16> {
-        self.code_units().nth(i)
+        match &self.0 {
+            Repr::Utf8(s, units) if units.get() as usize == s.len() => {
+                s.as_bytes().get(i).map(|&b| b as u16)
+            }
+            Repr::Rope(r) if r.units == r.bytes => {
+                self.as_str().as_bytes().get(i).map(|&b| b as u16)
+            }
+            _ => self.code_units().nth(i),
+        }
     }
     /// Iterate the UTF-16 code units.
     pub fn code_units(&self) -> CodeUnits<'_> {
         match &self.0 {
-            Repr::Utf8(s) => CodeUnits::Utf8(s.encode_utf16()),
+            Repr::Utf8(s, _) => CodeUnits::Utf8(s.encode_utf16()),
             Repr::Wtf8(w) => CodeUnits::Wtf8(crate::wtf8::decode_units(&w.bytes)),
             Repr::Rope(_) => CodeUnits::Utf8(self.as_str().encode_utf16()),
         }
@@ -256,15 +294,35 @@ impl JsString {
     }
     /// `true` if the string contains no unpaired surrogate.
     pub fn is_well_formed(&self) -> bool {
-        matches!(self.0, Repr::Utf8(_) | Repr::Rope(_))
+        matches!(self.0, Repr::Utf8(..) | Repr::Rope(_))
     }
     /// Replace every unpaired surrogate with U+FFFD (`String.prototype.toWellFormed`).
     pub fn to_well_formed(&self) -> JsString {
         match &self.0 {
-            Repr::Utf8(_) | Repr::Rope(_) => self.clone(),
+            Repr::Utf8(..) | Repr::Rope(_) => self.clone(),
             Repr::Wtf8(w) => JsString::new(&*w.lossy),
         }
     }
+    /// The borrowed UTF-8 view IF this is a plain (non-rope, well-formed)
+    /// string — O(1), never flattens a rope. `None` for ropes and WTF-8.
+    pub fn as_flat_utf8(&self) -> Option<&str> {
+        match &self.0 {
+            Repr::Utf8(s, _) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The flat UTF-8 view of a well-formed string, FLATTENING a rope on
+    /// first use (the copy is cached in the rope node, so repeated calls —
+    /// a kernel's per-access reads — are O(1)). `None` for WTF-8 strings.
+    pub fn flatten_utf8(&self) -> Option<&str> {
+        match &self.0 {
+            Repr::Utf8(s, _) => Some(s),
+            Repr::Rope(_) => Some(self.as_str()),
+            Repr::Wtf8(_) => None,
+        }
+    }
+
     /// Concatenate, preserving code units. Two well-formed strings concatenate
     /// as plain UTF-8; otherwise we route through code units so a high+low
     /// surrogate straddling the boundary re-pairs into one astral code point.
@@ -274,7 +332,7 @@ impl JsString {
             // enough to matter; eager copy below the threshold (small-string
             // behavior unchanged, no node overhead). This turns the
             // `s += chunk` build loop from O(total²) into O(total).
-            (Repr::Utf8(_) | Repr::Rope(_), Repr::Utf8(_) | Repr::Rope(_)) => {
+            (Repr::Utf8(..) | Repr::Rope(_), Repr::Utf8(..) | Repr::Rope(_)) => {
                 let (lb, rb) = (self.byte_len(), other.byte_len());
                 if lb == 0 {
                     return other.clone();
@@ -296,7 +354,7 @@ impl JsString {
                 let mut s = String::with_capacity(lb + rb);
                 s.push_str(self.as_str());
                 s.push_str(other.as_str());
-                JsString(Repr::Utf8(Rc::from(s.as_str())))
+                JsString(utf8_repr(Rc::from(s.as_str())))
             }
             _ => {
                 let mut units = self.to_utf16_vec();
@@ -314,7 +372,7 @@ impl PartialEq for JsString {
         // usually compare a clone of the very same allocation. Content equality
         // is unchanged — `ptr_eq` can only confirm, never deny.
         match (&self.0, &other.0) {
-            (Repr::Utf8(a), Repr::Utf8(b)) if Rc::ptr_eq(a, b) => true,
+            (Repr::Utf8(a, _), Repr::Utf8(b, _)) if Rc::ptr_eq(a, b) => true,
             (Repr::Wtf8(a), Repr::Wtf8(b)) if Rc::ptr_eq(a, b) => true,
             (Repr::Rope(a), Repr::Rope(b)) if Rc::ptr_eq(a, b) => true,
             _ => self.wtf8_bytes() == other.wtf8_bytes(),
@@ -339,7 +397,7 @@ impl From<&str> for JsString {
 }
 impl From<String> for JsString {
     fn from(s: String) -> Self {
-        JsString(Repr::Utf8(Rc::from(s.as_str())))
+        JsString(utf8_repr(Rc::from(s.as_str())))
     }
 }
 
@@ -618,7 +676,11 @@ impl PropertyKey {
         PropertyKey::Str(JsString::new(s))
     }
     pub fn from_index(i: u32) -> PropertyKey {
-        PropertyKey::Str(JsString::new(i.to_string()))
+        // Stack-format the digits so the key costs one allocation (the
+        // `Rc<str>`), not two — this runs per element in `own_keys` and the
+        // array builtins' generic paths.
+        let mut buf = [0u8; 10];
+        PropertyKey::Str(JsString::new(fmt_index(i, &mut buf)))
     }
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -644,14 +706,22 @@ impl fmt::Debug for PropertyKey {
 }
 
 /// Upper bound on eager dense-array allocation. Beyond this, length operations
-/// throw `RangeError` rather than allocating (we use dense storage, not sparse).
-pub const MAX_DENSE_ARRAY: usize = 1_000_000;
+/// throw `RangeError` rather than allocating (we use dense storage, not
+/// sparse). Sized to match V8's fast-array ceiling (32M elements — beyond it
+/// V8 switches to dictionary mode, which we don't have): real programs like
+/// `new Array(2e6)` or `a[2_000_000] = x` must succeed, while a hostile
+/// `new Array(2**32 - 1)` still fails loudly (~768 MiB at 24-byte slots is
+/// the worst case a script can demand per allocation).
+pub const MAX_DENSE_ARRAY: usize = 1 << 25; // 33.5M elements
 
 /// Upper bound on a single eager string allocation (`repeat`, `padStart`/
-/// `padEnd`, …). Beyond this, those builtins throw `RangeError` *before*
-/// allocating, so a hostile/conformance input (`"a".repeat(2**33)`) cannot OOM
-/// the process. Well above any legitimate string a program builds.
-pub const MAX_STRING_LEN: usize = 1 << 24; // 16M code units
+/// `padEnd`, concatenation, …). Beyond this, those operations throw
+/// `RangeError` *before* allocating, so a hostile/conformance input
+/// (`"a".repeat(2**33)`, a doubling loop) cannot OOM the process. Sized near
+/// V8's own string ceiling (2^29 - 24 units) so legitimate large strings —
+/// multi-hundred-MB JSON payloads, log accumulations — succeed; the unit
+/// count also must stay far below `u32::MAX` (see `UNITS_UNKNOWN`).
+pub const MAX_STRING_LEN: usize = 1 << 28; // 268M code units
 
 /// Canonical numeric index per spec `CanonicalNumericIndexString` restricted to
 /// array indices (used for ordering and array fast-paths).
@@ -712,15 +782,13 @@ pub fn protos_allow_index_create(proto: Option<JsObject>, idx: u32, count: u32) 
             // String character slots, mapped Arguments, …) own their [[Set]].
             _ => return false,
         }
-        if !b.props.is_empty() {
-            if b.props.contains_key(&StrKeyRef(first)) {
+        if !b.own_is_empty() {
+            if b.own_contains_key(&StrKeyRef(first)) {
                 return false;
             }
             for j in 1..count {
                 let mut buf = [0u8; 10];
-                if b.props
-                    .contains_key(&StrKeyRef(fmt_index(idx + j, &mut buf)))
-                {
+                if b.own_contains_key(&StrKeyRef(fmt_index(idx + j, &mut buf))) {
                     return false;
                 }
             }
@@ -748,7 +816,7 @@ pub fn protos_allow_any_index_create(start: &JsObject) -> bool {
             Internal::Ordinary | Internal::Array(_) => {}
             _ => return false,
         }
-        if !b.props.is_empty() && b.props.keys().any(|k| k.array_index().is_some()) {
+        if !b.own_is_empty() && b.own_keys_iter().any(|k| k.array_index().is_some()) {
             return false;
         }
         let next = b.proto.clone();
@@ -821,9 +889,158 @@ impl Property {
     }
 }
 
+/// Ordinary own-property storage (see docs/js-object-shapes-design.md §3.1).
+///
+/// `Shaped` is the append-only common case: the [`Shape`] holds the shared,
+/// insertion-ordered key list and `slots[i]` holds the full [`Property`] for
+/// the key at chain depth `i`. Keeping whole `Property` values in the slots
+/// (rather than bare values) means attribute mutation and accessor
+/// properties need NO demotion — the shape encodes key ORDER only, so the
+/// only edges that demote are the order-destroying ones (`delete`) and
+/// integer-key spam (see [`Shape::can_append`]). `Dict` is today's map,
+/// verbatim: the battle-tested path every demoted object falls back to
+/// (objects never re-promote), and the birth mode for exotics/intrinsics.
+///
+/// Mode is unobservable: enumeration order is insertion order in both.
+pub(crate) enum PropStorage {
+    Shaped {
+        shape: Rc<crate::shape::Shape>,
+        slots: Vec<Property>,
+    },
+    Dict(crate::fxhash::FxIndexMap<PropertyKey, Property>),
+}
+
+impl Default for PropStorage {
+    fn default() -> Self {
+        PropStorage::Dict(crate::fxhash::FxIndexMap::default())
+    }
+}
+
+/// Chain length up to which shaped iteration steps positions in place
+/// (`key_at` per step: O(len²) parent hops total, ZERO allocation) rather
+/// than pre-collecting the key list. Stringify/own-keys enumerate every
+/// object per pass, so the per-object `Vec` was a measurable slice of
+/// `json_stringify`; the 2–8 key records that dominate stay alloc-free and
+/// genuinely wide objects pay one collect instead of O(len²) hops.
+const ITER_WALK_MAX: usize = 16;
+
+/// Iterator over own properties in insertion order, across both storage
+/// modes (see [`ObjectData::own_iter`]).
+pub enum OwnIter<'a> {
+    Dict(indexmap::map::Iter<'a, PropertyKey, Property>),
+    /// Positional stepping over a short shaped chain (alloc-free).
+    Shaped {
+        shape: &'a crate::shape::Shape,
+        slots: &'a [Property],
+        pos: u32,
+    },
+    /// Pre-collected keys for a wide shaped chain.
+    ShapedWide {
+        keys: std::vec::IntoIter<&'a PropertyKey>,
+        slots: std::slice::Iter<'a, Property>,
+    },
+}
+
+impl<'a> Iterator for OwnIter<'a> {
+    type Item = (&'a PropertyKey, &'a Property);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            OwnIter::Dict(it) => it.next(),
+            OwnIter::Shaped { shape, slots, pos } => {
+                let i = *pos as usize;
+                let prop = slots.get(i)?;
+                *pos += 1;
+                Some((shape.key_at(i as u32).expect("slot in range"), prop))
+            }
+            OwnIter::ShapedWide { keys, slots } => Some((keys.next()?, slots.next()?)),
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            OwnIter::Dict(it) => it.size_hint(),
+            OwnIter::Shaped { slots, pos, .. } => {
+                let n = slots.len().saturating_sub(*pos as usize);
+                (n, Some(n))
+            }
+            OwnIter::ShapedWide { keys, .. } => keys.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for OwnIter<'_> {}
+
+/// Iterator over own property keys in insertion order, across both storage
+/// modes (see [`ObjectData::own_keys_iter`]).
+pub enum OwnKeys<'a> {
+    Dict(indexmap::map::Keys<'a, PropertyKey, Property>),
+    /// Positional stepping over a short shaped chain (alloc-free).
+    Shaped {
+        shape: &'a crate::shape::Shape,
+        pos: u32,
+        len: u32,
+    },
+    /// Pre-collected keys for a wide shaped chain.
+    ShapedWide(std::vec::IntoIter<&'a PropertyKey>),
+}
+
+impl<'a> Iterator for OwnKeys<'a> {
+    type Item = &'a PropertyKey;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            OwnKeys::Dict(it) => it.next(),
+            OwnKeys::Shaped { shape, pos, len } => {
+                if pos < len {
+                    let k = shape.key_at(*pos).expect("slot in range");
+                    *pos += 1;
+                    Some(k)
+                } else {
+                    None
+                }
+            }
+            OwnKeys::ShapedWide(it) => it.next(),
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            OwnKeys::Dict(it) => it.size_hint(),
+            OwnKeys::Shaped { pos, len, .. } => {
+                let n = (*len - *pos) as usize;
+                (n, Some(n))
+            }
+            OwnKeys::ShapedWide(it) => it.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for OwnKeys<'_> {}
+
+/// Owning iterator over property values (see
+/// [`ObjectData::take_props_values`]).
+pub enum PropsIntoValues {
+    Dict(indexmap::map::IntoValues<PropertyKey, Property>),
+    Slots(std::vec::IntoIter<Property>),
+}
+
+impl Iterator for PropsIntoValues {
+    type Item = Property;
+    #[inline]
+    fn next(&mut self) -> Option<Property> {
+        match self {
+            PropsIntoValues::Dict(it) => it.next(),
+            PropsIntoValues::Slots(it) => it.next(),
+        }
+    }
+}
+
 pub struct ObjectData {
     pub proto: Option<JsObject>,
-    pub props: crate::fxhash::FxIndexMap<PropertyKey, Property>,
+    /// The ordinary own-property storage. Private to this module: every other
+    /// part of the engine goes through the `own_*` accessor API below, so the
+    /// backing representation can vary (shaped vs dictionary) without the
+    /// 300+ call sites knowing.
+    props: PropStorage,
     pub extensible: bool,
     pub internal: Internal,
     /// The spec `[[PrivateElements]]` list, keyed by [`PrivateName::id`].
@@ -837,25 +1054,372 @@ impl ObjectData {
     pub fn new(proto: Option<JsObject>, internal: Internal) -> Self {
         ObjectData {
             proto,
-            props: crate::fxhash::FxIndexMap::default(),
+            props: PropStorage::default(),
             extensible: true,
             internal,
             privates: None,
         }
     }
+
+    /// A plain object born in shaped mode: `root` is the realm's empty root
+    /// shape. Costs nothing until the first insert (no table, no slot vec
+    /// allocation).
+    pub fn new_shaped(proto: Option<JsObject>, root: Rc<crate::shape::Shape>) -> Self {
+        ObjectData {
+            proto,
+            props: PropStorage::Shaped {
+                shape: root,
+                slots: Vec::new(),
+            },
+            extensible: true,
+            internal: Internal::Ordinary,
+            privates: None,
+        }
+    }
+
+    /// A plain object born shaped at a KNOWN shape with its slots pre-built
+    /// (object-literal template instantiation). `slots.len()` must equal
+    /// `shape.len()`.
+    pub fn new_shaped_with(
+        proto: Option<JsObject>,
+        shape: Rc<crate::shape::Shape>,
+        slots: Vec<Property>,
+    ) -> Self {
+        debug_assert_eq!(slots.len(), shape.len());
+        ObjectData {
+            proto,
+            props: PropStorage::Shaped { shape, slots },
+            extensible: true,
+            internal: Internal::Ordinary,
+            privates: None,
+        }
+    }
+
     pub fn private_get(&self, id: u64) -> Option<&PrivateElement> {
         self.privates.as_ref().and_then(|p| p.get(&id))
+    }
+
+    /// Demote to dictionary mode: materialize the map from the shape chain +
+    /// slots, preserving insertion order. One-way — a demoted object never
+    /// re-promotes (docs §3.4). Idempotent; returns the map for follow-up
+    /// mutation.
+    fn demote(&mut self) -> &mut crate::fxhash::FxIndexMap<PropertyKey, Property> {
+        if matches!(self.props, PropStorage::Shaped { .. }) {
+            if let PropStorage::Shaped { shape, slots } = std::mem::take(&mut self.props) {
+                let mut map = crate::fxhash::FxIndexMap::with_capacity_and_hasher(
+                    slots.len() + 1,
+                    Default::default(),
+                );
+                for (k, p) in shape.keys_in_order().into_iter().zip(slots) {
+                    map.insert(k.clone(), p);
+                }
+                self.props = PropStorage::Dict(map);
+            }
+        }
+        match &mut self.props {
+            PropStorage::Dict(m) => m,
+            PropStorage::Shaped { .. } => unreachable!("just demoted"),
+        }
+    }
+
+    // =====================================================================
+    // Own-property accessor API (see docs/js-object-shapes-design.md §4,
+    // Phase 1). This is the ONLY way the rest of the engine touches the
+    // ordinary own-property storage; the map itself is module-private.
+    //
+    // The API mirrors `IndexMap`'s surface deliberately: the inline caches
+    // and the kernel prop machinery depend on stable insertion-order slot
+    // indices (`own_get_full` hands them out, `own_get_index[_mut]` uses
+    // them), and probes are generic over `Equivalent<PropertyKey>` so the
+    // alloc-free `StrKeyRef` guards keep working unchanged.
+    // =====================================================================
+
+    /// The own property for `key`, if present.
+    #[inline]
+    pub fn own_get<Q>(&self, key: &Q) -> Option<&Property>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        match &self.props {
+            PropStorage::Dict(m) => m.get(key),
+            PropStorage::Shaped { shape, slots } => {
+                shape.lookup(key).map(|slot| &slots[slot as usize])
+            }
+        }
+    }
+
+    /// Mutable access to the own property for `key`, if present.
+    #[inline]
+    pub fn own_get_mut<Q>(&mut self, key: &Q) -> Option<&mut Property>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        match &mut self.props {
+            PropStorage::Dict(m) => m.get_mut(key),
+            PropStorage::Shaped { shape, slots } => {
+                shape.lookup(key).map(|slot| &mut slots[slot as usize])
+            }
+        }
+    }
+
+    /// The own property for `key` with its insertion-order slot index (the
+    /// index the inline caches and kernel prop localization cache; it is
+    /// stable for the property's lifetime).
+    #[inline]
+    pub fn own_get_full<Q>(&self, key: &Q) -> Option<(usize, &PropertyKey, &Property)>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        match &self.props {
+            PropStorage::Dict(m) => m.get_full(key),
+            PropStorage::Shaped { shape, slots } => {
+                let (slot, k) = shape.lookup_full(key)?;
+                Some((slot as usize, k, &slots[slot as usize]))
+            }
+        }
+    }
+
+    /// Mutable variant of [`Self::own_get_full`].
+    #[inline]
+    pub fn own_get_full_mut<Q>(&mut self, key: &Q) -> Option<(usize, &PropertyKey, &mut Property)>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        match &mut self.props {
+            PropStorage::Dict(m) => m.get_full_mut(key),
+            PropStorage::Shaped { shape, slots } => {
+                let (slot, k) = shape.lookup_full(key)?;
+                Some((slot as usize, k, &mut slots[slot as usize]))
+            }
+        }
+    }
+
+    /// Whether an own property for `key` exists.
+    #[inline]
+    pub fn own_contains_key<Q>(&self, key: &Q) -> bool
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        match &self.props {
+            PropStorage::Dict(m) => m.contains_key(key),
+            PropStorage::Shaped { shape, .. } => shape.lookup(key).is_some(),
+        }
+    }
+
+    /// Insert (or replace, preserving insertion order) the own property for
+    /// `key`, returning the previous property if any — `IndexMap::insert`
+    /// semantics. Spec checks (extensibility, writability) are the CALLER's
+    /// job, exactly as with the raw map.
+    #[inline]
+    pub fn own_insert(&mut self, key: PropertyKey, prop: Property) -> Option<Property> {
+        match &mut self.props {
+            PropStorage::Dict(m) => return m.insert(key, prop),
+            PropStorage::Shaped { shape, slots } => {
+                if let Some(slot) = shape.lookup(&key) {
+                    // Replacing at an existing key keeps slot order in both
+                    // modes; the shape is unchanged.
+                    return Some(std::mem::replace(&mut slots[slot as usize], prop));
+                }
+                if crate::shape::Shape::can_append(&key, slots.len()) {
+                    let next = shape.transition(key);
+                    *shape = next;
+                    slots.push(prop);
+                    return None;
+                }
+            }
+        }
+        // Shaped, but the key must not join the transition tree
+        // (integer-index spam): fall to dictionary mode.
+        self.demote().insert(key, prop)
+    }
+
+    /// Remove the own property for `key`, preserving the insertion order of
+    /// the remaining properties (`shift_remove` semantics — enumeration
+    /// order is observable).
+    #[inline]
+    pub fn own_remove<Q>(&mut self, key: &Q) -> Option<Property>
+    where
+        Q: ?Sized + std::hash::Hash + indexmap::Equivalent<PropertyKey>,
+    {
+        if let PropStorage::Shaped { shape, .. } = &self.props {
+            // Deleting an absent key changes nothing: stay shaped. A hit
+            // shifts the slot indices of everything after it — the one edge
+            // shapes cannot represent — so demote first (docs §3.4).
+            shape.lookup(key)?;
+            self.demote();
+        }
+        match &mut self.props {
+            PropStorage::Dict(m) => m.shift_remove(key),
+            PropStorage::Shaped { .. } => unreachable!("demoted above"),
+        }
+    }
+
+    /// The current shape, when the storage is shaped (`None` in dictionary
+    /// mode). Shape identity (`Rc::ptr_eq`) pins the whole key layout — the
+    /// basis of the (shape, slot) inline caches (docs §3.3).
+    #[inline]
+    pub fn own_shape(&self) -> Option<&Rc<crate::shape::Shape>> {
+        match &self.props {
+            PropStorage::Shaped { shape, .. } => Some(shape),
+            PropStorage::Dict(_) => None,
+        }
+    }
+
+    /// The property at slot `i` WITHOUT retrieving its key — for
+    /// shape-verified cache hits, where shape identity already pins the key
+    /// at every slot.
+    #[inline]
+    pub fn own_prop_at(&self, i: usize) -> Option<&Property> {
+        match &self.props {
+            PropStorage::Shaped { slots, .. } => slots.get(i),
+            PropStorage::Dict(m) => m.get_index(i).map(|(_, p)| p),
+        }
+    }
+
+    /// Mutable variant of [`Self::own_prop_at`].
+    #[inline]
+    pub fn own_prop_at_mut(&mut self, i: usize) -> Option<&mut Property> {
+        match &mut self.props {
+            PropStorage::Shaped { slots, .. } => slots.get_mut(i),
+            PropStorage::Dict(m) => m.get_index_mut(i).map(|(_, p)| p),
+        }
+    }
+
+    /// The own property at insertion-order slot `i` (IC/kernel verification:
+    /// callers compare the returned key against the expected one).
+    #[inline]
+    pub fn own_get_index(&self, i: usize) -> Option<(&PropertyKey, &Property)> {
+        match &self.props {
+            PropStorage::Dict(m) => m.get_index(i),
+            PropStorage::Shaped { shape, slots } => Some((shape.key_at(i as u32)?, slots.get(i)?)),
+        }
+    }
+
+    /// Mutable variant of [`Self::own_get_index`].
+    #[inline]
+    pub fn own_get_index_mut(&mut self, i: usize) -> Option<(&PropertyKey, &mut Property)> {
+        match &mut self.props {
+            PropStorage::Dict(m) => m.get_index_mut(i),
+            PropStorage::Shaped { shape, slots } => {
+                Some((shape.key_at(i as u32)?, slots.get_mut(i)?))
+            }
+        }
+    }
+
+    /// Number of own properties in the ordinary storage.
+    #[inline]
+    pub fn own_len(&self) -> usize {
+        match &self.props {
+            PropStorage::Dict(m) => m.len(),
+            PropStorage::Shaped { slots, .. } => slots.len(),
+        }
+    }
+
+    /// `true` when the ordinary own-property storage is empty — the guard
+    /// every dense-array/exotic fast path checks ("nothing reified can
+    /// shadow").
+    #[inline]
+    pub fn own_is_empty(&self) -> bool {
+        match &self.props {
+            PropStorage::Dict(m) => m.is_empty(),
+            PropStorage::Shaped { slots, .. } => slots.is_empty(),
+        }
+    }
+
+    /// Iterate own properties in insertion order.
+    #[inline]
+    pub fn own_iter(&self) -> OwnIter<'_> {
+        match &self.props {
+            PropStorage::Dict(m) => OwnIter::Dict(m.iter()),
+            PropStorage::Shaped { shape, slots } if slots.len() <= ITER_WALK_MAX => {
+                OwnIter::Shaped {
+                    shape,
+                    slots,
+                    pos: 0,
+                }
+            }
+            PropStorage::Shaped { shape, slots } => OwnIter::ShapedWide {
+                keys: shape.keys_in_order().into_iter(),
+                slots: slots.iter(),
+            },
+        }
+    }
+
+    /// Iterate own property keys in insertion order.
+    #[inline]
+    pub fn own_keys_iter(&self) -> OwnKeys<'_> {
+        match &self.props {
+            PropStorage::Dict(m) => OwnKeys::Dict(m.keys()),
+            PropStorage::Shaped { shape, slots } if slots.len() <= ITER_WALK_MAX => {
+                OwnKeys::Shaped {
+                    shape,
+                    pos: 0,
+                    len: slots.len() as u32,
+                }
+            }
+            PropStorage::Shaped { shape, .. } => {
+                OwnKeys::ShapedWide(shape.keys_in_order().into_iter())
+            }
+        }
+    }
+
+    /// Pre-size the storage for `n` additional properties.
+    #[inline]
+    pub fn own_reserve(&mut self, n: usize) {
+        match &mut self.props {
+            PropStorage::Dict(m) => m.reserve(n),
+            PropStorage::Shaped { slots, .. } => slots.reserve(n),
+        }
+    }
+
+    /// Allocated capacity of the storage (0 ⇔ nothing allocated yet).
+    #[inline]
+    pub fn own_capacity(&self) -> usize {
+        match &self.props {
+            PropStorage::Dict(m) => m.capacity(),
+            PropStorage::Shaped { slots, .. } => slots.capacity(),
+        }
+    }
+
+    /// Drop every own property (GC edge-clearing).
+    #[inline]
+    pub fn own_clear(&mut self) {
+        match &mut self.props {
+            PropStorage::Dict(m) => m.clear(),
+            PropStorage::Shaped { shape, slots } => {
+                slots.clear();
+                *shape = shape.root();
+            }
+        }
+    }
+
+    /// Replace the whole storage with a pre-built map (object-literal
+    /// template instantiation).
+    #[inline]
+    pub fn set_props_map(&mut self, map: crate::fxhash::FxIndexMap<PropertyKey, Property>) {
+        self.props = PropStorage::Dict(map);
+    }
+
+    /// Take every own property VALUE, leaving the storage empty (teardown /
+    /// cycle breaking — the keys are not needed to break value edges, and a
+    /// shaped object must not pay a key-cloning dictionary materialization
+    /// just to be dropped).
+    #[inline]
+    pub fn take_props_values(&mut self) -> PropsIntoValues {
+        match std::mem::take(&mut self.props) {
+            PropStorage::Dict(m) => PropsIntoValues::Dict(m.into_values()),
+            PropStorage::Shaped { slots, .. } => PropsIntoValues::Slots(slots.into_iter()),
+        }
     }
     /// Does `props` hold a (reified) entry for the array index `idx`?
     /// Alloc-free: the index is formatted into a stack buffer and probed via
     /// [`StrKeyRef`], so hot fast-path guards can call this per element.
     pub fn has_index_prop(&self, idx: u32) -> bool {
-        if self.props.is_empty() {
+        if self.own_is_empty() {
             return false;
         }
         let mut buf = [0u8; 10];
-        self.props
-            .contains_key(&StrKeyRef(fmt_index(idx, &mut buf)))
+        self.own_contains_key(&StrKeyRef(fmt_index(idx, &mut buf)))
     }
     /// Append a private element; `false` (no insert) when `id` is already
     /// present — the caller's duplicate-initialization TypeError.
@@ -927,7 +1491,10 @@ pub enum Internal {
     /// expose collection and remain unsupported (determinism contract).
     WeakMap(crate::fxhash::FxIndexMap<MapKey, Value>),
     WeakSet(crate::fxhash::FxIndexMap<MapKey, ()>),
-    Promise(crate::vm::PromiseData),
+    /// Boxed: `PromiseData` is the largest inline payload (104 bytes) and
+    /// promises are allocation-rare next to plain objects — boxing it (and
+    /// `NamespaceData`) shrinks EVERY `ObjectData` by ~32 bytes.
+    Promise(Box<crate::vm::PromiseData>),
     Generator(crate::vm::GeneratorData),
     Date(f64),
     /// The `arguments` exotic object. For a MAPPED one (sloppy, simple
@@ -951,7 +1518,7 @@ pub enum Internal {
     /// `import()` result): null prototype, non-extensible, exports exposed as
     /// live {writable:true, enumerable:true, configurable:false} data
     /// properties whose [[Set]] always fails and whose [[Delete]] refuses.
-    ModuleNamespace(NamespaceData),
+    ModuleNamespace(Box<NamespaceData>),
     /// A `Temporal.*` object. The spec arithmetic lives in `temporal_rs`; the
     /// slot holds the immutable backing value (no JS references, so the GC
     /// treats it as a leaf).

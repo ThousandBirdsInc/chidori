@@ -44,16 +44,16 @@ impl Vm {
 
     /// Step an iterator: returns `Some(value)` or `None` when done.
     pub fn iterator_step(&mut self, it: &Value) -> Result<Option<Value>, Value> {
-        let next = self.get_prop(it, &PropertyKey::str("next"))?;
+        let next = self.get_prop(it, &crate::names::key_next())?;
         let res = self.call(next, it.clone(), &[])?;
         if !matches!(res, Value::Object(_)) {
             return Err(self.throw_type("iterator result is not an object"));
         }
-        let done = self.get_prop(&res, &PropertyKey::str("done"))?;
+        let done = self.get_prop(&res, &crate::names::key_done())?;
         if self.to_boolean(&done) {
             Ok(None)
         } else {
-            let value = self.get_prop(&res, &PropertyKey::str("value"))?;
+            let value = self.get_prop(&res, &crate::names::key_value())?;
             Ok(Some(value))
         }
     }
@@ -92,11 +92,8 @@ impl Vm {
         }
         let it = self.get_iterator(v)?;
         let mut out = Vec::new();
-        loop {
-            match self.iterator_step(&it)? {
-                Some(val) => out.push(val),
-                None => break,
-            }
+        while let Some(val) = self.iterator_step(&it)? {
+            out.push(val);
         }
         Ok(out)
     }
@@ -108,7 +105,7 @@ impl Vm {
         let sym = self.realm.symbol_iterator.clone();
         let key = PropertyKey::Sym(sym);
         let b = o.borrow();
-        if b.props.contains_key(&key) {
+        if b.own_contains_key(&key) {
             return false;
         }
         match &b.proto {
@@ -118,7 +115,7 @@ impl Vm {
     }
 
     pub fn iterator_close(&mut self, it: &Value) -> Result<(), Value> {
-        let ret = self.get_prop(it, &PropertyKey::str("return"))?;
+        let ret = self.get_prop(it, &crate::names::key_return())?;
         if self.is_callable(&ret) {
             let _ = self.call(ret, it.clone(), &[]);
         }
@@ -129,11 +126,9 @@ impl Vm {
     pub fn make_iter_result(&self, value: Value, done: bool) -> Value {
         let o = self.new_object();
         o.borrow_mut()
-            .props
-            .insert(PropertyKey::str("value"), Property::data(value));
+            .own_insert(crate::names::key_value(), Property::data(value));
         o.borrow_mut()
-            .props
-            .insert(PropertyKey::str("done"), Property::data(Value::Bool(done)));
+            .own_insert(crate::names::key_done(), Property::data(Value::Bool(done)));
         Value::Object(o)
     }
 
@@ -159,6 +154,17 @@ impl Vm {
 
     /// Advance a built-in iterator, returning an iterator-result object.
     pub fn builtin_iterator_next(&mut self, it: &JsObject) -> Result<Value, Value> {
+        Ok(match self.builtin_iterator_step(it)? {
+            Some(v) => self.make_iter_result(v, false),
+            None => self.make_iter_result(Value::Undefined, true),
+        })
+    }
+
+    /// Advance a built-in iterator, returning `Some(value)` or `None` when
+    /// done — the allocation-free core of [`builtin_iterator_next`].
+    /// `Op::IteratorStepValue` calls this directly when the loop's `next` is
+    /// the pinned canonical, skipping the `{value, done}` result object.
+    pub fn builtin_iterator_step(&mut self, it: &JsObject) -> Result<Option<Value>, Value> {
         // An Array* iterator over an array-like that is neither a dense array
         // nor a typed array (e.g. the `arguments` object): step it via generic
         // length/index reads, OUTSIDE the iterator borrow (the reads can run
@@ -193,14 +199,13 @@ impl Vm {
                 if let Internal::Iterator(st) = &mut it.borrow_mut().internal {
                     st.done = true;
                 }
-                return Ok(self.make_iter_result(Value::Undefined, true));
+                return Ok(None);
             }
             let v = self.get_index(&base, idx as u32)?;
             if let Internal::Iterator(st) = &mut it.borrow_mut().internal {
                 st.index += 1;
             }
-            let entry = self.iter_entry(kind, idx, v);
-            return Ok(self.make_iter_result(entry, false));
+            return Ok(Some(self.iter_entry(kind, idx, v)));
         }
         // %ArrayIterator%.next over a typed array re-validates the view each
         // step: a detached or out-of-bounds (shrunk resizable buffer) view is
@@ -208,14 +213,13 @@ impl Vm {
         let ta_oob = {
             let b = it.borrow();
             match &b.internal {
-                Internal::Iterator(st) if !st.done => {
-                    st.target
-                        .as_ref()
-                        .map_or(false, |t| match &t.borrow().internal {
-                            Internal::TypedArray(td) => crate::typed_array::ta_out_of_bounds(td),
-                            _ => false,
-                        })
-                }
+                Internal::Iterator(st) if !st.done => st.target.as_ref().is_some_and(|t| match &t
+                    .borrow()
+                    .internal
+                {
+                    Internal::TypedArray(td) => crate::typed_array::ta_out_of_bounds(td),
+                    _ => false,
+                }),
                 _ => false,
             }
         };
@@ -335,9 +339,41 @@ impl Vm {
             }
         };
         Ok(match out {
-            Out::Done => self.make_iter_result(Value::Undefined, true),
-            Out::Value(v) => self.make_iter_result(v, false),
+            Out::Done => None,
+            Out::Value(v) => Some(v),
         })
+    }
+
+    /// One sync for-of protocol round for `Op::IteratorStepValue`: `next` is
+    /// the iterator record's cached next method, `it` the iterator. Returns
+    /// `(value, done)` with `value == undefined` when done. When `next` is a
+    /// pinned canonical builtin-iterator `next` and `it` a builtin iterator,
+    /// the step runs inline with no call frame or result object; otherwise
+    /// the generic path performs exactly the observable sequence this op
+    /// replaced: `Call(next)`, the iterator-result type check, `Get(done)`,
+    /// and `Get(value)` only when not done.
+    pub fn iterator_step_value(&mut self, next: Value, it: Value) -> Result<(Value, bool), Value> {
+        if let (Value::Object(nf), Value::Object(io)) = (&next, &it) {
+            if matches!(io.borrow().internal, Internal::Iterator(_))
+                && self.realm.builtin_iter_next.iter().any(|c| nf.ptr_eq(c))
+            {
+                let io = io.clone();
+                return Ok(match self.builtin_iterator_step(&io)? {
+                    Some(v) => (v, false),
+                    None => (Value::Undefined, true),
+                });
+            }
+        }
+        let res = self.call(next, it, &[])?;
+        if !matches!(res, Value::Object(_)) {
+            return Err(self.throw_type("Iterator result is not an object"));
+        }
+        let done = self.get_prop(&res, &crate::names::key_done())?;
+        if self.to_boolean(&done) {
+            Ok((Value::Undefined, true))
+        } else {
+            Ok((self.get_prop(&res, &crate::names::key_value())?, false))
+        }
     }
 
     fn iter_entry(&self, kind: IterKind, index: usize, value: Value) -> Value {
@@ -363,15 +399,43 @@ impl Vm {
     }
 
     /// Collect enumerable string keys across the prototype chain for `for-in`,
-    /// in deterministic order, de-duplicated, skipping shadowed keys.
+    /// in deterministic order, de-duplicated, skipping shadowed keys. The
+    /// returned buffer comes from the Vm's `forin_pool` (`ForInPop` parks it
+    /// back) — a glue loop for-inning a fresh object per iteration reuses
+    /// one allocation instead of a malloc/free per loop entry.
     pub fn for_in_keys(&mut self, v: &Value) -> Result<Vec<JsString>, Value> {
-        let mut out: Vec<JsString> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out = self.forin_pool.pop().unwrap_or_default();
+        debug_assert!(out.is_empty());
         let obj = match v {
             Value::Object(o) => o.clone(),
             Value::Undefined | Value::Null => return Ok(out),
             _ => self.to_object(v)?,
         };
+        // FAST PATH — the overwhelmingly common shape: an ORDINARY receiver
+        // whose prototype chain CONTRIBUTES no enumerable string key (every
+        // standard prototype is fully non-enumerable). One object's own
+        // enumerable string keys are unique by construction, and a chain
+        // that contributes nothing makes shadowing irrelevant — so the
+        // shadow set and the per-level `own_keys` key-clone Vecs (together
+        // ~14% of glue-shaped workloads) are skipped entirely. Anything
+        // else — proxy, exotic index sources, an enumerable proto key —
+        // falls back to the generic walk below, unchanged.
+        if self.for_in_keys_fast(&obj, &mut out) {
+            return Ok(out);
+        }
+        out.clear();
+        // Dedup by `JsString` (an insert clones an `Rc`, not the bytes) under
+        // the deterministic Fx hasher — the std SipHash `HashSet<String>` it
+        // replaces paid a fresh `String` per key per chain level.
+        // `mutable_key_type` is a false positive: `JsString`'s interior
+        // `Cell` is a code-unit-count cache that participates in neither
+        // `Hash` nor `Eq` (both go through `wtf8_bytes`), the same contract
+        // the `props` maps already rely on.
+        #[allow(clippy::mutable_key_type)]
+        let mut seen: std::collections::HashSet<
+            JsString,
+            std::hash::BuildHasherDefault<crate::fxhash::FxHasher>,
+        > = Default::default();
         let mut cur = Some(obj);
         while let Some(o) = cur {
             if self.is_proxy(&o) {
@@ -379,7 +443,7 @@ impl Vm {
                 // `getOwnPropertyDescriptor` trap, prototype via `getPrototypeOf`.
                 for k in self.own_property_keys(&o)? {
                     if let PropertyKey::Str(s) = &k {
-                        if !seen.insert(s.as_str().to_string()) {
+                        if !seen.insert(s.clone()) {
                             continue; // shadowed by a nearer object
                         }
                         let desc = self.proxy_get_own_descriptor(&o, &k)?;
@@ -402,18 +466,108 @@ impl Vm {
                 continue;
             }
             for k in self.enumerable_own_string_keys(&o) {
-                if seen.insert(k.as_str().to_string()) {
+                if seen.insert(k.clone()) {
                     out.push(k);
                 }
             }
             // Record even non-enumerable own keys as "seen" so they shadow.
             for k in self.own_keys(&o) {
                 if let PropertyKey::Str(s) = k {
-                    seen.insert(s.as_str().to_string());
+                    seen.insert(s);
                 }
             }
             cur = o.borrow().proto.clone();
         }
         Ok(out)
+    }
+
+    /// Park a for-in enumerator's key buffer back in the pool (cleared —
+    /// the pool never extends a key's lifetime past the `ForInPop` that
+    /// parked it). Capacity-less buffers (empty enumerations that never
+    /// grew) and a full pool just drop.
+    pub(crate) fn park_forin_vec(&mut self, mut keys: Vec<JsString>) {
+        keys.clear();
+        if self.forin_pool.len() < 8 && keys.capacity() > 0 {
+            self.forin_pool.push(keys);
+        }
+    }
+
+    /// `for_in_keys`' allocation-free fast path, filling the caller's
+    /// (pooled) buffer. `true` iff the receiver is an ordinary object and NO
+    /// prototype-chain level contributes an enumerable string key — then
+    /// the receiver's own enumerable string keys (index-likes sorted first,
+    /// per `[[OwnPropertyKeys]]`) ARE the for-in keys, no shadow set
+    /// needed. `false` = use the generic walk (the caller clears the
+    /// buffer); the split is decided by the same facts that walk reads, so
+    /// both produce identical keys where this path applies.
+    fn for_in_keys_fast(&self, obj: &JsObject, out: &mut Vec<JsString>) -> bool {
+        let mut ints: Vec<u32> = Vec::new();
+        let proto = {
+            let b = obj.borrow();
+            // Ordinary receivers only: exotic internals (dense elements,
+            // string indices, typed arrays, proxies, namespace exports)
+            // synthesize own keys that live outside `props`.
+            if !matches!(b.internal, Internal::Ordinary) {
+                return false;
+            }
+            for (k, p) in b.own_iter() {
+                if let PropertyKey::Str(s) = k {
+                    // Internal-slot keys are non-enumerable by contract, so
+                    // `p.enumerable` alone excludes them, as on the generic
+                    // path.
+                    if !p.enumerable {
+                        continue;
+                    }
+                    match k.array_index() {
+                        Some(i) => ints.push(i),
+                        None => out.push(s.clone()),
+                    }
+                }
+            }
+            b.proto.clone()
+        };
+        // Index-like keys enumerate first, ascending (map keys are unique,
+        // so no dedup); the plain names keep insertion order after them.
+        if !ints.is_empty() {
+            ints.sort_unstable();
+            let mut merged: Vec<JsString> = Vec::with_capacity(ints.len() + out.len());
+            for i in ints {
+                match PropertyKey::from_index(i) {
+                    PropertyKey::Str(s) => merged.push(s),
+                    PropertyKey::Sym(_) => unreachable!("index keys are strings"),
+                }
+            }
+            merged.append(out);
+            std::mem::swap(out, &mut merged);
+        }
+        // The rest of the chain must contribute NOTHING: no enumerable
+        // string key in `props`, and no internal that synthesizes own
+        // enumerable keys. Any contribution (or a proxy, whose traps must
+        // run) sends the whole walk down the generic path.
+        let mut cur = proto;
+        while let Some(o) = cur {
+            let b = o.borrow();
+            match &b.internal {
+                Internal::Proxy(_)
+                | Internal::StringObj(_)
+                | Internal::TypedArray(_)
+                | Internal::ModuleNamespace(_) => return false,
+                // An EMPTY dense array (Array.prototype!) contributes only
+                // its non-enumerable `length`; any element is enumerable.
+                Internal::Array(arr) if arr.iter().any(|v| !matches!(v, Value::Hole)) => {
+                    return false;
+                }
+                _ => {}
+            }
+            for (k, p) in b.own_iter() {
+                if p.enumerable && matches!(k, PropertyKey::Str(_)) {
+                    return false;
+                }
+            }
+            let next = b.proto.clone();
+            drop(b);
+            cur = next;
+        }
+        true
     }
 }

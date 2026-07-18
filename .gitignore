@@ -22,14 +22,24 @@
 .claude/shell-snapshots/
 .claude/statsig/
 
-# Run artifacts and runtime state produced by `chidori run`
-# (kept out of source control)
+# Run artifacts and runtime state produced by `chidori run` / `chidori serve`
+# (kept out of source control; sessions.sqlite3* also matches SQLite -wal/-shm
+# sidecar files)
 .chidori/runs/
 .chidori/wasm-cache/
 .chidori/memory/
+.chidori/sessions.sqlite3*
 **/.chidori/runs/
 **/.chidori/wasm-cache/
 **/.chidori/memory/
+**/.chidori/sessions.sqlite3*
+# Durable run-store mirror (CHIDORI_RUN_STORE=sqlite) + SQLite sidecars
+.chidori/runs.sqlite3*
+**/.chidori/runs.sqlite3*
+# Workspace file store (chidori.workspace.write) + its generation manifest
+**/.generation/
+examples/*/RELEASE_NOTES.md
+examples/*/AUDIT.md
 
 # Python build/dist
 __pycache__/

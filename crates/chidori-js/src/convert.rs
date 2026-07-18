@@ -31,6 +31,50 @@ impl Vm {
         self.to_string_lossy(err)
     }
 
+    /// As [`Vm::error_to_string`], but when the thrown value carries frames
+    /// recorded during unwinding (see `Vm::record_unwind_frame`), append them —
+    /// multi-line `Name: message\n    at f (line:col)\n    at g (...)` output
+    /// for surfaces that show an uncaught error to a human. Values without
+    /// recorded frames render exactly as [`Vm::error_to_string`].
+    ///
+    /// The recorded frames are exactly the suffix appended after the stack's
+    /// creation-time head (`make_error` seeds `.stack` with `Name: message`),
+    /// so they are recovered by stripping that head — NOT by searching for
+    /// the first `\n    at `. The message itself may contain frame lines: a
+    /// nested tool/sub-agent error re-enters the awaiting engine as a new
+    /// `Error` whose message embeds the inner engine's rendered trace, and
+    /// the search-based cut re-appended those message frames after the head
+    /// that already showed them — the "same frame printed twice" bug. The
+    /// search remains only as the fallback for a `name`/`message` mutated
+    /// after creation (the head no longer prefixes the stack).
+    pub fn error_to_string_with_stack(&mut self, err: &Value) -> String {
+        let head = self.error_to_string(err);
+        if let Value::Object(o) = err {
+            let b = o.borrow();
+            if matches!(b.internal, Internal::Error) {
+                if let Some(prop) = b.own_get(&StrKeyRef("stack")) {
+                    if let PropertyKind::Data {
+                        value: Value::String(s),
+                        ..
+                    } = &prop.kind
+                    {
+                        let stack = s.as_str();
+                        let frames = stack
+                            .strip_prefix(head.as_str())
+                            .filter(|rest| rest.starts_with("\n    at "))
+                            .or_else(|| stack.find("\n    at ").map(|i| &stack[i..]));
+                        if let Some(frames) = frames {
+                            let mut out = head.clone();
+                            out.push_str(frames);
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        head
+    }
+
     /// Engine value → JSON (host boundary). Mirrors `JSON.stringify` semantics
     /// for plain data; functions/symbols/undefined become `null`.
     pub fn value_to_json(&mut self, v: &Value) -> Json {
@@ -122,8 +166,7 @@ impl Vm {
                 {
                     let mut b = o.borrow_mut();
                     for (k, val) in m {
-                        b.props
-                            .insert(PropertyKey::str(k), Property::data(self.json_to_value(val)));
+                        b.own_insert(PropertyKey::str(k), Property::data(self.json_to_value(val)));
                     }
                 }
                 Value::Object(o)

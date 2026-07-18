@@ -49,7 +49,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::runtime::call_log::CallRecord;
-use crate::runtime::context::{PendingInput, RuntimeContext, PAUSE_MARKER};
+use crate::runtime::context::{PendingInput, RuntimeContext};
+use crate::runtime::errors::RunInterrupt;
 use crate::runtime::host_core;
 use crate::runtime::snapshot::{
     CallLogSequenceRange, HostOperationId, ParallelBranchManifest, BRANCHES_DIR,
@@ -137,7 +138,7 @@ fn settle_branch(result: anyhow::Result<Value>, branch_ctx: &RuntimeContext) -> 
             pending_input: None,
             pending_prompt: None,
         },
-        Err(err) if err.to_string().contains(PAUSE_MARKER) => {
+        Err(err) if RunInterrupt::from_error(&err).is_some() => {
             // A suspended branch is reported as paused; when it suspended on
             // `input()` the persisted pending op makes it resumable via
             // `resume_branch`. Approval/signal pauses are reported but not yet

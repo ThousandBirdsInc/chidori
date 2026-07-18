@@ -7,9 +7,8 @@
 //! schedule on a recipe simply means "no scheduling", and the scheduler
 //! skips it.
 
-use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -29,8 +28,11 @@ use crate::tools::ToolRegistry;
 /// branch worker threads. The interpreter recurses natively with the agent's
 /// JS call depth (`max_call_depth` = 2000 frames), which needs more headroom
 /// than tokio's 2 MiB default; on 64-bit the extra virtual space is only
-/// committed if actually touched.
-pub const JS_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+/// committed if actually touched. Sized by measurement: a debug build needs
+/// more than 32 MiB for the depth guard to fire its catchable RangeError
+/// before the native stack runs out (release frames are far smaller, but the
+/// reservation is virtual either way, so one generous constant serves both).
+pub const JS_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Build the process's tokio runtime. Exactly `tokio::runtime::Runtime::new()`
 /// plus [`JS_THREAD_STACK_BYTES`]-sized threads: agent JS executes on this
@@ -44,8 +46,30 @@ pub fn new_tokio_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
+/// The process-wide host-effect runtime, built on first use and never
+/// dropped. The server and scheduler used to build (and tear down) a fresh
+/// multi-thread runtime PER AGENT RUN — spawning a full worker pool with
+/// [`JS_THREAD_STACK_BYTES`] stacks each time (~430 µs plus thread churn;
+/// `benches/runtime.rs` per_run_setup). Engines only `block_on` this runtime
+/// from blocking threads and never spawn run-scoped background tasks on it,
+/// so one shared runtime serves every run. It lives in a `static` so it is
+/// never dropped (dropping a runtime from async context panics); the CLI's
+/// one-runtime-per-invocation paths in `main.rs` are unaffected.
+pub fn shared_tokio_runtime() -> std::io::Result<Arc<tokio::runtime::Runtime>> {
+    static RT: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
+    if let Some(rt) = RT.get() {
+        return Ok(rt.clone());
+    }
+    let rt = Arc::new(new_tokio_runtime()?);
+    Ok(RT.get_or_init(|| rt).clone())
+}
+
 #[derive(Clone)]
 pub struct SchedulerDeps {
+    /// Shared provider registry — the same one the server's session handlers
+    /// use, so scheduled runs see identical providers (and reuse its HTTP
+    /// clients) instead of rebuilding a registry from env on every tick.
+    pub providers: Arc<ProviderRegistry>,
     pub template_engine: Arc<TemplateEngine>,
     pub session_store: Arc<dyn SessionStore>,
     pub policy: Arc<PolicyConfig>,
@@ -108,20 +132,12 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
     let recipe_name = recipe.name.clone();
 
     let (id, session) = tokio::task::spawn_blocking(move || -> Result<(String, StoredSession)> {
-        let rt = Arc::new(crate::scheduler::new_tokio_runtime()?);
-        let providers = Arc::new(ProviderRegistry::from_env());
+        let rt = crate::scheduler::shared_tokio_runtime()?;
+        let providers = deps.providers.clone();
 
-        // Build the tool registry: recipe-local dirs + default `<agent>/tools`
-        // + any MCP tools the server handed us.
-        let mut dirs: Vec<PathBuf> = recipe.tools.iter().cloned().collect();
-        dirs.push(
-            agent_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("tools"),
-        );
-        let mut registry =
-            ToolRegistry::load_from_dirs(&dirs).unwrap_or_else(|_| ToolRegistry::new());
+        // The registry holds only externally-sourced tools (MCP servers the
+        // server handed us). Agent tools are defined in-VM with `defineTool`.
+        let mut registry = ToolRegistry::new();
         for def in &deps.mcp_tools {
             registry.register(def.clone());
         }
@@ -146,6 +162,7 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
             error: None,
             pending_seq: None,
             pending_prompt: None,
+            pending_details: None,
             pending_signal_name: None,
             pending_signal_names: Vec::new(),
             pending_signal_deadline: None,
@@ -160,4 +177,36 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
 
     deps.session_store.put(&session)?;
     Ok(id)
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::JS_THREAD_STACK_BYTES;
+
+    /// A JS thread sized to [`JS_THREAD_STACK_BYTES`] must let the engine's
+    /// default call-depth guard fire its catchable `RangeError` on deep
+    /// recursion, rather than the native stack overflowing and aborting the
+    /// process (which is what a too-small stack did — see the constant's
+    /// rationale). Regression for `chidori run <deeply-recursive-agent>`.
+    #[test]
+    fn default_depth_recursion_throws_not_aborts() {
+        let outcome = std::thread::Builder::new()
+            .stack_size(JS_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let mut engine = chidori_js::Engine::new();
+                // Default max_call_depth (2000); unbounded recursion must hit
+                // the guard, not the stack.
+                engine
+                    .eval("function f(n){ return f(n + 1); } f(0)")
+                    .err()
+                    .unwrap_or_default()
+            })
+            .expect("spawn JS thread")
+            .join()
+            .expect("thread must return an error, not abort");
+        assert!(
+            outcome.contains("Maximum call stack size exceeded"),
+            "expected a catchable RangeError, got: {outcome}"
+        );
+    }
 }

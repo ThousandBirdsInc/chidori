@@ -7,10 +7,25 @@
 import type { SignalSender } from "./agent.js";
 
 export type {
+  ActorHandle,
+  ActorMessage,
+  ActorOutcome,
+  ActorOutcomeStatus,
+  ActorRestartStrategy,
+  Actors,
+  ActorStatus,
+  ActorStillRunning,
   AgentFunction,
   AgentJson,
+  AgentOutput,
+  AppData,
+  BranchOptions,
+  BranchOutcome,
+  BranchStatus,
+  BranchVariant,
   CacheTtl,
   Chidori,
+  ChidoriUtil,
   CompactOptions,
   Context,
   Conversation,
@@ -18,22 +33,31 @@ export type {
   ConversationOptions,
   ConversationTurn,
   DatePolicy,
+  DetachedAgentHandle,
+  DetachedAgentOutcome,
+  DetachedAgents,
+  DetachedAgentStatus,
   InputOptions,
+  JoinActorOptions,
   JsonObject,
   JsonSchema,
   LlmResponseJson,
+  LogFields,
   MapSetSnapshotPolicy,
-  MemoryAction,
+  MemoryStore,
   ParallelOptions,
   PromptOptions,
   PromptStreamType,
   RandomPolicy,
+  ReceiveOptions,
   RetryOptions,
   RuntimePolicyConfig,
   Signal,
   SignalOptions,
   SignalSender,
   SignalTimeout,
+  SpawnActorOptions,
+  SpawnAgentOptions,
   ToolDefinition,
   ToolFunction,
   TryCallResult,
@@ -256,7 +280,7 @@ export class Session {
     public pendingSignalName: string | null = null,
     /**
      * The full awaited name set when paused on a signal listen point: `[name]`
-     * for `chidori.signal(name)`, the listen set for `chidori.signalAny(names)`.
+     * for `chidori.signal(name)`, the listen set for the fan-in `chidori.signal(names)`.
      * Empty for non-signal states.
      */
     public pendingSignalNames: string[] = [],
@@ -266,6 +290,18 @@ export class Session {
      * when it passes. `null` when the pause has no timeout.
      */
     public pendingSignalDeadline: string | null = null,
+    /**
+     * The artifact under review for an `input()` pause created with
+     * `{ details }` (a draft, a diff) — surface it so a human never approves
+     * blind. `null` when the pause carries no details.
+     */
+    public pendingDetails: string | null = null,
+    /**
+     * The durable run directory id (`.chidori/runs/<run_id>`) this session
+     * journals into. Deliberately distinct from the session id: `chidori
+     * resume <agent.ts> <run_id>` and `chidori trace <run_id>` take THIS id.
+     */
+    public runId: string | null = null,
   ) {}
 
   get ok(): boolean {
@@ -321,7 +357,7 @@ export type StreamEvent =
     }
   | {
       /**
-       * The streamed run paused at a `signal()` / `signalAny()` listen point
+       * The streamed run paused at a `signal()` listen point
        * and stays live: the worker keeps supervising, and a delivered signal
        * (or the `timeoutMs` deadline) resumes it in-process — further events
        * follow on the same stream. Deliver with `client.signal`.
@@ -336,6 +372,109 @@ export type StreamEvent =
     }
   | { type: "done"; id: string; status: SessionStatus; output?: Json; error?: string };
 
+/** Base class for every error the SDK throws. `catch (e) { if (e instanceof
+ * AgentClientError) ... }` covers HTTP failures, timeouts, and connection
+ * errors alike. */
+export class AgentClientError extends Error {}
+
+/**
+ * A non-2xx HTTP response. Carries the parsed `status` so callers can
+ * distinguish the server's documented semantics — e.g. for `client.signal`:
+ * 400 (empty name), 404 (unknown session), 409 (terminal run) — instead of
+ * string-matching the message.
+ */
+export class HttpError extends AgentClientError {
+  constructor(
+    /** HTTP method of the failed request. */
+    readonly method: string,
+    /** Request path relative to the base URL. */
+    readonly path: string,
+    /** HTTP status code (400, 404, 409, 500, ...). */
+    readonly status: number,
+    /** Raw response body text (may be empty). */
+    readonly body: string,
+    /** The server's `error` field, when the body was `{ "error": ... }`. */
+    readonly detail: string | null = null,
+  ) {
+    super(`${method} ${path} failed: HTTP ${status}${detail || body ? `: ${detail ?? body}` : ""}`);
+    this.name = "HttpError";
+  }
+
+  static async fromResponse(method: string, path: string, resp: Response): Promise<HttpError> {
+    const body = await resp.text().catch(() => "");
+    let detail: string | null = null;
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown };
+      if (typeof parsed.error === "string") detail = parsed.error;
+    } catch {
+      // not JSON — leave detail null
+    }
+    return new HttpError(method, path, resp.status, body, detail);
+  }
+}
+
+/** The request exceeded the client's `timeoutMs` without completing. */
+export class TimeoutError extends AgentClientError {
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`${method} ${path} timed out after ${timeoutMs}ms`);
+    this.name = "TimeoutError";
+  }
+}
+
+/** The request never produced an HTTP response (refused, reset, DNS, ...). */
+export class ConnectionError extends AgentClientError {
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    cause: unknown,
+  ) {
+    super(`${method} ${path} failed: ${cause instanceof Error ? cause.message : String(cause)}`, {
+      cause,
+    });
+    this.name = "ConnectionError";
+  }
+}
+
+/** Response statuses worth retrying on idempotent requests. */
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+
+export interface AgentClientOptions {
+  /**
+   * Bearer token for a server running with `CHIDORI_API_KEY` set (the
+   * production posture — see docs/deployment.md). Sent as
+   * `Authorization: Bearer <apiKey>` on every request, including `stream()`.
+   * Omit against an unauthenticated loopback server.
+   */
+  apiKey?: string;
+  /**
+   * Extra headers merged into every request (after `apiKey`, so an explicit
+   * `Authorization` entry here wins). Escape hatch for proxies and custom
+   * auth schemes the `apiKey` option doesn't cover.
+   */
+  headers?: Record<string, string>;
+  /**
+   * Per-request timeout in milliseconds; `0` disables it. Defaults to
+   * 300 000 (5 minutes) — generous because `run()` executes the whole agent
+   * before responding, but finite so a hung server surfaces as a
+   * `TimeoutError` instead of blocking forever. For `stream()` the timeout
+   * covers connection establishment only, never an open event stream.
+   */
+  timeoutMs?: number;
+  /**
+   * How many times to retry **idempotent GET requests** after a connection
+   * error, timeout, or retryable status (429/502/503/504). Defaults to 2.
+   * POST requests are never retried — `run`/`resume`/`signal` are not
+   * idempotent, and a blind retry could execute an agent twice.
+   */
+  retries?: number;
+  /** Base delay between retries in milliseconds, doubling per attempt (default 250). */
+  retryDelayMs?: number;
+}
+
 /**
  * HTTP client for an `chidori serve` instance.
  *
@@ -347,12 +486,28 @@ export type StreamEvent =
  * const cp = await session.checkpoint();
  * const replayed = await client.replay(cp);  // zero LLM calls
  * ```
+ *
+ * Failures throw typed errors (all extending {@link AgentClientError}):
+ * {@link HttpError} with a `.status` for non-2xx responses,
+ * {@link TimeoutError} after `timeoutMs`, {@link ConnectionError} when no
+ * response arrived at all.
  */
 export class AgentClient {
   readonly baseUrl: string;
+  readonly timeoutMs: number;
+  readonly retries: number;
+  readonly retryDelayMs: number;
+  private readonly baseHeaders: Record<string, string>;
 
-  constructor(baseUrl: string = "http://localhost:8080") {
+  constructor(baseUrl: string = "http://localhost:8080", options: AgentClientOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.timeoutMs = options.timeoutMs ?? 300_000;
+    this.retries = options.retries ?? 2;
+    this.retryDelayMs = options.retryDelayMs ?? 250;
+    this.baseHeaders = {
+      ...(options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
+      ...(options.headers ?? {}),
+    };
   }
 
   async health(): Promise<Json> {
@@ -472,15 +627,45 @@ export class AgentClient {
    * events (`prompt_start`, `prompt_delta`, `prompt_end`), then a final
    * `done` event. Prompt events include `prompt_type` so UIs can filter
    * progress streams separately from final-answer streams.
+   *
+   * `options.policyProfile` mirrors `run()`: a built-in profile layered on
+   * the server policy with stricter-wins semantics for this session.
    */
-  async *stream(input: Json): AsyncGenerator<StreamEvent, void, void> {
-    const resp = await fetch(`${this.baseUrl}/sessions/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ input }),
-    });
+  async *stream(
+    input: Json,
+    options?: { policyProfile?: PolicyProfile },
+  ): AsyncGenerator<StreamEvent, void, void> {
+    // The timeout covers connection establishment (until response headers
+    // arrive), not the open event stream — a healthy run may stream for a
+    // long time between events.
+    const controller = new AbortController();
+    const timer =
+      this.timeoutMs > 0 ? setTimeout(() => controller.abort(), this.timeoutMs) : null;
+    const body: Record<string, unknown> = { input };
+    if (options?.policyProfile) {
+      body.policy_profile = options.policyProfile;
+    }
+    let resp: Response;
+    try {
+      resp = await fetch(`${this.baseUrl}/sessions/stream`, {
+        method: "POST",
+        headers: {
+          ...this.baseHeaders,
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      throw controller.signal.aborted
+        ? new TimeoutError("POST", "/sessions/stream", this.timeoutMs)
+        : new ConnectionError("POST", "/sessions/stream", err);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
     if (!resp.ok || !resp.body) {
-      throw new Error(`stream request failed: ${resp.status}`);
+      throw await HttpError.fromResponse("POST", "/sessions/stream", resp);
     }
 
     // Minimal SSE parser — just enough for the events our server emits.
@@ -517,12 +702,15 @@ export class AgentClient {
       (data.pending_signal_name as string | undefined) ?? null,
       (data.pending_signal_names as string[] | undefined) ?? [],
       (data.pending_signal_deadline as string | undefined) ?? null,
+      (data.pending_details as string | undefined) ?? null,
+      (data.run_id as string | undefined) ?? null,
     );
   }
 
   private async getJSON(path: string): Promise<unknown> {
-    const resp = await fetch(this.baseUrl + path);
-    if (!resp.ok) throw await httpError(resp);
+    // GETs are idempotent: retry connection failures, timeouts, and
+    // retryable statuses with exponential backoff.
+    const resp = await this.request("GET", path, undefined, this.retries);
     return await resp.json();
   }
 
@@ -534,19 +722,67 @@ export class AgentClient {
     path: string,
     body: unknown,
   ): Promise<{ status: number; data: Record<string, unknown> }> {
-    const resp = await fetch(this.baseUrl + path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) throw await httpError(resp);
+    // POSTs are never retried: run/resume/signal are not idempotent.
+    const resp = await this.request("POST", path, body, 0);
     return { status: resp.status, data: (await resp.json()) as Record<string, unknown> };
+  }
+
+  /**
+   * One HTTP exchange with timeout and (for idempotent requests) retries.
+   * Resolves with a 2xx `Response`; throws {@link HttpError},
+   * {@link TimeoutError}, or {@link ConnectionError} otherwise.
+   */
+  private async request(
+    method: "GET" | "POST",
+    path: string,
+    body: unknown,
+    retries: number,
+  ): Promise<Response> {
+    let lastError: AgentClientError | null = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (attempt > 0) {
+        await sleep(this.retryDelayMs * 2 ** (attempt - 1));
+      }
+      const controller = new AbortController();
+      const timer =
+        this.timeoutMs > 0 ? setTimeout(() => controller.abort(), this.timeoutMs) : null;
+      try {
+        let resp: Response;
+        try {
+          resp = await fetch(this.baseUrl + path, {
+            method,
+            signal: controller.signal,
+            headers:
+              body !== undefined
+                ? { ...this.baseHeaders, "Content-Type": "application/json" }
+                : this.baseHeaders,
+            ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+          });
+        } catch (err) {
+          throw controller.signal.aborted
+            ? new TimeoutError(method, path, this.timeoutMs)
+            : new ConnectionError(method, path, err);
+        }
+        if (!resp.ok) throw await HttpError.fromResponse(method, path, resp);
+        return resp;
+      } catch (err) {
+        const retryable =
+          err instanceof TimeoutError ||
+          err instanceof ConnectionError ||
+          (err instanceof HttpError && RETRYABLE_STATUS.has(err.status));
+        if (!retryable || attempt === retries) throw err;
+        lastError = err as AgentClientError;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+    // Unreachable: the loop either returns or throws on the last attempt.
+    throw lastError ?? new ConnectionError(method, path, "retries exhausted");
   }
 }
 
-async function httpError(resp: Response): Promise<Error> {
-  const text = await resp.text().catch(() => "");
-  return new Error(`HTTP ${resp.status}: ${text}`);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseSseFrame(frame: string): StreamEvent | null {

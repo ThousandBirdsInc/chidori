@@ -6,6 +6,11 @@
 //! See `docs/architecture.md` and `docs/conformance.md` for the engine design
 //! and Test262 conformance status.
 
+// The engine is the sandbox: memory safety is a security property here, not a
+// style preference (docs/sandbox-model.md). Enforce the zero-`unsafe` claim at
+// compile time rather than by convention.
+#![forbid(unsafe_code)]
+
 pub mod builtins;
 pub mod bytecode;
 pub mod compiler;
@@ -23,6 +28,7 @@ pub mod jsx;
 pub mod kernel;
 pub mod localize;
 pub mod module;
+pub mod names;
 /// Phase-0 opcode-frequency instrumentation; present only under the
 /// `op-histogram` feature (see `docs/interpreter-optimization.md`).
 #[cfg(feature = "op-histogram")]
@@ -30,8 +36,10 @@ pub mod opstats;
 pub mod promise;
 pub mod proxy;
 pub mod realm;
+pub mod reg;
 pub mod regexp;
 pub mod replay;
+pub mod shape;
 pub mod trace;
 pub mod typed_array;
 mod unicode_tables;
@@ -71,7 +79,7 @@ impl Engine {
     /// Compile and run a script to completion (draining microtasks), returning
     /// the completion value. Errors are returned as their string form.
     pub fn eval(&mut self, src: &str) -> Result<Value, String> {
-        let proto = compiler::compile_script(src).map_err(|e| e)?;
+        let proto = compiler::compile_script(src)?;
         let func = self.vm.make_closure(std::rc::Rc::new(proto), Vec::new());
         let result = self
             .vm
@@ -128,12 +136,25 @@ impl Engine {
         let chidori = self.vm.new_object();
         let d = dispatch.clone();
         self.vm
-            .define_method(&chidori, "log", 1, move |vm, _t, args| {
+            .define_method(&chidori, "log", 2, move |vm, _t, args| {
                 let msg = args
                     .first()
                     .map(|v| vm.to_string_lossy(v))
                     .unwrap_or_default();
-                forward_effect(vm, &d, "log", serde_json::json!({ "message": msg }))
+                // Forward the structured fields object too — the host side
+                // (`host_core::execute_log`) has always accepted it, but the
+                // binding used to drop everything past the message, silently
+                // losing every `chidori.log(msg, {...})` payload.
+                let fields = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let payload = if fields.is_null() {
+                    serde_json::json!({ "message": msg })
+                } else {
+                    serde_json::json!({ "message": msg, "fields": fields })
+                };
+                forward_effect(vm, &d, "log", payload)
             });
         let d = dispatch.clone();
         self.vm
@@ -190,6 +211,10 @@ impl Engine {
                 )
             });
         let d = dispatch.clone();
+        // chidori.signal(name | names[], opts) — a single listen verb: a
+        // string listens for one name, an array is the fan-in form (routed to
+        // the signal_any host effect, whose recorded result's `name` says
+        // which fired).
         self.vm
             .define_method(&chidori, "signal", 2, move |vm, _t, args| {
                 let name = args
@@ -200,6 +225,14 @@ impl Engine {
                     .get(1)
                     .map(|v| vm.value_to_json(v))
                     .unwrap_or(serde_json::Value::Null);
+                if name.is_array() {
+                    return forward_effect(
+                        vm,
+                        &d,
+                        "signal_any",
+                        serde_json::json!({ "names": name, "opts": opts }),
+                    );
+                }
                 forward_effect(
                     vm,
                     &d,
@@ -299,26 +332,12 @@ impl Engine {
                 }
             });
         let d = dispatch.clone();
+        // chidori.mark(label, data) — a labelled trace marker in the call log.
+        // (Named `mark`, not `checkpoint`: the durable value checkpoint is
+        // `chidori.step`, and `checkpoint.json` is the run's call log — this
+        // is neither, just an annotation.)
         self.vm
-            .define_method(&chidori, "signalAny", 2, move |vm, _t, args| {
-                let names = args
-                    .first()
-                    .map(|v| vm.value_to_json(v))
-                    .unwrap_or(serde_json::Value::Null);
-                let opts = args
-                    .get(1)
-                    .map(|v| vm.value_to_json(v))
-                    .unwrap_or(serde_json::Value::Null);
-                forward_effect(
-                    vm,
-                    &d,
-                    "signal_any",
-                    serde_json::json!({ "names": names, "opts": opts }),
-                )
-            });
-        let d = dispatch.clone();
-        self.vm
-            .define_method(&chidori, "checkpoint", 2, move |vm, _t, args| {
+            .define_method(&chidori, "mark", 2, move |vm, _t, args| {
                 let label = args
                     .first()
                     .map(|v| vm.value_to_json(v))
@@ -330,7 +349,7 @@ impl Engine {
                 forward_effect(
                     vm,
                     &d,
-                    "checkpoint",
+                    "mark",
                     serde_json::json!({ "label": label, "data": data }),
                 )
             });
@@ -421,6 +440,252 @@ impl Engine {
                     &d,
                     "branch",
                     serde_json::json!({ "variants": variants, "options": options }),
+                )
+            });
+        // chidori.actors.<method> — supervised actor sub-runs + message
+        // passing (`docs/actors.md`). Each method forwards its effect to the
+        // durable host, which owns spawning, mailboxes, supervision trees,
+        // and record/replay. The runtime's helper script wraps `spawn` and
+        // `lookup` results into actor handles (`.send()`/`.join()`/...);
+        // these natives return the raw durable JSON.
+        let actors = self.vm.new_object();
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&actors, "spawn", 3, move |vm, _t, args| {
+                let source = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let input = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let options = args
+                    .get(2)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "spawn_actor",
+                    serde_json::json!({ "source": source, "input": input, "options": options }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&actors, "send", 3, move |vm, _t, args| {
+                let to = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let name = args
+                    .get(1)
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let payload = args
+                    .get(2)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "send_actor",
+                    serde_json::json!({ "to": to, "name": name, "payload": payload }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&actors, "join", 2, move |vm, _t, args| {
+                let pid = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "join_actor",
+                    serde_json::json!({ "pid": pid, "opts": opts }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&actors, "stop", 2, move |vm, _t, args| {
+                let pid = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "stop_actor",
+                    serde_json::json!({ "pid": pid, "opts": opts }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&actors, "status", 1, move |vm, _t, args| {
+                let pid = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                forward_effect(vm, &d, "actor_status", serde_json::json!({ "pid": pid }))
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&actors, "lookup", 1, move |vm, _t, args| {
+                let name = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                forward_effect(vm, &d, "whereis", serde_json::json!({ "name": name }))
+            });
+        self.vm
+            .define_value(&chidori, "actors", Value::Object(actors));
+        // chidori.agents.<method> — detached, durable, addressable agent
+        // processes. Unlike actors (in-run, fold-at-join), a detached agent is
+        // its own durable run with a registered name, a durable mailbox, and a
+        // hibernate/wake lifecycle owned by the process-global supervisor. The
+        // natives return the raw durable JSON; the helper script wraps spawn/
+        // lookup results into handles.
+        let agents = self.vm.new_object();
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "spawn", 3, move |vm, _t, args| {
+                let source = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let input = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let options = args
+                    .get(2)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "spawn_agent",
+                    serde_json::json!({ "source": source, "input": input, "options": options }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "send", 3, move |vm, _t, args| {
+                let to = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let name = args
+                    .get(1)
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let payload = args
+                    .get(2)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "send_agent",
+                    serde_json::json!({ "to": to, "name": name, "payload": payload }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "join", 2, move |vm, _t, args| {
+                let to = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "join_agent",
+                    serde_json::json!({ "to": to, "opts": opts }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "stop", 2, move |vm, _t, args| {
+                let to = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "stop_agent",
+                    serde_json::json!({ "to": to, "opts": opts }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "status", 1, move |vm, _t, args| {
+                let to = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                forward_effect(vm, &d, "agent_status", serde_json::json!({ "to": to }))
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&agents, "lookup", 1, move |vm, _t, args| {
+                let name = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                forward_effect(vm, &d, "lookup_agent", serde_json::json!({ "name": name }))
+            });
+        self.vm
+            .define_value(&chidori, "agents", Value::Object(agents));
+        // chidori.alarm(ms) — a durable timer: the run (or detached agent)
+        // hibernates and is woken at the deadline, surviving process
+        // restarts. Lowered onto the durable signal machinery host-side.
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&chidori, "alarm", 1, move |vm, _t, args| {
+                let ms = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(vm, &d, "alarm", serde_json::json!({ "ms": ms }))
+            });
+        // chidori.receive stays top-level: it is the general listen verb for
+        // both the run (parent-addressed messages) and actor code.
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&chidori, "receive", 2, move |vm, _t, args| {
+                let names = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "receive",
+                    serde_json::json!({ "names": names, "opts": opts }),
                 )
             });
         let d = dispatch.clone();
@@ -683,7 +948,7 @@ impl Engine {
         registry.modules.insert(entry.to_string(), rec.clone());
         self.vm
             .run_module_graph(&registry, entry)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         // Entrypoint: whatever `run(...)` captured, else the named export.
         let handler = slot.borrow().clone().or_else(|| {
             cell_of_name
@@ -698,11 +963,11 @@ impl Engine {
         let ret = self
             .vm
             .call(handler, Value::Undefined, &[arg, chidori])
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         let settled = self
             .vm
             .settle(ret)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
 
@@ -731,7 +996,7 @@ impl Engine {
             if registry.modules.contains_key(&key) {
                 continue;
             }
-            let compiled = compiler::compile_module(&src)
+            let compiled = compiler::compile_module_labeled(&src, Some(&key))
                 .map_err(|e| format!("compiling module '{key}': {e}"))?;
             let cell_of_name = compiled.cell_of_name.clone();
             let requested = compiled.requested.clone();
@@ -753,7 +1018,7 @@ impl Engine {
 
         self.vm
             .run_module_graph(&registry, entry_key)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
 
         let entry_rec = entry_rec.ok_or_else(|| "entry module was not loaded".to_string())?;
         let cell_of_name =
@@ -772,11 +1037,11 @@ impl Engine {
         let ret = self
             .vm
             .call(handler, Value::Undefined, &[arg, chidori])
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         let settled = self
             .vm
             .settle(ret)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
 
@@ -799,7 +1064,7 @@ impl Engine {
             if registry.modules.contains_key(&key) {
                 continue;
             }
-            let compiled = compiler::compile_module(&src)
+            let compiled = compiler::compile_module_labeled(&src, Some(&key))
                 .map_err(|e| format!("compiling module '{key}': {e}"))?;
             let cell_of_name = compiled.cell_of_name.clone();
             let requested = compiled.requested.clone();
@@ -821,7 +1086,7 @@ impl Engine {
 
         self.vm
             .run_module_graph(&registry, entry_key)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
 
         let entry_rec = entry_rec.ok_or_else(|| "entry module was not loaded".to_string())?;
         let cell_of_name =
@@ -833,7 +1098,7 @@ impl Engine {
         let settled = self
             .vm
             .settle(val)
-            .map_err(|e| self.vm.error_to_string(&e))?;
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
 }

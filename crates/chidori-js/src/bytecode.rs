@@ -27,6 +27,49 @@ pub enum Const {
     BigInt(Rc<str>),
 }
 
+/// A compilation's source text plus its line-start index, shared (one `Rc`)
+/// by every `FuncProto` the compilation produced. Exists so stack frames can
+/// resolve a bytecode position table entry (a byte offset — see
+/// [`FuncProto::pos`]) into a 1-based line/column *lazily, on the error path
+/// only*: the happy path pays one `Rc` per proto instead of an eager per-op
+/// line/column resolution at compile time.
+#[derive(Debug)]
+pub struct SourceInfo {
+    text: Rc<str>,
+    /// Byte offset of each line start in `text` (`[0]` is always 0).
+    line_starts: Box<[u32]>,
+}
+
+impl SourceInfo {
+    pub fn new(text: Rc<str>) -> SourceInfo {
+        let mut line_starts = vec![0u32];
+        for (i, b) in text.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push(i as u32 + 1);
+            }
+        }
+        SourceInfo {
+            text,
+            line_starts: line_starts.into_boxed_slice(),
+        }
+    }
+
+    /// 1-based (line, column) of byte `offset` in the source. Columns count
+    /// characters, not bytes, matching the parser's diagnostics.
+    pub fn line_col_of(&self, offset: u32) -> (u32, u32) {
+        let offset = offset.min(self.text.len() as u32);
+        let line = self.line_starts.partition_point(|&s| s <= offset).max(1);
+        let start = self.line_starts[line - 1] as usize;
+        let col = self
+            .text
+            .get(start..offset as usize)
+            .map(|s| s.chars().count())
+            .unwrap_or(0) as u32
+            + 1;
+        (line as u32, col)
+    }
+}
+
 /// How a free variable referenced by a nested function is captured at closure
 /// creation time.
 #[derive(Clone, Copy, Debug)]
@@ -116,6 +159,12 @@ pub struct FuncProto {
     /// the ordinary frame path. `None` for anything but tiny pure-scalar
     /// bodies (sort comparators, map/filter/reduce callbacks).
     pub fn_kernel: Option<Kernel>,
+    /// Register bytecode for the WHOLE body (reg.rs, docs/js-performance-
+    /// roadmap.md §3.5): executed by `Vm::run_reg_frame` instead of the stack
+    /// interpreter whenever present and no op budget is installed. `None`
+    /// when any op falls outside the translated subset (try/finally, `with`/
+    /// direct-eval, suspension, super/private, loop kernels, …).
+    pub reg: Option<Rc<crate::reg::RegProto>>,
     /// Number of plain (non-captured) local slots.
     pub num_locals: u32,
     /// Number of cell (captured-by-closure) slots.
@@ -129,6 +178,29 @@ pub struct FuncProto {
     pub kind: FuncKind,
     /// Source span for stack traces (start byte offset).
     pub source_start: u32,
+    /// 1-based line/column of the function's definition site in its source.
+    /// `0` = unknown (synthetic protos, sources compiled without position
+    /// tracking). Stack frames prefer the per-op position (`pos` at the
+    /// frame's current ip); this is the fallback when no source is attached.
+    pub source_line: u32,
+    pub source_col: u32,
+    /// Per-op source position table, index-parallel to `code`: the byte
+    /// offset (into `source_info`'s text) of the statement or call the op was
+    /// emitted for. Lets a stack frame report where the frame *is* — the
+    /// throwing statement for the innermost frame, the call site for outer
+    /// frames — instead of where its function was declared. Maintained by
+    /// every code-shortening pass (fusion remaps it alongside the ops);
+    /// resolved to line/column only on the error path.
+    pub pos: Box<[u32]>,
+    /// The compilation's shared source text + line index used to resolve
+    /// `pos` entries. `None` for synthetic protos and sources compiled
+    /// without text, which then fall back to the definition site.
+    pub source_info: Option<Rc<SourceInfo>>,
+    /// Which source this function came from — the module key/path supplied to
+    /// [`crate::compiler::compile_module_labeled`] — rendered in stack frames
+    /// as `at name (label:line:col)` so an embedder can resolve the frame back
+    /// to a file. `None` for unlabeled compilations (plain scripts, eval).
+    pub source_label: Option<Rc<str>>,
     /// Whether this function references `arguments`.
     pub uses_arguments: bool,
     /// Names of the positional params, for `arguments`/debug.
@@ -189,6 +261,37 @@ pub struct FuncProto {
     /// at runtime by `(this proto's pointer, index)` — the spec's per-Parse
     /// Node template cache (a shared proto is the same Parse Node).
     pub templates: Vec<TemplateParts>,
+    /// Object-literal templates for [`Op::NewObjectTpl`]: each carries the
+    /// literal's static keys and a pre-built property map (placeholder
+    /// `undefined` values) that instantiation CLONES instead of re-hashing
+    /// and re-inserting every key per evaluation.
+    pub obj_tpls: Vec<std::rc::Rc<ObjTemplate>>,
+}
+
+/// Compile-time template for an all-static-data-key object literal (see
+/// [`Op::NewObjectTpl`]). `map` holds every key inserted in source order with
+/// a placeholder `undefined` data property (writable/enumerable/configurable
+/// — exactly what `CreateDataProperty` defines); instantiation clones the map
+/// (bucket layout included — no hashing) and overwrites slots `0..N` with the
+/// evaluated values.
+pub struct ObjTemplate {
+    pub map: crate::fxhash::FxIndexMap<crate::value::PropertyKey, crate::value::Property>,
+    /// Memoized (realm root, leaf) shape pair for this literal site: after
+    /// the first instantiation in a realm, building the object is ONE slot
+    /// vec allocation + N value writes under the cached leaf shape — no
+    /// hashing, no transition walk (docs/js-object-shapes-design.md §3.3).
+    /// The root is stored to verify the cache belongs to the CURRENT realm
+    /// (a `FuncProto` may be shared across realms by the source cache);
+    /// a mismatch just recomputes. Never serialized, never observable.
+    pub shape_cache: std::cell::RefCell<Option<(Rc<crate::shape::Shape>, Rc<crate::shape::Shape>)>>,
+}
+
+impl std::fmt::Debug for ObjTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.map.keys().map(|k| format!("{k:?}")))
+            .finish()
+    }
 }
 
 /// One inline-cache entry (see [`FuncProto::ic`]). `own_slot` indexes the
@@ -200,9 +303,22 @@ pub struct IcEntry {
     pub own_slot: std::cell::Cell<u32>,
     pub proto_slot: std::cell::Cell<u32>,
     pub holder: std::cell::RefCell<Option<crate::value::JsObject>>,
+    /// The receiver's shape when `own_slot` was resolved (`None` when it was
+    /// in dictionary mode). A pointer-identical CURRENT shape upgrades the
+    /// hit check to one `Rc::ptr_eq` — no key compare, no probe. Holds the
+    /// shape strongly: an IC pins at most one small key chain per site.
+    pub own_shape: std::cell::RefCell<Option<Rc<crate::shape::Shape>>>,
+    /// As `own_shape`, for the prototype holder's `proto_slot`.
+    pub proto_shape: std::cell::RefCell<Option<Rc<crate::shape::Shape>>>,
 }
 
 impl FuncProto {
+    /// Source position (byte offset) recorded for the op at `ip`, or `None`
+    /// when this proto carries no position table (synthetic protos).
+    pub fn pos_at(&self, ip: usize) -> Option<u32> {
+        self.pos.get(ip).copied()
+    }
+
     pub fn empty(name: &str, kind: FuncKind) -> FuncProto {
         FuncProto {
             name: name.to_string(),
@@ -210,6 +326,7 @@ impl FuncProto {
             consts: Vec::new(),
             kernels: Vec::new(),
             fn_kernel: None,
+            reg: None,
             num_locals: 0,
             num_cells: 0,
             num_params: 0,
@@ -217,6 +334,11 @@ impl FuncProto {
             upvalues: Vec::new(),
             kind,
             source_start: 0,
+            source_line: 0,
+            source_col: 0,
+            pos: Box::new([]),
+            source_info: None,
+            source_label: None,
             uses_arguments: false,
             param_names: Vec::new(),
             mapped_param_cells: Vec::new(),
@@ -229,6 +351,7 @@ impl FuncProto {
             this_cell: None,
             inherit_home: false,
             templates: Vec::new(),
+            obj_tpls: Vec::new(),
         }
     }
 }
@@ -606,6 +729,21 @@ pub enum Op {
 
     // ---- objects / arrays ----
     NewObject,
+    /// Instantiate an all-static-data-key object literal from the pre-built
+    /// template at [`FuncProto::obj_tpls`]\[payload\]: pops the template's N
+    /// values (pushed in source order) and pushes the object. The template's
+    /// property map is CLONED (no hashing, no growth rehash, no per-key
+    /// descriptor validation — the compiler proved every key a distinct
+    /// static string data property on a fresh ordinary extensible object,
+    /// where `CreateDataPropertyOrThrow` cannot observe anything and cannot
+    /// fail) and the popped values are written into slots `0..N` in order —
+    /// the exact map the generic `NewObject` + N×`DefineField` sequence
+    /// builds, at a fraction of the cost. `n` is the key count (kept in the
+    /// op so stack-effect tables need no template lookup).
+    NewObjectTpl {
+        idx: u32,
+        n: u32,
+    },
     NewArray(u32), // number of initial elements popped
     /// Push the cached, frozen template object for tagged-template literal
     /// `index` (into the function's `templates`): `[] -> [templateObject]`.
@@ -815,6 +953,11 @@ pub enum Op {
     JumpIfFalsyPeek(u32), // peek top; if falsy jump (keep), else pop
     JumpIfTruthyPeek(u32),
     JumpIfNullishPeek(u32),
+    /// Optional CALL short-circuit for method callees (`o.m?.()`): stack is
+    /// [receiver, func]. Peek func; if nullish, pop BOTH, push `undefined`,
+    /// and jump (the optional chain's end expects exactly one value). Falls
+    /// through with the stack untouched otherwise.
+    JumpIfNullishDropUnder(u32),
 
     // ---- exceptions ----
     Throw,
@@ -844,6 +987,14 @@ pub enum Op {
     /// We implement as: IteratorNext leaves [iterator] and pushes result obj;
     /// the compiler then reads .done/.value.
     IteratorNext,
+    /// Fused sync for-of protocol round: pops `[next, iterator]` (the iterator
+    /// record the loop header read once), pushes `[value, done]` — `value` is
+    /// `undefined` when done. Observably identical to the sequence it replaces
+    /// (`Call(0); RequireIterResult; Dup; GetProp done; …; GetProp value`),
+    /// but when `next` is a pinned canonical builtin-iterator `next`
+    /// (`realm.builtin_iter_next`) the step runs inline: no call frame, no
+    /// `{value, done}` result object, no done/value property reads.
+    IteratorStepValue,
     /// Close the iterator (calls return()) — used on early loop exit.
     IteratorClose,
     /// for-in: build a list of enumerable keys from object; push an enumerator.
@@ -926,6 +1077,18 @@ pub enum Op {
 // Typed loop kernels
 // =============================================================================
 
+/// Fixed size of one kernel register WINDOW. Translation declines any kernel
+/// needing more than `KWIN` registers (every observed kernel uses ≤ 10), so
+/// the executors can hold registers in a `&mut [f64; KWIN]` and index it as
+/// `regs[(r as usize) & KWIN_MASK]` — the mask proves the index in-bounds to
+/// the compiler, eliminating the per-access bounds check (measured at 12–17%
+/// of kernel-owned workloads) with zero `unsafe`. Translation guarantees every
+/// register index is `< n_regs ≤ KWIN`, so the mask never changes a valid
+/// index; it only removes the panic branch.
+pub const KWIN: usize = 32;
+/// `KWIN - 1`, the index mask (KWIN is a power of two).
+pub const KWIN_MASK: usize = KWIN - 1;
+
 /// The kernel register machine's instruction set: unboxed `f64` registers, no
 /// operand stack, no heap values. Produced by `kernel.rs` from an eligible
 /// loop region's bytecode; executed by `Vm::run_kernel`. `target` fields index
@@ -984,6 +1147,68 @@ pub enum KOp {
         a: u16,
         k: f64,
         target: u16,
+    },
+    /// SUPERINSTRUCTION: `ArithK` followed by `Add` — the `s += a <op> K`
+    /// accumulation shape after const-propagation folded the constant.
+    ArithKAdd {
+        kind: crate::exec::ArithKind,
+        dst: u16,
+        a: u16,
+        k: f64,
+        d2: u16,
+        a2: u16,
+        b2: u16,
+    },
+    /// SUPERINSTRUCTION: `LoadLen` followed by `BrCmp` — the `i < a.length`
+    /// loop header test in one dispatch. Element/length semantics (and the
+    /// `bail` edge) are exactly [`KOp::LoadLen`]'s; the compare-and-branch is
+    /// exactly [`KOp::BrCmp`]'s.
+    LenBrCmp {
+        dst: u16,
+        obj: u16,
+        bail: u16,
+        cmp: CmpOp,
+        a: u16,
+        b: u16,
+        if_true: bool,
+        target: u16,
+    },
+    /// SUPERINSTRUCTION: `LoadElem` followed by `Add` — the `s += a[i]`
+    /// accumulation shape. Element semantics (and the `bail` edge) are
+    /// exactly [`KOp::LoadElem`]'s.
+    LoadElemAdd {
+        dst: u16,
+        obj: u16,
+        idx: u16,
+        bail: u16,
+        d2: u16,
+        a2: u16,
+        b2: u16,
+    },
+    /// `regs[dst] = <utf16 length>` of the pinned STRING in string slot
+    /// `str`. TOTAL (no bail): the entry guard proved the slot holds a flat
+    /// ASCII string, strings are immutable, and the local is pinned — the
+    /// length is an activation constant.
+    StrLen { dst: u16, str: u16 },
+    /// `regs[dst] = charCodeAt(regs[idx])` over the pinned ASCII string in
+    /// string slot `str`. TOTAL (no bail): the index conversion
+    /// (ToIntegerOrInfinity — NaN→0, truncate toward zero, saturating) and
+    /// the out-of-range NaN result are computed exactly in-kernel; the entry
+    /// guard proved the receiver a flat ASCII string (unit == byte) and the
+    /// canonical `String.prototype.charCodeAt` resolution.
+    CharCodeAt { dst: u16, str: u16, idx: u16 },
+    /// SUPERINSTRUCTION: `LoadElem` followed by `Arith` — the
+    /// `d += a[i] * b[i]` dot-product shape's second load feeding its
+    /// multiply (which the `(Arith, Add)` fusion then folds separately).
+    LoadElemArith {
+        dst: u16,
+        obj: u16,
+        idx: u16,
+        bail: u16,
+        kind: crate::exec::ArithKind,
+        d2: u16,
+        a2: u16,
+        b2: u16,
     },
     /// unconditional jump
     Br { target: u16 },
@@ -1100,15 +1325,20 @@ pub enum KOp {
     /// `Op::SetProp` fast-path conditions). See [`KOp::LoadProp`] for why no
     /// per-access check is needed.
     StoreProp { prop: u16, src: u16 },
-    /// LOOP kernels only: call the PINNED CLOSURE in oslot
+    /// LOOP kernels only: call the PINNED CLOSURE of
     /// [`Kernel::callee_slots`]`[fslot]` — a plain bytecode function whose
     /// proto carries a (non-recursive, Number-returning) function kernel —
     /// by running that kernel's register program on a dedicated window above
     /// the caller's registers. The window's upvalue registers were loaded
-    /// ONCE at entry (the callee local is an oslot: in-region stores to it
-    /// reject, so the closure identity is pinned); per call only the `argc`
-    /// argument registers at `base..` copy in, and the callee's `Ret` value
-    /// copies out to `dst`. The entry guard verified everything a per-call
+    /// ONCE at entry (the callee resolution — an oslot local or a
+    /// global-object own data property, see [`KCalleeSrc`] — is an
+    /// activation constant, so the closure identity is pinned); per call
+    /// only the `argc` argument registers at `base..` copy in, and the
+    /// callee's `Ret` value copies out to `dst`. A cell-writing callee
+    /// ([`Kernel::uv_writes`]) additionally flushes its written registers
+    /// back to the cells after EVERY call, so a mid-loop bail resumes the
+    /// generic loop against current cell state; cross-window cell aliasing
+    /// declines at entry. The entry guard verified everything a per-call
     /// `run_fn_kernel` guard would (arguments are statically Numbers here),
     /// plus one depth check for the whole activation (the loop calls at a
     /// CONSTANT depth). No trace sink may be active (it would see an
@@ -1127,12 +1357,49 @@ pub enum KOp {
     /// `regs[dst]` of the calling window (always a Number — recursive
     /// kernels reject boolean returns). Only emitted when the body's callee
     /// is `LoadGlobal` of the function's OWN name; the entry guard then
-    /// verifies that global binding still holds the very closure being
-    /// invoked ([`Kernel::self_global`]), so a rebound name declines to the
-    /// generic path. Depth is tracked against the interpreter's limit; an
-    /// overflow ABANDONS the (pure, side-effect-free) kernel activation and
-    /// reruns the whole call generically, which raises the spec RangeError.
-    SelfCall { dst: u16, base: u16, argc: u16 },
+    /// verifies the referenced bindings still hold the expected closures
+    /// ([`Kernel::rec`]), so a rebound name declines to the generic path.
+    /// `callee` selects the target: 0 = the invoked closure itself
+    /// (self-recursion, whether referenced through its global name or a
+    /// captured binding), `1 + i` = the closure the entry guard resolved for
+    /// [`KernelRec::globals`]`[i]` (mutual recursion). Depth is tracked
+    /// against the interpreter's limit; an overflow ABANDONS the (pure,
+    /// side-effect-free) kernel activation and reruns the whole call
+    /// generically, which raises the spec RangeError.
+    SelfCall {
+        dst: u16,
+        base: u16,
+        argc: u16,
+        callee: u16,
+    },
+}
+
+/// How a recursive function kernel's body referenced the function ITSELF —
+/// the entry guard verifies each holds the very closure being invoked
+/// (pointer identity), so a rebound/shadowed reference declines to the
+/// generic path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfRefKind {
+    /// `function f() { … f() … }` — via the global binding `f`.
+    Global(Box<str>),
+    /// `const f = () => … f() …` — via the captured cell at upvalue index.
+    Upvalue(u32),
+}
+
+/// Recursion descriptor for a FUNCTION kernel containing [`KOp::SelfCall`]s.
+/// Present iff the kernel is recursive; such kernels run on the windowed
+/// executor (`Vm::run_fn_kernel_rec`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KernelRec {
+    /// Every way the body referenced the invoked function itself.
+    pub self_refs: Box<[SelfRefKind]>,
+    /// GLOBAL names of the OTHER functions the body calls recursively
+    /// (mutual recursion): [`KOp::SelfCall`] `callee` `1 + i` targets the
+    /// closure the entry guard resolves for `globals[i]`. The guard requires
+    /// each to be a plain data global holding a plain bytecode closure with
+    /// a compatible recursive-class kernel, closed transitively over the
+    /// whole call family.
+    pub globals: Box<[Box<str>]>,
 }
 
 /// A numeric register's source: a frame local (read/write), a captured
@@ -1168,15 +1435,33 @@ pub struct KProp {
     pub store: bool,
 }
 
-/// One pinned CALLEE of a loop kernel (see [`KOp::CallKernel`]): the oslot
-/// local holding the closure, and the smallest `argc` any call site in the
+/// One pinned CALLEE of a loop kernel (see [`KOp::CallKernel`]): where the
+/// closure resolves from, and the smallest `argc` any call site in the
 /// region supplies — the entry guard requires the callee's function kernel
 /// to consume no argument index at or beyond it (a shorter call would need
 /// the generic `undefined` parameter).
 #[derive(Clone, Debug)]
 pub struct KCallee {
-    pub oslot: u16,
+    pub source: KCalleeSrc,
     pub min_argc: u16,
+}
+
+/// Where a pinned callee's closure lives. Both are activation constants: an
+/// oslot local is never stored to in-region, and nothing inside a kernel
+/// region can rebind a global — `StoreGlobal` is not on the allowlist, and
+/// a [`KProp`] store aimed at the same global-object property cannot pass
+/// its own holds-a-Number entry check while this guard sees a closure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KCalleeSrc {
+    /// The closure is held in this oslot local (discovered like an array
+    /// base; in-region stores to it reject).
+    Oslot(u16),
+    /// The closure is the value of a global-object OWN DATA property — the
+    /// exact fast path `LoadGlobal` takes for a top-level `function`
+    /// binding. Accessor, proto-inherited, and missing globals decline the
+    /// activation into the generic loop (which then resolves or throws
+    /// exactly as the spec says).
+    Global(Box<str>),
 }
 
 /// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
@@ -1198,6 +1483,11 @@ pub enum KShapeSlot {
     Obj(u16),
     MathObj,
     MathFn(KMath),
+    /// The pinned string in string slot `s` (cached at kernel entry).
+    Str(u16),
+    /// The canonical `String.prototype.charCodeAt` function object (entry
+    /// guard proved the live resolution IS the canonical — like `MathFn`).
+    CharCodeFn,
 }
 
 /// The `Math` methods the loop kernels can execute directly. Every kind maps
@@ -1287,10 +1577,12 @@ impl KMath {
 pub struct Kernel {
     pub code: Box<[KOp]>,
     /// Numeric slots mirrored into registers `0..locals.len()`: frame locals
-    /// (read/write) and UPVALUES (read-only snapshots — no call can run
-    /// inside a kernel, so nothing can write a captured cell mid-activation;
-    /// in-region upvalue WRITES reject at translation). The guard requires
-    /// `Value::Number` in every one; only `Local` slots write back.
+    /// (read/write) and UPVALUES (snapshots — no call can run inside a
+    /// kernel, so nothing else can write a captured cell mid-activation).
+    /// The guard requires `Value::Number` in every one; `Local` slots write
+    /// back in loop kernels, and upvalue slots listed in [`Kernel::uv_writes`]
+    /// flush back in function kernels. Loop-kernel regions still reject
+    /// in-region upvalue writes at translation.
     ///
     /// FUNCTION kernels additionally use `Arg` slots (read-only; the guard
     /// requires the argument present and a `Number`), and their `Local` slots
@@ -1308,6 +1600,15 @@ pub struct Kernel {
     /// guard requires each to hold an object; per-access checks do the rest.
     /// Disjoint from `locals`, and never stored to inside the region.
     pub oslots: Box<[u32]>,
+    /// `frame.locals` indices of STRING BASES (`s` in `s.charCodeAt(i)` /
+    /// `s.length`): string slot `n` caches that local's `JsString` at kernel
+    /// entry. The guard requires each to hold a FLAT ASCII string (unit ==
+    /// byte, so every read is O(1)); strings are immutable and the local is
+    /// pinned, so no per-access re-checks exist. Disjoint from `locals`.
+    pub sslots: Box<[u32]>,
+    /// Whether the region calls `charCodeAt` (the entry guard then
+    /// identity-checks the canonical `String.prototype.charCodeAt`).
+    pub uses_char_code: bool,
     /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
     pub shapes: Box<[Box<[KShapeSlot]>]>,
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
@@ -1322,13 +1623,40 @@ pub struct Kernel {
     pub math_used: Box<[KMath]>,
     /// Total register count (mapped locals + canonical stack slots).
     pub n_regs: u16,
-    /// FUNCTION kernels containing [`KOp::SelfCall`]: the GLOBAL name the
-    /// body's recursive callee resolves through. The entry guard requires
-    /// the global binding to be a plain data property holding the very
-    /// closure being invoked (pointer identity) — a shadowed/rebound/
-    /// accessor'd name declines the kernel and the call runs generically.
-    /// `None` for loop kernels and non-recursive function kernels.
-    pub self_global: Option<Box<str>>,
+    /// FUNCTION kernels containing [`KOp::SelfCall`]: how the body
+    /// references itself and its mutual-recursion partners. `None` for loop
+    /// kernels and non-recursive function kernels. See [`KernelRec`].
+    pub rec: Option<Box<KernelRec>>,
+    /// FUNCTION kernels: the static return type — `true` when every
+    /// completing path returns a BOOLEAN (`isEven`-style predicates). A
+    /// recursive kernel's translation types every [`KOp::SelfCall`] dst
+    /// register by this (mixed-type recursive returns stay generic), and
+    /// the mutual-recursion entry guard requires it to AGREE across the
+    /// whole resolved call family.
+    pub ret_bool: bool,
+    /// FUNCTION kernels: 1 + the highest argument index the body consumes
+    /// (0 = none). A recursive call must supply at least this many
+    /// arguments — a shorter call would need the generic `undefined`
+    /// parameter. Self-calls are checked at translation; mutual-recursion
+    /// call sites are checked against the RESOLVED callee's value by the
+    /// entry guard.
+    pub args_used: u32,
+    /// NON-RECURSIVE FUNCTION kernels: captured upvalue cells the body
+    /// WRITES, as `(register, upvalue index)` pairs (the register is the
+    /// cell's `locals` slot). The cell's value lives in the register for the
+    /// whole frameless call — nothing else can run mid-kernel — and is
+    /// flushed back as `Value::Number` on every completion (return AND the
+    /// interrupt unwind), so the cell holds exactly what the generic
+    /// write-through path would leave. A conditionally-skipped store flushes
+    /// the entry snapshot back: same value, unobservable (plain cells, no
+    /// setters). Only `Number` stores translate — a boolean/undefined store
+    /// would change the cell's type vs. the generic path and declines.
+    /// Non-empty `uv_writes` declines the recursion tier (its entry
+    /// resolution assumes cells are activation constants), the prepared
+    /// callback paths, and the loop-kernel pinned-callee guard — those run
+    /// many calls per guard and snapshot upvalues once. Always empty for
+    /// loop kernels.
+    pub uv_writes: Box<[(u16, u32)]>,
     /// Whether the code contains a [`KOp::StoreElem`]. A store may CREATE an
     /// element (hole fill / exact append), and the spec's OrdinarySet
     /// consults the prototype chain when the own property is absent — so the
@@ -1336,6 +1664,12 @@ pub struct Kernel {
     /// reified index entry (`protos_allow_any_index_create`). Read-only
     /// loops skip that walk entirely.
     pub stores_elems: bool,
+    /// Whether the code contains a [`KOp::LoadLen`]. A typed-array base
+    /// resolves `.length` through a prototype ACCESSOR (unlike a dense
+    /// array's own exotic property), so the activation entry guard must
+    /// identity-check the canonical getter for any typed-array LoadLen base.
+    /// Kernels without a LoadLen skip that scan entirely.
+    pub loads_len: bool,
     /// Whether the code contains a [`KOp::ArrayPush`]: the activation entry
     /// must verify the canonical `Array.prototype.push` still backs the
     /// `push` property of the canonical Array prototype.

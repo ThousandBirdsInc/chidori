@@ -13,16 +13,12 @@ use anyhow::{bail, Context, Result};
 /// (written to `agent.ts`) and the fileless `chidori chat` (written to a temp
 /// file). Driven mode (a fixed `messages` list) is how `chidori chat` feeds each
 /// turn; with no messages it reads the terminal interactively.
-pub const CHAT_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
+pub const CHAT_AGENT_SRC: &str = r#"import { chidori, run } from "chidori:agent";
 
-export async function agent(
-  input: { messages?: string[]; system?: string; model?: string; tools?: string[] },
-  chidori: Chidori,
-) {
+run(async (input: { messages?: string[]; system?: string; model?: string }) => {
   const chat = chidori.conversation({
     system: input.system ?? "You are a helpful, concise assistant.",
     model: input.model || undefined,
-    tools: input.tools && input.tools.length ? input.tools : undefined,
     // Opt-in window management: a no-op until the running tail exceeds budget.
     compact: { budgetTokens: 8000 },
   });
@@ -38,7 +34,7 @@ export async function agent(
   // Interactive mode: read each turn from the terminal. Type "exit" to end.
   const transcript = await chat.loop({ prompt: "you>" });
   return { transcript };
-}
+});
 "#;
 
 const CHAT_README: &str = r#"# Chidori chat agent
@@ -64,18 +60,24 @@ skip the env var entirely.
 const WORKER_README: &str = r#"# Chidori worker agent
 
 An autonomous agent that loops — think, call a tool, observe the result, repeat —
-until it finishes. Tools live in `tools/`; a sample `reverse` tool is included.
+until it finishes. A tool is just a function with a documented signature, so
+tools are defined inline with `defineTool` right in `agent.ts`; a sample
+`reverse` tool is included.
 
 ## Run it
 
     chidori run agent.ts \
-      --input task="Reverse the word 'chidori' and tell me the result." \
-      --tools tools
+      --input task="Reverse the word 'chidori' and tell me the result."
 
-Add your own tools under `tools/` and list their names in the agent's
-`.tools([...])` call. Set a provider key first (e.g. `ANTHROPIC_API_KEY` or
-`OPENAI_API_KEY`) — or just run `chidori model-login` to sign in with OpenRouter and
-skip the env var entirely.
+Gated effects (network, workspace writes) ask for a y/a/N approval at the
+terminal (the ask-by-default policy for running unfamiliar code). Add
+`--trusted` to skip the prompts — required when running non-interactively,
+where gated effects fail closed.
+
+Add your own tools with more `defineTool({...})` handles and register them in
+the agent's `toolbox` map. Set a provider key first (e.g. `ANTHROPIC_API_KEY`
+or `OPENAI_API_KEY`) — or just run `chidori model-login` to sign in with
+OpenRouter and skip the env var entirely.
 "#;
 
 /// The docs-chat agent: an offline-friendly RAG-lite assistant that answers
@@ -83,7 +85,7 @@ skip the env var entirely.
 /// (scoped to this project — the agent can only see files placed here) plus the
 /// conversation + replay model. The only thing sent to the model is the user's
 /// question and these scaffolded docs; nothing else on the machine is touched.
-const DOCS_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
+const DOCS_AGENT_SRC: &str = r#"import { chidori, run } from "chidori:agent";
 
 /**
  * Chat with the Chidori docs.
@@ -93,10 +95,7 @@ const DOCS_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
  * agent can only ever read files you put here — and the only data sent to the
  * model is your question plus these docs.
  */
-export async function agent(
-  input: { messages?: string[]; model?: string },
-  chidori: Chidori,
-) {
+run(async (input: { messages?: string[]; model?: string }) => {
   // Load the local docs corpus. workspace.list/read are recorded host calls,
   // so re-running this agent replays them for free (no disk re-read on replay).
   const entries = await chidori.workspace.list();
@@ -132,7 +131,7 @@ export async function agent(
   // Interactive mode: ask the docs anything. Type "exit" to quit.
   const transcript = await chat.loop({ prompt: "ask the docs>" });
   return { transcript };
-}
+});
 "#;
 
 const DOCS_README: &str = r#"# Chat with the Chidori docs
@@ -206,18 +205,20 @@ Either way the `chidori` binary lands on your PATH. Check it with
 
 ## Writing an agent
 
-An agent is a TypeScript file that exports an `agent` function taking the run
-input and the `chidori` host object:
+An agent is a TypeScript file that imports the `chidori` host object and the
+`run` definer from the virtual `chidori:agent` module, then registers its
+handler with `run(...)`:
 
-    import type { Chidori } from "chidori:agent";
+    import { chidori, run } from "chidori:agent";
 
-    export async function agent(input: { document: string }, chidori: Chidori) {
+    run(async (input: { document: string }) => {
       const summary = await chidori.prompt("Summarize:\n" + input.document);
       return { summary };
-    }
+    });
 
 That is a complete, durable agent. The prompt is recorded; replay returns it for
-free.
+free. (The older style — `export async function agent(input, chidori)` — is
+still accepted for existing files.)
 
 ## What a host call is
 
@@ -236,7 +237,12 @@ the exact same path with no external calls and no cost.
   `.respond()`.
 - `chidori.conversation(options?)` — stateful multi-turn chat: `.say(message)`,
   `.respond()`, `.loop()`, `.history()`.
-- `chidori.tool(name, args?)` — call a discovered local tool (policy-gated).
+- `defineTool({ name, description, parameters, run })` — a tool is just a
+  function (`run`) plus its documented signature (`name` + `description` +
+  JSON-schema `parameters`); pass the handle in `prompt(text, { tools:
+  [handle] })` or `context().tools([handle])`. Its `run` executes in the
+  agent's own VM.
+- `chidori.tool(name, args?)` — call an MCP/native tool by name (policy-gated).
 - `chidori.workspace` — the sandboxed project filesystem: `.list()`, `.read()`,
   `.write()`, `.delete()`, `.manifest()`. Scoped to the project directory.
 - `chidori.fetch(url)` — HTTP request (policy-gated).
@@ -244,20 +250,24 @@ the exact same path with no external calls and no cost.
 - `chidori.callAgent(path, input?)` — run another agent file as a sub-run.
 - `chidori.branch(variants, options?)` — fork into parallel sub-runs.
 - `chidori.step(name, fn)` — durable checkpoint for an expensive computation.
-- `chidori.retry(fn, options?)` — retry with backoff.
-- `chidori.parallel(tasks, options?)` — run tasks concurrently.
-- `chidori.memory(action, key?, value?)` — persistent key/value store.
+- `chidori.util.retry(fn, options?)` — retry with backoff (in-VM helper, not recorded).
+- `chidori.util.parallel(tasks, options?)` — run tasks concurrently (in-VM helper, not recorded).
+- `chidori.memory.set/get/delete/list/clear` — persistent key/value store.
 - `chidori.log(message, fields?)` — structured log into the call trace.
 
 ## Writing a tool
 
-A tool is a TypeScript file in a directory you pass with `--tools`. It exports a
-`tool` definition (name, description, JSON-schema parameters) and a `run`
-function:
+A tool is merely a function with a documented signature. `defineTool` pairs a
+`run` function with the `name`, `description`, and JSON-schema `parameters`
+the model reads to call it, and hands back a plain object — inline in your
+agent or imported from any module. No `tools/` directory, no registration. The
+`run` function executes in the agent's own VM (closures and captured effects
+work), so route real side effects through host calls (`chidori.fetch` /
+`chidori.log`) to keep them recorded and replayed once.
 
-    import type { ToolDefinition } from "chidori:agent";
+    import { chidori, run, defineTool } from "chidori:agent";
 
-    export const tool: ToolDefinition = {
+    const reverse = defineTool({
       name: "reverse",
       description: "Reverse a string.",
       parameters: {
@@ -265,21 +275,22 @@ function:
         properties: { text: { type: "string" } },
         required: ["text"],
       },
-    };
+      run: async (args: { text: string }) => ({
+        reversed: [...args.text].reverse().join(""),
+      }),
+    });
 
-    export async function run(args: { text: string }) {
-      return { reversed: [...args.text].reverse().join("") };
-    }
-
-Tools are auto-discovered by name from the `--tools` directory. List the names
-you want available in the agent's `.tools([...])` call, then invoke one with
-`chidori.tool("reverse", { text })`.
+Pass the handle where you want the model to use it — `prompt(text, { tools:
+[reverse], maxTurns })` (the runtime runs the loop for you) or
+`context().tools([reverse])` for an author-driven loop.
 
 ## Running agents (CLI)
 
-- `chidori run <file.ts> [--input key=value] [--tools <dir>] [--trace] [--stream]`
+- `chidori run <file.ts> [--input key=value] [--trusted] [--trace] [--stream]`
   — execute an agent. `--input` accepts `key=value` pairs or a JSON object;
-  `@file` loads a value from a file.
+  `@file` loads a value from a file. Powerful effects (tool calls, network,
+  workspace writes) ask for approval at the terminal by default; `--trusted`
+  skips the ask (required non-interactively, where gated effects fail closed).
 - `chidori chat [agent.ts]` — interactive REPL. With no file it chats with the
   model directly; with a file it drives the agent's `messages` input per turn.
 - `chidori demo` — interactive menu of example agents (several need no API key).
@@ -287,7 +298,6 @@ you want available in the agent's `.tools([...])` call, then invoke one with
   an LLM without setting a provider key. Saved to `~/.chidori/credentials.json`.
 - `chidori init [dir] [--template <name>]` — scaffold a starter project.
 - `chidori check <file.ts>` — type/parse-check an agent without running it.
-- `chidori tools [--dir <dir>]` — list discovered tools.
 - `chidori serve <file.ts> [--port N]` — run an agent as an HTTP server.
 - `chidori resume <file.ts> <run_id>` — replay/resume a recorded run.
 - `chidori trace <run_id>` — pretty-print a run's host-call log.
@@ -309,7 +319,9 @@ Set one provider environment variable before runs that call the model:
 
 - `ANTHROPIC_API_KEY` for Anthropic (Claude) models.
 - `OPENAI_API_KEY` for OpenAI models.
-- `LITELLM_API_URL` + `LITELLM_API_KEY` to route through a LiteLLM proxy.
+- `CHIDORI_OPENAI_COMPAT_URL` + `CHIDORI_OPENAI_COMPAT_KEY` for any
+  OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, a LiteLLM
+  proxy…) — pick the model with `--model` or `CHIDORI_MODEL`.
 
 No key handy? Run `chidori model-login` to sign in with OpenRouter in your browser.
 Chidori exchanges the sign-in for a user-scoped key (saved to
@@ -324,9 +336,13 @@ need no key at all.
 
 Agents run in a pure-Rust JavaScript sandbox — there is no raw shell or
 unfettered filesystem access. Effects that touch the outside world go through a
-policy layer. By default `chidori run` is permissive; `--untrusted` switches to
-deny-by-default (workspace reads allowed, writes and network denied unless
-approved). The workspace is always scoped to the project directory.
+policy layer. By default `chidori run` asks before powerful effects (tool
+calls, network, workspace writes) with a y/a/N prompt (`a` approves all further calls to that target for the run) at the terminal; LLM
+prompts and pure compute never ask. Pass `--trusted` for the permissive
+allow-all behavior (needed for non-interactive runs, where gated effects fail
+closed), or `--untrusted` for deny-by-default (workspace reads allowed, writes
+and network denied outright). The workspace is always scoped to the project
+directory.
 "#;
 
 /// One file a template writes, relative to the target directory.
@@ -385,28 +401,52 @@ const CHAT: Template = Template {
 
 // Inlined rather than include_str!'d from examples/ so the crate packages
 // self-contained for crates.io (examples/ lives outside the package root).
-// Mirrors examples/agents/worker.ts and examples/tools/reverse.ts.
-const WORKER_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
+// Mirrors examples/agents/worker.ts.
+const WORKER_AGENT_SRC: &str = r#"import { chidori, run, defineTool, type AgentJson, type JsonObject } from "chidori:agent";
 
 /**
  * An autonomous "worker" agent: it loops — think, call a tool, observe the
  * result, repeat — until it produces an answer with no further tool calls.
  *
  * The loop is author-driven via `context.respond()`, which returns the model's
- * structured turn (`tool_calls` + `text`). Tool results are appended back to the
+ * structured turn (`toolCalls` + `text`). Tool results are appended back to the
  * context with `toolResult(...)`, and the next `respond()` continues from there.
- * Every turn and tool call is a durable host call, so the whole run replays for
- * free.
+ * (For the common case, `prompt(text, { tools, maxTurns })` runs the whole loop
+ * for you.)
+ *
+ * A tool is just a function with a documented signature — a `name`, a
+ * `description`, and JSON-schema `parameters`. `defineTool` staples that
+ * signature onto the function, giving a plain handle you define inline or
+ * import; its `run` executes in the agent's own VM. No `tools/` directory.
+ * Every turn is a durable host call, so the whole run replays for free.
  *
  * Run:
- *   chidori run examples/agents/worker.ts \
- *     --input task="Reverse the word 'chidori' and tell me the result." \
- *     --tools examples/tools
+ *   chidori run agent.ts \
+ *     --input task="Reverse the word 'chidori' and tell me the result."
  */
-export async function agent(
-  input: { task: string; maxSteps?: number },
-  chidori: Chidori,
-) {
+
+// A sample tool: a `run` function plus the signature the model calls it by.
+// Replace the body (and schema) with whatever your agent needs — an API call,
+// a DB query, a computation. Route real side effects through host calls
+// (chidori.fetch / chidori.log) so they are recorded and replayed once.
+const reverse = defineTool({
+  name: "reverse",
+  description: "Reverse a string and return it. A sample tool — replace with your own.",
+  parameters: {
+    type: "object",
+    properties: { text: { type: "string", description: "The text to reverse" } },
+    required: ["text"],
+  },
+  run: async (args: { text: string }) => ({
+    reversed: [...String(args.text)].reverse().join(""),
+  }),
+});
+
+// The tools this worker can call, indexed by name so the loop can dispatch a
+// model tool-call to the right handle. Add your own handles here.
+const toolbox = new Map([[reverse.name, reverse]]);
+
+run(async (input: { task: string; maxSteps?: number }) => {
   const maxSteps = input.maxSteps ?? 8;
 
   let ctx = chidori
@@ -416,54 +456,33 @@ export async function agent(
         "task. Call a tool when it helps; when you are finished, reply with a " +
         "final answer and no tool calls.",
     )
-    .tools(["reverse"]) // tool names discovered from the --tools directory
+    .tools([...toolbox.values()]) // pass the defineTool handles
     .user(input.task);
 
-  const steps: { tool: string; input: unknown; result: unknown }[] = [];
+  const steps: { tool: string; input: JsonObject; result: AgentJson }[] = [];
 
   for (let step = 0; step < maxSteps; step++) {
     const { response, context } = await ctx.respond({ type: "final" });
     ctx = context; // the assistant turn (incl. tool-use blocks) is now in ctx
 
     // No tool calls means the worker is done.
-    if (!response.tool_calls || response.tool_calls.length === 0) {
+    if (!response.toolCalls || response.toolCalls.length === 0) {
       return { answer: response.content, steps };
     }
 
-    // Run each requested tool and feed the result back for the next turn.
-    for (const call of response.tool_calls) {
-      const result = await chidori.tool(call.name, call.input);
+    // Run each requested tool in-VM and feed the result back for the next turn.
+    for (const call of response.toolCalls) {
+      const tool = toolbox.get(call.name);
+      const result = tool
+        ? await tool.run(call.input, chidori)
+        : { error: `unknown tool: ${call.name}` };
       steps.push({ tool: call.name, input: call.input, result });
       ctx = ctx.toolResult(call.id, JSON.stringify(result));
     }
   }
 
   return { answer: "(stopped: reached maxSteps without finishing)", steps };
-}
-"#;
-
-const REVERSE_TOOL_SRC: &str = r#"import type { ToolDefinition } from "chidori:agent";
-
-/**
- * A sample tool for the worker agent. Reverses a string. Replace the body (and
- * the schema) with whatever your agent needs — an API call, a DB query, a
- * computation. Every `chidori.tool(...)` call is policy-gated and recorded.
- */
-export const tool: ToolDefinition = {
-  name: "reverse",
-  description: "Reverse a string and return it. A sample tool — replace with your own.",
-  parameters: {
-    type: "object",
-    properties: {
-      text: { type: "string", description: "The text to reverse" },
-    },
-    required: ["text"],
-  },
-};
-
-export async function run(args: { text: string }) {
-  return { reversed: [...String(args.text)].reverse().join("") };
-}
+});
 "#;
 
 const WORKER: Template = Template {
@@ -476,16 +495,12 @@ const WORKER: Template = Template {
             contents: WORKER_AGENT_SRC,
         },
         TemplateFile {
-            path: "tools/reverse.ts",
-            contents: REVERSE_TOOL_SRC,
-        },
-        TemplateFile {
             path: "README.md",
             contents: WORKER_README,
         },
     ],
     run_hint:
-        "chidori run agent.ts --input task=\"Reverse the word 'chidori' and tell me the result.\" --tools tools",
+        "chidori run agent.ts --input task=\"Reverse the word 'chidori' and tell me the result.\"",
 };
 
 pub const TEMPLATES: &[&Template] = &[&DOCS, &CHAT, &WORKER];
@@ -635,9 +650,11 @@ mod tests {
     fn scaffolds_worker_template_with_tool() {
         let dir = temp_dir("worker");
         run(&dir, Some("worker")).unwrap();
-        assert!(dir.join("agent.ts").exists());
-        let tool = std::fs::read_to_string(dir.join("tools/reverse.ts")).unwrap();
-        assert!(tool.contains("name: \"reverse\""));
+        // The sample tool is defined inline with defineTool — no tools/ dir.
+        let agent = std::fs::read_to_string(dir.join("agent.ts")).unwrap();
+        assert!(agent.contains("defineTool("));
+        assert!(agent.contains("name: \"reverse\""));
+        assert!(!dir.join("tools").exists());
         assert!(dir.join("README.md").exists());
         let _ = std::fs::remove_dir_all(dir);
     }

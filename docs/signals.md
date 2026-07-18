@@ -71,7 +71,7 @@ chidori.pollSignal<T = AgentJson>(name: string): Promise<Signal<T> | null>;
 // Fan-in: pause until ANY of the named signals is delivered; the result is the
 // bare consumed signal — its `name` says which fired. Pre-arrived candidates
 // are consumed in arrival order (lowest delivery_seq across the name set).
-chidori.signalAny<T = AgentJson>(names: string[], opts?: {
+chidori.signal<T = AgentJson>(names: string[], opts?: {
   timeoutMs?: number;          // sentinel `name` is null (no name fired)
 }): Promise<Signal<T> | SignalTimeout>;
 ```
@@ -79,7 +79,7 @@ chidori.signalAny<T = AgentJson>(names: string[], opts?: {
 `timeoutMs` never rejects — a timeout is an expected outcome the agent
 discriminates on, not an error. The pause resolves to the
 `{ name, payload: null, from: null, timedOut: true }` sentinel (`name` is null
-for a multi-name `signalAny`, since no name fired). Enforcement is server-side:
+for a multi-name fan-in listen, since no name fired). Enforcement is server-side:
 an in-process timer armed against a persisted `pending_signal_deadline` on the
 session, re-armed for every paused session at server startup. A delivery that
 lands first wins; the late timer validates against the stored session and
@@ -88,7 +88,7 @@ replays deterministically.
 
 ### SDK types
 
-`Signal`, `SignalSender`, and `signal`/`pollSignal`/`signalAny` live on the
+`Signal`, `SignalSender`, and `signal`/`pollSignal` live on the
 `Chidori` interface in `sdk/typescript/src/agent.ts` (types only; the runtime
 supplies the methods, like the other host methods).
 
@@ -243,7 +243,7 @@ The server routes on the run's state:
 | Run state | Response | Behavior |
 |---|---|---|
 | **Streaming** (a live worker supervises the run) | `202 {"status":"delivered_live"}` | The signal is enqueued straight into the live run's in-memory mailbox (write-through to `signals/inbox.json` in the same critical section) and the worker is woken. A run mid-execution drains it at its next listen point; a run idling on a matching listen point is resolved and resumed **in-process** — no HTTP round-trip — and the SSE stream stays open across the resume. |
-| **Paused, waiting on THIS name** (a `Signal` op whose `{name}` matches, or a `signalAny` listen set containing it) | `200` + updated session view | **Resolve + resume**: the pending op is resolved with `{name, payload, from}`, a synthetic `signal` CallRecord is injected at the pending seq, and the run re-runs to its next pause or completion — the same machinery `/resume` uses. |
+| **Paused, waiting on THIS name** (a `Signal` op whose `{name}` matches, or a fan-in listen set containing it) | `200` + updated session view | **Resolve + resume**: the pending op is resolved with `{name, payload, from}`, a synthetic `signal` CallRecord is injected at the pending seq, and the run re-runs to its next pause or completion — the same machinery `/resume` uses. |
 | **Paused on a DIFFERENT name / on input / on approval, or Running** (no live worker) | `202 {"status":"queued"}` | **Enqueue** into `signals/inbox.json` with an assigned `delivery_seq`. The run stays where it is; the entry is drained when it reaches a matching listen point. |
 | **Completed / Failed / Cancelled** | `409 Conflict` | No inbox write — an orphan inbox would mislead a later replay. |
 
@@ -280,7 +280,7 @@ pausing host call (`PendingHostOperation` / `HostPromiseTable` / `pending.json`)
    `PendingInput`), and throws the pause marker. The engine surfaces the pause
    as `RunResult { paused_signal: Some(PendingSignal { seq, name, .. }) }`, so
    the server knows *which* named op is waiting. `pollSignal` stops after step
-   3, recording the value *or* `null`; `signalAny` pauses on a name *set*
+   3, recording the value *or* `null`; the fan-in `signal([...])` pauses on a name *set*
    (match key `{names: [...]}`) and drains the lowest-`delivery_seq` entry
    across the whole set.
 

@@ -18,6 +18,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Test workspace
         run: cargo test --workspace
 
@@ -42,11 +45,22 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Typecheck examples against the SDK types
+        run: |
+          npx tsc -p ../../examples
+          npx tsc -p ../../examples/record-replay
+
       - name: Build package
         run: npm run build
 
       - name: Test
         run: npm test
+
+      # If this package.json version is already on npm, the tree must match
+      # the published tarball — otherwise the change needs a version bump or
+      # it will never publish (release.yml skips existing versions).
+      - name: Check published-package drift
+        run: SKIP_BUILD=1 ../../scripts/check-npm-drift.sh
 
   python-sdk:
     name: Python SDK integration
@@ -62,6 +76,9 @@ jobs:
 
       - name: Build chidori binary
         run: cargo build
+
+      - name: Run Python SDK client unit tests
+        run: python -m unittest sdk/python/tests/test_client_http.py
 
       - name: Run Python SDK integration tests
         run: python -m unittest sdk/python/tests/test_session_api.py

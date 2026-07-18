@@ -964,6 +964,819 @@ checksums byte-identical across the suite. Remaining costs are parse-side
 object building (property-map hashing) and the interpreter reads around
 the loop — shape-cache territory, out of scope here.
 
+## 6.7 String code-unit reads (landed 2026-07-10): cached length + O(1) ASCII indexing
+
+A gap found while adding bench coverage, not by callgrind — no workload
+exercised it (the new `string_scan` closes that): the `charCodeAt`-class
+accessors (`charCodeAt`/`charAt`/`codePointAt`/`at`) materialized the ENTIRE
+string as a fresh `Vec<u16>` per call (`units_this` → `to_utf16_vec`), and
+`.length` on a plain `Utf8` string re-scanned it per read — so the canonical
+tokenizer loop `for (i = 0; i < s.length; i++) s.charCodeAt(i)` was O(n²)
+with n full-string allocations.
+
+Two changes, no new dependencies, no semantic surface:
+
+- `Repr::Utf8` carries a lazily-cached UTF-16 unit count (`Cell<u32>`,
+  computed on first `len_utf16`; `from_code_units` records it for free).
+  `.length` is O(1) after first read, and — since unit count == byte count
+  iff the string is pure ASCII — `code_unit_at` indexes bytes directly on
+  ASCII strings (the `Rope` arm already stores totals, so an ASCII rope
+  gets the same O(1) path over its flattened bytes). Construction stays
+  O(1); the bytecode-constant load path (`from_rc_str`) pays nothing.
+- The four accessor builtins read through `code_unit_at` instead of
+  materializing code units.
+
+Measured: `string_scan` (8 KB ASCII string, 12 scan rounds + a charAt pass)
+**1.50 s → 50 ms wall (30×)**; heap churn for the criterion variant
+**20.16 MiB / 166 k allocs → 167 KiB / 2.4 k allocs**. RESULT byte-identical
+to Node. Non-ASCII strings keep the O(i) iterator path per read — a rope
+index or WTF-8 offset table remains available headroom if a workload ever
+needs it, and kernel candidate (a) (§6.5.1) now has its O(1) accessor
+prerequisite.
+
+## 6.8 Typed-array kernel bases (landed 2026-07-10): §6.5.1 candidate (c)
+
+The loop-kernel translator always accepted `t[i]` / `t[i] = v` / `t.length`
+over a pinned object base — the RUNTIME arms just only recognized dense
+`Internal::Array`, so a typed-array loop kernelized and then bailed on every
+access. The arms now also take numeric typed arrays:
+
+- `LoadElem`/`StoreElem`: a valid-index integer-indexed [[Get]]/[[Set]]
+  reads/writes element storage directly — own props and the prototype chain
+  are never consulted, so no props/proto re-check is needed (unlike dense
+  arrays). The register already holds the ToNumber'd store value, and
+  `typed_array::encode`/`decode` are the SAME per-kind conversions the
+  builtin path uses (f32 rounding, ToInt32-class wrapping, u8 clamping) —
+  bit-identical by construction. OOB (incl. detached / shrunk views) bails:
+  the generic path owns undefined-absorption and silent-store semantics.
+  BigInt-element kinds always bail (elements aren't Numbers).
+- `LoadLen`: typed-array `.length` resolves through a prototype ACCESSOR, so
+  the activation entry guard (`kernel_ta_len_ok`, gated by the new
+  `Kernel::loads_len` flag) identity-checks that any typed-array LoadLen
+  base still resolves to the pinned canonical `%TypedArray%.prototype`
+  getter (`Realm::ta_length_getter`) with no own shadow. Sound for the whole
+  activation: nothing inside a kernel can add props, change protos, or
+  resize/detach a buffer (all require calls).
+
+Measured: the `typed_array` workload (Float64Array sum/dot/transform +
+Int32Array bit-mix) **637 ms → 37 ms wall (17×)** — from ~45× behind Node to
+roughly parity. Gates: the kernels differential corpus grew 17 typed-array
+programs (per-kind store semantics incl. clamping/wrapping/f32 rounding,
+OOB reads and writes, aliased same-buffer and cross-kind views, offset
+subarrays, own-`length` shadow, patched prototype getter, null proto,
+BigInt kinds, resizable-buffer length tracking, mixed dense+typed regions);
+full suites + Test262 gate green.
+
+## 6.9 Kernel v9 (landed 2026-07-10): the recursion shapes — mutual,
+boolean-returning, and captured-binding self-reference (§6.5.1 e/f/g)
+
+The three shapes v6's self-recursion tier declined, all landed in one
+generalization. `KOp::SelfCall` gained a `callee` selector, `Kernel::
+self_global` became a `KernelRec` descriptor (`self_refs` + partner
+`globals`), and the windowed executor became MULTI-FUNCTION:
+
+- **Boolean returns (g)**: translation runs under an assumed static return
+  type (Number first, then Boolean) — `SelfCall` dst registers are typed by
+  the assumption and every `Ret` must agree, so `isEven`-class predicates
+  kernelize while mixed-type recursions stay generic. A top-level boolean
+  result materializes `Value::Bool` (typeof/strict-eq exact).
+- **Captured-binding self-reference (f)**: `LoadUpvalue` in callee position
+  (the compiler's `LoadUpvalue; LoadUndefined(this); args…; Call` pattern)
+  speculates SELF; the entry guard requires the cell to hold the very
+  closure being invoked. `const gcd = (a, b) => … gcd(…)` and named
+  function expressions kernelize; a rebound `let` or a helper closure in
+  the cell declines observably. Mis-speculation only costs translation —
+  the shapes it could hit were never kernelizable.
+- **Mutual recursion (e)**: `LoadGlobal` of a non-self name in fn mode
+  becomes a speculative partner reference. The entry guard resolves the
+  whole call FAMILY once per activation (transitively, bounded at 8):
+  every name a plain data global holding a plain sync bytecode closure
+  with a function kernel, every member's self-references intact, every
+  member's `Ret` type matching the entry kernel's, every call site
+  supplying the RESOLVED callee's consumed arguments, canonical Math and
+  Number upvalues per member. Execution stacks per-member register
+  windows over one buffer; the current member's tables are hoisted so
+  same-kernel recursion (fib-class) pays nothing new — fib's count is
+  unchanged. Nothing inside a kernel writes globals or cells, so entry
+  resolution holds for the activation; rebinding a partner BETWEEN calls
+  declines and the patched binding is observed generically.
+
+Measured (idle machine, interleaved A/B medians): **mutual_recursion
+(isEven/isOdd over 20k outer calls + const-arrow gcd) 1.106 s → 0.160 s
+(6.9×)**; fib_recursive / closures / sort unchanged. RESULT byte-identical.
+Remaining headroom: the per-activation family resolution allocates its
+tables per OUTER call (~40k entries here) — an entry cache or Vm-pooled
+scratch would shave the shallow-recursion case further. *(→ landed as the
+family cache + grow-only register buffer, §6.11.)*
+
+Gates: the kernels differential corpus grew 16 recursion programs
+(boolean/mutual/const-binding families, typeof/strict-eq observation,
+partner and self rebinding declines, non-kernelizable family members,
+short-arg call sites at translation and at entry, −0 pins, Math inside
+recursion, captured numeric upvalues) and the depth-overflow differential
+now covers the mutual path; structural pins updated (boolean/mutual/
+captured-binding recursion MUST kernelize, parameter-recursion must not);
+full suites + Test262 gate green.
+
+## 6.10 Register bytecode (landed 2026-07-10): §3.5, scoped as a tier
+
+The remaining structural lever from §3.5, built the way this engine builds
+tiers rather than as the big-bang rewrite the original phase plan imagined:
+a compile-finish pass (`reg.rs`) translates a WHOLE eligible function body
+from the final stack bytecode into a register program
+(`FuncProto::reg: Option<Rc<RegProto>>`), and `Vm::run_frame` — the single
+funnel every call, construct, accessor, and module/script evaluation goes
+through — executes it via `run_reg_frame` instead of the stack loop. No
+operand stack, no per-value push/pop traffic, and one dispatch where the
+stack machine pays two or three: `LoadLocal a; LoadLocal b; Add; StoreLocal c`
+is a single `Add { dst: c, a, b }`.
+
+**Translation model** (mirrors the kernel tiers' discipline, over boxed
+values):
+
+- **Same helpers, same semantics.** Every register op calls the SAME `Vm`
+  helper as its stack twin. The inline-cache fast paths (`GetProp`/`SetProp`/
+  `LoadGlobal`) and the dense-array element fast paths were extracted into
+  shared `Vm` methods (`ic_get_prop`, `ic_set_prop`, `ic_load_global`,
+  `elem_get`, `elem_set`, …) that BOTH interpreters call, so each op keeps
+  exactly one implementation and the tiers cannot drift. Register programs
+  carry their own `IcEntry` table with the identical key-verified protocol.
+- **Registers are `frame.locals`.** Slots `0..num_locals` are the localized
+  bindings (same TDZ marker, same semantics); slots above are the canonical
+  homes of the stack machine's operand depths (`canon(d) = num_locals + d`).
+  A register frame is an ordinary pooled `Frame` — GC tracing, `arguments`,
+  cells, upvalues, and the frame pool all work unchanged.
+- **Lazy operands.** A virtual stack of entries abstract-interprets the
+  stack code at compile time. `LoadLocal`/`LoadConst`/`LoadThis`&c. emit
+  NOTHING — consuming ops read the local register or a `konst` operand
+  directly; everything is flushed to canonical form at control-flow edges,
+  and any op that writes a local first flushes live lazy references to it
+  (locals are provably unaliasable — that is what localization established).
+  A forward dataflow (intersection at joins, to a fixpoint) proves most
+  local reads can never see the TDZ marker, so they skip the check the
+  stack interpreter pays on every `LoadLocal`; unprovable reads emit an
+  explicit `TdzCheck`. The `Dup; GetProp(name); Swap` method-call prologue
+  fuses to one property op (plus at most one move). Fused stack
+  superinstructions map 1:1 onto fused register ops (`CmpBrK`,
+  `IncLocal`, `AddCellK`, …), so non-kernel loops keep their one-dispatch
+  tests and updates.
+- **Whole-function eligibility, tier ordering.** Any op outside the
+  translated subset declines the function: `with`/direct-eval scope ops,
+  `super`/private class elements, dispose scopes (`using`), suspension
+  ops, and `Op::LoopKernel` — a loop-kernelized function keeps the stack
+  tier because its unboxed kernels are far faster than boxed register ops.
+  The call paths still try `fn_kernel` first, so the tier order per
+  activation is: function kernel (unboxed, frameless) → register program
+  (boxed, framed) → stack loop. Await-free `async` bodies translate (they
+  contain no suspension ops and run to completion in one shot); a real
+  `await` declines the body.
+- **Try/catch/finally translate** (round 2, same day) — and with them
+  for-of loops and array destructuring, whose IteratorClose-on-abrupt-exit
+  protocol rides the handler machinery. `ROp::PushTryHandler` records the
+  CANONICAL operand depth after a full flush (so the surviving entries —
+  a for-of loop's iterator — sit where every unwind expects them); the
+  register-mode completion walk (`reg_do_completion`) mirrors
+  `do_completion` exactly, with "truncate the operand stack" becoming
+  "clear the canonical registers above the handler's depth" (value-
+  lifetime parity) and the exception landing in `canon(depth)` — the
+  register the catch label's seeded state reads it from. Catch/finally
+  labels are seeded in the pre-emission dataflow (catch at `depth + 1`)
+  with a conservative all-maybe TDZ set, since a throw can occur anywhere
+  in the guarded region. `Op::CompletionJump`/`Op::EndFinally` (break/
+  continue/return crossing finallys) translate 1:1; the delegation arms
+  cannot occur (generators never translate). A jump target reachable ONLY
+  through parked completions (a `while(true)` whose sole exits break
+  through a `finally`) has no seeded state and declines the function.
+- **Determinism.** The register program is a pure function of the source,
+  compiled at compile finish. It polls the cooperative interrupt flag at
+  the stack loop's cadence. ~~Like the kernel tiers, the register tier is
+  OFF whenever an op budget is installed~~ — superseded by §6.11: the tier
+  now carries EXACT per-op stack-unit costs and stays on under a budget,
+  so the production server's default `CHIDORI_JS_OP_BUDGET=5e9` runs get
+  the register tier too. The kernel tiers still decline under a budget.
+- **Native stack discipline.** `run_reg_frame` keeps the hot ops inline and
+  delegates everything rare to an `#[inline(never)]` `rstep_cold`, the same
+  split (and reason) as `step`/`step_cold`; the depth-overflow differential
+  pins that deep recursion through register frames raises the same
+  catchable RangeError at the same depth.
+
+**Gates:** a 110-program differential corpus + 300-case deterministic fuzz
+(`tests/reg.rs`) require byte-identical output and errors reg-on vs reg-off
+across the virtual-stack shuffles (ternaries, logical operators, optional
+chains, method calls, compound assignment), TDZ edges, IC hit/miss/exotic
+paths, dense-element semantics, every call shape, closures/per-iteration
+capture, `arguments` aliasing, mixed-tier throws, the full handler-
+machinery surface (rethrow, nested finallys, return-in-finally overriding,
+break/continue crossing finally regions, iterator close on break/throw
+with throwing/suppressed `return()`), and the decline boundaries; structural pins require the canonical shapes to translate and
+the excluded shapes to decline; the op-budget test additionally asserts the
+budget drains to the exact same count on both compiles. Full suites for
+both crates (118 + 761 tests, incl. record→replay byte-identity) and the
+Test262 gate: green. The pass is disabled under the `op-histogram` feature
+(register execution would hide per-op counts).
+
+### 6.10.1 Measured (callgrind instruction counts, whole workload)
+
+Reg-on vs reg-off, same commit, release build; RESULT checksums
+byte-identical on every workload:
+
+| workload | reg off | reg on | Δ instructions |
+| --- | ---: | ---: | ---: |
+| string_scan | 521.4 M | 368.3 M | **−29.4%** |
+| sort | 2.64 G | 2.07 G | **−21.5%** |
+| mixed_helpers (new) | 5.98 G | 5.18 G | **−13.5%** |
+| string_build | 183.3 M | 160.1 M | **−12.7%** |
+| json_roundtrip | 1.25 G | 1.20 G | −4.3% |
+| arith / fib / closures / property / array_hof / array_push_sum | — | — | ±0.003% |
+
+The unchanged rows are exactly the kernel-owned workloads: their hot
+functions decline register translation by design (the `+0.003%`-class
+deltas are the one-branch `proto.reg` probe per call, the same cost class
+as the `fn_kernel` probe). The wins land where the boxed interpreter
+itself carries the run — top-level glue around native/kernel calls (sort's
+build-and-invoke loop), string-scan/build loops, and `mixed_helpers`,
+which is all glue by construction. Geomean over the five
+interpreter-carried workloads: **−17%** instructions.
+
+Wall-clock (idle container, 5-run median, execution-only):
+
+| workload | reg off | reg on | speedup |
+| --- | ---: | ---: | ---: |
+| string_scan | 58 ms | 42 ms | 1.38× |
+| sort | 295 ms | 243 ms | 1.21× |
+| mixed_helpers | 724 ms | 620 ms | 1.17× |
+| string_build | 28 ms | 26 ms | 1.08× |
+| json_roundtrip | 154 ms | 147 ms | 1.05× |
+| kernel-owned workloads | — | — | 1.0× (noise) |
+
+Handler-machinery spot check (round 2): an ad-hoc for-of/try/destructuring
+glue script (`Object.entries` iteration, destructuring in a helper called
+per entry, try/catch around a throwing path, try/finally in the loop body —
+all shapes round 1 declined) measures **518.9 M vs 646.6 M instructions
+(−19.8%)** and 84 ms vs 103 ms wall (1.23×) reg-on vs reg-off, RESULT
+byte-identical. The committed suite's rows are unchanged (no committed
+workload uses try/for-of in hot code).
+
+`mixed_helpers` is a new workload added with this round: small helper
+functions over objects and strings (property traffic across calls, string
+building, for-in, ternary classification) — the shape of real agent glue
+where every function declines the kernel tiers and the interpreter itself
+carries the run. It is the register tier's home turf; the kernel-owned
+numeric workloads are untouched by design (their functions decline
+translation), and the suite's RESULT checksums are byte-identical reg-on
+vs reg-off across the board.
+
+### 6.10.2 What's next (post-register baseline)
+
+- ~~**Try/finally support**~~ — landed same day (see above): for-of,
+  array destructuring, and try-wrapped code now translate.
+- **Register-mode loop-kernel embedding** — let a function carry BOTH
+  kernels and a register program by teaching kernel bail-out to resume at a
+  register pc instead of a stack ip.
+- ~~**Budget-compatible fast tiers**~~ — the register half landed (§6.11):
+  budgeted runs keep the register tier with EXACT drain. The kernel tiers
+  (whose fused unboxed regions have no 1:1 stack-op correspondence at
+  bail boundaries) still decline under a budget; mapping them stays open.
+- Re-run the callgrind sweep before choosing; §1.1's caveats stand.
+
+## 6.11 Recursion-entry + for-in fast paths; the register tier joins budgeted runs (landed 2026-07-11)
+
+Four items from a fresh callgrind review of the two workloads the previous
+rounds left richest — mutual_recursion (1.43 G, ~22% per-activation
+overhead) and mixed_helpers (4.16 G, ~14% for-in machinery) — plus the
+op-budget follow-up §6.10.2 tracked. All safe Rust, zero new dependencies.
+
+1. **Grow-only kernel register buffer.** `Vm::kernel_regs` was cleared and
+   re-zeroed per activation, so a 300-deep `isEven` recursion re-zero-filled
+   every window on each of 40k outer calls — `Vec::resize` + memset were
+   11% of mutual_recursion. The buffer now keeps its high-water length
+   across activations and is never re-zeroed: stale `f64`s are unreadable
+   by construction (every register is loaded at entry or store-before-read
+   by translation proof — the same proofs the kernels already rely on).
+2. **Recursion-family cache** (`exec::RecFamily`, `Vm::rec_families`). v9's
+   per-activation family resolution allocated ~8 table Vecs and re-scanned
+   every member's kernel code (Ret-type + argc cross-checks) per OUTER
+   call. The resolved family is now cached keyed by the entry closure's
+   identity; a hit re-verifies only the dynamic facts — each recorded
+   global SLOT still holds its member (key-verified indexed read, no
+   hashing — insertion slots are stable under value writes and appends),
+   upvalue self-cells intact, `Math` canonical — and re-snapshots upvalue
+   values. Any failure drops the entry and re-resolves from scratch
+   (exactly the uncached path), so hit vs miss is unobservable. The
+   windowed executor's (return-pc, dst, window) stack is Vm-pooled, and
+   the family's tables are read through the cache during execution.
+   Bounded (8 entries, MRU); holding member closures across activations is
+   the same retention class as the prototype-holder ICs.
+3. **for-in fast path** (`Vm::for_in_keys_fast`). Every `for (k in o)`
+   built a shadowing `HashSet` and per-chain-level `own_keys` key-clone
+   Vecs — so a 5-key plain object also inserted Object.prototype's ~12
+   non-enumerable keys into a set that then rehashed and dropped, 60k
+   times (~14% of mixed_helpers + a large share of its allocator
+   traffic). Now: an ORDINARY receiver's own enumerable string keys come
+   straight off its property map (index-likes sorted first, own keys
+   unique by construction — no dedup needed for one level), and the
+   prototype chain is walked with an allocation-free "contributes any
+   enumerable string key?" scan. If nothing contributes (every standard
+   prototype), shadowing is irrelevant and the walk is done; a proxy, an
+   exotic index source, or any enumerable proto key falls back to the
+   generic path unchanged. Gated by an 18-case differential vs Node
+   (index ordering, shadowing incl. non-enumerable shadows, null proto,
+   mid-program `Object.prototype` injection, arrays/holes/strings,
+   enumerable accessors, frozen objects, array-valued protos).
+4. **The register tier joins budgeted runs** (`RegProto::costs`). The tier
+   previously declined whenever an op budget was installed — so the
+   production server's `CHIDORI_JS_OP_BUDGET=5e9` kept every agent run on
+   the stack tier, and §6.10's wins never reached production. Each
+   register op now carries the EXACT number of final stack-bytecode ops it
+   stands for, attributed during translation: elided pure loads accumulate
+   into the next ANCHOR op on their path (between a pure stack op and the
+   next anchor nothing observable runs, so charging there is exact); a
+   fall-through edge into a join sinks stranded units into a pure
+   `ROp::Charge`; the fused method-call window anchors at its `GetProp`
+   (unit 2 of 3) so a getter still runs — with the same remaining budget —
+   when the stack tier would have died exactly at the trailing `Swap`.
+   The charge is hard-checked before each op: the budget-exceeded throw
+   fires exactly where the stack loop's per-op check would have, no op
+   the stack tier would not have reached can run, and every control op
+   costs ≥ 1 so termination stays guaranteed. Unbudgeted runs pay one
+   predicted branch per op (the stack loop's own `counting` protocol).
+
+   En route this EXPOSED a pre-existing register-tier crash that budgeted
+   runs had masked: a zero-arg call/construct whose argument window starts
+   one past every touched register (`new`/method-call at virtual-stack
+   top, the Test262 `S13.2.2_A10` shape) panicked slicing
+   `locals[at..at]` out of range — the process-killing kind of bug the
+   conformance gate exists to catch, and it only surfaced because the gate
+   (which installs a 50M budget) now exercises the register tier at all.
+   Fixed with explicit empty-window guards; the shape is pinned in the reg
+   corpus.
+
+### 6.11.1 Measured (callgrind, whole workload, deterministic)
+
+Baseline = the branch point, same toolchain; RESULT checksums
+byte-identical across the suite and cross-checked against node/bun by the
+benchmark harness:
+
+| workload | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| mixed_helpers | 4.157 G | 2.953 G | **−29.0%** |
+| mutual_recursion | 1.434 G | 1.097 G | **−23.5%** |
+| json_roundtrip | 1.193 G | 1.191 G | −0.2% |
+| sort | 2.045 G | 2.051 G | +0.3% ¹ |
+| string_scan | 353.8 M | 354.9 M | +0.3% ¹ |
+| fib_recursive | 673.8 M | 676.5 M | +0.4% ² |
+| closures / arith_loop / property_access / array_sum / typed_array / array_hof / array_push_sum / string_build | — | — | unchanged (±0.1%) |
+
+¹ The register loop's `counting` branch — the price of budget
+eligibility, paid only by reg-carried workloads.
+² One instruction per self-call reading window sizes through the cached
+family instead of hoisted locals.
+
+Wall-clock (idle container, indicative per §1.1): mutual_recursion
+150 → 113 ms, mixed_helpers 587 → 427 ms.
+
+**Gates:** full suites for both crates green; kernels + reg differential
+corpora green (reg corpus grew the zero-arg-window pin); the op-budget
+test now genuinely exercises the register tier, joined by TWO new budget
+differentials — a full 0..=total budget sweep on a side-effecting program
+(every budget value must produce identical console output, completion,
+and remaining budget on both compiles) and boundary probes across the
+whole reg corpus; the 18-case for-in differential vs Node; Test262 gate
+green — now running the register tier under the runner's budget for the
+first time, i.e. 40k+ conformance tests newly executing the tier.
+
+## 6.12 Masked kernel windows, kernel const-prop + fusion round 2, and
+object-literal templates (landed 2026-07-11)
+
+A fresh callgrind review of the post-§6.11 profiles found three structural
+costs, attacked in one round. All safe Rust, zero new dependencies, RESULT
+checksums byte-identical across the suite (cross-checked against node/bun by
+the benchmark harness).
+
+1. **Masked fixed register windows (`bytecode::KWIN = 32`).** Every kernel
+   executor indexed its register file through `Vec<f64>` slice indexing —
+   and the resulting bounds checks were **12–17% of every kernel-owned
+   workload** (they never predict away: the panic branch sits in the hot
+   dispatch loop). Registers now live in fixed `[f64; KWIN]` WINDOWS indexed
+   as `regs[(r as usize) & KWIN_MASK]` — translation caps every kernel at
+   KWIN registers (observed max: 10) so the mask is an identity on valid
+   indices that PROVES the access in-bounds; the compiler drops the check
+   and the panic branch entirely, zero `unsafe`. Loop kernels run one window
+   (pinned-callee windows at KWIN strides above it, re-split per
+   `CallKernel`); plain function kernels run one stack-allocated window (no
+   pool traffic at all); the recursive executor strides windows at KWIN with
+   a member-level/window-level loop split so same-kernel calls re-derive
+   only the window view, never the member tables.
+2. **Kernel const-propagation + fusion round 2** (`const_prop_kops`, three
+   new superinstructions). The loop translator materialized constants that
+   fed two-register ops (`(i*7919) % 10007` ran `Const` + `Arith` where
+   `ArithK` exists), so cleanup gained a forward const-prop pass (same
+   block discipline as `copy_prop_kops`): `Add`/`Arith`/`BrCmp` operands
+   that are known constants rewrite to their `*K` immediate forms
+   (mirroring the comparison when the constant is on the left; only
+   commutative kinds swap `Arith` operands), `Mov`-of-constant becomes
+   `Const`, and dead `Const` defs die in DCE (extended past `Mov`s). Fusion
+   gained the shapes the array_sum dump showed dominating: `LenBrCmp` (the
+   `i < a.length` header test — LoadLen + BrCmp in one dispatch, with the
+   LoadLen entry-guard scan taught to see the fused form), `LoadElemAdd`
+   (`s += a[i]`), `LoadElemArith` (the dot-product second load feeding its
+   multiply), and `ArithKAdd` (`s += a <op> K` after const-prop). The
+   canonical `s += a[i]` loop: 8 dispatches per iteration → 5. En route,
+   the `i.fract() == 0.0` integrality probe in every element fast path
+   (kernel and interpreter) became a cast round-trip (`dense_index`) —
+   `fract` lowers to a libm `trunc` CALL on baseline x86-64, ~3% of
+   array-heavy workloads.
+3. **Object-literal templates** (`Op::NewObjectTpl`,
+   `FuncProto::obj_tpls`). mixed_helpers spent ~12% (inclusive) in
+   `define_own_property` + `IndexMap::insert_full`: every `{ id: …, name:
+   …, … }` evaluation re-hashed and re-inserted every key through the full
+   spec descriptor path — on a fresh ordinary extensible object, where
+   none of that machinery can observe anything or fail. The compiler now
+   detects all-static-data-key literals (≥2 distinct plain keys; computed
+   keys, accessors, methods, spread, `__proto__`, and duplicates keep the
+   generic path), pre-builds the property map ONCE at compile time, and
+   instantiation CLONES it (bucket layout included — no hashing, no
+   growth-rehash, no descriptor validation) and writes the evaluated
+   values into slots `0..N`. Value expressions still evaluate in exact
+   source order (static keys have no evaluation step, and the object
+   cannot be observed mid-literal — no binding exists and every
+   template-eligible property is plain data). Both tiers execute it
+   (`ROp::NewObjectTpl` mirrors `NewArray`'s canonical window; budget cost
+   is its exact 1 stack unit); kernel regions decline it as before. A
+   side benefit: all objects from one site share one insertion layout, so
+   the key-verified property ICs hit consistently.
+4. **Smaller wins along the way**: `op_add` gained a String⊕Number fast
+   path (both operands already primitive: format the number's digits
+   straight into the once-allocated result buffer via
+   `push_number_string` — the exact digits `to_js_string` produces —
+   skipping two intermediate allocations per `+`; restricted below the
+   rope threshold so big accumulators keep the O(1) rope path);
+   `JSON.parse` interns object keys across parses (Vm-level bounded
+   cache — repeated same-shaped documents reuse one `Rc<str>` per key)
+   and pre-sizes each object's property map (one table allocation instead
+   of the 0→3→7 growth); `js_mod`'s integer fast path also dropped its
+   libm `trunc` calls.
+
+### 6.12.1 Measured (callgrind, whole workload, deterministic)
+
+Baseline = the branch point, same toolchain (rustc 1.97), same container;
+RESULT checksums byte-identical on every workload:
+
+| workload | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| array_sum | 1.948 G | 1.522 G | **−21.8%** |
+| mixed_helpers | 2.953 G | 2.324 G | **−21.3%** |
+| string_build | 118.1 M | 94.0 M | **−20.4%** |
+| typed_array | 521.0 M | 429.4 M | **−17.6%** |
+| property_access | 247.4 M | 204.4 M | **−17.4%** |
+| arith_loop | 382.3 M | 322.3 M | **−15.7%** |
+| array_push_sum | 282.0 M | 240.0 M | −14.9% |
+| closures | 378.4 M | 326.4 M | −13.7% |
+| mutual_recursion | 1.097 G | 958.9 M | −12.6% |
+| array_hof | 340.2 M | 327.4 M | −3.8% |
+| sort | 2.051 G | 1.992 G | −2.9% |
+| string_scan | 355.3 M | 351.4 M | −1.1% |
+| json_roundtrip | 1.191 G | 1.186 G | −0.4% |
+| fib_recursive | 676.5 M | 695.3 M | +2.8% ¹ |
+
+Geomean across the suite: **−12%** instructions; −15 to −22% on the
+kernel-owned and object/string-glue workloads the round targeted.
+
+¹ fib runs the recursive windowed executor, where the window-loop
+restructure costs a few instructions per call/return crossing against the
+masking savings inside the (tiny, ~10-op) activations — the member/window
+loop split recovered most of an initial +19%; the residual is the price
+the other recursion shapes' wins ride on (mutual_recursion −12.6%).
+
+Wall-clock under the RECOMMENDED (PGO) build — interleaved best-of-7 A/B,
+both sides PGO'd on the same corpus, same idle container (plain-release
+wall on two workloads swung the OTHER way purely from fat-LTO code layout;
+cachegrind showed the new binary better on every simulated metric while
+plain-release wall read slower — exactly the layout sensitivity that made
+PGO the recommended benchmark build, and why callgrind stays the
+load-bearing gate):
+
+| workload | PGO before | PGO after | Δ |
+| --- | ---: | ---: | ---: |
+| array_sum | 201 ms | 138 ms | **−31%** |
+| property_access | 29 ms | 20 ms | **−31%** |
+| typed_array | 56 ms | 42 ms | **−25%** |
+| arith_loop | 38 ms | 29 ms | **−24%** |
+| mixed_helpers | 307 ms | 240 ms | **−22%** |
+| mutual_recursion | 93 ms | 80 ms | −14% |
+| array_push_sum / closures | 38 / 32 ms | 33 / 28 ms | −13% |
+| string_build | 18 ms | 16 ms | −11% |
+| string_scan / array_hof / sort / json | — | — | 0 to −5% |
+| fib_recursive | 58 ms | 62 ms | +7% |
+
+### 6.12.2 What the profiles say now
+
+- **json_roundtrip barely moved (−0.4%)**: its cost is diffuse allocator
+  traffic (~20% malloc/free) across parse-side ObjectData/array/string
+  construction and teardown — per-key and per-table tweaks are rounding
+  errors against one `Rc<RefCell<ObjectData>>` + map + value allocations
+  per node. The structural answer is an ObjectData pool or arena (needs a
+  recycle point for Rc-dropped objects) — tracked as the next
+  allocation-side lever.
+- **mixed_helpers (the "real agent glue" proxy)** is now dominated by the
+  register tier's own dispatch (~15%), `Value` drop glue (~8%), and the
+  remaining allocator share (~10%) — the object-literal define path and
+  the string `+` machinery have left the top ranks. Further movement needs
+  either reg-tier superinstructions or a smaller `Value`.
+- **sort / array_hof** remain comparator-call-ceremony bound around the
+  prepared-kernel paths; **string_scan** is `charCodeAt` loop glue the
+  register tier already carries.
+
+**Gates:** full suites for both crates green (chidori-js 129 incl. the new
+`obj_tpl.rs` template structural+behavior tests and kernels structural pins
+for `LenBrCmp`/`LoadElemAdd`/K-form const-prop; record→replay byte-identity
+unchanged); kernels + reg differential corpora and 300-case fuzzes green —
+the kernels corpus caught a real bug during development (the fused
+`LenBrCmp` escaped the typed-array `length`-shadow entry guard scan, fixed
+by teaching the guard the fused form); Test262 gate green (0 regressions,
+99.11%); clippy clean across the workspace.
+
+## 6.13 Pinned-string kernels (charCodeAt/length) + allocation diet
+(landed 2026-07-11, follow-up round)
+
+Round 2 on the §6.12 baseline: the biggest remaining per-workload gap with a
+clear shape was string_scan (~6× behind bun — the tokenizer idiom
+`for (i = 0; i < s.length; i++) s.charCodeAt(i)`, §6.5.1 candidate (a),
+unlocked by §6.7's O(1) ASCII accessors), plus a first pass at the
+allocation costs that dominate json_roundtrip.
+
+1. **Pinned STRING bases in loop kernels** (`Kernel::sslots`,
+   `KOp::StrLen`, `KOp::CharCodeAt`). A local used as `s.charCodeAt(i)` /
+   `s.length` inside a kernel region is discovered (fixpoint, like array
+   bases; string discovery WINS over a same-local array-base guess) and
+   PINNED: the entry guard requires a FLAT ASCII string — flattening a
+   rope-built accumulator once, cached in the rope node — and, for
+   `charCodeAt`, the canonical `String.prototype.charCodeAt` resolution
+   (pinned at install like `Array.prototype.push`; a monkeypatched method
+   runs generically, observably). Both ops are then TOTAL — no bail path
+   exists: strings are immutable and the local is pinned, so `StrLen` is an
+   activation constant, and `CharCodeAt` computes ToIntegerOrInfinity
+   (NaN→0, truncate-toward-zero via saturating casts — no libm) and the
+   out-of-range NaN exactly as the builtin does. Non-ASCII/WTF-8 receivers
+   decline the activation into the generic loop.
+2. **Allocation diet**: `Internal::Promise`/`Internal::ModuleNamespace`
+   carried the enum's largest payloads inline (104/72 bytes) — boxing the
+   two cold variants shrinks `Internal` 104→64 and **every `ObjectData`
+   184→144 bytes** (~20% less memory traffic per object allocation,
+   json_roundtrip's dominant cost). JSON string values now parse straight
+   from the source slice into the `Rc` backing (one allocation instead of
+   the String round-trip's two).
+3. Not taken: a `Vec<[f64; KWIN]>` window pool for the recursive executor
+   measured WORSE on instructions than §6.12's slice+`try_into` windows
+   (fib 695→713 M) and was reverted — fib's residual +2.8% stands as the
+   accepted price of the recursion tier's masked windows. An ObjectData
+   pool/arena (the real json lever) needs a recycle point for Rc-dropped
+   objects — a GC-design change, still tracked.
+
+### 6.13.1 Measured (callgrind, whole workload; wall best-of-5 plain release)
+
+| workload | §6.12 baseline | after | Δ instructions | wall |
+| --- | ---: | ---: | ---: | ---: |
+| string_scan | 351.4 M | 145.2 M | **−58.7%** | 46 → 21 ms |
+| json_roundtrip | 1.186 G | 1.176 G | −0.8% | 165 → 144 ms |
+| mixed_helpers | 2.324 G | 2.318 G | −0.3% | 315 → 273 ms |
+| fib_recursive | 695.3 M | 683.2 M | −1.7% | — |
+| string_build / others | — | — | unchanged | — |
+
+The wall movement beyond the instruction deltas on json/mixed is the
+allocation diet (smaller objects, one less copy per parsed string) — cache
+effects callgrind cannot see; plain-release layout noise caveats (§6.12)
+apply, but the direction is consistent across repeated interleaved runs.
+
+**Gates:** kernels differential corpus grew 9 pinned-string programs
+(rope-built receivers, ToIntegerOrInfinity edges incl. NaN/fractional/
+negative/OOB indices, non-ASCII and astral receivers declining to generic,
+monkeypatched `charCodeAt` observed, mid-program reassignment re-guarded,
+results feeding arithmetic/booleans) plus a structural pin
+(`char_code_loops_get_kernels`); a 7-case differential vs Node 22
+byte-identical; full suites green for both crates; Test262 gate green
+(0 regressions); clippy clean.
+
+## 6.14 Cell-writing function kernels (landed 2026-07-11): the PRNG idiom
+
+Motivated by the CPython benchmark column: on the `sort` workload chidori
+trailed every other runtime, and phase isolation showed the sort itself was
+already at Bun parity (§6.5's prepared f64 comparator) — the deficit was the
+LCG **fill loop**, 300k calls to
+`function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; }`
+at ~370 ns each. `rnd` declined the function-kernel tier for exactly one op:
+`StoreUpvalueChecked` (function kernels were pure — "nothing inside a kernel
+can write globals or cells"). A function that mutates captured state through
+a cell is the PRNG/accumulator/counter idiom, common in exactly the glue
+code the fn-kernel tier targets.
+
+1. **Translation** (`kernel.rs`): fn mode now accepts
+   `StoreUpvalue`/`StoreUpvalueChecked` of a NUMBER — the value moves into
+   the upvalue's register (later loads read the same register), and the
+   kernel records the write in `Kernel::uv_writes` (`(register, upvalue)`
+   pairs). Written registers join the always-live set so the completion
+   flush's source survives DCE. The Checked form's TDZ test is statically
+   satisfied: the entry guard already requires the cell to hold a Number
+   (a TDZ'd cell declines to the generic path, which raises the spec
+   ReferenceError). Non-Number stores (boolean/undefined — the flush would
+   change the cell's observable type) and loop-mode upvalue stores keep
+   declining.
+2. **Execution** (`run_fn_kernel`): written cells buffer in registers for
+   the whole frameless call — nothing else can run mid-kernel — and flush
+   back as `Value::Number` on BOTH completions (return and the interrupt
+   unwind, mirroring the loop kernels' local write-back), so the cell holds
+   exactly the generic write-through path's state; a conditionally-skipped
+   store flushes the entry snapshot back (same value, unobservable). A
+   belt-and-braces entry check declines if a written cell aliases another
+   captured cell. Both helpers live out of line so write-free kernels' hot
+   paths are untouched.
+3. **Tier boundaries**: non-empty `uv_writes` declines the recursion tier
+   (its family resolution and cache treat cells as activation constants —
+   checked at translation for self-recursion and at `build_rec_family` for
+   non-recursive helpers pulled into a family), the prepared-callback paths
+   (sort/HOF: they snapshot upvalues once per run), and the loop-kernel
+   pinned-callee guard (one snapshot per activation). Those shapes run
+   generically, exactly as before.
+
+### 6.14.1 Measured (callgrind, whole workload; wall interleaved 6-run median)
+
+| workload | before | after | Δ instructions | wall |
+| --- | ---: | ---: | ---: | ---: |
+| sort | 1.992 G | 1.554 G | **−22.0%** | 232 → 179 ms |
+| sort fill phase only | 1.107 G | 657 M | −40.6% | 166 → 85 ms |
+| 300k bare `rnd()` calls | 976 M | 526 M | −46.1% | 118 → 69 ms |
+| fib_recursive | 683.2 M | 694.0 M | +1.6% | 65 → 64 ms |
+| mutual_recursion | 940.2 M | 958.8 M | +2.0% | 79 → 81 ms |
+| array_hof / others | — | — | ±0.1% | — |
+
+Per-call cost of the PRNG shape drops ~370 → ~210 ns (the remaining cost is
+the generic caller loop: `LoadGlobal; Call` dispatch around the frameless
+body). On the cross-runtime suite the sort row goes from slowest-of-four to
+ahead of Node and CPython (~1.5× Bun, from 2.0×). The fib/mutual instruction
+upticks are the §6.13-class fat-LTO layout shift (their wall is flat, and
+neither workload executes any new code on its hot path); the residual
+stands as accepted noise, same as §6.13's window-pool revert.
+
+**What's next here:** the fill loop itself still runs generic bytecode — a
+loop kernel can't contain a call to a GLOBAL callee (pinned callees are
+local-held only, and cell-writing callees decline the pinned path). Extending
+`KOp::CallKernel` to entry-guarded global callees with per-call flush would
+kernelize the entire fill loop (the inlined-LCG equivalent measured 26 ms
+total, another ~3× on this phase). **Landed as §6.15.**
+
+**Gates:** kernels differential corpus grew 16 cell-writing programs (PRNG,
+shared cells across two kernels, conditional/write-only/self-assign stores,
+-0/NaN round-trips, boolean/undefined stores declining, call-time TDZ
+throwing generically, cell-writing comparator/HOF-callback/self-recursion
+declining their tiers, the fill idiom) plus a structural pin
+(`cell_writing_functions_get_fn_kernels`); benchmark suite cross-checks
+green (all four runtimes agree on every workload); full suites green;
+clippy clean.
+
+## 6.15 Global pinned callees, cell-writing callee flush, and the
+default-sort key precompute (landed 2026-07-11, follow-up round)
+
+The two follow-ups §6.14 queued: kernelize the sort workload's fill loop
+END TO END, and fix the latent no-comparator `Array.prototype.sort` cliff
+(868 ms vs Bun's 129 ms on a 6×50k numeric sort — per-comparison ToString).
+
+1. **Pinned GLOBAL callees in loop kernels** ([`KCalleeSrc`]). `LoadGlobal`
+   of a non-`Math` name in a loop region now speculates a pinned callee
+   ([`VE::GlobalFn`]) — its only legal consumer is a `Call` under an
+   `undefined` this, fusing to the existing `KOp::CallKernel`, so a
+   mis-speculated non-callee global just fails translation (exactly
+   today's decline). The activation entry guard resolves the name the way
+   `LoadGlobal`'s fast path does — an own DATA property of the global
+   object holding a kernel-carrying closure — and declines
+   accessor/proto-inherited/missing bindings to the generic loop (which
+   then runs the getter per iteration / throws the ReferenceError
+   exactly per spec). The binding is an activation constant: nothing on
+   the kernel allowlist can rebind a global, and a `KProp` store aimed at
+   the same global-object property can't pass its holds-a-Number entry
+   check while this guard sees a closure.
+2. **Cell-writing callees in the pinned path.** §6.14's `uv_writes`
+   kernels are now admitted by the `CallKernel` guard: the callee window
+   still snapshots upvalues once per activation, the written register IS
+   the cell's live value across calls (nothing else can touch it
+   mid-loop), and the window flushes written cells back after EVERY call
+   — so a mid-loop bail (a store target going string-tainted) resumes the
+   generic loop against current cell state, and the interrupt unwind
+   keeps the generic-prefix contract. Cross-window aliasing (a written
+   cell captured by another callee window or snapshot by the caller
+   kernel's own upvalue registers) declines the activation — the
+   differential corpus pins the caller-reads-the-cell shape staying
+   generic.
+3. **Default-sort ToString precompute** (`sort_default_primitive`,
+   independent of the kernel tiers). The spec's default SortCompare
+   stringifies both operands per comparison — ~2·n·log n allocating
+   conversions. ToString of a Number/String/Bool/Null/BigInt is pure, so
+   an all-primitive snapshot now precomputes the n keys once and sorts an
+   index permutation with the IDENTICAL stable take-left merge — same
+   output element-for-element, no observable difference (objects keep the
+   exact per-comparison path: their toString/valueOf call order and count
+   are user-visible; a Symbol element still throws from the comparison).
+   All-ASCII keys (number-to-string output always is) compare as bytes
+   instead of UTF-16 code units.
+
+### 6.15.1 Measured (callgrind, whole workload; wall interleaved 7-run median)
+
+| workload | §6.14 baseline | after | Δ instructions | wall |
+| --- | ---: | ---: | ---: | ---: |
+| sort (benchmark workload) | 1.554 G | 1.144 G | **−26.3%** | 175 → 125 ms |
+| sort fill phase only | 669.1 M | 259.8 M | **−61.2%** | 85 → 33 ms |
+| default-sort probe (6×50k, no comparator) | 9.900 G | 1.618 G | **−83.7%** | 838 → 184 ms |
+| fib_recursive | 694.0 M | 694.0 M | ±0.0% | 64 → 66 ms |
+
+Cumulative on the sort benchmark row since §6.13: 1.992 G → 1.144 G
+instructions (−42.6%), 232 → 125 ms — on the cross-runtime suite chidori
+now posts the FASTEST execution-only sort of all four runtimes (Node
+~1.6×, Bun ~1.5×, CPython ~1.0–1.3× behind on the same box). The
+no-comparator cliff drops from 6.7× behind Bun to ~1.4×. fib is
+bit-identical this round (the §6.14 layout shift did not compound).
+
+**Gates:** kernels differential corpus grew 12 global-callee programs
+(args/two-callees/two-sites-min-argc, under-supplied args declining,
+rebinding between activations, rebound-to-non-function throwing, accessor
+global counting its per-iteration getter calls, cell-writing callee with
+post-loop reads, mid-loop bail with a live cell, caller-reads-cell alias
+decline) plus a structural pin (`global_callee_loops_get_kernels`); the
+default sort gained a smoke pin (`default_sort_precomputed_keys`:
+string-order numerics, mixed primitives, -0/NaN, stability, object and
+Symbol elements, UTF-16 astral order, toSorted) all verified against Node
+per case; benchmark suite cross-checks green on all four runtimes; full
+suites green; clippy and rustfmt clean.
+
+## 6.16 Glue-code round: typeof-dispatch fusion, compile-scoped string
+interning, String+String add, for-in buffer pool (landed 2026-07-12)
+
+mixed_helpers ran ~2.3× slower than CPython (~255 vs ~112 ms execution) —
+by design the workload where every function declines the kernel tiers and
+the register interpreter carries everything. Phase isolation split its
+~255 ms into normalize/for-in ~120 ms, render/string-build ~66 ms, object
+allocation ~41 ms, buckets/classify ~38 ms; the profile showed no cliff,
+just the aggregate per-iteration tax (~38.6 k instructions each): dispatch
+~30%, `Value` drops + malloc ~13%, string equality ~4.5%, map hashing ~5%.
+This round took every bounded lever; the rest is the tracked
+arena/GC-design work.
+
+1. **`ROp::TypeofBr`** — the dispatch idiom `typeof v === "number"` fuses
+   at register-translation time into a direct type-tag test: no typeof
+   string materialized, no `Value` clone/drop, no string compare, no const
+   load. Build-time conditions: an equality compare (`===`/`!==`/`==`/
+   `!=`) K-folded against a string literal that IS one of the eight typeof
+   names, whose operand is the Temp defined by the immediately preceding
+   `Unary{Typeof}` (`code.last()` — any interleaving materialization would
+   have emitted a later op). The fused-away Unary becomes a `Charge`
+   carrying its already-assigned units, so budgeted runs drain at exactly
+   the stack tier's points — the first cut deferred those units across the
+   branch edge and the reg budget-sweep differential caught it precisely
+   (per-path charge divergence). Literals outside the eight names
+   (`typeof x === "Number"`) keep the generic compare.
+2. **Compile-scoped string interning** (`Compiler::str_intern`): one
+   `JsString` allocation per distinct string across a whole compilation —
+   const pools AND object-template keys — so a for-in key cloned out of an
+   instantiated template pointer-matches `k === "id"` literals and
+   property-name consts in any function of the program. The eight typeof
+   names route to the process-wide `names.rs` table instead, giving
+   unfused/stack-tier `typeof` compares the pointer fast path too.
+   Compile-scoped, so nothing is retained across programs.
+3. **`op_add` String+String fast path**: both operands already primitive —
+   ToPrimitive and ToString are identities — so concatenate directly under
+   the same length cap; skipped are two identity-clone ToPrimitive calls
+   and two ToString round-trips per join (`label + ":" + v` pays it
+   twice).
+4. **Pooled for-in key buffers** (`Vm::forin_pool`): a glue loop
+   for-inning a fresh object per iteration reused one buffer allocation
+   instead of a malloc/free per loop entry; parked cleared at `ForInPop`
+   (unwound frames just miss the pool).
+
+Evaluated and REJECTED: a for-in slot-carry for `rec[k]` re-hashing —
+the measured cost is ~1.7% of the row and soundness needs a generation
+counter on every `ObjectData`, undoing §6.13's size diet; the arena/GC
+recycle point remains the real allocation lever (drops + malloc still
+~12% after this round).
+
+### 6.16.1 Measured (callgrind, whole workload; wall interleaved medians)
+
+| workload | before | after | Δ instructions | wall |
+| --- | ---: | ---: | ---: | ---: |
+| mixed_helpers | 2.319 G | 1.996 G | **−13.9%** | 260 → 226 ms |
+| normalize/for-in phase probe | 1.504 G | ~1.26 G | −16% | 166 → 142 ms |
+| fib_recursive / sort / others | — | — | ±0.001% | unchanged |
+
+The row stays ~2× CPython (~227 vs ~116 ms execution on the same box) —
+CPython's dict iteration, type dispatch, and string concat are its own
+C-tuned native gait, and parity for chidori on this shape needs the
+ObjectData arena or a baseline-compile step, both tracked.
+
+**Gates:** reg differential corpus grew 7 typeof-dispatch programs (every
+tag × every value kind, negated/loose/literal-on-the-left forms, a
+non-typeof-name literal, non-branch consumers, the LoadGlobalTypeof path)
+plus a structural pin (`typeof_branches_fuse`, positive and negative);
+the reg budget sweep runs over the new corpus entries (and caught the
+first cost-model cut); full suites green; benchmark cross-checks green on
+all four runtimes; clippy and rustfmt clean.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

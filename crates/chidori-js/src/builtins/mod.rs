@@ -88,10 +88,8 @@ fn install_restricted_properties(vm: &mut Vm) {
     ));
     {
         let mut b = tte.borrow_mut();
-        b.props
-            .insert(PropertyKey::str("length"), frozen(Value::Number(0.0)));
-        b.props
-            .insert(PropertyKey::str("name"), frozen(Value::str("")));
+        b.own_insert(PropertyKey::str("length"), frozen(Value::Number(0.0)));
+        b.own_insert(PropertyKey::str("name"), frozen(Value::str("")));
         b.extensible = false;
     }
     vm.realm.throw_type_error = tte.clone();
@@ -106,8 +104,8 @@ fn install_restricted_properties(vm: &mut Vm) {
     };
     let fp = vm.realm.function_proto.clone();
     let mut b = fp.borrow_mut();
-    b.props.insert(PropertyKey::str("caller"), poison.clone());
-    b.props.insert(PropertyKey::str("arguments"), poison);
+    b.own_insert(PropertyKey::str("caller"), poison.clone());
+    b.own_insert(PropertyKey::str("arguments"), poison);
 }
 
 // ---- function-kind intrinsics (%GeneratorFunction% etc.) ----
@@ -169,7 +167,7 @@ fn install_kind_function(
     // [[Prototype]] of the constructor is %Function% (the Function constructor).
     ctor.borrow_mut().proto = Some(function_ctor.clone());
     // Constructor.prototype = func_proto (non-writable, non-enumerable, non-config).
-    ctor.borrow_mut().props.insert(
+    ctor.borrow_mut().own_insert(
         PropertyKey::str("prototype"),
         Property {
             kind: PropertyKind::Data {
@@ -182,12 +180,10 @@ fn install_kind_function(
     );
     {
         let mut fp = func_proto.borrow_mut();
-        fp.props
-            .insert(PropertyKey::str("constructor"), ro_c(Value::Object(ctor)));
-        fp.props
-            .insert(tag_key.clone(), ro_c(Value::str(ctor_name)));
+        fp.own_insert(PropertyKey::str("constructor"), ro_c(Value::Object(ctor)));
+        fp.own_insert(tag_key.clone(), ro_c(Value::str(ctor_name)));
         if let Some((ip, _)) = &instance {
-            fp.props.insert(
+            fp.own_insert(
                 PropertyKey::str("prototype"),
                 ro_c(Value::Object(ip.clone())),
             );
@@ -195,11 +191,11 @@ fn install_kind_function(
     }
     if let Some((ip, instance_tag)) = instance {
         let mut ipb = ip.borrow_mut();
-        ipb.props.insert(
+        ipb.own_insert(
             PropertyKey::str("constructor"),
             ro_c(Value::Object(func_proto)),
         );
-        ipb.props.insert(tag_key, ro_c(Value::str(instance_tag)));
+        ipb.own_insert(tag_key, ro_c(Value::str(instance_tag)));
     }
 }
 
@@ -242,8 +238,7 @@ fn inspect_object(vm: &mut Vm, o: &JsObject, depth: usize, seen: &mut Vec<usize>
         let b = o.borrow();
         if b.is_callable() {
             let name = b
-                .props
-                .get(&PropertyKey::str("name"))
+                .own_get(&PropertyKey::str("name"))
                 .and_then(|p| p.value().cloned())
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                 .unwrap_or_default();
@@ -528,8 +523,7 @@ fn deep_clone(vm: &mut Vm, v: &Value) -> Result<Value, Value> {
                     let val = vm.get_prop(v, &PropertyKey::Str(k.clone()))?;
                     let cloned = deep_clone(vm, &val)?;
                     no.borrow_mut()
-                        .props
-                        .insert(PropertyKey::Str(k), Property::data(cloned));
+                        .own_insert(PropertyKey::Str(k), Property::data(cloned));
                 }
                 Ok(Value::Object(no))
             }

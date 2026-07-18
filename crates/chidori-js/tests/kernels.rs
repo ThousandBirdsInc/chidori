@@ -14,7 +14,7 @@
 
 use std::rc::Rc;
 
-use chidori_js::bytecode::{Const, FuncProto, Op};
+use chidori_js::bytecode::{Const, FuncProto, KOp, Op};
 use chidori_js::compiler::{compile_script, compile_script_kernels};
 use chidori_js::{Engine, Value};
 
@@ -322,6 +322,75 @@ const CORPUS: &[&str] = &[
     "'use strict'; function f(a, b) { return a * b; } console.log(f(6, 7));",
     // Boolean ARGUMENT declines (guard is Number-only) — generic coercion.
     "const f = (a, b) => a - b; console.log(f(true, 1), f(5, false));",
+    // ---- upvalue-WRITING function kernels (buffered cell writes) ----
+    // The PRNG idiom (the sort workload's `rnd`): write a captured cell,
+    // return it. Cell state must advance identically call over call.
+    "let seed = 123456789; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; } let s = 0; for (let i = 0; i < 50; i++) s = (s + rnd()) >>> 0; console.log(s, seed);",
+    // Generic code reads the cell BETWEEN kernel calls (per-call flush).
+    "let acc = 0; const bump = x => { acc = acc + x; return acc; }; bump(1); const mid = acc; bump(2); console.log(mid, acc);",
+    // Two kernels sharing one cell: each entry re-reads the other's flush.
+    "let s = 10; const inc = () => { s = s + 1; return s; }; const dec = () => { s = s - 2; return s; }; console.log(inc(), dec(), inc(), s);",
+    // Conditional store: the skipped path leaves the cell untouched (the
+    // flush writes the entry snapshot back — same value, unobservable).
+    "let hi = 0; const f = x => { if (x > 10) hi = x; return hi; }; console.log(f(5), f(20), f(7), hi);",
+    // Write-only cell (no read in the body).
+    "let last = -1; const f = x => { last = x * 2; return x; }; f(3); f(4); console.log(last);",
+    // Store then read-back within the body (register forwarding).
+    "let t = 1; const f = x => { t = t * x; return t + t; }; console.log(f(3), f(5), t);",
+    // Self-assignment (a dead store — the flush is value-identical anyway).
+    "let v = 7; const f = x => { v = v; return v + x; }; console.log(f(1), v);",
+    // -0 and NaN round through the cell bit-exactly.
+    "let z = 0; const f = x => { z = x * -0; return 1 / z; }; console.log(f(5), f(-5), Object.is(z, -0));",
+    "let n = 0; const f = x => { n = n + x; return n; }; f(NaN); console.log(n === n, typeof n);",
+    // Non-Number stores decline (the generic path must store the actual
+    // boolean/undefined — a flushed Number would change typeof).
+    "let b = 0; const f = x => { b = x > 0; return 1; }; console.log(f(5), b, typeof b);",
+    "let u = 0; const f = x => { u = undefined; return x; }; console.log(f(1), u, typeof u);",
+    // TDZ at call time: the cell isn't a Number yet — the guard declines and
+    // the generic path throws the spec ReferenceError.
+    "try { const f = () => { w = 1; return w; }; f(); let w; } catch (e) { console.log('tdz', e instanceof ReferenceError); }",
+    // A cell-writing COMPARATOR: the prepared sort path declines per-sort,
+    // results and the final call-count cell state stay exact.
+    "let calls = 0; const a = [5,3,8,1]; a.sort((x, y) => { calls = calls + 1; return x - y; }); console.log(a.join(','), calls > 0);",
+    // A cell-writing HOF callback (prepared map path declines per-run).
+    "let sum = 0; console.log([1,2,3,4].map(x => { sum = sum + x; return sum; }).join(','), sum);",
+    // Cell-writing SELF-RECURSION declines the recursion tier, stays exact.
+    "let depth = 0; function down(n) { depth = depth + 1; return n <= 0 ? depth : down(n - 1); } console.log(down(5), depth);",
+    // A cell-writing callee inside a hot numeric LOOP (the fill idiom).
+    "let seed2 = 42; function r2() { seed2 = (seed2 * 31 + 7) % 1000003; return seed2; } const arr = new Array(20); for (let i = 0; i < 20; i++) arr[i] = r2(); console.log(arr[0], arr[19], seed2);",
+    // ---- pinned GLOBAL callees in loop kernels ----
+    // Plain global callee with arguments, result consumed numerically.
+    "function twice(x) { return x * 2; } let s = 0; for (let i = 0; i < 40; i++) { s += twice(i) - 1; } console.log(s);",
+    // Two distinct global callees in one region.
+    "function inc(x) { return x + 1; } function sq(x) { return x * x; } let s = 0; for (let i = 0; i < 25; i++) { s += sq(inc(i)); } console.log(s);",
+    // The same global callee at two call sites (one window, min_argc).
+    "function h(a, b) { return a - b; } let s = 0; for (let i = 0; i < 20; i++) { s += h(i, 1) + h(2 * i, i); } console.log(s);",
+    // UNDER-supplied global callee: args_used > min_argc declines the
+    // activation; the generic loop computes the NaN coercions.
+    "function add(a, b) { return a + b; } let s = 0; for (let i = 0; i < 5; i++) { s += add(i); } console.log(s, s !== s);",
+    // REBINDING the global between loop executions: each activation
+    // re-guards, so run 2 must call the NEW closure.
+    "function r() { return 1; } function fill() { let s = 0; for (let i = 0; i < 10; i++) { s += r(); } return s; } console.log(fill()); globalThis.r = () => 5; console.log(fill());",
+    // Rebound to a NON-function mid-program: run 2 throws generically.
+    "var q = function () { return 2; }; function go() { let s = 0; for (let i = 0; i < 5; i++) { s += q(); } return s; } console.log(go()); q = 7; try { go(); } catch (e) { console.log('ok', e instanceof TypeError); }",
+    // ACCESSOR global: the guard declines (own DATA property only), and the
+    // generic loop calls the getter once per iteration — the count proves it.
+    "let gets = 0; Object.defineProperty(globalThis, 'gf', { get() { gets++; return () => 3; } }); let s = 0; for (let i = 0; i < 4; i++) { s += gf(); } console.log(s, gets);",
+    // Cell-writing GLOBAL callee where generic code reads the cell right
+    // after the loop (per-call flush must have landed the final state).
+    "let acc2 = 0; function step(x) { acc2 = acc2 + x; return acc2; } let last = 0; for (let i = 1; i <= 10; i++) { last = step(i); } console.log(last, acc2);",
+    // Cell-writing callee + a mid-loop BAIL (the store target goes
+    // string-tainted): the generic tail keeps calling the callee, so the
+    // cell must be current at the bail point.
+    "let n2 = 0; function bump() { n2 = n2 + 1; return n2; } let a = [0, 0, 0, 0, 0]; for (let i = 0; i < 5; i++) { if (i === 3) a = { 3: 0, 4: 0 }; a[i] = bump(); } console.log(a[4], n2);",
+    // The callee's written cell is ALSO read by generic code inside the
+    // loop-adjacent expression (loop kernel itself must not snapshot it).
+    "let c3 = 100; function dec3() { c3 = c3 - 1; return c3; } let s = 0; for (let i = 0; i < 6; i++) { s += dec3(); } console.log(s + c3);",
+    // ALIAS DECLINE: the caller's loop reads the same cell the callee
+    // writes (both capture `seed3` as an upvalue) — the caller's snapshot
+    // would go stale after the first flush, so the activation must stay
+    // generic and see every intermediate value.
+    "let seed3 = 1; function stir() { seed3 = seed3 * 3 + 1; return seed3; } function fill3() { let s = 0; for (let i = 0; i < 8; i++) { s += stir() + seed3; } return s; } console.log(fill3(), seed3);",
     // ---- self-recursive function kernels (SelfCall) ----
     // The canonical fib shape (global function declaration).
     "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } console.log(fib(15), fib(0), fib(1));",
@@ -426,6 +495,101 @@ const CORPUS: &[&str] = &[
     "function m(x, y) { return x * y; } let z = 1; for (let i = 0; i < 3; i++) { z = m(-0, i); } console.log(Object.is(z, -0), Object.is(m(0, -1), -0));",
     // Callee result stored through kernel props and elements.
     "const step = x => (x * 3 + 1) % 97; const o = { v: 5 }; const a = [0, 0, 0]; for (let i = 0; i < a.length; i++) { o.v = step(o.v); a[i] = o.v; } console.log(a.join(','), o.v);",
+    // --- TYPED ARRAYS as kernel element/length bases -----------------------
+    // Float64Array fill + sum + in-place transform.
+    "const a = new Float64Array(8); for (let i = 0; i < a.length; i++) a[i] = i * 1.5; let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; for (let i = 0; i < a.length; i++) a[i] = a[i] / 2 + 0.25; console.log(s, a[3], a[7]);",
+    // Float32 store rounds to f32 per write (visible on read-back).
+    "const f = new Float32Array(4); for (let i = 0; i < f.length; i++) f[i] = 0.1 * (i + 1); let s = 0; for (let i = 0; i < f.length; i++) s += f[i]; console.log(s, f[0]);",
+    // Int32 wrap on store, truncation of fractions.
+    "const n = new Int32Array(6); for (let i = 0; i < n.length; i++) n[i] = 2147483646 + i; let s = 0; for (let i = 0; i < n.length; i++) s += n[i]; console.log(s, n[3]);",
+    "const n = new Int32Array(4); for (let i = 0; i < n.length; i++) n[i] = -(i + 0.75); console.log(n.join(','));",
+    // NaN / infinities store as 0 in integer kinds.
+    "const n = new Int16Array(3); const src = [NaN, Infinity, -Infinity]; for (let i = 0; i < n.length; i++) n[i] = src[i]; console.log(n.join(','));",
+    // Uint8Clamped: clamp + round-half-to-even.
+    "const c = new Uint8ClampedArray(6); const v = [-5, 0.5, 1.5, 2.5, 254.5, 300]; for (let i = 0; i < c.length; i++) c[i] = v[i]; console.log(c.join(','));",
+    // Uint32 negative wrap.
+    "const u = new Uint32Array(3); for (let i = 0; i < u.length; i++) u[i] = -1 - i; let s = 0; for (let i = 0; i < u.length; i++) s = (s + u[i]) % 1000000007; console.log(s);",
+    // OOB read: undefined flows through + (NaN), exactly as generic.
+    "const a = new Float64Array(3); a[0] = 1; a[1] = 2; a[2] = 3; let s = 0; for (let i = 0; i < 5; i++) { s += a[i]; } console.log(s, s === s);",
+    // OOB write: silent no-op; in-bounds part persists.
+    "const a = new Float64Array(2); for (let i = 0; i < 4; i++) { a[i] = i + 1; } console.log(a.join(','), a.length);",
+    // Two views aliasing one buffer: writes through one visible via the other.
+    "const buf = new ArrayBuffer(32); const x = new Float64Array(buf); const y = new Float64Array(buf); for (let i = 0; i < x.length; i++) { x[i] = i; y[i] = y[i] + 10; } console.log(x.join(','));",
+    // Different-kind views over one buffer (byte-level aliasing).
+    "const buf = new ArrayBuffer(8); const i8 = new Int8Array(buf); const i32 = new Int32Array(buf); for (let i = 0; i < i8.length; i++) i8[i] = i + 1; let s = 0; for (let i = 0; i < i32.length; i++) s ^= i32[i]; console.log(s >>> 0);",
+    // Byte-offset subarray view.
+    "const buf = new ArrayBuffer(64); const v = new Float64Array(buf, 16, 4); for (let i = 0; i < v.length; i++) v[i] = i * 2; console.log(v.join(','), v.length);",
+    // Own `length` shadow: kernel declines, generic observes the shadow.
+    "const a = new Float64Array(5); Object.defineProperty(a, 'length', { value: 2 }); let s = 0; for (let i = 0; i < a.length; i++) { s += 1; } console.log(s);",
+    // Patched %TypedArray%.prototype length getter: declines, patch observed.
+    "const proto = Object.getPrototypeOf(Object.getPrototypeOf(new Float64Array(1))); const desc = Object.getOwnPropertyDescriptor(proto, 'length'); Object.defineProperty(proto, 'length', { get() { return 2; }, configurable: true }); const a = new Float64Array(5); let s = 0; for (let i = 0; i < a.length; i++) s++; Object.defineProperty(proto, 'length', desc); console.log(s);",
+    // Null proto: `length` is undefined (0 iterations); elements still read.
+    "const a = new Float64Array(3); Object.setPrototypeOf(a, null); let s = 0; for (let i = 0; i < a.length; i++) s++; console.log(s, a[1] === 0);",
+    // BigInt-element kinds stay generic (elements aren't Numbers).
+    "const b = new BigInt64Array(3); b[0] = 1n; b[1] = 2n; b[2] = 3n; let s = 0; for (let i = 0; i < b.length; i++) { s += Number(b[i]); } console.log(s);",
+    // Length-tracking view on a resizable buffer, resized between loop runs.
+    "const buf = new ArrayBuffer(16, { maxByteLength: 64 }); const v = new Float64Array(buf); function sum() { let s = 0; for (let i = 0; i < v.length; i++) s += v[i]; return s; } v[0] = 1; v[1] = 2; const s1 = sum(); buf.resize(32); v[2] = 3; v[3] = 4; console.log(s1, sum());",
+    // Mixed dense-array and typed-array bases in one region.
+    "const d = [1, 2, 3, 4]; const t = new Float64Array(4); for (let i = 0; i < d.length; i++) { t[i] = d[i] * 2; } let s = 0; for (let i = 0; i < t.length; i++) s += t[i]; console.log(s);",
+    // --- RECURSION: mutual, boolean-returning, captured-binding self ------
+    // Mutual recursion with boolean returns (the isEven/isOdd family).
+    "function isEven(n) { return n === 0 ? true : isOdd(n - 1); } function isOdd(n) { return n === 0 ? false : isEven(n - 1); } let c = 0; for (let i = 0; i < 30; i++) { if (isEven(i)) c++; } console.log(c, isEven(40), isOdd(7));",
+    // typeof / strict-eq observe REAL booleans from the recursion.
+    "function isEven(n) { return n === 0 ? true : isOdd(n - 1); } function isOdd(n) { return n === 0 ? false : isEven(n - 1); } const r = isEven(6); console.log(typeof r, r === true, isOdd(6) === false);",
+    // Numeric mutual recursion, multiple arguments.
+    "function a2(m, n) { return m <= 0 ? n : b2(m - 1, n + m); } function b2(m, n) { return m <= 0 ? n : a2(m - 1, n + 2 * m); } console.log(a2(20, 0), b2(20, 0));",
+    // Self-recursion through a captured `const` binding (arrow).
+    "const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b)); console.log(gcd(48, 18), gcd(17, 5), gcd(0, 9));",
+    // Named function expression: self-reference through its own binding.
+    "const k = function inner(n) { return n <= 0 ? 0 : n + inner(n - 1); }; console.log(k(40));",
+    // Boolean-returning SELF recursion.
+    "function tob(n) { return n <= 0 ? true : tob(n - 2); } console.log(tob(10), typeof tob(10));",
+    // Mixed-type returns stay generic (number on one path, boolean on the other).
+    "function mx(n) { if (n <= 0) return true; return n * mx(n - 1); } console.log(mx(3), mx(0));",
+    // Rebinding the mutual-recursion partner mid-program: the entry guard
+    // declines and the patched binding is observed.
+    "function ev(n) { return n === 0 ? true : od(n - 1); } function od(n) { return n === 0 ? false : ev(n - 1); } console.log(ev(4)); od = function () { return true; }; console.log(ev(4));",
+    // Rebinding the captured self binding: recursion dispatches to the NEW fn.
+    "let fr = (n) => (n <= 0 ? 0 : n + fr(n - 1)); const keep = fr; console.log(keep(5)); fr = () => 42; console.log(keep(5));",
+    // A family member whose body can't kernelize (strings) declines the family.
+    "function ping(n) { return n <= 0 ? 0 : pong(n - 1) + 1; } function pong(n) { return ('' + n).length > 9 ? 0 : ping(n - 1); } console.log(ping(9));",
+    // Mutual recursion past any single window's worth of calls. Depths in
+    // this corpus stay ~40: the kernels-OFF differential run holds real
+    // interpreter frames on the test thread's DEFAULT stack (debug frames
+    // are fat); the dedicated depth-overflow test owns the deep case on a
+    // big-stack thread.
+    "function e2(n) { return n === 0 ? true : o2(n - 1); } function o2(n) { return n === 0 ? false : e2(n - 1); } console.log(e2(40));",
+    // Short-arg self-call: translation declines (undefined parameter path).
+    "function sh(n, m) { return n <= 0 ? m : sh(n - 1); } console.log(sh(3, 7));",
+    // Short-arg MUTUAL call site: entry cross-check declines the family.
+    "function p2(n) { return n <= 0 ? 0 : q2(n - 1); } function q2(n, m) { return (m || 0) + (n <= 0 ? 1 : p2(n - 1)); } console.log(p2(9), q2(4, 2));",
+    // -0 propagation through recursive returns.
+    "function nz(n) { return n === 0 ? -0 : nz(n - 1) * -1; } const r = nz(3); console.log(Object.is(r, -0), Object.is(r, 0), 1 / nz(2));",
+    // Math intrinsics inside a recursive kernel.
+    "function h2(n) { return n <= 0 ? 0 : Math.max(n % 7, h2(n - 1)); } console.log(h2(40));",
+    // Captured numeric upvalue inside a recursive const arrow.
+    "const LIM = 3; const f2 = (n) => (n <= LIM ? n : f2(n - 2) + 1); console.log(f2(21));",
+    // ---- pinned-string charCodeAt/length (KOp::StrLen / KOp::CharCodeAt) ----
+    // The canonical tokenizer hash loop over a flat ASCII string.
+    "const s = \"hello world, kernel strings!\"; let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) % 1000000007; } console.log(h);",
+    // Rope-built accumulator (flattened once at kernel entry).
+    "let s = \"\"; for (let i = 0; i < 200; i++) s += \"ab\"; let h = 0; for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); console.log(h, s.length);",
+    // ToIntegerOrInfinity edges computed in-kernel: negative, OOB, NaN,
+    // fractional, negative-fraction indices.
+    "const s = \"abc\"; let out = \"\"; for (let i = -2; i < 6; i++) out += s.charCodeAt(i + 0.5) + \",\"; console.log(out, s.charCodeAt(NaN));",
+    // Non-ASCII receiver: the entry guard declines, the loop runs generic.
+    "const s = \"héllo wörld\"; let h = 0; for (let i = 0; i < s.length; i++) h = h * 3 + s.charCodeAt(i); console.log(h, s.length);",
+    // Astral (surrogate pair) receiver: WTF-16 code units via the generic path.
+    "const s = \"x𝒳y\"; let h = 0; for (let i = 0; i < s.length; i++) h = h * 7 + s.charCodeAt(i); console.log(h, s.length);",
+    // Monkeypatched charCodeAt: canonical check declines, the patch runs.
+    "const orig = String.prototype.charCodeAt; String.prototype.charCodeAt = function () { return 42; }; const s = \"abcdef\"; let h = 0; for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); String.prototype.charCodeAt = orig; console.log(h);",
+    // String local reassigned between activations (re-guarded each entry).
+    "let t = \"abc\"; let h = 0; for (let r = 0; r < 3; r++) { for (let i = 0; i < t.length; i++) h += t.charCodeAt(i); t = t + \"z\"; } console.log(h);",
+    // Non-string in the local: guard declines to the generic path (TypeError
+    // class behavior must be identical).
+    "let s = \"ok\"; let h = 0; for (let r = 0; r < 2; r++) { for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); s = \"next\"; } console.log(h);",
+    // charCodeAt result feeding arithmetic, compares, and a stored boolean.
+    "const s = \"mixed13chars\"; let digits = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); const isd = c >= 48 && c <= 57; if (isd) digits++; } console.log(digits);",
 ];
 
 #[test]
@@ -531,6 +695,12 @@ fn v4_loops_get_kernels() {
         kernels_in("const N = 100; function f() { let s = 0; for (let i = 0; i < N; i++) { s += i; } return s; } f();") >= 1,
         "upvalue-bound loop must kernelize"
     );
+    // Typed-array element/length loop (bases are runtime-checked, so the
+    // translation is the same as a dense array's — pin that it still fires).
+    assert!(
+        kernels_in("function f(t) { let s = 0; for (let i = 0; i < t.length; i++) { s += t[i]; } return s; } f(new Float64Array(4));") >= 1,
+        "typed-array loop must kernelize"
+    );
 }
 
 /// Tiny pure-scalar functions get a FUNCTION kernel (frameless call path) —
@@ -582,20 +752,98 @@ fn tiny_functions_get_fn_kernels() {
     }
 }
 
-/// Self-recursive numeric functions get a RECURSIVE function kernel
-/// (`self_global` set), and the shapes that must not — boolean returns,
-/// mutual recursion, named-expression self-reference — never do.
+/// The fill idiom — a numeric loop whose body calls a GLOBAL function —
+/// kernelizes as one loop kernel with a pinned global callee (pins the
+/// `KCalleeSrc::Global` shape).
 #[test]
-fn recursive_functions_get_self_kernels() {
-    fn self_kernels(p: &FuncProto) -> usize {
-        let mut n = usize::from(
-            p.fn_kernel
-                .as_ref()
-                .is_some_and(|k| k.self_global.is_some()),
-        );
+fn global_callee_loops_get_kernels() {
+    fn kernels_in(p: &FuncProto) -> usize {
+        let mut n = p.kernels.len();
         for c in &p.consts {
             if let Const::Func(f) = c {
-                n += self_kernels(f);
+                n += kernels_in(f);
+            }
+        }
+        n
+    }
+    // The sort workload's fill loop: a cell-writing global callee.
+    let src = "let seed = 1; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; } const a = new Array(10); for (let i = 0; i < 10; i++) a[i] = rnd(); console.log(a[9]);";
+    let proto = compile_script(src).expect("compiles");
+    assert!(
+        kernels_in(&proto) >= 1,
+        "fill loop with a global callee must kernelize"
+    );
+    let has_call_kernel = proto
+        .kernels
+        .iter()
+        .any(|k| k.code.iter().any(|op| matches!(op, KOp::CallKernel { .. })));
+    assert!(
+        has_call_kernel,
+        "the fill loop's kernel must carry a CallKernel to the global callee"
+    );
+}
+
+/// Cell-writing scalar bodies (the PRNG idiom) get a function kernel with
+/// `uv_writes` populated; non-Number stores and cell-writing recursion stay
+/// generic (pins the upvalue write-back shape).
+#[test]
+fn cell_writing_functions_get_fn_kernels() {
+    /// (fn kernels found, of which with non-empty uv_writes, of which rec)
+    fn scan(p: &FuncProto) -> (usize, usize, usize) {
+        let mut t = match &p.fn_kernel {
+            Some(k) => (
+                1,
+                usize::from(!k.uv_writes.is_empty()),
+                usize::from(k.rec.is_some()),
+            ),
+            None => (0, 0, 0),
+        };
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                let s = scan(f);
+                t = (t.0 + s.0, t.1 + s.1, t.2 + s.2);
+            }
+        }
+        t
+    }
+    // The PRNG idiom kernelizes WITH a recorded cell write.
+    for src in [
+        "let seed = 1; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; }",
+        "let acc = 0; const f = x => { acc = acc + x; return acc; };",
+        "let hi = 0; const f = x => { if (x > 10) hi = x; return hi; };",
+    ] {
+        let (kernels, writing, rec) = scan(&compile_script(src).expect("compiles"));
+        assert!(
+            kernels >= 1 && writing >= 1 && rec == 0,
+            "expected a non-recursive cell-writing fn kernel in {src:?}"
+        );
+    }
+    // Non-Number stores and cell-writing recursion stay generic.
+    for src in [
+        // Boolean store: a flushed Number would change typeof.
+        "let b = 0; const f = x => { b = x > 0; return 1; };",
+        // Undefined store: unrepresentable in a register.
+        "let u = 0; const f = x => { u = undefined; return x; };",
+        // Self-recursion + cell write: the recursion tier's entry resolution
+        // treats cells as activation constants.
+        "let d = 0; function f(n) { d = d + 1; return n <= 0 ? d : f(n - 1); }",
+    ] {
+        let (kernels, _, _) = scan(&compile_script(src).expect("compiles"));
+        assert_eq!(kernels, 0, "expected NO fn kernel in {src:?}");
+    }
+}
+
+/// Recursive numeric functions get a RECURSIVE function kernel
+/// (`Kernel::rec` set) — including boolean-returning predicates, mutual
+/// recursion (resolved at entry), and self-reference through a captured
+/// binding — and non-recursive/argument-fed shapes never do.
+#[test]
+fn recursive_functions_get_self_kernels() {
+    fn rec_kernels(p: &FuncProto) -> usize {
+        let mut n = usize::from(p.fn_kernel.as_ref().is_some_and(|k| k.rec.is_some()));
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                n += rec_kernels(f);
             }
         }
         n
@@ -605,24 +853,28 @@ fn recursive_functions_get_self_kernels() {
         "function gcd(a, b) { return b === 0 ? a : gcd(b, a % b); }",
         "function ack(m, n) { return m === 0 ? n + 1 : n === 0 ? ack(m - 1, 1) : ack(m - 1, ack(m, n - 1)); }",
         "var f = function (n) { return n <= 0 ? 0 : n + f(n - 1); };",
+        // Boolean-returning recursion (result registers typed Bool).
+        "function tob(n) { return n <= 0 ? true : tob(n - 1); }",
+        // Mutual recursion: the partner resolves at entry.
+        "function even(n) { return n === 0 ? 1 : odd(n - 1); }",
+        // Self-reference through the captured `const` binding.
+        "const g = (a, b) => (b === 0 ? a : g(b, a % b));",
     ] {
         let proto = compile_script(src).expect("compiles");
         assert!(
-            self_kernels(&proto) >= 1,
+            rec_kernels(&proto) >= 1,
             "expected a recursive kernel in {src:?}"
         );
     }
     for src in [
-        // Boolean-returning recursion (result register is Number-typed).
-        "function tob(n) { return n <= 0 ? true : tob(n - 1); }",
-        // Mutual recursion is not a SELF call.
-        "function even(n) { return n === 0 ? 1 : odd(n - 1); }",
-        // A named expression's self-reference is lexical, not global.
-        "const k = function inner(n) { return n <= 0 ? 0 : n + inner(n - 1); };",
+        // Plain non-recursive body.
+        "function add(a, b) { return a + b; }",
+        // Recursion through a PARAMETER is a plain argument (not Number).
+        "function apply(f, n) { return n <= 0 ? 0 : f(f, n - 1); }",
     ] {
         let proto = compile_script(src).expect("compiles");
         assert_eq!(
-            self_kernels(&proto),
+            rec_kernels(&proto),
             0,
             "expected NO recursive kernel in {src:?}"
         );
@@ -641,21 +893,29 @@ fn self_kernel_depth_overflow_reruns_generic() {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(|| {
-            let src = "function rec(n) { return n <= 0 ? 0 : 1 + rec(n - 1); } \
-                       try { console.log(rec(1000)); } catch (e) { console.log('deep', e.constructor.name); } \
-                       console.log(rec(10));";
-            let mut outs = Vec::new();
-            for kernels in [true, false] {
-                let proto = Rc::new(compile_script_kernels(src, kernels).expect("compiles"));
-                let mut engine = Engine::new();
-                engine.vm.max_call_depth = 64;
-                let func = engine.vm.make_closure(proto, Vec::new());
-                let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
-                assert!(res.is_ok(), "caught in-script (kernels={kernels})");
-                outs.push(engine.console().to_vec());
+            for src in [
+                "function rec(n) { return n <= 0 ? 0 : 1 + rec(n - 1); } \
+                 try { console.log(rec(1000)); } catch (e) { console.log('deep', e.constructor.name); } \
+                 console.log(rec(10));",
+                // Same contract for the MUTUAL-recursion windowed path.
+                "function me(n) { return n === 0 ? true : mo(n - 1); } \
+                 function mo(n) { return n === 0 ? false : me(n - 1); } \
+                 try { console.log(me(1001)); } catch (e) { console.log('deep', e.constructor.name); } \
+                 console.log(me(10));",
+            ] {
+                let mut outs = Vec::new();
+                for kernels in [true, false] {
+                    let proto = Rc::new(compile_script_kernels(src, kernels).expect("compiles"));
+                    let mut engine = Engine::new();
+                    engine.vm.max_call_depth = 64;
+                    let func = engine.vm.make_closure(proto, Vec::new());
+                    let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
+                    assert!(res.is_ok(), "caught in-script (kernels={kernels})");
+                    outs.push(engine.console().to_vec());
+                }
+                assert_eq!(outs[0], outs[1], "depth overflow diverged:\n{src}");
+                assert_eq!(outs[0][0], "deep RangeError");
             }
-            assert_eq!(outs[0], outs[1], "depth overflow diverged");
-            assert_eq!(outs[0][0], "deep RangeError");
         })
         .expect("spawns")
         .join()
@@ -875,4 +1135,113 @@ fn op_budget_identical_with_kernels() {
             );
         }
     }
+}
+
+/// The cleanup/fusion pipeline actually produces the new superinstructions
+/// (const-propagated K-forms, the fused loop-header test, and the fused
+/// element-load accumulations) on the canonical shapes — pins the
+/// masked-window round's dispatch counts.
+#[test]
+fn kernel_superinstructions_fire() {
+    fn kernel_ops(src: &str) -> Vec<KOp> {
+        fn collect(p: &FuncProto, out: &mut Vec<KOp>) {
+            for k in &p.kernels {
+                out.extend(k.code.iter().copied());
+            }
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    collect(f, out);
+                }
+            }
+        }
+        let proto = compile_script(src).expect("compiles");
+        let mut out = Vec::new();
+        collect(&proto, &mut out);
+        out
+    }
+    // `i < a.length` header: one fused LenBrCmp dispatch.
+    let ops = kernel_ops(
+        "function f(a) { let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } return s; }",
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::LenBrCmp { .. })),
+        "length header must fuse: {ops:?}"
+    );
+    // `s += a[i]`: one fused LoadElemAdd dispatch.
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::LoadElemAdd { .. })),
+        "element accumulation must fuse: {ops:?}"
+    );
+    // Constant operands reach the immediate forms: no materialized `Const`
+    // feeding an `Arith`/`BrCmp` survives in the canonical modular loop.
+    let ops = kernel_ops(
+        "function f(n) { let s = 0; for (let i = 0; i < n; i++) { s += (i * 7919) % 10007; } return s; }",
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, KOp::ArithK { .. } | KOp::ArithKAdd { .. })),
+        "constant arithmetic must use K-forms: {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(op, KOp::Const { .. })),
+        "no stranded Const feeding const-propagated ops: {ops:?}"
+    );
+}
+
+/// The masked-window executors run kernels correctly at the register-count
+/// CAP boundary (KWIN registers is the translation limit; a body needing
+/// more must decline and stay generic — never corrupt).
+#[test]
+fn kernel_register_cap() {
+    // Many distinct live locals in one loop body push the register count up;
+    // whether or not this kernelizes, the RESULT must be exact.
+    let mut body = String::new();
+    let mut sum = String::new();
+    for i in 0..24 {
+        body.push_str(&format!("let v{i} = i + {i}; "));
+        sum.push_str(&format!("+ v{i} "));
+    }
+    let src = format!(
+        "let s = 0; for (let i = 0; i < 100; i++) {{ {body} s = (s {sum}) % 1000003; }} console.log(s);"
+    );
+    let (threw_on, con_on, err_on) = run(&src, true);
+    let (threw_off, con_off, err_off) = run(&src, false);
+    assert_eq!(
+        (threw_on, &con_on, &err_on),
+        (threw_off, &con_off, &err_off),
+        "cap-boundary loop must behave identically"
+    );
+}
+
+/// The canonical charCodeAt scan loop actually kernelizes with the
+/// pinned-string ops (pins the string tier).
+#[test]
+fn char_code_loops_get_kernels() {
+    fn kernel_ops(src: &str) -> Vec<KOp> {
+        fn collect(p: &FuncProto, out: &mut Vec<KOp>) {
+            for k in &p.kernels {
+                out.extend(k.code.iter().copied());
+            }
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    collect(f, out);
+                }
+            }
+        }
+        let proto = compile_script(src).expect("compiles");
+        let mut out = Vec::new();
+        collect(&proto, &mut out);
+        out
+    }
+    let ops = kernel_ops(
+        "function f(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) % 1000000007; } return h; }",
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::CharCodeAt { .. })),
+        "charCodeAt scan must kernelize: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, KOp::StrLen { .. })),
+        "string length must use StrLen: {ops:?}"
+    );
 }

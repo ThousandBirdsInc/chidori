@@ -12,7 +12,8 @@ use crate::providers::{
     ToolSchema,
 };
 use crate::runtime::call_log::CallRecord;
-use crate::runtime::context::{InputMode, PendingApproval, RuntimeContext, PAUSE_MARKER};
+use crate::runtime::context::{InputMode, PendingApproval, RuntimeContext};
+use crate::runtime::errors::RunInterrupt;
 use crate::runtime::host_core;
 use crate::runtime::snapshot::RuntimePolicy;
 use crate::runtime::template::TemplateEngine;
@@ -66,7 +67,16 @@ impl HostBindingBackend {
         }
     }
 
-    fn template_engine(&self) -> Arc<TemplateEngine> {
+    /// When this backend's context belongs to an actor sub-run, drain the
+    /// actor's shared mailbox into the run-level signal inbox (no-op
+    /// otherwise). Called before the signal-family effects.
+    fn pump_actor_mailbox(&self) {
+        if let Some(ctx) = self.runtime_ctx() {
+            crate::runtime::host_actor::pump_own_mailbox(ctx);
+        }
+    }
+
+    pub(crate) fn template_engine(&self) -> Arc<TemplateEngine> {
         match self {
             HostBindingBackend::Recorder(_) => Arc::new(TemplateEngine::new(".")),
             HostBindingBackend::Runtime {
@@ -177,12 +187,10 @@ impl HostBindingBackend {
             .unwrap_or(config.temperature);
         let max_tokens = options
             .get("maxTokens")
-            .or_else(|| options.get("max_tokens"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(config.max_tokens);
         let max_turns = options
             .get("maxTurns")
-            .or_else(|| options.get("max_turns"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(config.max_turns)
             .max(1);
@@ -194,6 +202,16 @@ impl HostBindingBackend {
             .get("format")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
+        // `format:"json"` historically fell back to the raw string on ANY
+        // parse failure, so a truncated reply (e.g. a reasoning model spending
+        // the whole `maxTokens` budget before visible output) flowed on as an
+        // empty/garbage value and the run "succeeded" with a degraded product.
+        // Strict by default now: unparseable JSON throws. `strict: false`
+        // restores the lenient raw-string fallback.
+        let strict_json = options
+            .get("strict")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
         let prompt_type = options
             .get("type")
             .or_else(|| options.get("streamType"))
@@ -234,11 +252,15 @@ impl HostBindingBackend {
             }
             let mut tool_schemas = Vec::new();
             for name in &all_tool_names {
-                let tool_def = tools
-                    .get(name)
-                    .ok_or_else(|| format!("Unknown tool in context tools: {name}"))?;
+                let tool_def = tools.get(name).ok_or_else(|| {
+                    format!(
+                        "{} (referenced in context tools)",
+                        tools.describe_miss(name)
+                    )
+                })?;
                 tool_schemas.push(tool_def_to_schema(tool_def));
             }
+            tool_schemas.extend(parts.inline_tool_schemas.iter().cloned());
             let system = match (parts.system, system) {
                 (Some(ctx_system), Some(opt_system)) => {
                     Some(format!("{ctx_system}\n\n{opt_system}"))
@@ -274,6 +296,12 @@ impl HostBindingBackend {
                     "tools": all_tool_names,
                     "turn": turn,
                     "context_segments": segments.len(),
+                    // Journaled so `trace` can explain a short/odd response
+                    // and so an edit to them is a visible divergence on
+                    // resume (older checkpoints without these keys still
+                    // replay — see snapshot::completed_args_match).
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
                     "request_digest": host_core::prompt_request_digest(request),
                 })
             };
@@ -359,9 +387,9 @@ impl HostBindingBackend {
 
         let mut tool_schemas = Vec::new();
         for name in &tool_names {
-            let tool_def = tools
-                .get(name)
-                .ok_or_else(|| format!("Unknown tool in prompt tools: {name}"))?;
+            let tool_def = tools.get(name).ok_or_else(|| {
+                format!("{} (referenced in prompt tools)", tools.describe_miss(name))
+            })?;
             tool_schemas.push(tool_def_to_schema(tool_def));
         }
 
@@ -392,6 +420,8 @@ impl HostBindingBackend {
                         "tools": tool_names,
                         "turn": turn,
                         "max_turns": max_turns,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
                         "request_digest": request_digest,
                     }),
                     prompt_type.clone(),
@@ -411,8 +441,7 @@ impl HostBindingBackend {
                 });
             }
             if format.as_deref() == Some("json") {
-                return serde_json::from_str::<serde_json::Value>(&final_text)
-                    .or(Ok(serde_json::Value::String(final_text)));
+                return parse_json_reply(&final_text, strict_json);
             }
             return Ok(serde_json::Value::String(final_text));
         }
@@ -437,6 +466,8 @@ impl HostBindingBackend {
                 "text": text,
                 "model": model,
                 "type": prompt_type,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
                 "request_digest": request_digest,
             }),
             prompt_type.clone(),
@@ -445,8 +476,7 @@ impl HostBindingBackend {
 
         if format.as_deref() == Some("json") {
             if let Some(content) = result.as_str() {
-                serde_json::from_str::<serde_json::Value>(content)
-                    .or(Ok(serde_json::Value::String(content.to_string())))
+                parse_json_reply(content, strict_json)
             } else {
                 Ok(result)
             }
@@ -470,7 +500,10 @@ impl HostBindingBackend {
                     content: serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
                     is_error: false,
                 }),
-                Err(err) if err.contains(PAUSE_MARKER) => return Err(err),
+                // At this boundary the pause is already a wire string (the
+                // tool ran behind `Result<_, String>`); pass it through
+                // verbatim so it keeps unwinding into the VM.
+                Err(err) if RunInterrupt::from_message(&err).is_some() => return Err(err),
                 Err(err) => result_blocks.push(ContentBlock::ToolResult {
                     tool_use_id: call.id,
                     content: err,
@@ -499,11 +532,15 @@ impl HostBindingBackend {
         let parts = context_request_parts(segments)?;
         let mut tool_schemas = Vec::new();
         for name in &parts.tool_names {
-            let tool_def = tools
-                .get(name)
-                .ok_or_else(|| format!("Unknown tool in context tools: {name}"))?;
+            let tool_def = tools.get(name).ok_or_else(|| {
+                format!(
+                    "{} (referenced in context tools)",
+                    tools.describe_miss(name)
+                )
+            })?;
             tool_schemas.push(tool_def_to_schema(tool_def));
         }
+        tool_schemas.extend(parts.inline_tool_schemas.iter().cloned());
         let mut request = LlmRequest {
             model: opts
                 .get("model")
@@ -532,14 +569,20 @@ impl HostBindingBackend {
         )))
     }
 
-    fn input(&self, prompt: String) -> std::result::Result<String, String> {
+    fn input(
+        &self,
+        prompt: String,
+        opts: serde_json::Value,
+    ) -> std::result::Result<String, String> {
         let HostBindingBackend::Runtime { runtime_ctx, .. } = self else {
             return Err("chidori.input requires the runtime host backend".to_string());
         };
 
-        let result =
-            host_core::execute_input(runtime_ctx, &serde_json::json!({ "prompt": prompt }))
-                .map_err(|err| err.to_string())?;
+        let result = host_core::execute_input(
+            runtime_ctx,
+            &serde_json::json!({ "prompt": prompt, "opts": opts }),
+        )
+        .map_err(|err| err.to_string())?;
         Ok(result.as_str().unwrap_or("").to_string())
     }
 
@@ -559,7 +602,7 @@ impl HostBindingBackend {
 
     fn signal_any(&self, a: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
         let HostBindingBackend::Runtime { runtime_ctx, .. } = self else {
-            return Err("chidori.signalAny requires the runtime host backend".to_string());
+            return Err("chidori.signal requires the runtime host backend".to_string());
         };
         host_core::execute_signal_any(runtime_ctx, a).map_err(|err| err.to_string())
     }
@@ -579,14 +622,30 @@ impl HostBindingBackend {
             return Ok(());
         };
 
+        // A call about to be served from the replay journal executes no side
+        // effect — the recorded result returns from cache, or the divergence
+        // check refuses loudly. Policy gates guard LIVE effects, so a pure
+        // replay must not ask (or fail closed) for work it will never do.
+        if runtime_ctx.next_call_is_replayed() {
+            return Ok(());
+        }
+
         let (decision, reason) = policy.decide(target, args);
         match decision {
             Decision::AlwaysAllow => Ok(()),
-            Decision::NeverAllow => Err(format!(
-                "policy: `{}` denied{}",
-                target,
-                reason.map(|r| format!(" ({})", r)).unwrap_or_default()
-            )),
+            Decision::NeverAllow => {
+                let message = format!(
+                    "policy: `{}` denied{}",
+                    target,
+                    reason.map(|r| format!(" ({})", r)).unwrap_or_default()
+                );
+                // Denials must be audible where the operator sits, not only in
+                // the journal: the error returns to the agent, and tool loops
+                // routinely swallow it and produce confident output with no
+                // data — a silently misconfigured policy looks like success.
+                eprintln!("chidori: {message}");
+                Err(message)
+            }
             Decision::AskBefore => {
                 {
                     let cache = policy_cache.lock().unwrap();
@@ -604,14 +663,48 @@ impl HostBindingBackend {
                         args: args.clone(),
                         reason: reason.clone(),
                     });
-                    return Err(PAUSE_MARKER.to_string());
+                    // This error crosses into the VM as a plain string, so it
+                    // is raised in wire form (a Rust enum can't survive the
+                    // JS hop); the approval payload rides in the pending slot
+                    // set above.
+                    return Err(RunInterrupt::Approval.to_wire());
                 }
-                Err(format!(
-                    "policy: `{}` requires approval{}. Set CHIDORI_POLICY_AUTO_APPROVE=1 to \
-                     auto-approve, or run through the server so the approval flow can pause.",
-                    target,
-                    reason.map(|r| format!(" - {}", r)).unwrap_or_default()
-                ))
+                // Bare CLI: ask the operator on the controlling terminal.
+                // "y" is remembered per (target, args); "a" allows every
+                // further call to this target for the rest of the run.
+                if let Some(answer) =
+                    crate::policy::prompt_operator_approval(target, args, reason.as_deref())
+                {
+                    use crate::policy::OperatorAnswer;
+                    match answer {
+                        OperatorAnswer::Approve => {
+                            policy_cache.lock().unwrap().approve(target, args);
+                            return Ok(());
+                        }
+                        OperatorAnswer::ApproveTarget => {
+                            policy_cache.lock().unwrap().approve_target(target);
+                            return Ok(());
+                        }
+                        OperatorAnswer::Deny => {
+                            return Err(format!(
+                                "policy: `{}` denied at the operator prompt",
+                                target
+                            ));
+                        }
+                    }
+                }
+                // Non-interactive and nothing to answer the prompt: fail closed.
+                // A policy-supplied reason already tells the operator how to
+                // relax the posture; otherwise fall back to the generic help.
+                Err(match reason {
+                    Some(r) => format!("policy: `{}` requires approval - {}", target, r),
+                    None => format!(
+                        "policy: `{}` requires approval. Approve interactively at a terminal, \
+                         set CHIDORI_POLICY_AUTO_APPROVE=1 to auto-approve, or run through the \
+                         server so the approval flow can pause.",
+                        target
+                    ),
+                })
             }
         }
     }
@@ -677,20 +770,9 @@ impl HostBindingBackend {
                         server_id,
                         remote_name,
                     } => tokio_rt.block_on(async {
-                        mcp.call_tool(&server_id, &remote_name, &serde_json::Value::Object(kwargs))
+                        mcp.call_tool(server_id, remote_name, &serde_json::Value::Object(kwargs))
                             .await
                     }),
-                    ToolBackend::TypeScript => {
-                        // Nested execution: run the nested TS tool on the rust
-                        // engine, threading the same backend (`self`) so host
-                        // effects nest under this tool call and a suspension
-                        // propagates.
-                        crate::runtime::rust_engine::run_tool_file(
-                            &tool_def.source_path,
-                            &serde_json::Value::Object(kwargs),
-                            self,
-                        )
-                    }
                     ToolBackend::Native => {
                         tools.dispatch_native(tool_name, serde_json::Value::Object(kwargs))
                     }
@@ -827,6 +909,78 @@ impl HostBindingBackend {
         }
     }
 
+    /// As [`with_runtime_ctx`](Self::with_runtime_ctx), but also swapping the
+    /// durable runtime policy — for sub-runs that are their OWN durable runs
+    /// (detached agents), whose policy is derived from their own run id so a
+    /// wake on a fresh process reconstructs the identical policy.
+    #[allow(dead_code)] // Not yet wired into a call path; staged API.
+    pub(crate) fn with_runtime_ctx_and_policy(
+        &self,
+        runtime_ctx: RuntimeContext,
+        runtime_policy: RuntimePolicy,
+    ) -> Option<Self> {
+        match self.with_runtime_ctx(runtime_ctx) {
+            Some(HostBindingBackend::Runtime {
+                runtime_ctx,
+                providers,
+                template_engine,
+                tokio_rt,
+                policy,
+                tools,
+                mcp,
+                ..
+            }) => Some(HostBindingBackend::Runtime {
+                runtime_ctx,
+                providers,
+                template_engine,
+                tokio_rt,
+                policy,
+                // A fresh approval cache: a detached agent's approvals are its
+                // own, not the spawner's.
+                policy_cache: Arc::new(StdMutex::new(PolicyCache::default())),
+                runtime_policy,
+                tools,
+                mcp,
+            }),
+            other => other,
+        }
+    }
+
+    /// The engine parts shared by every run this backend can host — what a
+    /// detached-agent supervisor needs to run agent modules outside the
+    /// spawning run's lifetime. None for the recorder backend.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn runtime_parts(
+        &self,
+    ) -> Option<(
+        Arc<ProviderRegistry>,
+        Arc<TemplateEngine>,
+        Arc<tokio::runtime::Runtime>,
+        Arc<PolicyConfig>,
+        Arc<ToolRegistry>,
+        Arc<McpManager>,
+    )> {
+        match self {
+            HostBindingBackend::Runtime {
+                providers,
+                template_engine,
+                tokio_rt,
+                policy,
+                tools,
+                mcp,
+                ..
+            } => Some((
+                providers.clone(),
+                template_engine.clone(),
+                tokio_rt.clone(),
+                policy.clone(),
+                tools.clone(),
+                mcp.clone(),
+            )),
+            HostBindingBackend::Recorder(_) => None,
+        }
+    }
+
     /// The runtime context, when this is the runtime backend.
     pub(crate) fn runtime_ctx(&self) -> Option<&RuntimeContext> {
         match self {
@@ -871,7 +1025,13 @@ impl HostBindingBackend {
         match effect {
             "log" => {
                 let message = a.get("message").cloned().unwrap_or(serde_json::Value::Null);
-                let args = serde_json::json!({ "message": message });
+                let mut args = serde_json::json!({ "message": message });
+                // Keep the structured fields: this arm used to rebuild the
+                // payload as message-only, silently dropping every
+                // `chidori.log(msg, {...})` object from the journal.
+                if let Some(fields) = a.get("fields").filter(|f| !f.is_null()) {
+                    args["fields"] = fields.clone();
+                }
                 self.durable_call("log", args.clone(), || {
                     host_core::execute_log(&args).map_err(|err| err.to_string())
                 })
@@ -883,11 +1043,24 @@ impl HostBindingBackend {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                self.input(prompt).map(serde_json::Value::String)
+                let opts = a.get("opts").cloned().unwrap_or(serde_json::Value::Null);
+                self.input(prompt, opts).map(serde_json::Value::String)
             }
-            "signal" => self.signal(a),
-            "poll_signal" => self.poll_signal(a),
-            "signal_any" => self.signal_any(a),
+            // Inside an actor sub-run, pump the actor's shared mailbox into
+            // the run-level inbox first, so the listen point's drain sees
+            // every message delivered while the iteration was executing.
+            "signal" => {
+                self.pump_actor_mailbox();
+                self.signal(a)
+            }
+            "poll_signal" => {
+                self.pump_actor_mailbox();
+                self.poll_signal(a)
+            }
+            "signal_any" => {
+                self.pump_actor_mailbox();
+                self.signal_any(a)
+            }
             // The two halves of `chidori.step(name, fn)` — the durable value
             // checkpoint (docs/value-checkpoints.md). The engine binding probes
             // for a recorded result, runs the callback only on a miss, then
@@ -909,12 +1082,12 @@ impl HostBindingBackend {
                     Ok(a.get("value").cloned().unwrap_or(serde_json::Value::Null))
                 }
             },
-            "checkpoint" => {
+            "mark" => {
                 let args = serde_json::json!({
                     "label": a.get("label").cloned().unwrap_or(serde_json::Value::Null),
                     "data": a.get("data").cloned().unwrap_or(serde_json::Value::Null),
                 });
-                self.durable_call("checkpoint", args, || Ok(serde_json::Value::Null))
+                self.durable_call("mark", args, || Ok(serde_json::Value::Null))
                     .map(opt_null)
             }
             "prompt" => {
@@ -967,8 +1140,14 @@ impl HostBindingBackend {
                     "prefix": prefix,
                     "value": value,
                 });
+                // Anchor the store to the agent, not the process cwd: the
+                // workspace root (agent dir / CHIDORI_WORKSPACE_ROOT), with a
+                // CHIDORI_MEMORY_DIR override, falling back to cwd only when no
+                // root is known (bare embedding). Mirrors how runs and
+                // workspace resolve their `.chidori/` location.
+                let base = memory_base(self);
                 self.durable_call("memory", args.clone(), || {
-                    host_core::execute_memory(&args).map_err(|err| err.to_string())
+                    host_core::execute_memory(&base, &args).map_err(|err| err.to_string())
                 })
                 .map(opt_null)
             }
@@ -1100,6 +1279,39 @@ impl HostBindingBackend {
                 self.call_agent(path, input)
             }
             "branch" => crate::runtime::host_branch::run_branches(self, a),
+            // Supervised actor sub-runs + message passing (docs/actors.md).
+            "spawn_actor" => crate::runtime::host_actor::spawn_actor(self, a),
+            // Detached, durable, addressable agent processes
+            // (docs/detached-agents.md).
+            "spawn_agent" => crate::runtime::host_agent::spawn_agent(self, a),
+            "send_agent" => crate::runtime::host_agent::send_agent(self, a),
+            "join_agent" => crate::runtime::host_agent::join_agent(self, a),
+            "stop_agent" => crate::runtime::host_agent::stop_agent(self, a),
+            "agent_status" => crate::runtime::host_agent::agent_status(self, a),
+            "lookup_agent" => crate::runtime::host_agent::lookup_agent(self, a),
+            // chidori.alarm(ms) — a durable timer, lowered onto the signal
+            // machinery: a listen on the reserved alarm name with `ms` as the
+            // timeout. The run (or detached agent) hibernates and the
+            // supervising server / agent hub re-arms the deadline across
+            // restarts; the wake resolves with the timeout sentinel.
+            "alarm" => {
+                let ms = a
+                    .get("ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("chidori.alarm requires a positive millisecond delay".to_string())?;
+                let args = serde_json::json!({
+                    "name": crate::runtime::host_agent::ALARM_SIGNAL_NAME,
+                    "opts": { "timeoutMs": ms },
+                });
+                self.pump_actor_mailbox();
+                self.signal(&args)
+            }
+            "send_actor" => crate::runtime::host_actor::send_actor(self, a),
+            "receive" => crate::runtime::host_actor::receive(self, a),
+            "join_actor" => crate::runtime::host_actor::join_actor(self, a),
+            "stop_actor" => crate::runtime::host_actor::stop_actor(self, a),
+            "actor_status" => crate::runtime::host_actor::actor_status(self, a),
+            "whereis" => crate::runtime::host_actor::whereis(self, a),
             "workspace" => self.dispatch_workspace(a),
             "contextDigest" => {
                 let segments = a
@@ -1210,8 +1422,53 @@ impl HostBindingBackend {
 struct ContextRequestParts {
     system: Option<String>,
     tool_names: Vec<String>,
+    /// Tool schemas carried inline by the context (import-defined function
+    /// tools via `defineTool`), as opposed to `tool_names`, which resolve
+    /// against the registry of directory-loaded tools. Inline tools are
+    /// executed by the AGENT's own VM (the JS-side loop over `respond()`),
+    /// never by the host — the host only advertises their schemas to the
+    /// provider.
+    inline_tool_schemas: Vec<ToolSchema>,
     messages: Vec<LlmMessage>,
     cache: CacheLayout,
+}
+
+/// Parse a `format:"json"` model reply. Tolerates the common markdown-fence
+/// wrapping (```json ... ```). On unparseable output: strict mode (the
+/// default) fails loudly with the likely cause and the reply head, so a
+/// truncated or off-format reply can never masquerade as a successful
+/// structured result; `strict: false` restores the historical raw-string
+/// fallback.
+fn parse_json_reply(reply: &str, strict: bool) -> std::result::Result<serde_json::Value, String> {
+    let mut candidate = reply.trim();
+    // Strip a single wrapping markdown fence: ```json\n...\n``` or ```\n...\n```.
+    if let Some(rest) = candidate.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        if let Some(inner) = rest.trim_start_matches(['\r', '\n']).strip_suffix("```") {
+            candidate = inner.trim();
+        }
+    }
+    match serde_json::from_str::<serde_json::Value>(candidate) {
+        Ok(value) => Ok(value),
+        Err(parse_err) => {
+            if strict {
+                let head: String = candidate.chars().take(120).collect();
+                let head = if head.is_empty() {
+                    "(empty — was the response truncated? see the `maxTokens` warning above; \
+                     reasoning models spend the budget on hidden reasoning first)"
+                        .to_string()
+                } else {
+                    format!("reply starts: {head:?}")
+                };
+                Err(format!(
+                    "format:\"json\": the model reply is not valid JSON ({parse_err}); {head}. \
+                     Pass `strict: false` in the prompt options to get the raw string instead."
+                ))
+            } else {
+                Ok(serde_json::Value::String(reply.to_string()))
+            }
+        }
+    }
 }
 
 fn cache_ttl_from_str(value: &str) -> CacheTtl {
@@ -1235,6 +1492,7 @@ fn context_request_parts(
     };
     let mut system_parts: Vec<String> = Vec::new();
     let mut tool_names: Vec<String> = Vec::new();
+    let mut inline_tool_schemas: Vec<ToolSchema> = Vec::new();
     let mut messages: Vec<LlmMessage> = Vec::new();
     let mut cache = CacheLayout::default();
     for seg in segments {
@@ -1255,6 +1513,35 @@ fn context_request_parts(
                     if !tool_names.iter().any(|existing| existing == name) {
                         tool_names.push(name.to_string());
                     }
+                }
+                // Inline schemas from import-defined tools (`defineTool`):
+                // full {name, description, parameters} objects, no registry.
+                for schema in seg
+                    .get("schemas")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(name) = schema.get("name").and_then(serde_json::Value::as_str) else {
+                        return Err("tools segment schema entry is missing `name`".to_string());
+                    };
+                    if inline_tool_schemas.iter().any(|t| t.name == name)
+                        || tool_names.iter().any(|existing| existing == name)
+                    {
+                        continue;
+                    }
+                    inline_tool_schemas.push(ToolSchema {
+                        name: name.to_string(),
+                        description: schema
+                            .get("description")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        input_schema: schema
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+                    });
                 }
             }
             "doc" => {
@@ -1317,6 +1604,7 @@ fn context_request_parts(
             Some(system_parts.join("\n\n"))
         },
         tool_names,
+        inline_tool_schemas,
         messages,
         cache,
     })
@@ -1348,6 +1636,21 @@ fn workspace_root(backend: &HostBindingBackend) -> std::result::Result<PathBuf, 
     backend.workspace_root().ok_or_else(|| {
         "chidori.workspace requires CHIDORI_WORKSPACE_ROOT or a runtime workspace root".to_string()
     })
+}
+
+/// The directory under which `chidori.memory` stores `.chidori/memory/`.
+/// Precedence: `CHIDORI_MEMORY_DIR`, then the run's workspace root (the agent
+/// file's directory / `CHIDORI_WORKSPACE_ROOT`), then the process cwd as a
+/// last resort. Unlike `chidori.workspace`, memory never hard-fails on a
+/// missing root — an agent embedded without one still gets a working store,
+/// just cwd-relative as before.
+fn memory_base(backend: &HostBindingBackend) -> PathBuf {
+    if let Some(dir) = std::env::var_os("CHIDORI_MEMORY_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    backend
+        .workspace_root()
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 const WORKSPACE_MANIFEST_VERSION: u32 = 1;
@@ -1769,5 +2072,53 @@ fn tool_def_to_schema(def: &ToolDef) -> ToolSchema {
             "properties": properties,
             "required": required,
         }),
+    }
+}
+
+#[cfg(test)]
+mod json_reply_tests {
+    use super::parse_json_reply;
+
+    #[test]
+    fn parses_plain_json() {
+        let v = parse_json_reply(r#"{"themes": [1, 2]}"#, true).unwrap();
+        assert_eq!(v["themes"][1], 2);
+    }
+
+    #[test]
+    fn strips_a_wrapping_markdown_fence() {
+        for reply in [
+            "```json\n{\"ok\": true}\n```",
+            "```\n{\"ok\": true}\n```",
+            "  ```json\r\n{\"ok\": true}\r\n```  ",
+        ] {
+            let v = parse_json_reply(reply, true).unwrap();
+            assert_eq!(v["ok"], true, "fenced reply parses: {reply:?}");
+        }
+    }
+
+    #[test]
+    fn strict_throws_on_unparseable_with_actionable_message() {
+        // The empty reply is the reasoning-model truncation shape: the whole
+        // maxTokens budget went to hidden reasoning, zero visible output.
+        let err = parse_json_reply("", true).unwrap_err();
+        assert!(err.contains("format:\"json\""), "{err}");
+        assert!(err.contains("truncated"), "names the likely cause: {err}");
+        assert!(
+            err.contains("strict: false"),
+            "names the escape hatch: {err}"
+        );
+
+        let err = parse_json_reply("Sure! Here are the themes: ...", true).unwrap_err();
+        assert!(
+            err.contains("reply starts:"),
+            "carries the reply head: {err}"
+        );
+    }
+
+    #[test]
+    fn lenient_falls_back_to_the_raw_string() {
+        let v = parse_json_reply("not json", false).unwrap();
+        assert_eq!(v, serde_json::Value::String("not json".to_string()));
     }
 }

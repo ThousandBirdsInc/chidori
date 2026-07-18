@@ -81,6 +81,13 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Skipping an already-published version is only safe if that publish
+      # matches this tree. Otherwise the SDK changed without a version bump
+      # and the "skip" would silently strand users on stale contents.
+      - name: Fail if the published tarball drifted from this tree
+        if: steps.check.outputs.published == 'true'
+        run: SKIP_BUILD=1 ../../scripts/check-npm-drift.sh
+
       - name: Publish (dry run)
         if: github.event_name == 'workflow_dispatch'
         run: npm publish --dry-run
@@ -165,6 +172,15 @@ jobs:
   # floor. Windows users install from source (cargo install chidori). This job
   # runs on dispatch too (a build smoke test) but only the github-release job
   # below publishes the artifacts.
+  #
+  # Targets the runner can execute natively are built with PGO
+  # (scripts/pgo-build.sh --bin chidori): instrument, run the offline training
+  # agents, rebuild with feedback. Measured on the shipped binary: -19%
+  # wall-clock on in-corpus interpreter-heavy work, -7% on a held-out
+  # JS-heavy agent, ~-2% on startup/actor-IPC-bound runs (byte-identical
+  # agent outputs). PGO has to *run* the instrumented binary, so the
+  # cross-compiled x86_64-apple-darwin target keeps the plain release build
+  # rather than gambling on Rosetta.
   binaries:
     name: Build ${{ matrix.target }}
     needs: verify
@@ -177,20 +193,33 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-14
+            pgo: true
           - target: x86_64-apple-darwin
             os: macos-14 # cross-compiled from Apple Silicon; macos-13 Intel runners are scarce
+            pgo: false # can't natively run the instrumented binary (see above)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+            pgo: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
+            pgo: true
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: llvm-tools # llvm-profdata, for the PGO merge step
+
+      - name: Build release binary (PGO)
+        if: matrix.pgo
+        run: |
+          mkdir -p "target/${{ matrix.target }}/release"
+          ./scripts/pgo-build.sh --bin chidori --target ${{ matrix.target }} --locked \
+            "target/${{ matrix.target }}/release/chidori"
 
       - name: Build release binary
+        if: ${{ !matrix.pgo }}
         run: cargo build --release --locked --bin chidori --target ${{ matrix.target }}
 
       - name: Package (tar.gz)

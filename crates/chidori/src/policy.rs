@@ -10,8 +10,11 @@
 //!   1. CHIDORI_POLICY_FILE — path to a JSON file
 //!   2. CHIDORI_POLICY — inline JSON string
 //!   3. CHIDORI_POLICY_PROFILE — name of a built-in profile (e.g. "untrusted")
-//!   4. default (AlwaysAllow for everything except shell, which keeps the
-//!      existing CHIDORI_SHELL_ALLOW semantics)
+//!   4. a per-surface default when nothing is configured: `chidori run` asks
+//!      before powerful effects ([`run_default_profile`], relaxed with
+//!      `--trusted`), `chidori serve` denies them ([`serve_default_profile`],
+//!      relaxed with `--trusted`). Shell keeps the existing
+//!      CHIDORI_SHELL_ALLOW semantics in every posture.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,16 +24,12 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Decision {
+    #[default]
     AlwaysAllow,
     AskBefore,
     NeverAllow,
-}
-
-impl Default for Decision {
-    fn default() -> Self {
-        Decision::AlwaysAllow
-    }
 }
 
 impl Decision {
@@ -47,7 +46,12 @@ impl Decision {
 /// A single rule. `target` is "tool:<name>" / "http" / "workspace:<action>"
 /// (where `<action>` is `list` / `read` / `write` / `delete` / `manifest`) /
 /// "*". `match_args` is an optional JSON subset that must be contained in the
-/// call args for the rule to apply.
+/// call args for the rule to apply. String values SUBSTRING-match (`"url":
+/// "/status/"` matches any URL containing it); the reserved key `url_prefix`
+/// ANCHORS instead — it matches when the call's `url` string starts with the
+/// given prefix, which is the right shape for scoping `http` to a host
+/// (`{"url_prefix": "https://api.example.com/"}`) since an unanchored
+/// substring would also match that text embedded in a hostile URL's query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
     pub target: String,
@@ -234,11 +238,29 @@ pub fn serve_default_profile() -> PolicyConfig {
     cfg
 }
 
+/// The policy `chidori run` uses when the operator has not configured one and
+/// has not passed `--trusted`. Agents pulled from a registry or a repo are
+/// third-party code, so the out-of-the-box posture asks before every powerful
+/// effect (the `supervised` profile) instead of running fully trusted: on an
+/// interactive terminal the run pauses at a y/N prompt, and without a terminal
+/// the call fails closed with this reason telling the operator how to relax it.
+pub fn run_default_profile() -> PolicyConfig {
+    let mut cfg = supervised_profile();
+    cfg.default_reason = Some(
+        "chidori run asks before powerful effects by default: approve at the prompt, pass \
+         --trusted for the historical allow-all behavior, or configure CHIDORI_POLICY / \
+         CHIDORI_POLICY_FILE / CHIDORI_POLICY_PROFILE"
+            .to_string(),
+    );
+    cfg
+}
+
 /// Ask-by-default profile: identical allowlist to `untrusted`, but unmatched
 /// gated effects resolve to `AskBefore` — under the server's pause flow the
 /// run suspends as `awaiting_approval` and the operator decides per call
 /// (approvals are remembered per (target, args) for the session). On the bare
-/// CLI, where nothing can answer the prompt, the call errors instead.
+/// CLI the operator is prompted on the controlling terminal when one exists;
+/// otherwise the call errors.
 fn supervised_profile() -> PolicyConfig {
     PolicyConfig {
         rules: read_only_workspace_allowlist(),
@@ -262,13 +284,115 @@ fn read_only_workspace_allowlist() -> Vec<PolicyRule> {
     ]
 }
 
+/// The operator's answer to an `AskBefore` prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorAnswer {
+    /// Allow this call; remembered per (target, args) for the run.
+    Approve,
+    /// Allow every further call to this target for the rest of the run,
+    /// regardless of arguments — so a ten-step tool loop is one keypress,
+    /// not ten.
+    ApproveTarget,
+    /// Deny the call.
+    Deny,
+}
+
+/// Ask the operator on the controlling terminal whether an `AskBefore` call
+/// may proceed. Returns `Some(answer)` when a terminal answered, `None`
+/// when no terminal is available — non-interactive runs must fail closed
+/// instead of assuming consent.
+///
+/// On Unix the prompt goes through `/dev/tty`, so it works even when stdin is
+/// piped input and stdout is a JSON stream (`run --stream`). When `/dev/tty`
+/// is unavailable (or off-Unix) it falls back to stderr + stdin, but only when
+/// both are terminals.
+pub fn prompt_operator_approval(
+    target: &str,
+    args: &Value,
+    reason: Option<&str>,
+) -> Option<OperatorAnswer> {
+    use std::io::Write;
+
+    let args_short: String = {
+        let s = serde_json::to_string(args).unwrap_or_default();
+        if s.chars().count() > 200 {
+            let mut t: String = s.chars().take(200).collect();
+            t.push('…');
+            t
+        } else {
+            s
+        }
+    };
+    let prompt = format!(
+        "chidori policy: agent requests `{target}`{}\n  args: {args_short}\nAllow? \
+         [y]es once (remembered for these args) / [a]ll further `{target}` calls this run / [N]o ",
+        reason.map(|r| format!(" — {r}")).unwrap_or_default(),
+    );
+
+    let parse_answer = |line: &str| match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => OperatorAnswer::Approve,
+        "a" | "all" | "always" => OperatorAnswer::ApproveTarget,
+        _ => OperatorAnswer::Deny,
+    };
+
+    #[cfg(unix)]
+    {
+        use std::io::BufRead;
+        if let Ok(tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        {
+            let mut out = &tty;
+            if out
+                .write_all(prompt.as_bytes())
+                .and_then(|_| out.flush())
+                .is_ok()
+            {
+                let mut line = String::new();
+                if std::io::BufReader::new(&tty).read_line(&mut line).is_ok() {
+                    return Some(parse_answer(&line));
+                }
+            }
+        }
+    }
+
+    {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+            let mut err = std::io::stderr();
+            if err
+                .write_all(prompt.as_bytes())
+                .and_then(|_| err.flush())
+                .is_ok()
+            {
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_ok() {
+                    return Some(parse_answer(&line));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// True when `args` contains all keys/values in `pattern` (shallow for scalars,
 /// recursive for objects). Lists require equality.
 fn value_contains(args: &Value, pattern: &Value) -> bool {
     match (args, pattern) {
-        (Value::Object(a), Value::Object(p)) => p
-            .iter()
-            .all(|(k, pv)| a.get(k).map(|av| value_contains(av, pv)).unwrap_or(false)),
+        (Value::Object(a), Value::Object(p)) => p.iter().all(|(k, pv)| {
+            // Reserved key: `url_prefix` anchors against the call's `url`
+            // (see `PolicyRule`). `starts_with` rather than `contains`, so a
+            // rule scoping `http` to a host cannot be satisfied by that host
+            // appearing inside a hostile URL's path or query string.
+            if k == "url_prefix" {
+                return match (a.get("url"), pv) {
+                    (Some(Value::String(url)), Value::String(prefix)) => url.starts_with(prefix),
+                    _ => false,
+                };
+            }
+            a.get(k).map(|av| value_contains(av, pv)).unwrap_or(false)
+        }),
         (Value::String(a), Value::String(p)) => a.contains(p.as_str()),
         (a, p) => a == p,
     }
@@ -285,12 +409,18 @@ pub struct PolicyCache {
 impl PolicyCache {
     pub fn is_approved(&self, target: &str, args: &Value) -> bool {
         self.inner
-            .get(&cache_key(target, args))
+            .get(&target_key(target))
+            .or_else(|| self.inner.get(&cache_key(target, args)))
             .copied()
             .unwrap_or(false)
     }
     pub fn approve(&mut self, target: &str, args: &Value) {
         self.inner.insert(cache_key(target, args), true);
+    }
+    /// The operator's "[a]ll" answer: allow every further call to this target
+    /// for the rest of the run, regardless of arguments.
+    pub fn approve_target(&mut self, target: &str) {
+        self.inner.insert(target_key(target), true);
     }
 }
 
@@ -302,6 +432,12 @@ fn cache_key(target: &str, args: &Value) -> String {
     )
 }
 
+/// Target-wide key. Cannot collide with `cache_key`: the args side there is
+/// always serialized JSON, and `*` is not valid JSON.
+fn target_key(target: &str) -> String {
+    format!("{target}::*")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +446,23 @@ mod tests {
     #[test]
     fn unknown_profile_is_none() {
         assert!(builtin_profile("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn policy_cache_per_args_approval_does_not_leak_to_other_args() {
+        let mut cache = PolicyCache::default();
+        cache.approve("tool:web_search", &json!({"query": "a"}));
+        assert!(cache.is_approved("tool:web_search", &json!({"query": "a"})));
+        assert!(!cache.is_approved("tool:web_search", &json!({"query": "b"})));
+    }
+
+    #[test]
+    fn policy_cache_target_approval_covers_any_args_but_not_other_targets() {
+        let mut cache = PolicyCache::default();
+        cache.approve_target("tool:web_search");
+        assert!(cache.is_approved("tool:web_search", &json!({"query": "a"})));
+        assert!(cache.is_approved("tool:web_search", &json!({"query": "b"})));
+        assert!(!cache.is_approved("tool:reverse", &json!({"text": "a"})));
     }
 
     #[test]
@@ -453,8 +606,76 @@ mod tests {
     }
 
     #[test]
+    fn run_default_profile_asks_with_actionable_reason() {
+        let cfg = run_default_profile();
+        assert_eq!(cfg.default, Decision::AskBefore);
+
+        let (decision, reason) = cfg.decide("http", &json!({ "url": "https://example.com" }));
+        assert_eq!(decision, Decision::AskBefore);
+        let reason = reason.expect("run default carries a how-to-relax reason");
+        assert!(
+            reason.contains("--trusted"),
+            "reason should name the opt-out: {reason}"
+        );
+        assert!(
+            reason.contains("CHIDORI_POLICY"),
+            "reason should name the env config: {reason}"
+        );
+
+        // The read-only workspace allowlist stays open so agents can still
+        // introspect their sandbox without a prompt.
+        for target in ["workspace:list", "workspace:read", "workspace:manifest"] {
+            let (decision, _) = cfg.decide(target, &json!({}));
+            assert_eq!(
+                decision,
+                Decision::AlwaysAllow,
+                "{target} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn url_prefix_match_args_anchor_at_the_start() {
+        // The production rule "this agent talks to this host only": allow
+        // http scoped by an ANCHORED url prefix, deny everything else.
+        let cfg: PolicyConfig = serde_json::from_value(json!({
+            "rules": [{
+                "target": "http",
+                "decision": "always_allow",
+                "match_args": { "url_prefix": "http://ops.internal:9911/" }
+            }],
+            "default": "never_allow"
+        }))
+        .unwrap();
+
+        let (decision, _) = cfg.decide(
+            "http",
+            &json!({ "url": "http://ops.internal:9911/status/x" }),
+        );
+        assert_eq!(decision, Decision::AlwaysAllow);
+
+        // A different host is denied…
+        let (decision, _) = cfg.decide("http", &json!({ "url": "http://evil.example/" }));
+        assert_eq!(decision, Decision::NeverAllow);
+
+        // …and so is the allowed prefix appearing INSIDE a hostile URL —
+        // the unanchored substring semantics of plain string match_args
+        // would have been satisfied here.
+        let (decision, _) = cfg.decide(
+            "http",
+            &json!({ "url": "http://evil.example/?u=http://ops.internal:9911/" }),
+        );
+        assert_eq!(decision, Decision::NeverAllow);
+
+        // No `url` in the args at all: the prefix rule cannot match.
+        let (decision, _) = cfg.decide("http", &json!({}));
+        assert_eq!(decision, Decision::NeverAllow);
+    }
+
+    #[test]
     fn default_profile_allows_everything() {
-        // The historical default must stay unchanged: no rules, AlwaysAllow fallback.
+        // The permissive posture (`--trusted`, or an explicit empty policy)
+        // must stay unchanged: no rules, AlwaysAllow fallback.
         let cfg = PolicyConfig::default();
         assert_eq!(cfg.default, Decision::AlwaysAllow);
         let (decision, _) = cfg.decide("http", &json!({ "url": "https://example.com" }));

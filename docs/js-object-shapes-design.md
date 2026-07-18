@@ -1,6 +1,13 @@
 # Object shapes (hidden classes): design + phased migration plan
 
-> **Status:** design (2026-07-06). This answers the question
+> **Status:** IMPLEMENTED (2026-07-12) — Phases 0–3 landed on this branch;
+> every phase gated on the full test262 language+built-ins baseline with
+> zero regressions (47,291 tests). See §6.5 for the deltas between this design
+> and what actually landed (slots hold whole `Property` values so attribute
+> edges never demote; transition edges are `Weak`; the per-shape `index` is
+> an `FxIndexMap` for `Equivalent`-probe parity).
+>
+> Original design note (2026-07-06): this answers the question
 > [`js-performance-roadmap.md`](./js-performance-roadmap.md) §3.7 deferred —
 > "revisit with fresh callgrind data; if `get_index_of` still dominates
 > property-heavy code, shapes are the next step" — with fresh data, and it
@@ -210,6 +217,62 @@ workload allocates a record per iteration) and colder property access.
   shapes hold no `Value`s, only keys.
 - **`u128` liveness / slot bounds**: slot vecs cap at the same bound as
   dictionary properties today (no new limit).
+
+## 6.5 Implementation deltas (what actually landed, 2026-07-12)
+
+The landed implementation follows §3–§4 with four refinements, each chosen
+to shrink the correctness surface rather than to chase speed:
+
+1. **Slots hold whole `Property` values** (`Shaped { shape, slots:
+   Vec<Property> }`), not bare `Value`s, and the shape does NOT carry an
+   `enumerable` bit. The shape therefore encodes exactly one thing — the
+   insertion-ordered key list — and every attribute/kind mutation
+   (`defineProperty` with any attributes, accessors, `seal`/`freeze`) works
+   identically in both modes with NO demotion. The §3.4 demotion set
+   shrinks to the order-destroying edges only: `delete` of a present key,
+   and integer-index keys past a small bound (8). This also let the
+   Phase-1 accessor API keep `IndexMap`-shaped signatures
+   (`&Property`/`&mut Property`, 3-tuple `get_full`), which is what made
+   the ~340-site refactor mechanical. The cost is `size_of::<Property>()`
+   per slot instead of `size_of::<Value>()` — the allocation-count win
+   (one slot vec vs. a per-object `IndexMap` + key strings) is unchanged.
+2. **Transition edges are `Weak`** (`transitions:
+   RefCell<FxHashMap<PropertyKey, Weak<Shape>>>`); the child holds its
+   parent strongly. The §3.1 sketch's strong child edges would form
+   parent↔child `Rc` cycles that the reference-counting GC can never
+   reclaim. With weak edges a shape subtree dies with its last object /
+   cache entry, and a later transition simply rebuilds the node — no
+   registry, no §5 quiescence sweep needed.
+3. **The per-shape `index` is an `FxIndexMap<PropertyKey, u32>`** (not a
+   plain `FxHashMap`) so it accepts the same `Equivalent<PropertyKey>`
+   probes (`StrKeyRef`) as the dictionary path.
+4. **ICs hold `Rc<Shape>` strongly** in the new `IcEntry::{own_shape,
+   proto_shape}` fields — one small key chain pinned per monomorphic site,
+   in exchange for upgrade-free verification. The JSON.parse cursor is a
+   per-nesting-depth path (`Vec<Rc<Shape>>` per depth) so nested records
+   don't clobber their parent's cursor mid-object.
+
+**Measured (callgrind instruction counts, examples/shapebench, vs the
+fork point efb16a0):** `object_literals` −19%, `mixed_helpers` −5.8%,
+`for-in` over per-iteration records −3.8%, `JSON.parse` −1.9%,
+`json_roundtrip` −0.8%, `JSON.stringify` +1.7% — of which ~+0.5M
+instructions in every workload is one-time realm setup (intrinsic
+container objects now mint shape chains; ≈0.15 ms per `Engine::new`, and
+two rounds of tuning already halved it twice: an inline single-entry
+transition slot, and two-touch arming of the per-shape key index so
+grow-by-insert singletons never pay O(n²) index builds). The §4 1.3–1.6×
+json estimate did NOT materialize on this corpus: with Phase-0 interning
+and the pre-reserved parse maps already landed, per-record construction
+was a smaller slice of `json_roundtrip` than the 2026-07-06 table
+suggested, and stringify/parse inherent work dominates. The structural
+wins concentrate where construction actually dominates (object literals
+in loops, record-processing helpers).
+
+Phase-4 items still open: stringify-from-shape (serializing slots
+directly for all-plain-data records — deliberately skipped because the
+spec's per-key re-lookup during serialization is observable under
+mutating `toJSON`), and shrinking the residual realm-setup delta if
+`Engine::new` latency ever matters.
 
 ## 6. Relationship to register bytecode (§3.5 of the roadmap)
 

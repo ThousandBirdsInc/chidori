@@ -29,7 +29,7 @@ impl Vm {
         // itself (spec EvaluateGeneratorBody / OrdinaryCreateFromConstructor).
         let proto = {
             let own = func_obj.borrow();
-            match own.props.get(&PropertyKey::str("prototype")) {
+            match own.own_get(&PropertyKey::str("prototype")) {
                 Some(Property {
                     kind:
                         PropertyKind::Data {
@@ -312,7 +312,7 @@ impl Vm {
                     let cell_f = cell.clone();
                     let on_f = self.new_native("", 1, move |vm, _t, args| {
                         if let Some(fr) = cell_f.borrow_mut().take() {
-                            let awaited = args.get(0).cloned().unwrap_or(Value::Undefined);
+                            let awaited = args.first().cloned().unwrap_or(Value::Undefined);
                             vm.set_gen_state(&gen_f, GeneratorState::SuspendedYield(fr));
                             let r = vm.make_iter_result(awaited, false);
                             vm.resolve_promise(&res_f, r);
@@ -328,7 +328,7 @@ impl Vm {
                         if let Some(mut fr) = cell.borrow_mut().take() {
                             let token = fr.trace_token;
                             vm.trace_resume(token);
-                            let e = args.get(0).cloned().unwrap_or(Value::Undefined);
+                            let e = args.first().cloned().unwrap_or(Value::Undefined);
                             // Internal await-of-yielded-value rejection: it
                             // propagates out of a `yield*` rather than being
                             // delegated to the inner iterator's `throw`.
@@ -353,7 +353,7 @@ impl Vm {
                         if let Some(fr) = cell_f.borrow_mut().take() {
                             let token = fr.trace_token;
                             vm.trace_resume(token);
-                            let v = args.get(0).cloned().unwrap_or(Value::Undefined);
+                            let v = args.first().cloned().unwrap_or(Value::Undefined);
                             let flow = vm.resume_frame(fr, v);
                             vm.agen_drive(&gen_f, flow, &res_f, token);
                         }
@@ -365,7 +365,7 @@ impl Vm {
                         if let Some(fr) = cell.borrow_mut().take() {
                             let token = fr.trace_token;
                             vm.trace_resume(token);
-                            let e = args.get(0).cloned().unwrap_or(Value::Undefined);
+                            let e = args.first().cloned().unwrap_or(Value::Undefined);
                             let flow = vm.resume_frame_throw(fr, e);
                             vm.agen_drive(&gen_r, flow, &res_r, token);
                         }

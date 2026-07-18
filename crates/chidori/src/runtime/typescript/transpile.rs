@@ -96,44 +96,104 @@ pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -
     // between calls with identical source and must never be cached.
     validate_imports(path, source, options.import_policy)?;
 
-    // The oxc pipeline below (parse → semantic → transform → codegen → strip →
-    // collapse) is a pure function of `(path, source)` — the transform options
+    // The oxc pipeline below (parse → semantic → transform → codegen → strip)
+    // is a pure function of `(path, source)` — the transform options
     // are compile-time constants and nothing reads the environment — so its
     // output is memoized process-wide. This is the dominant fixed cost paid on
     // EVERY agent execution: initial runs, every pause→resume re-execution,
     // tool files, sub-agents, branch waves/resumes, and each imported module —
-    // all re-transpile byte-identical sources today. Keyed by the full
-    // `(path, source)` pair (hash + equality via the map), so a hit can never
-    // alias distinct inputs; only successes are cached (errors are cheap and
+    // all re-transpile byte-identical sources today. Keyed by path with the
+    // source matched by full string equality, so a hit can never alias
+    // distinct inputs; only successes are cached (errors are cheap and
     // deterministic to recompute).
     {
         let cache = transpile_cache().lock().expect("transpile cache poisoned");
-        if let Some(js) = cache.get(&(path.to_path_buf(), source.to_string())) {
-            return Ok(js.clone());
+        if let Some(entries) = cache.get(path) {
+            if let Some((_, js)) = entries.iter().find(|(cached, _)| cached == source) {
+                return Ok(js.clone());
+            }
         }
     }
     let js = transpile_source(path, source)?;
     {
         let mut cache = transpile_cache().lock().expect("transpile cache poisoned");
         // Bound the cache; a process sees dozens of distinct module sources.
-        // Clearing wholesale at the cap is simpler than LRU and has no
+        // Clearing wholesale at the caps is simpler than LRU and has no
         // order-dependent behavior.
         if cache.len() >= 256 {
             cache.clear();
         }
-        cache.insert((path.to_path_buf(), source.to_string()), js.clone());
+        let entries = cache.entry(path.to_path_buf()).or_default();
+        if entries.len() >= 8 {
+            entries.clear();
+        }
+        entries.push((source.to_string(), js.clone()));
     }
     Ok(js)
 }
 
-fn transpile_cache() -> &'static std::sync::Mutex<HashMap<(PathBuf, String), String>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(PathBuf, String), String>>> =
+/// Keyed by path, with the source carried in the per-path entries and matched
+/// by FULL string equality — a hit can never alias distinct inputs. The
+/// two-level shape lets a lookup borrow `&Path`/`&str` directly: the old
+/// `(PathBuf, String)` key forced a heap copy of the whole source (and a hash
+/// over every byte of it) on EVERY probe, hits included — per module, per
+/// execution, per resume.
+type TranspileCache = HashMap<PathBuf, Vec<(String, String)>>;
+
+fn transpile_cache() -> &'static std::sync::Mutex<TranspileCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<TranspileCache>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Render oxc diagnostics through miette's graphical report handler (the
+/// diagnostic toolkit oxc's errors are built on): each error shows its
+/// `file:line:column`, the offending source line, and a caret under the exact
+/// span — instead of a bare message that leaves the user hunting for the
+/// position. Unicode box-drawing, no ANSI color (output lands in error chains
+/// and logs, not always a terminal).
+fn render_diagnostics(
+    path: &Path,
+    source: &str,
+    errors: &[oxc::diagnostics::OxcDiagnostic],
+) -> String {
+    use oxc::diagnostics::{GraphicalReportHandler, GraphicalTheme, NamedSource};
+    let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
+    let mut out = String::new();
+    for err in errors {
+        let report = err
+            .clone()
+            .with_source_code(NamedSource::new(path.to_string_lossy(), source.to_string()));
+        if handler.render_report(&mut out, report.as_ref()).is_err() {
+            // Rendering is best-effort presentation; never mask the error itself.
+            out.push_str(&format!("\n{err}"));
+        }
+    }
+    out
+}
+
 /// The pure transpile pipeline (no import validation, no filesystem access).
 fn transpile_source(path: &Path, source: &str) -> Result<String> {
+    Ok(transpile_source_impl(path, source, false)?.0)
+}
+
+/// As [`transpile_source`], additionally returning the codegen source map
+/// (original TypeScript → emitted JavaScript). Used by [`remap_to_original`]
+/// on the error path; the hot execution path skips map generation.
+pub fn transpile_source_with_map(
+    path: &Path,
+    source: &str,
+) -> Result<(String, oxc_sourcemap::SourceMap)> {
+    let (js, map) = transpile_source_impl(path, source, true)?;
+    map.map(|m| (js, m))
+        .ok_or_else(|| anyhow::anyhow!("codegen produced no source map"))
+}
+
+fn transpile_source_impl(
+    path: &Path,
+    source: &str,
+    with_map: bool,
+) -> Result<(String, Option<oxc_sourcemap::SourceMap>)> {
     // Treat input as TypeScript regardless of extension — agents may live in
     // `agent.ts` / `tools/*.ts` and the snapshot pipeline only calls us with TS.
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
@@ -141,15 +201,10 @@ fn transpile_source(path: &Path, source: &str) -> Result<String> {
 
     let parser_ret = Parser::new(&allocator, source, source_type).parse();
     if !parser_ret.errors.is_empty() {
-        let messages: Vec<String> = parser_ret
-            .errors
-            .iter()
-            .map(|err| err.to_string())
-            .collect();
         anyhow::bail!(
-            "{}: TypeScript parse error: {}",
+            "{}: TypeScript parse error:{}",
             path.display(),
-            messages.join("; ")
+            render_diagnostics(path, source, &parser_ret.errors)
         );
     }
     let mut program = parser_ret.program;
@@ -159,15 +214,10 @@ fn transpile_source(path: &Path, source: &str) -> Result<String> {
         .with_excess_capacity(2.0)
         .build(&program);
     if !semantic_ret.errors.is_empty() {
-        let messages: Vec<String> = semantic_ret
-            .errors
-            .iter()
-            .map(|err| err.to_string())
-            .collect();
         anyhow::bail!(
-            "{}: TypeScript semantic error: {}",
+            "{}: TypeScript semantic error:{}",
             path.display(),
-            messages.join("; ")
+            render_diagnostics(path, source, &semantic_ret.errors)
         );
     }
     let scoping = semantic_ret.semantic.into_scoping();
@@ -186,26 +236,21 @@ fn transpile_source(path: &Path, source: &str) -> Result<String> {
     let transformer_ret = Transformer::new(&allocator, path, &transform_options)
         .build_with_scoping(scoping, &mut program);
     if !transformer_ret.errors.is_empty() {
-        let messages: Vec<String> = transformer_ret
-            .errors
-            .iter()
-            .map(|err| err.to_string())
-            .collect();
         anyhow::bail!(
-            "{}: TypeScript transform error: {}",
+            "{}: TypeScript transform error:{}",
             path.display(),
-            messages.join("; ")
+            render_diagnostics(path, source, &transformer_ret.errors)
         );
     }
 
-    // Emit no comments. The bundler collapses each top-level statement onto a
-    // single line (see `collapse_top_level_statements`); a surviving `//` line
-    // comment would then swallow the rest of that line — including closing
-    // braces — corrupting the bundle. Comments serve no runtime purpose, so we
-    // drop them at codegen rather than trying to rewrite them during collapse.
+    // Emit no comments — they serve no runtime purpose and keeping codegen
+    // output minimal keeps the transpile cache and error positions stable.
+    // When `with_map` is set, codegen also records the source map that error
+    // frames are remapped through (original .ts → emitted JS).
     let codegen_ret = Codegen::new()
         .with_options(CodegenOptions {
             comments: CommentOptions::disabled(),
+            source_map_path: with_map.then(|| path.to_path_buf()),
             ..CodegenOptions::default()
         })
         .build(&program);
@@ -214,128 +259,120 @@ fn transpile_source(path: &Path, source: &str) -> Result<String> {
     // ToolDefinition, etc.) — there's no real module at module-resolution time,
     // so any surviving `import ... from "chidori:agent"` would crash the loader.
     // oxc's TS pass elides import-of-type-only specifiers but keeps value
-    // imports, so we filter the remaining `from "chidori:agent"` lines out of
-    // the emitted code.
+    // imports, so we BLANK the remaining `from "chidori:agent"` lines in the
+    // emitted code — blanked rather than removed so every other line keeps its
+    // line number and the source map (hence error-frame remapping) stays valid.
+    //
+    // Note the emitted code is NOT collapsed onto one line per top-level
+    // statement anymore: nothing line-walks the transpiled output today, and
+    // preserving codegen's line structure is what lets runtime stack frames
+    // map back to real positions in the original TypeScript.
     let js = strip_chidori_sdk_imports(&codegen_ret.code);
-    // The snapshot bundler line-walks the output to rewrite `import` / `export`
-    // statements. oxc splits object literals and function bodies across many
-    // lines, so we join everything inside nested braces/parens/brackets onto
-    // the same line. That keeps each top-level statement on a single line
-    // while leaving string and template-literal contents untouched.
-    Ok(collapse_top_level_statements(&js))
+    Ok((js, codegen_ret.map))
 }
 
+/// Blank (not remove) each `chidori:agent` import line, preserving all other
+/// lines' positions.
 fn strip_chidori_sdk_imports(js: &str) -> String {
     let mut out = String::with_capacity(js.len());
     for line in js.lines() {
-        if is_chidori_sdk_import(line.trim_start()) {
-            continue;
+        if !is_chidori_sdk_import(line.trim_start()) {
+            out.push_str(line);
         }
-        out.push_str(line);
         out.push('\n');
     }
     out
 }
 
-/// Walk `js` and replace newlines that sit inside `{...}`, `(...)`, `[...]`,
-/// or template-literal interpolations with spaces, so each top-level
-/// statement ends up on a single line. Quoted strings and template-literal
-/// text are passed through untouched.
-fn collapse_top_level_statements(js: &str) -> String {
-    enum Mode {
-        Code,
-        DoubleQuote,
-        SingleQuote,
-        TemplateText,
+/// A stack-frame position translated back into the original TypeScript file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginalPosition {
+    /// 1-based line in the original source.
+    pub line: u32,
+    /// 1-based character column in the original source.
+    pub column: u32,
+    /// Byte offset into the original source (for miette span labels).
+    pub offset: usize,
+}
+
+/// Translate a 1-based `(line, character-column)` position in the transpiled
+/// output of `source` back to the original TypeScript, via the codegen source
+/// map. This re-runs the transpile pipeline with map generation on — it is an
+/// error-path helper (a run renders at most a handful of frames), not
+/// something to call per executed function.
+pub fn remap_to_original(
+    path: &Path,
+    source: &str,
+    line: u32,
+    column: u32,
+) -> Option<OriginalPosition> {
+    let (js, map) = transpile_source_with_map(path, source).ok()?;
+    // The engine counts columns in characters; source-map columns are UTF-16
+    // code units. Convert against the transpiled line's text.
+    let gen_line0 = line.checked_sub(1)?;
+    let gen_text = js.lines().nth(gen_line0 as usize)?;
+    let gen_col16: u32 = gen_text
+        .chars()
+        .take(column.saturating_sub(1) as usize)
+        .map(|c| c.len_utf16() as u32)
+        .sum();
+    let table = map.generate_lookup_table();
+    let token = map.lookup_token(&table, gen_line0, gen_col16)?;
+    let src_line0 = token.get_src_line();
+    let src_col16 = token.get_src_col();
+    // UTF-16 column → byte offset + 1-based character column in the original.
+    let line_start: usize = source
+        .split_inclusive('\n')
+        .take(src_line0 as usize)
+        .map(str::len)
+        .sum();
+    let line_text = source[line_start..].split('\n').next().unwrap_or_default();
+    let mut units: u32 = 0;
+    let mut chars: u32 = 0;
+    let mut bytes: usize = 0;
+    for c in line_text.chars() {
+        if units >= src_col16 {
+            break;
+        }
+        units += c.len_utf16() as u32;
+        chars += 1;
+        bytes += c.len_utf8();
     }
-    let mut out = String::with_capacity(js.len());
-    let mut mode = Mode::Code;
-    let mut depth: i32 = 0;
-    // Stack of template literals we're currently inside, so we know when a `}`
-    // closes a `${...}` interpolation vs. an object/block.
-    let mut template_interp_starts: Vec<i32> = Vec::new();
-    let mut chars = js.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match mode {
-            Mode::Code => match ch {
-                '"' => {
-                    mode = Mode::DoubleQuote;
-                    out.push(ch);
-                }
-                '\'' => {
-                    mode = Mode::SingleQuote;
-                    out.push(ch);
-                }
-                '`' => {
-                    mode = Mode::TemplateText;
-                    out.push(ch);
-                }
-                '{' | '(' | '[' => {
-                    depth += 1;
-                    out.push(ch);
-                }
-                '}' => {
-                    // If this `}` closes a `${...}` interpolation, drop back into the
-                    // surrounding template literal. The matching `${` already
-                    // incremented depth, so we always decrement here.
-                    depth -= 1;
-                    out.push(ch);
-                    if template_interp_starts
-                        .last()
-                        .is_some_and(|&start| start == depth + 1)
-                    {
-                        template_interp_starts.pop();
-                        mode = Mode::TemplateText;
-                    }
-                }
-                ')' | ']' => {
-                    depth -= 1;
-                    out.push(ch);
-                }
-                '\n' if depth > 0 => {
-                    out.push(' ');
-                }
-                _ => out.push(ch),
-            },
-            Mode::DoubleQuote => {
-                out.push(ch);
-                if ch == '\\' {
-                    if let Some(next) = chars.next() {
-                        out.push(next);
-                    }
-                } else if ch == '"' {
-                    mode = Mode::Code;
-                }
-            }
-            Mode::SingleQuote => {
-                out.push(ch);
-                if ch == '\\' {
-                    if let Some(next) = chars.next() {
-                        out.push(next);
-                    }
-                } else if ch == '\'' {
-                    mode = Mode::Code;
-                }
-            }
-            Mode::TemplateText => {
-                out.push(ch);
-                if ch == '\\' {
-                    if let Some(next) = chars.next() {
-                        out.push(next);
-                    }
-                } else if ch == '`' {
-                    mode = Mode::Code;
-                } else if ch == '$' && chars.peek() == Some(&'{') {
-                    let brace = chars.next().unwrap();
-                    out.push(brace);
-                    depth += 1;
-                    template_interp_starts.push(depth);
-                    mode = Mode::Code;
-                }
+    Some(OriginalPosition {
+        line: src_line0 + 1,
+        column: chars + 1,
+        offset: line_start + bytes,
+    })
+}
+
+/// Byte offset of the first dynamic `import(...)` expression in `source`, or
+/// `None` if there is none — or if the source fails to parse (the transpile
+/// step owns parse-error reporting).
+fn find_dynamic_import(path: &Path, source: &str) -> Option<usize> {
+    use oxc::ast::ast::ImportExpression;
+    use oxc::ast_visit::Visit;
+
+    struct Finder {
+        first: Option<usize>,
+    }
+    impl<'a> Visit<'a> for Finder {
+        fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
+            // Visitation is in source order, so the first hit is the earliest.
+            if self.first.is_none() {
+                self.first = Some(it.span.start as usize);
             }
         }
     }
-    out
+
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.errors.is_empty() {
+        return None;
+    }
+    let mut finder = Finder { first: None };
+    finder.visit_program(&parsed.program);
+    finder.first
 }
 
 pub fn validate_imports(
@@ -343,17 +380,48 @@ pub fn validate_imports(
     source: &str,
     policy: TypeScriptImportPolicy,
 ) -> Result<Vec<ModuleImport>> {
+    validate_imports_inner(path, source, policy, true)
+}
+
+/// Like [`validate_imports`], but tuned for describing the module graph of
+/// THIRD-PARTY files (under `node_modules`): the dynamic-import rejection is
+/// skipped there — a package's lazily-imported paths are not executed at link
+/// time, and the runtime enforces the dynamic-import policy at the moment of
+/// use — while every *static* edge still resolves strictly (an unresolvable
+/// static edge fails the engine's eager loader the same way). Project files
+/// keep the full policy.
+pub fn module_graph_imports(
+    path: &Path,
+    source: &str,
+    policy: TypeScriptImportPolicy,
+) -> Result<Vec<ModuleImport>> {
+    let third_party = path.components().any(|c| c.as_os_str() == "node_modules");
+    validate_imports_inner(path, source, policy, !third_party)
+}
+
+fn validate_imports_inner(
+    path: &Path,
+    source: &str,
+    policy: TypeScriptImportPolicy,
+    reject_dynamic_import: bool,
+) -> Result<Vec<ModuleImport>> {
     let mut imports = Vec::new();
     let project_root = path.parent().unwrap_or_else(|| Path::new("."));
 
-    for (line_no, line) in source.lines().enumerate() {
-        if line.contains("import(") || line.contains("import (") {
-            anyhow::bail!(
-                "{}:{}: dynamic import is disabled in durable TypeScript agents",
-                path.display(),
-                line_no + 1
-            );
-        }
+    // Dynamic import is rejected from the AST, not a text scan: `import(` in a
+    // comment, a string literal, or an identifier ending in "import" must not
+    // fail the file. If the source doesn't parse, skip the check here — the
+    // transpile step reports parse errors with full diagnostics.
+    if let Some(span_start) = reject_dynamic_import
+        .then(|| find_dynamic_import(path, source))
+        .flatten()
+    {
+        let line_no = source[..span_start].bytes().filter(|&b| b == b'\n').count() + 1;
+        anyhow::bail!(
+            "{}:{}: dynamic import is disabled in durable TypeScript agents",
+            path.display(),
+            line_no
+        );
     }
 
     // Lazily construct the Node resolver only when needed — it touches the
@@ -361,7 +429,7 @@ pub fn validate_imports(
     // legacy policies.
     let mut node_resolver: Option<Resolver> = None;
 
-    for (line_no, specifier) in import_specifiers(source) {
+    for (line_no, specifier, type_only) in import_specifiers(path, source) {
         if is_chidori_sdk_specifier(&specifier) {
             imports.push(ModuleImport {
                 specifier,
@@ -383,6 +451,13 @@ pub fn validate_imports(
                 specifier,
                 CHIDORI_AGENT_SPECIFIER,
             );
+        }
+
+        // Type-only imports/exports are erased by transpilation: no runtime
+        // edge, nothing to resolve (a types-only package need not exist on
+        // disk). The name checks above still apply.
+        if type_only {
+            continue;
         }
 
         // Vendored packages (react, react-dom/server, …) are served from the
@@ -471,17 +546,81 @@ pub fn validate_imports(
     Ok(imports)
 }
 
-fn import_specifiers(source: &str) -> Vec<(usize, String)> {
+/// One collected specifier: (line, specifier, type_only). Type-only imports
+/// are erased by transpilation — they get the name checks (legacy-SDK
+/// migration, policy) but never resolve to a module-graph edge.
+type CollectedSpecifier = (usize, String, bool);
+
+fn import_specifiers(path: &Path, source: &str) -> Vec<CollectedSpecifier> {
+    // AST first: real dist files are minified (`import"node:module";var …`),
+    // which no line scan can see. The text scan below stays as the fallback
+    // for sources oxc cannot parse — the transpile step reports those with
+    // full diagnostics anyway.
+    ast_import_specifiers(path, source).unwrap_or_else(|| text_import_specifiers(source))
+}
+
+/// Every static module-graph edge, from the AST: `import … from`, side-effect
+/// `import "x"`, `export * from`, `export {a} from`, and `export * as ns
+/// from`.
+fn ast_import_specifiers(path: &Path, source: &str) -> Option<Vec<CollectedSpecifier>> {
+    use oxc::ast::ast::Statement;
+
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.errors.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut push = |start: usize, specifier: &str, type_only: bool| {
+        let line_no = source[..start].bytes().filter(|&b| b == b'\n').count() + 1;
+        out.push((line_no, specifier.to_string(), type_only));
+    };
+    for stmt in &parsed.program.body {
+        match stmt {
+            Statement::ImportDeclaration(d) => {
+                push(
+                    d.span.start as usize,
+                    d.source.value.as_str(),
+                    d.import_kind.is_type(),
+                );
+            }
+            Statement::ExportAllDeclaration(d) => {
+                push(
+                    d.span.start as usize,
+                    d.source.value.as_str(),
+                    d.export_kind.is_type(),
+                );
+            }
+            Statement::ExportNamedDeclaration(d) => {
+                if let Some(src) = &d.source {
+                    push(
+                        d.span.start as usize,
+                        src.value.as_str(),
+                        d.export_kind.is_type(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+fn text_import_specifiers(source: &str) -> Vec<CollectedSpecifier> {
     let mut out = Vec::new();
     for (line_no, line) in source.lines().enumerate() {
         let trimmed = line.trim();
-        if !trimmed.starts_with("import ") {
-            continue;
-        }
-        if let Some(specifier) =
-            specifier_after_from(trimmed).or_else(|| side_effect_import(trimmed))
-        {
-            out.push((line_no + 1, specifier));
+        if trimmed.starts_with("import ") {
+            if let Some(specifier) =
+                specifier_after_from(trimmed).or_else(|| side_effect_import(trimmed))
+            {
+                out.push((line_no + 1, specifier, false));
+            }
+        } else if trimmed.starts_with("export ") {
+            if let Some(specifier) = specifier_after_from(trimmed) {
+                out.push((line_no + 1, specifier, false));
+            }
         }
     }
     out
@@ -613,6 +752,51 @@ fn normalize_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::runtime::snapshot::TypeScriptImportPolicy;
+
+    #[test]
+    fn dynamic_import_expression_is_rejected_with_its_line() {
+        let source = "const x = 1;\nconst mod = await import(\"./other.ts\");\n";
+        let err = validate_imports(
+            Path::new("/tmp/project/agent.ts"),
+            source,
+            TypeScriptImportPolicy::Relative,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dynamic import is disabled"), "{msg}");
+        assert!(msg.contains("agent.ts:2"), "line should be 2: {msg}");
+    }
+
+    #[test]
+    fn import_in_comment_string_or_identifier_is_not_dynamic_import() {
+        let source = r#"
+            // A comment mentioning import( must not fail the file.
+            const s = "also fine in a string: import(x)";
+            function reimport(v: string) { return v; }
+            const t = reimport(s);
+            export async function agent() { return { t }; }
+        "#;
+        let imports = validate_imports(
+            Path::new("/tmp/project/agent.ts"),
+            source,
+            TypeScriptImportPolicy::Relative,
+        )
+        .unwrap();
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn unparseable_source_defers_to_transpile_for_diagnostics() {
+        // A parse error must not be masked by (or misreported as) a dynamic-
+        // import rejection — transpile owns parse diagnostics.
+        let source = "const value = { a: 1, b: 2 ;\n";
+        assert!(validate_imports(
+            Path::new("/tmp/project/agent.ts"),
+            source,
+            TypeScriptImportPolicy::Relative,
+        )
+        .is_ok());
+    }
 
     #[test]
     fn transpile_strips_basic_type_syntax() {
@@ -1137,6 +1321,60 @@ mod tests {
     /// Timing probe (not a CI assertion — run with `--ignored --nocapture`):
     /// prints the cold vs warm cost of `transpile_module` on a synthetic
     /// agent-sized source, i.e. the per-execution cost the cache removes.
+    #[test]
+    fn remap_recovers_original_positions_across_type_stripping() {
+        // The interface block and the type-only import vanish in the
+        // transpiled output, so `priced` sits on a different line there; the
+        // codegen source map takes its position back to the original line 6.
+        let source = "import type { ToolDefinition } from \"chidori:agent\";\n\
+                      interface Order {\n\
+                      \x20 total: number;\n\
+                      }\n\n\
+                      export function priced(o: Order): number {\n\
+                      \x20 return o.total;\n\
+                      }\n";
+        let path = Path::new("remap-test.ts");
+        let (js, _) = transpile_source_with_map(path, source).unwrap();
+        let (line0, text) = js
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("function priced"))
+            .expect("transpiled output keeps the function");
+        assert_ne!(line0 + 1, 6, "the stripped types must shift the line");
+        let col0 = text.find("priced").unwrap();
+        let pos = remap_to_original(path, source, line0 as u32 + 1, col0 as u32 + 1)
+            .expect("position remaps");
+        assert_eq!(pos.line, 6, "definition maps back to the original line");
+        assert!(
+            source[pos.offset..].starts_with("priced")
+                || source[pos.offset..].starts_with("function priced")
+                || source[pos.offset..].starts_with("export function priced"),
+            "offset lands on the definition: {:?}",
+            &source[pos.offset..pos.offset + 20]
+        );
+    }
+
+    #[test]
+    fn stripped_sdk_import_lines_are_blanked_not_removed() {
+        // Blanking keeps every other line's number stable, which is what
+        // keeps the source map (and error-frame remapping) valid. The import
+        // must actually be used — oxc elides unused imports before the strip
+        // ever sees them.
+        let source = "import { chidori, run } from \"chidori:agent\";\n\
+                      export function f(): number {\n\
+                      \x20 return 1;\n\
+                      }\n\
+                      run(async () => f());\n";
+        let js = transpile_source(Path::new("blank-test.ts"), source).unwrap();
+        assert!(!js.contains("chidori:agent"), "sdk import stripped: {js}");
+        assert!(js.contains("run("), "the agent body survives: {js}");
+        assert_eq!(
+            js.lines().next(),
+            Some(""),
+            "the import line is blanked in place, not removed: {js}"
+        );
+    }
+
     #[test]
     #[ignore]
     fn transpile_cache_timing_probe() {

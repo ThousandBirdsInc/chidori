@@ -1,8 +1,10 @@
 //! Session and memory persistence.
 //!
 //! Provides two backends:
-//!   * JSON files (default; same layout the framework has used since v0)
-//!   * SQLite (enabled via CHIDORI_DB_PATH)
+//!   * SQLite (default: `.chidori/sessions.sqlite3` next to the agent's
+//!     `.chidori/runs/`; override the path with CHIDORI_DB_PATH)
+//!   * in-memory (opt-in via CHIDORI_DB_PATH=:memory:, for dev loops that
+//!     should leave no state behind)
 //!
 //! The server holds a `SessionStore` trait object so it can switch backends
 //! without touching the HTTP handlers. Sessions are serialized as a JSON blob
@@ -43,6 +45,11 @@ pub struct StoredSession {
     pub error: Option<String>,
     pub pending_seq: Option<u64>,
     pub pending_prompt: Option<String>,
+    /// The artifact under review for an `input()` pause (`opts.details`) —
+    /// surfaced alongside `pending_prompt` so an approval UI can show what it
+    /// is approving. Defaulted for sessions stored before the field existed.
+    #[serde(default)]
+    pub pending_details: Option<String>,
     /// Set when status == Paused on a `chidori.signal(name)` listen point.
     /// Carries the listen-point name so the view advertises which signal the
     /// run is awaiting and the delivery endpoint can match `body.name` against
@@ -51,7 +58,7 @@ pub struct StoredSession {
     #[serde(default)]
     pub pending_signal_name: Option<String>,
     /// The full awaited name set for a signal pause: `[name]` for
-    /// `chidori.signal(name)`, the listen set for `chidori.signalAny(names)`.
+    /// `chidori.signal(name)`, the listen set for the fan-in `chidori.signal(names[])`.
     /// The delivery endpoint matches `body.name` against ANY of these. Empty
     /// when the session is not paused on a signal (sessions persisted before
     /// `signalAny` deserialize as empty; fall back to `pending_signal_name`).
@@ -89,8 +96,8 @@ pub trait SessionStore: Send + Sync {
     fn delete(&self, id: &str) -> Result<()>;
 }
 
-/// In-memory store. Default when no persistence is configured; keeps the
-/// pre-v1 behavior for dev loops.
+/// In-memory store. Opt-in via `CHIDORI_DB_PATH=:memory:`, for dev loops that
+/// should leave no state behind.
 pub struct MemoryStore {
     inner: Mutex<std::collections::HashMap<String, StoredSession>>,
 }
@@ -145,6 +152,12 @@ impl SqliteStore {
         }
         let conn = rusqlite::Connection::open(&path)
             .with_context(|| format!("opening sqlite at {}", path.display()))?;
+        // WAL + NORMAL, matching the run store (`runtime/store.rs`): every
+        // session state transition rewrites the session row, and the default
+        // rollback journal pays a full fsync per put while blocking readers.
+        // In WAL a put is one log append and readers never block on the writer.
+        conn.pragma_update(None, "journal_mode", "WAL").ok();
+        conn.pragma_update(None, "synchronous", "NORMAL").ok();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                  id TEXT PRIMARY KEY,
@@ -219,24 +232,31 @@ impl SessionStore for SqliteStore {
     }
 }
 
-/// Build the SessionStore configured by env. CHIDORI_DB_PATH picks SQLite;
-/// otherwise an in-memory store is returned.
-pub fn build_session_store() -> std::sync::Arc<dyn SessionStore> {
-    if let Ok(path) = std::env::var("CHIDORI_DB_PATH") {
-        match SqliteStore::open(PathBuf::from(&path)) {
-            Ok(store) => {
-                tracing::info!("session store: sqlite at {}", path);
-                return std::sync::Arc::new(store);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "sqlite session store failed ({}), falling back to memory",
-                    e
-                );
-            }
+/// Build the SessionStore configured by env. Durable by default: sessions go
+/// to SQLite at `CHIDORI_DB_PATH`, or `<base_dir>/.chidori/sessions.sqlite3`
+/// when unset. `CHIDORI_DB_PATH=:memory:` (or `memory`) opts into the
+/// non-durable in-memory store. A SQLite store that fails to open is a hard
+/// startup error — a durability framework must not silently downgrade to a
+/// store that loses every session on restart.
+pub fn build_session_store(base_dir: &std::path::Path) -> Result<std::sync::Arc<dyn SessionStore>> {
+    let path = match std::env::var("CHIDORI_DB_PATH") {
+        Ok(v) if matches!(v.trim(), ":memory:" | "memory") => {
+            tracing::info!("session store: in-memory (CHIDORI_DB_PATH=:memory:)");
+            return Ok(std::sync::Arc::new(MemoryStore::new()));
         }
-    }
-    std::sync::Arc::new(MemoryStore::new())
+        Ok(v) => PathBuf::from(v),
+        Err(_) => base_dir.join(".chidori").join("sessions.sqlite3"),
+    };
+    let store = SqliteStore::open(path.clone()).with_context(|| {
+        format!(
+            "opening the session store at {} — fix the path/permissions, point CHIDORI_DB_PATH \
+             somewhere writable, or set CHIDORI_DB_PATH=:memory: to explicitly opt out of \
+             durable sessions",
+            path.display()
+        )
+    })?;
+    tracing::info!("session store: sqlite at {}", path.display());
+    Ok(std::sync::Arc::new(store))
 }
 
 #[cfg(test)]
@@ -262,5 +282,57 @@ mod tests {
         let session: StoredSession = serde_json::from_value(raw).unwrap();
         assert_eq!(session.status, SessionStatus::Completed);
         assert_eq!(session.run_id, None);
+    }
+
+    fn sample_session(id: &str) -> StoredSession {
+        StoredSession {
+            id: id.to_string(),
+            run_id: None,
+            status: SessionStatus::Completed,
+            pending_details: None,
+            input: serde_json::json!({}),
+            output: Some(serde_json::json!({"ok": true})),
+            call_log: Vec::new(),
+            error: None,
+            pending_seq: None,
+            pending_prompt: None,
+            pending_signal_name: None,
+            pending_signal_names: Vec::new(),
+            pending_signal_deadline: None,
+            pending_approval: None,
+            approvals: Vec::new(),
+            policy_profile: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn sqlite_store_persists_across_reopen() {
+        // The durable default must actually be durable: a session written
+        // through one handle is visible through a fresh one on the same path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".chidori").join("sessions.sqlite3");
+
+        let store = SqliteStore::open(path.clone()).unwrap();
+        store.put(&sample_session("s-1")).unwrap();
+        drop(store);
+
+        let reopened = SqliteStore::open(path).unwrap();
+        let got = reopened
+            .get("s-1")
+            .unwrap()
+            .expect("session survives reopen");
+        assert_eq!(got.status, SessionStatus::Completed);
+    }
+
+    #[test]
+    fn sqlite_store_open_fails_loudly_on_unusable_path() {
+        // The old behavior silently fell back to the in-memory store when
+        // SQLite could not open. Failure must now surface to the caller.
+        let dir = tempfile::tempdir().unwrap();
+        let clash = dir.path().join("not-a-directory");
+        std::fs::write(&clash, b"file, not dir").unwrap();
+        let err = SqliteStore::open(clash.join("sessions.sqlite3"));
+        assert!(err.is_err(), "opening under a file path must error");
     }
 }

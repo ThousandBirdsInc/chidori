@@ -5,8 +5,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/ThousandBirdsInc/chidori/main/scripts/install.sh | sh
 #
 # Environment overrides:
-#   CHIDORI_VERSION       tag to install (e.g. v3.3.0); default: latest release
-#   CHIDORI_INSTALL_DIR   install directory; default: $HOME/.chidori/bin
+#   CHIDORI_VERSION        tag to install (e.g. v3.3.0); default: latest release
+#   CHIDORI_INSTALL_DIR    install directory; default: $HOME/.chidori/bin
+#   CHIDORI_SKIP_CHECKSUM  set to 1 to skip the (otherwise mandatory) sha256
+#                          verification of the downloaded tarball
 #
 # Prebuilt binaries cover macOS (arm64/x86_64) and Linux (x86_64/arm64). On any
 # other platform — or if you'd rather build from source — use `cargo install
@@ -85,19 +87,34 @@ fetch "$url" "$tmp/$asset" ||
 	err "download failed: $url
 No prebuilt binary for ${target} at ${version}. Build from source instead: cargo install chidori"
 
-# Verify the checksum when the .sha256 sidecar is published alongside the asset.
-if fetch "${url}.sha256" "$tmp/${asset}.sha256" 2>/dev/null; then
-	expected="$(cut -d' ' -f1 <"$tmp/${asset}.sha256")"
-	if command -v shasum >/dev/null 2>&1; then
-		actual="$(shasum -a 256 "$tmp/$asset" | cut -d' ' -f1)"
-	elif command -v sha256sum >/dev/null 2>&1; then
+# Verify the release checksum. Verification is mandatory: a missing sidecar,
+# a malformed sidecar, or a machine with no SHA-256 tool aborts the install
+# instead of silently skipping the check. CHIDORI_SKIP_CHECKSUM=1 is the
+# explicit escape hatch (e.g. for pre-sidecar releases pinned via
+# CHIDORI_VERSION).
+if [ "${CHIDORI_SKIP_CHECKSUM:-}" = "1" ]; then
+	printf 'WARNING: skipping checksum verification (CHIDORI_SKIP_CHECKSUM=1)\n' >&2
+else
+	fetch "${url}.sha256" "$tmp/${asset}.sha256" 2>/dev/null ||
+		err "could not download the checksum file ${url}.sha256
+Refusing to install an unverified binary. If this release predates checksum
+sidecars, re-run with CHIDORI_SKIP_CHECKSUM=1 to skip verification explicitly."
+	expected="$(cut -d' ' -f1 <"$tmp/${asset}.sha256" | tr -d '[:space:]')"
+	case "$expected" in
+	*[!0-9a-fA-F]* | "") err "malformed checksum file for ${asset} (got '${expected}')" ;;
+	esac
+	[ "${#expected}" -eq 64 ] || err "malformed checksum file for ${asset} (expected 64 hex chars, got ${#expected})"
+	if command -v sha256sum >/dev/null 2>&1; then
 		actual="$(sha256sum "$tmp/$asset" | cut -d' ' -f1)"
+	elif command -v shasum >/dev/null 2>&1; then
+		actual="$(shasum -a 256 "$tmp/$asset" | cut -d' ' -f1)"
 	else
-		actual=""
+		err "checksum verification requires sha256sum or shasum; install one, or set CHIDORI_SKIP_CHECKSUM=1 to skip verification explicitly"
 	fi
-	if [ -n "$actual" ] && [ "$expected" != "$actual" ]; then
+	if [ "$expected" != "$actual" ]; then
 		err "checksum mismatch for ${asset} (expected ${expected}, got ${actual})"
 	fi
+	printf 'Checksum verified (sha256: %s)\n' "$actual"
 fi
 
 tar -C "$tmp" -xzf "$tmp/$asset"

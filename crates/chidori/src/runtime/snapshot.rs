@@ -16,6 +16,13 @@ pub const SNAPSHOT_MANIFEST_FILE: &str = "runtime.snapshot.json";
 pub const SNAPSHOT_BLOB_FILE: &str = "runtime.snapshot";
 pub const PENDING_HOST_OPERATION_FILE: &str = "pending.json";
 pub const HOST_PROMISE_TABLE_FILE: &str = "host_promises.json";
+/// Per-operation host-promise blobs (`host_promises/<id>.json`), one written
+/// on every state change (begin/resolve/reject). This is the O(1) hot-path
+/// alternative to rewriting the whole `host_promises.json` table per host
+/// call (which cost O(history) per call, O(history²) per run). Compaction
+/// points fold the blobs into the table file and delete them; readers union
+/// both via [`load_host_promise_records`].
+pub const HOST_PROMISE_EVENTS_PREFIX: &str = "host_promises/";
 /// Durable per-run signal mailbox. Lives in a `signals/` subdirectory of the
 /// run directory (unlike the flat `pending.json`/`host_promises.json`), so
 /// writers must create the parent dir before writing. Holds the ordered
@@ -432,16 +439,18 @@ impl HostPromiseTable {
             })
     }
 
+    /// The completed record at (seq, kind), if any. Args are NOT matched here:
+    /// the caller compares them via [`completed_args_match`] so a mismatch can
+    /// be surfaced as a replay divergence instead of silently discarding the
+    /// recorded completion (and re-executing the side effect live).
     pub fn completed_operation(
         &self,
         seq: u64,
         kind: PendingHostOperationKind,
-        args: &Value,
     ) -> Option<HostPromiseRecord> {
         self.records.values().find_map(|record| {
             if record.operation.seq == seq
                 && record.operation.kind == kind
-                && completed_args_match(&record.operation.args, args)
                 && !matches!(record.state, HostPromiseState::Pending)
             {
                 Some(record.clone())
@@ -456,23 +465,75 @@ impl HostPromiseTable {
     }
 }
 
+/// Blob key for one operation's durable host-promise state.
+pub fn host_promise_blob_key(id: HostOperationId) -> String {
+    format!("{HOST_PROMISE_EVENTS_PREFIX}{}.json", id.0)
+}
+
+/// Load the durable host-promise table: the compacted `host_promises.json`
+/// base unioned with any per-operation blobs written since the last
+/// compaction. A per-op blob wins over the base entry for its id — it is
+/// strictly newer (compaction deletes the blobs it folds in, and a blob that
+/// survives a crashed compaction carries the same state the table already
+/// folded). Returns an empty vec when the run has no table at all.
+pub fn load_host_promise_records(
+    store: &dyn crate::runtime::store::RunStore,
+) -> Result<Vec<HostPromiseRecord>> {
+    let mut records: Vec<HostPromiseRecord> = match store.get_blob(HOST_PROMISE_TABLE_FILE)? {
+        Some(bytes) => serde_json::from_slice(&bytes).context("parsing host promise table")?,
+        None => Vec::new(),
+    };
+    let mut tail: Vec<HostPromiseRecord> = Vec::new();
+    for key in store.list_blobs()? {
+        if !key.starts_with(HOST_PROMISE_EVENTS_PREFIX) {
+            continue;
+        }
+        let Some(bytes) = store.get_blob(&key)? else {
+            continue;
+        };
+        match serde_json::from_slice::<HostPromiseRecord>(&bytes) {
+            Ok(record) => tail.push(record),
+            // A crash can truncate a blob mid-write; the compacted base (or
+            // the pending re-execution path) covers that operation.
+            Err(_) => continue,
+        }
+    }
+    tail.sort_by_key(|record| record.operation.id.0);
+    for record in tail {
+        match records
+            .iter_mut()
+            .find(|existing| existing.operation.id == record.operation.id)
+        {
+            Some(existing) => *existing = record,
+            None => records.push(record),
+        }
+    }
+    Ok(records)
+}
+
 /// Args comparison for completed-operation replay, ignoring derived request
 /// metadata: `request_digest` describes the assembled prompt (it is recomputed
 /// from the same inputs on resume) rather than identifying the operation, so a
 /// digest-scheme change between record and resume must not force a completed
 /// side effect to re-execute.
-fn completed_args_match(recorded: &Value, rebuilt: &Value) -> bool {
+pub(crate) fn completed_args_match(recorded: &Value, rebuilt: &Value) -> bool {
     if recorded == rebuilt {
         return true;
     }
-    let strip = |value: &Value| {
-        let mut value = value.clone();
-        if let Some(map) = value.as_object_mut() {
-            map.remove("request_digest");
-        }
-        value
-    };
-    strip(recorded) == strip(rebuilt)
+    // `request_digest` is derived metadata, never compared. Beyond that the
+    // comparison is key-tolerant at the top level: a key present on only one
+    // side is metadata evolution (e.g. newer runtimes journal `max_tokens` /
+    // `temperature`, older checkpoints don't carry them) and must not fail
+    // replay of existing runs. A key present on BOTH sides must match
+    // exactly — so an edit that changes a journaled argument still fails
+    // loudly as a divergence.
+    match (recorded, rebuilt) {
+        (Value::Object(a), Value::Object(b)) => a
+            .iter()
+            .filter(|(k, _)| k.as_str() != "request_digest")
+            .all(|(k, av)| b.get(k).map(|bv| av == bv).unwrap_or(true)),
+        _ => false,
+    }
 }
 
 /// One signal sitting in the durable per-run mailbox (`signals/inbox.json`),
@@ -706,21 +767,17 @@ pub struct SnapshotBranchMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SnapshotBlobKind {
     /// Current scaffold: a serialized set of TypeScript context roots after
     /// initial module evaluation, not a suspended VM continuation.
+    #[default]
     InitialTypeScriptStateScaffold,
     /// Legacy blob kind for a live VM-image snapshot (async continuations, job
     /// queues, module records, and heap roots). VM-image snapshots are descoped
     /// — durability is the deterministic-replay journal — but the variant is
     /// retained for manifest compatibility (serialized as `live_quick_js_vm`).
     LiveQuickJsVm,
-}
-
-impl Default for SnapshotBlobKind {
-    fn default() -> Self {
-        Self::InitialTypeScriptStateScaffold
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -748,6 +805,18 @@ pub struct SnapshotManifest {
     /// context on resume so reads/writes survive suspend identically.
     #[serde(default)]
     pub vfs: crate::runtime::vfs::Vfs,
+    /// The run's resolved default model (`--model` / `CHIDORI_MODEL` / the
+    /// built-in default at run time), so `resume` and the branch commands can
+    /// re-run under the same model without the operator re-deriving flags.
+    /// `None` on manifests written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// The `CHIDORI_PRICING` table that was live when the run executed, so
+    /// `trace`/`stats` can price the run in any shell without the operator
+    /// re-exporting the env var. `None` when no table was set (or on
+    /// manifests written before this field existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<String>,
     pub call_log_len: usize,
     pub snapshot_file: String,
     pub created_at: DateTime<Utc>,
@@ -776,10 +845,22 @@ impl SnapshotManifest {
             branch: None,
             capabilities: CapabilityLedger::new(),
             vfs: crate::runtime::vfs::Vfs::new(),
+            default_model: None,
+            pricing: None,
             call_log_len,
             snapshot_file: SNAPSHOT_BLOB_FILE.to_string(),
             created_at: Utc::now(),
         }
+    }
+
+    pub fn with_default_model(mut self, model: Option<String>) -> Self {
+        self.default_model = model;
+        self
+    }
+
+    pub fn with_pricing(mut self, pricing: Option<String>) -> Self {
+        self.pricing = pricing;
+        self
     }
 
     pub fn with_host_promises(mut self, host_promises: Vec<HostPromiseRecord>) -> Self {
@@ -908,6 +989,97 @@ impl SnapshotManifest {
     }
 }
 
+/// Verify the agent code on disk against the snapshot manifest recorded for
+/// `run_id` before a resume replays its journal. Replay is positional — a
+/// changed source file could silently pair cached results with different code
+/// — so every resume surface (the server's resume/approve routes AND the
+/// `chidori resume` CLI) must call this first. Runs persisted before manifests
+/// existed (no readable manifest) are tolerated with a warning; every other
+/// mismatch is an error the caller should surface.
+///
+/// `allow_source_change` is the edit-and-resume opt-in (`--allow-source-change`
+/// on the CLI, `"allow_source_change": true` on the server routes): source and
+/// module fingerprint mismatches downgrade to a warning and the resume
+/// proceeds, relying on the replay engine's own edit-conflict policy — an edit
+/// that touches already-journaled calls is a fail-loud divergence error, while
+/// an edit past the replay frontier resumes cleanly (see
+/// `chidori_js::replay`). ABI and policy mismatches stay fatal either way:
+/// those are environment drift, not a deliberate edit.
+pub fn validate_manifest_for_resume(
+    run_base: &Path,
+    run_id: Option<&str>,
+    agent_path: &Path,
+    allow_source_change: bool,
+) -> Result<()> {
+    let Some(run_id) = run_id else {
+        return Ok(());
+    };
+    let store = SnapshotStore::new(run_base.join(run_id));
+    let manifest = match store.load_manifest() {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            tracing::warn!(
+                "resume: no readable snapshot manifest for run {run_id} ({err}); \
+                 skipping source verification"
+            );
+            return Ok(());
+        }
+    };
+    let entry_source = std::fs::read_to_string(agent_path).map_err(|err| {
+        anyhow::anyhow!("reading resume source {}: {}", agent_path.display(), err)
+    })?;
+    let current_entry = SourceFingerprint::from_source(agent_path, &entry_source);
+    let expected_abi = SnapshotAbi::current("chidori-quickjs");
+    let expected_policy = RuntimePolicy::from_env_for_durable_run(run_id)?;
+    // One module walk yields both manifest views (fingerprints + graph), so
+    // each imported module is read from disk once per resume instead of twice
+    // (once for its fingerprint, again inside the graph walk). Manifests
+    // written before the graph existed fall back to fingerprinting exactly
+    // the paths they list.
+    let (current_modules, current_module_graph) = if manifest.module_graph.is_empty() {
+        let mut current_modules = Vec::with_capacity(manifest.modules.len());
+        for module in &manifest.modules {
+            let source = std::fs::read_to_string(&module.path).map_err(|err| {
+                anyhow::anyhow!(
+                    "reading resume module source {}: {}",
+                    module.path.display(),
+                    err
+                )
+            })?;
+            current_modules.push(SourceFingerprint::from_source(&module.path, &source));
+        }
+        (current_modules, Vec::new())
+    } else {
+        crate::runtime::typescript::module_graph::snapshot_modules(
+            agent_path,
+            &entry_source,
+            &expected_policy,
+        )?
+    };
+    manifest.abi.ensure_compatible(&expected_abi)?;
+    manifest.policy.ensure_compatible(&expected_policy)?;
+    let sources = manifest
+        .ensure_sources_match(&current_entry)
+        .and_then(|()| manifest.ensure_modules_match(&current_modules))
+        .and_then(|()| manifest.ensure_module_graph_matches(&current_module_graph));
+    match sources {
+        Ok(()) => Ok(()),
+        Err(err) if allow_source_change => {
+            tracing::warn!(
+                "resume: agent source changed since run {run_id} was recorded; proceeding \
+                 because the caller opted in (allow_source_change) — replay will fail loudly \
+                 if the edit diverges from already-journaled calls: {err}"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err.context(
+            "the agent source changed since this run was recorded; edit-and-resume is \
+             opt-in — pass --allow-source-change (CLI) or \"allow_source_change\": true \
+             (server) to replay the recorded calls against the edited code",
+        )),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
     pub manifest: SnapshotManifest,
@@ -917,12 +1089,30 @@ pub struct RuntimeSnapshot {
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
     run_dir: PathBuf,
+    /// Every write goes through this handle: the plain filesystem layout for
+    /// `SnapshotStore::new`, or the filesystem teed with a durable mirror for
+    /// `SnapshotStore::with_store` (`docs/durable-storage.md`). The on-disk
+    /// shape is identical either way.
+    store: std::sync::Arc<dyn crate::runtime::store::RunStore>,
 }
 
 impl SnapshotStore {
     pub fn new(run_dir: impl Into<PathBuf>) -> Self {
+        let run_dir = run_dir.into();
+        let store = std::sync::Arc::new(crate::runtime::store::FsRunStore::new(&run_dir));
+        Self { run_dir, store }
+    }
+
+    /// A snapshot store writing through an explicit [`RunStore`] handle
+    /// (e.g. the run's tee to a durable mirror). `run_dir` stays the
+    /// filesystem address of the artifacts for path-based consumers.
+    pub fn with_store(
+        run_dir: impl Into<PathBuf>,
+        store: std::sync::Arc<dyn crate::runtime::store::RunStore>,
+    ) -> Self {
         Self {
             run_dir: run_dir.into(),
+            store,
         }
     }
 
@@ -936,56 +1126,10 @@ impl SnapshotStore {
         snapshot_blob: &[u8],
         call_log: &[CallRecord],
     ) -> Result<()> {
-        fs::create_dir_all(&self.run_dir)
-            .with_context(|| format!("creating snapshot dir {}", self.run_dir.display()))?;
-
-        fs::write(self.run_dir.join(&manifest.snapshot_file), snapshot_blob).with_context(
-            || {
-                format!(
-                    "writing {}",
-                    self.run_dir.join(&manifest.snapshot_file).display()
-                )
-            },
-        )?;
-
-        fs::write(
-            self.run_dir.join(SNAPSHOT_MANIFEST_FILE),
-            serde_json::to_vec_pretty(manifest)?,
-        )
-        .with_context(|| {
-            format!(
-                "writing {}",
-                self.run_dir.join(SNAPSHOT_MANIFEST_FILE).display()
-            )
-        })?;
-
-        fs::write(
-            self.run_dir.join("checkpoint.json"),
-            serde_json::to_vec_pretty(call_log)?,
-        )
-        .with_context(|| format!("writing {}", self.run_dir.join("checkpoint.json").display()))?;
-
-        match &manifest.pending {
-            Some(pending) => fs::write(
-                self.run_dir.join(PENDING_HOST_OPERATION_FILE),
-                serde_json::to_vec_pretty(pending)?,
-            )
-            .with_context(|| {
-                format!(
-                    "writing {}",
-                    self.run_dir.join(PENDING_HOST_OPERATION_FILE).display()
-                )
-            })?,
-            None => {
-                let pending_path = self.run_dir.join(PENDING_HOST_OPERATION_FILE);
-                if pending_path.exists() {
-                    fs::remove_file(&pending_path)
-                        .with_context(|| format!("removing {}", pending_path.display()))?;
-                }
-            }
-        }
-
-        Ok(())
+        self.store
+            .put_blob(&manifest.snapshot_file, snapshot_blob)
+            .with_context(|| format!("writing snapshot blob {}", manifest.snapshot_file))?;
+        self.save_manifest_only(manifest, call_log)
     }
 
     pub fn save_live_vm_snapshot(
@@ -1005,64 +1149,101 @@ impl SnapshotStore {
         manifest: &SnapshotManifest,
         call_log: &[CallRecord],
     ) -> Result<()> {
-        fs::create_dir_all(&self.run_dir)
-            .with_context(|| format!("creating snapshot dir {}", self.run_dir.display()))?;
+        self.put_manifest(manifest)?;
+        self.write_call_log(call_log)?;
+        self.put_pending(manifest.pending.as_ref())
+    }
 
-        fs::write(
-            self.run_dir.join(SNAPSHOT_MANIFEST_FILE),
-            serde_json::to_vec_pretty(manifest)?,
-        )
-        .with_context(|| {
-            format!(
-                "writing {}",
-                self.run_dir.join(SNAPSHOT_MANIFEST_FILE).display()
+    /// Write just the snapshot blob under the manifest's blob file name.
+    /// The blob is run-invariant (the durable code bundle), so per-safepoint
+    /// persisters write it once per run instead of on every safepoint.
+    pub fn put_snapshot_blob(&self, manifest: &SnapshotManifest, blob: &[u8]) -> Result<()> {
+        self.store
+            .put_blob(&manifest.snapshot_file, blob)
+            .with_context(|| format!("writing snapshot blob {}", manifest.snapshot_file))
+    }
+
+    /// Write just the manifest artifact.
+    pub fn put_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
+        self.store
+            .put_blob(
+                SNAPSHOT_MANIFEST_FILE,
+                &serde_json::to_vec_pretty(manifest)?,
             )
-        })?;
+            .with_context(|| format!("writing {SNAPSHOT_MANIFEST_FILE}"))
+    }
 
-        fs::write(
-            self.run_dir.join("checkpoint.json"),
-            serde_json::to_vec_pretty(call_log)?,
-        )
-        .with_context(|| format!("writing {}", self.run_dir.join("checkpoint.json").display()))?;
+    /// Write the full-log checkpoint artifact (compacting the append-only
+    /// journal to match). O(history) — callers on per-effect paths should
+    /// reach for this only when the in-memory log holds records the O(1)
+    /// journal appends did not cover (see `RuntimeContext::record_call` /
+    /// `try_replay`), or at explicit compaction points (run start, pause,
+    /// settle).
+    pub fn write_call_log(&self, call_log: &[CallRecord]) -> Result<()> {
+        self.store
+            .write_call_log(call_log)
+            .context("writing checkpoint")
+    }
 
-        match &manifest.pending {
-            Some(pending) => fs::write(
-                self.run_dir.join(PENDING_HOST_OPERATION_FILE),
-                serde_json::to_vec_pretty(pending)?,
+    /// Fold the host-promise table into its compacted artifact: write the
+    /// full `host_promises.json` and delete the per-operation blobs it now
+    /// covers. Write-then-delete ordering keeps a crash in between harmless —
+    /// a surviving blob carries the same state the table just folded, and the
+    /// union loader lets it win by id.
+    pub fn compact_host_promises(&self, records: &[HostPromiseRecord]) -> Result<()> {
+        self.store
+            .put_blob(
+                HOST_PROMISE_TABLE_FILE,
+                &serde_json::to_vec_pretty(records)?,
             )
-            .with_context(|| {
-                format!(
-                    "writing {}",
-                    self.run_dir.join(PENDING_HOST_OPERATION_FILE).display()
-                )
-            })?,
-            None => {
-                let pending_path = self.run_dir.join(PENDING_HOST_OPERATION_FILE);
-                if pending_path.exists() {
-                    fs::remove_file(&pending_path)
-                        .with_context(|| format!("removing {}", pending_path.display()))?;
-                }
+            .with_context(|| format!("writing {HOST_PROMISE_TABLE_FILE}"))?;
+        for key in self.store.list_blobs()? {
+            if key.starts_with(HOST_PROMISE_EVENTS_PREFIX) {
+                self.store.delete_blob(&key)?;
             }
         }
-
         Ok(())
+    }
+
+    /// Write (or, when `None`, remove) the pending-host-operation artifact.
+    pub fn put_pending(&self, pending: Option<&PendingHostOperation>) -> Result<()> {
+        match pending {
+            Some(pending) => self
+                .store
+                .put_blob(
+                    PENDING_HOST_OPERATION_FILE,
+                    &serde_json::to_vec_pretty(pending)?,
+                )
+                .with_context(|| format!("writing {PENDING_HOST_OPERATION_FILE}")),
+            None => self
+                .store
+                .delete_blob(PENDING_HOST_OPERATION_FILE)
+                .with_context(|| format!("removing {PENDING_HOST_OPERATION_FILE}")),
+        }
     }
 
     pub fn load(&self) -> Result<RuntimeSnapshot> {
         let manifest = self.load_manifest()?;
-        let blob_path = self.run_dir.join(&manifest.snapshot_file);
-        let blob =
-            fs::read(&blob_path).with_context(|| format!("reading {}", blob_path.display()))?;
+        let blob = self
+            .store
+            .get_blob(&manifest.snapshot_file)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "reading {}: not found",
+                    self.run_dir.join(&manifest.snapshot_file).display()
+                )
+            })?;
         Ok(RuntimeSnapshot { manifest, blob })
     }
 
     pub fn load_manifest(&self) -> Result<SnapshotManifest> {
         let manifest_path = self.run_dir.join(SNAPSHOT_MANIFEST_FILE);
-        serde_json::from_slice(
-            &fs::read(&manifest_path)
-                .with_context(|| format!("reading {}", manifest_path.display()))?,
-        )
-        .with_context(|| format!("parsing {}", manifest_path.display()))
+        let bytes = self
+            .store
+            .get_blob(SNAPSHOT_MANIFEST_FILE)?
+            .ok_or_else(|| anyhow::anyhow!("reading {}: not found", manifest_path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", manifest_path.display()))
     }
 
     pub fn load_for_resume(
@@ -1114,18 +1295,18 @@ impl SnapshotStore {
         manifest: &ParallelBranchManifest,
     ) -> Result<PathBuf> {
         let dir = self.parallel_branch_dir(manifest.parallel_op_id);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("creating branch manifest dir {}", dir.display()))?;
-        fs::write(
-            dir.join(PARALLEL_BRANCH_MANIFEST_FILE),
-            serde_json::to_vec_pretty(manifest)?,
-        )
-        .with_context(|| {
-            format!(
-                "writing {}",
-                dir.join(PARALLEL_BRANCH_MANIFEST_FILE).display()
-            )
-        })?;
+        let key = format!(
+            "{}/{PARALLEL_BRANCH_MANIFEST_FILE}",
+            parallel_branch_prefix(manifest.parallel_op_id)
+        );
+        self.store
+            .put_blob(&key, &serde_json::to_vec_pretty(manifest)?)
+            .with_context(|| {
+                format!(
+                    "writing {}",
+                    dir.join(PARALLEL_BRANCH_MANIFEST_FILE).display()
+                )
+            })?;
         Ok(dir)
     }
 
@@ -1136,10 +1317,15 @@ impl SnapshotStore {
         let path = self
             .parallel_branch_dir(parallel_op_id)
             .join(PARALLEL_BRANCH_MANIFEST_FILE);
-        serde_json::from_slice(
-            &fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
-        )
-        .with_context(|| format!("parsing {}", path.display()))
+        let key = format!(
+            "{}/{PARALLEL_BRANCH_MANIFEST_FILE}",
+            parallel_branch_prefix(parallel_op_id)
+        );
+        let bytes = self
+            .store
+            .get_blob(&key)?
+            .ok_or_else(|| anyhow::anyhow!("reading {}: not found", path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
     }
 
     pub fn branch_store(
@@ -1150,9 +1336,21 @@ impl SnapshotStore {
         let branch = manifest
             .branch(branch_index)
             .ok_or_else(|| anyhow::anyhow!("unknown branch index {}", branch_index))?;
-        Ok(SnapshotStore::new(
+        let prefix = format!(
+            "{}/branch-{:03}",
+            parallel_branch_prefix(manifest.parallel_op_id),
+            branch.branch_index
+        );
+        // A scoped view of the run's store, so branch artifacts flow through
+        // the same handle (and any durable mirror) under their established
+        // relative paths.
+        Ok(SnapshotStore::with_store(
             self.parallel_branch_dir(manifest.parallel_op_id)
                 .join(format!("branch-{:03}", branch.branch_index)),
+            std::sync::Arc::new(crate::runtime::store::ScopedRunStore::new(
+                self.store.clone(),
+                prefix,
+            )),
         ))
     }
 
@@ -1161,6 +1359,11 @@ impl SnapshotStore {
             .join(BRANCHES_DIR)
             .join(format!("op-{:020}", parallel_op_id.0))
     }
+}
+
+/// The run-dir-relative key prefix of a parallel branch op's artifacts.
+fn parallel_branch_prefix(parallel_op_id: HostOperationId) -> String {
+    format!("{BRANCHES_DIR}/op-{:020}", parallel_op_id.0)
 }
 
 pub fn start_live_parallel_branch_runtimes<E: SnapshotCapableJsEngine>(
@@ -1433,4 +1636,134 @@ fn stable_source_hash(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+#[cfg(test)]
+mod completed_args_match_tests {
+    use super::completed_args_match;
+    use serde_json::json;
+
+    #[test]
+    fn identical_args_match() {
+        let args = json!({"text": "hi", "model": "m"});
+        assert!(completed_args_match(&args, &args));
+    }
+
+    #[test]
+    fn request_digest_is_ignored() {
+        assert!(completed_args_match(
+            &json!({"text": "hi", "request_digest": "aaa"}),
+            &json!({"text": "hi", "request_digest": "bbb"}),
+        ));
+    }
+
+    /// Metadata evolution: newer runtimes journal keys (e.g. `max_tokens`)
+    /// that older checkpoints don't carry — those must still replay.
+    #[test]
+    fn key_missing_from_recorded_side_is_tolerated() {
+        assert!(completed_args_match(
+            &json!({"text": "hi"}),
+            &json!({"text": "hi", "max_tokens": 1200, "temperature": 0.7}),
+        ));
+    }
+
+    /// But a key present on BOTH sides must match: editing a journaled
+    /// argument is a loud divergence, not a silent cache hit.
+    #[test]
+    fn differing_shared_key_is_a_divergence() {
+        assert!(!completed_args_match(
+            &json!({"text": "hi", "max_tokens": 1200}),
+            &json!({"text": "hi", "max_tokens": 800}),
+        ));
+        assert!(!completed_args_match(
+            &json!({"text": "hi"}),
+            &json!({"text": "CHANGED"}),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod host_promise_union_tests {
+    use super::*;
+    use crate::runtime::store::{FsRunStore, RunStore as _};
+
+    fn record(id: u64, state: HostPromiseState) -> HostPromiseRecord {
+        HostPromiseRecord {
+            operation: PendingHostOperation::new(
+                HostOperationId(id),
+                id,
+                PendingHostOperationKind::Prompt,
+                serde_json::json!({ "n": id }),
+            ),
+            state,
+        }
+    }
+
+    /// Pins the per-op blob ∪ compacted table protocol: a per-op blob wins
+    /// over the table entry for its id (it is strictly newer), new ids from
+    /// blobs are unioned in, and compaction folds everything into the table
+    /// file and retires the blobs.
+    #[test]
+    fn per_op_blobs_union_with_table_and_compact_away() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-host-promise-union-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = FsRunStore::new(&dir);
+
+        // Compacted base: op 1 still Pending.
+        store
+            .put_blob(
+                HOST_PROMISE_TABLE_FILE,
+                &serde_json::to_vec_pretty(&vec![record(1, HostPromiseState::Pending)]).unwrap(),
+            )
+            .unwrap();
+        // Per-op blobs written since: op 1 resolved, op 2 begun.
+        let resolved = record(
+            1,
+            HostPromiseState::Resolved {
+                value: serde_json::json!("done"),
+                completed_at: chrono::Utc::now(),
+            },
+        );
+        store
+            .put_blob(
+                &host_promise_blob_key(HostOperationId(1)),
+                &serde_json::to_vec_pretty(&resolved).unwrap(),
+            )
+            .unwrap();
+        store
+            .put_blob(
+                &host_promise_blob_key(HostOperationId(2)),
+                &serde_json::to_vec_pretty(&record(2, HostPromiseState::Pending)).unwrap(),
+            )
+            .unwrap();
+
+        let records = load_host_promise_records(&store).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            records[0].state,
+            HostPromiseState::Resolved { .. }
+        ));
+        assert!(matches!(records[1].state, HostPromiseState::Pending));
+
+        // Compaction folds the union into the table file and retires the blobs.
+        SnapshotStore::new(&dir)
+            .compact_host_promises(&records)
+            .unwrap();
+        assert!(!store
+            .list_blobs()
+            .unwrap()
+            .iter()
+            .any(|key| key.starts_with(HOST_PROMISE_EVENTS_PREFIX)));
+        let reloaded = load_host_promise_records(&store).unwrap();
+        assert_eq!(reloaded.len(), 2);
+        assert!(matches!(
+            reloaded[0].state,
+            HostPromiseState::Resolved { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -708,7 +708,7 @@ fn install_math(vm: &mut Vm) {
 
     // Math[Symbol.toStringTag] = "Math" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    math.borrow_mut().props.insert(
+    math.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -730,8 +730,7 @@ fn install_math(vm: &mut Vm) {
         .map(|k| {
             match math
                 .borrow()
-                .props
-                .get(&PropertyKey::str(k.name()))
+                .own_get(&PropertyKey::str(k.name()))
                 .and_then(|p| p.value().cloned())
             {
                 Some(Value::Object(o)) => o,
@@ -799,7 +798,7 @@ pub(crate) fn math_round(n: f64) -> f64 {
     if n > 0.0 && n < 0.5 {
         return 0.0;
     }
-    if n < 0.0 && n >= -0.5 {
+    if (-0.5..0.0).contains(&n) {
         // -0 result, preserving sign.
         return -0.0;
     }
@@ -895,6 +894,8 @@ fn install_json(vm: &mut Vm) {
             pos: 0,
             src: s.as_str(),
             keys: Default::default(),
+            shape_paths: Vec::new(),
+            depth: 0,
         };
         p.skip_ws();
         let v = p.parse_value(vm)?;
@@ -908,8 +909,7 @@ fn install_json(vm: &mut Vm) {
             let holder = vm.new_object();
             holder
                 .borrow_mut()
-                .props
-                .insert(PropertyKey::str(""), Property::data(v));
+                .own_insert(PropertyKey::str(""), Property::data(v));
             return json_revive(vm, &holder, "", &reviver);
         }
         Ok(v)
@@ -932,8 +932,7 @@ fn install_json(vm: &mut Vm) {
         let holder = vm.new_object();
         holder
             .borrow_mut()
-            .props
-            .insert(PropertyKey::str(""), Property::data(value));
+            .own_insert(PropertyKey::str(""), Property::data(value));
         let mut out = String::with_capacity(128);
         let root_key = JsString::from("");
         if json_stringify(
@@ -951,7 +950,7 @@ fn install_json(vm: &mut Vm) {
     });
     // JSON[Symbol.toStringTag] = "JSON" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    json.borrow_mut().props.insert(
+    json.borrow_mut().own_insert(
         PropertyKey::Sym(tag),
         Property {
             kind: PropertyKind::Data {
@@ -1133,6 +1132,16 @@ struct JsonParser<'a> {
         PropertyKey,
         std::hash::BuildHasherDefault<crate::fxhash::FxHasher>,
     >,
+    /// Record-shape cursor (docs/js-object-shapes-design.md §3.3): per
+    /// object-nesting depth, the shape chain (first key → leaf) of the last
+    /// COMPLETED object at that depth. The dominant JSON input — an array of
+    /// same-structure records — makes every record after the first advance
+    /// this path with one parent-pointer + key compare per key (interned
+    /// keys hit the `Rc` fast path), skipping the transition-table hash;
+    /// the object is then one slot-vec allocation. Depth-indexed so nested
+    /// records don't clobber their parent's cursor mid-object.
+    shape_paths: Vec<Vec<std::rc::Rc<crate::shape::Shape>>>,
+    depth: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -1152,7 +1161,7 @@ impl<'a> JsonParser<'a> {
         match self.bytes[self.pos] {
             b'{' => self.parse_object(vm),
             b'[' => self.parse_array(vm),
-            b'"' => Ok(Value::str(self.parse_string(vm)?)),
+            b'"' => Ok(Value::String(self.parse_string(vm)?)),
             b't' => self.parse_lit(vm, "true", Value::Bool(true)),
             b'f' => self.parse_lit(vm, "false", Value::Bool(false)),
             b'n' => self.parse_lit(vm, "null", Value::Null),
@@ -1218,7 +1227,7 @@ impl<'a> JsonParser<'a> {
             .map(Value::Number)
             .map_err(|_| vm.throw_syntax("Invalid number in JSON"))
     }
-    fn parse_string(&mut self, vm: &mut Vm) -> Result<String, Value> {
+    fn parse_string(&mut self, vm: &mut Vm) -> Result<JsString, Value> {
         self.pos += 1; // opening quote
                        // Fast path: a string with no escapes and no control characters —
                        // the overwhelmingly common case — is ONE slice copy instead of
@@ -1230,7 +1239,9 @@ impl<'a> JsonParser<'a> {
             match self.bytes[i] {
                 b'"' => {
                     self.pos = i + 1;
-                    return Ok(self.src[start..i].to_string());
+                    // One allocation: straight from the source slice into the
+                    // Rc backing (the old String round-trip copied twice).
+                    return Ok(JsString::new(&self.src[start..i]));
                 }
                 b'\\' | 0x00..=0x1f => break,
                 _ => i += 1,
@@ -1245,7 +1256,7 @@ impl<'a> JsonParser<'a> {
             match c {
                 b'"' => {
                     self.pos += 1;
-                    return Ok(s);
+                    return Ok(JsString::from(s));
                 }
                 b'\\' => {
                     self.pos += 1;
@@ -1352,8 +1363,11 @@ impl<'a> JsonParser<'a> {
         Ok(Value::Object(vm.new_array(elems)))
     }
     /// An object key: the unescaped fast path is interned by source slice
-    /// (see the `keys` field); anything needing escape processing falls back
-    /// to the general string parser. `self.pos` is on the opening quote.
+    /// (see the `keys` field) and, across parses, through the Vm-level
+    /// `json_keys` cache (same-shaped documents parsed repeatedly reuse one
+    /// `Rc<str>` per distinct key — the poll/roundtrip pattern); anything
+    /// needing escape processing falls back to the general string parser.
+    /// `self.pos` is on the opening quote.
     fn parse_key(&mut self, vm: &mut Vm) -> Result<PropertyKey, Value> {
         let start = self.pos + 1;
         let mut i = start;
@@ -1365,7 +1379,18 @@ impl<'a> JsonParser<'a> {
                     if let Some(k) = self.keys.get(s) {
                         return Ok(k.clone());
                     }
-                    let k = PropertyKey::str(s);
+                    let k = if let Some(k) = vm.json_keys.get(s) {
+                        k.clone()
+                    } else {
+                        let k = PropertyKey::str(s);
+                        // Bounded: a pathological stream of distinct keys
+                        // resets the cache rather than growing it.
+                        if vm.json_keys.len() >= 4096 {
+                            vm.json_keys.clear();
+                        }
+                        vm.json_keys.insert(s.into(), k.clone());
+                        k
+                    };
                     self.keys.insert(s, k.clone());
                     return Ok(k);
                 }
@@ -1373,17 +1398,38 @@ impl<'a> JsonParser<'a> {
                 _ => i += 1,
             }
         }
-        Ok(PropertyKey::str(self.parse_string(vm)?))
+        Ok(PropertyKey::Str(self.parse_string(vm)?))
     }
 
     fn parse_object(&mut self, vm: &mut Vm) -> Result<Value, Value> {
         self.pos += 1;
-        let obj = vm.new_object();
         self.skip_ws();
         if self.pos < self.bytes.len() && self.bytes[self.pos] == b'}' {
             self.pos += 1;
-            return Ok(Value::Object(obj));
+            return Ok(Value::Object(vm.new_object()));
         }
+        self.depth += 1;
+        if self.shape_paths.len() < self.depth {
+            self.shape_paths.push(Vec::new());
+        }
+        let r = self.parse_object_members(vm);
+        self.depth -= 1;
+        r
+    }
+
+    /// The member loop of a NON-EMPTY object, accumulated locally: keys and
+    /// values build a (shape, slots) pair directly — the object materializes
+    /// with ONE allocation (the slot vec) at the closing brace. The
+    /// record-shape cursor (`shape_paths`, see the field docs) makes a
+    /// repeat of the previous record's key sequence advance by pointer
+    /// compares alone; a divergent key falls back to the memoized
+    /// transition tree, and duplicate/index-spam keys take the same
+    /// replace/demote edges as `ObjectData::own_insert`.
+    fn parse_object_members(&mut self, vm: &mut Vm) -> Result<Value, Value> {
+        let mut shape = vm.realm.shape_root.clone();
+        let mut slots: Vec<Property> = Vec::with_capacity(8);
+        let mut dict: Option<crate::fxhash::FxIndexMap<PropertyKey, Property>> = None;
+        let mut on_path = true;
         loop {
             self.skip_ws();
             if self.pos >= self.bytes.len() || self.bytes[self.pos] != b'"' {
@@ -1396,7 +1442,40 @@ impl<'a> JsonParser<'a> {
             }
             self.pos += 1;
             let v = self.parse_value(vm)?;
-            obj.borrow_mut().props.insert(key, Property::data(v));
+            let prop = Property::data(v);
+            if let Some(map) = &mut dict {
+                map.insert(key, prop);
+            } else {
+                let cursor_hit = on_path
+                    .then(|| self.shape_paths[self.depth - 1].get(slots.len()))
+                    .flatten()
+                    .filter(|next| next.appends(&shape, &key))
+                    .cloned();
+                if let Some(next) = cursor_hit {
+                    shape = next;
+                    slots.push(prop);
+                } else if let Some(slot) = shape.lookup(&key) {
+                    // Duplicate key: last value wins, first position kept
+                    // (CreateDataProperty on an existing key).
+                    slots[slot as usize] = prop;
+                } else if crate::shape::Shape::can_append(&key, slots.len()) {
+                    on_path = false;
+                    shape = shape.transition(key);
+                    slots.push(prop);
+                } else {
+                    // Integer-key spam: same demotion edge as own_insert.
+                    on_path = false;
+                    let mut map = crate::fxhash::FxIndexMap::with_capacity_and_hasher(
+                        slots.len() + 1,
+                        Default::default(),
+                    );
+                    for (k, p) in shape.keys_in_order().into_iter().zip(slots.drain(..)) {
+                        map.insert(k.clone(), p);
+                    }
+                    map.insert(key, prop);
+                    dict = Some(map);
+                }
+            }
             self.skip_ws();
             if self.pos >= self.bytes.len() {
                 return Err(vm.throw_syntax("Unexpected end of JSON input"));
@@ -1410,6 +1489,21 @@ impl<'a> JsonParser<'a> {
                 _ => return Err(vm.throw_syntax("Expected ',' or '}' in JSON object")),
             }
         }
+        let proto = Some(vm.realm.object_proto.clone());
+        let obj = match dict {
+            Some(map) => {
+                let mut data = ObjectData::new(proto, Internal::Ordinary);
+                data.set_props_map(map);
+                vm.alloc(data)
+            }
+            None => {
+                if !on_path {
+                    // Remember this record's chain for its siblings.
+                    self.shape_paths[self.depth - 1] = shape.path_from_root();
+                }
+                vm.alloc(ObjectData::new_shaped_with(proto, shape, slots))
+            }
+        };
         Ok(Value::Object(obj))
     }
 }
