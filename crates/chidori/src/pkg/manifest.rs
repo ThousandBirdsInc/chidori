@@ -89,8 +89,11 @@ impl Manifest {
             .entry(key.to_string())
             .or_insert_with(|| Value::Object(Map::new()));
         if let Some(map) = section.as_object_mut() {
+            // This build's serde_json (no `preserve_order`) backs objects
+            // with a BTreeMap, so dependency sections stay alphabetized
+            // automatically, matching npm. Top-level key order is imposed
+            // separately in `save`.
             map.insert(name.to_string(), Value::String(range.to_string()));
-            sort_map_in_place(map);
         }
     }
 
@@ -106,18 +109,78 @@ impl Manifest {
     }
 
     pub fn save(&self) -> Result<()> {
-        let mut out = serde_json::to_string_pretty(&self.value).expect("manifest serializes");
+        let obj = self.value.as_object().expect("validated as object");
+        let mut out = serde_json::to_string_pretty(&ConventionallyOrdered(obj))
+            .expect("manifest serializes");
         out.push('\n');
         std::fs::write(&self.path, out).with_context(|| format!("writing {}", self.path.display()))
     }
 }
 
-/// serde_json preserves insertion order by default; rewrite the map sorted so
-/// dependency sections stay alphabetized like npm keeps them.
-fn sort_map_in_place(map: &mut Map<String, Value>) {
-    let mut entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    map.extend(entries);
+/// Top-level `package.json` keys in npm's conventional order. `save` emits
+/// these first, in this order, then any remaining keys alphabetically.
+///
+/// This build's serde_json does *not* enable the `preserve_order` feature
+/// (objects are BTreeMaps, keys always sorted), so a plain
+/// `to_string_pretty` would sink `name` below `dependencies`. Enabling
+/// `preserve_order` globally would change JSON map ordering across the whole
+/// binary — journal/checkpoint serialization included — so instead we impose
+/// a stable conventional order at write time.
+const TOP_LEVEL_KEY_ORDER: &[&str] = &[
+    "name",
+    "version",
+    "private",
+    "description",
+    "keywords",
+    "homepage",
+    "bugs",
+    "repository",
+    "funding",
+    "license",
+    "author",
+    "contributors",
+    "type",
+    "main",
+    "module",
+    "types",
+    "exports",
+    "imports",
+    "bin",
+    "files",
+    "engines",
+    "os",
+    "cpu",
+    "scripts",
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "peerDependenciesMeta",
+    "optionalDependencies",
+    "bundledDependencies",
+    "overrides",
+];
+
+/// Serializes the manifest object with [`TOP_LEVEL_KEY_ORDER`] applied to the
+/// top level only; nested objects (dependency sections included) keep their
+/// natural sorted order, which matches how npm alphabetizes them.
+struct ConventionallyOrdered<'a>(&'a Map<String, Value>);
+
+impl serde::Serialize for ConventionallyOrdered<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for key in TOP_LEVEL_KEY_ORDER {
+            if let Some(value) = self.0.get(*key) {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        for (key, value) in self.0 {
+            if !TOP_LEVEL_KEY_ORDER.contains(&key.as_str()) {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +204,36 @@ mod tests {
         assert_eq!(v["customField"]["keep"], Value::Bool(true));
         let deps: Vec<&String> = v["dependencies"].as_object().unwrap().keys().collect();
         assert_eq!(deps, ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn save_keeps_name_first_in_conventional_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Keys deliberately chosen so a plain alphabetical dump would put
+        // `dependencies` before `name` and `version`.
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"zebraCustom":1,"version":"0.1.0","name":"demo","scripts":{"start":"x"}}"#,
+        )
+        .unwrap();
+        let mut m = Manifest::load_or_default(dir.path()).unwrap();
+        m.set_dependency("alpha", "^2.0.0", false);
+        m.save().unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let pos = |key: &str| {
+            raw.find(&format!("\"{key}\""))
+                .unwrap_or_else(|| panic!("missing key {key}:\n{raw}"))
+        };
+        assert!(pos("name") < pos("version"), "{raw}");
+        assert!(pos("version") < pos("scripts"), "{raw}");
+        assert!(pos("scripts") < pos("dependencies"), "{raw}");
+        // Unknown keys trail the conventional ones.
+        assert!(pos("dependencies") < pos("zebraCustom"), "{raw}");
+        // The reordering is purely cosmetic: same JSON value.
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["dependencies"]["alpha"], "^2.0.0");
+        assert_eq!(v["zebraCustom"], 1);
     }
 
     #[test]

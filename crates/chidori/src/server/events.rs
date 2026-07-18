@@ -30,6 +30,38 @@ use super::{session_view, store_or_500, AppState};
 // Event-driven handler (fallback for non-session routes)
 // ---------------------------------------------------------------------------
 
+/// Paths that are overwhelmingly automatic browser/scanner noise, not
+/// deliberate events: browsers request these on their own (favicon, touch
+/// icons), and crawlers/probes sweep them constantly. Kept deliberately
+/// conservative — only paths a browser or well-behaved bot fetches without
+/// the user asking — because a matching request is answered 404 without
+/// running the agent (each event run executes the full agent and burns
+/// tokens). `CHIDORI_SERVE_ALL_PATHS=1` disables the short-circuit for
+/// agents that genuinely serve these paths.
+pub(super) fn is_probe_noise_path(path: &str) -> bool {
+    path == "/favicon.ico"
+        || path == "/robots.txt"
+        || path.starts_with("/apple-touch-icon")
+        || path.starts_with("/.well-known/")
+}
+
+/// Escape hatch for the noise short-circuit: `CHIDORI_SERVE_ALL_PATHS=1`
+/// (or `true`/`on`) routes every path to the agent, including the ones
+/// [`is_probe_noise_path`] would answer 404.
+fn serve_all_paths_from_env() -> bool {
+    matches!(
+        std::env::var("CHIDORI_SERVE_ALL_PATHS").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
+/// Whether a request path should be answered 404 without invoking the agent.
+/// Split from the env read so both branches are unit-testable without
+/// mutating process-global environment state.
+pub(super) fn noise_short_circuit(path: &str, serve_all_paths: bool) -> bool {
+    !serve_all_paths && is_probe_noise_path(path)
+}
+
 pub(super) async fn handle_event(
     State(state): State<AppState>,
     method: Method,
@@ -38,6 +70,15 @@ pub(super) async fn handle_event(
     query: Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
+    // Short-circuit obvious browser/scanner noise (favicon, robots.txt,
+    // touch icons, /.well-known/*) with an empty 404 before the agent runs:
+    // every event run executes the whole agent end-to-end, so stray probes
+    // would otherwise burn tokens. See docs/running-modes.md §3;
+    // CHIDORI_SERVE_ALL_PATHS=1 restores agent(event) for these paths.
+    if noise_short_circuit(uri.path(), serve_all_paths_from_env()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     let mut header_map = serde_json::Map::new();
     for (key, value) in headers.iter() {
         if let Ok(v) = value.to_str() {

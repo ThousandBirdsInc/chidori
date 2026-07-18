@@ -1,7 +1,8 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use minijinja::{Environment, UndefinedBehavior};
+use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use serde_json::Value;
 
 /// Template engine backed by minijinja.
@@ -30,10 +31,10 @@ impl TemplateEngine {
     pub fn render_string(&self, template: &str, vars: &Value) -> Result<String> {
         let mut env = self.create_env();
         env.add_template("__inline__", template)
-            .context("Failed to parse inline template")?;
+            .map_err(|err| describe_template_error("parse", "inline template", &err))?;
         let tmpl = env.get_template("__inline__").unwrap();
         tmpl.render(vars)
-            .context("Failed to render inline template")
+            .map_err(|err| describe_template_error("render", "inline template", &err))
     }
 
     /// Render a template from a .jinja file with the given variables.
@@ -55,10 +56,10 @@ impl TemplateEngine {
         });
 
         env.add_template("__file__", &source)
-            .with_context(|| format!("Failed to parse template: {path}"))?;
+            .map_err(|err| describe_template_error("parse", &format!("template {path}"), &err))?;
         let tmpl = env.get_template("__file__").unwrap();
         tmpl.render(vars)
-            .with_context(|| format!("Failed to render template: {path}"))
+            .map_err(|err| describe_template_error("render", &format!("template {path}"), &err))
     }
 
     /// Determine if a template arg is a file path or an inline string, and render it.
@@ -76,8 +77,63 @@ impl TemplateEngine {
         env.set_undefined_behavior(UndefinedBehavior::SemiStrict);
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
+        // Embed the template source in errors so failure messages can point at
+        // the offending expression and its line/column (on by default only in
+        // debug builds; force it on so release builds report the same detail).
+        env.set_debug(true);
         env
     }
+}
+
+/// Turn a minijinja error into a single self-contained anyhow error whose
+/// primary message carries the located detail — error kind, offending
+/// expression (e.g. the undefined variable's name), and line/column. Without
+/// this the detail lives only in the anyhow source chain, which the runtime
+/// drops when it stringifies errors for the user-facing frame.
+fn describe_template_error(action: &str, what: &str, err: &minijinja::Error) -> anyhow::Error {
+    let mut msg = format!("Failed to {action} {what}: {}", err.kind());
+    if let Some(detail) = err.detail() {
+        let _ = write!(msg, ": {detail}");
+    }
+    // The error's span points at the failing expression in the template
+    // source; for an undefined-variable error that is the variable itself.
+    let located = err
+        .template_source()
+        .zip(err.range())
+        .and_then(|(source, range)| Some((source, source.get(range.clone())?, range.start)));
+    if let Some((_, snippet, _)) = located {
+        let snippet = snippet.trim();
+        if !snippet.is_empty() && !snippet.contains('\n') && snippet.len() <= 80 {
+            if err.kind() == ErrorKind::UndefinedError {
+                let _ = write!(msg, " (variable `{snippet}`)");
+            } else {
+                let _ = write!(msg, " (in `{snippet}`)");
+            }
+        }
+    }
+    if let Some(line) = err.line() {
+        let _ = write!(msg, " at line {line}");
+        if let Some(col) = located.and_then(|(source, _, start)| column_at(source, start)) {
+            let _ = write!(msg, ", column {col}");
+        }
+    }
+    // Chained errors (e.g. a failing include wraps the real cause) would
+    // otherwise stay hidden as sources — fold them into the message.
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        let _ = write!(msg, ": {cause}");
+        source = cause.source();
+    }
+    anyhow::anyhow!(msg)
+}
+
+/// 1-based column of `offset` within its line of `source`.
+fn column_at(source: &str, offset: usize) -> Option<usize> {
+    if offset > source.len() || !source.is_char_boundary(offset) {
+        return None;
+    }
+    let line_start = source[..offset].rfind('\n').map_or(0, |pos| pos + 1);
+    Some(source[line_start..offset].chars().count() + 1)
 }
 
 #[cfg(test)]
@@ -123,6 +179,63 @@ mod tests {
         let engine = TemplateEngine::new(".");
         let result = engine.render_string("Hello {{ name }}!", &json!({}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_render_inline_undefined_variable_error_names_variable_and_location() {
+        let engine = TemplateEngine::new(".");
+        let err = engine
+            .render_string("line one\nHello {{ usernme }}!", &json!({"username": "x"}))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("inline template"), "missing template name: {msg}");
+        assert!(msg.contains("undefined value"), "missing error kind: {msg}");
+        assert!(msg.contains("`usernme`"), "missing variable name: {msg}");
+        assert!(msg.contains("line 2"), "missing line number: {msg}");
+        assert!(msg.contains("column 10"), "missing column: {msg}");
+    }
+
+    #[test]
+    fn test_render_inline_unknown_filter_error_names_filter_and_line() {
+        let engine = TemplateEngine::new(".");
+        let err = engine
+            .render_string("{{ name | shuot }}", &json!({"name": "x"}))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("inline template"), "missing template name: {msg}");
+        assert!(msg.contains("unknown filter"), "missing error kind: {msg}");
+        assert!(msg.contains("shuot"), "missing filter name: {msg}");
+        assert!(msg.contains("line 1"), "missing line number: {msg}");
+    }
+
+    #[test]
+    fn test_render_file_error_names_path_variable_and_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("summary.md.j2"),
+            "# Report\n\nAuthor: {{ author }}\nUser: {{ usernme }}\n",
+        )
+        .unwrap();
+        let engine = TemplateEngine::new(dir.path());
+        let err = engine
+            .render_file("summary.md.j2", &json!({"author": "a", "username": "x"}))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("summary.md.j2"), "missing template path: {msg}");
+        assert!(msg.contains("undefined value"), "missing error kind: {msg}");
+        assert!(msg.contains("`usernme`"), "missing variable name: {msg}");
+        assert!(msg.contains("line 4"), "missing line number: {msg}");
+    }
+
+    #[test]
+    fn test_parse_error_names_line() {
+        let engine = TemplateEngine::new(".");
+        let err = engine
+            .render_string("ok\n{% if x %}\nnever closed", &json!({}))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to parse"), "missing action: {msg}");
+        assert!(msg.contains("syntax error"), "missing error kind: {msg}");
     }
 
     #[test]

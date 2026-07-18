@@ -119,6 +119,15 @@ export interface PromptOptions {
    * returning the raw reply string.
    */
   strict?: boolean;
+  /**
+   * Opt-in guard for plain-text prompts: `true` THROWS a catchable error when
+   * the reply is empty after trimming whitespace — a response truncated to
+   * nothing (e.g. a reasoning model spending the whole `maxTokens` budget on
+   * hidden reasoning) can never flow on as a silently empty result. Has no
+   * effect with `format: "json"`, where strict parsing already throws on an
+   * empty reply. Off by default: an empty reply resolves to `""`.
+   */
+  nonEmpty?: boolean;
   stream?: boolean;
   /**
    * Prompt-cache posture. Defaults to on (`"5m"`): the runtime marks the

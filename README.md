@@ -326,6 +326,11 @@ human-in-the-loop pause/resume loop — see
 - **Cost-efficient prompting** — structural [prompt
   caching](./docs/context-management.md) re-bills stable prefixes at the cached
   rate, and replay pays zero tokens.
+- **Agents that learn across sessions** — persist distilled lessons and
+  preferences in [`chidori.memory`](./docs/memory.md), a namespaced key-value
+  store anchored to the agent's directory, and render reusable prompt
+  [templates](./docs/template.md) (Jinja with strict undefined-variable
+  checking) instead of concatenating strings.
 - **npm packages without Node** — `chidori add zod` installs straight from the
   npm registry into a content-addressed cache (SHA-512 verified, hardlinked
   `node_modules`, merge-friendly JSONL lockfile, no install scripts ever), and
@@ -386,6 +391,8 @@ deterministic, replayable, and testable for free.
 | [JavaScript conformance (Test262)](./docs/conformance.md) | Running the pure-Rust JS engine against the TC39 suite |
 | [Sandbox & security model](./docs/sandbox-model.md) | Deny-by-default policy, capability injection, resource limits |
 | [Context management & caching](./docs/context-management.md) | Immutable contexts, compaction, cost accounting |
+| [Prompt templates](./docs/template.md) | `chidori.template`: Jinja rendering, inline vs. file templates, path resolution, strict undefined variables |
+| [Agent memory](./docs/memory.md) | `chidori.memory`: persistent cross-run key-value store — namespacing, on-disk anchoring, replay semantics |
 | [Signals & multiplayer](./docs/signals.md) | Named listen points, mailboxes, fan-in |
 | [Actors & supervision](./docs/actors.md) | Spawned agent processes, message passing, supervision trees, restart strategies |
 | [Detached agents](./docs/detached-agents.md) | Durable, addressable, hibernating agent processes; `chidori.alarm`; the `/agents/detached` HTTP surface |

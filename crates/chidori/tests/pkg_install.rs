@@ -47,6 +47,8 @@ struct MockRegistryData {
 
 struct MockVersion {
     deps: BTreeMap<String, String>,
+    /// peer name -> (range, optional-in-peerDependenciesMeta).
+    peers: BTreeMap<String, (String, bool)>,
     tarball: Vec<u8>,
     /// Serve bytes that don't match the advertised integrity.
     corrupt: bool,
@@ -104,17 +106,34 @@ impl MockRegistry {
     /// Publish `name@version` with the given dependencies and a package.json
     /// + index.js generated to match.
     fn publish(&self, name: &str, version: &str, deps: &[(&str, &str)]) {
-        self.publish_inner(name, version, deps, false);
+        self.publish_inner(name, version, deps, &[], false);
     }
 
     fn publish_corrupt(&self, name: &str, version: &str) {
-        self.publish_inner(name, version, &[], true);
+        self.publish_inner(name, version, &[], &[], true);
     }
 
-    fn publish_inner(&self, name: &str, version: &str, deps: &[(&str, &str)], corrupt: bool) {
+    /// Publish with `peerDependencies`; each peer is (name, range, optional),
+    /// where `optional` marks it optional in `peerDependenciesMeta`.
+    fn publish_with_peers(&self, name: &str, version: &str, peers: &[(&str, &str, bool)]) {
+        self.publish_inner(name, version, &[], peers, false);
+    }
+
+    fn publish_inner(
+        &self,
+        name: &str,
+        version: &str,
+        deps: &[(&str, &str)],
+        peers: &[(&str, &str, bool)],
+        corrupt: bool,
+    ) {
         let deps: BTreeMap<String, String> = deps
             .iter()
             .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        let peers: BTreeMap<String, (String, bool)> = peers
+            .iter()
+            .map(|(n, r, opt)| (n.to_string(), (r.to_string(), *opt)))
             .collect();
         let manifest = serde_json::json!({
             "name": name,
@@ -139,6 +158,7 @@ impl MockRegistry {
                 version.to_string(),
                 MockVersion {
                     deps,
+                    peers,
                     tarball,
                     corrupt,
                 },
@@ -177,18 +197,33 @@ fn handle(data: &MockRegistryData, base: &str, path: &str) -> Vec<u8> {
                 base64::engine::general_purpose::STANDARD
                     .encode(sha2::Sha512::digest(&v.tarball))
             );
-            (
-                version.clone(),
-                serde_json::json!({
-                    "name": name,
-                    "version": version,
-                    "dependencies": v.deps,
-                    "dist": {
-                        "tarball": format!("{base}/tarballs/{}__{version}.tgz", name.replace('/', "+")),
-                        "integrity": integrity,
-                    }
-                }),
-            )
+            let mut vjson = serde_json::json!({
+                "name": name,
+                "version": version,
+                "dependencies": v.deps,
+                "dist": {
+                    "tarball": format!("{base}/tarballs/{}__{version}.tgz", name.replace('/', "+")),
+                    "integrity": integrity,
+                }
+            });
+            if !v.peers.is_empty() {
+                let ranges: serde_json::Map<String, serde_json::Value> = v
+                    .peers
+                    .iter()
+                    .map(|(n, (r, _))| (n.clone(), serde_json::Value::String(r.clone())))
+                    .collect();
+                vjson["peerDependencies"] = ranges.into();
+                let meta: serde_json::Map<String, serde_json::Value> = v
+                    .peers
+                    .iter()
+                    .filter(|(_, (_, optional))| *optional)
+                    .map(|(n, _)| (n.clone(), serde_json::json!({ "optional": true })))
+                    .collect();
+                if !meta.is_empty() {
+                    vjson["peerDependenciesMeta"] = meta.into();
+                }
+            }
+            (version.clone(), vjson)
         })
         .collect();
     let packument = serde_json::json!({
@@ -560,6 +595,96 @@ fn unsupported_manifest_deps_are_skipped_per_dependency() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("file dependencies are not supported"), "{err}");
+
+    registry.stop();
+}
+
+#[test]
+fn add_writes_manifest_with_name_before_dependencies() {
+    let registry = MockRegistry::start();
+    registry.publish("apple", "1.0.0", &[]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let _env = setup_env(&registry.base, &tmp.path().join("store"));
+
+    // Start from a manifest whose keys would alphabetize badly ("dependencies"
+    // sorts before "name"); after `add` the file must keep npm's conventional
+    // top-level order with `name` first.
+    std::fs::write(
+        project.join("package.json"),
+        r#"{"name":"demo","version":"0.1.0","private":true}"#,
+    )
+    .unwrap();
+    cmd_add(&project, &["apple".to_string()], false).unwrap();
+
+    let raw = std::fs::read_to_string(project.join("package.json")).unwrap();
+    let pos = |key: &str| {
+        raw.find(&format!("\"{key}\""))
+            .unwrap_or_else(|| panic!("missing key {key}:\n{raw}"))
+    };
+    assert!(
+        pos("name") < pos("dependencies"),
+        "`name` must stay above `dependencies`:\n{raw}"
+    );
+    assert!(pos("version") < pos("dependencies"), "{raw}");
+    assert!(pos("name") < pos("version"), "{raw}");
+
+    registry.stop();
+}
+
+#[test]
+fn peer_warnings_skip_optional_and_typescript_peers() {
+    let registry = MockRegistry::start();
+    // Like valibot: a `typescript` peer, plus one optional and one required
+    // peer. Only the required non-typescript peer should warn.
+    registry.publish_with_peers(
+        "valibot-like",
+        "1.0.0",
+        &[
+            ("typescript", ">=5", false),
+            ("softpeer", "^1.0.0", true),
+            ("hardpeer", "^2.0.0", false),
+        ],
+    );
+
+    let client = chidori::pkg::registry::RegistryClient::new(registry.base.clone()).unwrap();
+    let root_deps: BTreeMap<String, String> =
+        [("valibot-like".to_string(), "^1.0.0".to_string())].into();
+    let resolution = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(chidori::pkg::resolve::resolve(
+            &client,
+            &root_deps,
+            &std::collections::HashMap::new(),
+        ))
+        .unwrap();
+
+    let peer_warnings: Vec<&String> = resolution
+        .warnings
+        .iter()
+        .filter(|w| w.contains("unmet peer dependency"))
+        .collect();
+    assert_eq!(
+        peer_warnings.len(),
+        1,
+        "exactly the required non-typescript peer should warn: {:?}",
+        resolution.warnings
+    );
+    assert!(peer_warnings[0].contains("hardpeer"), "{peer_warnings:?}");
+    assert!(
+        !resolution.warnings.iter().any(|w| w.contains("softpeer")),
+        "optional peer must not warn: {:?}",
+        resolution.warnings
+    );
+    assert!(
+        !resolution.warnings.iter().any(|w| w.contains("typescript")),
+        "typescript peer must not warn: {:?}",
+        resolution.warnings
+    );
 
     registry.stop();
 }

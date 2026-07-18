@@ -2443,6 +2443,74 @@ mod tests {
     }
 
     #[test]
+    fn prompt_non_empty_option_rejects_blank_reply_and_defaults_stay_lenient() {
+        // Round-4 usability finding: a response truncated to emptiness flows
+        // on as "" and the run "succeeds" with an empty product. The opt-in
+        // `nonEmpty: true` prompt option must turn that into a catchable
+        // error; WITHOUT the option the empty string still resolves (default
+        // behavior unchanged). Whitespace-only output counts as empty.
+        let _env = PROMPT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = RuntimeContext::new();
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-rust-nonempty-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent(input: {}) {
+                let guarded: string | null = null;
+                let error = "";
+                try {
+                    guarded = await chidori.prompt("guarded-empty-question?", {
+                        model: "test-model",
+                        nonEmpty: true,
+                    });
+                } catch (e: any) {
+                    error = String(e && e.message ? e.message : e);
+                }
+                const unguarded = await chidori.prompt("unguarded-empty-question?", {
+                    model: "test-model",
+                });
+                return { guarded, error, unguarded };
+            }
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut providers = crate::providers::ProviderRegistry::new();
+        providers.register(Box::new(SequenceProvider {
+            // Whitespace-only for the guarded call (trims to empty), truly
+            // empty for the unguarded one.
+            responses: vec!["   \n".to_string(), String::new()],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: Arc::clone(&requests),
+        }));
+        let backend = context_test_backend(ctx.clone(), providers);
+        let output = run_agent(&path, src, &serde_json::json!({}), &backend).unwrap();
+
+        // The guarded prompt rejected: the assignment never happened and the
+        // error names the failure, the likely truncation cause, and the knobs.
+        assert_eq!(output["guarded"], serde_json::Value::Null);
+        let error = output["error"].as_str().unwrap();
+        assert!(
+            error.contains("no visible output"),
+            "error must name the failure, got: {error}"
+        );
+        assert!(
+            error.contains("truncated") && error.contains("maxTokens"),
+            "error must point at the likely cause and remedy, got: {error}"
+        );
+        // The unguarded prompt kept the default lenient behavior: "".
+        assert_eq!(output["unguarded"], serde_json::json!(""));
+        // Both calls actually reached the provider (the guard runs on the
+        // reply, it does not short-circuit the request).
+        assert_eq!(requests.lock().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn run_agent_resolves_relative_module_imports() {
         // A multi-file agent: the entry imports a helper from a sibling `.ts`
         // module. The rust engine resolves + transpiles + links the graph.

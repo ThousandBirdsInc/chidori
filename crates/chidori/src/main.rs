@@ -1600,7 +1600,7 @@ fn cmd_chat(
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
         .with_policy(cli_policy(untrusted, trusted))
-        .with_persist_base(run_base)
+        .with_persist_base(run_base.clone())
         .with_workspace_root(abs_dir(&base_dir));
 
     eprintln!("chidori chat — type a message and press enter. Type 'exit' or Ctrl-D to quit.");
@@ -1665,7 +1665,7 @@ fn cmd_chat(
                         let text = turn.get("text").and_then(Value::as_str).unwrap_or("");
                         match turn.get("role").and_then(Value::as_str) {
                             Some("user") => println!("\nyou> {text}"),
-                            _ => println!("{text}"),
+                            _ => println!("assistant> {text}"),
                         }
                     }
                 }
@@ -1711,6 +1711,11 @@ fn cmd_chat(
             let mut streamed = false;
             while let Some(evt) = rx.blocking_recv() {
                 if let RuntimeEvent::PromptDelta { delta, .. } = evt {
+                    // Mark where the reply starts (mirrors the `you> ` prompt)
+                    // so scrollback distinguishes the two speakers.
+                    if !streamed {
+                        print!("assistant> ");
+                    }
                     print!("{delta}");
                     out.flush().ok();
                     streamed = true;
@@ -1748,7 +1753,7 @@ fn cmd_chat(
                         })
                         .and_then(|turn| turn.get("text").and_then(Value::as_str))
                         .unwrap_or("");
-                    print!("{reply}");
+                    print!("assistant> {reply}");
                 }
                 println!();
                 call_log = result.call_log.into_records();
@@ -1772,6 +1777,7 @@ fn cmd_chat(
         );
     }
     if !call_log.is_empty() {
+        print_chat_session_summary(&run_base, &session_id, messages.len());
         let agent_arg = agent
             .map(|p| format!("{} ", p.display()))
             .unwrap_or_default();
@@ -1785,6 +1791,86 @@ fn cmd_chat(
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
     Ok(())
+}
+
+/// One-line usage/cost summary printed when a chat session ends. Reads the
+/// session's journaled records from its run dir and prices them exactly like
+/// `chidori stats` (same record parsing, same journaled-pricing fallback, and
+/// the same "unknown, not $0" treatment for unpriced models).
+fn print_chat_session_summary(run_base: &Path, session_id: &str, turns: usize) {
+    use crate::runtime::cost::{estimate_cost_usd_with_cache, is_priced_model};
+    use crate::runtime::store::RunStore as _;
+
+    let run_dir = run_base.join(session_id);
+    let Ok(Some(records)) = crate::runtime::store::FsRunStore::new(&run_dir).load_call_log() else {
+        return;
+    };
+    // Price under the pricing table recorded in the session's manifest, same
+    // as `stats` (a live CHIDORI_PRICING still wins inside the cost module).
+    if let Ok(manifest) = crate::runtime::snapshot::SnapshotStore::new(&run_dir).load_manifest() {
+        if let Some(ref pricing) = manifest.pricing {
+            crate::runtime::cost::install_journaled_pricing(pricing);
+        }
+    }
+
+    let mut prompt_calls: u64 = 0;
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut cache_read: u64 = 0;
+    let mut cost: f64 = 0.0;
+    let mut any_unpriced = false;
+    for r in &records {
+        if r.function != "prompt" {
+            continue;
+        }
+        prompt_calls += 1;
+        let model = r
+            .args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if !is_priced_model(model) {
+            any_unpriced = true;
+        }
+        if let Some(ref usage) = r.token_usage {
+            input_tokens += usage.input_tokens;
+            output_tokens += usage.output_tokens;
+            let read = usage.cache_read_tokens.unwrap_or(0);
+            let write = usage.cache_creation_tokens.unwrap_or(0);
+            cache_read += read;
+            cost += estimate_cost_usd_with_cache(
+                model,
+                usage.input_tokens,
+                usage.output_tokens,
+                write,
+                read,
+            );
+        }
+    }
+    if prompt_calls == 0 {
+        return;
+    }
+
+    let cache_note = if cache_read > 0 {
+        format!(", {cache_read} cache reads")
+    } else {
+        String::new()
+    };
+    // Same distinction as `stats`: an unpriced model's cost is unknown, not $0.
+    let cost_note = if !any_unpriced {
+        format!("est. cost: ${cost:.6}")
+    } else if cost > 0.0 {
+        format!(
+            "est. cost: ${cost:.6} + unknown (unpriced model; supply rates via CHIDORI_PRICING)"
+        )
+    } else {
+        "est. cost: unknown (unpriced model; supply rates via CHIDORI_PRICING)".to_string()
+    };
+    eprintln!(
+        "session usage: {turns} turn(s), {prompt_calls} prompt call(s), {} tokens \
+         ({input_tokens} in / {output_tokens} out{cache_note}), {cost_note}",
+        input_tokens + output_tokens
+    );
 }
 
 fn cmd_check(file: &Path) -> Result<()> {

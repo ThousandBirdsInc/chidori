@@ -102,7 +102,6 @@ const text = await chidori.prompt("Write a concise answer", {
   model: "claude-sonnet",
   maxTokens: 500,
   temperature: 0.2,
-  tools: ["web_search"],
 });
 ```
 
@@ -212,7 +211,7 @@ See `examples/agents/context_qa.ts` for a complete corpus-Q&A agent.
 ```ts
 const chat = chidori.conversation({
   system: "You are a concise, friendly assistant.",
-  tools: ["web_search"],          // available on every turn
+  tools: [search],                 // defineTool handles (see the `tools` prompt option), on every turn
   compact: { budgetTokens: 8000 }, // opt-in per-turn window management
 });
 
@@ -318,7 +317,8 @@ agent — MCP-server tools (configured via `CHIDORI_MCP_*`) and Rust-native
 tools registered by an embedding application — dispatched by name:
 
 ```ts
-const result = await chidori.tool("web_search", { query: "snapshot runtime" });
+// e.g. a search tool exposed by a configured MCP server
+const result = await chidori.tool("docs_search", { query: "snapshot runtime" });
 ```
 
 A tool's `fetch` is SSRF-guarded by default: requests to hosts that resolve
@@ -633,18 +633,26 @@ if (!result.ok) {
 `RetryOptions` also accepts `delayMs` and `backoff`, but the helper
 retries immediately — no delay is applied between attempts.
 
-## TypeScript Tool Shape
+## Defining Tools
 
-A TypeScript tool exports JSON-compatible metadata and an async
-`run(args, chidori)` function. Tool discovery evaluates the exported `tool`
-value in a restricted metadata VM context before registration.
+A tool is a plain object made with `defineTool`: JSON-compatible metadata
+(`name`, `description`, JSON-schema `parameters`) wrapped around an async
+`run(args, chidori)` function. Define it inline or import it from any module —
+there is no `tools/` directory and no registration step — and pass the handle
+in the `tools` prompt option. The `run` body executes in the agent's own VM,
+so closures over agent state work, and its side effects (`fetch`, workspace,
+...) are the same captured effects the agent already has: journaled live,
+replayed deterministically. Each invocation is journaled as a
+`mark("tool:<name>")` record for the trace.
 
 ```ts
-import type { Chidori, ToolDefinition } from "chidori:agent";
+import { chidori, run, defineTool } from "chidori:agent";
 
-export const tool: ToolDefinition = {
-  name: "web_search",
-  description: "Search the web for a short query.",
+// A real web lookup: `fetch` inside a tool body is the captured fetch, so
+// every request is policy-gated, journaled, and replays for $0.
+const wikiSearch = defineTool({
+  name: "wiki_search",
+  description: "Search Wikipedia and return the top matching titles and URLs.",
   parameters: {
     type: "object",
     properties: {
@@ -652,16 +660,31 @@ export const tool: ToolDefinition = {
     },
     required: ["query"],
   },
-};
+  run: async (args: { query: string }) => {
+    const url =
+      "https://en.wikipedia.org/w/api.php?action=opensearch&format=json" +
+      "&limit=5&search=" +
+      encodeURIComponent(args.query);
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`wiki_search failed: HTTP ${resp.status}`);
+    const [, titles, , urls] = (await resp.json()) as [string, string[], string[], string[]];
+    return titles.map((title, i) => ({ title, url: urls[i] }));
+  },
+});
 
-export async function run(args: { query: string }, chidori: Chidori) {
-  await chidori.log("Running web_search", { query: args.query });
-  return { query: args.query, results: [] };
-}
+run(async (input: { question: string }) => {
+  const answer = await chidori.prompt(input.question, {
+    tools: [wikiSearch],
+    maxTurns: 4,
+  });
+  return { answer };
+});
 ```
 
-Tool metadata must be JSON-compatible. The `parameters` field is a JSON Schema
-object and is used for provider tool calling.
+The `parameters` field is a JSON Schema object and is what the provider reads
+for tool calling. Tools sourced from OUTSIDE the agent — MCP-server tools and
+Rust-native registrations — are invoked by NAME instead, via the
+`chidori.tool` host effect or a name string in `tools` (see `tool` above).
 
 ## Streaming
 

@@ -875,6 +875,27 @@ fn cli_chat_session_persists_and_resumes() {
         stderr.contains("session saved"),
         "exit should point at --resume/trace, got:\n{stderr}"
     );
+    // The reply is marked like the `you> ` prompt, so scrollback shows who
+    // said what instead of one undifferentiated text column.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("assistant> "),
+        "reply should carry an assistant> marker, got:\n{stdout}"
+    );
+    // Exit prints a usage/cost summary before the "session saved" line,
+    // computed from the journaled records the same way `chidori stats` is.
+    let summary = stderr
+        .lines()
+        .find(|line| line.starts_with("session usage:"))
+        .expect("exit should print a session usage summary");
+    assert!(
+        summary.contains("1 prompt call(s)") && summary.contains("est. cost:"),
+        "summary should count prompt calls and estimate cost, got:\n{summary}"
+    );
+    assert!(
+        stderr.find("session usage:").unwrap() < stderr.find("session saved").unwrap(),
+        "summary should precede the session-saved line, got:\n{stderr}"
+    );
 
     let run_dir = dir.join(".chidori").join("runs").join(&session_id);
     let input: serde_json::Value =

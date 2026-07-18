@@ -15,7 +15,7 @@ directly, so the runtime sees and records everything. See
 | `chidori.prompt(text, { type, ... })` | Send to an LLM, return string or parsed JSON; streamed prompt events carry the optional type |
 | `chidori.context()` | Immutable multi-turn prompt builder with prefix sharing and provider prompt caching |
 | `chidori.conversation(options)` | Stateful chat-assistant wrapper over `context()` — `say(message)` per turn, or `loop()` for an interactive `input()` dialogue |
-| `chidori.template(strOrPath, vars)` | Render a Jinja2 template with minijinja |
+| `chidori.template(strOrPath, vars)` | Render a Jinja2 template (inline string or `.jinja`/`.j2` file) with minijinja — undefined variables fail loudly ([details](./template.md)) |
 | `chidori.tool(name, args)` | Invoke a registered tool |
 | `chidori.callAgent(path, input)` | Call a sub-agent |
 | `chidori.util.parallel(fns)` | Run functions concurrently (in-VM helper — records nothing itself) |
@@ -29,7 +29,7 @@ directly, so the runtime sees and records everything. See
 | `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued; `timeoutMs` resolves to a `{ timedOut: true }` sentinel after the deadline |
 | `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
 | `chidori.signal(names[], options)` | Fan-in — pass an array to pause until ANY of the named signals is delivered; the result's `name` says which fired |
-| `chidori.memory.set/get/delete/list/clear` | Persistent key-value storage, namespaced on disk under the agent's `.chidori/memory/` (anchored to the workspace root, like runs; `CHIDORI_MEMORY_DIR` overrides) |
+| `chidori.memory.set/get/delete/list/clear` | Persistent key-value storage, namespaced on disk under the agent's `.chidori/memory/` (anchored to the workspace root, like runs; `CHIDORI_MEMORY_DIR` overrides) ([details](./memory.md)) |
 | `chidori.workspace.{list,read,write,delete,manifest}` | Shared workspace files under the run's workspace root — policy-gated, recorded like every other effect |
 | `chidori.log(msg, data)` | Structured logging |
 | `chidori.mark(label, data)` | Record a labelled trace marker in the call log (the durable *value* checkpoint is `chidori.step`) |

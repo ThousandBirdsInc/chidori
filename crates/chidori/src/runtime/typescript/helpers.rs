@@ -535,6 +535,7 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                         const respondOptions = turnOptions(perTurn);
                         delete respondOptions.format;
                         delete respondOptions.strict;
+                        delete respondOptions.nonEmpty;
                         const loop = await globalThis.chidori.__fnToolLoop(
                             ctx,
                             respondOptions,
@@ -708,6 +709,24 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             }
         }
 
+        // Opt-in guard against silent degradation on PLAIN-TEXT prompts: a
+        // response truncated to nothing (stop reason aside) otherwise flows on
+        // as "" and the run "succeeds" with an empty product. `format:"json"`
+        // needs no such guard — strict-by-default parsing (above) already
+        // throws on an empty/unparseable reply — so nonEmpty only applies to
+        // the plain-string result.
+        function assertNonEmptyReply(text) {
+            const reply = String(text == null ? "" : text);
+            if (reply.trim() !== "") return reply;
+            throw new Error(
+                "nonEmpty: prompt() returned no visible output (empty after trimming " +
+                    "whitespace) - was the response truncated? reasoning models spend the " +
+                    "maxTokens budget on hidden reasoning before any visible text. Raise " +
+                    "`maxTokens` in the prompt options, or drop `nonEmpty: true` to get " +
+                    "the empty string back.",
+            );
+        }
+
         function stringifyResult(value) {
             return typeof value === "string" ? value : JSON.stringify(value);
         }
@@ -769,7 +788,14 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             const opts = options || {};
             const list = Array.isArray(opts.tools) ? opts.tools : [];
             if (!list.some(isHandle)) {
-                return nativePrompt.call(globalThis.chidori, text, options);
+                const out = nativePrompt.call(globalThis.chidori, text, options);
+                // nonEmpty is a JS-layer contract (the host ignores the key):
+                // check the resolved reply here. JSON mode is exempt — the
+                // host's strict format:"json" parsing already throws on empty.
+                if (opts.nonEmpty === true && opts.format !== "json") {
+                    return Promise.resolve(out).then(assertNonEmptyReply);
+                }
+                return out;
             }
             return (async () => {
                 const maxTurns = Number.isFinite(Number(opts.maxTurns))
@@ -783,6 +809,7 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                 delete respondOptions.system;
                 delete respondOptions.format;
                 delete respondOptions.strict;
+                delete respondOptions.nonEmpty;
                 delete respondOptions.maxTurns;
                 const { handles } = splitTools(list);
                 const { text: reply } = await runToolLoop(
@@ -793,6 +820,9 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                 );
                 if (opts.format === "json") {
                     return parseJsonReply(reply, opts.strict);
+                }
+                if (opts.nonEmpty === true) {
+                    return assertNonEmptyReply(reply);
                 }
                 return reply;
             })();

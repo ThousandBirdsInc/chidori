@@ -39,9 +39,19 @@ pub struct PackageVersion {
     pub optional_dependencies: BTreeMap<String, String>,
     #[serde(default, rename = "peerDependencies")]
     pub peer_dependencies: BTreeMap<String, String>,
+    #[serde(default, rename = "peerDependenciesMeta")]
+    pub peer_dependencies_meta: BTreeMap<String, PeerDependencyMeta>,
     pub dist: Dist,
     #[serde(default)]
     pub deprecated: Option<String>,
+}
+
+/// Per-peer metadata (`peerDependenciesMeta.<name>`): today just the
+/// `optional` flag, which marks a peer as fine to leave uninstalled.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PeerDependencyMeta {
+    #[serde(default)]
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -268,6 +268,22 @@ pub async fn resolve(
         // Peer dependency check: warn when nothing in the resolved set
         // satisfies a peer range. We don't auto-install peers (v1).
         for (peer, peer_range) in &meta.peer_dependencies {
+            // Peers marked optional in `peerDependenciesMeta` are explicitly
+            // fine to leave uninstalled — never warn about them.
+            if meta
+                .peer_dependencies_meta
+                .get(peer)
+                .is_some_and(|m| m.optional)
+            {
+                continue;
+            }
+            // The chidori runtime transpiles and executes TypeScript itself,
+            // so a `typescript` peer (declared by e.g. valibot) is always
+            // effectively satisfied; warning about it would be noise on
+            // every install.
+            if peer == "typescript" {
+                continue;
+            }
             let satisfied = resolution
                 .packages
                 .keys()
