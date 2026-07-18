@@ -1,4 +1,5 @@
 mod acp;
+mod export;
 mod init;
 mod mcp;
 mod mem_guard;
@@ -289,6 +290,33 @@ enum Commands {
         run_id: String,
 
         /// Project dir containing `.chidori/runs/` (defaults to agent file's parent)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+
+        /// Read the run from `<runs-dir>/<run_id>` instead of
+        /// `<dir>/.chidori/runs/<run_id>` — the consumption side of
+        /// `chidori export --fixture`: point this at the committed fixture
+        /// directory.
+        #[arg(long)]
+        runs_dir: Option<PathBuf>,
+    },
+
+    /// Export a completed run as a minimal, committable verification fixture:
+    /// copies just the artifacts `chidori verify` reads (records.jsonl,
+    /// runtime.snapshot.json, output.json, input.json) into `<dest>/<run_id>/`,
+    /// leaving the multi-megabyte runtime snapshot blob and resume-only state
+    /// behind. Commit the fixture and run
+    /// `chidori verify <agent.ts> <run_id> --runs-dir <dest>` in CI.
+    Export {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Destination directory for the fixture; the run's artifacts land in
+        /// `<dest>/<run_id>/`.
+        #[arg(long)]
+        fixture: PathBuf,
+
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
         #[arg(short, long)]
         dir: Option<PathBuf>,
     },
@@ -653,9 +681,23 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             },
             false,
         ),
-        Commands::Verify { file, run_id, dir } => {
-            (cmd_verify(&file, &run_id, dir.as_deref()), false)
-        }
+        Commands::Verify {
+            file,
+            run_id,
+            dir,
+            runs_dir,
+        } => (
+            cmd_verify(&file, &run_id, dir.as_deref(), runs_dir.as_deref()),
+            false,
+        ),
+        Commands::Export {
+            run_id,
+            fixture,
+            dir,
+        } => (
+            crate::export::cmd_export(&run_id, &fixture, dir.as_deref()),
+            false,
+        ),
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
         Commands::BranchResume {
             run_id,
@@ -2231,12 +2273,22 @@ fn cmd_resume(
 /// changed source refuses via the manifest check, a diverging recorded call
 /// errors positionally, a run that reaches for anything live has no provider
 /// (and no allowed gated effects) to reach.
-fn cmd_verify(file: &Path, run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+fn cmd_verify(
+    file: &Path,
+    run_id: &str,
+    dir: Option<&std::path::Path>,
+    runs_dir: Option<&std::path::Path>,
+) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
         .or_else(|| file.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let run_base = base_dir.join(".chidori").join("runs");
+    // `--runs-dir` points straight at a runs base (e.g. a committed
+    // `chidori export --fixture` directory); otherwise the run lives under
+    // the project's `.chidori/runs/` as usual.
+    let run_base = runs_dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| base_dir.join(".chidori").join("runs"));
     let run_dir = run_base.join(run_id);
 
     use crate::runtime::store::RunStore as _;

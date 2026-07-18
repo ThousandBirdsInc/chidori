@@ -64,7 +64,16 @@ This means you can:
   (top-level workspace effects re-materialize their recorded artifacts —
   workspace state is real disk, not journal-served).
   Exit 0 on pass — a full integration test that costs $0 and runs in
-  milliseconds, built for CI.
+  milliseconds, built for CI. A full run directory is heavy (the runtime
+  snapshot blob alone can run to tens of MB), so don't commit it raw:
+  `chidori export <run_id> --fixture tests/fixtures` copies just the four
+  artifacts `verify` reads (`records.jsonl`, `runtime.snapshot.json`,
+  `output.json`, `input.json`) into `tests/fixtures/<run_id>/` — typically
+  a few KB. Commit that, and point verify at it with
+  `chidori verify agent.ts <run_id> --runs-dir tests/fixtures`. Export
+  refuses runs whose journal isn't a complete verifiable record (still
+  leased by a live process, paused at a pending operation, or never
+  completed).
 - **Resume after crashes:** the runtime can persist checkpoints after each call; on restart, replay picks up where it left off.
 - **Pause for human approval:** `input()` suspends execution; when the human responds, the agent replays to that point and continues.
 

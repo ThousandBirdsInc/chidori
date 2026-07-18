@@ -1133,3 +1133,205 @@ fn cli_chat_session_persists_and_resumes() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// Total size in bytes of every regular file under `path`, recursively.
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                stack.push(entry_path);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+// `chidori export <run_id> --fixture <dest>` — a run directory is tens of MB
+// (snapshot blob, promise table, duplicated journal), too heavy to commit as
+// a CI test. Export carves out just what `chidori verify` reads
+// (records.jsonl, runtime.snapshot.json, output.json, input.json), and
+// `verify --runs-dir <dest>` must pass against the fixture alone.
+#[test]
+fn cli_export_fixture_is_minimal_and_verify_consumes_it() {
+    let dir = temp_project("export-fixture");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("start", { who: input.who });
+                const text = await chidori.prompt("say hi to " + input.who);
+                return { text };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori_with_str_env(
+        &[
+            "run",
+            agent.to_str().unwrap(),
+            "--input",
+            r#"{"who":"fixture"}"#,
+        ],
+        &dir,
+        &[("CHIDORI_TEST_LLM_RESPONSE", "hi fixture")],
+    );
+    assert_success(&output);
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    // Precondition for the size claim: the full run dir carries the heavy
+    // resume-only artifacts export must leave behind.
+    assert!(run_dir.join("runtime.snapshot").exists());
+    assert!(run_dir.join("checkpoint.json").exists());
+    // A mock run's snapshot blob is tiny; real runs carry multi-MB blobs —
+    // that's the whole reason export exists. Pad the blob to a representative
+    // size: export must not copy it, so the fixture stays small regardless.
+    fs::write(run_dir.join("runtime.snapshot"), vec![0u8; 1 << 20]).unwrap();
+
+    let fixture = dir.join("fixtures");
+    let output = run_chidori(
+        &["export", &run_id, "--fixture", fixture.to_str().unwrap()],
+        &dir,
+    );
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("exported fixture:") && stdout.contains("run dir was"),
+        "export should summarize fixture vs run-dir size, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("--runs-dir"),
+        "export should print the verify hint, got:\n{stdout}"
+    );
+
+    // The fixture holds exactly the verify set — no snapshot blob, no
+    // duplicated checkpoint.json, no host-promise/pending/lease state.
+    let fixture_run = fixture.join(&run_id);
+    assert!(fixture_run.join("records.jsonl").exists());
+    assert!(fixture_run.join("runtime.snapshot.json").exists());
+    assert!(fixture_run.join("output.json").exists());
+    assert!(fixture_run.join("input.json").exists());
+    assert!(!fixture_run.join("runtime.snapshot").exists());
+    assert!(!fixture_run.join("checkpoint.json").exists());
+    assert!(!fixture_run.join("host_promises.json").exists());
+    assert!(!fixture_run.join("pending.json").exists());
+    assert!(!fixture_run.join("lease.json").exists());
+
+    // Dramatically smaller: the snapshot blob and duplicated journal dominate
+    // the run dir, so the fixture must come in at a small fraction of it.
+    let run_size = dir_size(&run_dir);
+    let fixture_size = dir_size(&fixture_run);
+    assert!(
+        fixture_size * 10 < run_size,
+        "fixture ({fixture_size} B) should be far smaller than the run dir ({run_size} B)"
+    );
+
+    // The fixture alone must satisfy `chidori verify` — no provider, and the
+    // original run directory is not consulted.
+    fs::remove_dir_all(&run_dir).unwrap();
+    let output = run_chidori_without_providers(
+        &[
+            "verify",
+            agent.to_str().unwrap(),
+            &run_id,
+            "--runs-dir",
+            fixture.to_str().unwrap(),
+        ],
+        &dir,
+    );
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("verified:"),
+        "verify against the fixture should report success"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+// Exporting a run that does not exist must error cleanly, naming the path it
+// looked at.
+#[test]
+fn cli_export_nonexistent_run_errors_cleanly() {
+    let dir = temp_project("export-missing");
+    let fixture = dir.join("fixtures");
+    let output = run_chidori(
+        &[
+            "export",
+            "no-such-run",
+            "--fixture",
+            fixture.to_str().unwrap(),
+        ],
+        &dir,
+    );
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No persisted run") && stderr.contains("no-such-run"),
+        "expected a clear missing-run error, got:\n{stderr}"
+    );
+    assert!(
+        !fixture.exists(),
+        "a failed export must not leave a fixture directory behind"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+// A run that is still owned by a live process (unexpired lease) has a
+// mid-flight journal; export must refuse it rather than freeze an incomplete
+// record as a "passing" fixture.
+#[test]
+fn cli_export_refuses_leased_run() {
+    let dir = temp_project("export-leased");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("ok", {});
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+    let output = run_chidori(&["run", agent.to_str().unwrap()], &dir);
+    assert_success(&output);
+    let run_id = first_run_id(&dir);
+
+    // Simulate a live owner: an unexpired lease on the run directory.
+    let lease = serde_json::json!({
+        "owner": "some-other-process",
+        "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+    });
+    fs::write(
+        dir.join(".chidori")
+            .join("runs")
+            .join(&run_id)
+            .join("lease.json"),
+        serde_json::to_vec(&lease).unwrap(),
+    )
+    .unwrap();
+
+    let fixture = dir.join("fixtures");
+    let output = run_chidori(
+        &["export", &run_id, "--fixture", fixture.to_str().unwrap()],
+        &dir,
+    );
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("leased") && stderr.contains("some-other-process"),
+        "expected a live-lease refusal naming the owner, got:\n{stderr}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
