@@ -1,4 +1,3 @@
-/// <reference types="@1kbirds/chidori/agent-env" />
 import { chidori, run, defineTool, type JsonObject } from "chidori:agent";
 
 /**
