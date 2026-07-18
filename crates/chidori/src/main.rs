@@ -1190,6 +1190,72 @@ fn abs_dir(dir: &std::path::Path) -> PathBuf {
     })
 }
 
+/// Spawn a stderr progress listener for plain (non `--stream`) runs: one line
+/// per live prompt call, so a long model call shows a sign of life instead of
+/// dead air until the run ends. Reuses the runtime's existing event channel —
+/// the returned sender is handed to the engine's `*_streaming` entry point and
+/// the drain thread prints only `PromptStart`/`PromptEnd` (per-record `Call`
+/// and per-token `PromptDelta` events flow on the same channel and are
+/// ignored). Replayed and locally-cached prompt calls short-circuit in
+/// `host_core` before the provider-request path that emits `PromptStart`, so
+/// a resume never prints phantom "started" lines for calls it served from the
+/// journal. Stdout is untouched: it stays reserved for the agent's output.
+///
+/// Returns `None` when `CHIDORI_QUIET` is set (to anything but `0`/empty),
+/// the opt-out for scripts that want the old fully-silent stderr; the caller
+/// then runs without an event sender attached, exactly as before.
+fn spawn_prompt_progress_listener() -> Option<(
+    tokio::sync::mpsc::UnboundedSender<crate::runtime::context::RuntimeEvent>,
+    std::thread::JoinHandle<()>,
+)> {
+    if std::env::var_os("CHIDORI_QUIET").is_some_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
+    let (event_tx, event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::runtime::context::RuntimeEvent>();
+    let drain = std::thread::spawn(move || {
+        use crate::runtime::context::RuntimeEvent;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let mut rx = event_rx;
+        let mut started: HashMap<String, Instant> = HashMap::new();
+        while let Some(event) = rx.blocking_recv() {
+            match event {
+                RuntimeEvent::PromptStart {
+                    stream_id,
+                    seq,
+                    model,
+                    ..
+                } => {
+                    started.insert(stream_id, Instant::now());
+                    eprintln!("seq {seq}: prompt started ({model})");
+                }
+                RuntimeEvent::PromptEnd {
+                    stream_id,
+                    seq,
+                    error,
+                    ..
+                } => {
+                    // A failed prompt surfaces through the run's own error
+                    // path; the progress line only marks successful finishes.
+                    let elapsed = started.remove(&stream_id);
+                    if error.is_none() {
+                        if let Some(t0) = elapsed {
+                            eprintln!(
+                                "seq {seq}: prompt finished ({:.1}s)",
+                                t0.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                }
+                RuntimeEvent::Call(_) | RuntimeEvent::PromptDelta { .. } => {}
+            }
+        }
+    });
+    Some((event_tx, drain))
+}
+
 fn cmd_run(
     file: &Path,
     inputs: &[String],
@@ -1251,7 +1317,19 @@ fn cmd_run(
     // Run the agent.
     // Announce the run id up front (stderr): after a crash — where buffered
     // stdout is lost — the id `chidori resume` needs is already on record.
-    let result = engine.run_announced(file, &input_value)?;
+    // With the progress listener attached (the default), each live prompt
+    // call also gets a one-line stderr note — long model calls are otherwise
+    // total silence on the plain path. CHIDORI_QUIET=1 restores that silence.
+    let result = match spawn_prompt_progress_listener() {
+        Some((event_tx, drain)) => {
+            let result = engine.run_streaming_announced(file, &input_value, event_tx);
+            // The sender moved into the engine and drops when the run
+            // returns; join so the last progress lines land before output.
+            drain.join().ok();
+            result?
+        }
+        None => engine.run_announced(file, &input_value)?,
+    };
 
     // A `chidori.signal(name)` listen point with an empty mailbox pauses the run
     // (there is no stdin fallback for signals, unlike `input()`). The engine has
@@ -2011,7 +2089,18 @@ fn cmd_resume(
         .iter()
         .filter(|r| r.function == "workspace" && r.parent_seq.is_none())
         .count() as u64;
-    let result = engine.resume_run(file, &input_value, records, run_id);
+    // Same one-line-per-prompt stderr progress as plain `run`, and only for
+    // calls executed live past the replay frontier: replayed records
+    // short-circuit before the provider path that emits PromptStart, so the
+    // replayed prefix stays silent. CHIDORI_QUIET=1 opts out.
+    let result = match spawn_prompt_progress_listener() {
+        Some((event_tx, drain)) => {
+            let result = engine.resume_run_streaming(file, &input_value, records, run_id, event_tx);
+            drain.join().ok();
+            result
+        }
+        None => engine.resume_run(file, &input_value, records, run_id),
+    };
     let _ =
         crate::runtime::store::release_lease(factory.store_for(run_id).as_ref(), &cli_lease_owner);
     let result = result?;

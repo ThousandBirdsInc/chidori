@@ -853,6 +853,60 @@ fn cli_stream_matches_plain_run_posture() {
     fs::remove_dir_all(dir).ok();
 }
 
+// Plain `chidori run` prints a one-line sign of life per live prompt call on
+// stderr (`seq N: prompt started (<model>)`, then a matching `prompt
+// finished` line) — long model calls are otherwise total silence until the
+// run ends, with `--stream` as the only progress path. Stdout stays reserved
+// for the agent's output, and CHIDORI_QUIET=1 restores the old silent stderr.
+#[test]
+fn cli_plain_run_reports_prompt_progress_on_stderr() {
+    let dir = temp_project("prompt-progress");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                const text = await chidori.prompt("say hi");
+                return { text };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let envs = [("CHIDORI_TEST_LLM_RESPONSE", "hi back")];
+    let output = run_chidori_with_str_env(&["run", agent.to_str().unwrap()], &dir, &envs);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("prompt started ("),
+        "plain run should print a prompt progress line on stderr, got:\n{stderr}"
+    );
+    // Progress must not leak into stdout: the agent's JSON output is still
+    // the only thing there, byte-parseable as before.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("prompt started"),
+        "progress lines must stay on stderr, got stdout:\n{stdout}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["text"], "hi back");
+
+    // CHIDORI_QUIET=1 suppresses the progress lines entirely.
+    let quiet_envs = [
+        ("CHIDORI_TEST_LLM_RESPONSE", "hi back"),
+        ("CHIDORI_QUIET", "1"),
+    ];
+    let output = run_chidori_with_str_env(&["run", agent.to_str().unwrap()], &dir, &quiet_envs);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("prompt started"),
+        "CHIDORI_QUIET=1 should suppress progress lines, got:\n{stderr}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
 // A chat session is a durable run: the session id is announced, every turn
 // journals under `.chidori/runs/<session_id>` with `input.json` holding the
 // dialogue state, and `--resume` replays the transcript and continues the
