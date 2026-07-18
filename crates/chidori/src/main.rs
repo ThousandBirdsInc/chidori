@@ -180,8 +180,10 @@ enum Commands {
 
     /// Start an interactive multi-turn chat. With no AGENT it chats with the
     /// model directly (no agent file); pass a conversational agent file to chat
-    /// through it. Each turn is a durable host call; replaying the prior turns
-    /// is free, so only your newest message hits the provider.
+    /// through it. Each turn is a durable host call journaled under
+    /// `.chidori/runs/<session_id>`, so the conversation survives crashes, is
+    /// inspectable with `chidori trace`, and continues with `--resume`; prior
+    /// turns replay for free, so only your newest message hits the provider.
     Chat {
         /// Optional conversational agent .ts file to chat through. It must accept
         /// `{ messages, system?, model?, tools? }` and return `{ transcript }`
@@ -195,6 +197,12 @@ enum Commands {
         /// Model override (otherwise the provider default).
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Continue a previous chat session by its session id (printed when the
+        /// session starts, and again at exit). Prior turns replay from the
+        /// journal for $0; only new messages reach the provider.
+        #[arg(long, value_name = "SESSION_ID")]
+        resume: Option<String>,
 
         /// Run under the built-in deny-by-default `untrusted` policy profile.
         #[arg(long, conflicts_with = "trusted")]
@@ -598,10 +606,11 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             agent,
             system,
             model,
+            resume,
             untrusted,
             trusted,
         } => (
-            cmd_chat(agent.as_deref(), system, model, untrusted, trusted),
+            cmd_chat(agent.as_deref(), system, model, resume, untrusted, trusted),
             false,
         ),
         Commands::Check { file } => (cmd_check(&file), true),
@@ -1328,9 +1337,15 @@ fn cmd_run_stream(
 
     let tools = Arc::new(ToolRegistry::new());
 
+    // Same posture as the plain `run` path: the agent's project directory is
+    // the implicit workspace root, and the run journals under
+    // `.chidori/runs/<run_id>` — `--stream` changes how progress is reported,
+    // never what the runtime can do or what survives a crash.
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
-        .with_policy(cli_policy(untrusted, trusted));
+        .with_policy(cli_policy(untrusted, trusted))
+        .with_persist_base(base_dir.join(".chidori").join("runs"))
+        .with_workspace_root(abs_dir(&base_dir));
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<crate::runtime::context::RuntimeEvent>();
 
@@ -1385,7 +1400,7 @@ fn cmd_run_stream(
         }
     });
 
-    let result = engine.run_streaming(file, &input_value, event_tx);
+    let result = engine.run_streaming_announced(file, &input_value, event_tx);
 
     // event_tx was moved into the engine; it is dropped when run_streaming
     // returns, which causes blocking_recv() in the drain thread to return None.
@@ -1393,11 +1408,25 @@ fn cmd_run_stream(
 
     match result {
         Ok(r) => {
-            let line = serde_json::json!({
-                "type": "done",
-                "status": "completed",
-                "output": r.output,
-            });
+            // A `chidori.signal(...)` listen point with an empty mailbox pauses
+            // the run; the persisted scaffold is resumable exactly like the
+            // plain-run case, so report `paused` (with the pending names)
+            // rather than a `completed` with a null output.
+            let line = if let Some(signal) = &r.paused_signal {
+                serde_json::json!({
+                    "type": "done",
+                    "status": "paused",
+                    "run_id": r.run_id,
+                    "pending_signal": signal.listen_names(),
+                })
+            } else {
+                serde_json::json!({
+                    "type": "done",
+                    "status": "completed",
+                    "run_id": r.run_id,
+                    "output": r.output,
+                })
+            };
             println!("{line}");
             Ok(())
         }
@@ -1423,14 +1452,23 @@ fn cmd_run_stream(
 /// (prior turns are free), streams the newest assistant reply, and carries the
 /// merged call log forward.
 ///
+/// The whole session is one durable run: every turn journals into
+/// `.chidori/runs/<session_id>` under the agent's directory (the cwd for the
+/// built-in agent), the run's `input.json` always holds the full dialogue
+/// state, and `--resume <session_id>` replays the journal — restoring the
+/// transcript for $0 — and continues the conversation in place. A crash mid-
+/// generation loses at most the reply being streamed; `--resume` completes it
+/// live.
+///
 /// With no `agent`, a built-in conversational agent (`init::CHAT_AGENT_SRC`) is
 /// written to a temp file. With an `agent`, that file is used instead; it must
 /// follow the same contract — accept `{ messages, system?, model?, tools? }` and
 /// return `{ transcript }` or `{ history }` of `{ role, text }` turns.
 fn cmd_chat(
     agent: Option<&std::path::Path>,
-    system: Option<String>,
-    model: Option<String>,
+    mut system: Option<String>,
+    mut model: Option<String>,
+    resume: Option<String>,
     untrusted: bool,
     trusted: bool,
 ) -> Result<()> {
@@ -1460,6 +1498,95 @@ fn cmd_chat(
         }
     };
 
+    // A chat session is an ordinary durable run: every turn journals into
+    // `.chidori/runs/<session_id>` next to the agent (the cwd for the built-in
+    // agent), so the conversation survives crashes, is inspectable with
+    // `chidori trace`/`verify`, and can be continued with `--resume`.
+    let run_base = base_dir.join(".chidori").join("runs");
+    let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    let lease_owner = format!("chidori-chat-{}", std::process::id());
+    let mut messages: Vec<String> = Vec::new();
+    let mut call_log: Vec<crate::runtime::call_log::CallRecord> = Vec::new();
+    let session_id = match &resume {
+        Some(session_id) => {
+            let run_dir = run_base.join(session_id);
+            // Load through the run store: hydrates from a durable mirror when
+            // configured, and unions the last checkpoint with any
+            // crash-stranded `records.jsonl` tail — same path as `resume`.
+            let _ = factory.hydrate(session_id);
+            call_log = factory
+                .store_for(session_id)
+                .load_call_log()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no chat session found under {}", run_dir.display())
+                })?;
+            // One driver per session journal, same guard (and same
+            // unrenewed-lease limitation) as `chidori resume`.
+            match crate::runtime::store::acquire_lease(
+                factory.store_for(session_id).as_ref(),
+                &lease_owner,
+                chrono::Duration::minutes(10),
+            ) {
+                Ok(Ok(_)) => {}
+                Ok(Err(holder)) => anyhow::bail!(
+                    "chat session {session_id} is already being driven by another process \
+                     (lease holder `{}`, expires {}). Two concurrent drivers would corrupt \
+                     the journal — close the other chat, or delete {} if the holder is dead.",
+                    holder.owner,
+                    holder.expires_at,
+                    run_dir.join("lease.json").display()
+                ),
+                Err(err) => {
+                    eprintln!("warning: could not take the session lease: {err}");
+                }
+            }
+            // Each turn rewrites the run's `input.json` with the full driven
+            // input, so it is the durable record of the dialogue state:
+            // restore the message list, and (unless overridden by flags) the
+            // session's system prompt and model.
+            if let Ok(text) = std::fs::read_to_string(run_dir.join("input.json")) {
+                if let Ok(saved) = serde_json::from_str::<Value>(&text) {
+                    if let Some(saved_messages) =
+                        saved.get("messages").and_then(Value::as_array)
+                    {
+                        messages = saved_messages
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect();
+                    }
+                    if system.is_none() {
+                        system = saved
+                            .get("system")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                    }
+                    if model.is_none() {
+                        model = saved.get("model").and_then(Value::as_str).map(String::from);
+                    }
+                }
+            }
+            // An explicit agent file must still match the recorded source
+            // fingerprints, exactly like `chidori resume`. The built-in agent
+            // is a compiled-in constant written to a fresh temp path each
+            // process, so path-keyed validation cannot apply to it.
+            if agent.is_some() {
+                crate::runtime::snapshot::validate_manifest_for_resume(
+                    &run_base,
+                    Some(session_id),
+                    &agent_path,
+                    false,
+                )
+                .context(
+                    "chat --resume refused: the agent source no longer matches this \
+                     session's journal",
+                )?;
+            }
+            session_id.clone()
+        }
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+
     // Chat always calls the model, so offer an OpenRouter sign-in up front when
     // no provider key is configured — building the registry after so it picks
     // up a freshly saved key.
@@ -1475,16 +1602,84 @@ fn cmd_chat(
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
         .with_policy(cli_policy(untrusted, trusted))
+        .with_persist_base(run_base)
         .with_workspace_root(abs_dir(&base_dir));
 
     eprintln!("chidori chat — type a message and press enter. Type 'exit' or Ctrl-D to quit.");
+    eprintln!(
+        "session {session_id}{}",
+        if resume.is_some() {
+            format!(" resumed with {} prior message(s)", messages.len())
+        } else {
+            String::new()
+        }
+    );
     if !tool_names.is_empty() {
         eprintln!("tools available: {}", tool_names.join(", "));
     }
 
-    let mut messages: Vec<String> = Vec::new();
-    let mut call_log: Vec<crate::runtime::call_log::CallRecord> = Vec::new();
     let stdin = std::io::stdin();
+
+    let build_input = |messages: &[String]| {
+        let mut input_value = serde_json::json!({ "messages": messages });
+        if let Some(system) = &system {
+            input_value["system"] = Value::String(system.clone());
+        }
+        if let Some(model) = &model {
+            input_value["model"] = Value::String(model.clone());
+        }
+        if !tool_names.is_empty() {
+            input_value["tools"] = serde_json::json!(tool_names);
+        }
+        input_value
+    };
+
+    // On `--resume`, re-drive the restored dialogue against the journal before
+    // reading new input: prior turns replay silently for $0, a final turn that
+    // was interrupted mid-generation completes live, and the transcript prints
+    // once, in order, so the human sees the conversation they are rejoining.
+    if resume.is_some() && !messages.is_empty() {
+        let input_value = build_input(&messages);
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+        // Discard deltas: the transcript dump below shows the whole dialogue,
+        // so streaming a completing tail turn here would print it twice.
+        let drain = std::thread::spawn(move || {
+            let mut rx = event_rx;
+            while rx.blocking_recv().is_some() {}
+        });
+        let result = engine.resume_run_streaming(
+            &agent_path,
+            &input_value,
+            call_log.clone(),
+            &session_id,
+            event_tx,
+        );
+        drain.join().ok();
+        match result {
+            Ok(result) => {
+                if let Some(turns) = result
+                    .output
+                    .get("transcript")
+                    .or_else(|| result.output.get("history"))
+                    .and_then(Value::as_array)
+                {
+                    for turn in turns {
+                        let text = turn.get("text").and_then(Value::as_str).unwrap_or("");
+                        match turn.get("role").and_then(Value::as_str) {
+                            Some("user") => println!("\nyou> {text}"),
+                            _ => println!("{text}"),
+                        }
+                    }
+                }
+                call_log = result.call_log.into_records();
+            }
+            Err(e) => {
+                // The journal on disk is untouched; the session can still
+                // continue (new turns replay the loaded log in memory).
+                eprintln!("\nerror: could not restore the session transcript: {e:#}");
+            }
+        }
+    }
 
     loop {
         print!("\nyou> ");
@@ -1505,16 +1700,7 @@ fn cmd_chat(
         }
 
         messages.push(message);
-        let mut input_value = serde_json::json!({ "messages": messages });
-        if let Some(system) = &system {
-            input_value["system"] = Value::String(system.clone());
-        }
-        if let Some(model) = &model {
-            input_value["model"] = Value::String(model.clone());
-        }
-        if !tool_names.is_empty() {
-            input_value["tools"] = serde_json::json!(tool_names);
-        }
+        let input_value = build_input(&messages);
 
         // Stream just the new turn's reply. The drain thread prints token
         // deltas while the engine runs; joining it before the next prompt is a
@@ -1535,8 +1721,13 @@ fn cmd_chat(
             streamed
         });
 
-        let result =
-            engine.run_with_replay_streaming(&agent_path, &input_value, call_log.clone(), event_tx);
+        let result = engine.resume_run_streaming(
+            &agent_path,
+            &input_value,
+            call_log.clone(),
+            &session_id,
+            event_tx,
+        );
         // event_tx was moved into the engine and is dropped when the run
         // returns, ending the drain loop; join flushes every queued delta
         // before we print anything else.
@@ -1565,12 +1756,31 @@ fn cmd_chat(
                 call_log = result.call_log.into_records();
             }
             Err(e) => {
-                // Drop the failed turn so the next message starts clean, and keep
-                // the prior call log (the failed turn left no durable record).
+                // Drop the failed turn so the next message starts clean, and
+                // keep the prior call log. The failed attempt may have
+                // journaled partial records on disk; the persister's
+                // monotonic floor lets the next successful turn rewrite the
+                // journal once its log grows past them.
                 messages.pop();
                 eprintln!("\nerror: {e:#}");
             }
         }
+    }
+
+    if resume.is_some() {
+        let _ = crate::runtime::store::release_lease(
+            factory.store_for(&session_id).as_ref(),
+            &lease_owner,
+        );
+    }
+    if !call_log.is_empty() {
+        let agent_arg = agent
+            .map(|p| format!("{} ", p.display()))
+            .unwrap_or_default();
+        eprintln!(
+            "session saved — continue with: chidori chat {agent_arg}--resume {session_id} \
+             (inspect: chidori trace {session_id})"
+        );
     }
 
     if let Some(temp_dir) = temp_dir {

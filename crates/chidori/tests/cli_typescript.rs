@@ -771,3 +771,139 @@ fn cli_resume_refuses_changed_agent_source() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+fn run_chidori_with_stdin(
+    args: &[&str],
+    cwd: &Path,
+    envs: &[(&str, &str)],
+    stdin_text: &str,
+) -> Output {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let mut command = Command::new(chidori_bin());
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_text.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+// `--stream` must run under the same posture as the plain `run` path: the
+// agent's directory is the implicit workspace root, and the run journals under
+// `.chidori/runs/<run_id>` — streaming changes progress reporting, not what
+// the runtime can do or what survives.
+#[test]
+fn cli_stream_matches_plain_run_posture() {
+    let dir = temp_project("stream-parity");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.workspace.write("out.txt", "streamed", { language: "text" });
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori(
+        &[
+            "run",
+            agent.to_str().unwrap(),
+            "--trusted",
+            "--stream",
+            "--input",
+            r#"{}"#,
+        ],
+        &dir,
+    );
+    assert_success(&output);
+    let events: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let done = events
+        .iter()
+        .find(|event| event["type"] == "done")
+        .expect("stream ended without a done event");
+    assert_eq!(done["status"], "completed");
+    let run_id = done["run_id"].as_str().expect("done event carries run_id");
+
+    // Workspace root defaulted to the agent's directory, no env var required.
+    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "streamed");
+
+    // The run journaled like a plain run: trace can read it back.
+    assert!(dir.join(".chidori").join("runs").join(run_id).exists());
+    assert_success(&run_chidori(&["trace", run_id], &dir));
+
+    fs::remove_dir_all(dir).ok();
+}
+
+// A chat session is a durable run: the session id is announced, every turn
+// journals under `.chidori/runs/<session_id>` with `input.json` holding the
+// dialogue state, and `--resume` replays the transcript and continues the
+// same session in place.
+#[test]
+fn cli_chat_session_persists_and_resumes() {
+    let dir = temp_project("chat-persist");
+    let envs = [("CHIDORI_TEST_LLM_RESPONSE", "canned reply")];
+
+    let output = run_chidori_with_stdin(&["chat"], &dir, &envs, "hello there\nexit\n");
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let session_id = stderr
+        .lines()
+        .find(|line| line.starts_with("session ") && !line.starts_with("session saved"))
+        .and_then(|line| line.strip_prefix("session "))
+        .map(|rest| rest.split_whitespace().next().unwrap().to_string())
+        .expect("chat announces its session id");
+    assert!(
+        stderr.contains("session saved"),
+        "exit should point at --resume/trace, got:\n{stderr}"
+    );
+
+    let run_dir = dir.join(".chidori").join("runs").join(&session_id);
+    let input: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("input.json")).unwrap()).unwrap();
+    assert_eq!(input["messages"], serde_json::json!(["hello there"]));
+
+    // Resume: the restored transcript prints (prior turn replayed from the
+    // journal), and the continued dialogue journals into the same run.
+    let output = run_chidori_with_stdin(
+        &["chat", "--resume", &session_id],
+        &dir,
+        &envs,
+        "second message\nexit\n",
+    );
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello there") && stdout.contains("canned reply"),
+        "resume should print the restored transcript, got:\n{stdout}"
+    );
+    let input: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("input.json")).unwrap()).unwrap();
+    assert_eq!(
+        input["messages"],
+        serde_json::json!(["hello there", "second message"])
+    );
+
+    // The session is an ordinary run to the rest of the toolchain.
+    assert_success(&run_chidori(&["trace", &session_id], &dir));
+
+    fs::remove_dir_all(dir).ok();
+}

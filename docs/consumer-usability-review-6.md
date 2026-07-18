@@ -283,6 +283,58 @@ the consumer trips.
 
 ---
 
+## Follow-up (2026-07-18): the two degraded-runtime findings are fixed
+
+Both wiring gaps were closed the same day and re-verified live on
+`deepseek-v4-flash` against this round's demo.
+
+**Finding 1 (`--stream`) — fixed.** `cmd_run_stream` now builds its engine
+with the same `.with_persist_base(...)` / `.with_workspace_root(...)` posture
+as the plain `run` path, announces `Run id:` on stderr (stdout stays pure
+NDJSON), and the final `done` event carries `run_id` plus an honest `status`
+(`completed` / `paused` with `pending_signal` / `failed`). Re-verified: the
+exact `ask.ts --stream` invocation that failed above now completes — workspace
+reads work, deltas stream, and the streamed run is a first-class citizen:
+
+```
+{"output":{...},"run_id":"a9056b93-...","status":"completed","type":"done"}
+$ chidori verify ask.ts a9056b93-...          # no provider keys set
+verified: 3 calls replayed, 3 workspace re-materialization(s), output identical — $0
+```
+
+**Finding 2 (ephemeral chat) — fixed.** A chat session is now an ordinary
+durable run: the session id is announced at start, every turn journals into
+`.chidori/runs/<session_id>` (each turn re-persists `input.json` with the full
+dialogue state), and exit prints the continuation command. New
+`chidori chat [FILE] --resume <session_id>` replays the journal — reprinting
+the transcript for $0 — and continues the conversation in place, with the same
+run-store hydration, source-fingerprint validation (for explicit agent files),
+and one-driver lease as `chidori resume`. Re-verified live, including the
+adversarial case: `kill -9` mid-generation lost only the streaming reply;
+`--resume` reprinted the transcript, completed the interrupted turn live, and
+a follow-up question ("what is **her** next milestone?") resolved its pronoun
+against the restored context — conversational state genuinely crossed
+processes:
+
+```
+$ printf 'And what is her next milestone?\nexit\n' | \
+    chidori chat ask.ts --resume 56602de2-...
+session 56602de2-... resumed with 1 prior message(s)
+
+you> Who owns the ClickHouse migration?
+Priya owns the ClickHouse migration.                 ← replayed, $0
+
+you> Priya's next milestone is the write-primary handoff to ClickHouse ...
+```
+
+Both fixes are pinned by new CLI integration tests
+(`cli_stream_matches_plain_run_posture`,
+`cli_chat_session_persists_and_resumes`), and `running-modes.md` / `llm.txt`
+now document the session lifecycle. Finding 3 (template error opacity) and
+Finding 4 (one-line docs for `template`/`memory`) remain open.
+
+---
+
 ## Appendix: selected verbatim output
 
 Week-1 trace tail (DeepSeek cache reads growing turn over turn; pricing
