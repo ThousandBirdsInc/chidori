@@ -42,11 +42,31 @@ const EFFECT_MARKERS: &[(&str, &str, &str)] = &[
     ("fetch(", "http", "fetch(...)"),
     ("node:http", "http", "node:http import"),
     ("node:https", "http", "node:https import"),
-    ("workspace.write(", "workspace:write", "chidori.workspace.write"),
-    ("workspace.delete(", "workspace:delete", "chidori.workspace.delete"),
-    ("workspace.remove(", "workspace:delete", "chidori.workspace.remove"),
-    ("workspace.read(", "workspace:read", "chidori.workspace.read"),
-    ("workspace.list(", "workspace:list", "chidori.workspace.list"),
+    (
+        "workspace.write(",
+        "workspace:write",
+        "chidori.workspace.write",
+    ),
+    (
+        "workspace.delete(",
+        "workspace:delete",
+        "chidori.workspace.delete",
+    ),
+    (
+        "workspace.remove(",
+        "workspace:delete",
+        "chidori.workspace.remove",
+    ),
+    (
+        "workspace.read(",
+        "workspace:read",
+        "chidori.workspace.read",
+    ),
+    (
+        "workspace.list(",
+        "workspace:list",
+        "chidori.workspace.list",
+    ),
     (
         "workspace.manifest(",
         "workspace:manifest",

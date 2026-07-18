@@ -830,7 +830,9 @@ pub async fn serve(
     eprintln!("              POST /sessions/{{id}}/signal     → deliver a signal to a run");
     eprintln!("              POST /sessions/{{id}}/cancel     → cancel running session");
     eprintln!("              POST /sessions/stream            → run with SSE events");
-    eprintln!("              GET  /sessions/{{id}}/stream     → re-attach: replay + follow SSE events");
+    eprintln!(
+        "              GET  /sessions/{{id}}/stream     → re-attach: replay + follow SSE events"
+    );
     eprintln!("  Health:     GET  /health");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

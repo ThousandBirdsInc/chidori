@@ -2835,7 +2835,10 @@ async fn event_noise_paths_404_without_running_the_agent() {
         let bytes = body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(bytes.is_empty(), "noise 404 must have an empty body: {path}");
+        assert!(
+            bytes.is_empty(),
+            "noise 404 must have an empty body: {path}"
+        );
     }
     assert!(
         state.session_store.list().unwrap().is_empty(),
@@ -2896,8 +2899,7 @@ async fn attach_stream_replays_settled_session_journal() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["status"], json!("completed"), "body: {body}");
 
-    let response =
-        attach_session_stream(State(state.clone()), Path("settled-1".to_string())).await;
+    let response = attach_session_stream(State(state.clone()), Path("settled-1".to_string())).await;
     assert_eq!(response.status(), StatusCode::OK);
     let sse_text = collect_sse(response).await;
     assert!(sse_text.contains("event: call"), "sse: {sse_text}");
@@ -2979,8 +2981,7 @@ async fn attach_stream_catches_up_and_follows_live_run() {
         "live tail must carry the consumed signal record: {attached_text}"
     );
     assert!(
-        attached_text.contains("event: done")
-            && attached_text.contains("\"status\":\"completed\""),
+        attached_text.contains("event: done") && attached_text.contains("\"status\":\"completed\""),
         "attached stream must follow to settlement: {attached_text}"
     );
 
@@ -3029,10 +3030,8 @@ fn preflight_flags_only_unconditionally_denied_targets() {
 
     // Read-only workspace introspection is on the untrusted allowlist → not
     // flagged.
-    let denied = preflight::denied_static_effects(
-        r#"await chidori.workspace.read("a.txt");"#,
-        &untrusted,
-    );
+    let denied =
+        preflight::denied_static_effects(r#"await chidori.workspace.read("a.txt");"#, &untrusted);
     assert!(denied.is_empty(), "denied: {denied:?}");
 
     // A deny-by-default policy with a SCOPED http allow rule can pass some
@@ -3057,8 +3056,9 @@ fn preflight_flags_only_unconditionally_denied_targets() {
 
     // Layered: a permissive server policy tightened by an untrusted session
     // profile denies http at the overlay → flagged.
-    let layered =
-        PolicyConfig::default().restricted_by(Arc::new(crate::policy::builtin_profile("untrusted").unwrap()));
+    let layered = PolicyConfig::default().restricted_by(Arc::new(
+        crate::policy::builtin_profile("untrusted").unwrap(),
+    ));
     let denied = preflight::denied_static_effects(HTTP_AGENT, &layered);
     assert_eq!(denied.len(), 1, "denied: {denied:?}");
     assert_eq!(denied[0].0.target, "http");

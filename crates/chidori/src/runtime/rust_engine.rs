@@ -2451,10 +2451,8 @@ mod tests {
         // behavior unchanged). Whitespace-only output counts as empty.
         let _env = PROMPT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ctx = RuntimeContext::new();
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-rust-nonempty-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("chidori-rust-nonempty-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.ts");
         let src = r#"

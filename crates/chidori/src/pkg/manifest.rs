@@ -110,8 +110,8 @@ impl Manifest {
 
     pub fn save(&self) -> Result<()> {
         let obj = self.value.as_object().expect("validated as object");
-        let mut out = serde_json::to_string_pretty(&ConventionallyOrdered(obj))
-            .expect("manifest serializes");
+        let mut out =
+            serde_json::to_string_pretty(&ConventionallyOrdered(obj)).expect("manifest serializes");
         out.push('\n');
         std::fs::write(&self.path, out).with_context(|| format!("writing {}", self.path.display()))
     }

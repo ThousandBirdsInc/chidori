@@ -188,7 +188,10 @@ mod tests {
             .render_string("line one\nHello {{ usernme }}!", &json!({"username": "x"}))
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("inline template"), "missing template name: {msg}");
+        assert!(
+            msg.contains("inline template"),
+            "missing template name: {msg}"
+        );
         assert!(msg.contains("undefined value"), "missing error kind: {msg}");
         assert!(msg.contains("`usernme`"), "missing variable name: {msg}");
         assert!(msg.contains("line 2"), "missing line number: {msg}");
@@ -202,7 +205,10 @@ mod tests {
             .render_string("{{ name | shuot }}", &json!({"name": "x"}))
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("inline template"), "missing template name: {msg}");
+        assert!(
+            msg.contains("inline template"),
+            "missing template name: {msg}"
+        );
         assert!(msg.contains("unknown filter"), "missing error kind: {msg}");
         assert!(msg.contains("shuot"), "missing filter name: {msg}");
         assert!(msg.contains("line 1"), "missing line number: {msg}");
@@ -221,7 +227,10 @@ mod tests {
             .render_file("summary.md.j2", &json!({"author": "a", "username": "x"}))
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("summary.md.j2"), "missing template path: {msg}");
+        assert!(
+            msg.contains("summary.md.j2"),
+            "missing template path: {msg}"
+        );
         assert!(msg.contains("undefined value"), "missing error kind: {msg}");
         assert!(msg.contains("`usernme`"), "missing variable name: {msg}");
         assert!(msg.contains("line 4"), "missing line number: {msg}");

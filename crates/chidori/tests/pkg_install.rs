@@ -194,8 +194,7 @@ fn handle(data: &MockRegistryData, base: &str, path: &str) -> Vec<u8> {
         .map(|(version, v)| {
             let integrity = format!(
                 "sha512-{}",
-                base64::engine::general_purpose::STANDARD
-                    .encode(sha2::Sha512::digest(&v.tarball))
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&v.tarball))
             );
             let mut vjson = serde_json::json!({
                 "name": name,
