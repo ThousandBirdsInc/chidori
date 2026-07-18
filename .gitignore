@@ -7,6 +7,9 @@
 # Vendored Test262 conformance suite (fetched by scripts/test262.sh, ~56k files)
 /vendor/test262/
 
+# wasm-bindgen output for the browser demo (regenerate with scripts/build-wasm.sh)
+/crates/chidori-wasm/www/pkg/
+
 # macOS
 .DS_Store
 

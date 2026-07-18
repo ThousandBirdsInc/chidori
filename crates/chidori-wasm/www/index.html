@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Chidori in the browser — durable replay on wasm</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    max-width: 60rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; }
+  p.sub { opacity: .75; margin-top: -.5rem; }
+  textarea {
+    width: 100%; min-height: 14rem; font-family: ui-monospace, monospace;
+    font-size: .85rem; box-sizing: border-box; padding: .6rem;
+  }
+  button { font-size: .95rem; padding: .4rem .9rem; margin-right: .5rem; }
+  button:disabled { opacity: .4; }
+  pre {
+    background: rgba(127,127,127,.12); padding: .8rem; border-radius: 6px;
+    white-space: pre-wrap; word-break: break-word; min-height: 6rem;
+  }
+  .cols { display: flex; gap: 1rem; flex-wrap: wrap; }
+  .cols > div { flex: 1 1 24rem; }
+  .live   { color: #b3261e; }
+  .replay { color: #1e7d32; }
+  @media (prefers-color-scheme: dark) {
+    .live { color: #ff8a80; } .replay { color: #7ae582; }
+  }
+</style>
+</head>
+<body>
+<h1>Chidori in the browser</h1>
+<p class="sub">
+  The pure-Rust chidori-js engine and its durable replay runtime, compiled to
+  WebAssembly. Host effects (<code>now</code>, <code>random</code>,
+  <code>httpFetch</code>) are served by this page and journaled; replaying the
+  journal re-runs the agent with <b>zero</b> live host calls.
+</p>
+
+<textarea id="bundle" spellcheck="false">
+async function main() {
+  const started = await now();
+  const fact = await httpFetch('./data/fact.json');
+  const roll = await random();
+  console.log('fact: ' + fact.text);
+  console.log('dice: ' + (Math.floor(roll * 6) + 1));
+  console.log('recorded at ' + started);
+}
+main();
+</textarea>
+
+<p>
+  <button id="run">▶ Run (record)</button>
+  <button id="replay" disabled>↺ Replay journal</button>
+</p>
+
+<div class="cols">
+  <div>
+    <h3>Agent console</h3>
+    <pre id="console"></pre>
+  </div>
+  <div>
+    <h3>Host-call log</h3>
+    <pre id="hostlog"></pre>
+  </div>
+</div>
+
+<script type="module">
+import init, { WasmRuntime } from './pkg/chidori_wasm.js';
+
+const EFFECTS = ['now', 'random', 'httpFetch'];
+const $ = (id) => document.getElementById(id);
+let blob = null; // the durable artifact from the last recorded run
+
+// The host: each effect is an async JS function. Only ever invoked at the
+// live frontier — during replay the journal answers instead.
+const host = {
+  now: async () => Date.now(),
+  random: async () => Math.random(),
+  httpFetch: async (url) => (await fetch(url)).json(),
+};
+
+// The pump: run the VM until it blocks on a host call, perform the call in
+// the browser, journal the result, continue. Returns the number of live calls.
+async function drive(rt, hostlog) {
+  let live = 0;
+  for (;;) {
+    const status = JSON.parse(rt.runUntilBlocked());
+    if (status.status === 'completed') return live;
+    const { opId, name, args } = status;
+    live += 1;
+    hostlog.append(Object.assign(document.createElement('span'), {
+      className: 'live', textContent: `live   ${name}(${JSON.stringify(args).slice(1, -1)})\n`,
+    }));
+    try {
+      const result = await host[name](...args);
+      rt.resolveOp(opId, JSON.stringify(result ?? null));
+    } catch (e) {
+      rt.rejectOp(opId, String(e));
+    }
+  }
+}
+
+function show(rt, live, mode) {
+  $('console').textContent = rt.consoleLines().join('\n');
+  const note = Object.assign(document.createElement('span'), {
+    className: mode, textContent: `— ${mode}: ${live} live host call(s) —\n`,
+  });
+  $('hostlog').append(note);
+}
+
+async function run() {
+  $('console').textContent = ''; $('hostlog').textContent = '';
+  const rt = new WasmRuntime($('bundle').value, EFFECTS);
+  const live = await drive(rt, $('hostlog'));
+  blob = rt.toBlob();
+  show(rt, live, 'live');
+  $('replay').disabled = false;
+  window.__lastRun = { live, console: rt.consoleLines() };
+}
+
+async function replay() {
+  $('console').textContent = ''; $('hostlog').textContent = '';
+  const rt = WasmRuntime.fromBlob(blob);
+  const live = await drive(rt, $('hostlog'));
+  show(rt, live, 'replay');
+  window.__lastRun = { live, console: rt.consoleLines() };
+}
+
+await init();
+$('run').addEventListener('click', () => run().catch(err => { $('console').textContent = String(err); }));
+$('replay').addEventListener('click', () => replay().catch(err => { $('console').textContent = String(err); }));
+window.__chidoriReady = true;
+</script>
+</body>
+</html>

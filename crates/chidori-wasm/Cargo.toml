@@ -1,0 +1,28 @@
+[package]
+name = "chidori-wasm"
+version = "0.1.0"
+edition = "2021"
+# oxc 0.133 (via chidori-js) relies on `if let` guards, stabilized in Rust 1.95.
+rust-version = "1.95"
+description = "Browser embedding of the chidori-js engine and durable replay runtime, via wasm-bindgen."
+publish = false
+readme.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib for the wasm-bindgen artifact; rlib so the native workspace build and
+# `cargo test --workspace` can compile and run this crate's unit tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+chidori-js = { path = "../chidori-js", version = "0.3.3" }
+serde_json = "1"
+# Kept in lockstep with the wasm-bindgen-cli version used by
+# scripts/build-wasm.sh — the CLI refuses to process a module built by a
+# different crate version.
+wasm-bindgen = "0.2.126"
+
+# Workspace-wide lint levels (see [workspace.lints] in the root Cargo.toml).
+[lints]
+workspace = true
