@@ -1,10 +1,15 @@
 {
   "rules": [
-    { "target": "http", "decision": "always_allow", "reason": "commander probes the ops API and pages on-call" },
+    {
+      "target": "http",
+      "decision": "always_allow",
+      "match_args": { "url_prefix": "http://127.0.0.1:9911/" },
+      "reason": "commander may reach the ops API (status, runbooks, paging, mitigation) — nothing else"
+    },
     { "target": "workspace:write", "decision": "always_allow", "reason": "publishes the postmortem under incidents/" },
     { "target": "workspace:read", "decision": "always_allow" },
     { "target": "workspace:list", "decision": "always_allow" }
   ],
   "default": "never_allow",
-  "default_reason": "war-room server allows only ops-API http and postmortem writes"
+  "default_reason": "war-room server allows only the ops API and postmortem writes (see policy.json)"
 }

@@ -62,11 +62,38 @@ fn parse_user_pricing(raw: &str) -> Vec<(String, UserPricing)> {
     }
 }
 
-fn user_pricing_for(model: &str) -> Option<&'static UserPricing> {
-    user_pricing()
+/// Pricing recorded in a run's manifest (the `CHIDORI_PRICING` value that was
+/// live when the run executed), installed by `trace`/`stats` so cost display
+/// works in any shell without re-exporting the env var. The live env var, when
+/// set, still wins — it is the operator's current word.
+fn journaled_pricing() -> &'static std::sync::RwLock<Vec<(String, UserPricing)>> {
+    static TABLE: std::sync::OnceLock<std::sync::RwLock<Vec<(String, UserPricing)>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// Install a pricing table recorded in a run manifest as the fallback for
+/// cost estimation (consulted after `CHIDORI_PRICING`, before the built-in
+/// table). Replaces any previously installed fallback, so per-run callers
+/// (`stats`) can install each run's own recorded table.
+pub fn install_journaled_pricing(raw: &str) {
+    *journaled_pricing().write().unwrap() = parse_user_pricing(raw);
+}
+
+fn user_pricing_for(model: &str) -> Option<UserPricing> {
+    if let Some(pricing) = user_pricing()
         .iter()
         .find(|(prefix, _)| model.starts_with(prefix.as_str()))
-        .map(|(_, pricing)| pricing)
+        .map(|(_, pricing)| pricing.clone())
+    {
+        return Some(pricing);
+    }
+    journaled_pricing()
+        .read()
+        .unwrap()
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix.as_str()))
+        .map(|(_, pricing)| pricing.clone())
 }
 
 const PRICING: &[Pricing] = &[

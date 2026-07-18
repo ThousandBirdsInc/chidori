@@ -37,8 +37,10 @@ node ops_api.mjs &
 export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com
 export CHIDORI_OPENAI_COMPAT_KEY=sk-...
 export CHIDORI_MODEL=deepseek-v4-flash
-export CHIDORI_POLICY_FILE=policy.json
+export CHIDORI_POLICY_FILE=policy.json        # http scoped to the ops API via url_prefix
 export CHIDORI_HTTP_ALLOW_HOSTS=127.0.0.1     # ops API is loopback; SSRF guard needs the opt-in
+export CHIDORI_API_KEY=$(openssl rand -hex 16)  # bearer auth; clients pass it as apiKey
+export WARROOM_API_KEY=$CHIDORI_API_KEY         # picked up by dashboard.mjs / responder.mjs
 chidori serve commander.ts --port 8787
 
 # 3. the dashboard opens the incident and streams it
@@ -52,6 +54,16 @@ node responder.mjs <sessionId> approve mitigate --as sam
 
 Let the first `paused` deadline lapse to watch the commander page the
 secondary on-call instead of stalling forever.
+
+Or open the incident from a **webhook** instead of the dashboard — a pausing
+event run comes back as `202` with a real session id you can signal:
+
+```bash
+curl -s -H "Authorization: Bearer $CHIDORI_API_KEY" -H content-type:application/json \
+  -X POST http://127.0.0.1:8787/alerts/pagerduty \
+  -d '{"alert":{"id":"INC-7002","service":"checkout-api","summary":"5xx spike"}}'
+# → {"id":"<sessionId>","status":"paused","pending_signal_names":["approve","note","escalate"],...}
+```
 
 ## What this exercises
 

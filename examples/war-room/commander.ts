@@ -121,7 +121,7 @@ run(
         `Error rate: ${alert.errorRate ?? "unknown"}\nLog excerpt:\n${alert.logs ?? "(none)"}\n\n` +
         'Reply as JSON: {"severity": "SEV1"|"SEV2"|"SEV3", "hypothesis": string, "customerImpact": string}',
       { type: "progress", format: "json", maxTokens: 2000 },
-    )) as unknown as Triage;
+    )) as Triage;
     timeline.push(`triaged ${triage.severity}: ${triage.hypothesis}`);
     await chidori.log("triage", { severity: triage.severity });
 

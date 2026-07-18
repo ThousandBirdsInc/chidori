@@ -617,7 +617,7 @@ pub(super) fn agent_error_string(agent_path: &FsPath, e: &anyhow::Error) -> Stri
 /// and the pending-pause fields (input prompt / signal listen set + timeout
 /// deadline / approval). Shared by session creation, the durable resume tail,
 /// and the streaming supervisor so every path surfaces pauses identically.
-fn apply_run_outcome(session: &mut StoredSession, run_result: RunResult) {
+pub(super) fn apply_run_outcome(session: &mut StoredSession, run_result: RunResult) {
     session.run_id = Some(run_result.run_id);
     session.call_log = run_result.call_log.into_records();
     session.output = None;

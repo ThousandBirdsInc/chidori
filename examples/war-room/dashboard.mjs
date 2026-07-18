@@ -6,7 +6,12 @@
 import { AgentClient, isSignalQueued } from "@1kbirds/chidori";
 
 const serverUrl = process.argv[2] ?? "http://127.0.0.1:8787";
-const client = new AgentClient(serverUrl, { timeoutMs: 30_000 });
+// WARROOM_API_KEY: the server's CHIDORI_API_KEY when auth is on (production
+// posture); the SDK sends it as a bearer token on every request incl. SSE.
+const client = new AgentClient(serverUrl, {
+  timeoutMs: 30_000,
+  apiKey: process.env.WARROOM_API_KEY,
+});
 
 const alert = {
   id: "INC-4207",

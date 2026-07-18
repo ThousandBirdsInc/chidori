@@ -45,7 +45,7 @@ under `CHIDORI_API_KEY` bearer auth.
 | Full multiplayer incident, first attempt: stream → context note from "dana" (`delivered_live`, in-process resume on the same SSE stream) → plan revised → approve from "sam" → mitigation POST → postmortem published | **Completed first try, 42s**, 17 recorded calls, $0.0013 |
 | Unattended incident (15s war-room deadline, nobody answers) | **Exactly as designed**: three server-side deadlines fired on one live stream, two real pages hit the ops API, stand-down postmortem written; 68s |
 | `kill -9` the server while the war room is paused; restart | **Pause survived perfectly**: status `paused`, fan-in names and deadline intact; approve resolved the durable pause and the rest of the run (mitigation, postmortem, publish) completed inside that one request — with the pre-crash context note in the output |
-| …but the pause's **expired timeout** after that restart | **Never fired.** 60+ s past the persisted deadline: still `paused`, no page. [signals.md](./signals.md) promises timers are "re-armed for every paused session at server startup" (Finding 3) |
+| …but the pause's **expired timeout** after that restart | ~~Never fired~~ — **finding retracted**: the deadline was still 3 minutes in the future during the poll, and the manual approve preempted the correctly re-armed timer. Deterministic repro shows boot re-arm works in every shape (Finding 3, [retracted](#follow-up-2026-07-18-fixes-landed-and-one-finding-retracted)) |
 | `chidori verify` on the crash-spanning multiplayer run | **exit 0 in 30ms, $0**, output identical — a multiplayer run that survived SIGKILL is a valid CI fixture |
 | Replay of a completed run (invalid provider key) | 33ms, $0, correct output — reported as "16 replayed, **1 executed live**", which is actually a workspace re-materialization that rewrites the published file's mtime on every replay (Finding 7) |
 | Server under `CHIDORI_API_KEY` (the production checklist's posture) vs the official SDKs | **Both SDKs locked out — neither can send a bearer token at all** (Finding 1) |
@@ -57,10 +57,12 @@ under `CHIDORI_API_KEY` bearer auth.
 Same shape as every prior round, sharper than ever: **the engine went nine
 for nine** — nothing in the recording, replay, pause, mailbox, or
 crash-recovery machinery so much as flinched, under SIGKILL, with humans
-racing the process. What failed is everything *around* the engine that a
-team shipping to users touches first: the client SDK can't authenticate,
-the webhook surface strands runs, the restart path drops timers, and the
-operator can't see denials happening.
+racing the process. (On re-verification it went ten for ten: the one
+engine-side finding, the restart timer, was my own test error — see the
+follow-up.) What failed is everything *around* the engine that a team
+shipping to users touches first: the client SDK can't authenticate, the
+webhook surface strands runs, and the operator can't see denials
+happening.
 
 ## The verdict up front
 
@@ -77,12 +79,12 @@ But this round's premise was "now ship it," and on that premise the sharp
 edges are not cosmetic. Following the project's own production checklist
 locks the project's own SDKs out of the server (Finding 1). Pointing a
 webhook at the flagship event surface silently strands paid-for runs
-(Finding 2). The restart that the deployment docs call "the recovery
-mechanism" quietly breaks the paging deadline the agent was designed around
-(Finding 3). None of these are deep flaws — every one looks like a week of
-work — but all of them sit on the exact path from "demo that thrilled me"
-to "service my team uses," and three of five directly contradict a
-documented promise.
+(Finding 2). (A third apparent contradiction — the restart dropping the
+paging deadline, Finding 3 — turned out on re-verification to be my own
+test error; retracted in the follow-up.) None of these are deep flaws —
+every one looks like a week of work — but all of them sit on the exact
+path from "demo that thrilled me" to "service my team uses," and two
+directly contradict a documented promise.
 
 ---
 
@@ -173,6 +175,11 @@ running-modes.md, and say out loud that signal deadlines are enforced only
 by a live server.
 
 ## Finding 3: signal deadlines do not re-arm after a restart
+
+> **RETRACTED (same day).** This finding was a test error on my side, not a
+> framework bug — see the [follow-up](#follow-up-2026-07-18-fixes-landed-and-one-finding-retracted)
+> for the disproof and what actually happened. The original text is kept
+> below unedited, as a record of how convincing a false negative can look.
 
 **Severity: durability promise broken · direct docs contradiction**
 
@@ -391,17 +398,106 @@ with the run.
 ## Where that leaves a round-5 consumer
 
 Rounds 1–4 asked whether the engine can be trusted; they answered yes, and
-round 5 re-confirmed it nine for nine under the most adversarial conditions
-yet. Round 5's question was whether a team can *put this in front of
-users*, and the answer is: **not on the documented path, today** — not
-because anything is architecturally wrong, but because the last mile is
-unfinished in five specific, small places: an SDK auth option (Finding 1),
-a session handle for event runs (Finding 2), a boot-time timer scan
-(Finding 3), signal events on the stream (Finding 4), a stderr line per
-denial (Finding 5). None of these looks like more than days of work. The
-distance between this framework and a shippable multiplayer-agent platform
-is one focused sprint on the serving surface — the engine underneath it is
-already there.
+round 5 re-confirmed it under the most adversarial conditions yet. Round
+5's question was whether a team can *put this in front of users*, and the
+answer at review time was: **not on the documented path, today** — not
+because anything is architecturally wrong, but because the last mile was
+unfinished in specific, small places: an SDK auth option (Finding 1), a
+session handle for event runs (Finding 2), signal events on the stream
+(Finding 4), a stderr line per denial (Finding 5). (The boot-time timer
+scan this list originally included was Finding 3, since retracted — it
+already worked.) None of these looked like more than days of work, and the
+[follow-up](#follow-up-2026-07-18-fixes-landed-and-one-finding-retracted)
+below confirms it: all of them landed the next day. The engine underneath
+was already there.
+
+## Follow-up (2026-07-18): fixes landed, and one finding retracted
+
+All findings were re-worked the day after the review, with regression tests;
+each item below names what shipped. One finding did not survive its own
+re-verification and is retracted.
+
+**Finding 3 — RETRACTED (my test error, not a framework bug).** Rebuilding
+the crash timeline from the artifacts showed the "expired" deadline
+(`00:10:47`) was still **three minutes in the future** during my 60-second
+poll — the 300s `timeoutMs` I had set for the crash scenario put it well
+past the restart, I misread it as already-past, and my manual `approve`
+then resolved the pause before the (correctly re-armed) timer could ever
+fire. A deterministic mock-provider reproduction of all three shapes —
+deadline already expired at boot, deadline still in the future at boot, and
+the exact war-room shape (an in-process live resume before the crash) —
+shows the boot re-arm firing correctly every time, including an immediate
+fire for an already-expired deadline. The behavior signals.md promises is
+real; a regression test now pins it
+(`signal_timeout_rearm_fires_for_deadline_persisted_by_a_dead_server`).
+Left as a lesson: the failure looked exactly like rounds 1–4's real
+failure-path bugs, and I stopped verifying one step too early.
+
+**Finding 1 — fixed.** Both SDKs authenticate: `new AgentClient(url,
+{ apiKey })` (TypeScript) / `AgentClient(url, api_key=...)` (Python) send
+the bearer token on every request including the SSE stream, with a
+`headers` escape hatch (an explicit `Authorization` wins). Covered by SDK
+tests; the deployment docs and both SDK READMEs now show it, and the
+war-room dashboard/responder use it via `WARROOM_API_KEY`.
+
+**Finding 2 — fixed.** An event-driven run that pauses is now persisted as
+a **real session** and answered `202 Accepted` with the session view (id,
+status, pending signal names), so a webhook can open a war room and hand
+its caller the id to drive it; completed event runs stay stateless (no
+session row per scanner probe), and event runs now respect the same
+concurrency semaphore as sessions. The event dict shape and both behaviors
+are documented in running-modes.md and llm.txt. Regression tests:
+`event_run_that_pauses_becomes_a_deliverable_session`,
+`event_run_that_completes_stays_stateless`. The CLI half also landed:
+`chidori resume` reaching a signal pause now prints the same
+deliver-instructions message `chidori run` does (naming the server-side
+nature of delivery and deadlines) instead of a bare `null`.
+
+**Finding 4 — fixed.** The consumed signal record now rides the live SSE
+stream as a `call` event (it was the one host call the stream omitted), so
+a dashboard can render "note from human:dana" the moment it lands —
+asserted in `stream_session_resolves_signal_pause_in_process`. And
+`chidori trace` renders signal results inline
+(`signal_any {...} ← note from human:dana: {"text":"..."}`, with timeout
+and empty-poll variants), so the trace finally is the multiplayer audit
+trail signals.md advertises.
+
+**Finding 5 — fixed.** Policy and SSRF denials now print one line to the
+server/CLI **stderr** at the moment they fire (the full self-remedying
+message), in addition to the journal — a tool loop can still swallow the
+error, but the operator hears it. The policy-file schema is documented in
+sandbox-model.md (shape, targets, decisions, `match_args` semantics, the
+fail-closed guarantee). And scoping `http` by host is now expressible *and
+safe*: the discovery here was that string `match_args` had always
+substring-matched (undocumented — and unsafe as a boundary, since
+`{"url": "http://ops:9911/"}` would also match that text inside a hostile
+URL's query string); the new reserved `url_prefix` key **anchors** at the
+start of the URL (`url_prefix_match_args_anchor_at_the_start` pins the
+bypass case). The war-room policy.json now uses it.
+
+**Finding 6 — partly fixed, partly a release step.** In the SDK source:
+`prompt(text, { format: "json" })` now types as `Promise<AgentJson>` (no
+more double-cast), and `stream()` accepts `{ policyProfile }` like `run()`.
+`Session.runId`/`pendingDetails` and the fan-in overload were already in
+the repo SDK — the remaining gap is *publishing*: the npm/PyPI packages
+must ship in lockstep with the runtime (both now sit at 3.6.1 in-tree;
+cutting the release is a maintainer step this branch can't perform). A
+stream re-attach endpoint remains future work.
+
+**Finding 7 — fixed.** `chidori resume` reports the honest split —
+`N recorded calls replayed, M workspace re-materialization(s), K executed
+live` — instead of folding re-materializations into "executed live";
+llm.txt's `verify` description now says workspace writes re-materialize
+(same bytes, fresh mtime) rather than "no writes"; and `chidori stats`
+counts in-VM `defineTool` invocations (journaled as `mark("tool:...")`)
+instead of reporting `Tool calls: 0` for the most common agent shape.
+
+With these landed, the review's bottom line moves: the five "one focused
+sprint" items are done (four in this branch, publishing remains), and the
+sharpest sentence in the verdict — *"not on the documented path, today"* —
+no longer holds for auth, webhooks, or observability. What remains open:
+SDK package publishing, and a stream re-attach endpoint for dashboards
+that lose their SSE connection.
 
 ## Appendix: what was run
 

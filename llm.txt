@@ -61,8 +61,10 @@ chidori resume agents/my_agent.ts <run_id>  # replay a recorded run byte-for-byt
 chidori resume agents/my_agent.ts <run_id> --trusted  # crash recovery of a trusted tool-using run:
                                             # same posture flags as `run`; continuation journals into the same run dir
 chidori resume agents/my_agent.ts <run_id> --allow-source-change  # edit-and-resume: replay against edited code (divergence-checked)
-chidori verify agents/my_agent.ts <run_id>  # checkpoint-as-test: replay with NO provider, deny-all policy, no writes;
+chidori verify agents/my_agent.ts <run_id>  # checkpoint-as-test: replay with NO provider and a deny-all policy;
                                             # asserts completion with byte-identical output. Exit 0 = pass. Built for CI.
+                                            # Journaled workspace writes DO re-materialize on disk (reported as
+                                            # "N workspace re-materialization(s)") — same bytes, fresh mtime.
 chidori trace <run_id>
 chidori snapshot <run_id>
 ```
@@ -724,6 +726,11 @@ Session endpoints:
 - `POST /sessions/{id}/cancel`: cancel a running session.
 - `POST /sessions/{id}/replay`: replay from a call-log checkpoint.
 - `POST /sessions/stream`: run with SSE events.
+- `ANY /*` (any other route): the request is folded into
+  `{event: {method, path, headers, query, body}}` and run as the agent's
+  input. `{status, body, headers?}` output shapes the HTTP response; a run
+  that PAUSES (signal/input/approval) is stored as a real session and
+  answered 202 with the session view, so the caller can deliver/resume it.
 
 Sessions persist across server restarts by default (SQLite at
 `.chidori/sessions.sqlite3` next to the agent). `CHIDORI_DB_PATH` overrides
@@ -735,6 +742,8 @@ the path; `CHIDORI_DB_PATH=:memory:` opts out of durable sessions.
 import { AgentClient, Checkpoint } from "@1kbirds/chidori";
 
 const client = new AgentClient("http://localhost:8080");
+// Production server (CHIDORI_API_KEY set): pass { apiKey } — sent as a
+// bearer token on every request including stream(). Python: api_key=...
 const session = await client.run({ document: "Rust is a systems language." });
 
 const checkpoint = await session.checkpoint();

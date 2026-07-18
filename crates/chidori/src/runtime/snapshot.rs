@@ -811,6 +811,12 @@ pub struct SnapshotManifest {
     /// `None` on manifests written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// The `CHIDORI_PRICING` table that was live when the run executed, so
+    /// `trace`/`stats` can price the run in any shell without the operator
+    /// re-exporting the env var. `None` when no table was set (or on
+    /// manifests written before this field existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<String>,
     pub call_log_len: usize,
     pub snapshot_file: String,
     pub created_at: DateTime<Utc>,
@@ -840,6 +846,7 @@ impl SnapshotManifest {
             capabilities: CapabilityLedger::new(),
             vfs: crate::runtime::vfs::Vfs::new(),
             default_model: None,
+            pricing: None,
             call_log_len,
             snapshot_file: SNAPSHOT_BLOB_FILE.to_string(),
             created_at: Utc::now(),
@@ -848,6 +855,11 @@ impl SnapshotManifest {
 
     pub fn with_default_model(mut self, model: Option<String>) -> Self {
         self.default_model = model;
+        self
+    }
+
+    pub fn with_pricing(mut self, pricing: Option<String>) -> Self {
+        self.pricing = pricing;
         self
     }
 

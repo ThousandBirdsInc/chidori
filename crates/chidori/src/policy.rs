@@ -46,7 +46,12 @@ impl Decision {
 /// A single rule. `target` is "tool:<name>" / "http" / "workspace:<action>"
 /// (where `<action>` is `list` / `read` / `write` / `delete` / `manifest`) /
 /// "*". `match_args` is an optional JSON subset that must be contained in the
-/// call args for the rule to apply.
+/// call args for the rule to apply. String values SUBSTRING-match (`"url":
+/// "/status/"` matches any URL containing it); the reserved key `url_prefix`
+/// ANCHORS instead — it matches when the call's `url` string starts with the
+/// given prefix, which is the right shape for scoping `http` to a host
+/// (`{"url_prefix": "https://api.example.com/"}`) since an unanchored
+/// substring would also match that text embedded in a hostile URL's query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
     pub target: String,
@@ -375,9 +380,19 @@ pub fn prompt_operator_approval(
 /// recursive for objects). Lists require equality.
 fn value_contains(args: &Value, pattern: &Value) -> bool {
     match (args, pattern) {
-        (Value::Object(a), Value::Object(p)) => p
-            .iter()
-            .all(|(k, pv)| a.get(k).map(|av| value_contains(av, pv)).unwrap_or(false)),
+        (Value::Object(a), Value::Object(p)) => p.iter().all(|(k, pv)| {
+            // Reserved key: `url_prefix` anchors against the call's `url`
+            // (see `PolicyRule`). `starts_with` rather than `contains`, so a
+            // rule scoping `http` to a host cannot be satisfied by that host
+            // appearing inside a hostile URL's path or query string.
+            if k == "url_prefix" {
+                return match (a.get("url"), pv) {
+                    (Some(Value::String(url)), Value::String(prefix)) => url.starts_with(prefix),
+                    _ => false,
+                };
+            }
+            a.get(k).map(|av| value_contains(av, pv)).unwrap_or(false)
+        }),
         (Value::String(a), Value::String(p)) => a.contains(p.as_str()),
         (a, p) => a == p,
     }
@@ -617,6 +632,42 @@ mod tests {
                 "{target} should be allowed"
             );
         }
+    }
+
+    #[test]
+    fn url_prefix_match_args_anchor_at_the_start() {
+        // The production rule "this agent talks to this host only": allow
+        // http scoped by an ANCHORED url prefix, deny everything else.
+        let cfg: PolicyConfig = serde_json::from_value(json!({
+            "rules": [{
+                "target": "http",
+                "decision": "always_allow",
+                "match_args": { "url_prefix": "http://ops.internal:9911/" }
+            }],
+            "default": "never_allow"
+        }))
+        .unwrap();
+
+        let (decision, _) =
+            cfg.decide("http", &json!({ "url": "http://ops.internal:9911/status/x" }));
+        assert_eq!(decision, Decision::AlwaysAllow);
+
+        // A different host is denied…
+        let (decision, _) = cfg.decide("http", &json!({ "url": "http://evil.example/" }));
+        assert_eq!(decision, Decision::NeverAllow);
+
+        // …and so is the allowed prefix appearing INSIDE a hostile URL —
+        // the unanchored substring semantics of plain string match_args
+        // would have been satisfied here.
+        let (decision, _) = cfg.decide(
+            "http",
+            &json!({ "url": "http://evil.example/?u=http://ops.internal:9911/" }),
+        );
+        assert_eq!(decision, Decision::NeverAllow);
+
+        // No `url` in the args at all: the prefix rule cannot match.
+        let (decision, _) = cfg.decide("http", &json!({}));
+        assert_eq!(decision, Decision::NeverAllow);
     }
 
     #[test]

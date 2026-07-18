@@ -2460,6 +2460,18 @@ async fn stream_session_resolves_signal_pause_in_process() {
         sse_text.contains("\"status\":\"completed\""),
         "sse: {sse_text}"
     );
+    // The consumed signal itself must ride the stream as a `call` event —
+    // it is the one record carrying `{name, payload, from}`, and a
+    // dashboard cannot show who steered the run without it (the resumed
+    // run's replayed records deliberately re-emit nothing).
+    assert!(
+        sse_text.contains("\"function\":\"signal\""),
+        "sse must carry the consumed signal record: {sse_text}"
+    );
+    assert!(
+        sse_text.contains("\"id\":\"mara\""),
+        "sse signal record must carry sender provenance: {sse_text}"
+    );
 
     // Determinism: the same agent driven through the durable
     // create→deliver path records the identical signal call.
@@ -2598,6 +2610,160 @@ async fn stream_session_signal_timeout_resolves_in_process() {
     assert!(
         sse_text.contains("\"status\":\"completed\""),
         "sse: {sse_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Round-5 review regressions: boot re-arm of signal deadlines, and the
+// event-driven surface's handling of pausing runs.
+// ---------------------------------------------------------------------------
+
+/// A signal-pause deadline persisted by a server that died must fire after a
+/// restart: the boot loop (`run()` in mod.rs) re-arms `arm_signal_timeout`
+/// for every stored session, and an already-expired deadline resolves to the
+/// timeout sentinel immediately. Documented in `docs/signals.md` ("re-armed
+/// for every paused session at server startup").
+#[tokio::test]
+async fn signal_timeout_rearm_fires_for_deadline_persisted_by_a_dead_server() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("chidori-signal-rearm-{}", uuid::Uuid::new_v4()));
+    let agent_path = write_agent(
+        &temp_dir,
+        r#"
+            export async function agent(input, chidori) {
+                const result = await chidori.signal("review", { timeoutMs: 60000 });
+                return { timedOut: result.timedOut === true };
+            }
+        "#,
+    );
+    let state = signal_test_state(&temp_dir, agent_path.clone());
+
+    // Pause with a distant deadline (the first server's own timer is armed
+    // for 60s — far past this test), then simulate that server dying and a
+    // replacement booting AFTER the deadline: rewrite the persisted deadline
+    // into the past, as wall clock passing would have.
+    create_paused_session(&state, "rearm-1", json!({})).await;
+    let mut stored = state.session_store.get("rearm-1").unwrap().unwrap();
+    assert!(stored.pending_signal_deadline.is_some());
+    stored.pending_signal_deadline = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+    state.session_store.put(&stored).unwrap();
+
+    // "Restart": a fresh AppState (empty active_sessions, new semaphore)
+    // over the SAME session store and run directory, running the same boot
+    // re-arm loop the server's startup runs.
+    let mut restarted = test_state(temp_dir.join(".chidori").join("runs"), agent_path);
+    restarted.session_store = state.session_store.clone();
+    restarted.run_semaphore = Arc::new(Semaphore::new(4));
+    restarted.acquire_timeout = std::time::Duration::from_secs(30);
+    for session in restarted.session_store.list().unwrap() {
+        arm_signal_timeout(&restarted, &session);
+    }
+
+    let stored = wait_for_status(&restarted, "rearm-1", SessionStatus::Completed).await;
+    assert_eq!(stored.output, Some(json!({ "timedOut": true })));
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// An event-driven run (`ANY /*`) that pauses at a signal listen point must
+/// become a real, deliverable session: 202 Accepted carrying the session
+/// view (id + pending names), not a bare `null` that strands the journaled
+/// run. Delivering the signal then completes it.
+#[tokio::test]
+async fn event_run_that_pauses_becomes_a_deliverable_session() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("chidori-event-pause-{}", uuid::Uuid::new_v4()));
+    let agent_path = write_agent(
+        &temp_dir,
+        r#"
+            export async function agent(input, chidori) {
+                if (!input.event) return { status: 400, body: { error: "no event" } };
+                const go = await chidori.signal("go");
+                return { done: true, via: input.event.path, by: go.from.id };
+            }
+        "#,
+    );
+    let state = signal_test_state(&temp_dir, agent_path);
+
+    let response = handle_event(
+        State(state.clone()),
+        axum::http::Method::POST,
+        "/alerts/pagerduty".parse().unwrap(),
+        axum::http::HeaderMap::new(),
+        axum::extract::Query(HashMap::new()),
+        axum::body::Bytes::from_static(b"{\"alert\":\"redis down\"}"),
+    )
+    .await;
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "paused event run: {body}");
+    assert_eq!(body["status"], json!("paused"));
+    assert_eq!(body["pending_signal_name"], json!("go"));
+    let id = body["id"].as_str().expect("session id").to_string();
+    assert!(
+        state.session_store.get(&id).unwrap().is_some(),
+        "paused event run must be stored as a session"
+    );
+
+    let (status, body) = response_json(
+        signal_session(
+            State(state.clone()),
+            Path(id),
+            Json(SignalRequest {
+                allow_source_change: false,
+                name: "go".to_string(),
+                payload: json!({}),
+                from: json!({ "kind": "human", "id": "dana" }),
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["output"],
+        json!({ "done": true, "via": "/alerts/pagerduty", "by": "dana" })
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// An event-driven run that completes stays stateless: the response mapping
+/// (`{status, body}` honored as the HTTP response) is unchanged, and no
+/// session row is stored — stray probes must not grow the session store.
+#[tokio::test]
+async fn event_run_that_completes_stays_stateless() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("chidori-event-complete-{}", uuid::Uuid::new_v4()));
+    let agent_path = write_agent(
+        &temp_dir,
+        r#"
+            export async function agent(input) {
+                if (!input.event || !input.event.body || !input.event.body.alert) {
+                    return { status: 400, body: { error: "no alert in request" } };
+                }
+                return { status: 200, body: { ok: true } };
+            }
+        "#,
+    );
+    let state = signal_test_state(&temp_dir, agent_path);
+
+    let response = handle_event(
+        State(state.clone()),
+        axum::http::Method::GET,
+        "/favicon.ico".parse().unwrap(),
+        axum::http::HeaderMap::new(),
+        axum::extract::Query(HashMap::new()),
+        axum::body::Bytes::new(),
+    )
+    .await;
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], json!("no alert in request"));
+    assert!(
+        state.session_store.list().unwrap().is_empty(),
+        "completed event runs must not store sessions"
     );
 
     let _ = std::fs::remove_dir_all(temp_dir);

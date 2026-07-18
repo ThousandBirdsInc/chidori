@@ -22,7 +22,9 @@ const payload =
   name === "approve" ? { decision: args[0] ?? "mitigate" } :
   {};
 
-const client = new AgentClient(process.env.WARROOM_URL ?? "http://127.0.0.1:8787");
+const client = new AgentClient(process.env.WARROOM_URL ?? "http://127.0.0.1:8787", {
+  apiKey: process.env.WARROOM_API_KEY,
+});
 const result = await client.signal(sessionId, {
   name,
   payload,

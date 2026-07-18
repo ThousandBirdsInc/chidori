@@ -64,6 +64,49 @@ describe("health", () => {
   });
 });
 
+describe("auth", () => {
+  it("sends Authorization: Bearer on GET, POST, and stream when apiKey is set", async () => {
+    const authed = new AgentClient(server.baseUrl, { apiKey: "secret-1" });
+    const seen = [];
+    server.on((req, res, { url }) => {
+      seen.push([url.pathname, req.headers.authorization]);
+      if (url.pathname === "/sessions/stream") {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write('event: done\ndata: {"id":"s","status":"completed"}\n\n');
+        res.end();
+        return;
+      }
+      sendJson(res, 200, { id: "s", status: "completed" });
+    });
+
+    await authed.health();
+    await authed.run({});
+    for await (const _evt of authed.stream({})) {
+      // drain
+    }
+    assert.deepEqual(
+      seen.map(([, auth]) => auth),
+      ["Bearer secret-1", "Bearer secret-1", "Bearer secret-1"],
+    );
+  });
+
+  it("lets an explicit headers.Authorization override apiKey, and sends none by default", async () => {
+    const overridden = new AgentClient(server.baseUrl, {
+      apiKey: "ignored",
+      headers: { Authorization: "Bearer winner" },
+    });
+    const plain = new AgentClient(server.baseUrl);
+    const seen = [];
+    server.on((req, res) => {
+      seen.push(req.headers.authorization);
+      sendJson(res, 200, { status: "ok" });
+    });
+    await overridden.health();
+    await plain.health();
+    assert.deepEqual(seen, ["Bearer winner", undefined]);
+  });
+});
+
 describe("run", () => {
   it("POSTs the input to /sessions and returns a completed Session", async () => {
     server.on((req, res, { url }) => {
