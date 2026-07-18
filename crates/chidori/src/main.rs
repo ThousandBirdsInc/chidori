@@ -1546,9 +1546,7 @@ fn cmd_chat(
             // session's system prompt and model.
             if let Ok(text) = std::fs::read_to_string(run_dir.join("input.json")) {
                 if let Ok(saved) = serde_json::from_str::<Value>(&text) {
-                    if let Some(saved_messages) =
-                        saved.get("messages").and_then(Value::as_array)
-                    {
+                    if let Some(saved_messages) = saved.get("messages").and_then(Value::as_array) {
                         messages = saved_messages
                             .iter()
                             .filter_map(Value::as_str)
