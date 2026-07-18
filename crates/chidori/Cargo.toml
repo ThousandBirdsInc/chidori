@@ -92,6 +92,10 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 
+# Checkpoint export: `chidori checkpoint export <run_id>` archives a run dir
+# as a .tar.gz so a golden eval case's fixture can be committed to git or
+# attached to a tael case without knowing the `.chidori/runs/` layout.
+
 # TypeScript-to-JavaScript stripping. Replaces a hand-rolled line-based stripper
 # that missed constructs like type predicates (`(t): t is string => ...`),
 # `satisfies` in odd positions, and overload signatures. oxc parses to a real

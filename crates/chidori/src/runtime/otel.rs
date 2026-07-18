@@ -103,9 +103,10 @@ pub fn shutdown_on_exit() {
 
 /// Flush any currently buffered spans without shutting down the exporter.
 ///
-/// Long-lived embedders can call this after an agent turn when traces should be
-/// visible immediately in an OTLP backend such as Tael.
-#[allow(dead_code)]
+/// The engine calls this at every run-end boundary (while its Tokio runtime is
+/// still alive — see `emit_otel` in `engine.rs`); long-lived embedders can also
+/// call it after an agent turn when traces should be visible immediately in an
+/// OTLP backend such as Tael.
 pub fn force_flush() {
     if let Some(Some(h)) = HANDLE.get() {
         h.force_flush();
@@ -140,6 +141,17 @@ fn try_init() -> Option<OtelHandle> {
     Some(OtelHandle { provider })
 }
 
+/// Branch attribution for a call record: which `chidori.branch` variant the
+/// call executed inside. Stamped as `chidori.branch_id` / `chidori.branch_label`
+/// span attributes so a branch fan-out's subtrees are filterable per variant
+/// in an OTLP backend (`tael experiment compare`, `tael query traces
+/// --attribute chidori.branch_label=...`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchTag {
+    pub branch_id: String,
+    pub label: String,
+}
+
 /// Incremental span-emission state for a run. Records stream in as calls
 /// complete; a record whose parent span isn't emitted yet waits in `pending`
 /// until the parent arrives (a child is recorded before its parent during live
@@ -150,8 +162,9 @@ struct EmitState {
     ctx_by_seq: HashMap<u64, Context>,
     /// seqs already emitted as spans (idempotency + parent-ready checks).
     emitted: HashSet<u64>,
-    /// Records whose parent span hasn't been emitted yet, awaiting it.
-    pending: Vec<CallRecord>,
+    /// Records whose parent span hasn't been emitted yet, awaiting it,
+    /// each with its branch attribution (None outside `chidori.branch`).
+    pending: Vec<(CallRecord, Option<BranchTag>)>,
 }
 
 /// A live parent span for one agent run. [`stream_record`](RunSpan::stream_record)
@@ -169,17 +182,37 @@ pub struct RunSpan {
 
 /// Start a root span for an agent run if OTEL is active. Returns None when
 /// tracing is disabled so callers can skip the per-call cost entirely.
-pub fn start_run_span(agent_name: &str, run_id: &str) -> Option<Arc<RunSpan>> {
+///
+/// `checkpoint_path` is the persisted run directory (`.chidori/runs/<run id>/`)
+/// when persistence is on; it's stamped as `chidori.checkpoint_path` so tooling
+/// can go from a trace straight to the replayable artifact ($0 `chidori resume`,
+/// `chidori branch-rerun` from the anchored state).
+pub fn start_run_span(
+    agent_name: &str,
+    run_id: &str,
+    checkpoint_path: Option<&std::path::Path>,
+) -> Option<Arc<RunSpan>> {
     init_from_env()?;
+
+    let mut attrs = vec![
+        KeyValue::new("agent.name", agent_name.to_string()),
+        KeyValue::new("agent.run_id", run_id.to_string()),
+        // `chidori.run_id` is the stable, product-named join key between a
+        // tael trace and the replayable run (`chidori resume <file> <run_id>`).
+        KeyValue::new("chidori.run_id", run_id.to_string()),
+    ];
+    if let Some(path) = checkpoint_path {
+        attrs.push(KeyValue::new(
+            "chidori.checkpoint_path",
+            path.display().to_string(),
+        ));
+    }
 
     let tracer = global::tracer(TRACER_NAME);
     let span = tracer
         .span_builder(format!("agent.run {agent_name}"))
         .with_kind(SpanKind::Internal)
-        .with_attributes(vec![
-            KeyValue::new("agent.name", agent_name.to_string()),
-            KeyValue::new("agent.run_id", run_id.to_string()),
-        ])
+        .with_attributes(attrs)
         .start(&tracer);
 
     let parent_cx = Context::current_with_span(span);
@@ -211,12 +244,20 @@ impl RunSpan {
     /// during the run, with the OTLP batch processor handling the wire batching,
     /// instead of all at once at the end. Idempotent per seq; safe to call from
     /// `record_call`.
+    #[cfg_attr(not(test), allow(dead_code))] // Production spans go through `stream_record_tagged`.
     pub fn stream_record(&self, record: CallRecord) {
+        self.stream_record_tagged(record, None);
+    }
+
+    /// [`stream_record`](Self::stream_record) with branch attribution: calls
+    /// made inside a `chidori.branch` variant stamp `chidori.branch_id` /
+    /// `chidori.branch_label` so each variant renders as a filterable subtree.
+    pub fn stream_record_tagged(&self, record: CallRecord, branch: Option<BranchTag>) {
         let mut state = self.emit.lock().unwrap();
         if state.emitted.contains(&record.seq) {
             return;
         }
-        state.pending.push(record);
+        state.pending.push((record, branch));
         self.drain_ready(&mut state);
     }
 
@@ -226,10 +267,10 @@ impl RunSpan {
         while let Some(pos) = state
             .pending
             .iter()
-            .position(|r| r.parent_seq.is_none_or(|p| state.emitted.contains(&p)))
+            .position(|(r, _)| r.parent_seq.is_none_or(|p| state.emitted.contains(&p)))
         {
-            let record = state.pending.remove(pos);
-            self.emit_one(state, &record);
+            let (record, branch) = state.pending.remove(pos);
+            self.emit_one(state, &record, branch.as_ref());
         }
     }
 
@@ -242,22 +283,22 @@ impl RunSpan {
             let pos = state
                 .pending
                 .iter()
-                .position(|r| r.parent_seq.is_none_or(|p| state.emitted.contains(&p)))
+                .position(|(r, _)| r.parent_seq.is_none_or(|p| state.emitted.contains(&p)))
                 .unwrap_or(0);
-            let record = state.pending.remove(pos);
-            self.emit_one(state, &record);
+            let (record, branch) = state.pending.remove(pos);
+            self.emit_one(state, &record, branch.as_ref());
         }
     }
 
     /// Build and emit `record`'s span under its parent's context (or the run
     /// span), recording its context for descendants.
-    fn emit_one(&self, state: &mut EmitState, record: &CallRecord) {
+    fn emit_one(&self, state: &mut EmitState, record: &CallRecord, branch: Option<&BranchTag>) {
         let span_ctx = {
             let parent_cx = record
                 .parent_seq
                 .and_then(|p| state.ctx_by_seq.get(&p))
                 .unwrap_or(&self.parent_cx);
-            self.build_call_span(record, parent_cx)
+            self.build_call_span(record, parent_cx, branch)
         };
         state.ctx_by_seq.insert(
             record.seq,
@@ -275,6 +316,7 @@ impl RunSpan {
         &self,
         record: &CallRecord,
         parent_cx: &Context,
+        branch: Option<&BranchTag>,
     ) -> opentelemetry::trace::SpanContext {
         let tracer = global::tracer(TRACER_NAME);
 
@@ -284,16 +326,33 @@ impl RunSpan {
         let mut attrs = vec![
             KeyValue::new("agent.name", self.agent_name.clone()),
             KeyValue::new("agent.run_id", self.run_id.clone()),
+            KeyValue::new("chidori.run_id", self.run_id.clone()),
             KeyValue::new("call.seq", record.seq as i64),
             KeyValue::new("call.function", record.function.clone()),
             KeyValue::new("call.duration_ms", record.duration_ms as i64),
         ];
+
+        // Branch attribution: which `chidori.branch` variant this call ran
+        // inside, so an A/B fan-out is comparable per variant in the backend.
+        if let Some(tag) = branch {
+            attrs.push(KeyValue::new("chidori.branch_id", tag.branch_id.clone()));
+            attrs.push(KeyValue::new("chidori.branch_label", tag.label.clone()));
+        }
 
         // Surface the LLM model if present — the most commonly filtered-on
         // attribute for cost and latency debugging. Uses the OTEL semantic
         // convention for GenAI.
         if let Some(model) = record.args.get("model").and_then(|v| v.as_str()) {
             attrs.push(KeyValue::new("gen_ai.request.model", model.to_string()));
+        }
+        // Mirror the prompt's content-addressed request digest (already in the
+        // call-log args) onto the span: a stable join key for "the same prompt
+        // across runs" in a backend's attribute/SQL layer.
+        if let Some(digest) = record.args.get("request_digest").and_then(|v| v.as_str()) {
+            attrs.push(KeyValue::new(
+                "chidori.prompt.request_digest",
+                digest.to_string(),
+            ));
         }
         if let Some(usage) = &record.token_usage {
             attrs.push(KeyValue::new(
@@ -1016,6 +1075,70 @@ mod tests {
             total.map(|a| &a.value),
             Some(opentelemetry::Value::I64(17))
         ));
+    }
+
+    #[test]
+    fn call_spans_stamp_chidori_run_id_and_prompt_digest() {
+        let mut r = rec(1, None, "prompt");
+        r.args = json!({ "model": "claude", "request_digest": "abc123" });
+        let spans = emit_and_collect(std::slice::from_ref(&r));
+        let call = span_by_seq(&spans, 1);
+        let attr = |key: &str| {
+            call.attributes
+                .iter()
+                .find(|a| a.key.as_str() == key)
+                .map(|a| a.value.as_str().into_owned())
+        };
+        assert_eq!(attr("chidori.run_id").as_deref(), Some("r1"));
+        assert_eq!(
+            attr("chidori.prompt.request_digest").as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn branch_tagged_records_stamp_branch_id_and_label() {
+        let _guard = PROVIDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+            .build();
+        global::set_tracer_provider(provider.clone());
+
+        let run = run_span_for_test("agent", "r1");
+        // A branch op (seq 1) with one tagged call inside variant "retry" and
+        // one untagged sibling outside the branch.
+        run.stream_record(rec(1, None, "branch"));
+        run.stream_record_tagged(
+            rec(2, Some(1), "prompt"),
+            Some(BranchTag {
+                branch_id: "r1-op1-branch-0".to_string(),
+                label: "retry".to_string(),
+            }),
+        );
+        run.stream_record(rec(3, None, "log"));
+        run.finish(None);
+        let _ = provider.force_flush();
+        let spans = exporter.get_finished_spans().unwrap();
+
+        let tagged = span_by_seq(&spans, 2);
+        let attr = |s: &SpanData, key: &str| {
+            s.attributes
+                .iter()
+                .find(|a| a.key.as_str() == key)
+                .map(|a| a.value.as_str().into_owned())
+        };
+        assert_eq!(
+            attr(tagged, "chidori.branch_id").as_deref(),
+            Some("r1-op1-branch-0")
+        );
+        assert_eq!(
+            attr(tagged, "chidori.branch_label").as_deref(),
+            Some("retry")
+        );
+        // Untagged sibling carries no branch attribution.
+        let untagged = span_by_seq(&spans, 3);
+        assert_eq!(attr(untagged, "chidori.branch_label"), None);
     }
 
     #[test]

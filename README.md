@@ -338,10 +338,38 @@ human-in-the-loop pause/resume loop — see
   compatible set is pure-ESM, native-free packages using only the shimmed
   builtins — `chidori add` warns when a package falls outside it. See
   [package management](./docs/package-management.md#compatibility).
+- **Self-improving agents / harness engineering** — the same durability
+  machinery is a substrate for the self-improvement loop: mine failures from
+  traces, fork a controlled experiment from the failure's exact anchored state
+  with `chidori.branch`, validate against golden cases whose fixtures are
+  checkpoints (replayed byte-for-byte at $0), and regression-guard the win by
+  committing the checkpoint. See the runnable
+  [self-harness-loop demo](./examples/self-harness-loop/) and
+  [Observing runs with Tael](./docs/observing-with-tael.md).
 
 Agents reach all of this through a fixed set of host functions on the `chidori`
 object — see [**Core concepts**](./docs/core-concepts.md) for the full list and
 [`llm.txt`](./llm.txt) for the complete API reference.
+
+### Observing runs with Tael
+
+Every run emits standard OTLP spans — one per host call, with `gen_ai.*` token
+and cache attributes on prompts and `chidori.run_id` on every span, so a trace
+in your observability backend points straight back at the replayable run:
+
+```bash
+tael serve                                                  # OTLP on :4317
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+chidori run examples/agents/worker.ts --input task="..." --tools examples/tools
+
+tael query traces --attribute chidori.run_id=<run-id>       # find the run's spans
+tael get trace <trace-id> --format table                    # waterfall + replay pointer
+tael experiment compare <run-id>                            # a chidori.branch A/B, per variant
+```
+
+Any OTLP backend works; [tael](https://github.com/ThousandBirds/app-tael) adds
+the run↔trace round trip and checkpoint-backed golden eval cases. Full guide:
+[Observing runs with Tael](./docs/observing-with-tael.md).
 
 ## ⚖️ How Chidori Compares
 
@@ -399,6 +427,7 @@ deterministic, replayable, and testable for free.
 | [Durable storage](./docs/durable-storage.md) | The run store: append-only journal, SQLite / Durable Object mirrors, hydration, strict durability, leases, `--until-seq` |
 | [Deployment](./docs/deployment.md) | Running in production: config, durability tiers, recipes for a plain VM / Fly.io / Kubernetes, failure & recovery |
 | [Rust style guide](./docs/rust-style-guide.md) | Conventions for contributing Rust: error handling, panics, tracing, async, `unsafe` policy, testing |
+| [Observing runs with Tael](./docs/observing-with-tael.md) | OTLP export, run↔trace correlation, checkpoint-backed golden cases, the self-harness loop |
 | [Python SDK](./sdk/python/README.md) · [TypeScript SDK](./sdk/typescript/README.md) | HTTP clients with no native bindings |
 | [`llm.txt`](./llm.txt) | Complete API reference, optimized for LLMs generating agents |
 

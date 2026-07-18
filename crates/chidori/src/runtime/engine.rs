@@ -864,10 +864,12 @@ impl Engine {
 
         // Enable persistence if configured: the filesystem run dir, teed with
         // the durable mirror when one is set up (`docs/durable-storage.md`).
-        if let Some(ref factory) = self.run_store {
+        // The run dir is kept so the OTEL run span can advertise it
+        // (`chidori.checkpoint_path`) — the trace→replayable-artifact pointer.
+        let persist_run_dir = if let Some(ref factory) = self.run_store {
             let run_id = ctx.run_id();
             let run_dir = factory.run_base().join(&run_id);
-            ctx.enable_persistence_with_store(run_dir, factory.store_for(&run_id));
+            ctx.enable_persistence_with_store(run_dir.clone(), factory.store_for(&run_id));
             // Save the input alongside the checkpoint for later resume/trace.
             if let Some(store) = ctx.store() {
                 let _ = store.put_blob(
@@ -877,7 +879,10 @@ impl Engine {
                         .as_bytes(),
                 );
             }
-        }
+            Some(run_dir)
+        } else {
+            None
+        };
 
         // Start a root OTEL span for this run. No-op when OTEL is disabled
         // (i.e. OTEL_EXPORTER_OTLP_ENDPOINT is unset). The `_otel_guard`
@@ -894,7 +899,9 @@ impl Engine {
         // one-time init and the per-call span emissions well-formed.
         let _tokio_guard = self.tokio_rt.enter();
         info!(agent = %agent_name, run_id = %run_id, "agent run start");
-        if let Some(run_span) = crate::runtime::otel::start_run_span(&agent_name, &run_id) {
+        if let Some(run_span) =
+            crate::runtime::otel::start_run_span(&agent_name, &run_id, persist_run_dir.as_deref())
+        {
             ctx.set_otel_run(run_span);
         }
 
@@ -908,6 +915,13 @@ impl Engine {
         let emit_otel = |ctx: &RuntimeContext, error: Option<&str>| {
             if let Some(otel) = ctx.otel_run() {
                 otel.finish(error);
+                // Ship everything now, while this engine's Tokio runtime — the
+                // one the batch processor's background task was spawned on — is
+                // still alive. A short-lived CLI command drops the engine (and
+                // its runtime) before `main`'s `shutdown_on_exit`, which would
+                // otherwise find the exporter channel closed with every span
+                // of the run still buffered and unsent.
+                crate::runtime::otel::force_flush();
             }
         };
 
