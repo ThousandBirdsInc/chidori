@@ -33,7 +33,7 @@ pub fn execute_durable_json_call_at_seq(
     live: impl FnOnce() -> Result<Value>,
 ) -> Result<Value> {
     if let Some(record) = ctx
-        .try_replay_checked(seq, function)
+        .try_replay_checked(seq, function, Some(&args))
         .map_err(|err| anyhow::anyhow!(err))?
     {
         // A replayed call's `live()` is skipped. If it was a container (a tool
@@ -209,7 +209,7 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         .to_string();
     let seq = ctx.next_seq();
     if let Some(record) = ctx
-        .try_replay_checked(seq, "input")
+        .try_replay_checked(seq, "input", None)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -338,7 +338,7 @@ pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "signal")
+        .try_replay_checked(seq, "signal", Some(&match_args))
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -407,7 +407,7 @@ pub fn execute_signal_any(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "signal_any")
+        .try_replay_checked(seq, "signal_any", Some(&match_args))
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -477,7 +477,7 @@ pub fn execute_poll_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> 
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "poll_signal")
+        .try_replay_checked(seq, "poll_signal", Some(&match_args))
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -557,7 +557,7 @@ pub fn execute_step_begin(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     let seq = ctx.next_seq();
 
     if let Some(record) = ctx
-        .try_replay_checked(seq, "step")
+        .try_replay_checked(seq, "step", None)
         .map_err(|err| anyhow::anyhow!(err))?
     {
         let recorded_name = record
@@ -790,7 +790,7 @@ pub fn execute_prompt_text(
     apply_model_override(ctx, &mut request);
     let seq = ctx.next_seq();
     if let Some(record) = ctx
-        .try_replay_checked(seq, "prompt")
+        .try_replay_checked(seq, "prompt", Some(&args))
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return Ok(record.result);
@@ -881,7 +881,7 @@ pub fn execute_prompt_response(
     apply_model_override(ctx, &mut request);
     let seq = ctx.next_seq();
     if let Some(record) = ctx
-        .try_replay_checked(seq, "prompt")
+        .try_replay_checked(seq, "prompt", Some(&args))
         .map_err(|err| anyhow::anyhow!(err))?
     {
         return llm_response_from_json(&record.result).ok_or_else(|| {

@@ -693,7 +693,7 @@ fn execute_captured_random(
 ) -> std::result::Result<Vec<u8>, String> {
     use crate::runtime::capability::Capability;
     let seq = ctx.next_seq();
-    match ctx.try_replay_checked(seq, "crypto.random") {
+    match ctx.try_replay_checked(seq, "crypto.random", None) {
         Ok(Some(record)) => {
             ctx.note_capability(Capability::CryptoRandom, seq);
             let b64 = record

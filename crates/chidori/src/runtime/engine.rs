@@ -265,6 +265,23 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    /// [`run_with_replay`](Self::run_with_replay) in strict mode: a cached call
+    /// whose recorded arguments differ from what the agent passes now aborts as
+    /// divergence instead of silently returning the recorded result. The
+    /// regression-test mode behind `chidori resume --ci` — a checkpoint used as
+    /// a golden fixture should fail loudly when the agent drifts, not paper
+    /// over the change with stale cached results.
+    pub fn run_with_replay_strict(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::with_replay(replay_log);
+        ctx.set_strict_replay_args(true);
+        self.run_with_context(path, inputs, ctx)
+    }
+
     pub fn run_with_replay_and_host_promises(
         &self,
         path: &Path,
@@ -531,15 +548,20 @@ impl Engine {
             }
         }
 
-        // Enable on-disk persistence if configured.
-        if let Some(ref base) = self.persist_base {
+        // Enable on-disk persistence if configured. The run dir is kept so the
+        // OTEL run span can advertise it (`chidori.checkpoint_path`) — the
+        // trace→replayable-artifact pointer.
+        let persist_run_dir = if let Some(ref base) = self.persist_base {
             let run_dir = ctx.enable_persistence(base.clone());
             // Save the input alongside the checkpoint for later resume/trace.
             let _ = std::fs::write(
                 run_dir.join("input.json"),
                 serde_json::to_string_pretty(inputs).unwrap_or_default(),
             );
-        }
+            Some(run_dir)
+        } else {
+            None
+        };
 
         // Start a root OTEL span for this run. No-op when OTEL is disabled
         // (i.e. OTEL_EXPORTER_OTLP_ENDPOINT is unset). The `_otel_guard`
@@ -556,7 +578,9 @@ impl Engine {
         // one-time init and the per-call span emissions well-formed.
         let _tokio_guard = self.tokio_rt.enter();
         info!(agent = %agent_name, run_id = %run_id, "agent run start");
-        if let Some(run_span) = crate::runtime::otel::start_run_span(&agent_name, &run_id) {
+        if let Some(run_span) =
+            crate::runtime::otel::start_run_span(&agent_name, &run_id, persist_run_dir.as_deref())
+        {
             ctx.set_otel_run(run_span);
         }
 
@@ -570,6 +594,13 @@ impl Engine {
         let emit_otel = |ctx: &RuntimeContext, error: Option<&str>| {
             if let Some(otel) = ctx.otel_run() {
                 otel.finish(error);
+                // Ship everything now, while this engine's Tokio runtime — the
+                // one the batch processor's background task was spawned on — is
+                // still alive. A short-lived CLI command drops the engine (and
+                // its runtime) before `main`'s `shutdown_on_exit`, which would
+                // otherwise find the exporter channel closed with every span
+                // of the run still buffered and unsent.
+                crate::runtime::otel::force_flush();
             }
         };
 

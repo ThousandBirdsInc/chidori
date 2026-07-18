@@ -266,10 +266,38 @@ human-in-the-loop pause/resume loop — see
 - **Cost-efficient prompting** — structural [prompt
   caching](./docs/context-management.md) re-bills stable prefixes at the cached
   rate, and replay pays zero tokens.
+- **Self-improving agents / harness engineering** — the same durability
+  machinery is a substrate for the self-improvement loop: mine failures from
+  traces, fork a controlled experiment from the failure's exact anchored state
+  with `chidori.branch`, validate against golden cases whose fixtures are
+  checkpoints (replayed byte-for-byte at $0), and regression-guard the win by
+  committing the checkpoint. See the runnable
+  [self-harness-loop demo](./examples/self-harness-loop/) and
+  [Observing runs with Tael](./docs/observing-with-tael.md).
 
 Agents reach all of this through a fixed set of host functions on the `chidori`
 object — see [**Core concepts**](./docs/core-concepts.md) for the full list and
 [`llm.txt`](./llm.txt) for the complete API reference.
+
+### Observing runs with Tael
+
+Every run emits standard OTLP spans — one per host call, with `gen_ai.*` token
+and cache attributes on prompts and `chidori.run_id` on every span, so a trace
+in your observability backend points straight back at the replayable run:
+
+```bash
+tael serve                                                  # OTLP on :4317
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+chidori run examples/agents/worker.ts --input task="..." --tools examples/tools
+
+tael query traces --attribute chidori.run_id=<run-id>       # find the run's spans
+tael get trace <trace-id> --format table                    # waterfall + replay pointer
+tael experiment compare <run-id>                            # a chidori.branch A/B, per variant
+```
+
+Any OTLP backend works; [tael](https://github.com/ThousandBirds/app-tael) adds
+the run↔trace round trip and checkpoint-backed golden eval cases. Full guide:
+[Observing runs with Tael](./docs/observing-with-tael.md).
 
 ## ⚖️ How Chidori Compares
 
@@ -319,6 +347,7 @@ deterministic, replayable, and testable for free.
 | [Sandbox & security model](./docs/sandbox-model.md) | Deny-by-default policy, capability injection, resource limits |
 | [Context management & caching](./docs/context-management.md) | Immutable contexts, compaction, cost accounting |
 | [Signals & multiplayer](./docs/signals.md) | Named listen points, mailboxes, fan-in |
+| [Observing runs with Tael](./docs/observing-with-tael.md) | OTLP export, run↔trace correlation, checkpoint-backed golden cases, the self-harness loop |
 | [Python SDK](./sdk/python/README.md) · [TypeScript SDK](./sdk/typescript/README.md) | HTTP clients with no native bindings |
 | [`llm.txt`](./llm.txt) | Complete API reference, optimized for LLMs generating agents |
 

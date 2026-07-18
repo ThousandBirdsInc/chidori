@@ -314,6 +314,9 @@ fn run_branches_live(
                 let branch_id = format!("{parent_run_id}-op{branch_seq}-branch-{index}");
                 let branch_ctx =
                     RuntimeContext::for_branch(ctx, branch_id.clone(), range.start - 1, branch_seq);
+                // Stamp variant identity on the branch's OTEL spans so each
+                // fan-out subtree is filterable by `chidori.branch_label`.
+                branch_ctx.set_otel_branch(branch_id.clone(), variant.label.clone());
                 let branch_backend = backend
                     .with_runtime_ctx(branch_ctx.clone())
                     .ok_or("chidori.branch requires the runtime host backend")?;

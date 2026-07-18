@@ -185,6 +185,17 @@ struct RuntimeContextInner {
     /// ranges outside the parent branch's reserved range and break the
     /// disjointness invariant, so `run_branches` rejects it up front.
     pub is_branch: bool,
+    /// Branch attribution for OTEL spans: the `chidori.branch` variant this
+    /// context executes (id + label). Set by `run_branches` right after
+    /// `for_branch`; every call recorded here stamps `chidori.branch_id` /
+    /// `chidori.branch_label` on its span so a fan-out's subtrees are
+    /// filterable per variant in the backend.
+    pub otel_branch: Option<crate::runtime::otel::BranchTag>,
+    /// Strict replay (the `chidori resume --ci` regression mode): a cached
+    /// call whose recorded args differ from what the agent passes now is
+    /// divergence, not a silent cache hit. Off by default — normal replay is
+    /// deliberately tolerant of cosmetic arg changes.
+    pub strict_replay_args: bool,
     /// Optional host-supplied model override (Pi-style save point). When set,
     /// every prompt host call (`execute_prompt_text` / `execute_prompt_response`)
     /// consults it just before sending and, if it yields `Some(model)`, swaps
@@ -347,6 +358,8 @@ impl RuntimeContext {
                 vfs: vfs_from_seed_env(),
                 is_branch: false,
                 model_override: None,
+                otel_branch: None,
+                strict_replay_args: false,
             })),
         }
     }
@@ -414,6 +427,8 @@ impl RuntimeContext {
                 vfs,
                 is_branch: false,
                 model_override: None,
+                otel_branch: None,
+                strict_replay_args: false,
             })),
         }
     }
@@ -451,6 +466,8 @@ impl RuntimeContext {
                 vfs: vfs_from_seed_env(),
                 is_branch: false,
                 model_override: None,
+                otel_branch: None,
+                strict_replay_args: false,
             })),
         }
     }
@@ -498,6 +515,8 @@ impl RuntimeContext {
                 vfs: parent_inner.vfs.clone(),
                 is_branch: true,
                 model_override: parent_inner.model_override.clone(),
+                otel_branch: None,
+                strict_replay_args: false,
             })),
         }
     }
@@ -546,6 +565,8 @@ impl RuntimeContext {
                 vfs,
                 is_branch: true,
                 model_override: None,
+                otel_branch: None,
+                strict_replay_args: false,
             })),
         }
     }
@@ -672,21 +693,52 @@ impl RuntimeContext {
     ///                      what the agent is calling now. The agent code
     ///                      changed since the checkpoint was saved. The
     ///                      engine should abort the replay with a clear error.
+    ///
+    /// `live_args` are the arguments the agent is passing *now*. Normally
+    /// ignored (replay is keyed on seq + function so cosmetic arg changes
+    /// don't invalidate a checkpoint), but under strict replay
+    /// ([`set_strict_replay_args`](Self::set_strict_replay_args) — the
+    /// `chidori resume --ci` regression mode) a mismatch against the recorded
+    /// args is divergence: the agent no longer makes the same call.
     pub fn try_replay_checked(
         &self,
         seq: u64,
         expected_fn: &str,
+        live_args: Option<&serde_json::Value>,
     ) -> Result<Option<CallRecord>, String> {
+        let strict = self.inner.lock().unwrap().strict_replay_args;
         match self.try_replay(seq) {
             None => Ok(None),
-            Some(record) if record.function == expected_fn => Ok(Some(record)),
-            Some(record) => Err(format!(
+            Some(record) if record.function != expected_fn => Err(format!(
                 "Replay divergence at seq {}: checkpoint has `{}` but agent called `{}`. \
                  The agent code changed since the checkpoint was saved — \
                  re-run without replay to regenerate.",
                 seq, record.function, expected_fn
             )),
+            Some(record) => {
+                if strict {
+                    if let Some(live) = live_args {
+                        if *live != record.args {
+                            return Err(format!(
+                                "Replay divergence at seq {} (`{}`): the agent now passes \
+                                 different arguments than the checkpoint recorded. \
+                                 recorded: {} — live: {}",
+                                seq, expected_fn, record.args, live
+                            ));
+                        }
+                    }
+                }
+                Ok(Some(record))
+            }
         }
+    }
+
+    /// Enable strict replay: a cached call whose recorded args differ from the
+    /// args the agent passes now is treated as divergence instead of silently
+    /// returning the recorded result. Used by `chidori resume --ci` so a
+    /// checkpoint doubles as a byte-identical regression fixture.
+    pub fn set_strict_replay_args(&self, strict: bool) {
+        self.inner.lock().unwrap().strict_replay_args = strict;
     }
 
     /// Reconcile the sequence counter (and active log) with the nested host
@@ -761,6 +813,7 @@ impl RuntimeContext {
         // calls (try_replay / absorb_replayed_subtree) don't re-emit. The
         // `RuntimeEvent::Call` stream below is the other real-time surface.
         let otel = inner.otel_run.clone();
+        let otel_branch = inner.otel_branch.clone();
         if inner.emit_call_events {
             if let Some(ref tx) = inner.event_sender {
                 let _ = tx.send(RuntimeEvent::Call(record.clone()));
@@ -768,7 +821,7 @@ impl RuntimeContext {
         }
         drop(inner);
         if let Some(otel) = otel {
-            otel.stream_record(record);
+            otel.stream_record_tagged(record, otel_branch);
         }
     }
 
@@ -972,6 +1025,14 @@ impl RuntimeContext {
 
     pub fn otel_run(&self) -> Option<Arc<RunSpan>> {
         self.inner.lock().unwrap().otel_run.clone()
+    }
+
+    /// Stamp this context's calls with a `chidori.branch` variant identity.
+    /// Called by `run_branches` on each freshly forked branch context so the
+    /// variant's spans carry `chidori.branch_id` / `chidori.branch_label`.
+    pub fn set_otel_branch(&self, branch_id: String, label: String) {
+        self.inner.lock().unwrap().otel_branch =
+            Some(crate::runtime::otel::BranchTag { branch_id, label });
     }
 
     #[allow(dead_code)]
