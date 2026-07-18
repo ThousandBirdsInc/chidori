@@ -1,0 +1,10 @@
+{
+  "rules": [
+    { "target": "http", "decision": "always_allow", "reason": "commander probes the ops API and pages on-call" },
+    { "target": "workspace:write", "decision": "always_allow", "reason": "publishes the postmortem under incidents/" },
+    { "target": "workspace:read", "decision": "always_allow" },
+    { "target": "workspace:list", "decision": "always_allow" }
+  ],
+  "default": "never_allow",
+  "default_reason": "war-room server allows only ops-API http and postmortem writes"
+}
