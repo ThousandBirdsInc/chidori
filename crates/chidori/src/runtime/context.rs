@@ -334,6 +334,12 @@ struct RuntimeContextInner {
     /// ranges outside the parent branch's reserved range and break the
     /// disjointness invariant, so `run_branches` rejects it up front.
     pub is_branch: bool,
+    /// Branch attribution for OTEL spans: the `chidori.branch` variant this
+    /// context executes (id + label). Set by `run_branches` right after
+    /// `for_branch`; every call recorded here stamps `chidori.branch_id` /
+    /// `chidori.branch_label` on its span so a fan-out's subtrees are
+    /// filterable per variant in the backend.
+    pub otel_branch: Option<crate::runtime::otel::BranchTag>,
     /// Optional host-supplied model override (Pi-style save point). When set,
     /// every prompt host call (`execute_prompt_text` / `execute_prompt_response`)
     /// consults it just before sending and, if it yields `Some(model)`, swaps
@@ -597,6 +603,7 @@ impl RuntimeContext {
                 vfs: vfs_from_seed_env(),
                 is_branch: false,
                 model_override: None,
+                otel_branch: None,
                 actor_hub: None,
                 actor_id: None,
             })),
@@ -673,6 +680,7 @@ impl RuntimeContext {
                 vfs,
                 is_branch: false,
                 model_override: None,
+                otel_branch: None,
                 actor_hub: None,
                 actor_id: None,
             })),
@@ -721,6 +729,7 @@ impl RuntimeContext {
                 vfs: vfs_from_seed_env(),
                 is_branch: false,
                 model_override: None,
+                otel_branch: None,
                 actor_hub: None,
                 actor_id: None,
             })),
@@ -777,6 +786,7 @@ impl RuntimeContext {
                 vfs: parent_inner.vfs.clone(),
                 is_branch: true,
                 model_override: parent_inner.model_override.clone(),
+                otel_branch: None,
                 actor_hub: None,
                 actor_id: None,
             })),
@@ -834,6 +844,7 @@ impl RuntimeContext {
                 vfs,
                 is_branch: true,
                 model_override: None,
+                otel_branch: None,
                 actor_hub: None,
                 actor_id: None,
             })),
@@ -902,6 +913,7 @@ impl RuntimeContext {
                 vfs,
                 is_branch: false,
                 model_override: parent_inner.model_override.clone(),
+                otel_branch: parent_inner.otel_branch.clone(),
                 actor_hub: Some(hub),
                 actor_id: Some(actor_id),
             })),
@@ -1250,6 +1262,7 @@ impl RuntimeContext {
         inner.seq = inner.seq.max(record.seq);
         let store = inner.store.clone();
         let otel = inner.otel_run.clone();
+        let otel_branch = inner.otel_branch.clone();
         let event_tx = if inner.emit_call_events {
             inner.event_sender.clone()
         } else {
@@ -1291,7 +1304,7 @@ impl RuntimeContext {
             let _ = tx.send(RuntimeEvent::Call(record.clone()));
         }
         if let Some(otel) = otel {
-            otel.stream_record(record);
+            otel.stream_record_tagged(record, otel_branch);
         }
     }
 
@@ -1496,6 +1509,14 @@ impl RuntimeContext {
 
     pub fn otel_run(&self) -> Option<Arc<RunSpan>> {
         self.inner.lock().unwrap().otel_run.clone()
+    }
+
+    /// Stamp this context's calls with a `chidori.branch` variant identity.
+    /// Called by `run_branches` on each freshly forked branch context so the
+    /// variant's spans carry `chidori.branch_id` / `chidori.branch_label`.
+    pub fn set_otel_branch(&self, branch_id: String, label: String) {
+        self.inner.lock().unwrap().otel_branch =
+            Some(crate::runtime::otel::BranchTag { branch_id, label });
     }
 
     #[allow(dead_code)]

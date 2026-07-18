@@ -1,4 +1,5 @@
 mod acp;
+mod deploy;
 mod export;
 mod init;
 mod mcp;
@@ -271,6 +272,15 @@ enum Commands {
         /// scripts), even though the original run was trusted.
         #[arg(long)]
         trusted: bool,
+
+        /// CI mode: emit a machine-readable JSON report to stdout and use
+        /// stable exit codes — 0 the replay matched the checkpoint exactly
+        /// (byte-identical, $0), 3 the replay diverged (the agent's calls or
+        /// output no longer match the recording), 1 on any other error.
+        /// Designed for `tael eval run --cmd`. A superset of `chidori verify`
+        /// (same gates), reported machine-readably.
+        #[arg(long)]
+        ci: bool,
     },
 
     /// Replay a recorded run as a deterministic test: re-run the agent with
@@ -319,6 +329,12 @@ enum Commands {
         /// Project dir containing `.chidori/runs/` (defaults to current dir)
         #[arg(short, long)]
         dir: Option<PathBuf>,
+    },
+
+    /// Operate on persisted run checkpoints as portable artifacts.
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
     },
 
     /// List a run's persisted `chidori.branch` sub-runs and their states.
@@ -481,6 +497,52 @@ enum Commands {
         /// Equivalent to CHIDORI_ISOLATE=off.
         #[arg(long)]
         no_isolate: bool,
+    },
+
+    /// Deploy an agent to a Chidori Deploy server (like Val Town's `vt`): a
+    /// local directory kept in sync with the cloud. With no subcommand, pushes
+    /// the current directory as a new live version.
+    ///
+    ///   chidori deploy                 # push the current directory
+    ///   chidori deploy status          # live version + count
+    ///   chidori deploy versions        # version history
+    ///   chidori deploy rollback        # revert to the previous version
+    ///   chidori deploy promote 3       # make v3 live
+    ///   chidori deploy pull            # download the live version's tree
+    ///
+    /// Auth via CHIDORI_API_KEY (or --token); server via CHIDORI_DEPLOY_URL
+    /// (or --url; default http://localhost:8090).
+    Deploy(deploy::DeployArgs),
+}
+
+#[derive(Subcommand)]
+enum CheckpointAction {
+    /// Archive a persisted run directory (`.chidori/runs/<run_id>/`) as a
+    /// .tar.gz — checkpoint, input, snapshot manifest, branch stores — so the
+    /// run can be committed to git as a regression fixture or attached to an
+    /// eval case in an external system without knowing the runs layout.
+    Export {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Output path (defaults to `<run_id>.chidori-run.tar.gz`)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Unpack an exported run archive back under `.chidori/runs/` so it can
+    /// be replayed with `chidori resume`.
+    Import {
+        /// Path to a `.chidori-run.tar.gz` produced by `checkpoint export`
+        archive: PathBuf,
+
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -662,11 +724,19 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             model,
             untrusted,
             trusted,
-        } => (
-            {
-                if let Some(ref model) = model {
-                    std::env::set_var("CHIDORI_MODEL", model);
-                }
+            ci,
+        } => {
+            if ci {
+                // CI mode manages its own exit codes (0 match / 3 diverged / 1
+                // error) and always prints a JSON report before exiting.
+                let code = cmd_resume_ci(&file, &run_id, dir.as_deref());
+                crate::runtime::otel::shutdown_on_exit();
+                std::process::exit(code);
+            }
+            if let Some(ref model) = model {
+                std::env::set_var("CHIDORI_MODEL", model);
+            }
+            (
                 cmd_resume(
                     &file,
                     &run_id,
@@ -677,10 +747,10 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                     model,
                     untrusted,
                     trusted,
-                )
-            },
-            false,
-        ),
+                ),
+                false,
+            )
+        }
         Commands::Verify {
             file,
             run_id,
@@ -698,6 +768,19 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             crate::export::cmd_export(&run_id, &fixture, dir.as_deref()),
             false,
         ),
+        Commands::Checkpoint { action } => match action {
+            CheckpointAction::Export {
+                run_id,
+                output,
+                dir,
+            } => (
+                cmd_checkpoint_export(&run_id, output.as_deref(), dir.as_deref()),
+                false,
+            ),
+            CheckpointAction::Import { archive, dir } => {
+                (cmd_checkpoint_import(&archive, dir.as_deref()), false)
+            }
+        },
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
         Commands::BranchResume {
             run_id,
@@ -770,6 +853,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                 false,
             )
         }
+        Commands::Deploy(args) => (deploy::run(args), false),
     }
 }
 
@@ -2386,6 +2470,298 @@ fn cmd_verify(
         "verified: {} calls replayed, {live} workspace re-materialization(s), \
          output identical — $0",
         result.replayed_calls
+    );
+    Ok(())
+}
+
+/// `chidori resume --ci`: replay a checkpoint non-interactively and report
+/// whether the run still replays byte-identically. Prints one JSON object to
+/// stdout and returns a stable exit code:
+///
+///   0 — exact replay: every call was served from the checkpoint, none went
+///       live, and the recorded shape (seq/function/args/result/error) matches.
+///   3 — divergence: the agent's behavior no longer matches the checkpoint
+///       (code drift); the report carries the first mismatch.
+///   1 — the run errored or the checkpoint couldn't be loaded.
+///
+/// This is the regression-test mode `tael eval run --cmd` consumes: a golden
+/// case whose fixture is a checkpoint replays at $0 in milliseconds, and any
+/// nonzero exit marks the case failed.
+fn cmd_resume_ci(file: &Path, run_id: &str, dir: Option<&std::path::Path>) -> i32 {
+    let report = |value: Value| {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
+    };
+
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .or_else(|| file.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
+
+    use crate::runtime::store::RunStore as _;
+    let store = crate::runtime::store::FsRunStore::new(run_dir.clone());
+    let load = || -> Result<(Vec<crate::runtime::call_log::CallRecord>, Value)> {
+        let records = store
+            .load_call_log()?
+            .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+        let input_path = run_dir.join("input.json");
+        let input = if input_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&input_path)?)
+                .unwrap_or(Value::Object(Default::default()))
+        } else {
+            Value::Object(Default::default())
+        };
+        Ok((records, input))
+    };
+    let (records, input_value) = match load() {
+        Ok(v) => v,
+        Err(e) => {
+            report(serde_json::json!({
+                "status": "error",
+                "run_id": run_id,
+                "error": format!("{e:#}"),
+            }));
+            return 1;
+        }
+    };
+
+    // Source drift IS divergence for a regression gate: a fixture replayed
+    // against edited agent code is testing something else.
+    if let Err(e) =
+        crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file, false)
+    {
+        report(serde_json::json!({
+            "status": "diverged",
+            "run_id": run_id,
+            "checkpoint_path": run_dir.display().to_string(),
+            "live_cost_usd": 0.0,
+            "divergence": { "kind": "source_changed", "detail": format!("{e:#}") },
+        }));
+        return 3;
+    }
+
+    // Same posture as `chidori verify`: no providers, deny-all policy, no
+    // persistence — the replay must answer every effect from the journal (a
+    // record whose args drifted aborts as divergence), so live spend is $0
+    // by construction.
+    let run = || -> Result<crate::runtime::engine::RunResult> {
+        let providers = Arc::new(ProviderRegistry::new());
+        let template_engine = Arc::new(TemplateEngine::new(&base_dir));
+        let tokio_rt =
+            Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
+        let manifest_model = crate::runtime::snapshot::SnapshotStore::new(run_dir.clone())
+            .load_manifest()
+            .ok()
+            .and_then(|manifest| manifest.default_model);
+        let engine = Engine::new(providers, template_engine, tokio_rt)
+            .with_tools(Arc::new(ToolRegistry::new()))
+            .with_policy(Arc::new(
+                policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
+            ))
+            .with_default_model(manifest_model)
+            .with_workspace_root(abs_dir(&base_dir));
+        engine.resume_run(file, &input_value, records.clone(), run_id)
+    };
+    let result = match run() {
+        Ok(r) => r,
+        Err(e) => {
+            // A replay-divergence abort IS the regression signal: the agent no
+            // longer makes the recorded call (changed function or args).
+            let msg = format!("{e:#}");
+            if msg.contains("Replay divergence") {
+                report(serde_json::json!({
+                    "status": "diverged",
+                    "run_id": run_id,
+                    "checkpoint_path": run_dir.display().to_string(),
+                    "live_cost_usd": 0.0,
+                    "divergence": { "kind": "changed_call", "detail": msg },
+                }));
+                return 3;
+            }
+            report(serde_json::json!({
+                "status": "error",
+                "run_id": run_id,
+                "error": msg,
+            }));
+            return 1;
+        }
+    };
+
+    // Compare the replayed log against the checkpoint, keyed by seq. A
+    // byte-identical replay reproduces every record (try_replay copies records
+    // verbatim), but the *order* records land in the new log legitimately
+    // differs — a container call's absorbed subtree (branch sub-records,
+    // nested tool calls) is re-appended when the container replays, not at its
+    // original interleaved position. Divergence is therefore: a checkpoint seq
+    // the replay never produced, a seq whose recorded shape changed, or a seq
+    // the checkpoint doesn't have (the agent made a new live call). Timestamps
+    // and durations are excluded (copied verbatim on replay hits anyway);
+    // `parent_seq` is excluded because a replay fills in parentage that
+    // pre-nesting checkpoints serialized as None.
+    let fingerprint = |r: &crate::runtime::call_log::CallRecord| {
+        serde_json::json!({
+            "function": r.function,
+            "args": r.args,
+            "result": r.result,
+            "error": r.error,
+        })
+    };
+    let by_seq = |rs: &[crate::runtime::call_log::CallRecord]| {
+        rs.iter()
+            .map(|r| (r.seq, fingerprint(r)))
+            .collect::<std::collections::BTreeMap<u64, Value>>()
+    };
+    let expected_by_seq = by_seq(&records);
+    let replayed_by_seq = by_seq(result.call_log.records());
+    let mut divergence: Option<Value> = None;
+    for (seq, expected) in &expected_by_seq {
+        match replayed_by_seq.get(seq) {
+            None => {
+                divergence = Some(serde_json::json!({
+                    "at_seq": seq,
+                    "kind": "missing_call",
+                    "expected": expected,
+                }));
+                break;
+            }
+            Some(got) if got != expected => {
+                divergence = Some(serde_json::json!({
+                    "at_seq": seq,
+                    "kind": "changed_call",
+                    "expected": expected,
+                    "got": got,
+                }));
+                break;
+            }
+            Some(_) => {}
+        }
+    }
+    if divergence.is_none() {
+        if let Some((seq, got)) = replayed_by_seq
+            .iter()
+            .find(|(seq, _)| !expected_by_seq.contains_key(seq))
+        {
+            divergence = Some(serde_json::json!({
+                "at_seq": seq,
+                "kind": "extra_call",
+                "got": got,
+            }));
+        }
+    }
+
+    let (input_tokens, output_tokens) = result.call_log.total_tokens();
+    let base = serde_json::json!({
+        "run_id": run_id,
+        "checkpoint_path": run_dir.display().to_string(),
+        "calls_expected": expected_by_seq.len(),
+        "calls_replayed": replayed_by_seq.len(),
+        // Replay never re-executes providers: the live spend of this
+        // invocation is $0 regardless of the recorded token totals.
+        "live_cost_usd": 0.0,
+        "recorded_input_tokens": input_tokens,
+        "recorded_output_tokens": output_tokens,
+        "output": result.output,
+    });
+    match divergence {
+        Some(d) => {
+            let mut v = base;
+            v["status"] = Value::String("diverged".to_string());
+            v["divergence"] = d;
+            report(v);
+            3
+        }
+        None => {
+            let mut v = base;
+            v["status"] = Value::String("match".to_string());
+            report(v);
+            0
+        }
+    }
+}
+
+/// Archive `.chidori/runs/<run_id>/` as a gzip tarball whose entries are
+/// rooted at `<run_id>/`, so `checkpoint import` (or plain `tar -xzf` inside
+/// `.chidori/runs/`) restores the run under its original id.
+fn cmd_checkpoint_export(
+    run_id: &str,
+    output: Option<&std::path::Path>,
+    dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
+    if !run_dir.is_dir() {
+        anyhow::bail!("No persisted run at {}", run_dir.display());
+    }
+
+    let out_path = output
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(format!("{run_id}.chidori-run.tar.gz")));
+    let file = std::fs::File::create(&out_path)
+        .with_context(|| format!("Failed to create {}", out_path.display()))?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    builder
+        .append_dir_all(run_id, &run_dir)
+        .with_context(|| format!("Failed to archive {}", run_dir.display()))?;
+    builder
+        .into_inner()
+        .and_then(|gz| gz.finish())
+        .context("Failed to finalize archive")?;
+
+    eprintln!("Exported {} -> {}", run_dir.display(), out_path.display());
+    println!(
+        "{}",
+        serde_json::json!({
+            "run_id": run_id,
+            "archive": out_path.display().to_string(),
+        })
+    );
+    Ok(())
+}
+
+/// Unpack a `checkpoint export` archive under `<base>/.chidori/runs/`. The
+/// archive's entries are rooted at the run id, so extraction recreates
+/// `.chidori/runs/<run_id>/` ready for `chidori resume`.
+fn cmd_checkpoint_import(archive: &std::path::Path, dir: Option<&std::path::Path>) -> Result<()> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let runs_dir = base_dir.join(".chidori").join("runs");
+    std::fs::create_dir_all(&runs_dir)
+        .with_context(|| format!("Failed to create {}", runs_dir.display()))?;
+
+    let file = std::fs::File::open(archive)
+        .with_context(|| format!("Failed to open {}", archive.display()))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut ar = tar::Archive::new(decoder);
+    // Collect the top-level run id(s) while unpacking, to report what landed.
+    let mut run_ids = std::collections::BTreeSet::new();
+    for entry in ar.entries().context("Failed to read archive")? {
+        let mut entry = entry.context("Failed to read archive entry")?;
+        let path = entry.path().context("Bad entry path")?.into_owned();
+        if let Some(first) = path.components().next() {
+            run_ids.insert(first.as_os_str().to_string_lossy().to_string());
+        }
+        entry
+            .unpack_in(&runs_dir)
+            .with_context(|| format!("Failed to unpack {}", path.display()))?;
+    }
+
+    for id in &run_ids {
+        eprintln!("Imported run {} -> {}", id, runs_dir.join(id).display());
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "runs": run_ids.iter().collect::<Vec<_>>(),
+            "runs_dir": runs_dir.display().to_string(),
+        })
     );
     Ok(())
 }
