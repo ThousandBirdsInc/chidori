@@ -1708,22 +1708,60 @@ fn cmd_resume(
         .with_history_rewrite_allowed(until_seq.is_some())
         .with_workspace_root(abs_dir(&base_dir));
 
+    // Journaled top-level workspace records re-execute on every replay by
+    // design (the workspace is real disk state, re-materialized rather than
+    // served from the journal) — count them up front so the summary below can
+    // report them as what they are instead of folding them into "executed
+    // live", which reads as a re-fired side effect.
+    let journaled_workspace = records
+        .iter()
+        .filter(|r| r.function == "workspace" && r.parent_seq.is_none())
+        .count() as u64;
     let result = engine.resume_run(file, &input_value, records, run_id);
     let _ =
         crate::runtime::store::release_lease(factory.store_for(run_id).as_ref(), &cli_lease_owner);
     let result = result?;
 
+    // A resume that lands back on a `chidori.signal(...)` listen point has no
+    // stdin fallback: report the pause and how to deliver, exactly like
+    // `chidori run` does, instead of printing a bare `null` that reads as a
+    // completed run.
+    if let Some(signal) = &result.paused_signal {
+        let names = signal.listen_names();
+        eprintln!(
+            "Run {run_id} replayed to its pause and is still awaiting signal{} '{}'.",
+            if names.len() > 1 { " (any of)" } else { "" },
+            names.join("', '")
+        );
+        eprintln!(
+            "Deliver it with: POST /sessions/{{id}}/signal \
+             {{\"name\":\"{}\",\"payload\":...,\"from\":...}} against a `chidori serve` \
+             session for this run. (Signal delivery and `timeoutMs` deadlines are \
+             server-side — the bare CLI can neither deliver nor time out a signal.)",
+            signal.name
+        );
+        return Ok(());
+    }
+
     let output_str = serde_json::to_string_pretty(&result.output)?;
     println!("{output_str}");
-    // Report the replayed/live split — the total alone reads as "everything
-    // was replayed" and hides what the recovery actually re-executed (and
-    // re-billed). In-flight work at a crash re-executes by design
+    // Report the replayed / re-materialized / live split — the total alone
+    // reads as "everything was replayed", and folding workspace
+    // re-materializations into "executed live" reads as a re-fired side
+    // effect. In-flight work at a crash re-executes by design
     // (at-least-once), so the live count is the honest recovery cost.
     let total = result.call_log.records().len() as u64;
+    let live = total.saturating_sub(result.replayed_calls);
+    let rematerialized = live.min(journaled_workspace);
+    let live_new = live.saturating_sub(rematerialized);
+    let remat_clause = if rematerialized > 0 {
+        format!(", {rematerialized} workspace re-materialization(s)")
+    } else {
+        String::new()
+    };
     eprintln!(
-        "\nResumed from {run_id} ({} recorded calls replayed, {} executed live)",
+        "\nResumed from {run_id} ({} recorded calls replayed{remat_clause}, {live_new} executed live)",
         result.replayed_calls,
-        total.saturating_sub(result.replayed_calls)
     );
     Ok(())
 }
@@ -1998,6 +2036,15 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
         .load_call_log()?
         .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
 
+    // The run's manifest carries the CHIDORI_PRICING table that was live when
+    // it executed — install it as the cost fallback so the trace prices
+    // correctly in a shell that doesn't have the env var set.
+    if let Ok(manifest) = crate::runtime::snapshot::SnapshotStore::new(&run_dir).load_manifest() {
+        if let Some(ref pricing) = manifest.pricing {
+            crate::runtime::cost::install_journaled_pricing(pricing);
+        }
+    }
+
     println!("Run: {}", run_id);
     println!("Calls: {}", records.len());
 
@@ -2086,9 +2133,44 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
         } else {
             format!("·{}", r.seq % 1_000_000_000_000)
         };
+        // Signals carry the interesting half — who answered, with what — in
+        // the RESULT (`{name, payload, from}`), which the generic args column
+        // never shows. Render it inline so `trace` is the multiplayer audit
+        // trail the signals docs promise, not just a list of listen points.
+        let signal_tag = if matches!(r.function.as_str(), "signal" | "signal_any" | "poll_signal") {
+            if r.result.is_null() {
+                "  ← empty (no queued signal)".to_string()
+            } else if r.result.get("timedOut").and_then(|v| v.as_bool()) == Some(true) {
+                "  ← timed out (sentinel)".to_string()
+            } else {
+                let name = r.result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let from = match r.result.get("from") {
+                    Some(serde_json::Value::Object(f)) => format!(
+                        "{}:{}",
+                        f.get("kind").and_then(|v| v.as_str()).unwrap_or("?"),
+                        f.get("id").and_then(|v| v.as_str()).unwrap_or("?")
+                    ),
+                    _ => "unattributed".to_string(),
+                };
+                let payload = r
+                    .result
+                    .get("payload")
+                    .map(|p| serde_json::to_string(p).unwrap_or_default())
+                    .unwrap_or_else(|| "null".to_string());
+                let payload_short = if payload.chars().count() > 80 {
+                    let head: String = payload.chars().take(80).collect();
+                    format!("{head}…")
+                } else {
+                    payload
+                };
+                format!("  ← {name} from {from}: {payload_short}")
+            }
+        } else {
+            String::new()
+        };
         println!(
-            "  {:<owner_width$}  {:<8} {:>6}ms  {}  {}{}{}",
-            label, seq_disp, r.duration_ms, r.function, args_short, token_tag, err_tag
+            "  {:<owner_width$}  {:<8} {:>6}ms  {}  {}{}{}{}",
+            label, seq_disp, r.duration_ms, r.function, args_short, token_tag, signal_tag, err_tag
         );
         if let Some(ref u) = r.token_usage {
             total_in += u.input_tokens;
@@ -2207,6 +2289,16 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
             continue;
         };
 
+        // Price this run under the pricing table recorded in its manifest
+        // (env-set CHIDORI_PRICING still wins inside the cost module).
+        if let Ok(manifest) =
+            crate::runtime::snapshot::SnapshotStore::new(entry.path()).load_manifest()
+        {
+            if let Some(ref pricing) = manifest.pricing {
+                crate::runtime::cost::install_journaled_pricing(pricing);
+            }
+        }
+
         run_count += 1;
         let mut log = CallLog::new();
         for r in records {
@@ -2246,6 +2338,17 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
                     ms.cost_usd += cost;
                 }
             } else if r.function == "tool" {
+                // Registry (MCP / Rust-native) tools dispatched by name.
+                tool_count += 1;
+            } else if r.function == "mark"
+                && r.args
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|l| l.starts_with("tool:"))
+            {
+                // In-VM `defineTool` invocations journal as `mark("tool:<name>")`
+                // records — the common case for single-file agents. Leaving them
+                // out reported "Tool calls: 0" for agents that made dozens.
                 tool_count += 1;
             }
             total_duration_ms += r.duration_ms;

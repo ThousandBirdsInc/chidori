@@ -521,7 +521,55 @@ Selection order is the `--untrusted` flag first, then env-driven resolution:
   banner's `Policy:` line reports the active posture either way).
 
 To customize further, copy the profile's shape into your own `CHIDORI_POLICY`
-JSON (rules + `"default": "never_allow"`).
+JSON (rules + `"default": "never_allow"`) — full schema below.
+
+### Writing a policy file (`CHIDORI_POLICY_FILE` / `CHIDORI_POLICY`)
+
+The deployment checklist asks for a configured policy; this is the file's
+complete shape (`src/policy.rs::PolicyConfig`):
+
+```jsonc
+{
+  "rules": [
+    // Tried in order; the FIRST rule whose target and match_args both
+    // match wins. No rule matches → the "default" decision applies.
+    {
+      "target": "http",                 // "http" | "workspace:<action>" | "tool:<name>" | "app_data:<action>" | "*"
+                                        //   workspace actions: list | read | write | delete | manifest
+      "decision": "always_allow",       // "always_allow" | "ask_before" | "never_allow"
+      "match_args": {                   // optional JSON subset matched against the call's args
+        "url_prefix": "http://ops.internal:9911/"
+      },
+      "reason": "ops API only"          // optional; shown in the denial/approval message
+    },
+    { "target": "workspace:write", "decision": "always_allow" },
+    { "target": "workspace:read",  "decision": "always_allow" },
+    { "target": "workspace:list",  "decision": "always_allow" }
+  ],
+  "default": "never_allow",             // fallback when no rule matches (default: "always_allow")
+  "default_reason": "this server allows only the ops API and workspace writes"
+}
+```
+
+`match_args` semantics:
+
+- **Objects** match as subsets: every key in the pattern must exist in the
+  call args and match recursively.
+- **Strings substring-match**: `{"url": "/status/"}` matches any URL
+  containing it. Convenient for tool args — but **never use a plain string
+  to scope `http` by host**: the host text appearing anywhere (e.g. inside
+  a hostile URL's query string) would satisfy it.
+- **`url_prefix` anchors**: the reserved key matches when the call's `url`
+  *starts with* the given string — the right shape for "this agent talks
+  to this host only" (`{"url_prefix": "https://api.example.com/"}`).
+  Combine with the [SSRF guard](#per-os-confinement-isolatesandboxrs)'s
+  `CHIDORI_HTTP_ALLOW_HOSTS` for internal hosts.
+- Other JSON values must be equal.
+
+A malformed file **fails closed**: `chidori serve` logs a parse warning and
+falls back to the deny-by-default `untrusted` profile, never to allow-all.
+Every denied gated call is reported on the server's stderr (as well as in
+the run journal), so a misconfigured policy is audible, not silent.
 
 ### The `supervised` profile (ask-by-default)
 

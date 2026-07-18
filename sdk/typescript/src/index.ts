@@ -444,6 +444,19 @@ const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 
 export interface AgentClientOptions {
   /**
+   * Bearer token for a server running with `CHIDORI_API_KEY` set (the
+   * production posture — see docs/deployment.md). Sent as
+   * `Authorization: Bearer <apiKey>` on every request, including `stream()`.
+   * Omit against an unauthenticated loopback server.
+   */
+  apiKey?: string;
+  /**
+   * Extra headers merged into every request (after `apiKey`, so an explicit
+   * `Authorization` entry here wins). Escape hatch for proxies and custom
+   * auth schemes the `apiKey` option doesn't cover.
+   */
+  headers?: Record<string, string>;
+  /**
    * Per-request timeout in milliseconds; `0` disables it. Defaults to
    * 300 000 (5 minutes) — generous because `run()` executes the whole agent
    * before responding, but finite so a hung server surfaces as a
@@ -484,12 +497,17 @@ export class AgentClient {
   readonly timeoutMs: number;
   readonly retries: number;
   readonly retryDelayMs: number;
+  private readonly baseHeaders: Record<string, string>;
 
   constructor(baseUrl: string = "http://localhost:8080", options: AgentClientOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.timeoutMs = options.timeoutMs ?? 300_000;
     this.retries = options.retries ?? 2;
     this.retryDelayMs = options.retryDelayMs ?? 250;
+    this.baseHeaders = {
+      ...(options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
+      ...(options.headers ?? {}),
+    };
   }
 
   async health(): Promise<Json> {
@@ -609,20 +627,34 @@ export class AgentClient {
    * events (`prompt_start`, `prompt_delta`, `prompt_end`), then a final
    * `done` event. Prompt events include `prompt_type` so UIs can filter
    * progress streams separately from final-answer streams.
+   *
+   * `options.policyProfile` mirrors `run()`: a built-in profile layered on
+   * the server policy with stricter-wins semantics for this session.
    */
-  async *stream(input: Json): AsyncGenerator<StreamEvent, void, void> {
+  async *stream(
+    input: Json,
+    options?: { policyProfile?: PolicyProfile },
+  ): AsyncGenerator<StreamEvent, void, void> {
     // The timeout covers connection establishment (until response headers
     // arrive), not the open event stream — a healthy run may stream for a
     // long time between events.
     const controller = new AbortController();
     const timer =
       this.timeoutMs > 0 ? setTimeout(() => controller.abort(), this.timeoutMs) : null;
+    const body: Record<string, unknown> = { input };
+    if (options?.policyProfile) {
+      body.policy_profile = options.policyProfile;
+    }
     let resp: Response;
     try {
       resp = await fetch(`${this.baseUrl}/sessions/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-        body: JSON.stringify({ input }),
+        headers: {
+          ...this.baseHeaders,
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
     } catch (err) {
@@ -720,12 +752,11 @@ export class AgentClient {
           resp = await fetch(this.baseUrl + path, {
             method,
             signal: controller.signal,
-            ...(body !== undefined
-              ? {
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify(body),
-                }
-              : {}),
+            headers:
+              body !== undefined
+                ? { ...this.baseHeaders, "Content-Type": "application/json" }
+                : this.baseHeaders,
+            ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
           });
         } catch (err) {
           throw controller.signal.aborted

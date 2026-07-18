@@ -263,7 +263,8 @@ impl ScaffoldPersister {
         .with_module_graph(module_graph.clone())
         .with_capabilities(ctx.capabilities())
         .with_vfs(ctx.vfs_snapshot())
-        .with_default_model(Some(ctx.config().model));
+        .with_default_model(Some(ctx.config().model))
+        .with_pricing(std::env::var("CHIDORI_PRICING").ok());
         // The embedded host-promise table has the same freshness contract as
         // checkpoint.json: a compaction-time snapshot. Runtime resume never
         // reads it (deliveries and replay load `host_promises.json` ∪ the

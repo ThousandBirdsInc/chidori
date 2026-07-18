@@ -803,6 +803,14 @@ export interface Chidori {
    * an interactive `input()` loop with `chat.loop()`.
    */
   conversation(options?: ConversationOptions): Conversation;
+  /**
+   * `format: "json"` parses the reply as JSON before returning it, so the
+   * resolved value is structured data (`AgentJson`), not a string. Narrow it
+   * to your shape with a single cast: `await chidori.prompt(p, { format:
+   * "json" }) as Triage`. (With `strict: false` an unparseable reply falls
+   * back to the raw string — still assignable to `AgentJson`.)
+   */
+  prompt(text: string, options: PromptOptions & { format: "json" }): Promise<AgentJson>;
   prompt(text: string, options?: PromptOptions): Promise<string>;
   input(message: string, options?: InputOptions): Promise<string>;
   /**

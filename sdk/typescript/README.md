@@ -86,6 +86,11 @@ import { AgentClient, Checkpoint, isSignalQueued } from "@1kbirds/chidori";
 
 const client = new AgentClient("http://localhost:8080");
 
+// Against a production server (CHIDORI_API_KEY set — see docs/deployment.md),
+// pass the bearer token; it is sent on every request, including stream():
+//   new AgentClient("https://agents.example.com", { apiKey: process.env.CHIDORI_API_KEY });
+// `headers: {...}` merges extra headers for proxies / custom auth schemes.
+
 // Run an agent
 const session = await client.run({ document: "Rust is a systems language." });
 console.log(session.output);
@@ -138,6 +143,10 @@ if (isSignalQueued(result)) {
 See the top-level `sdk/python/chidori` for the Python equivalent.
 
 ## Timeouts, retries, and errors
+
+`apiKey` sends `Authorization: Bearer <apiKey>` on every request — required
+against a server started with `CHIDORI_API_KEY` (any non-loopback bind). An
+explicit `headers.Authorization` entry overrides it.
 
 Every request is bounded by `timeoutMs` (default 300 000 — generous because
 `run()` executes the whole agent before responding; pass `0` to disable).

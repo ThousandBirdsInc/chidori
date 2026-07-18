@@ -633,11 +633,19 @@ impl HostBindingBackend {
         let (decision, reason) = policy.decide(target, args);
         match decision {
             Decision::AlwaysAllow => Ok(()),
-            Decision::NeverAllow => Err(format!(
-                "policy: `{}` denied{}",
-                target,
-                reason.map(|r| format!(" ({})", r)).unwrap_or_default()
-            )),
+            Decision::NeverAllow => {
+                let message = format!(
+                    "policy: `{}` denied{}",
+                    target,
+                    reason.map(|r| format!(" ({})", r)).unwrap_or_default()
+                );
+                // Denials must be audible where the operator sits, not only in
+                // the journal: the error returns to the agent, and tool loops
+                // routinely swallow it and produce confident output with no
+                // data — a silently misconfigured policy looks like success.
+                eprintln!("chidori: {message}");
+                Err(message)
+            }
             Decision::AskBefore => {
                 {
                     let cache = policy_cache.lock().unwrap();

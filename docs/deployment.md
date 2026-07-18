@@ -75,6 +75,10 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
 - **API-key rotation:** `CHIDORI_API_KEY` accepts a comma-separated list, so
   a key rotates without a hard cutover — set `new-key,old-key`, roll every
   client to the new key, then drop the old one. Comparison is constant-time.
+- **SDK clients authenticate with the same key:** pass it as
+  `new AgentClient(url, { apiKey })` (TypeScript) or
+  `AgentClient(url, api_key=...)` (Python) — it rides every request,
+  including the SSE stream.
 - **SSRF guard:** the `http`/`fetch` effect refuses destinations that resolve
   to non-public addresses (loopback, RFC 1918, link-local/cloud-metadata,
   CGNAT, and their IPv6 equivalents), checked at DNS-resolution time and on

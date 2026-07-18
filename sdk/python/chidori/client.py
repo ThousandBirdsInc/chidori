@@ -235,11 +235,21 @@ class AgentClient:
         self,
         base_url: str = "http://localhost:8080",
         *,
+        api_key: str | None = None,
+        headers: dict[str, str] | None = None,
         timeout_seconds: float = 300.0,
         retries: int = 2,
         retry_delay_seconds: float = 0.25,
     ):
         """Create a client.
+
+        ``api_key`` is the bearer token for a server running with
+        ``CHIDORI_API_KEY`` set (the production posture — see
+        docs/deployment.md); it is sent as ``Authorization: Bearer <api_key>``
+        on every request, including ``stream()``. Omit against an
+        unauthenticated loopback server. ``headers`` merges extra headers into
+        every request (after ``api_key``, so an explicit ``Authorization``
+        entry wins) — an escape hatch for proxies and custom auth schemes.
 
         ``timeout_seconds`` bounds each request (0 disables it). The default is
         generous — 5 minutes — because ``run()`` executes the whole agent
@@ -261,6 +271,11 @@ class AgentClient:
         self.timeout_seconds = timeout_seconds
         self.retries = retries
         self.retry_delay_seconds = retry_delay_seconds
+        self._base_headers: dict[str, str] = {}
+        if api_key:
+            self._base_headers["Authorization"] = f"Bearer {api_key}"
+        if headers:
+            self._base_headers.update(headers)
 
     def health(self) -> dict:
         """Check server health."""
@@ -492,6 +507,7 @@ class AgentClient:
             url,
             data=body,
             headers={
+                **self._base_headers,
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
             },
@@ -585,7 +601,9 @@ class AgentClient:
         """
         url = self.base_url + path
         data = json.dumps(body).encode() if body is not None else None
-        headers = {"Content-Type": "application/json"} if body is not None else {}
+        headers = dict(self._base_headers)
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         for attempt in range(retries + 1):
             if attempt:
                 time.sleep(self.retry_delay_seconds * 2 ** (attempt - 1))

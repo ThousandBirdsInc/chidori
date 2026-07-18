@@ -105,6 +105,11 @@ idempotent. For `stream()` the timeout covers connection establishment only.
 
 ```python
 client = AgentClient("http://localhost:8080", timeout_seconds=60, retries=3)
+
+# Against a production server (CHIDORI_API_KEY set — see docs/deployment.md),
+# pass the bearer token; it is sent on every request, including stream().
+# `headers={...}` merges extra headers (an explicit Authorization wins).
+client = AgentClient("https://agents.example.com", api_key=os.environ["CHIDORI_API_KEY"])
 ```
 
 Failures raise typed exceptions, all subclassing `AgentClientError` (itself a

@@ -211,11 +211,17 @@ fn ipv6_blocked(ip: Ipv6Addr) -> bool {
 }
 
 fn blocked_message(host: &str, ip: IpAddr) -> String {
-    format!(
+    let message = format!(
         "SSRF protection: '{host}' resolves to non-public address {ip}, which the http effect \
          refuses to reach; set {ALLOW_HOSTS_ENV} (comma-separated hostnames, IPs, or CIDRs; \
          '*' disables the guard) to allow it"
-    )
+    );
+    // Also say it on stderr. The denial travels back to the agent as a tool /
+    // fetch error, and agents (especially provider tool loops) routinely
+    // swallow it and carry on without data — leaving the journal as the only
+    // witness. The operator watching the console must hear the guard fire.
+    eprintln!("chidori: {message}");
+    message
 }
 
 /// Check a URL before the request (and on every redirect hop): scheme must be

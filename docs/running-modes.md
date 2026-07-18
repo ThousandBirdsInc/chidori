@@ -68,7 +68,39 @@ Exposes:
 
 ## 3. Event-driven agents
 
-An agent can handle incoming HTTP events:
+Any request to a non-session route is folded into an **event dict** and
+passed to the agent as its input:
+
+```jsonc
+{
+  "event": {
+    "method": "POST",            // HTTP method
+    "path": "/alerts/pagerduty", // request path
+    "headers": { "content-type": "application/json", ... },
+    "query": { "key": "value" }, // query-string parameters
+    "body": { ... }              // parsed JSON, or the raw string if not JSON
+  }
+}
+```
+
+The response mapping: an agent output of `{status, body, headers?}` becomes
+the HTTP response (status code, JSON body, extra headers); any other output
+returns as `200` JSON. Two behaviors to design for:
+
+- **Every request runs the whole agent** — including health probes and
+  scanner traffic. Branch on `input.event` early and return a cheap
+  `{status: 400, ...}` for non-events before any model call, or the strays
+  will cost tokens. (With `CHIDORI_API_KEY` set, unauthenticated requests
+  are rejected before the agent runs.)
+- **A run that pauses becomes a session.** If the agent reaches a
+  `chidori.signal(...)` listen point, an `input()` call, or a policy
+  approval gate, the server persists it as a real session and answers
+  `202 Accepted` with the session view (`id`, `status`,
+  `pending_signal_names`, ...). Deliver / resume / approve it through the
+  normal `/sessions/{id}/*` endpoints — a webhook can open a long-lived,
+  human-gated run and hand the caller the id to drive it with.
+
+An agent can also make outbound requests while handling an event:
 
 ```ts
 // agents/webhook.ts

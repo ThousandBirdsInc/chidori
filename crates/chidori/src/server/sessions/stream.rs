@@ -158,9 +158,13 @@ fn resume_signal_pause_in_process(
     let Ok(Some(pending)) = completed else {
         return false;
     };
-    session
-        .call_log
-        .push(signal_resolution_record(&pending, seq, value));
+    let resolution = signal_resolution_record(&pending, seq, value);
+    // Emit the consumed signal on the live stream. The resumed run replays
+    // the log (replayed records deliberately re-emit nothing), so without
+    // this the one record that carries `{name, payload, from}` — who steered
+    // the run — would never reach a dashboard watching the SSE stream.
+    let _ = event_tx.send(RuntimeEvent::Call(resolution.clone()));
+    session.call_log.push(resolution);
 
     let host_promises = load_persisted_host_promises(&state.run_base, session.run_id.as_deref())
         .unwrap_or_default();
