@@ -30,6 +30,14 @@ it. Each turn is a durable host call and streams its reply token-by-token; the
 prior turns replay for free, so only your newest message reaches the provider.
 Flags: `--system` and `--model`. Type `exit`/`quit` or Ctrl-D to end.
 
+Every chat session is an ordinary durable run: the session id is announced at
+start, each turn journals into `.chidori/runs/<session_id>` (next to the agent
+file, or the cwd for the built-in agent), and the run's `input.json` always
+holds the full dialogue state. `chidori chat [FILE] --resume <session_id>`
+replays the journal — reprinting the transcript for $0, completing a turn that
+a crash interrupted mid-generation — and continues the conversation in place.
+`chidori trace <session_id>` inspects a session like any other run.
+
 ## 2. HTTP server (event-driven + session API)
 
 ```bash

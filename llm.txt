@@ -81,7 +81,11 @@ no agent file it chats with the model directly; pass a conversational agent file
 `{ transcript }` or `{ history }`, like the `chat` template) to chat through it.
 Each turn is a durable host call and streams its reply token-by-token; the prior
 turns replay for free, so only your newest message reaches the provider. Flags:
-`--system`, `--model`. Type `exit`/`quit` or Ctrl-D to end.
+`--system`, `--model`. Type `exit`/`quit` or Ctrl-D to end. Sessions are durable
+runs journaled under `.chidori/runs/<session_id>`; `chidori chat [FILE]
+--resume <session_id>` reprints the transcript for $0 (completing a
+crash-interrupted turn live) and continues the same session; `chidori trace
+<session_id>` inspects it like any run.
 
 `chidori snapshot <run_id>` prints `runtime.snapshot.json` metadata without
 printing raw VM snapshot bytes.
@@ -666,6 +670,12 @@ CLI:
 ```bash
 chidori run examples/agents/streaming_progress.ts --stream
 ```
+
+`--stream` changes only how progress is reported (NDJSON events on stdout):
+the run keeps the plain `run` posture — implicit workspace root at the agent's
+directory, journaled under `.chidori/runs/<run_id>` — and the final `done`
+event carries `run_id` and `status` (`completed`, `paused` with
+`pending_signal`, or `failed`).
 
 HTTP:
 

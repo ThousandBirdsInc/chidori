@@ -581,6 +581,7 @@ impl Engine {
     /// Run an agent while forwarding each host function call and every
     /// streamed token delta to `sender` as a live RuntimeEvent. Used by
     /// the server's SSE endpoint to drive incremental UIs.
+    #[allow(dead_code)] // Lib-facade entry point; the bin target's stream path uses `run_streaming_announced`.
     pub fn run_streaming(
         &self,
         path: &Path,
@@ -597,6 +598,7 @@ impl Engine {
     /// provider request, so they emit no prompt stream); only calls past the
     /// end of the log execute live and stream token deltas. Used by the
     /// `chidori chat` REPL to stream just the newest turn's reply.
+    #[allow(dead_code)] // Lib-facade entry point; the bin target's chat path uses `resume_run_streaming`.
     pub fn run_with_replay_streaming(
         &self,
         path: &Path,
@@ -605,6 +607,40 @@ impl Engine {
         sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<RunResult> {
         let ctx = RuntimeContext::with_replay(replay_log);
+        ctx.set_event_sender(sender);
+        self.run_with_context(path, inputs, ctx)
+    }
+
+    /// `run_streaming`, announcing the fresh run's id on stderr before
+    /// execution starts — the streaming twin of `run_announced`. Stdout
+    /// carries the NDJSON event protocol, so the id goes to stderr, where it
+    /// is already on record if the process dies mid-run.
+    pub fn run_streaming_announced(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::new();
+        eprintln!("Run id: {}", ctx.run_id());
+        ctx.set_event_sender(sender);
+        self.run_with_context(path, inputs, ctx)
+    }
+
+    /// `run_with_replay_streaming` under a caller-owned run id — `resume_run`'s
+    /// streaming twin. With persistence configured, live continuation past the
+    /// replay frontier journals into that run's directory. The `chidori chat`
+    /// REPL uses this to journal every turn of a session into one durable run.
+    pub fn resume_run_streaming(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        run_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::with_replay(replay_log);
+        ctx.set_run_id(run_id.to_string());
         ctx.set_event_sender(sender);
         self.run_with_context(path, inputs, ctx)
     }
