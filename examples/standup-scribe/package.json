@@ -1,0 +1,8 @@
+{
+  "name": "standup-scribe",
+  "private": true,
+  "description": "Chidori consumer demo: a long-haul standup digest agent — templates, memory across weeks, window compaction, chat REPL (see docs/consumer-usability-review-6.md)",
+  "devDependencies": {
+    "@1kbirds/chidori": "file:../../sdk/typescript"
+  }
+}
