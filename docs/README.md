@@ -1,5 +1,23 @@
 # Chidori documentation
 
+Everything here is plain markdown, readable on GitHub as-is. The same files
+also build into a searchable docs website with
+[VitePress](https://vitepress.dev):
+
+```bash
+cd docs
+npm install
+npm run dev     # local dev server with live reload
+npm run build   # static site in docs/.vitepress/dist
+```
+
+The site is deployed to GitHub Pages by
+[`.github/workflows/docs.yml`](../.github/workflows/docs.yml) on every push to
+`main` that touches `docs/`. Site structure (sidebar, landing page, theme)
+lives in `.vitepress/config.mts` and `index.md`; links that point outside
+`docs/` are rewritten to GitHub URLs at build time, so keep writing ordinary
+relative links.
+
 This directory mixes two audiences. **Using Chidori** is the path for agent
 authors and operators; **Engineering notes** are internal design records —
 useful history and rationale, but not tutorials, and some describe work that

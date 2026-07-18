@@ -51,6 +51,10 @@ sdk/python/dist/
 # Node
 node_modules/
 
+# Docs website (VitePress) build output and cache
+/docs/.vitepress/cache/
+/docs/.vitepress/dist/
+
 # Secrets / local env
 .env
 .envrc

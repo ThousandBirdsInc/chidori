@@ -407,6 +407,14 @@ deterministic, replayable, and testable for free.
 
 ## 📚 Documentation
 
+The docs are plain markdown in [`docs/`](./docs) and also build into a
+searchable website with [VitePress](https://vitepress.dev). To browse them
+locally:
+
+```bash
+cd docs && npm install && npm run dev
+```
+
 | Topic | What's there |
 |---|---|
 | [Getting started & demos](./docs/getting-started.md) | Demo picker, inspecting a run, human-in-the-loop walkthrough, example agents |
