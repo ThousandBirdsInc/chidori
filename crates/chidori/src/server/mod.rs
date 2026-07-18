@@ -36,6 +36,7 @@ mod detached;
 mod engine;
 mod events;
 mod hardening;
+mod preflight;
 mod recipes;
 mod sessions;
 #[cfg(test)]
@@ -51,7 +52,7 @@ use hardening::{
 };
 use recipes::{list_recipes, run_recipe};
 use sessions::resume::{approve_session, resume_session, signal_session};
-use sessions::stream::stream_session;
+use sessions::stream::{attach_session_stream, stream_session, SessionEventLog};
 use sessions::{
     agent_error_string, arm_signal_timeout, cancel_session, create_session, get_checkpoint,
     get_session, get_snapshot_manifest, list_agents, list_sessions, replay_session, session_policy,
@@ -59,6 +60,8 @@ use sessions::{
 
 // Test-only re-imports: they keep the flat namespace the test module's
 // `use super::*` saw when this module was a single file.
+#[cfg(test)]
+use events::{is_probe_noise_path, noise_short_circuit};
 #[cfg(test)]
 use hardening::bearer_token_matches;
 #[cfg(test)]
@@ -263,6 +266,11 @@ struct ActiveSession {
     /// enqueues straight into the live run's mailbox and wakes the worker,
     /// skipping the HTTP pause→deliver→resume round-trip.
     signals: Option<LiveSignalSession>,
+    /// The SSE event journal + broadcast of a live streaming session, so a
+    /// client whose stream dropped can re-attach via
+    /// `GET /sessions/{id}/stream`, replay what it missed, and follow live.
+    /// `None` for non-streaming runs (nothing is emitted to re-attach to).
+    event_log: Option<Arc<SessionEventLog>>,
 }
 
 /// The live-delivery handle a streaming worker registers in `active_sessions`.
@@ -740,6 +748,11 @@ pub async fn serve(
         .route("/sessions/{id}/approve", post(approve_session))
         .route("/sessions/{id}/cancel", post(cancel_session))
         .route("/sessions/stream", post(stream_session))
+        // SSE re-attach: catch up on a live streaming session's already-
+        // emitted events and follow it to settlement, or replay a settled
+        // session's journal. Same bearer auth as the other session routes
+        // (the auth middleware wraps the whole router).
+        .route("/sessions/{id}/stream", get(attach_session_stream))
         // Example agent discovery — peer directory of the server's
         // configured agent. Lets clients like util-trace-webgl pick an
         // example to run without restarting the server.
@@ -787,6 +800,14 @@ pub async fn serve(
         }
     );
     eprintln!("  Policy:      {}", policy_posture);
+    // Effect preflight (warning only, see server/preflight.rs): agents don't
+    // statically declare their effects, so scan the served agent's source for
+    // references to policy-gated effect surfaces and warn about any target
+    // the active policy unconditionally denies — otherwise nothing surfaces
+    // the mismatch until a run fails mid-flight.
+    if has_default_agent {
+        preflight::warn_denied_static_effects(&state.agent_path, &state.policy, &policy_posture);
+    }
     eprintln!(
         "  CORS:        {}",
         match std::env::var("CHIDORI_CORS_ORIGINS").ok() {
@@ -809,6 +830,9 @@ pub async fn serve(
     eprintln!("              POST /sessions/{{id}}/signal     → deliver a signal to a run");
     eprintln!("              POST /sessions/{{id}}/cancel     → cancel running session");
     eprintln!("              POST /sessions/stream            → run with SSE events");
+    eprintln!(
+        "              GET  /sessions/{{id}}/stream     → re-attach: replay + follow SSE events"
+    );
     eprintln!("  Health:     GET  /health");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

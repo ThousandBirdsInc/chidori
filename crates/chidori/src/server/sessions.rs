@@ -226,6 +226,17 @@ pub(super) async fn create_session(
         }
         None => state.agent_path.clone(),
     };
+    // A per-session profile can tighten the server policy past what the
+    // startup preflight checked against — re-run the (warning-only) static
+    // effect scan under the session's effective policy so the mismatch shows
+    // up in the server log at creation, not only as a mid-run failure.
+    if let Some(profile) = body.policy_profile.as_deref() {
+        super::preflight::warn_denied_static_effects(
+            &effective_agent_path,
+            &session_policy(&state, Some(profile)),
+            &format!("session policy profile '{profile}'"),
+        );
+    }
     let app_state = state.clone();
 
     let result = if warm_resume_enabled() {

@@ -27,6 +27,7 @@
   "files": ["dist", "src", "README.md"],
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "pretest": "tsc",
     "test": "node --test test/*.test.mjs"

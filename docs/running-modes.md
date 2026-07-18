@@ -73,6 +73,7 @@ Exposes:
 - `POST /sessions/{id}/replay` — replay from a session's checkpoint
 - `POST /sessions/{id}/cancel` — cancel a running or stored session
 - `POST /sessions/stream` — run a session with SSE call and prompt progress events
+- `GET  /sessions/{id}/stream` — re-attach to a session's SSE events: replays everything already emitted (so a dropped client catches up), then follows a still-running streaming session live until it settles; for a settled session, replays the logged call records and closes with a `done` event carrying the final state
 
 ## 3. Event-driven agents
 
@@ -99,7 +100,12 @@ returns as `200` JSON. Two behaviors to design for:
   scanner traffic. Branch on `input.event` early and return a cheap
   `{status: 400, ...}` for non-events before any model call, or the strays
   will cost tokens. (With `CHIDORI_API_KEY` set, unauthenticated requests
-  are rejected before the agent runs.)
+  are rejected before the agent runs.) The server short-circuits the most
+  common automatic noise for you: requests for `/favicon.ico`,
+  `/robots.txt`, `/apple-touch-icon*`, and anything under `/.well-known/`
+  get an immediate empty `404` without invoking the agent. If your agent
+  genuinely serves those paths, set `CHIDORI_SERVE_ALL_PATHS=1` to route
+  every path to `agent(event)` again.
 - **A run that pauses becomes a session.** If the agent reaches a
   `chidori.signal(...)` listen point, an `input()` call, or a policy
   approval gate, the server persists it as a real session and answers

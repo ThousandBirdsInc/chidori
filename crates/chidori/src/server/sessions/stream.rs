@@ -37,8 +37,14 @@ pub(in crate::server) fn stamp_attempt(mut value: Value, attempt_number: Option<
     value
 }
 
-fn runtime_event_to_sse_event(evt: RuntimeEvent, attempt_number: Option<u64>) -> Event {
-    let (name, data) = match evt {
+/// Serialize a runtime event into its SSE (event name, data) pair — the
+/// canonical wire shape shared by the live POST stream, the re-attach log,
+/// and the GET replay path.
+fn runtime_event_to_sse_parts(
+    evt: RuntimeEvent,
+    attempt_number: Option<u64>,
+) -> (&'static str, String) {
+    match evt {
         RuntimeEvent::Call(record) => (
             "call",
             serde_json::to_string(&stamp_attempt(json!(record), attempt_number))
@@ -98,8 +104,232 @@ fn runtime_event_to_sse_event(evt: RuntimeEvent, attempt_number: Option<u64>) ->
             ))
             .unwrap_or_else(|_| "{}".into()),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE event log: catch-up + live re-attach (GET /sessions/{id}/stream)
+// ---------------------------------------------------------------------------
+
+/// The in-memory SSE journal of one live streaming session: every event the
+/// POST stream emits is appended here and fanned out on a broadcast channel,
+/// so a client whose SSE connection dropped can `GET /sessions/{id}/stream`,
+/// replay everything it missed, and follow live from exactly where the
+/// replay ends. Appends and subscriptions serialize on one lock — an append
+/// broadcasts while holding it and a subscriber snapshots + subscribes while
+/// holding it — so no event can be both absent from a snapshot and sent
+/// before that subscriber's receiver existed.
+pub(in crate::server) struct SessionEventLog {
+    inner: StdMutex<SessionEventLogInner>,
+    broadcast: tokio::sync::broadcast::Sender<(String, String)>,
+}
+
+struct SessionEventLogInner {
+    entries: Vec<(String, String)>,
+    /// Set once a `done` event lands; later appends are dropped so the
+    /// disconnect-cleanup guard can never write past a real terminal event.
+    closed: bool,
+}
+
+impl SessionEventLog {
+    fn new() -> Self {
+        let (broadcast, _) = tokio::sync::broadcast::channel(1024);
+        Self {
+            inner: StdMutex::new(SessionEventLogInner {
+                entries: Vec::new(),
+                closed: false,
+            }),
+            broadcast,
+        }
+    }
+
+    /// Append an event and fan it out to live subscribers. A `done` event
+    /// closes the log; appends after close are dropped.
+    fn append(&self, name: &str, data: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return;
+        }
+        if name == "done" {
+            inner.closed = true;
+        }
+        inner.entries.push((name.to_string(), data.to_string()));
+        let _ = self.broadcast.send((name.to_string(), data.to_string()));
+    }
+
+    /// Everything logged so far, whether the log is closed, and a receiver
+    /// positioned exactly after the snapshot (atomic with it, see above).
+    fn snapshot_and_subscribe(
+        &self,
+    ) -> (
+        Vec<(String, String)>,
+        bool,
+        tokio::sync::broadcast::Receiver<(String, String)>,
+    ) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.entries.clone(),
+            inner.closed,
+            self.broadcast.subscribe(),
+        )
+    }
+}
+
+/// Dropped when the POST stream's supervisor future ends. On the normal
+/// paths a real `done` event has already closed the log and this append is a
+/// no-op; if the originating client disconnected mid-run (the SSE body
+/// future dropped without reaching a terminal event), it closes the log with
+/// a synthetic `done` so re-attached clients don't hang on a feed nobody
+/// supervises anymore.
+struct EventLogCloseGuard {
+    log: Arc<SessionEventLog>,
+    session_id: String,
+}
+
+impl Drop for EventLogCloseGuard {
+    fn drop(&mut self) {
+        let data = json!({
+            "id": self.session_id,
+            "status": "failed",
+            "error": "the originating stream disconnected before the run settled; \
+                      check GET /sessions/{id} for the session's current state",
+        });
+        self.log.append("done", &data.to_string());
+    }
+}
+
+/// The terminal SSE `done` payload for a session's current state — one
+/// mapping shared by the live POST stream's final event and the GET
+/// re-attach replay of a settled session. `Running` only occurs on the GET
+/// path (a session with no live event log to follow, e.g. created via POST
+/// /sessions): the stream reports the status honestly and closes.
+fn final_session_event(session: &StoredSession) -> Value {
+    match session.status {
+        SessionStatus::Completed => json!({
+            "id": session.id,
+            "status": "completed",
+            "output": session.output,
+        }),
+        SessionStatus::Paused if !session.pending_signal_names.is_empty() => json!({
+            "id": session.id,
+            "status": "paused",
+            "pending_seq": session.pending_seq,
+            "pending_signal_name": session.pending_signal_name,
+            "pending_signal_names": session.pending_signal_names,
+            "pending_signal_deadline": session.pending_signal_deadline,
+        }),
+        SessionStatus::Paused => json!({
+            "id": session.id,
+            "status": "paused",
+            "pending_seq": session.pending_seq,
+            "pending_prompt": session.pending_prompt,
+            "pending_details": session.pending_details,
+        }),
+        SessionStatus::AwaitingApproval => json!({
+            "id": session.id,
+            "status": "awaiting_approval",
+            "pending_approval": session.pending_approval,
+        }),
+        SessionStatus::Cancelled => json!({
+            "id": session.id,
+            "status": "cancelled",
+            "error": session.error,
+        }),
+        SessionStatus::Running => json!({
+            "id": session.id,
+            "status": "running",
+        }),
+        SessionStatus::Failed => json!({
+            "id": session.id,
+            "status": "failed",
+            "error": session.error,
+        }),
+    }
+}
+
+/// GET /sessions/{id}/stream — (re-)attach to a session's SSE event stream.
+///
+/// For a session with a live streaming supervisor (started via POST
+/// /sessions/stream and not yet settled), replays every event already logged
+/// — so a client whose connection dropped catches up — then follows the live
+/// broadcast until the run settles (`done`). For any other stored session,
+/// replays the logged call records as `call` events and closes with a `done`
+/// event carrying the session's current state. Same SSE event format as the
+/// POST stream; same bearer auth as every session route (applied by the
+/// router-wide middleware).
+pub(in crate::server) async fn attach_session_stream(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    // Live re-attach: snapshot + subscribe atomically, then stream.
+    let live_log = state
+        .active_sessions
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(|active| active.event_log.clone());
+    if let Some(log) = live_log {
+        let (snapshot, closed, mut rx) = log.snapshot_and_subscribe();
+        let stream = async_stream::stream! {
+            for (name, data) in snapshot {
+                yield Ok::<_, std::convert::Infallible>(Event::default().event(name).data(data));
+            }
+            if !closed {
+                loop {
+                    match rx.recv().await {
+                        Ok((name, data)) => {
+                            let is_done = name == "done";
+                            yield Ok::<_, std::convert::Infallible>(
+                                Event::default().event(name).data(data),
+                            );
+                            if is_done {
+                                break;
+                            }
+                        }
+                        // Lagged: this attacher fell >capacity events behind;
+                        // skip the overwritten ones and keep following.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        };
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
+    // No live supervisor: replay the stored session's journal, then close
+    // with its current state.
+    let session = match state.session_store.get(&id) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({"error": "Session not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
     };
-    Event::default().event(name).data(data)
+    let stream = async_stream::stream! {
+        for record in &session.call_log {
+            let data = serde_json::to_string(&json!(record)).unwrap_or_else(|_| "{}".into());
+            yield Ok::<_, std::convert::Infallible>(Event::default().event("call").data(data));
+        }
+        let data = serde_json::to_string(&final_session_event(&session))
+            .unwrap_or_else(|_| "{}".into());
+        yield Ok::<_, std::convert::Infallible>(Event::default().event("done").data(data));
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Spawn one blocking agent run for the streaming supervisor, reporting the
@@ -240,6 +470,15 @@ pub(in crate::server) async fn stream_session(
             .into_response();
     }
     let policy_profile = body.policy_profile.clone();
+    // Warning-only static effect preflight under the session's tightened
+    // policy — mirrors create_session (see server/preflight.rs).
+    if let Some(profile) = policy_profile.as_deref() {
+        super::super::preflight::warn_denied_static_effects(
+            &state.agent_path,
+            &super::session_policy(&state, Some(profile)),
+            &format!("session policy profile '{profile}'"),
+        );
+    }
 
     let session_id = body
         .session_id
@@ -273,6 +512,10 @@ pub(in crate::server) async fn stream_session(
     let run_id = ctx.run_id();
     let ctx_slot = Arc::new(StdMutex::new(ctx.clone()));
 
+    // Journal every SSE event this stream emits so a dropped client can
+    // re-attach via GET /sessions/{id}/stream, catch up, and follow live.
+    let event_log = Arc::new(SessionEventLog::new());
+
     state.active_sessions.lock().unwrap().insert(
         session_id.clone(),
         ActiveSession {
@@ -283,6 +526,7 @@ pub(in crate::server) async fn stream_session(
                 ctx_slot: ctx_slot.clone(),
                 signal_tx,
             }),
+            event_log: Some(event_log.clone()),
         },
     );
     let mut session = StoredSession {
@@ -319,6 +563,12 @@ pub(in crate::server) async fn stream_session(
     let stream = async_stream::stream! {
         // The supervisor's share of the run slot (see acquire above).
         let permit = permit;
+        // Closes the re-attach log with a synthetic `done` if this future is
+        // dropped (client disconnect) before a real terminal event lands.
+        let _close_guard = EventLogCloseGuard {
+            log: event_log.clone(),
+            session_id: session.id.clone(),
+        };
         // The signal pause currently supervised: (pending seq, listen set).
         // While set, the run idles and a matching delivery (or the timeout
         // deadline) resumes it in-process without an HTTP round-trip.
@@ -327,7 +577,9 @@ pub(in crate::server) async fn stream_session(
         loop {
             tokio::select! {
                 Some(evt) = event_rx.recv() => {
-                    yield Ok::<_, std::convert::Infallible>(runtime_event_to_sse_event(evt, attempt_number));
+                    let (name, data) = runtime_event_to_sse_parts(evt, attempt_number);
+                    event_log.append(name, &data);
+                    yield Ok::<_, std::convert::Infallible>(Event::default().event(name).data(data));
                 }
                 Some(reason) = cancel_rx.recv() => {
                     cancelled.store(true, Ordering::SeqCst);
@@ -346,6 +598,7 @@ pub(in crate::server) async fn stream_session(
                         "error": reason,
                     }), attempt_number);
                     let data = serde_json::to_string(&final_event).unwrap_or_else(|_| "{}".into());
+                    event_log.append("done", &data);
                     yield Ok::<_, std::convert::Infallible>(Event::default().event("done").data(data));
                     break;
                 }
@@ -429,6 +682,7 @@ pub(in crate::server) async fn stream_session(
                             "pending_signal_deadline": session.pending_signal_deadline,
                         }), attempt_number);
                         let data = serde_json::to_string(&paused_event).unwrap_or_else(|_| "{}".into());
+                        event_log.append("paused", &data);
                         yield Ok::<_, std::convert::Infallible>(Event::default().event("paused").data(data));
 
                         let queued = ctx_slot.lock().unwrap().take_queued_signal_any(&names);
@@ -462,36 +716,9 @@ pub(in crate::server) async fn stream_session(
                     // close the stream, and input/approval pauses hand off to
                     // the durable HTTP resume/approve endpoints.
                     state_for_stream.active_sessions.lock().unwrap().remove(&session.id);
-                    let final_event = match session.status {
-                        SessionStatus::Completed => json!({
-                            "id": session.id,
-                            "status": "completed",
-                            "output": session.output,
-                        }),
-                        SessionStatus::Paused => json!({
-                            "id": session.id,
-                            "status": "paused",
-                            "pending_seq": session.pending_seq,
-                            "pending_prompt": session.pending_prompt,
-                            "pending_details": session.pending_details,
-                        }),
-                        SessionStatus::AwaitingApproval => json!({
-                            "id": session.id,
-                            "status": "awaiting_approval",
-                            "pending_approval": session.pending_approval,
-                        }),
-                        SessionStatus::Cancelled => json!({
-                            "id": session.id,
-                            "status": "cancelled",
-                            "error": session.error,
-                        }),
-                        _ => json!({
-                            "id": session.id,
-                            "status": "failed",
-                            "error": session.error,
-                        }),
-                    };
+                    let final_event = final_session_event(&session);
                     let data = serde_json::to_string(&stamp_attempt(final_event, attempt_number)).unwrap_or_else(|_| "{}".into());
+                    event_log.append("done", &data);
                     yield Ok::<_, std::convert::Infallible>(Event::default().event("done").data(data));
                     break;
                 }

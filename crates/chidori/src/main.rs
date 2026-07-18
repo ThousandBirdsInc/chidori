@@ -1,4 +1,5 @@
 mod acp;
+mod export;
 mod init;
 mod mcp;
 mod mem_guard;
@@ -233,6 +234,15 @@ enum Commands {
         #[arg(long)]
         until_seq: Option<u64>,
 
+        /// Repair a failed run: strip the trailing failed record(s) — and any
+        /// nested effects the failed call consumed — from the journal, replay
+        /// everything before the failure from cache, then re-execute the
+        /// failed call live. Errors if the run's journal has no trailing
+        /// failure (a completed run needs nothing; a paused run wants plain
+        /// `resume`). Mutually exclusive with `--until-seq`.
+        #[arg(long, conflicts_with = "until_seq")]
+        retry_failed: bool,
+
         /// Edit-and-resume: proceed even though the agent source changed
         /// since this run was recorded. Recorded calls replay positionally
         /// against the edited code; an edit that touches already-replayed
@@ -280,6 +290,33 @@ enum Commands {
         run_id: String,
 
         /// Project dir containing `.chidori/runs/` (defaults to agent file's parent)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+
+        /// Read the run from `<runs-dir>/<run_id>` instead of
+        /// `<dir>/.chidori/runs/<run_id>` — the consumption side of
+        /// `chidori export --fixture`: point this at the committed fixture
+        /// directory.
+        #[arg(long)]
+        runs_dir: Option<PathBuf>,
+    },
+
+    /// Export a completed run as a minimal, committable verification fixture:
+    /// copies just the artifacts `chidori verify` reads (records.jsonl,
+    /// runtime.snapshot.json, output.json, input.json) into `<dest>/<run_id>/`,
+    /// leaving the multi-megabyte runtime snapshot blob and resume-only state
+    /// behind. Commit the fixture and run
+    /// `chidori verify <agent.ts> <run_id> --runs-dir <dest>` in CI.
+    Export {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Destination directory for the fixture; the run's artifacts land in
+        /// `<dest>/<run_id>/`.
+        #[arg(long)]
+        fixture: PathBuf,
+
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
         #[arg(short, long)]
         dir: Option<PathBuf>,
     },
@@ -620,6 +657,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             run_id,
             dir,
             until_seq,
+            retry_failed,
             allow_source_change,
             model,
             untrusted,
@@ -634,6 +672,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                     &run_id,
                     dir.as_deref(),
                     until_seq,
+                    retry_failed,
                     allow_source_change,
                     model,
                     untrusted,
@@ -642,9 +681,23 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             },
             false,
         ),
-        Commands::Verify { file, run_id, dir } => {
-            (cmd_verify(&file, &run_id, dir.as_deref()), false)
-        }
+        Commands::Verify {
+            file,
+            run_id,
+            dir,
+            runs_dir,
+        } => (
+            cmd_verify(&file, &run_id, dir.as_deref(), runs_dir.as_deref()),
+            false,
+        ),
+        Commands::Export {
+            run_id,
+            fixture,
+            dir,
+        } => (
+            crate::export::cmd_export(&run_id, &fixture, dir.as_deref()),
+            false,
+        ),
         Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
         Commands::BranchResume {
             run_id,
@@ -1190,6 +1243,72 @@ fn abs_dir(dir: &std::path::Path) -> PathBuf {
     })
 }
 
+/// Spawn a stderr progress listener for plain (non `--stream`) runs: one line
+/// per live prompt call, so a long model call shows a sign of life instead of
+/// dead air until the run ends. Reuses the runtime's existing event channel —
+/// the returned sender is handed to the engine's `*_streaming` entry point and
+/// the drain thread prints only `PromptStart`/`PromptEnd` (per-record `Call`
+/// and per-token `PromptDelta` events flow on the same channel and are
+/// ignored). Replayed and locally-cached prompt calls short-circuit in
+/// `host_core` before the provider-request path that emits `PromptStart`, so
+/// a resume never prints phantom "started" lines for calls it served from the
+/// journal. Stdout is untouched: it stays reserved for the agent's output.
+///
+/// Returns `None` when `CHIDORI_QUIET` is set (to anything but `0`/empty),
+/// the opt-out for scripts that want the old fully-silent stderr; the caller
+/// then runs without an event sender attached, exactly as before.
+fn spawn_prompt_progress_listener() -> Option<(
+    tokio::sync::mpsc::UnboundedSender<crate::runtime::context::RuntimeEvent>,
+    std::thread::JoinHandle<()>,
+)> {
+    if std::env::var_os("CHIDORI_QUIET").is_some_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
+    let (event_tx, event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::runtime::context::RuntimeEvent>();
+    let drain = std::thread::spawn(move || {
+        use crate::runtime::context::RuntimeEvent;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let mut rx = event_rx;
+        let mut started: HashMap<String, Instant> = HashMap::new();
+        while let Some(event) = rx.blocking_recv() {
+            match event {
+                RuntimeEvent::PromptStart {
+                    stream_id,
+                    seq,
+                    model,
+                    ..
+                } => {
+                    started.insert(stream_id, Instant::now());
+                    eprintln!("seq {seq}: prompt started ({model})");
+                }
+                RuntimeEvent::PromptEnd {
+                    stream_id,
+                    seq,
+                    error,
+                    ..
+                } => {
+                    // A failed prompt surfaces through the run's own error
+                    // path; the progress line only marks successful finishes.
+                    let elapsed = started.remove(&stream_id);
+                    if error.is_none() {
+                        if let Some(t0) = elapsed {
+                            eprintln!(
+                                "seq {seq}: prompt finished ({:.1}s)",
+                                t0.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                }
+                RuntimeEvent::Call(_) | RuntimeEvent::PromptDelta { .. } => {}
+            }
+        }
+    });
+    Some((event_tx, drain))
+}
+
 fn cmd_run(
     file: &Path,
     inputs: &[String],
@@ -1251,7 +1370,19 @@ fn cmd_run(
     // Run the agent.
     // Announce the run id up front (stderr): after a crash — where buffered
     // stdout is lost — the id `chidori resume` needs is already on record.
-    let result = engine.run_announced(file, &input_value)?;
+    // With the progress listener attached (the default), each live prompt
+    // call also gets a one-line stderr note — long model calls are otherwise
+    // total silence on the plain path. CHIDORI_QUIET=1 restores that silence.
+    let result = match spawn_prompt_progress_listener() {
+        Some((event_tx, drain)) => {
+            let result = engine.run_streaming_announced(file, &input_value, event_tx);
+            // The sender moved into the engine and drops when the run
+            // returns; join so the last progress lines land before output.
+            drain.join().ok();
+            result?
+        }
+        None => engine.run_announced(file, &input_value)?,
+    };
 
     // A `chidori.signal(name)` listen point with an empty mailbox pauses the run
     // (there is no stdin fallback for signals, unlike `input()`). The engine has
@@ -1600,7 +1731,7 @@ fn cmd_chat(
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
         .with_policy(cli_policy(untrusted, trusted))
-        .with_persist_base(run_base)
+        .with_persist_base(run_base.clone())
         .with_workspace_root(abs_dir(&base_dir));
 
     eprintln!("chidori chat — type a message and press enter. Type 'exit' or Ctrl-D to quit.");
@@ -1665,7 +1796,7 @@ fn cmd_chat(
                         let text = turn.get("text").and_then(Value::as_str).unwrap_or("");
                         match turn.get("role").and_then(Value::as_str) {
                             Some("user") => println!("\nyou> {text}"),
-                            _ => println!("{text}"),
+                            _ => println!("assistant> {text}"),
                         }
                     }
                 }
@@ -1711,6 +1842,11 @@ fn cmd_chat(
             let mut streamed = false;
             while let Some(evt) = rx.blocking_recv() {
                 if let RuntimeEvent::PromptDelta { delta, .. } = evt {
+                    // Mark where the reply starts (mirrors the `you> ` prompt)
+                    // so scrollback distinguishes the two speakers.
+                    if !streamed {
+                        print!("assistant> ");
+                    }
                     print!("{delta}");
                     out.flush().ok();
                     streamed = true;
@@ -1748,7 +1884,7 @@ fn cmd_chat(
                         })
                         .and_then(|turn| turn.get("text").and_then(Value::as_str))
                         .unwrap_or("");
-                    print!("{reply}");
+                    print!("assistant> {reply}");
                 }
                 println!();
                 call_log = result.call_log.into_records();
@@ -1772,6 +1908,7 @@ fn cmd_chat(
         );
     }
     if !call_log.is_empty() {
+        print_chat_session_summary(&run_base, &session_id, messages.len());
         let agent_arg = agent
             .map(|p| format!("{} ", p.display()))
             .unwrap_or_default();
@@ -1785,6 +1922,86 @@ fn cmd_chat(
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
     Ok(())
+}
+
+/// One-line usage/cost summary printed when a chat session ends. Reads the
+/// session's journaled records from its run dir and prices them exactly like
+/// `chidori stats` (same record parsing, same journaled-pricing fallback, and
+/// the same "unknown, not $0" treatment for unpriced models).
+fn print_chat_session_summary(run_base: &Path, session_id: &str, turns: usize) {
+    use crate::runtime::cost::{estimate_cost_usd_with_cache, is_priced_model};
+    use crate::runtime::store::RunStore as _;
+
+    let run_dir = run_base.join(session_id);
+    let Ok(Some(records)) = crate::runtime::store::FsRunStore::new(&run_dir).load_call_log() else {
+        return;
+    };
+    // Price under the pricing table recorded in the session's manifest, same
+    // as `stats` (a live CHIDORI_PRICING still wins inside the cost module).
+    if let Ok(manifest) = crate::runtime::snapshot::SnapshotStore::new(&run_dir).load_manifest() {
+        if let Some(ref pricing) = manifest.pricing {
+            crate::runtime::cost::install_journaled_pricing(pricing);
+        }
+    }
+
+    let mut prompt_calls: u64 = 0;
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut cache_read: u64 = 0;
+    let mut cost: f64 = 0.0;
+    let mut any_unpriced = false;
+    for r in &records {
+        if r.function != "prompt" {
+            continue;
+        }
+        prompt_calls += 1;
+        let model = r
+            .args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if !is_priced_model(model) {
+            any_unpriced = true;
+        }
+        if let Some(ref usage) = r.token_usage {
+            input_tokens += usage.input_tokens;
+            output_tokens += usage.output_tokens;
+            let read = usage.cache_read_tokens.unwrap_or(0);
+            let write = usage.cache_creation_tokens.unwrap_or(0);
+            cache_read += read;
+            cost += estimate_cost_usd_with_cache(
+                model,
+                usage.input_tokens,
+                usage.output_tokens,
+                write,
+                read,
+            );
+        }
+    }
+    if prompt_calls == 0 {
+        return;
+    }
+
+    let cache_note = if cache_read > 0 {
+        format!(", {cache_read} cache reads")
+    } else {
+        String::new()
+    };
+    // Same distinction as `stats`: an unpriced model's cost is unknown, not $0.
+    let cost_note = if !any_unpriced {
+        format!("est. cost: ${cost:.6}")
+    } else if cost > 0.0 {
+        format!(
+            "est. cost: ${cost:.6} + unknown (unpriced model; supply rates via CHIDORI_PRICING)"
+        )
+    } else {
+        "est. cost: unknown (unpriced model; supply rates via CHIDORI_PRICING)".to_string()
+    };
+    eprintln!(
+        "session usage: {turns} turn(s), {prompt_calls} prompt call(s), {} tokens \
+         ({input_tokens} in / {output_tokens} out{cache_note}), {cost_note}",
+        input_tokens + output_tokens
+    );
 }
 
 fn cmd_check(file: &Path) -> Result<()> {
@@ -1805,6 +2022,7 @@ fn cmd_resume(
     run_id: &str,
     dir: Option<&std::path::Path>,
     until_seq: Option<u64>,
+    retry_failed: bool,
     allow_source_change: bool,
     model: Option<String>,
     untrusted: bool,
@@ -1828,6 +2046,63 @@ fn cmd_resume(
         .store_for(run_id)
         .load_call_log()?
         .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+
+    // `--retry-failed`: first-class repair for a failed run. The trailing
+    // failed record(s) — the crash frontier — are stripped with the exact
+    // fixpoint the actor `restart: "resume"` path and the detached-agent
+    // supervisor use (`strip_crash_frontier`): pop trailing failed records,
+    // then sweep out every record whose parent is stripped, so a failed
+    // call's nested effects re-execute live too. Divergence scoping falls out
+    // of the strip: the surviving prefix still replays under the normal
+    // strict rules (nothing here loosens them, and `--allow-source-change`
+    // keeps its usual meaning), while the retried tail has no records left to
+    // diverge against — it is ordinary live execution, so a different
+    // args/result on the retry needs no opt-in.
+    if retry_failed {
+        if records.last().is_none_or(|r| r.error.is_none()) {
+            let store = factory.store_for(run_id);
+            let state = if store.get_blob("output.json").ok().flatten().is_some() {
+                "completed — it already has a recorded output, so there is nothing to \
+                 retry (use `chidori verify` to re-check it, or `--until-seq` to \
+                 time-travel into its history)"
+                    .to_string()
+            } else if store
+                .get_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                "paused on a pending operation, not failed — continue it with a plain \
+                 `chidori resume` (or deliver its input/signal through `chidori serve`)"
+                    .to_string()
+            } else {
+                format!(
+                    "not in a failed state: its journal's last record ({}) completed, so \
+                     there is no failure frontier to retry",
+                    records
+                        .last()
+                        .map(|r| format!("seq {} `{}`", r.seq, r.function))
+                        .unwrap_or_else(|| "empty journal".to_string())
+                )
+            };
+            anyhow::bail!("--retry-failed: run {run_id} is {state}.");
+        }
+        let before_seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
+        records = crate::runtime::host_actor::strip_crash_frontier(records);
+        let kept: std::collections::HashSet<u64> = records.iter().map(|r| r.seq).collect();
+        let removed: Vec<u64> = before_seqs
+            .into_iter()
+            .filter(|seq| !kept.contains(seq))
+            .collect();
+        let low = removed.iter().min().copied().unwrap_or_default();
+        let high = removed.iter().max().copied().unwrap_or_default();
+        eprintln!(
+            "retry-failed: stripped {} failed record(s) (seqs {low}..{high}), \
+             replaying {} records then executing live",
+            removed.len(),
+            records.len()
+        );
+    }
 
     // Time travel: truncate the journal at the requested frontier; replay
     // serves everything up to it from cache and the run continues live there.
@@ -1913,7 +2188,13 @@ fn cmd_resume(
         .with_policy(cli_policy(untrusted, trusted))
         .with_persist_base(run_base.clone())
         .with_default_model(default_model)
-        .with_history_rewrite_allowed(until_seq.is_some())
+        // Both `--until-seq` and `--retry-failed` intentionally hand the
+        // engine a journal SHORTER than the durable one; without the opt-in
+        // the shorter-log floor would refuse to compact the repaired history
+        // (e.g. a retry that settles in fewer records than the failed attempt
+        // journaled), leaving stale failed records behind for `verify` to
+        // trip over.
+        .with_history_rewrite_allowed(until_seq.is_some() || retry_failed)
         .with_workspace_root(abs_dir(&base_dir));
 
     // Journaled top-level workspace records re-execute on every replay by
@@ -1925,7 +2206,18 @@ fn cmd_resume(
         .iter()
         .filter(|r| r.function == "workspace" && r.parent_seq.is_none())
         .count() as u64;
-    let result = engine.resume_run(file, &input_value, records, run_id);
+    // Same one-line-per-prompt stderr progress as plain `run`, and only for
+    // calls executed live past the replay frontier: replayed records
+    // short-circuit before the provider path that emits PromptStart, so the
+    // replayed prefix stays silent. CHIDORI_QUIET=1 opts out.
+    let result = match spawn_prompt_progress_listener() {
+        Some((event_tx, drain)) => {
+            let result = engine.resume_run_streaming(file, &input_value, records, run_id, event_tx);
+            drain.join().ok();
+            result
+        }
+        None => engine.resume_run(file, &input_value, records, run_id),
+    };
     let _ =
         crate::runtime::store::release_lease(factory.store_for(run_id).as_ref(), &cli_lease_owner);
     let result = result?;
@@ -1981,12 +2273,22 @@ fn cmd_resume(
 /// changed source refuses via the manifest check, a diverging recorded call
 /// errors positionally, a run that reaches for anything live has no provider
 /// (and no allowed gated effects) to reach.
-fn cmd_verify(file: &Path, run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+fn cmd_verify(
+    file: &Path,
+    run_id: &str,
+    dir: Option<&std::path::Path>,
+    runs_dir: Option<&std::path::Path>,
+) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
         .or_else(|| file.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let run_base = base_dir.join(".chidori").join("runs");
+    // `--runs-dir` points straight at a runs base (e.g. a committed
+    // `chidori export --fixture` directory); otherwise the run lives under
+    // the project's `.chidori/runs/` as usual.
+    let run_base = runs_dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| base_dir.join(".chidori").join("runs"));
     let run_dir = run_base.join(run_id);
 
     use crate::runtime::store::RunStore as _;

@@ -272,8 +272,10 @@ of commits as this document:
   error now points at `POST /sessions/{id}/replay` as the recovery path.
 - **`input()` at EOF** — an empty answer resolves to the declared `default`;
   EOF with no default fails loudly instead of silently returning `""`.
-- **CLI/server asymmetries** — `chidori serve` accepts `--tools` (and the
-  implicit `tools/` convention is documented); the approval prompt gained an
+- **CLI/server asymmetries** — the `run`/`serve` tools asymmetry was resolved
+  by removing the flag and the `tools/`-directory mechanism entirely: tools
+  are now defined in-VM with `defineTool` and passed as handles, so there is
+  nothing to load and no flag to forget; the approval prompt gained an
   `[a]ll further calls to this target` answer; sandbox degradation notes
   (the landlock line) print only under `--verbose` /
   `CHIDORI_ISOLATE_VERBOSE`, with `CHIDORI_ISOLATE_REQUIRE_SANDBOX`
@@ -285,8 +287,11 @@ of commits as this document:
   the argument comparison tolerates keys absent from the recorded side);
   `reasoning_content` from reasoning models is captured on
   `LlmResponse.reasoning`, journaled, and exposed on `respond()`.
-- **Example tool** — `examples/tools/web_search.ts` performs a real
-  (keyless) DuckDuckGo Instant Answer search instead of returning `[]`.
+- **Example tool** — the `examples/tools/web_search.ts` stub went away with
+  the `tools/` mechanism; `llm.txt`'s tool section now shows a real
+  fetch-backed `defineTool` example instead of a stub, and the bundled
+  examples (`examples/release-notes-concierge`, `examples/war-room`) define
+  real HTTP-backed tools inline with `defineTool`.
 - **Types** — the `interface`-vs-`type` input gotcha and the
   SDK-must-match-binary rule are documented in the SDK README. Republishing
   the npm package in lockstep with the binary release remains a

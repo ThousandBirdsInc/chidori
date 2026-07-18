@@ -306,8 +306,10 @@ Every finding above was addressed on this branch, in the same series of
 commits as this update, and re-verified against the original scenarios:
 
 - **Finding 1 (crash-resume)** — `chidori resume` accepts
-  `--trusted`/`--untrusted`/`--tools`, journals live continuation into the
+  `--trusted`/`--untrusted`, journals live continuation into the
   same run dir, and takes the run's lease against concurrent drivers.
+  (No `--tools` flag exists anymore on any command: the tool model moved
+  to in-VM `defineTool` handles, so there is nothing for resume to load.)
   Investigating the re-verification exposed the *actual* root cause beneath
   the policy gap: replayed `spawn_actor` records never re-created actors
   unless a live `send`/`join` addressed them — a `receive`-driven fan-in
