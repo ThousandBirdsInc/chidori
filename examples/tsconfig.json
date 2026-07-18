@@ -19,5 +19,6 @@
     "branching/**/*.ts",
     "interactive-pipeline/**/*.ts",
     "multiplayer-review/**/*.ts",
+    "war-room/**/*.ts",
   ]
 }
