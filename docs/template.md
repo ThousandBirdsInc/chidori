@@ -1,5 +1,6 @@
 ---
 title: "Prompt Templates"
+description: "chidori.template: Jinja prompt rendering \u2014 inline vs. file templates, path resolution, strict undefined variables."
 ---
 
 # Templates — Jinja prompt rendering

@@ -1,12 +1,15 @@
 ---
 title: "Getting Started"
+description: "Install the binary, run the example agents, inspect a durable run, and exercise the human-in-the-loop pause/resume loop."
 ---
 
 # Getting started & demos
 
 This walks through running Chidori's example agents, inspecting a durable run,
 and exercising the human-in-the-loop pause/resume loop. For the two-minute
-version, see [Quick Start in the README](../README.md#️-quick-start).
+version, see [Quick Start in the README](../README.md#️-quick-start). When
+you're ready to write your own agent, continue to
+[Your First Agent](./your-first-agent.md).
 
 ## Try the demo picker
 

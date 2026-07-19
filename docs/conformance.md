@@ -1,5 +1,6 @@
 ---
 title: "Conformance (Test262)"
+description: "Test262 methodology and the CI conformance gate for the pure-Rust JS engine."
 ---
 
 # JavaScript conformance: running chidori against Test262

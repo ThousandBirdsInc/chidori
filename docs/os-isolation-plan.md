@@ -1,5 +1,6 @@
 ---
 title: "OS Isolation Plan"
+description: "Process isolation design: namespaces, Landlock, seccomp, and Seatbelt."
 ---
 
 # OS-level isolation: process-per-run with brokered effects

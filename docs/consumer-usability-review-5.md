@@ -1,5 +1,6 @@
 ---
 title: "Round 5: Shipping to Users"
+description: "Round 5: shipping to users \u2014 serve in production posture, SSE streaming, multiplayer signals under crashes, SDK-as-client, webhooks."
 ---
 
 # Consumer usability review, round 5: shipping an agent to users

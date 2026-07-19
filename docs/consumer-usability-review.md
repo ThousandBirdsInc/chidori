@@ -1,5 +1,6 @@
 ---
 title: "Round 1: Linear Path"
+description: "Round 1: building a real agent on 3.6.0 \u2014 the linear path."
 ---
 
 # Consumer usability review: building a real agent on Chidori

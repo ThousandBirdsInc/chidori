@@ -1,5 +1,6 @@
 ---
 title: "Architecture"
+description: "Engine and runtime layering: the high-level component map and repository layout."
 ---
 
 # Architecture & project structure

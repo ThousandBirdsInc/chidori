@@ -1,5 +1,6 @@
 ---
 title: "Round 2: Multi-Agent Surface"
+description: "Round 2: the multi-agent surface (actors, branches, detached agents) under failure."
 ---
 
 # Consumer usability review, round 2: the multi-agent surface

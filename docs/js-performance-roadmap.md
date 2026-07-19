@@ -1,5 +1,6 @@
 ---
 title: "JS Performance Roadmap"
+description: "Profiling data and the JS engine performance roadmap."
 ---
 
 # JS execution performance: the road toward JIT-class throughput

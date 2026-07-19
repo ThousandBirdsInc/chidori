@@ -1,5 +1,6 @@
 ---
 title: "Observing with Tael"
+description: "OTLP export, run-trace correlation, checkpoint-backed golden cases, and the self-harness loop."
 ---
 
 # Observing runs with Tael

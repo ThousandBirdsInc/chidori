@@ -1,5 +1,6 @@
 ---
 title: "JIT Experiment (retired)"
+description: "The closure-threading JIT experiment \u2014 retired; kept as data."
 ---
 
 # An experimental closure-threading "JIT" for `chidori-js`

@@ -1,5 +1,6 @@
 ---
 title: "Round 4: Day-2 Surface"
+description: "Round 4: the day-2 surface \u2014 npm packages, durable store, hydration, time travel, verify."
 ---
 
 # Consumer usability review, round 4: the day-2 surface

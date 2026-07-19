@@ -1,5 +1,6 @@
 ---
 title: "Context Management"
+description: "Immutable prompt contexts, provider prompt caching, explicit window compaction, and cost accounting."
 ---
 
 # Context Management — Cache-Aware, Composable Prompts

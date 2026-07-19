@@ -1,5 +1,6 @@
 ---
 title: "Harness Engineering Needs a Substrate"
+description: "Why harness engineering needs a durable execution substrate \u2014 a response to Lilian Weng's essay."
 ---
 
 # Harness Engineering Needs a Substrate

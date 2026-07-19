@@ -1,5 +1,6 @@
 ---
 title: "DOM Runtime Prototype"
+description: "The DOM runtime prototype behind chidori.renderDOM."
 ---
 
 # DOM behind the host boundary

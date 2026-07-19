@@ -1,5 +1,6 @@
 ---
 title: "Interpreter Optimization"
+description: "Measured interpreter optimization phases, with the numbers."
 ---
 
 # Interpreter performance: optimizing `chidori-js` without a JIT

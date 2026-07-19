@@ -1,5 +1,6 @@
 ---
 title: "Signals"
+description: "Named listen points for multiplayer sessions: pause for humans or other agents, durable mailboxes, fan-in, timeouts."
 ---
 
 # Signals — multiplayer agents

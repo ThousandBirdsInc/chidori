@@ -1,5 +1,6 @@
 ---
 title: "Captured Effects"
+description: "Captured-effect surfaces: networking, the virtual filesystem, crypto, and timers."
 ---
 
 # Captured Effects: Virtual Filesystem, Crypto, and Timers

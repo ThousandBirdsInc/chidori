@@ -1,5 +1,6 @@
 ---
 title: "Round 6: Conversational Surface"
+description: "Round 6: the long-haul conversational surface \u2014 init/chat funnel, templates, cross-run memory, window compaction, local prompt cache."
 ---
 
 # Consumer usability review, round 6: the long-haul conversational surface

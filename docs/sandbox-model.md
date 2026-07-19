@@ -1,5 +1,6 @@
 ---
 title: "Sandbox Model"
+description: "The security model: deny-by-default capability injection, resource limits, OS-level isolation, and its honest gaps."
 ---
 
 # Sandbox model of the chidori-js runtime

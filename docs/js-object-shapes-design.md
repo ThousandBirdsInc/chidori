@@ -1,5 +1,6 @@
 ---
 title: "Object Shapes Design"
+description: "Hidden-class (object shapes) design for the JS engine \u2014 implemented."
 ---
 
 # Object shapes (hidden classes): design + phased migration plan

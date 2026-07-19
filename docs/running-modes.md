@@ -1,5 +1,6 @@
 ---
 title: "Running Modes"
+description: "One-shot CLI runs vs. the HTTP session server, approval postures, policy profiles, and --trusted."
 ---
 
 # Running modes

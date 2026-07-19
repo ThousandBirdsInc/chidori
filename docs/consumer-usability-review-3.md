@@ -1,5 +1,6 @@
 ---
 title: "Round 3: Daily Driver"
+description: "Round 3: the everyday-agent surface as a daily driver."
 ---
 
 # Consumer usability review, round 3: the everyday-agent surface

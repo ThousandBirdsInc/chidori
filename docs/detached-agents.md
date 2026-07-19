@@ -1,5 +1,6 @@
 ---
 title: "Detached Agents"
+description: "Durable, addressable, hibernating agent processes that outlive their spawner; chidori.alarm; the detached-agent HTTP surface."
 ---
 
 # Detached agents: durable, addressable, hibernating processes

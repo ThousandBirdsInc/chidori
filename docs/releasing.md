@@ -1,5 +1,6 @@
 ---
 title: "Releasing"
+description: "The release train and versioning."
 ---
 
 # Releasing

@@ -1,5 +1,6 @@
 ---
 title: "Deployment"
+description: "Running agents in production: config, durability tiers, recipes for a plain VM, Fly.io, and Kubernetes, failure and recovery."
 ---
 
 # Deploying Chidori

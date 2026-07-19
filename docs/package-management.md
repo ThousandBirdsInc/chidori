@@ -1,5 +1,6 @@
 ---
 title: "Package Management"
+description: "npm packages without Node: chidori add/install/remove, the content-addressed store, SHA-512 verification, JSONL lockfile."
 ---
 
 # Package management

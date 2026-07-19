@@ -1,5 +1,6 @@
 ---
 title: "Core Concepts"
+description: "Agents, host functions, and the mental model: the chidori.* surface, tools, streaming, and prompt caching."
 ---
 
 # Core concepts: agents & host functions

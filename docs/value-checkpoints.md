@@ -1,5 +1,6 @@
 ---
 title: "Value Checkpoints"
+description: "chidori.step: journal expensive pure compute once so replay and resume never re-pay it."
 ---
 
 # Value Checkpoints — `chidori.step(name, fn)`

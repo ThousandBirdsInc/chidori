@@ -1,5 +1,6 @@
 ---
 title: "Replay & Resume"
+description: "The record/checkpoint/replay model: how resume works, what counts as divergence, and what keeps replay byte-identical."
 ---
 
 # How replay works

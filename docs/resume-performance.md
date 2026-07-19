@@ -1,5 +1,6 @@
 ---
 title: "Resume Performance"
+description: "Resume cost analysis and optimization notes."
 ---
 
 # Resume performance: what a resume costs, and how to make it cheap

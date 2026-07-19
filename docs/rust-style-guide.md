@@ -1,5 +1,6 @@
 ---
 title: "Rust Style Guide"
+description: "Contributor conventions: error handling, panics, tracing, async, unsafe policy, testing."
 ---
 
 # Rust style guide
