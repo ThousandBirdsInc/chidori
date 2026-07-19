@@ -24,5 +24,15 @@ wasm-bindgen --target web \
 # the wasm bindings, so mirror it into the (gitignored) pkg/ output.
 cp sdk/browser/index.js crates/chidori-wasm/www/pkg/chidori-browser.js
 
+# Mirror the runtime assets into the docs website's public dir (also
+# gitignored) so the /playground page can load them. The docs deploy workflow
+# runs this script before `next build`.
+mkdir -p website/public/chidori-wasm
+cp crates/chidori-wasm/www/pkg/chidori_wasm.js \
+   crates/chidori-wasm/www/pkg/chidori_wasm_bg.wasm \
+   crates/chidori-wasm/www/pkg/chidori-browser.js \
+   crates/chidori-wasm/www/data/fact.json \
+   website/public/chidori-wasm/
+
 echo "Built crates/chidori-wasm/www/pkg:"
 ls -la crates/chidori-wasm/www/pkg

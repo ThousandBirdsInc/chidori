@@ -59,6 +59,8 @@ node_modules/
 /website/out/
 /website/.source/
 /website/next-env.d.ts
+# Playground runtime assets, mirrored from the wasm build by scripts/build-wasm.sh
+/website/public/chidori-wasm/
 
 # Secrets / local env
 .env

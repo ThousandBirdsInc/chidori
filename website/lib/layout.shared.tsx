@@ -23,6 +23,10 @@ export function baseOptions(): BaseLayoutProps {
     githubUrl: REPO_URL,
     links: [
       {
+        text: 'Playground',
+        url: '/playground',
+      },
+      {
         text: 'Examples',
         url: `${REPO_URL}/tree/main/examples`,
         external: true,
