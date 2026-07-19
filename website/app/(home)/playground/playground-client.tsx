@@ -15,6 +15,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 const BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
 const ASSETS = `${BASE}/chidori-wasm`;
 const SAVE_KEY = 'chidori-playground-run';
+// The exchanged OpenRouter key lives in sessionStorage: it survives the PKCE
+// redirect back to this page, and is gone when the tab closes.
+const OR_KEY = 'chidori-playground-openrouter-key';
 
 const SAMPLE_AGENT = `interface Weather { tempC: number; sky: string }
 
@@ -79,6 +82,9 @@ export function PlaygroundClient() {
   const [question, setQuestion] = useState<string | null>(null);
   const [answer, setAnswer] = useState('');
   const [hasSaved, setHasSaved] = useState(false);
+  const [provider, setProvider] = useState<'mock' | 'openrouter'>('mock');
+  const [orKey, setOrKey] = useState<string | null>(null);
+  const [model, setModel] = useState('openrouter/auto');
   const loadedRef = useRef<Loaded | null>(null);
   const agentRef = useRef<{ run(): Promise<RunView>; blob(): Uint8Array } | null>(null);
   const askResolveRef = useRef<((answer: string) => void) | null>(null);
@@ -88,8 +94,21 @@ export function PlaygroundClient() {
     // Preload so the first click is instant; surface a friendly error if the
     // assets have not been built into public/chidori-wasm.
     loadAssets()
-      .then((loaded) => {
+      .then(async (loaded) => {
         loadedRef.current = loaded;
+        // Finish the OpenRouter PKCE login if this page load is the redirect
+        // back from openrouter.ai (no-op otherwise).
+        try {
+          const exchanged = await loaded.sdk.completeOpenRouterLogin();
+          if (exchanged) sessionStorage.setItem(OR_KEY, exchanged);
+        } catch (err) {
+          setStatusLine(`OpenRouter login failed: ${String(err)}`);
+        }
+        const key = sessionStorage.getItem(OR_KEY);
+        if (key) {
+          setOrKey(key);
+          setProvider('openrouter');
+        }
         window.__chidoriReady = true;
       })
       .catch(() =>
@@ -101,10 +120,18 @@ export function PlaygroundClient() {
 
   const host = useCallback(
     (interactive: boolean) => ({
-      llm: async ({ text }: { text: string }) =>
-        text.startsWith('One line on')
-          ? 'crisp skies, bring a light jacket'
-          : `[mock] ${text}`,
+      llm:
+        provider === 'openrouter' && orKey && loadedRef.current
+          ? loadedRef.current.sdk.openRouterLlm({
+              apiKey: orKey,
+              model,
+              appName: 'Chidori Playground',
+              appUrl: typeof location !== 'undefined' ? location.origin : undefined,
+            })
+          : async ({ text }: { text: string }) =>
+              text.startsWith('One line on')
+                ? 'crisp skies, bring a light jacket'
+                : `[mock] ${text}`,
       tools: {
         weather: (kwargs: unknown) => {
           const { city } = kwargs as { city: string };
@@ -121,8 +148,20 @@ export function PlaygroundClient() {
         });
       },
     }),
-    [],
+    [provider, orKey, model],
   );
+
+  const connectOpenRouter = useCallback(() => {
+    // Redirects to openrouter.ai's consent page; the redirect back lands on
+    // this page with ?code=, which the mount effect exchanges for a key.
+    loadedRef.current?.sdk.startOpenRouterLogin();
+  }, []);
+
+  const disconnectOpenRouter = useCallback(() => {
+    sessionStorage.removeItem(OR_KEY);
+    setOrKey(null);
+    setProvider('mock');
+  }, []);
 
   const finish = useCallback((result: RunView, mode: string) => {
     setConsoleLines(result.console);
@@ -250,8 +289,54 @@ export function PlaygroundClient() {
         aria-label="Agent source (TypeScript)"
         className="min-h-[22rem] w-full rounded-lg border border-fd-border bg-fd-card p-4 font-mono text-sm"
       />
+      <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+        <span className="font-medium">LLM for chidori.prompt():</span>
+        <label className="flex items-center gap-1.5">
+          <input
+            type="radio"
+            name="provider"
+            id="provider-mock"
+            checked={provider === 'mock'}
+            onChange={() => setProvider('mock')}
+          />
+          Deterministic mock (offline, free)
+        </label>
+        <label className="flex items-center gap-1.5">
+          <input
+            type="radio"
+            name="provider"
+            id="provider-openrouter"
+            checked={provider === 'openrouter'}
+            onChange={() => setProvider('openrouter')}
+          />
+          OpenRouter (real models)
+        </label>
+        {provider === 'openrouter' &&
+          (orKey ? (
+            <span className="flex items-center gap-2">
+              <span id="or-connected" className="text-fd-muted-foreground">
+                ✓ connected
+              </span>
+              <input
+                id="or-model"
+                type="text"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                aria-label="OpenRouter model"
+                className="w-56 rounded-lg border border-fd-border bg-fd-background px-2 py-1"
+              />
+              <button id="or-disconnect" className={button} onClick={disconnectOpenRouter}>
+                Disconnect
+              </button>
+            </span>
+          ) : (
+            <button id="or-connect" className={button} onClick={connectOpenRouter}>
+              Connect OpenRouter
+            </button>
+          ))}
+      </div>
       <div className="mt-4 flex flex-wrap gap-3">
-        <button id="run" className={button} disabled={busy} onClick={run}>
+        <button id="run" className={button} disabled={busy || (provider === 'openrouter' && !orKey)} onClick={run}>
           ▶ Run agent
         </button>
         <button id="resume" className={button} disabled={busy || !hasSaved} onClick={resume}>

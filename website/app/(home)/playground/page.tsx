@@ -19,7 +19,10 @@ export default function PlaygroundPage() {
         The agent below suspends at <code>chidori.input()</code>: the run is
         saved to <code>localStorage</code>, survives a page reload, resumes
         exactly where it stopped, and replays offline with zero live host
-        calls. No server, no keys — the LLM is a deterministic mock.
+        calls. No server involved. <code>chidori.prompt()</code> runs against a
+        deterministic mock by default — or connect OpenRouter (one click, PKCE
+        login, no key pasting) to use real models; either way, replay never
+        calls the LLM again.
       </p>
       <PlaygroundClient />
     </main>
