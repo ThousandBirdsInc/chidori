@@ -20,5 +20,9 @@ wasm-bindgen --target web \
   --out-dir crates/chidori-wasm/www/pkg \
   target/wasm32-unknown-unknown/release/chidori_wasm.wasm
 
+# The browser SDK ships from sdk/browser; the demo page imports it alongside
+# the wasm bindings, so mirror it into the (gitignored) pkg/ output.
+cp sdk/browser/index.js crates/chidori-wasm/www/pkg/chidori-browser.js
+
 echo "Built crates/chidori-wasm/www/pkg:"
 ls -la crates/chidori-wasm/www/pkg

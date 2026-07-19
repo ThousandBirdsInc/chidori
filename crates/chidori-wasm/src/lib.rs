@@ -21,6 +21,8 @@
 
 use wasm_bindgen::prelude::*;
 
+pub mod transpile;
+
 pub mod driver {
     //! The wasm-agnostic driver core: everything here is testable on the
     //! native target (`JsValue` cannot exist outside wasm, so keeping this
@@ -151,6 +153,14 @@ fn to_js(e: String) -> JsValue {
 #[wasm_bindgen(js_name = evalScript)]
 pub fn eval_script(src: &str) -> Result<String, JsValue> {
     chidori_js::eval_to_string(src).map_err(to_js)
+}
+
+/// Strip TypeScript syntax from an agent source, returning plain JavaScript.
+/// `filename` picks the dialect (`agent.tsx` enables JSX); pass `agent.ts`
+/// when in doubt. Mirrors the native runtime's transpile defaults.
+#[wasm_bindgen(js_name = stripTypes)]
+pub fn strip_types(source: &str, filename: &str) -> Result<String, JsValue> {
+    transpile::strip_types(source, filename).map_err(to_js)
 }
 
 /// The durable runtime, driven from JavaScript. See the crate docs for the

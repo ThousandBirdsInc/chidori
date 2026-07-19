@@ -1,0 +1,20 @@
+{
+  "name": "@1kbirds/chidori-browser",
+  "version": "0.1.0",
+  "description": "Client-side chidori agents in the browser: the wasm engine + durable replay runtime, with host effects (LLM, fetch, input, tools) served by the page.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ThousandBirdsInc/chidori",
+    "directory": "sdk/browser"
+  },
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "sideEffects": false
+}

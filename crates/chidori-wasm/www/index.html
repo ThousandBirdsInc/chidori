@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Chidori in the browser — durable replay on wasm</title>
+<title>Chidori in the browser — client-side durable agents</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root { color-scheme: light dark; }
@@ -13,19 +13,20 @@
   h1 { font-size: 1.4rem; }
   p.sub { opacity: .75; margin-top: -.5rem; }
   textarea {
-    width: 100%; min-height: 14rem; font-family: ui-monospace, monospace;
+    width: 100%; min-height: 16rem; font-family: ui-monospace, monospace;
     font-size: .85rem; box-sizing: border-box; padding: .6rem;
   }
   button { font-size: .95rem; padding: .4rem .9rem; margin-right: .5rem; }
   button:disabled { opacity: .4; }
+  input[type=text] { font-size: .95rem; padding: .4rem; width: 16rem; }
   pre {
     background: rgba(127,127,127,.12); padding: .8rem; border-radius: 6px;
-    white-space: pre-wrap; word-break: break-word; min-height: 6rem;
+    white-space: pre-wrap; word-break: break-word; min-height: 5rem;
   }
-  .cols { display: flex; gap: 1rem; flex-wrap: wrap; }
-  .cols > div { flex: 1 1 24rem; }
-  .live   { color: #b3261e; }
-  .replay { color: #1e7d32; }
+  #ask { display: none; margin: .8rem 0; padding: .8rem; border-radius: 6px;
+         background: rgba(255, 193, 7, .15); }
+  #status { font-weight: 600; }
+  .replay { color: #1e7d32; } .live { color: #b3261e; }
   @media (prefers-color-scheme: dark) {
     .live { color: #ff8a80; } .replay { color: #7ae582; }
   }
@@ -34,105 +35,148 @@
 <body>
 <h1>Chidori in the browser</h1>
 <p class="sub">
-  The pure-Rust chidori-js engine and its durable replay runtime, compiled to
-  WebAssembly. Host effects (<code>now</code>, <code>random</code>,
-  <code>httpFetch</code>) are served by this page and journaled; replaying the
-  journal re-runs the agent with <b>zero</b> live host calls.
+  A <b>client-side-only</b> chidori agent, written in TypeScript, running on the
+  pure-Rust engine compiled to wasm. It suspends at <code>chidori.input()</code>
+  — the run is saved to <code>localStorage</code>, survives a page reload, and
+  resumes exactly where it stopped. Replay re-runs it offline: zero live host
+  calls, byte-identical output.
 </p>
 
-<textarea id="bundle" spellcheck="false">
-async function main() {
-  const started = await now();
-  const fact = await httpFetch('./data/fact.json');
-  const roll = await random();
-  console.log('fact: ' + fact.text);
-  console.log('dice: ' + (Math.floor(roll * 6) + 1));
-  console.log('recorded at ' + started);
+<textarea id="source" spellcheck="false">
+interface Weather { tempC: number; sky: string }
+
+async function main(): Promise<void> {
+  await chidori.log('starting research');
+  const city = await chidori.input('Which city should I research?');
+  const weather = await chidori.tool('weather', { city }) as Weather;
+  const fact = await chidori.fetch('./data/fact.json');
+  const stamp = await chidori.now();
+  const summary = await chidori.prompt(
+    `One line on ${city}: ${weather.tempC}C, ${weather.sky}`);
+  console.log(`city: ${city}`);
+  console.log(`weather: ${weather.tempC}C, ${weather.sky}`);
+  console.log(`fact: ${fact.json.text}`);
+  console.log(`summary: ${summary}`);
+  console.log(`researched at ${stamp}`);
 }
 main();
 </textarea>
 
 <p>
-  <button id="run">▶ Run (record)</button>
-  <button id="replay" disabled>↺ Replay journal</button>
+  <button id="run">▶ Run agent</button>
+  <button id="resume" disabled>⏯ Resume saved run</button>
+  <button id="replay" disabled>↺ Replay offline</button>
+  <button id="clear" disabled>✕ Discard saved run</button>
 </p>
 
-<div class="cols">
-  <div>
-    <h3>Agent console</h3>
-    <pre id="console"></pre>
-  </div>
-  <div>
-    <h3>Host-call log</h3>
-    <pre id="hostlog"></pre>
-  </div>
+<div id="ask">
+  <label for="answer"><span id="question"></span></label><br />
+  <input type="text" id="answer" />
+  <button id="send">Answer</button>
 </div>
 
+<p id="status"></p>
+<h3>Agent console</h3>
+<pre id="console"></pre>
+<h3>Host log</h3>
+<pre id="hostlog"></pre>
+
 <script type="module">
-import init, { WasmRuntime } from './pkg/chidori_wasm.js';
+import init, * as wasm from './pkg/chidori_wasm.js';
+import { BrowserAgent, mockLlm, saveRun, loadRun } from './pkg/chidori-browser.js';
 
-const EFFECTS = ['now', 'random', 'httpFetch'];
+const SAVE_KEY = 'chidori-demo-run';
 const $ = (id) => document.getElementById(id);
-let blob = null; // the durable artifact from the last recorded run
+let agent = null;
+let askResolve = null;
 
-// The host: each effect is an async JS function. Only ever invoked at the
-// live frontier — during replay the journal answers instead.
-const host = {
-  now: async () => Date.now(),
-  random: async () => Math.random(),
-  httpFetch: async (url) => (await fetch(url)).json(),
-};
+// The page's host: a mock LLM (deterministic, free, offline), one client-side
+// tool, and an input handler that suspends the run so it can be saved.
+function host({ interactive }) {
+  return {
+    llm: mockLlm({ 'One line on': 'crisp skies, bring a light jacket' }),
+    tools: {
+      weather: ({ city }) => ({ tempC: 11 + city.length, sky: 'clear' }),
+    },
+    onLog: ({ message }) => logLine(`log: ${message}`, 'live'),
+    // First pump: no resolver waiting → return undefined → suspend. After the
+    // user types an answer (interactive), resolve with it.
+    onInput: ({ prompt }) => {
+      if (!interactive) return undefined;
+      $('question').textContent = prompt;
+      $('ask').style.display = 'block';
+      $('answer').focus();
+      return new Promise((resolve) => { askResolve = resolve; });
+    },
+  };
+}
 
-// The pump: run the VM until it blocks on a host call, perform the call in
-// the browser, journal the result, continue. Returns the number of live calls.
-async function drive(rt, hostlog) {
-  let live = 0;
-  for (;;) {
-    const status = JSON.parse(rt.runUntilBlocked());
-    if (status.status === 'completed') return live;
-    const { opId, name, args } = status;
-    live += 1;
-    hostlog.append(Object.assign(document.createElement('span'), {
-      className: 'live', textContent: `live   ${name}(${JSON.stringify(args).slice(1, -1)})\n`,
-    }));
-    try {
-      const result = await host[name](...args);
-      rt.resolveOp(opId, JSON.stringify(result ?? null));
-    } catch (e) {
-      rt.rejectOp(opId, String(e));
-    }
+function logLine(text, cls) {
+  $('hostlog').append(Object.assign(document.createElement('span'), {
+    className: cls, textContent: text + '\n',
+  }));
+}
+
+function refreshButtons() {
+  const saved = loadRun(SAVE_KEY) !== null;
+  $('resume').disabled = !saved;
+  $('replay').disabled = !saved;
+  $('clear').disabled = !saved;
+}
+
+async function finish(result, mode) {
+  $('console').textContent = result.console.join('\n');
+  if (result.status === 'suspended') {
+    saveRun(SAVE_KEY, agent.blob());
+    $('status').textContent =
+      `⏸ Suspended at input("${result.pendingInput.prompt}") — saved to localStorage. ` +
+      'Reload the page and hit Resume.';
+  } else {
+    saveRun(SAVE_KEY, agent.blob());
+    $('status').textContent = `✅ Completed (${mode}: ${result.liveCalls} live host call(s)).`;
+    logLine(`— ${mode}: ${result.liveCalls} live host call(s) —`,
+      result.liveCalls === 0 ? 'replay' : 'live');
   }
+  refreshButtons();
+  window.__lastRun = result;
 }
 
-function show(rt, live, mode) {
-  $('console').textContent = rt.consoleLines().join('\n');
-  const note = Object.assign(document.createElement('span'), {
-    className: mode, textContent: `— ${mode}: ${live} live host call(s) —\n`,
+$('run').addEventListener('click', async () => {
+  $('console').textContent = ''; $('hostlog').textContent = ''; $('status').textContent = '';
+  agent = BrowserAgent.start(wasm, { source: $('source').value, ...host({ interactive: false }) });
+  await finish(await agent.run(), 'record');
+});
+
+$('resume').addEventListener('click', async () => {
+  $('console').textContent = ''; $('hostlog').textContent = ''; $('status').textContent = '';
+  agent = BrowserAgent.restore(wasm, loadRun(SAVE_KEY), host({ interactive: true }));
+  await finish(await agent.run(), 'resume');
+});
+
+$('send').addEventListener('click', () => {
+  $('ask').style.display = 'none';
+  askResolve?.($('answer').value);
+  askResolve = null;
+});
+
+$('replay').addEventListener('click', async () => {
+  $('console').textContent = ''; $('hostlog').textContent = ''; $('status').textContent = '';
+  // No host implementations at all: every effect must come from the journal.
+  agent = BrowserAgent.restore(wasm, loadRun(SAVE_KEY), {
+    llm: () => { throw new Error('replay must not call the LLM'); },
+    fetchImpl: () => { throw new Error('replay must not touch the network'); },
   });
-  $('hostlog').append(note);
-}
+  await finish(await agent.run(), 'replay');
+});
 
-async function run() {
-  $('console').textContent = ''; $('hostlog').textContent = '';
-  const rt = new WasmRuntime($('bundle').value, EFFECTS);
-  const live = await drive(rt, $('hostlog'));
-  blob = rt.toBlob();
-  show(rt, live, 'live');
-  $('replay').disabled = false;
-  window.__lastRun = { live, console: rt.consoleLines() };
-}
-
-async function replay() {
-  $('console').textContent = ''; $('hostlog').textContent = '';
-  const rt = WasmRuntime.fromBlob(blob);
-  const live = await drive(rt, $('hostlog'));
-  show(rt, live, 'replay');
-  window.__lastRun = { live, console: rt.consoleLines() };
-}
+$('clear').addEventListener('click', () => {
+  localStorage.removeItem(SAVE_KEY);
+  $('status').textContent = 'Saved run discarded.';
+  refreshButtons();
+});
 
 await init();
-$('run').addEventListener('click', () => run().catch(err => { $('console').textContent = String(err); }));
-$('replay').addEventListener('click', () => replay().catch(err => { $('console').textContent = String(err); }));
+refreshButtons();
 window.__chidoriReady = true;
 </script>
 </body>

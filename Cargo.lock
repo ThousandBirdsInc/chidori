@@ -607,6 +607,7 @@ name = "chidori-wasm"
 version = "0.1.0"
 dependencies = [
  "chidori-js",
+ "oxc",
  "serde_json",
  "wasm-bindgen",
 ]
