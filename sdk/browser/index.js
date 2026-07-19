@@ -71,11 +71,13 @@ export function mockLlm(replies) {
  * the user supplied to the page — never embed one in shipped code. Browser
  * calls are enabled via the `anthropic-dangerous-direct-browser-access`
  * header (Anthropic's own opt-in for client-side use).
- * @param {{ apiKey: string, model?: string, maxTokens?: number, baseUrl?: string }} cfg
+ * @param {{ apiKey: string, model?: string, maxTokens?: number, baseUrl?: string,
+ *           fetchImpl?: typeof fetch }} cfg
  */
-export function anthropicLlm({ apiKey, model = 'claude-sonnet-5', maxTokens = 1024, baseUrl = 'https://api.anthropic.com' }) {
+export function anthropicLlm({ apiKey, model = 'claude-sonnet-5', maxTokens = 1024, baseUrl = 'https://api.anthropic.com', fetchImpl }) {
+  const doFetch = fetchImpl ?? fetch;
   return async ({ text, opts }) => {
-    const res = await fetch(`${baseUrl}/v1/messages`, {
+    const res = await doFetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -99,15 +101,18 @@ export function anthropicLlm({ apiKey, model = 'claude-sonnet-5', maxTokens = 10
 /**
  * Call any OpenAI-compatible chat-completions endpoint (a LiteLLM proxy, a
  * local server, etc.).
- * @param {{ baseUrl: string, apiKey?: string, model: string }} cfg
+ * @param {{ baseUrl: string, apiKey?: string, model: string,
+ *           headers?: Record<string, string>, fetchImpl?: typeof fetch }} cfg
  */
-export function openaiCompatibleLlm({ baseUrl, apiKey, model }) {
+export function openaiCompatibleLlm({ baseUrl, apiKey, model, headers, fetchImpl }) {
+  const doFetch = fetchImpl ?? fetch;
   return async ({ text, opts }) => {
-    const res = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+    const res = await doFetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        ...headers,
       },
       body: JSON.stringify({
         model: opts?.model ?? model,
@@ -121,6 +126,93 @@ export function openaiCompatibleLlm({ baseUrl, apiKey, model }) {
     const body = await res.json();
     return body.choices?.[0]?.message?.content ?? '';
   };
+}
+
+/**
+ * Call OpenRouter from the browser (OpenRouter's API is CORS-enabled for
+ * client-side use). Obtain the key from user input, or — better for
+ * client-side apps — via the PKCE login pair
+ * {@link startOpenRouterLogin} / {@link completeOpenRouterLogin}, so users
+ * authenticate on openrouter.ai and never paste a key at all.
+ * `appName`/`appUrl` populate OpenRouter's optional attribution headers.
+ * @param {{ apiKey: string, model?: string, appName?: string, appUrl?: string,
+ *           fetchImpl?: typeof fetch }} cfg
+ */
+export function openRouterLlm({ apiKey, model = 'openrouter/auto', appName, appUrl, fetchImpl }) {
+  return openaiCompatibleLlm({
+    baseUrl: 'https://openrouter.ai/api/v1',
+    apiKey,
+    model,
+    headers: {
+      ...(appUrl ? { 'HTTP-Referer': appUrl } : {}),
+      ...(appName ? { 'X-Title': appName } : {}),
+    },
+    fetchImpl,
+  });
+}
+
+const OPENROUTER_VERIFIER_KEY = 'chidori-openrouter-verifier';
+
+/** @private RFC 4648 base64url, no padding — the PKCE alphabet. */
+function base64url(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Begin OpenRouter's PKCE login: generates a code verifier (kept in
+ * sessionStorage), and navigates to openrouter.ai's consent page, which
+ * redirects back to `callbackUrl` with a `?code=` parameter. Call
+ * {@link completeOpenRouterLogin} on the callback page to obtain the API key.
+ * Pass `redirect: false` to get the URL back (e.g. for a link) instead of
+ * navigating.
+ * @param {{ callbackUrl?: string, redirect?: boolean }} [options]
+ * @returns {Promise<string>} the authorization URL
+ */
+export async function startOpenRouterLogin({ callbackUrl = location.href, redirect = true } = {}) {
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  const challenge = base64url(new Uint8Array(digest));
+  sessionStorage.setItem(OPENROUTER_VERIFIER_KEY, verifier);
+  const url = 'https://openrouter.ai/auth' +
+    `?callback_url=${encodeURIComponent(callbackUrl)}` +
+    `&code_challenge=${challenge}&code_challenge_method=S256`;
+  if (redirect) location.assign(url);
+  return url;
+}
+
+/**
+ * Finish OpenRouter's PKCE login on the callback page: exchanges the `?code=`
+ * query parameter (plus the stored verifier) for a user-controlled API key,
+ * scrubs the code from the address bar, and returns the key — ready to hand
+ * to {@link openRouterLlm}. Returns null when the URL carries no code (i.e.
+ * this page load is not a login callback), so it is safe to call
+ * unconditionally at startup.
+ * @param {{ fetchImpl?: typeof fetch }} [options]
+ * @returns {Promise<string | null>}
+ */
+export async function completeOpenRouterLogin({ fetchImpl } = {}) {
+  const here = new URL(location.href);
+  const code = here.searchParams.get('code');
+  if (!code) return null;
+  const verifier = sessionStorage.getItem(OPENROUTER_VERIFIER_KEY);
+  const doFetch = fetchImpl ?? fetch;
+  const res = await doFetch('https://openrouter.ai/api/v1/auth/keys', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      code,
+      ...(verifier ? { code_verifier: verifier, code_challenge_method: 'S256' } : {}),
+    }),
+  });
+  if (!res.ok) throw new Error(`openrouter key exchange: ${res.status} ${await res.text()}`);
+  const { key } = await res.json();
+  sessionStorage.removeItem(OPENROUTER_VERIFIER_KEY);
+  // Scrub the one-time code so a reload doesn't attempt a second exchange.
+  here.searchParams.delete('code');
+  history.replaceState(null, '', here);
+  return key;
 }
 
 /** Persist a durable blob under a localStorage key. */

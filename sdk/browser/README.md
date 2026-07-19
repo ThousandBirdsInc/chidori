@@ -74,6 +74,31 @@ providers, or to keep keys out of the client entirely, point
 `({ text, opts }) => string` as `llm`. Docs demos should use `mockLlm()`:
 deterministic, free, offline.
 
+### OpenRouter, without pasting keys
+
+OpenRouter's API is CORS-enabled and ships a PKCE login flow built for
+client-side apps, so users can authenticate with a click instead of handling
+keys:
+
+```js
+import { startOpenRouterLogin, completeOpenRouterLogin, openRouterLlm } from './chidori-browser/index.js';
+
+// Safe to call unconditionally at startup: null unless this page load is the
+// login callback (?code=...).
+let key = await completeOpenRouterLogin();
+
+document.querySelector('#connect').onclick = () => startOpenRouterLogin();
+// After the redirect back, completeOpenRouterLogin() returns the key:
+const agent = BrowserAgent.start(wasm, {
+  source,
+  llm: openRouterLlm({ apiKey: key, model: 'openrouter/auto', appName: 'My docs demo' }),
+});
+```
+
+The exchanged key is user-controlled (it lives in their OpenRouter account,
+scoped and revocable there). Persist it — e.g. `localStorage` — only if the
+user opts in.
+
 ## Building the wasm module
 
 ```sh

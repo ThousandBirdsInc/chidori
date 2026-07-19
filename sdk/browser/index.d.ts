@@ -57,13 +57,45 @@ export function anthropicLlm(cfg: {
   model?: string;
   maxTokens?: number;
   baseUrl?: string;
+  fetchImpl?: typeof fetch;
 }): LlmHandler;
 
 export function openaiCompatibleLlm(cfg: {
   baseUrl: string;
   apiKey?: string;
   model: string;
+  headers?: Record<string, string>;
+  fetchImpl?: typeof fetch;
 }): LlmHandler;
+
+export function openRouterLlm(cfg: {
+  apiKey: string;
+  /** OpenRouter model id (e.g. "anthropic/claude-sonnet-4.5"); defaults to "openrouter/auto". */
+  model?: string;
+  /** Populates OpenRouter's X-Title attribution header. */
+  appName?: string;
+  /** Populates OpenRouter's HTTP-Referer attribution header. */
+  appUrl?: string;
+  fetchImpl?: typeof fetch;
+}): LlmHandler;
+
+/**
+ * Begin OpenRouter's PKCE login: stores a code verifier in sessionStorage and
+ * navigates to the consent page (or returns the URL with `redirect: false`).
+ */
+export function startOpenRouterLogin(options?: {
+  callbackUrl?: string;
+  redirect?: boolean;
+}): Promise<string>;
+
+/**
+ * Finish OpenRouter's PKCE login on the callback page: exchanges `?code=` for
+ * an API key, scrubs it from the URL, and returns the key — or null when this
+ * page load is not a login callback (safe to call unconditionally).
+ */
+export function completeOpenRouterLogin(options?: {
+  fetchImpl?: typeof fetch;
+}): Promise<string | null>;
 
 export function saveRun(key: string, blob: Uint8Array): void;
 export function loadRun(key: string): Uint8Array | null;
