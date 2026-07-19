@@ -1,3 +1,7 @@
+---
+title: "Resume Performance"
+---
+
 # Resume performance: what a resume costs, and how to make it cheap
 
 > **Status:** the two caches below are **landed** (branch

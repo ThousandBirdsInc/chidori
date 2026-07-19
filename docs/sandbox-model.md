@@ -1,3 +1,7 @@
+---
+title: "Sandbox Model"
+---
+
 # Sandbox model of the chidori-js runtime
 
 > Two layers ship: the **in-process** capability-confinement sandbox, and an

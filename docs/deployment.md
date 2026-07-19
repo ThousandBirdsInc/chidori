@@ -1,3 +1,7 @@
+---
+title: "Deployment"
+---
+
 # Deploying Chidori
 
 A deployment is four things: the `chidori` binary, your agent's `.ts` files,

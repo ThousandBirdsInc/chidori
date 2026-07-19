@@ -1,3 +1,7 @@
+---
+title: "Interpreter Optimization"
+---
+
 # Interpreter performance: optimizing `chidori-js` without a JIT
 
 > **Status:** Phase 0 (measurement) **done** — see §11. Phase 1 (hot-loop

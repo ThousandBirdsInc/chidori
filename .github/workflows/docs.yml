@@ -1,4 +1,5 @@
-# Builds the VitePress docs site from docs/ and deploys it to GitHub Pages.
+# Builds the docs website (Next.js + Fumadocs, content from docs/) and
+# deploys it to GitHub Pages.
 #
 # Requires Pages to be enabled for the repository with "GitHub Actions" as the
 # source (Settings → Pages → Build and deployment → Source).
@@ -9,6 +10,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "website/**"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -32,20 +34,20 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: docs/package-lock.json
+          cache-dependency-path: website/package-lock.json
       - name: Install dependencies
         run: npm ci
-        working-directory: docs
+        working-directory: website
       - name: Build site
         run: npm run build
-        working-directory: docs
+        working-directory: website
         env:
-          # Project pages are served under /<repo>/. Drop this (or set it to /)
-          # if the site moves to a custom domain.
-          DOCS_BASE: /chidori/
+          # Project pages are served under /<repo>. Drop this (or set it to
+          # empty) if the site moves to a custom domain.
+          DOCS_BASE_PATH: /chidori
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/.vitepress/dist
+          path: website/out
 
   deploy:
     needs: build

@@ -1,3 +1,7 @@
+---
+title: "Prompt Templates"
+---
+
 # Templates — Jinja prompt rendering
 
 > `chidori.template` renders Jinja2-syntax templates (inline strings or

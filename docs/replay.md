@@ -1,8 +1,10 @@
+---
+title: "Replay & Resume"
+---
+
 # How replay works
 
-<p align="center">
-  <img src="../.github/record-replay.svg" alt="Animation: an original run executes prompt, tool, and http calls while recording each one into a numbered call log; the call log becomes a JSON checkpoint; replay re-runs the same code answering every host call from the log — identical output, zero LLM calls" width="860" />
-</p>
+![Animation: an original run executes prompt, tool, and http calls while recording each one into a numbered call log; the call log becomes a JSON checkpoint; replay re-runs the same code answering every host call from the log — identical output, zero LLM calls](../.github/record-replay.svg)
 
 TypeScript durable runs use deterministic runtime policy plus cached host-call
 results. Given the same inputs, compatible source hashes, and the same cached

@@ -1,3 +1,7 @@
+---
+title: "OS Isolation Plan"
+---
+
 # OS-level isolation: process-per-run with brokered effects
 
 > **Status:** Phases 1–5 implemented (`crates/chidori/src/runtime/isolate/`):

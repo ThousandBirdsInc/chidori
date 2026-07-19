@@ -1,3 +1,7 @@
+---
+title: "Detached Agents"
+---
+
 # Detached agents: durable, addressable, hibernating processes
 
 `chidori.agents.spawn` starts an agent module as a **detached durable

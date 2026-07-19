@@ -1,3 +1,7 @@
+---
+title: "Package Management"
+---
+
 # Package management
 
 Chidori ships a native npm package manager — `chidori add`, `chidori install`,

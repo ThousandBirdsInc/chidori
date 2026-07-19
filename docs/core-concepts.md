@@ -1,3 +1,7 @@
+---
+title: "Core Concepts"
+---
+
 # Core concepts: agents & host functions
 
 An agent is a `.ts` file that imports `{ chidori, run }` from the virtual

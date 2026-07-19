@@ -1,64 +1,44 @@
 ---
-layout: home
-
-hero:
-  name: Chidori
-  text: Durable, replayable, resumable agents
-  tagline: >-
-    Write agents as plain async TypeScript on a Rust core. Every side effect
-    flows through the runtime as a recorded host call, so any run can be
-    checkpointed to disk, replayed for byte-identical output with zero LLM
-    calls, and resumed from any pause — even in a new process after a crash.
-  actions:
-    - theme: brand
-      text: Get Started
-      link: /getting-started
-    - theme: alt
-      text: Core Concepts
-      link: /core-concepts
-    - theme: alt
-      text: GitHub
-      link: https://github.com/ThousandBirdsInc/chidori
-
-features:
-  - icon: 🔁
-    title: Replay any run with zero LLM calls
-    details: >-
-      The call log is a deterministic record. Re-run the same code against it
-      and every prompt, tool, and HTTP call returns its recorded result
-      instantly — no tokens spent, identical output.
-    link: /replay
-  - icon: 💾
-    title: Survive crashes and restarts
-    details: >-
-      Runs are checkpointed at every host safepoint. Kill the process mid-run
-      and resume exactly where it left off, in a brand-new process.
-    link: /durable-storage
-  - icon: 🧑‍⚖️
-    title: Pause for humans, without a live process
-    details: >-
-      chidori.input() and named signals suspend the run to disk. A human or
-      another agent answers minutes or days later and the run picks up exactly
-      where it stopped.
-    link: /signals
-  - icon: 🧪
-    title: Check in a checkpoint as a test
-    details: >-
-      Commit a recorded run to git and assert the agent's behavior hasn't
-      drifted — a full integration test that costs $0 and runs in
-      milliseconds.
-    link: /value-checkpoints
-  - icon: 📦
-    title: One Rust binary, no runtime dependencies
-    details: >-
-      An embedded pure-Rust JavaScript engine runs your agents — no Node, no
-      Deno, no V8. TypeScript and Python SDKs talk to it over HTTP with no
-      native bindings.
-    link: /architecture
-  - icon: ⚡
-    title: Structural prompt caching built in
-    details: >-
-      Stable prefixes are auto-marked for the provider cache, and replay pays
-      nothing at all.
-    link: /context-management
+title: "Overview"
+description: "What Chidori is, and how these docs are organized."
 ---
+
+# Chidori documentation
+
+Chidori is the agent framework where every run is durable, replayable, and
+resumable by default. You write agents as plain async TypeScript; every side
+effect — every LLM call, tool call, and HTTP request — flows through the
+runtime as a recorded **host call**, so any run can be checkpointed to disk,
+replayed for byte-identical output with zero LLM calls, and resumed from any
+pause, even in a new process after a crash.
+
+## Where to start
+
+Read these in order if you're new:
+
+1. [Getting Started](./getting-started.md) — install, first agent, first replay.
+2. [Core Concepts](./core-concepts.md) — host calls, the call log, safepoints.
+3. [Replay & Resume](./replay.md) — record, replay, resume, divergence rules.
+
+Then pick up the rest of **Using Chidori** as you need it: running modes,
+signals, branching, actors, memory, storage, sandboxing, and deployment.
+
+## How these docs are organized
+
+- **Using Chidori** — guides for agent authors and operators.
+- **Engineering Notes** — internal design records for contributors. Status
+  headers inside each file are authoritative; several document retired or
+  superseded work.
+- **Usability Reviews** — six rounds of hands-on reviews that shaped the
+  developer experience.
+- **Posts** — longer-form writing about the ideas behind the framework.
+
+## Other references
+
+- [`llm.txt`](../llm.txt) — the complete API reference, optimized for LLMs
+  generating agents.
+- [TypeScript SDK](../sdk/typescript/README.md) and
+  [Python SDK](../sdk/python/README.md) — HTTP clients with no native
+  bindings.
+- [Examples](../examples/) — runnable agents, from hello-world to
+  multi-agent war rooms.

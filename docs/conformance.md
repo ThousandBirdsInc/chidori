@@ -1,3 +1,7 @@
+---
+title: "Conformance (Test262)"
+---
+
 # JavaScript conformance: running chidori against Test262
 
 Chidori executes agent code on its **pure-Rust JavaScript engine**

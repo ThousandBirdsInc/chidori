@@ -408,11 +408,11 @@ deterministic, replayable, and testable for free.
 ## 📚 Documentation
 
 The docs are plain markdown in [`docs/`](./docs) and also build into a
-searchable website with [VitePress](https://vitepress.dev). To browse them
-locally:
+searchable website ([`website/`](./website), Next.js + Fumadocs). To browse
+them locally:
 
 ```bash
-cd docs && npm install && npm run dev
+cd website && npm install && npm run dev
 ```
 
 | Topic | What's there |

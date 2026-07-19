@@ -1,3 +1,7 @@
+---
+title: "Releasing"
+---
+
 # Releasing
 
 Chidori ships from a single version train: the root `chidori` crate, the

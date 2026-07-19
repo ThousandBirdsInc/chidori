@@ -1,3 +1,7 @@
+---
+title: "Branching Execution"
+---
+
 # Branching execution
 
 `chidori.branch(variants)` lets an agent **fork itself mid-run** into N

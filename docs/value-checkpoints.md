@@ -1,3 +1,7 @@
+---
+title: "Value Checkpoints"
+---
+
 # Value Checkpoints — `chidori.step(name, fn)`
 
 > `chidori.step` bounds resume cost on long histories by memoizing expensive

@@ -1,3 +1,7 @@
+---
+title: "Durable Storage"
+---
+
 # Durable storage: the run store
 
 Chidori's durability model is the deterministic effect journal

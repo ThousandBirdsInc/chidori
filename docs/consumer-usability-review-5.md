@@ -1,3 +1,7 @@
+---
+title: "Round 5: Shipping to Users"
+---
+
 # Consumer usability review, round 5: shipping an agent to users
 
 **Date:** 2026-07-18 · **Chidori:** 3.6.1, built from source at `15d69ec` ·

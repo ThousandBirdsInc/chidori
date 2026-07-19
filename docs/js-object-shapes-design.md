@@ -1,3 +1,7 @@
+---
+title: "Object Shapes Design"
+---
+
 # Object shapes (hidden classes): design + phased migration plan
 
 > **Status:** IMPLEMENTED (2026-07-12) — Phases 0–3 landed on this branch;

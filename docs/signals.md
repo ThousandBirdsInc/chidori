@@ -1,3 +1,7 @@
+---
+title: "Signals"
+---
+
 # Signals — multiplayer agents
 
 A **signal** is a named message `{ name, payload, from }` addressed to a specific

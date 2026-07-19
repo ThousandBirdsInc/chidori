@@ -1,3 +1,7 @@
+---
+title: "Running Modes"
+---
+
 # Running modes
 
 Chidori agents run three ways: a one-shot CLI, an HTTP server with a session

@@ -1,3 +1,7 @@
+---
+title: "Rust Style Guide"
+---
+
 # Rust style guide
 
 How we write Rust in this repository. The goal is a codebase that reads as if

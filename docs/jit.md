@@ -1,3 +1,7 @@
+---
+title: "JIT Experiment (retired)"
+---
+
 # An experimental closure-threading "JIT" for `chidori-js`
 
 > **Status: RETIRED — implemented, measured, removed.** The closure-threading

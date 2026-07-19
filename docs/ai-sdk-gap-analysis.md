@@ -1,3 +1,7 @@
+---
+title: "AI SDK Gap Analysis"
+---
+
 # Chidori vs. Vercel AI SDK Gap Analysis
 
 This note compares Chidori's current functionality against the Vercel AI SDK

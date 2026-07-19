@@ -1,22 +1,33 @@
 # Chidori documentation
 
 Everything here is plain markdown, readable on GitHub as-is. The same files
-also build into a searchable docs website with
-[VitePress](https://vitepress.dev):
+are the content source for the docs website in [`website/`](../website),
+built with [Next.js](https://nextjs.org) + [Fumadocs](https://fumadocs.dev):
 
 ```bash
-cd docs
+cd website
 npm install
 npm run dev     # local dev server with live reload
-npm run build   # static site in docs/.vitepress/dist
+npm run build   # static site in website/out
 ```
 
 The site is deployed to GitHub Pages by
 [`.github/workflows/docs.yml`](../.github/workflows/docs.yml) on every push to
-`main` that touches `docs/`. Site structure (sidebar, landing page, theme)
-lives in `.vitepress/config.mts` and `index.md`; links that point outside
-`docs/` are rewritten to GitHub URLs at build time, so keep writing ordinary
-relative links.
+`main` that touches `docs/` or `website/`.
+
+Conventions for writing pages:
+
+- Every page carries a small YAML frontmatter block with its sidebar `title`;
+  keep the `# H1` in the body too — that's what renders, on GitHub and on the
+  site.
+- Sidebar order and section groupings live in `meta.json` (and
+  `posts/meta.json`).
+- Keep writing ordinary relative links (`./other-page.md`,
+  `../examples/...`); the build rewrites in-docs links to site routes and
+  out-of-docs links to GitHub URLs.
+- Write plain CommonMark, not MDX — `{` and `<` in prose stay literal.
+  This README and `posts/harness-engineering-thread.md` are excluded from
+  the site.
 
 This directory mixes two audiences. **Using Chidori** is the path for agent
 authors and operators; **Engineering notes** are internal design records —

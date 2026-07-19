@@ -1,3 +1,7 @@
+---
+title: "Actors"
+---
+
 # Actors: supervised, message-passing agent processes
 
 Actors let one agent run start other agent modules as long-lived, concurrent,

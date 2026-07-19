@@ -1,3 +1,7 @@
+---
+title: "Memory"
+---
+
 # Memory — persistent key-value storage across runs
 
 > `chidori.memory` is a small, namespaced, JSON key-value store that persists

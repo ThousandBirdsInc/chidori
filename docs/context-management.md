@@ -1,3 +1,7 @@
+---
+title: "Context Management"
+---
+
 # Context Management — Cache-Aware, Composable Prompts
 
 > Provider prompt caching, the `chidori.context` builder, the

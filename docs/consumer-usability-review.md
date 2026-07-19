@@ -1,3 +1,7 @@
+---
+title: "Round 1: Linear Path"
+---
+
 # Consumer usability review: building a real agent on Chidori
 
 **Date:** 2026-07-16 · **Chidori:** 3.6.0, built from source at `ea0e70e` ·

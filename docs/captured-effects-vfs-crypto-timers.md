@@ -1,3 +1,7 @@
+---
+title: "Captured Effects"
+---
+
 # Captured Effects: Virtual Filesystem, Crypto, and Timers
 
 ## Implementation status (Phases 1–4 landed)

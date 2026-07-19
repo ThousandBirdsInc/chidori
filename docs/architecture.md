@@ -1,3 +1,7 @@
+---
+title: "Architecture"
+---
+
 # Architecture & project structure
 
 A high-level map of the runtime.

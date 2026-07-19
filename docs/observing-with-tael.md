@@ -1,3 +1,7 @@
+---
+title: "Observing with Tael"
+---
+
 # Observing runs with Tael
 
 Chidori emits standard OTLP spans for every run — one parent span per run, one

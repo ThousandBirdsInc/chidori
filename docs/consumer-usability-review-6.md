@@ -1,3 +1,7 @@
+---
+title: "Round 6: Conversational Surface"
+---
+
 # Consumer usability review, round 6: the long-haul conversational surface
 
 **Date:** 2026-07-18 · **Chidori:** 3.6.1, built from source at `a98a686` ·
