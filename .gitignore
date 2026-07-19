@@ -54,6 +54,12 @@ sdk/python/dist/
 # Node
 node_modules/
 
+# Docs website (Next.js + Fumadocs) build output and generated sources
+/website/.next/
+/website/out/
+/website/.source/
+/website/next-env.d.ts
+
 # Secrets / local env
 .env
 .envrc

@@ -1,3 +1,8 @@
+---
+title: "Durable Storage"
+description: "The run store: append-only journal, SQLite and Durable Object mirrors, hydration, strict durability, leases, and time travel."
+---
+
 # Durable storage: the run store
 
 Chidori's durability model is the deterministic effect journal

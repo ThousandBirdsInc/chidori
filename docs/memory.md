@@ -1,3 +1,8 @@
+---
+title: "Memory"
+description: "chidori.memory: a persistent cross-run key-value store \u2014 namespacing, on-disk anchoring, replay semantics."
+---
+
 # Memory — persistent key-value storage across runs
 
 > `chidori.memory` is a small, namespaced, JSON key-value store that persists

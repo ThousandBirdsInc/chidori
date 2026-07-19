@@ -1,3 +1,8 @@
+---
+title: "Round 3: Daily Driver"
+description: "Round 3: the everyday-agent surface as a daily driver."
+---
+
 # Consumer usability review, round 3: the everyday-agent surface
 
 **Date:** 2026-07-17 · **Chidori:** 3.6.0, built from source at `eb3c788` ·

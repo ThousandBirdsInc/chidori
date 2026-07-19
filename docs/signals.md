@@ -1,3 +1,8 @@
+---
+title: "Signals"
+description: "Named listen points for multiplayer sessions: pause for humans or other agents, durable mailboxes, fan-in, timeouts."
+---
+
 # Signals — multiplayer agents
 
 A **signal** is a named message `{ name, payload, from }` addressed to a specific

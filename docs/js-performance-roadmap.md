@@ -1,3 +1,8 @@
+---
+title: "JS Performance Roadmap"
+description: "Profiling data and the JS engine performance roadmap."
+---
+
 # JS execution performance: the road toward JIT-class throughput
 
 > **Status:** profiling review complete (2026-07-02); the optimization push it

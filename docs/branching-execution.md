@@ -1,3 +1,8 @@
+---
+title: "Branching Execution"
+description: "chidori.branch sub-runs: fork a run into per-strategy variants from the current state and compare every outcome."
+---
+
 # Branching execution
 
 `chidori.branch(variants)` lets an agent **fork itself mid-run** into N

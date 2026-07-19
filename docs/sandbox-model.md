@@ -1,3 +1,8 @@
+---
+title: "Sandbox Model"
+description: "The security model: deny-by-default capability injection, resource limits, OS-level isolation, and its honest gaps."
+---
+
 # Sandbox model of the chidori-js runtime
 
 > Two layers ship: the **in-process** capability-confinement sandbox, and an
@@ -497,7 +502,7 @@ ambient configuration.
 Semantics:
 
 - **Fallback: `NeverAllow`.** Any gated effect with no matching allow-rule is
-  refused with `policy: \`<target>\` denied`.
+  refused with ``policy: `<target>` denied``.
 - **Allowed:** `workspace:list`, `workspace:read`, `workspace:manifest` —
   read-only introspection of the sanitized workspace root, which mutates nothing
   and cannot reach outside the root.

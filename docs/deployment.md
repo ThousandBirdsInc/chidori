@@ -1,3 +1,8 @@
+---
+title: "Deployment"
+description: "Running agents in production: config, durability tiers, recipes for a plain VM, Fly.io, and Kubernetes, failure and recovery."
+---
+
 # Deploying Chidori
 
 A deployment is four things: the `chidori` binary, your agent's `.ts` files,

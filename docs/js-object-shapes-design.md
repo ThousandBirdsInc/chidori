@@ -1,3 +1,8 @@
+---
+title: "Object Shapes Design"
+description: "Hidden-class (object shapes) design for the JS engine \u2014 implemented."
+---
+
 # Object shapes (hidden classes): design + phased migration plan
 
 > **Status:** IMPLEMENTED (2026-07-12) — Phases 0–3 landed on this branch;

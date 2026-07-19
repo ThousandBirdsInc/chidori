@@ -1,3 +1,8 @@
+---
+title: "OS Isolation Plan"
+description: "Process isolation design: namespaces, Landlock, seccomp, and Seatbelt."
+---
+
 # OS-level isolation: process-per-run with brokered effects
 
 > **Status:** Phases 1–5 implemented (`crates/chidori/src/runtime/isolate/`):

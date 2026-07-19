@@ -1,8 +1,15 @@
+---
+title: "Getting Started"
+description: "Install the binary, run the example agents, inspect a durable run, and exercise the human-in-the-loop pause/resume loop."
+---
+
 # Getting started & demos
 
 This walks through running Chidori's example agents, inspecting a durable run,
 and exercising the human-in-the-loop pause/resume loop. For the two-minute
-version, see [Quick Start in the README](../README.md#️-quick-start).
+version, see [Quick Start in the README](../README.md#️-quick-start). When
+you're ready to write your own agent, continue to
+[Your First Agent](./your-first-agent.md).
 
 ## Try the demo picker
 
@@ -72,9 +79,7 @@ chidori snapshot "$RUN_ID" --dir examples/agents
 This demo shows the session API pausing on `chidori.input(...)` and resuming
 from the persisted call log:
 
-<p align="center">
-  <img src="../.github/pause-resume.svg" alt="Animation: an agent runs until input() pauses it, the session is persisted to disk, and when a human responds the runtime replays the call log to the pause point and continues live from there" width="860" />
-</p>
+![Animation: an agent runs until input() pauses it, the session is persisted to disk, and when a human responds the runtime replays the call log to the pause point and continues live from there](../.github/pause-resume.svg)
 
 Start the server:
 
