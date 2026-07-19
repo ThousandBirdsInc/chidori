@@ -6,13 +6,14 @@ description: "Task-oriented recipes: approval gates, tool loops, fan-out, multip
 # Common patterns
 
 Chidori has a small number of primitives that compose into most agent
-shapes. This page maps jobs to primitives; each recipe links to the deep doc
-and a runnable example.
+shapes. This page maps jobs to primitives; each recipe links to the doc that
+covers it in depth, and to a runnable example where one exists.
 
 | I want to… | Reach for | Details |
 |---|---|---|
 | Ask an LLM, maybe with tools | `chidori.prompt` + `defineTool` | [Host API](./host-api.md#llm-calls) |
 | Build a chat assistant | `chidori.conversation` | [Core Concepts](./core-concepts.md#conversational-agents) |
+| Answer webhooks / arbitrary HTTP | `chidori serve` catch-all route | [below](#an-agent-behind-a-webhook) |
 | Gate an action on human approval | `chidori.input` with `details` | [below](#approval-gates-that-show-their-work) |
 | Wait for an outside party (human or agent) | `chidori.signal` | [Signals](./signals.md) |
 | Run several prompts concurrently | `chidori.util.parallel` | [below](#fan-out-drafts-concurrently) |
@@ -46,6 +47,38 @@ Under `chidori serve`, the `input()` suspends the session to disk — no
 process waits while the human decides. Days later,
 `POST /sessions/{id}/resume` picks the run up exactly where it paused.
 Example: [`examples/agents/input_pause.ts`](../examples/agents/input_pause.ts).
+
+## An agent behind a webhook
+
+Under `chidori serve`, any route other than the `/sessions/*` API is folded
+into `{ event: { method, path, headers, query, body } }` and run as the
+agent's input; returning `{ status, body, headers? }` shapes the HTTP
+response:
+
+```ts
+import { chidori, run } from "chidori:agent";
+
+run(async (input: { event: { method: string; path: string; body?: unknown } }) => {
+  const { event } = input;
+  if (event.method !== "POST" || event.path !== "/hooks/pr") {
+    return { status: 404, body: { error: "not found" } };
+  }
+  const triage = await chidori.prompt(
+    `Triage this pull request event:\n${JSON.stringify(event.body)}`,
+    { type: "final" },
+  );
+  return { status: 200, body: { triage } };
+});
+```
+
+Branch on `input.event` early, as above: **every** request runs the whole
+agent, so return a cheap `4xx` for non-events before any model call. A run
+that **pauses** (on `input()`, a signal, or a policy approval) is stored as
+a real session and answered `202` with the session view, so the caller can
+resume or signal it later — a webhook can open a long-lived, durable
+workflow. Deep doc: [Running Modes](./running-modes.md) (which also covers
+*outbound* requests from a handler —
+[`examples/agents/webhook.ts`](../examples/agents/webhook.ts)).
 
 ## Give the model tools, keep the loop
 
@@ -116,6 +149,8 @@ timer:
 
 ```ts
 // services/inbox-triager.ts
+import { chidori, run } from "chidori:agent";
+
 run(async () => {
   for (;;) {
     const msg = await chidori.signal(["email", "shutdown"], {
@@ -161,9 +196,9 @@ chidori verify agent.ts <run_id>                      # in CI: exit 0 = no drift
 
 `verify` replays with no provider configured and a deny-all policy — if the
 agent's prompts, tool calls, or control flow drift from the recording, it
-fails. A full integration test that costs $0 and runs in milliseconds. Used
-in anger by
-[`examples/self-harness-loop/`](../examples/self-harness-loop/).
+fails. A full integration test that costs $0 and runs in milliseconds.
+[Observing with Tael](./observing-with-tael.md) builds its golden regression
+cases on the same mechanism.
 
 ## Keep long conversations inside the window
 

@@ -40,8 +40,10 @@ Start here, roughly in order:
 
 | Doc | What it covers |
 |---|---|
-| [getting-started.md](./getting-started.md) | Install, first agent, first replay |
+| [getting-started.md](./getting-started.md) | Install, run the demos, inspect a durable run |
+| [your-first-agent.md](./your-first-agent.md) | Tutorial: write an agent, pause it, replay it for $0, check it into CI |
 | [core-concepts.md](./core-concepts.md) | Host calls, the call log, safepoints |
+| [patterns.md](./patterns.md) | Task-oriented recipes: which primitive fits which job |
 | [replay.md](./replay.md) | Record, replay, resume, divergence rules |
 | [running-modes.md](./running-modes.md) | `run` vs `serve`, policy profiles, `--trusted` |
 | [signals.md](./signals.md) | Named signals: pause for humans or other agents |
@@ -49,11 +51,21 @@ Start here, roughly in order:
 | [actors.md](./actors.md) | Supervised, message-passing agent processes |
 | [detached-agents.md](./detached-agents.md) | Long-lived agents outside a session |
 | [context-management.md](./context-management.md) | Conversation and context windows |
-| [value-checkpoints.md](./value-checkpoints.md) | `durableStep`: bounding replay cost |
+| [memory.md](./memory.md) | `chidori.memory`: persistent cross-run key-value storage |
+| [template.md](./template.md) | `chidori.template`: Jinja prompt rendering |
+| [value-checkpoints.md](./value-checkpoints.md) | `chidori.step`: bounding replay cost |
 | [durable-storage.md](./durable-storage.md) | Run persistence, time travel (`--until-seq`) |
 | [package-management.md](./package-management.md) | Imports, `node:` builtins, npm packages |
 | [sandbox-model.md](./sandbox-model.md) | The security model and its guarantees |
+| [observing-with-tael.md](./observing-with-tael.md) | OTLP export, run↔trace correlation, golden cases |
 | [deployment.md](./deployment.md) | Serving agents in production |
+
+## Reference
+
+| Doc | What it covers |
+|---|---|
+| [host-api.md](./host-api.md) | Every `chidori.*` method, option by option; providers; runtime policy |
+| [cli.md](./cli.md) | Every subcommand and the approval postures |
 
 ## Engineering notes (internal)
 

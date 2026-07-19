@@ -538,7 +538,8 @@ chidori run examples/agents/streaming_progress.ts --stream
 
 `--stream` changes only how progress is reported (NDJSON events on stdout);
 the final `done` event carries `run_id` and `status`. Over HTTP, use
-`POST /sessions/stream` (SSE):
+`POST /sessions/stream` (SSE) — here consumed through the
+[TypeScript SDK's](../sdk/typescript/README.md) `client.stream()`:
 
 ```ts
 for await (const event of client.stream({ topic: "snapshots" })) {
@@ -557,6 +558,16 @@ for await (const event of client.stream({ topic: "snapshots" })) {
 
 Prompt labels work inside sub-agents and parallel branches because prompt
 events are emitted through the shared runtime context.
+
+## HTTP session API
+
+`chidori serve` exposes runs as sessions — create, pause/resume, signal,
+approve, replay, stream, plus a catch-all route that turns any other HTTP
+request into an agent event. The endpoint reference lives in
+[Running Modes](./running-modes.md); production posture and recipes in
+[Deployment](./deployment.md); typed clients in the
+[TypeScript SDK](../sdk/typescript/README.md) and
+[Python SDK](../sdk/python/README.md).
 
 ## Providers & model selection
 

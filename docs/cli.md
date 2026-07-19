@@ -14,8 +14,8 @@ its job and the doc that covers it in depth.
 |---|---|
 | `chidori init [dir] --template docs\|chat\|worker` | Scaffold a starter project (agent + README; the `docs` template bundles a docs corpus to chat with). Omit `--template` to pick interactively. |
 | `chidori demo` | Interactive picker over the runnable examples, including no-key demos. |
-| `chidori check <agent.ts>` | Type-check an agent file without running it. |
-| `chidori model-login` | Zero-setup OpenRouter fallback so prompts work with no provider key of your own. |
+| `chidori check <agent.ts>` | Validate an agent file without running it. |
+| `chidori model-login` | Zero-setup OpenRouter fallback — prompts work without configuring a provider key. |
 
 ## Running
 
@@ -35,7 +35,7 @@ its job and the doc that covers it in depth.
 | `chidori resume … --allow-source-change` | Edit-and-resume: replay against edited code, divergence-checked ([divergence rules](./replay.md)). |
 | `chidori verify <agent.ts> <run_id>` | Checkpoint-as-test: replay with **no provider** and a **deny-all policy**; asserts completion with byte-identical output. Exit 0 = pass. Built for CI. Journaled workspace writes do re-materialize on disk (same bytes, fresh mtime). |
 | `chidori trace <run_id>` | Print a run's call log — every prompt, tool call, and effect, with token counts and cost (including prompt-cache read/write totals). |
-| `chidori stats` | Aggregate usage and cost, including prompt-cache totals. |
+| `chidori stats` | Usage and cost totals, including prompt-cache read/write tokens. |
 | `chidori snapshot <run_id>` | Print `runtime.snapshot.json` metadata (never raw VM snapshot bytes). |
 
 Run journals live under `.chidori/runs/<run_id>/` next to the agent file;
@@ -56,7 +56,7 @@ See [Branching Execution](./branching-execution.md).
 | Command | What it does |
 |---|---|
 | `chidori add <pkg>` | Add an npm dependency — content-addressed store, SHA-512 verification, JSONL lockfile, no Node. |
-| `chidori install` | Install everything in the lockfile. |
+| `chidori install` | Install dependencies from the lockfile. |
 | `chidori remove <pkg>` | Remove a dependency. |
 
 See [Package Management](./package-management.md).

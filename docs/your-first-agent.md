@@ -16,8 +16,9 @@ ideally, a provider key such as `ANTHROPIC_API_KEY`
 ([other providers](./host-api.md#providers--model-selection)).
 
 > **No API key?** Set `CHIDORI_TEST_LLM_RESPONSE="(test reply)"` and every
-> prompt call returns that static string instead of calling a provider. The
-> durability mechanics — journaling, pause, replay, verify — behave
+> prompt call returns that static string instead of calling a provider — so
+> the model won't actually exercise the tool, but the durability mechanics
+> this tutorial is about (journaling, pause, replay, verify) behave
 > identically.
 
 ## 1. Write the agent
@@ -91,15 +92,15 @@ Three things to notice before running it:
 chidori run research.ts --input question="what happened with the prompt cache?"
 ```
 
-The model calls `search_notes` (watch the turns go by), composes an answer,
-and then the run **stops and asks you**:
+The model runs the tool loop — calling `search_notes`, reading the results,
+composing an answer — and then the run **stops and asks you**:
 
 ```text
 Publish this answer? [yes/no]
 ```
 
 The answer text prints above the prompt — that's `details`. Type `yes`. The
-run completes and prints its JSON output:
+run completes and prints its JSON output, something like:
 
 ```json
 {
