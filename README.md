@@ -420,6 +420,7 @@ cd website && npm install && npm run dev
 | [Getting started & demos](./docs/getting-started.md) | Demo picker, inspecting a run, human-in-the-loop walkthrough, example agents |
 | [Your first agent](./docs/your-first-agent.md) | Fifteen-minute tutorial: write an agent, pause it for approval, replay it for $0, check it into CI |
 | [Common patterns](./docs/patterns.md) | Task-oriented recipes: approval gates, tool loops, fan-out, webhooks, scheduled agents, checkpoint tests |
+| [FAQ](./docs/faq.md) | Python support, Node, providers, comparisons, data locality, troubleshooting |
 | [Host API reference](./docs/host-api.md) | Every `chidori.*` method, option by option — plus providers, streaming events, and runtime policy |
 | [CLI reference](./docs/cli.md) | Every subcommand: run/chat/serve, resume/verify/trace, branches, packages, approval postures |
 | [Core concepts & host API](./docs/core-concepts.md) | Host function reference, streaming prompt progress, prompt caching |

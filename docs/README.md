@@ -44,6 +44,7 @@ Start here, roughly in order:
 | [your-first-agent.md](./your-first-agent.md) | Tutorial: write an agent, pause it, replay it for $0, check it into CI |
 | [core-concepts.md](./core-concepts.md) | Host calls, the call log, safepoints |
 | [patterns.md](./patterns.md) | Task-oriented recipes: which primitive fits which job |
+| [faq.md](./faq.md) | Python support, Node, providers, comparisons, data locality, troubleshooting |
 | [replay.md](./replay.md) | Record, replay, resume, divergence rules |
 | [running-modes.md](./running-modes.md) | `run` vs `serve`, policy profiles, `--trusted` |
 | [signals.md](./signals.md) | Named signals: pause for humans or other agents |

@@ -12,8 +12,15 @@ with zero LLM calls, and turn the recording into a CI test. Plan for about
 fifteen minutes.
 
 You need the `chidori` binary ([install](./getting-started.md)) and,
-ideally, a provider key such as `ANTHROPIC_API_KEY`
-([other providers](./host-api.md#providers--model-selection)).
+ideally, a provider key exported in your shell:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...   # or another provider — see below
+```
+
+Any Anthropic, OpenAI, or OpenAI-compatible key works
+([provider setup](./host-api.md#providers--model-selection)), and
+`chidori model-login` gives you a zero-setup OpenRouter fallback.
 
 > **No API key?** Set `CHIDORI_TEST_LLM_RESPONSE="(test reply)"` and every
 > prompt call returns that static string instead of calling a provider — so

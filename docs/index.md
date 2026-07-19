@@ -8,7 +8,9 @@ description: "What Chidori is, the one mechanism behind it, and how these docs a
 Chidori is the agent framework where every run is durable, replayable, and
 resumable by default. You write agents as plain async TypeScript — real
 `if`/`for`/`try`, real imports, no graph DSL — and run them on a single Rust
-binary with no Node, no Deno, and no V8.
+binary with no Node, no Deno, and no V8. (The TypeScript and Python *SDKs*
+are optional HTTP clients for driving a served runtime from your app —
+agents themselves are always TypeScript. [More FAQ →](./faq.md))
 
 ## The one mechanism
 
@@ -38,6 +40,9 @@ can log it, cache it, replay it, pause on it, and resume from it:
 
 Then pick up the rest of **Using Chidori** as you need it, and keep the
 [Host API Reference](./host-api.md) and [CLI Reference](./cli.md) at hand.
+Evaluating against other frameworks? Start with the
+[FAQ](./faq.md#choosing-chidori) and the
+[comparison table](../README.md#️-how-chidori-compares).
 
 ## How these docs are organized
 
