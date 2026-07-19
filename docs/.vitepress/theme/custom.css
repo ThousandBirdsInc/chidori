@@ -1,107 +1,225 @@
 /**
- * Chidori docs theme, matched to thousandbirds.ai/docs.
+ * Chidori docs theme — Geist-style treatment (in the vein of Vercel's design
+ * system and docs sites built on it, e.g. eve.dev).
  *
- * Palette (from the marketing site's design tokens):
- *   page    #0A0A0A   near-black ground ("ink")
- *   panel   #141414   raised surfaces, code blocks
- *   line    rgba(232,232,229,.12)   hairline borders
- *   bone-50 #E8E8E5   body text        bone-200 #A3A3A0   secondary
- *   accent  #FACC15   links, inline code, active nav (yellow)
- *
- * The site is dark-only (config sets appearance: 'force-dark'), so the
- * tokens are defined once on :root.
+ * Principles:
+ *   - Neutral grayscale surfaces; color is reserved for links and semantics.
+ *   - Light: white ground, #171717 text. Dark: near-black ground, #ededed text.
+ *   - Hairline alpha borders, 6-12px radii, card-like panels.
+ *   - Geist for prose, Geist Mono for code (vendored, OFL-licensed).
  */
 
+@font-face {
+  font-family: 'Geist';
+  src: url('./fonts/Geist-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('./fonts/GeistMono-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
-  --vp-c-bg: #0a0a0a;
-  --vp-c-bg-alt: #0a0a0a;
-  --vp-c-bg-elv: #141414;
-  --vp-c-bg-soft: #141414;
+  --vp-c-bg: #ffffff;
+  --vp-c-bg-alt: #fafafa;
+  --vp-c-bg-elv: #ffffff;
+  --vp-c-bg-soft: #f5f5f5;
 
-  --vp-c-divider: rgba(232, 232, 229, 0.12);
-  --vp-c-border: rgba(232, 232, 229, 0.24);
-  --vp-c-gutter: rgba(232, 232, 229, 0.12);
+  --vp-c-divider: rgba(0, 0, 0, 0.08);
+  --vp-c-border: rgba(0, 0, 0, 0.14);
+  --vp-c-gutter: rgba(0, 0, 0, 0.08);
 
-  --vp-c-text-1: #e8e8e5;
-  --vp-c-text-2: #a3a3a0;
-  --vp-c-text-3: #737373;
+  --vp-c-text-1: #171717;
+  --vp-c-text-2: #666666;
+  --vp-c-text-3: #999999;
 
-  --vp-c-brand-1: #facc15;
-  --vp-c-brand-2: #eab308;
-  --vp-c-brand-3: #facc15;
-  --vp-c-brand-soft: rgba(250, 204, 21, 0.14);
-  --vp-c-default-soft: rgba(232, 232, 229, 0.08);
+  /* Vercel blue, used sparingly: body links, focus states. */
+  --vp-c-brand-1: #0070f7;
+  --vp-c-brand-2: #0060d1;
+  --vp-c-brand-3: #0070f7;
+  --vp-c-brand-soft: rgba(0, 112, 247, 0.1);
+  --vp-c-default-soft: rgba(0, 0, 0, 0.05);
 
-  --vp-font-family-base: ui-sans-serif, system-ui, sans-serif,
+  --vp-font-family-base: 'Geist', ui-sans-serif, system-ui, sans-serif,
     'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
-  --vp-font-family-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo,
-    monospace;
+  --vp-font-family-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo,
+    Consolas, monospace;
 
-  --vp-code-color: #facc15;
-  --vp-code-bg: #141414;
-  --vp-code-block-bg: #141414;
+  /* Inline code and code blocks are neutral, not accent-colored. */
+  --vp-code-color: var(--vp-c-text-1);
+  --vp-code-bg: var(--vp-c-bg-soft);
+  --vp-code-block-bg: #fafafa;
 
-  --vp-button-brand-bg: #facc15;
-  --vp-button-brand-text: #0a0a0a;
+  /* Primary button: foreground-inverse, the Geist signature. */
+  --vp-button-brand-bg: #171717;
+  --vp-button-brand-text: #ffffff;
   --vp-button-brand-border: transparent;
-  --vp-button-brand-hover-bg: #eab308;
-  --vp-button-brand-hover-text: #0a0a0a;
+  --vp-button-brand-hover-bg: #383838;
+  --vp-button-brand-hover-text: #ffffff;
   --vp-button-brand-hover-border: transparent;
-  --vp-button-brand-active-bg: #eab308;
-  --vp-button-brand-active-text: #0a0a0a;
+  --vp-button-brand-active-bg: #383838;
+  --vp-button-brand-active-text: #ffffff;
   --vp-button-brand-active-border: transparent;
 
-  --vp-home-hero-name-color: #facc15;
+  --vp-home-hero-name-color: var(--vp-c-text-1);
 
-  --vp-custom-block-tip-border: rgba(250, 204, 21, 0.4);
-  --vp-custom-block-tip-text: #e8e8e5;
-  --vp-custom-block-tip-bg: #141414;
+  --vp-nav-bg-color: rgba(255, 255, 255, 0.85);
 }
 
-/* Headings render white against the ink ground, like the marketing site. */
-.vp-doc h1,
-.vp-doc h2,
+.dark {
+  --vp-c-bg: #0a0a0a;
+  --vp-c-bg-alt: #000000;
+  --vp-c-bg-elv: #121212;
+  --vp-c-bg-soft: #191919;
+
+  --vp-c-divider: rgba(255, 255, 255, 0.1);
+  --vp-c-border: rgba(255, 255, 255, 0.17);
+  --vp-c-gutter: rgba(255, 255, 255, 0.1);
+
+  --vp-c-text-1: #ededed;
+  --vp-c-text-2: #a1a1a1;
+  --vp-c-text-3: #6f6f6f;
+
+  --vp-c-brand-1: #52a8ff;
+  --vp-c-brand-2: #0090ff;
+  --vp-c-brand-3: #52a8ff;
+  --vp-c-brand-soft: rgba(82, 168, 255, 0.14);
+  --vp-c-default-soft: rgba(255, 255, 255, 0.07);
+
+  --vp-code-block-bg: #121212;
+
+  --vp-button-brand-bg: #ededed;
+  --vp-button-brand-text: #0a0a0a;
+  --vp-button-brand-hover-bg: #cccccc;
+  --vp-button-brand-hover-text: #0a0a0a;
+  --vp-button-brand-active-bg: #cccccc;
+  --vp-button-brand-active-text: #0a0a0a;
+
+  --vp-nav-bg-color: rgba(10, 10, 10, 0.8);
+}
+
+/* ---- typography ---- */
+
+.vp-doc h1 {
+  font-size: 32px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.vp-doc h2 {
+  border-top: none;
+  padding-top: 0;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
 .vp-doc h3,
 .vp-doc h4 {
-  color: #ffffff;
+  font-weight: 600;
 }
 
-/* Sidebar section titles: the site's uppercase, letter-spaced label style. */
-.VPSidebar .VPSidebarItem.level-0 > .item > .text {
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-size: 11px;
+/* ---- navbar: hairline + blur ---- */
+
+.VPNavBar:not(.home),
+.VPNavBar.has-sidebar {
+  backdrop-filter: saturate(180%) blur(10px);
+  -webkit-backdrop-filter: saturate(180%) blur(10px);
+}
+
+/* ---- sidebar: quiet items, neutral active pill (not accent-colored) ---- */
+
+.VPSidebarItem.level-0 > .item > .text {
+  font-weight: 600;
+  font-size: 14px;
+}
+.VPSidebarItem .link > .text {
+  font-size: 14px;
+}
+.VPSidebarItem.is-active > .item > .link > .text,
+.VPSidebarItem.is-link.is-active .link .text {
+  color: var(--vp-c-text-1) !important;
   font-weight: 500;
-  color: var(--vp-c-text-2);
+}
+.VPSidebarItem.is-link.is-active > .item {
+  background: var(--vp-c-default-soft);
+  border-radius: 6px;
+  margin: 0 -10px;
+  padding: 0 10px;
 }
 
-/* Panels read as hairline tiles: 1px line border, small radius. */
+/* ---- outline rail: neutral active state ---- */
+
+.VPDocAsideOutline .outline-link.active {
+  color: var(--vp-c-text-1);
+}
+.VPDocAsideOutline .outline-marker {
+  background-color: var(--vp-c-text-1);
+}
+
+/* ---- code ---- */
+
+.vp-doc :not(pre) > code {
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 6px;
+  font-size: 0.855em;
+  padding: 2px 5px;
+}
 .vp-doc div[class*='language-'] {
   border: 1px solid var(--vp-c-divider);
-  border-radius: 4px;
+  border-radius: 12px;
 }
+
+/* ---- tables: hairline rows, no zebra ---- */
+
+.vp-doc tr:nth-child(2n) {
+  background-color: transparent;
+}
+.vp-doc th {
+  color: var(--vp-c-text-2);
+  font-weight: 500;
+}
+.vp-doc th,
+.vp-doc td {
+  border-color: var(--vp-c-divider);
+}
+
+/* ---- callouts and cards ---- */
+
 .vp-doc .custom-block {
-  border-radius: 4px;
+  border-radius: 8px;
+  border: 1px solid var(--vp-c-divider);
+  background-color: var(--vp-c-bg-soft);
+}
+.VPFeature {
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 12px;
+  background-color: var(--vp-c-bg);
+  transition: border-color 0.2s;
+}
+.VPFeature:hover {
+  border-color: var(--vp-c-border);
 }
 
-/* Inline code: yellow on panel with a hairline ring, 2px radius. */
-.vp-doc :not(pre) > code {
-  border-radius: 2px;
-  box-shadow: inset 0 0 0 1px rgba(232, 232, 229, 0.12);
+/* ---- prev/next pager as cards ---- */
+
+.vp-doc .pager-link {
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  transition: border-color 0.2s;
+}
+.vp-doc .pager-link:hover {
+  border-color: var(--vp-c-border);
 }
 
-/* Blockquotes carry the accent rule, as in the site's prose styles. */
-.vp-doc blockquote {
-  border-left-color: #facc15;
-}
+/* ---- home hero: tight tracking, quiet tagline ---- */
 
-/* The site's faint scanline texture, on the home hero only. */
-.VPHero {
-  background-image: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 3px,
-    rgba(255, 255, 255, 0.015) 3px,
-    rgba(255, 255, 255, 0.015) 4px
-  );
+.VPHero .name,
+.VPHero .text {
+  letter-spacing: -0.02em;
+}
+.VPHero .tagline {
+  color: var(--vp-c-text-2);
 }

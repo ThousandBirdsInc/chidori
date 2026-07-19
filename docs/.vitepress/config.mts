@@ -50,8 +50,6 @@ export default defineConfig({
   // For GitHub Pages project hosting the CI workflow sets DOCS_BASE=/chidori/.
   base: process.env.DOCS_BASE || '/',
   srcExclude: ['posts/harness-engineering-thread.md'],
-  // The theme matches thousandbirds.ai, which is dark-only.
-  appearance: 'force-dark',
   lastUpdated: true,
   markdown: {
     config(md) {

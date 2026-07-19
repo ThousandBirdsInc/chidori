@@ -1,5 +1,5 @@
-// Default theme without the bundled Inter font: the thousandbirds.ai design
-// uses the system sans stack, so shipping Inter would just be dead weight.
+// Default theme without the bundled Inter font — the theme ships its own
+// vendored Geist / Geist Mono (see theme/fonts/, OFL-licensed).
 import DefaultTheme from 'vitepress/theme-without-fonts'
 import './custom.css'
 
