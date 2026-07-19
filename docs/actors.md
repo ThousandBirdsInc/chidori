@@ -1,3 +1,8 @@
+---
+title: "Actors"
+description: "Supervised, message-passing agent processes: spawn, send, receive, join, restart strategies, and supervision trees."
+---
+
 # Actors: supervised, message-passing agent processes
 
 Actors let one agent run start other agent modules as long-lived, concurrent,

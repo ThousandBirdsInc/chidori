@@ -1,3 +1,8 @@
+---
+title: "Observing with Tael"
+description: "OTLP export, run-trace correlation, checkpoint-backed golden cases, and the self-harness loop."
+---
+
 # Observing runs with Tael
 
 Chidori emits standard OTLP spans for every run — one parent span per run, one

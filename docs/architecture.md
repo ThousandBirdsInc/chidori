@@ -1,3 +1,8 @@
+---
+title: "Architecture"
+description: "Engine and runtime layering: the high-level component map and repository layout."
+---
+
 # Architecture & project structure
 
 A high-level map of the runtime.

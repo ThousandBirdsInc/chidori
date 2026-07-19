@@ -1,3 +1,8 @@
+---
+title: "Core Concepts"
+description: "Agents, host functions, and the mental model: the chidori.* surface, tools, streaming, and prompt caching."
+---
+
 # Core concepts: agents & host functions
 
 An agent is a `.ts` file that imports `{ chidori, run }` from the virtual
@@ -5,8 +10,9 @@ An agent is a `.ts` file that imports `{ chidori, run }` from the virtual
 (The legacy form — an exported async `agent(input, chidori)` function — is still
 accepted.) The runtime provides a fixed set of **host functions** for side
 effects through the `chidori` object — agents never touch the outside world
-directly, so the runtime sees and records everything. See
-[`llm.txt`](../llm.txt) for the full API reference.
+directly, so the runtime sees and records everything. See the
+[Host API Reference](./host-api.md) for every method option by option
+(shipped in the repo as [`llm.txt`](../llm.txt) for LLM consumption).
 
 ## Host functions
 

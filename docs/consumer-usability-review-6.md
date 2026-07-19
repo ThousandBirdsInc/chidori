@@ -1,3 +1,8 @@
+---
+title: "Round 6: Conversational Surface"
+description: "Round 6: the long-haul conversational surface \u2014 init/chat funnel, templates, cross-run memory, window compaction, local prompt cache."
+---
+
 # Consumer usability review, round 6: the long-haul conversational surface
 
 **Date:** 2026-07-18 · **Chidori:** 3.6.1, built from source at `a98a686` ·

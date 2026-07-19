@@ -1,3 +1,8 @@
+---
+title: "Value Checkpoints"
+description: "chidori.step: journal expensive pure compute once so replay and resume never re-pay it."
+---
+
 # Value Checkpoints — `chidori.step(name, fn)`
 
 > `chidori.step` bounds resume cost on long histories by memoizing expensive

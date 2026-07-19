@@ -1,5 +1,34 @@
 # Chidori documentation
 
+Everything here is plain markdown, readable on GitHub as-is. The same files
+are the content source for the docs website in [`website/`](../website),
+built with [Next.js](https://nextjs.org) + [Fumadocs](https://fumadocs.dev):
+
+```bash
+cd website
+npm install
+npm run dev     # local dev server with live reload
+npm run build   # static site in website/out
+```
+
+The site is deployed to GitHub Pages by
+[`.github/workflows/docs.yml`](../.github/workflows/docs.yml) on every push to
+`main` that touches `docs/` or `website/`.
+
+Conventions for writing pages:
+
+- Every page carries a small YAML frontmatter block with its sidebar `title`;
+  keep the `# H1` in the body too — that's what renders, on GitHub and on the
+  site.
+- Sidebar order and section groupings live in `meta.json` (and
+  `posts/meta.json`).
+- Keep writing ordinary relative links (`./other-page.md`,
+  `../examples/...`); the build rewrites in-docs links to site routes and
+  out-of-docs links to GitHub URLs.
+- Write plain CommonMark, not MDX — `{` and `<` in prose stay literal.
+  This README and `posts/harness-engineering-thread.md` are excluded from
+  the site.
+
 This directory mixes two audiences. **Using Chidori** is the path for agent
 authors and operators; **Engineering notes** are internal design records —
 useful history and rationale, but not tutorials, and some describe work that
@@ -11,8 +40,11 @@ Start here, roughly in order:
 
 | Doc | What it covers |
 |---|---|
-| [getting-started.md](./getting-started.md) | Install, first agent, first replay |
+| [getting-started.md](./getting-started.md) | Install, run the demos, inspect a durable run |
+| [your-first-agent.md](./your-first-agent.md) | Tutorial: write an agent, pause it, replay it for $0, check it into CI |
 | [core-concepts.md](./core-concepts.md) | Host calls, the call log, safepoints |
+| [patterns.md](./patterns.md) | Task-oriented recipes: which primitive fits which job |
+| [faq.md](./faq.md) | Python support, Node, providers, comparisons, data locality, troubleshooting |
 | [replay.md](./replay.md) | Record, replay, resume, divergence rules |
 | [running-modes.md](./running-modes.md) | `run` vs `serve`, policy profiles, `--trusted` |
 | [signals.md](./signals.md) | Named signals: pause for humans or other agents |
@@ -20,11 +52,21 @@ Start here, roughly in order:
 | [actors.md](./actors.md) | Supervised, message-passing agent processes |
 | [detached-agents.md](./detached-agents.md) | Long-lived agents outside a session |
 | [context-management.md](./context-management.md) | Conversation and context windows |
-| [value-checkpoints.md](./value-checkpoints.md) | `durableStep`: bounding replay cost |
+| [memory.md](./memory.md) | `chidori.memory`: persistent cross-run key-value storage |
+| [template.md](./template.md) | `chidori.template`: Jinja prompt rendering |
+| [value-checkpoints.md](./value-checkpoints.md) | `chidori.step`: bounding replay cost |
 | [durable-storage.md](./durable-storage.md) | Run persistence, time travel (`--until-seq`) |
 | [package-management.md](./package-management.md) | Imports, `node:` builtins, npm packages |
 | [sandbox-model.md](./sandbox-model.md) | The security model and its guarantees |
+| [observing-with-tael.md](./observing-with-tael.md) | OTLP export, run↔trace correlation, golden cases |
 | [deployment.md](./deployment.md) | Serving agents in production |
+
+## Reference
+
+| Doc | What it covers |
+|---|---|
+| [host-api.md](./host-api.md) | Every `chidori.*` method, option by option; providers; runtime policy |
+| [cli.md](./cli.md) | Every subcommand and the approval postures |
 
 ## Engineering notes (internal)
 

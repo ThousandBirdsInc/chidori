@@ -1,0 +1,17 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+@theme inline {
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo,
+    monospace;
+}
+
+/* Vercel-flavored grounds: pure white in light, near-black in dark. */
+:root {
+  --color-fd-background: hsl(0 0% 100%);
+}
+.dark {
+  --color-fd-background: hsl(0 0% 4%);
+}

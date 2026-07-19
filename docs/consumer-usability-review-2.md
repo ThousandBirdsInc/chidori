@@ -1,3 +1,8 @@
+---
+title: "Round 2: Multi-Agent Surface"
+description: "Round 2: the multi-agent surface (actors, branches, detached agents) under failure."
+---
+
 # Consumer usability review, round 2: the multi-agent surface
 
 **Date:** 2026-07-16 · **Chidori:** 3.6.0, built from source at `1694faa` ·
