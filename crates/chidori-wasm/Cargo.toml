@@ -20,7 +20,7 @@ chidori-js = { path = "../chidori-js", version = "0.3.3" }
 # TypeScript stripping for browser-authored agents, mirroring the native
 # runtime's transpile defaults (crates/chidori/src/runtime/typescript). Same
 # version/features as chidori-js, so this adds no new crates to the build.
-oxc = { version = "0.133", features = ["semantic", "transformer", "codegen"] }
+oxc = { version = "0.138", features = ["semantic", "transformer", "codegen"] }
 serde_json = "1"
 # Kept in lockstep with the wasm-bindgen-cli version used by
 # scripts/build-wasm.sh — the CLI refuses to process a module built by a
