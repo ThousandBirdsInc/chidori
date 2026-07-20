@@ -89,7 +89,7 @@ serde_yaml = "0.9"
 # can be shipped into any OTLP-compatible backend (tael, Jaeger, Tempo, etc.).
 # Activated at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is set.
 opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 
 # Checkpoint export: `chidori checkpoint export <run_id>` archives a run dir
@@ -124,7 +124,7 @@ landlock = "0.4"
 tempfile = "3"
 # In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
 # with the runtime `opentelemetry_sdk` features for test builds.
-opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 criterion = "0.5"
 
 # Runtime-layer perf coverage (journal replay lookup, session/run stores,
