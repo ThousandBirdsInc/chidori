@@ -90,7 +90,7 @@ serde_yaml = "0.9"
 # Activated at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is set.
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 
 # Checkpoint export: `chidori checkpoint export <run_id>` archives a run dir
 # as a .tar.gz so a golden eval case's fixture can be committed to git or
