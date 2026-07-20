@@ -72,7 +72,7 @@ temporal_rs = "0.2.3"
 mimalloc = { version = "0.1", optional = true, default-features = false }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 
 # Micro-benchmarks for the JS-execution hot paths (compile, interpreter loop,
 # property access, calls, arrays, strings). Run with `cargo bench -p chidori-js`.

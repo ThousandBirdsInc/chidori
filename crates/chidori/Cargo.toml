@@ -125,7 +125,7 @@ tempfile = "3"
 # In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
 # with the runtime `opentelemetry_sdk` features for test builds.
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
-criterion = "0.5"
+criterion = "0.8"
 
 # Runtime-layer perf coverage (journal replay lookup, session/run stores,
 # per-run construction costs). See `benches/runtime.rs`.
