@@ -557,7 +557,7 @@ dependencies = [
  "opentelemetry_sdk",
  "oxc",
  "oxc_sourcemap",
- "rand 0.8.6",
+ "rand 0.9.4",
  "reqwest",
  "rusqlite",
  "seccompiler",
@@ -2229,7 +2229,7 @@ dependencies = [
  "glob",
  "opentelemetry",
  "percent-encoding",
- "rand 0.8.6",
+ "rand 0.8.7",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
@@ -2964,9 +2964,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.6"
+version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
+checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -3852,7 +3852,7 @@ dependencies = [
  "indexmap 1.9.3",
  "pin-project",
  "pin-project-lite",
- "rand 0.8.6",
+ "rand 0.8.7",
  "slab",
  "tokio",
  "tokio-util",
