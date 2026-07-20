@@ -12,6 +12,11 @@ on:
       - "docs/**"
       - "website/**"
       - ".github/workflows/docs.yml"
+      # The /playground page ships the wasm runtime + browser SDK.
+      - "crates/chidori-wasm/**"
+      - "crates/chidori-js/**"
+      - "sdk/browser/**"
+      - "scripts/build-wasm.sh"
   workflow_dispatch:
 
 permissions:
@@ -35,6 +40,20 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: website/package-lock.json
+      # Build the /playground wasm assets (engine + browser SDK) into
+      # website/public/chidori-wasm before the site build. wasm-bindgen-cli
+      # must match the wasm-bindgen pin in crates/chidori-wasm/Cargo.toml.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs-wasm
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.126
+      - name: Build wasm playground assets
+        run: scripts/build-wasm.sh
       - name: Install dependencies
         run: npm ci
         working-directory: website

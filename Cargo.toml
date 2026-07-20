@@ -2,6 +2,7 @@
 members = [
     "crates/chidori",
     "crates/chidori-js",
+    "crates/chidori-wasm",
     "crates/test262-runner",
 ]
 # Bare `cargo run` / `cargo build` at the workspace root mean the CLI — the
