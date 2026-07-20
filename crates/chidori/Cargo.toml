@@ -88,7 +88,7 @@ serde_yaml = "0.9"
 # OpenTelemetry OTLP export — emits one span per host function call so agents
 # can be shipped into any OTLP-compatible backend (tael, Jaeger, Tempo, etc.).
 # Activated at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is set.
-opentelemetry = "0.27"
+opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 
