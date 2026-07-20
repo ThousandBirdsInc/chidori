@@ -100,7 +100,7 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 # that missed constructs like type predicates (`(t): t is string => ...`),
 # `satisfies` in odd positions, and overload signatures. oxc parses to a real
 # AST and emits JS via codegen, so unsupported sugar can't slip through.
-oxc = { version = "0.133", features = ["transformer", "codegen", "semantic", "ast_visit"] }
+oxc = { version = "0.138", features = ["transformer", "codegen", "semantic", "ast_visit"] }
 # Generated→original position lookup for the codegen source maps that back
 # error-frame remapping (`CodegenReturn::map` is this crate's `SourceMap`;
 # the oxc facade does not re-export it).
