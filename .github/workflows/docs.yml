@@ -43,9 +43,16 @@ jobs:
       # Build the /playground wasm assets (engine + browser SDK) into
       # website/public/chidori-wasm before the site build. wasm-bindgen-cli
       # must match the wasm-bindgen pin in crates/chidori-wasm/Cargo.toml.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      #
+      # rust-toolchain.toml pins the channel, and cargo always builds with
+      # that pinned toolchain — so the wasm target has to be added to it,
+      # not to `stable` (dtolnay/rust-toolchain@stable used to do that, and
+      # the target landed on a toolchain the build never uses). Argument-less
+      # `rustup toolchain install` reads rust-toolchain.toml.
+      - name: Install pinned toolchain with wasm target
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           key: docs-wasm
