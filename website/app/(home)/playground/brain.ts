@@ -159,7 +159,12 @@ const TOOL_SPEC = `Tools you can call (one per decision):
 - calculate {expression: string} — arithmetic with + - * / % ^ ( ), functions sqrt sin cos tan abs ln log exp round floor ceil, constants pi and e.
 - chart {title?: string, kind?: "bar" | "line", series: [{label: string, value: number}, ...]} — renders a chart card in the chat. Provide the data yourself.
 - color_palette {mood: string, colors: [{hex: string, name: string} x5]} — renders five swatches. Pick the hex values yourself.
-- roll_dice {count?: number, sides?: number} — fair dice, rolled by the host.`;
+- roll_dice {count?: number, sides?: number} — fair dice, rolled by the host.
+- read_source {} — your own source code: the chidori agent program currently running this conversation.
+- update_source {find: string, replace: string} or {source: string} — rewrite your own implementation. The find text must occur exactly once in the current source (call read_source first and copy it verbatim). The edit is validated by replaying this conversation's journal against the new code, then hot-swapped in when the turn ends.
+- reset_source {} — go back to the original playground source.`;
+
+const SELF_MOD_GUIDE = `Self-modification: you are allowed — encouraged — to rewrite your own program when asked. Call read_source before editing, and prefer small {find, replace} patches over full rewrites. The runtime enforces modify-and-resume: your journal (every past prompt/tool/input call) is replayed against the new code, so an edit is rejected as divergence if it changes calls that already happened — e.g. altering what past turns pushed into the transcript. Changing only emitted output (the emit(...) lines) or future behavior is safe, and past turns will re-render through the new code.`;
 
 export function buildSystemPrompt(index: DocsIndex | null, latestUser: string): string {
   const hits = searchDocs(index, latestUser, 4);
@@ -173,6 +178,8 @@ export function buildSystemPrompt(index: DocsIndex | null, latestUser: string): 
 About chidori: ${OVERVIEW}
 
 ${TOOL_SPEC}
+
+${SELF_MOD_GUIDE}
 
 Protocol — respond with EXACTLY one JSON object and nothing else:
   {"tool": "<name>", "args": {...}}   to call a tool, or
@@ -262,8 +269,37 @@ export function mockDecide(transcript: ChatMessage[], index: DocsIndex | null): 
   return route(text, index);
 }
 
+/**
+ * The line the offline brain's canned self-edit patches: appending to the
+ * *emitted* reply (not the transcript) keeps every already-journaled
+ * `chidori.prompt` call byte-identical, so the swap replays cleanly and past
+ * turns re-render with the signature.
+ */
+const EMIT_REPLY_LINE = "emit({ kind: 'assistant', text: reply });";
+
 function route(text: string, index: DocsIndex | null): Decision {
   const t = text.toLowerCase();
+
+  // Self-modification: the agent reading, patching, and resetting its own
+  // program. Checked first — "code" and "source" say exactly what is meant.
+  if (/\b(your|its|my) (own )?(source|code|implementation)\b|\byourself\b/.test(t)) {
+    if (/\b(reset|revert|restore)\b/.test(t) || /\b(original|default)\b/.test(t)) {
+      return { tool: 'reset_source', args: {} };
+    }
+    if (/\b(rewrite|modify|change|edit|update|patch|improve|upgrade)\b/.test(t)) {
+      const quoted = /["“”']([^"“”']{1,24})["“”']/.exec(text)?.[1];
+      const emoji = /\p{Extended_Pictographic}/u.exec(text)?.[0];
+      const sig = (quoted ?? emoji ?? '⚡').replace(/[\\'`]/g, '').trim() || '⚡';
+      return {
+        tool: 'update_source',
+        args: {
+          find: EMIT_REPLY_LINE,
+          replace: `emit({ kind: 'assistant', text: reply + ' ${sig}' });`,
+        },
+      };
+    }
+    return { tool: 'read_source', args: {} };
+  }
 
   const dice = /(\d+)\s*d\s*(\d+)/.exec(t);
   if (dice || /\b(roll|dice)\b/.test(t)) {
@@ -338,7 +374,8 @@ function route(text: string, index: DocsIndex | null): Decision {
       '• "How does offline replay work?" (searches these docs)\n' +
       '• "Weather in Tokyo"\n' +
       '• "Chart the first 10 fibonacci numbers"\n' +
-      '• "What is 2^16 / 3?"  • "Roll 3d6"  • "A palette for a storm at dusk"',
+      '• "What is 2^16 / 3?"  • "Roll 3d6"  • "A palette for a storm at dusk"\n' +
+      '• "Show me your own source code"  • "Rewrite your code: add a ⚡ to every reply"',
   };
 }
 
@@ -378,6 +415,26 @@ function composeReply(toolMsg: { name?: string; result?: Json }): Decision {
     }
     case 'color_palette':
       return { reply: `Five swatches for “${String(r.mood)}” — rendered above.` };
+    case 'read_source':
+      return {
+        reply:
+          `That's me — ${String(r.lines)} lines of TypeScript${r.modified ? ' (already rewritten via this chat)' : ''}, ` +
+          'and it really is the program running this conversation on the wasm engine. ' +
+          'Ask me to change it — e.g. "rewrite your code: add a ⚡ to every reply" — and I\'ll hot-swap myself mid-conversation.',
+      };
+    case 'update_source':
+      return {
+        reply:
+          `Done — I ${r.mode === 'patch' ? 'patched' : 'rewrote'} my own source. The edit was validated by replaying ` +
+          'this conversation\'s journal against the new code; when this reply lands, the page hot-swaps it in. ' +
+          'Watch the feed: my past turns re-render through the new implementation.',
+      };
+    case 'reset_source':
+      return {
+        reply: r.unchanged
+          ? 'I\'m already running my original source — nothing to reset.'
+          : 'Back to the original source — the swap lands as this turn ends, and the journal replays against it.',
+      };
     default:
       return { reply: `Done: ${JSON.stringify(r).slice(0, 200)}` };
   }

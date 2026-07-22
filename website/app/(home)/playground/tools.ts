@@ -169,10 +169,30 @@ const asObj = (kwargs: Json): Record<string, Json> =>
   kwargs && typeof kwargs === 'object' && !Array.isArray(kwargs) ? kwargs : {};
 
 /**
- * Build the tool table for a BrowserAgent host. `getIndex` is read at call
- * time so tools see the docs index even if it loads after the agent starts.
+ * Host hooks behind the self-modification tools. The page owns the running
+ * agent, so reading the live source and staging a replacement go through
+ * these callbacks; `propose` must throw (with a message the model can act
+ * on) when the new source doesn't compile or the conversation's journal
+ * cannot replay against it.
  */
-export function makeTools(getIndex: () => DocsIndex | null): Record<string, (kwargs: Json) => Json | Promise<Json>> {
+export interface SelfHost {
+  /** The source the next turn will run (a staged edit, if one is pending). */
+  getSource(): string;
+  /** The pristine source the playground shipped with. */
+  defaultSource: string;
+  /** Validate `next` and stage it for the end-of-turn hot-swap. */
+  propose(next: string): void;
+}
+
+/**
+ * Build the tool table for a BrowserAgent host. `getIndex` is read at call
+ * time so tools see the docs index even if it loads after the agent starts;
+ * `self` wires the source-editing tools back to the page hosting the agent.
+ */
+export function makeTools(
+  getIndex: () => DocsIndex | null,
+  self: SelfHost,
+): Record<string, (kwargs: Json) => Json | Promise<Json>> {
   return {
     search_docs: (kwargs) => {
       const query = String(asObj(kwargs).query ?? '');
@@ -219,6 +239,63 @@ export function makeTools(getIndex: () => DocsIndex | null): Record<string, (kwa
       // A model may send only a mood; derive swatches deterministically.
       if (!colors.length) colors = paletteFor(mood) as unknown as Json[];
       return { mood, colors: colors.slice(0, 6) };
+    },
+
+    read_source: () => {
+      const source = self.getSource();
+      return {
+        source,
+        lines: source.split('\n').length,
+        modified: source !== self.defaultSource,
+      };
+    },
+
+    update_source: (kwargs) => {
+      const o = asObj(kwargs);
+      const current = self.getSource();
+      let next: string;
+      let mode: 'rewrite' | 'patch';
+      if (typeof o.source === 'string' && o.source.trim()) {
+        next = o.source;
+        mode = 'rewrite';
+      } else if (typeof o.find === 'string' && o.find.length) {
+        const find = o.find;
+        const at = current.indexOf(find);
+        if (at === -1) {
+          throw new Error('find text does not occur in the current source — call read_source and copy it exactly');
+        }
+        if (current.indexOf(find, at + find.length) !== -1) {
+          throw new Error('find text occurs more than once — include more surrounding lines to make it unique');
+        }
+        next = current.slice(0, at) + String(o.replace ?? '') + current.slice(at + find.length);
+        mode = 'patch';
+      } else {
+        throw new Error('update_source needs {source} for a full rewrite or {find, replace} for a patch');
+      }
+      if (!next.includes('chidori.input')) {
+        throw new Error('the new source must keep awaiting chidori.input() in a loop, or the chat ends after this turn');
+      }
+      // Compiles the new source and replays the journal against it; throws
+      // (into this tool call, where the model can read it) on divergence.
+      self.propose(next);
+      return {
+        ok: true,
+        mode,
+        lines: next.split('\n').length,
+        note: 'validated against the journal — hot-swaps in when this turn ends',
+      };
+    },
+
+    reset_source: (): Json => {
+      if (self.getSource() === self.defaultSource) {
+        return { ok: true, unchanged: true, note: 'already running the original source' };
+      }
+      self.propose(self.defaultSource);
+      return {
+        ok: true,
+        lines: self.defaultSource.split('\n').length,
+        note: 'original source staged — hot-swaps in when this turn ends',
+      };
     },
 
     roll_dice: (kwargs) => {
