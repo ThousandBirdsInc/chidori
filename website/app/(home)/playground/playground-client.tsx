@@ -1,55 +1,66 @@
 'use client';
 
 /**
- * The interactive part of /playground: loads the wasm engine and the browser
- * SDK at runtime from /public (they are build artifacts produced by
- * scripts/build-wasm.sh, deliberately outside the Next bundle — hence the
- * webpackIgnore'd dynamic imports), then drives a durable agent through
- * record → suspend → resume → offline replay.
+ * The /playground chat: a chidori agent (agent-source.ts) running on the wasm
+ * engine in this tab, talking through a ReAct loop. This component is the
+ * *host*: it serves `chidori.prompt()` from a brain (offline router or
+ * OpenRouter), `chidori.tool()` from tools.ts, and `chidori.input()` from the
+ * chat box. The feed renders purely from the journaled console, so restored
+ * and replayed runs repaint identically — cards included.
+ *
+ * The wasm engine + browser SDK load at runtime from /public (build artifacts
+ * of scripts/build-wasm.sh, hence the webpackIgnore'd imports); the docs
+ * index loads from /playground-docs.json (scripts/build-playground-context.mjs).
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { AGENT_SOURCE } from './agent-source';
+import {
+  type ChatMessage,
+  type DocsIndex,
+  type FeedEvent,
+  type Json,
+  mockDecide,
+  openRouterDecide,
+  parseFeed,
+  prepareDocsIndex,
+} from './brain';
+import { makeTools } from './tools';
+import { ToolCard } from './cards';
 
-// Inlined at build time from DOCS_BASE_PATH (see next.config.mjs) so asset
-// URLs work both locally ('') and on GitHub Pages ('/chidori').
 const BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
 const ASSETS = `${BASE}/chidori-wasm`;
-const SAVE_KEY = 'chidori-playground-run';
+const SAVE_KEY = 'chidori-playground-chat-v1';
 // The exchanged OpenRouter key lives in sessionStorage: it survives the PKCE
 // redirect back to this page, and is gone when the tab closes.
 const OR_KEY = 'chidori-playground-openrouter-key';
 
-const SAMPLE_AGENT = `interface Weather { tempC: number; sky: string }
-
-async function main(): Promise<void> {
-  await chidori.log('starting research');
-  const city = await chidori.input('Which city should I research?');
-  const weather = await chidori.tool('weather', { city }) as Weather;
-  const fact = await chidori.fetch('${ASSETS}/fact.json');
-  const stamp = await chidori.now();
-  const summary = await chidori.prompt(
-    \`One line on \${city}: \${weather.tempC}C, \${weather.sky}\`);
-  console.log(\`city: \${city}\`);
-  console.log(\`weather: \${weather.tempC}C, \${weather.sky}\`);
-  console.log(\`fact: \${fact.json.text}\`);
-  console.log(\`summary: \${summary}\`);
-  console.log(\`researched at \${stamp}\`);
-}
-main();
-`;
+const SUGGESTIONS = [
+  'What is chidori, in one paragraph?',
+  'How does offline replay work?',
+  'Weather in Tokyo',
+  'Chart the first 10 fibonacci numbers',
+  'What is 2^16 / 3?',
+  'Roll 3d6',
+  'A color palette for a storm at dusk',
+];
 
 interface RunView {
   status: string;
   console: string[];
   liveCalls: number;
-  pendingInput?: { prompt: string };
+}
+
+interface AgentHandle {
+  run(): Promise<RunView>;
+  console(): string[];
+  blob(): Uint8Array;
 }
 
 declare global {
   interface Window {
-    /** Set once the wasm assets are loaded; the e2e tests key off these. */
+    /** Set once the wasm assets are loaded; smoke checks key off this. */
     __chidoriReady?: boolean;
-    __lastRun?: RunView;
   }
 }
 
@@ -73,28 +84,164 @@ async function loadAssets(): Promise<Loaded> {
 }
 
 export function PlaygroundClient() {
-  const [source, setSource] = useState(SAMPLE_AGENT);
+  const [ready, setReady] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [feed, setFeed] = useState<FeedEvent[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
   const [statusLine, setStatusLine] = useState('');
-  const [consoleLines, setConsoleLines] = useState<string[]>([]);
-  const [hostLines, setHostLines] = useState<string[]>([]);
-  const [question, setQuestion] = useState<string | null>(null);
-  const [answer, setAnswer] = useState('');
   const [hasSaved, setHasSaved] = useState(false);
+  const [draft, setDraft] = useState('');
   const [provider, setProvider] = useState<'mock' | 'openrouter'>('mock');
   const [orKey, setOrKey] = useState<string | null>(null);
   const [model, setModel] = useState('openrouter/auto');
+
   const loadedRef = useRef<Loaded | null>(null);
-  const agentRef = useRef<{ run(): Promise<RunView>; blob(): Uint8Array } | null>(null);
-  const askResolveRef = useRef<((answer: string) => void) | null>(null);
+  const loadedPromiseRef = useRef<Promise<Loaded | null> | null>(null);
+  const agentRef = useRef<AgentHandle | null>(null);
+  // The host closures live as long as the agent; anything they must see live
+  // goes through a ref. `token` invalidates a whole agent on Reset.
+  const tokenRef = useRef(0);
+  const resolveRef = useRef<((answer: string) => void) | null>(null);
+  const queueRef = useRef<string[]>([]);
+  const providerRef = useRef(provider);
+  const orKeyRef = useRef(orKey);
+  const modelRef = useRef(model);
+  const docsIndexRef = useRef<DocsIndex | null>(null);
+  const feedBoxRef = useRef<HTMLDivElement | null>(null);
+
+  const refreshFeed = useCallback(() => {
+    const agent = agentRef.current;
+    if (agent) setFeed(parseFeed(agent.console()));
+  }, []);
+
+  const persist = useCallback(() => {
+    const agent = agentRef.current;
+    if (!agent || agent.console().length === 0) return;
+    try {
+      localStorage.setItem(SAVE_KEY, new TextDecoder().decode(agent.blob()));
+      setHasSaved(true);
+    } catch {
+      /* storage full/blocked — chat still works, just not durable */
+    }
+  }, []);
+
+  /** Host implementations for one agent generation. */
+  const buildHost = useCallback(
+    (token: number) => {
+      const stale = () => token !== tokenRef.current;
+      const hang = () => new Promise<never>(() => {});
+      const baseTools = makeTools(() => docsIndexRef.current);
+      const tools: Record<string, (kwargs: Json) => Promise<Json>> = {};
+      for (const [name, impl] of Object.entries(baseTools)) {
+        tools[name] = async (kwargs) => {
+          if (stale()) return hang();
+          setBusy(`running ${name}…`);
+          refreshFeed();
+          return impl(kwargs);
+        };
+      }
+      return {
+        llm: async ({ text }: { text: string }) => {
+          if (stale()) return hang();
+          setBusy('thinking…');
+          refreshFeed();
+          let transcript: ChatMessage[] = [];
+          try {
+            transcript = JSON.parse(text);
+          } catch {
+            /* not a transcript — leave empty */
+          }
+          try {
+            const decision =
+              providerRef.current === 'openrouter' && orKeyRef.current
+                ? await openRouterDecide({
+                    apiKey: orKeyRef.current,
+                    model: modelRef.current,
+                    transcript,
+                    index: docsIndexRef.current,
+                  })
+                : mockDecide(transcript, docsIndexRef.current);
+            return JSON.stringify(decision);
+          } catch (err) {
+            // Keep the loop alive: surface the failure as the reply.
+            return JSON.stringify({ reply: `LLM call failed: ${String(err)}` });
+          }
+        },
+        tools,
+        onInput: () => {
+          if (stale()) return hang();
+          setBusy(null);
+          refreshFeed();
+          persist();
+          const queued = queueRef.current.shift();
+          if (queued !== undefined) return queued;
+          return new Promise<string>((resolve) => {
+            resolveRef.current = resolve;
+          });
+        },
+      };
+    },
+    [refreshFeed, persist],
+  );
+
+  const drive = useCallback(
+    (agent: AgentHandle, token: number) => {
+      agent
+        .run()
+        .then(() => {
+          if (token !== tokenRef.current) return;
+          setBusy(null);
+          refreshFeed();
+        })
+        .catch((err) => {
+          if (token !== tokenRef.current) return;
+          setBusy(null);
+          setStatusLine(`Agent error: ${String(err)}`);
+        });
+    },
+    [refreshFeed],
+  );
+
+  /** Restore a saved conversation: replays the journal, waits at input. */
+  const restoreSaved = useCallback(
+    (loaded: Loaded): boolean => {
+      const saved = localStorage.getItem(SAVE_KEY);
+      if (saved === null) return false;
+      try {
+        const token = tokenRef.current;
+        const agent = loaded.sdk.BrowserAgent.restore(
+          loaded.wasm,
+          new TextEncoder().encode(saved),
+          buildHost(token),
+        ) as AgentHandle;
+        agentRef.current = agent;
+        setHasSaved(true);
+        setStatusLine('Restored from localStorage — earlier turns replayed offline.');
+        drive(agent, token);
+        return true;
+      } catch {
+        localStorage.removeItem(SAVE_KEY);
+        return false;
+      }
+    },
+    [buildHost, drive],
+  );
 
   useEffect(() => {
-    setHasSaved(localStorage.getItem(SAVE_KEY) !== null);
-    // Preload so the first click is instant; surface a friendly error if the
-    // assets have not been built into public/chidori-wasm.
-    loadAssets()
+    let cancelled = false;
+    const loading = loadAssets();
+    loadedPromiseRef.current = loading.catch(() => null);
+    fetch(`${BASE}/playground-docs.json`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json) => {
+        if (json && !cancelled) docsIndexRef.current = prepareDocsIndex(json);
+      })
+      .catch(() => {
+        /* docs search degrades gracefully */
+      });
+    loading
       .then(async (loaded) => {
+        if (cancelled) return;
         loadedRef.current = loaded;
         // Finish the OpenRouter PKCE login if this page load is the redirect
         // back from openrouter.ai (no-op otherwise).
@@ -106,136 +253,71 @@ export function PlaygroundClient() {
         }
         const key = sessionStorage.getItem(OR_KEY);
         if (key) {
+          orKeyRef.current = key;
           setOrKey(key);
+          providerRef.current = 'openrouter';
           setProvider('openrouter');
         }
+        setReady(true);
         window.__chidoriReady = true;
+        restoreSaved(loaded);
       })
-      .catch(() =>
-        setLoadError(
-          'The wasm assets are missing. Build them with scripts/build-wasm.sh, then reload.',
-        ),
-      );
-  }, []);
-
-  const host = useCallback(
-    (interactive: boolean) => ({
-      llm:
-        provider === 'openrouter' && orKey && loadedRef.current
-          ? loadedRef.current.sdk.openRouterLlm({
-              apiKey: orKey,
-              model,
-              appName: 'Chidori Playground',
-              appUrl: typeof location !== 'undefined' ? location.origin : undefined,
-            })
-          : async ({ text }: { text: string }) =>
-              text.startsWith('One line on')
-                ? 'crisp skies, bring a light jacket'
-                : `[mock] ${text}`,
-      tools: {
-        weather: (kwargs: unknown) => {
-          const { city } = kwargs as { city: string };
-          return { tempC: 11 + city.length, sky: 'clear' };
-        },
-      },
-      onLog: ({ message }: { message: string }) =>
-        setHostLines((l) => [...l, `log: ${message}`]),
-      onInput: ({ prompt }: { prompt: string }) => {
-        if (!interactive) return undefined; // suspend: savable frontier
-        setQuestion(prompt);
-        return new Promise<string>((resolve) => {
-          askResolveRef.current = resolve;
-        });
-      },
-    }),
-    [provider, orKey, model],
-  );
-
-  const connectOpenRouter = useCallback(() => {
-    // Redirects to openrouter.ai's consent page; the redirect back lands on
-    // this page with ?code=, which the mount effect exchanges for a key.
-    loadedRef.current?.sdk.startOpenRouterLogin();
-  }, []);
-
-  const disconnectOpenRouter = useCallback(() => {
-    sessionStorage.removeItem(OR_KEY);
-    setOrKey(null);
-    setProvider('mock');
-  }, []);
-
-  const finish = useCallback((result: RunView, mode: string) => {
-    setConsoleLines(result.console);
-    if (agentRef.current) {
-      localStorage.setItem(
-        SAVE_KEY,
-        new TextDecoder().decode(agentRef.current.blob()),
-      );
-    }
-    setHasSaved(true);
-    if (result.status === 'suspended') {
-      setStatusLine(
-        `⏸ Suspended at input("${result.pendingInput?.prompt}") — saved to localStorage. Reload this page, then hit Resume.`,
-      );
-    } else {
-      setStatusLine(`✅ Completed — ${mode}: ${result.liveCalls} live host call(s).`);
-      setHostLines((l) => [...l, `— ${mode}: ${result.liveCalls} live host call(s) —`]);
-    }
-    window.__lastRun = result;
-  }, []);
-
-  const begin = useCallback(() => {
-    setBusy(true);
-    setStatusLine('');
-    setConsoleLines([]);
-    setHostLines([]);
-    setQuestion(null);
-  }, []);
-
-  const run = useCallback(async () => {
-    const loaded = loadedRef.current;
-    if (!loaded) return;
-    begin();
-    try {
-      const agent = loaded.sdk.BrowserAgent.start(loaded.wasm, {
-        source,
-        ...host(false),
+      .catch(() => {
+        if (!cancelled) {
+          setLoadError(
+            'The wasm assets are missing. Build them with scripts/build-wasm.sh, then reload.',
+          );
+        }
       });
-      agentRef.current = agent;
-      finish((await agent.run()) as RunView, 'record');
-    } catch (err) {
-      setStatusLine(`Error: ${String(err)}`);
-    } finally {
-      setBusy(false);
-    }
-  }, [source, host, begin, finish]);
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const resume = useCallback(async () => {
-    const loaded = loadedRef.current;
-    const saved = localStorage.getItem(SAVE_KEY);
-    if (!loaded || saved === null) return;
-    begin();
-    try {
-      const agent = loaded.sdk.BrowserAgent.restore(
-        loaded.wasm,
-        new TextEncoder().encode(saved),
-        host(true),
-      );
-      agentRef.current = agent;
-      finish((await agent.run()) as RunView, 'resume');
-    } catch (err) {
-      setStatusLine(`Error: ${String(err)}`);
-    } finally {
-      setBusy(false);
-    }
-  }, [host, begin, finish]);
+  useEffect(() => {
+    const box = feedBoxRef.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [feed, busy]);
+
+  const ensureAgent = useCallback(async () => {
+    if (agentRef.current) return;
+    const loaded = loadedRef.current ?? (await loadedPromiseRef.current);
+    if (!loaded || agentRef.current) return;
+    const token = tokenRef.current;
+    const agent = loaded.sdk.BrowserAgent.start(loaded.wasm, {
+      source: AGENT_SOURCE,
+      ...buildHost(token),
+    }) as AgentHandle;
+    agentRef.current = agent;
+    drive(agent, token);
+  }, [buildHost, drive]);
+
+  const send = useCallback(
+    (text: string) => {
+      const message = text.trim();
+      if (!message || !ready) return;
+      setDraft('');
+      setStatusLine('');
+      const resolve = resolveRef.current;
+      if (resolve) {
+        resolveRef.current = null;
+        resolve(message);
+      } else {
+        queueRef.current.push(message);
+        void ensureAgent();
+      }
+    },
+    [ready, ensureAgent],
+  );
 
   const replay = useCallback(async () => {
     const loaded = loadedRef.current;
     const saved = localStorage.getItem(SAVE_KEY);
     if (!loaded || saved === null) return;
-    begin();
     try {
-      // No host at all: every effect must come from the journal.
+      // No brain, no tools, no network: every effect must come from the
+      // journal. The whole chat — cards included — repaints from it.
       const agent = loaded.sdk.BrowserAgent.restore(
         loaded.wasm,
         new TextEncoder().encode(saved),
@@ -243,30 +325,50 @@ export function PlaygroundClient() {
           llm: () => {
             throw new Error('replay must not call the LLM');
           },
-          fetchImpl: () => {
+          fetchImpl: (() => {
             throw new Error('replay must not touch the network');
-          },
+          }) as unknown as typeof fetch,
         },
+      ) as AgentHandle;
+      const result = await agent.run();
+      setFeed(parseFeed(result.console));
+      setStatusLine(
+        `⚡ Replayed offline: ${result.console.length} journaled events re-rendered with ${result.liveCalls} live host calls.`,
       );
-      agentRef.current = agent;
-      finish((await agent.run()) as RunView, 'replay');
     } catch (err) {
-      setStatusLine(`Error: ${String(err)}`);
-    } finally {
-      setBusy(false);
+      setStatusLine(`Replay error: ${String(err)}`);
     }
-  }, [begin, finish]);
+  }, []);
 
-  const sendAnswer = useCallback(() => {
-    setQuestion(null);
-    askResolveRef.current?.(answer);
-    askResolveRef.current = null;
-  }, [answer]);
-
-  const discard = useCallback(() => {
+  const reset = useCallback(() => {
+    tokenRef.current += 1; // orphan the running agent; its host calls hang
+    agentRef.current = null;
+    resolveRef.current = null;
+    queueRef.current = [];
     localStorage.removeItem(SAVE_KEY);
+    setFeed([]);
+    setBusy(null);
+    setStatusLine('');
     setHasSaved(false);
-    setStatusLine('Saved run discarded.');
+  }, []);
+
+  const connectOpenRouter = useCallback(() => {
+    // Redirects to openrouter.ai's consent page; the redirect back lands on
+    // this page with ?code=, which the mount effect exchanges for a key.
+    void loadedRef.current?.sdk.startOpenRouterLogin();
+  }, []);
+
+  const disconnectOpenRouter = useCallback(() => {
+    sessionStorage.removeItem(OR_KEY);
+    orKeyRef.current = null;
+    setOrKey(null);
+    providerRef.current = 'mock';
+    setProvider('mock');
+  }, []);
+
+  const pickProvider = useCallback((p: 'mock' | 'openrouter') => {
+    providerRef.current = p;
+    setProvider(p);
   }, []);
 
   if (loadError) {
@@ -278,39 +380,27 @@ export function PlaygroundClient() {
   }
 
   const button =
-    'rounded-lg border border-fd-border px-4 py-2 text-sm font-medium transition-colors hover:bg-fd-accent disabled:pointer-events-none disabled:opacity-40';
+    'rounded-lg border border-fd-border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-fd-accent disabled:pointer-events-none disabled:opacity-40';
+  const segment = (active: boolean) =>
+    `rounded-md px-2.5 py-1 text-sm font-medium transition-colors ${
+      active ? 'bg-fd-background shadow-sm' : 'text-fd-muted-foreground hover:text-fd-foreground'
+    }`;
 
   return (
-    <div className="mt-8">
-      <textarea
-        value={source}
-        onChange={(e) => setSource(e.target.value)}
-        spellCheck={false}
-        aria-label="Agent source (TypeScript)"
-        className="min-h-[22rem] w-full rounded-lg border border-fd-border bg-fd-card p-4 font-mono text-sm"
-      />
-      <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
-        <span className="font-medium">LLM for chidori.prompt():</span>
-        <label className="flex items-center gap-1.5">
-          <input
-            type="radio"
-            name="provider"
-            id="provider-mock"
-            checked={provider === 'mock'}
-            onChange={() => setProvider('mock')}
-          />
-          Deterministic mock (offline, free)
-        </label>
-        <label className="flex items-center gap-1.5">
-          <input
-            type="radio"
-            name="provider"
+    <div className="mt-6">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
+        <div className="flex items-center gap-1 rounded-lg bg-fd-accent/60 p-1" role="group" aria-label="Brain">
+          <button id="provider-mock" className={segment(provider === 'mock')} onClick={() => pickProvider('mock')}>
+            Offline brain
+          </button>
+          <button
             id="provider-openrouter"
-            checked={provider === 'openrouter'}
-            onChange={() => setProvider('openrouter')}
-          />
-          OpenRouter (real models)
-        </label>
+            className={segment(provider === 'openrouter')}
+            onClick={() => pickProvider('openrouter')}
+          >
+            OpenRouter
+          </button>
+        </div>
         {provider === 'openrouter' &&
           (orKey ? (
             <span className="flex items-center gap-2">
@@ -321,81 +411,149 @@ export function PlaygroundClient() {
                 id="or-model"
                 type="text"
                 value={model}
-                onChange={(e) => setModel(e.target.value)}
+                onChange={(e) => {
+                  modelRef.current = e.target.value;
+                  setModel(e.target.value);
+                }}
                 aria-label="OpenRouter model"
-                className="w-56 rounded-lg border border-fd-border bg-fd-background px-2 py-1"
+                className="w-52 rounded-lg border border-fd-border bg-fd-background px-2 py-1"
               />
               <button id="or-disconnect" className={button} onClick={disconnectOpenRouter}>
                 Disconnect
               </button>
             </span>
           ) : (
-            <button id="or-connect" className={button} onClick={connectOpenRouter}>
+            <button id="or-connect" className={button} onClick={connectOpenRouter} disabled={!ready}>
               Connect OpenRouter
             </button>
           ))}
+        <span className="ml-auto flex gap-2">
+          <button id="replay" className={button} disabled={!ready || !hasSaved} onClick={replay} title="Re-render this chat from its journal — zero live calls">
+            ↺ Replay offline
+          </button>
+          <button id="clear" className={button} disabled={!hasSaved && feed.length === 0} onClick={reset}>
+            ✕ Reset
+          </button>
+        </span>
       </div>
-      <div className="mt-4 flex flex-wrap gap-3">
-        <button id="run" className={button} disabled={busy || (provider === 'openrouter' && !orKey)} onClick={run}>
-          ▶ Run agent
-        </button>
-        <button id="resume" className={button} disabled={busy || !hasSaved} onClick={resume}>
-          ⏯ Resume saved run
-        </button>
-        <button id="replay" className={button} disabled={busy || !hasSaved} onClick={replay}>
-          ↺ Replay offline
-        </button>
-        <button id="clear" className={button} disabled={busy || !hasSaved} onClick={discard}>
-          ✕ Discard saved run
-        </button>
-      </div>
-
-      {question !== null && (
-        <div
-          id="ask"
-          className="mt-4 rounded-lg border border-fd-border bg-fd-accent/50 p-4"
-        >
-          <label htmlFor="answer" className="block text-sm font-medium">
-            {question}
-          </label>
-          <div className="mt-2 flex gap-2">
-            <input
-              id="answer"
-              type="text"
-              value={answer}
-              onChange={(e) => setAnswer(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && sendAnswer()}
-              className="w-64 rounded-lg border border-fd-border bg-fd-background px-3 py-1.5 text-sm"
-            />
-            <button id="send" className={button} onClick={sendAnswer}>
-              Answer
-            </button>
-          </div>
-        </div>
+      {provider === 'openrouter' && !orKey && (
+        <p className="mt-2 text-xs text-fd-muted-foreground">
+          Not connected yet — messages fall back to the offline brain until you connect.
+        </p>
       )}
 
-      {statusLine && <p id="status" className="mt-4 font-medium">{statusLine}</p>}
-
-      <div className="mt-6 grid gap-4 md:grid-cols-2">
-        <section>
-          <h2 className="text-sm font-semibold">Agent console</h2>
-          <pre
-            id="console"
-            className="mt-2 min-h-[8rem] rounded-lg border border-fd-border bg-fd-card p-4 text-xs whitespace-pre-wrap"
-          >
-            {consoleLines.join('\n')}
-          </pre>
-        </section>
-        <section>
-          <h2 className="text-sm font-semibold">Host log</h2>
-          <pre
-            id="hostlog"
-            className="mt-2 min-h-[8rem] rounded-lg border border-fd-border bg-fd-card p-4 text-xs whitespace-pre-wrap"
-          >
-            {hostLines.join('\n')}
-          </pre>
-        </section>
+      <div className="mt-3 overflow-hidden rounded-xl border border-fd-border bg-fd-card/50">
+        <div ref={feedBoxRef} className="h-[28rem] overflow-y-auto p-4">
+          {feed.length === 0 && !busy ? (
+            <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
+              <p className="text-sm text-fd-muted-foreground">
+                {ready ? 'Ask about chidori, or put the tools to work:' : 'Loading the wasm engine…'}
+              </p>
+              <div className="flex max-w-lg flex-wrap justify-center gap-2">
+                {SUGGESTIONS.map((s) => (
+                  <button
+                    key={s}
+                    className="rounded-full border border-fd-border px-3 py-1.5 text-xs transition-colors hover:bg-fd-accent disabled:opacity-40"
+                    disabled={!ready}
+                    onClick={() => send(s)}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              {feed.map((event, i) => {
+                if (event.kind === 'user') {
+                  return (
+                    <div key={i} className="flex justify-end">
+                      <p className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-fd-primary px-3.5 py-2 text-sm text-fd-primary-foreground">
+                        {event.text}
+                      </p>
+                    </div>
+                  );
+                }
+                if (event.kind === 'assistant') {
+                  return (
+                    <div key={i} className="flex">
+                      <p className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-bl-md border border-fd-border bg-fd-background px-3.5 py-2 text-sm">
+                        {event.text}
+                      </p>
+                    </div>
+                  );
+                }
+                if (event.kind === 'tool') {
+                  return (
+                    <div key={i} className="flex">
+                      <ToolCard name={event.name} args={event.args} result={event.result} />
+                    </div>
+                  );
+                }
+                return (
+                  <p key={i} className="text-center text-xs text-fd-muted-foreground">
+                    {event.text}
+                  </p>
+                );
+              })}
+              {busy && (
+                <p className="animate-pulse text-xs text-fd-muted-foreground" id="busy">
+                  {busy}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+        <form
+          className="flex gap-2 border-t border-fd-border p-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            send(draft);
+          }}
+        >
+          <input
+            id="chat-input"
+            type="text"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder={ready ? 'Message the agent…' : 'Loading…'}
+            disabled={!ready}
+            autoComplete="off"
+            className="min-w-0 flex-1 rounded-lg border border-fd-border bg-fd-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-fd-primary/40"
+          />
+          <button id="send" type="submit" className={button} disabled={!ready || !draft.trim()}>
+            Send
+          </button>
+        </form>
       </div>
+
+      {statusLine && (
+        <p id="status" className="mt-2 text-sm text-fd-muted-foreground">
+          {statusLine}
+        </p>
+      )}
+
+      <details className="mt-8 rounded-lg border border-fd-border p-4">
+        <summary className="cursor-pointer text-sm font-medium">Under the hood</summary>
+        <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-fd-muted-foreground">
+          <li>
+            This chat is a chidori agent — the source below — executed by the pure-Rust engine
+            compiled to WebAssembly, entirely in this tab.
+          </li>
+          <li>
+            Every <code>chidori.prompt / tool / input</code> effect is journaled: the conversation
+            auto-saves each turn, survives a reload, and <em>Replay offline</em> repaints it — cards
+            and all — with zero live calls.
+          </li>
+          <li>
+            Docs answers are grounded: these docs are indexed at build time, retrieved into the
+            model&apos;s context, and exposed as the <code>search_docs</code> tool.
+          </li>
+        </ul>
+        <pre className="mt-3 overflow-x-auto rounded-lg border border-fd-border bg-fd-card p-4 text-xs">
+          {AGENT_SOURCE}
+        </pre>
+      </details>
     </div>
   );
 }

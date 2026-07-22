@@ -61,6 +61,9 @@ node_modules/
 /website/next-env.d.ts
 # Playground runtime assets, mirrored from the wasm build by scripts/build-wasm.sh
 /website/public/chidori-wasm/
+# Docs index for the /playground chat agent (regenerate with
+# website/scripts/build-playground-context.mjs; runs as part of npm run build)
+/website/public/playground-docs.json
 
 # Secrets / local env
 .env
