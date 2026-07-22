@@ -37,12 +37,12 @@ const FEATURES = [
 export default function HomePage() {
   return (
     <main className="flex flex-1 flex-col">
-      <section className="mx-auto w-full max-w-5xl px-6 pt-20 pb-16 md:pt-28">
-        <h1 className="max-w-3xl text-4xl font-semibold tracking-tight text-balance md:text-5xl">
+      <section className="mx-auto w-full max-w-5xl px-4 pt-14 pb-16 sm:px-6 sm:pt-20 md:pt-28">
+        <h1 className="max-w-3xl text-3xl font-semibold tracking-tight text-balance sm:text-4xl md:text-5xl">
           The agent framework where every run is durable, replayable, and
           resumable by default.
         </h1>
-        <p className="mt-6 max-w-2xl text-lg text-fd-muted-foreground">
+        <p className="mt-6 max-w-2xl text-base text-fd-muted-foreground sm:text-lg">
           Write agents as plain async TypeScript on a Rust core. Every side
           effect flows through the runtime as a recorded host call, so any run
           can be checkpointed to disk, replayed for byte-identical output with
@@ -72,7 +72,7 @@ export default function HomePage() {
         </div>
       </section>
 
-      <section className="mx-auto w-full max-w-5xl px-6 pb-24">
+      <section className="mx-auto w-full max-w-5xl px-4 pb-24 sm:px-6">
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {FEATURES.map((f) => (
             <Link
