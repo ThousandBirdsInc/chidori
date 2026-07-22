@@ -15,8 +15,8 @@ export default function PlaygroundPage() {
       </h1>
       <p className="mt-3 text-fd-muted-foreground">
         A chidori agent running entirely in this tab — ask it about chidori, or
-        hand it a tool. Reload mid-conversation and it resumes; every effect is
-        journaled.
+        hand it a tool. Every effect is journaled: reload mid-conversation and
+        it resumes, rewind any turn, or branch into an alternate timeline.
       </p>
       <PlaygroundClient />
     </main>
