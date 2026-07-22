@@ -572,7 +572,7 @@ export function PlaygroundClient() {
         </div>
         {provider === 'openrouter' &&
           (orKey ? (
-            <span className="flex items-center gap-2">
+            <span className="flex flex-wrap items-center gap-2">
               <span id="or-connected" className="text-fd-muted-foreground">
                 ✓ connected
               </span>
@@ -585,7 +585,7 @@ export function PlaygroundClient() {
                   setModel(e.target.value);
                 }}
                 aria-label="OpenRouter model"
-                className="w-52 rounded-lg border border-fd-border bg-fd-background px-2 py-1"
+                className="w-40 min-w-0 rounded-lg border border-fd-border bg-fd-background px-2 py-1 text-base sm:w-52 sm:text-sm"
               />
               <button id="or-disconnect" className={button} onClick={disconnectOpenRouter}>
                 Disconnect
@@ -649,7 +649,7 @@ export function PlaygroundClient() {
       )}
 
       <div className="mt-3 overflow-hidden rounded-xl border border-fd-border bg-fd-card/50">
-        <div ref={feedBoxRef} className="h-[28rem] overflow-y-auto p-4">
+        <div ref={feedBoxRef} className="h-[min(28rem,65dvh)] overflow-y-auto p-3 sm:p-4">
           {feed.length === 0 && !busy ? (
             <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
               <p className="text-sm text-fd-muted-foreground">
@@ -678,10 +678,10 @@ export function PlaygroundClient() {
                       <p className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-fd-primary px-3.5 py-2 text-sm text-fd-primary-foreground">
                         {event.text}
                       </p>
-                      <span className="mt-1 flex gap-1.5 text-[11px] text-fd-muted-foreground opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
+                      <span className="turn-controls mt-1 flex gap-1.5 text-[11px] text-fd-muted-foreground">
                         <button
                           id={`rewind-${turn}`}
-                          className="rounded border border-fd-border px-1.5 py-0.5 transition-colors hover:bg-fd-accent hover:text-fd-foreground"
+                          className="rounded border border-fd-border px-2 py-1 transition-colors hover:bg-fd-accent hover:text-fd-foreground"
                           title="Rewind here: the journal is truncated just before this message and replayed — later turns on this path are discarded"
                           onClick={() => rewindTo(turn, event.text)}
                         >
@@ -689,7 +689,7 @@ export function PlaygroundClient() {
                         </button>
                         <button
                           id={`branch-${turn}`}
-                          className="rounded border border-fd-border px-1.5 py-0.5 transition-colors hover:bg-fd-accent hover:text-fd-foreground"
+                          className="rounded border border-fd-border px-2 py-1 transition-colors hover:bg-fd-accent hover:text-fd-foreground"
                           title="Branch here: stash this conversation as a switchable timeline, then rewind to try a different path"
                           onClick={() => branchFrom(turn, event.text)}
                         >
@@ -744,7 +744,7 @@ export function PlaygroundClient() {
             placeholder={ready ? 'Message the agent…' : 'Loading…'}
             disabled={!ready}
             autoComplete="off"
-            className="min-w-0 flex-1 rounded-lg border border-fd-border bg-fd-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-fd-primary/40"
+            className="min-w-0 flex-1 rounded-lg border border-fd-border bg-fd-background px-3 py-2 text-base outline-none focus:ring-2 focus:ring-fd-primary/40 sm:text-sm"
           />
           <button id="send" type="submit" className={button} disabled={!ready || !draft.trim()}>
             Send
@@ -771,7 +771,7 @@ export function PlaygroundClient() {
             and all — with zero live calls.
           </li>
           <li>
-            Rewind and branch (hover a message you sent) are journal operations: rewinding
+            Rewind and branch (the controls under any message you sent) are journal operations: rewinding
             truncates the effect journal just before that turn&apos;s <code>chidori.input()</code>{' '}
             and replays the shorter journal; branching stashes the full blob first, so every
             timeline is just another durable blob you can switch back to.

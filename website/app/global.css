@@ -15,3 +15,21 @@
 .dark {
   --color-fd-background: hsl(0 0% 4%);
 }
+
+/*
+ * Per-turn controls (rewind/branch) are always visible so touch devices can
+ * reach them; devices with a real hover pointer get the quieter hover-reveal.
+ */
+.turn-controls {
+  opacity: 1;
+  transition: opacity 0.15s;
+}
+@media (hover: hover) and (pointer: fine) {
+  .turn-controls {
+    opacity: 0;
+  }
+  .group:hover .turn-controls,
+  .turn-controls:focus-within {
+    opacity: 1;
+  }
+}
