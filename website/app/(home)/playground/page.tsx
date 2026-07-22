@@ -4,25 +4,19 @@ import { PlaygroundClient } from './playground-client';
 export const metadata: Metadata = {
   title: 'Playground — Chidori',
   description:
-    'Run a durable chidori agent entirely in your browser: the pure-Rust engine compiled to WebAssembly, with suspend, resume, and offline replay.',
+    'Chat with a chidori agent running entirely in your browser: the pure-Rust engine compiled to WebAssembly, with tools, generative UI, and docs-grounded answers.',
 };
 
 export default function PlaygroundPage() {
   return (
-    <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-12">
+    <main className="mx-auto w-full max-w-3xl flex-1 px-6 py-12">
       <h1 className="text-3xl font-semibold tracking-tight md:text-4xl">
         Playground
       </h1>
-      <p className="mt-4 max-w-3xl text-fd-muted-foreground">
-        A <b>client-side-only</b> chidori agent — the pure-Rust engine and its
-        durable replay runtime compiled to WebAssembly, running in this tab.
-        The agent below suspends at <code>chidori.input()</code>: the run is
-        saved to <code>localStorage</code>, survives a page reload, resumes
-        exactly where it stopped, and replays offline with zero live host
-        calls. No server involved. <code>chidori.prompt()</code> runs against a
-        deterministic mock by default — or connect OpenRouter (one click, PKCE
-        login, no key pasting) to use real models; either way, replay never
-        calls the LLM again.
+      <p className="mt-3 text-fd-muted-foreground">
+        A chidori agent running entirely in this tab — ask it about chidori, or
+        hand it a tool. Reload mid-conversation and it resumes; every effect is
+        journaled.
       </p>
       <PlaygroundClient />
     </main>
