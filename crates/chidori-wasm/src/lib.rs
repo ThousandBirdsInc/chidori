@@ -336,6 +336,88 @@ mod tests {
         assert_eq!(d2.console_lines(), vec!["sum: 42".to_string()]);
     }
 
+    /// The contract the playground's rewind/branch controls depend on: a blob
+    /// whose journal is truncated just before the Nth `input` entry restores
+    /// to the exact state the run was in before that turn — the surviving
+    /// prefix replays offline, and the run blocks at that `input` frontier.
+    #[test]
+    fn truncating_journal_before_an_input_rewinds_to_that_turn() {
+        const CHAT: &str = r#"
+            async function main() {
+                for (;;) {
+                    const text = await input('message');
+                    if (text === 'quit') return;
+                    const result = await work(text);
+                    console.log(text + ' -> ' + result);
+                }
+            }
+            main();
+        "#;
+        let effects = || vec!["input".to_string(), "work".to_string()];
+
+        // Record two full turns, then quit.
+        let mut d = Driver::record(CHAT, effects());
+        for answer in ["a", "A", "b", "B", "quit"] {
+            let status: serde_json::Value =
+                serde_json::from_str(&d.run_until_blocked().unwrap()).unwrap();
+            assert_eq!(status["status"], json!("blocked"));
+            d.resolve_op(status["opId"].as_f64().unwrap(), &json!(answer).to_string())
+                .unwrap();
+        }
+        let status: serde_json::Value =
+            serde_json::from_str(&d.run_until_blocked().unwrap()).unwrap();
+        assert_eq!(status["status"], json!("completed"));
+        assert_eq!(d.console_lines(), vec!["a -> A", "b -> B"]);
+
+        // Rewind to before turn 2 the way the playground does: parse the
+        // blob, cut the journal's entry list just before the second `input`
+        // entry, and re-encode. No engine involvement — pure data work.
+        let mut blob: serde_json::Value = serde_json::from_slice(&d.to_blob()).unwrap();
+        let journal_bytes: Vec<u8> = blob["journal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_u64().unwrap() as u8)
+            .collect();
+        let mut journal: serde_json::Value = serde_json::from_slice(&journal_bytes).unwrap();
+        let entries = journal["entries"].as_array().unwrap();
+        let cut = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["site"] == json!("input"))
+            .map(|(i, _)| i)
+            .nth(1)
+            .unwrap();
+        let truncated = entries[..cut].to_vec();
+        journal["entries"] = json!(truncated);
+        blob["journal"] = json!(serde_json::to_vec(&journal).unwrap());
+
+        // The truncated blob replays turn 1 offline and blocks at turn 2's
+        // `input` — ready for a different message down a new path.
+        let mut d2 = Driver::from_blob(&serde_json::to_vec(&blob).unwrap()).unwrap();
+        let status: serde_json::Value =
+            serde_json::from_str(&d2.run_until_blocked().unwrap()).unwrap();
+        assert_eq!(status["status"], json!("blocked"));
+        assert_eq!(status["name"], json!("input"));
+        assert_eq!(d2.console_lines(), vec!["a -> A"]);
+
+        // Continue down the branch: the divergent turn records cleanly.
+        d2.resolve_op(status["opId"].as_f64().unwrap(), &json!("z").to_string())
+            .unwrap();
+        for answer in ["Z", "quit"] {
+            let status: serde_json::Value =
+                serde_json::from_str(&d2.run_until_blocked().unwrap()).unwrap();
+            assert_eq!(status["status"], json!("blocked"));
+            d2.resolve_op(status["opId"].as_f64().unwrap(), &json!(answer).to_string())
+                .unwrap();
+        }
+        let status: serde_json::Value =
+            serde_json::from_str(&d2.run_until_blocked().unwrap()).unwrap();
+        assert_eq!(status["status"], json!("completed"));
+        assert_eq!(d2.console_lines(), vec!["a -> A", "z -> Z"]);
+        assert_eq!(d2.divergence(), None);
+    }
+
     #[test]
     fn reject_op_surfaces_as_js_exception() {
         let mut d = Driver::record(BUNDLE, effects());
