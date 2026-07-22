@@ -111,4 +111,8 @@ export class BrowserAgent {
   run(): Promise<RunResult>;
   console(): string[];
   blob(): Uint8Array;
+  /** Replay divergence message (an edit changed already-executed code), or null. */
+  divergence(): string | null;
+  /** True when restored with a modified bundle — modify-and-resume. */
+  bundleChanged(): boolean;
 }

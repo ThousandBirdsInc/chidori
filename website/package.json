@@ -8,6 +8,8 @@
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@uiw/react-codemirror": "^4.25.11",
     "fumadocs-core": "^15.5.1",
     "fumadocs-mdx": "^11.6.9",
     "fumadocs-ui": "^15.5.1",

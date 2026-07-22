@@ -38,6 +38,12 @@ export function ToolCard({ name, args, result }: { name: string; args?: Json; re
       return <DiceCard r={r} />;
     case 'color_palette':
       return <PaletteCard r={r} />;
+    case 'read_source':
+      return <SourceCard r={r} />;
+    case 'update_source':
+      return <SourceUpdateCard r={r} args={asObj(args)} />;
+    case 'reset_source':
+      return <SourceUpdateCard r={r} args={{}} reset />;
     default:
       return (
         <div className={card}>
@@ -213,6 +219,60 @@ function DiceCard({ r }: { r: Record<string, Json> }) {
         )}
         <span className="ml-1 text-sm text-fd-muted-foreground">= {String(r.total)}</span>
       </div>
+    </div>
+  );
+}
+
+function SourceCard({ r }: { r: Record<string, Json> }) {
+  return (
+    <div className={card}>
+      <CardTitle
+        name="read_source"
+        extra={`${String(r.lines)} lines${r.modified ? ' · rewritten via chat' : ''}`}
+      />
+      <pre className="mt-2 max-h-56 overflow-auto rounded-lg border border-fd-border bg-fd-background p-2.5 text-[10px] leading-relaxed">
+        {String(r.source ?? '')}
+      </pre>
+    </div>
+  );
+}
+
+function SourceUpdateCard({
+  r,
+  args,
+  reset,
+}: {
+  r: Record<string, Json>;
+  args: Record<string, Json>;
+  reset?: boolean;
+}) {
+  const patch = typeof args.find === 'string';
+  const diffPre =
+    'mt-1 max-h-32 overflow-auto rounded-lg border border-fd-border bg-fd-background p-2 text-[10px] leading-relaxed';
+  return (
+    <div className={card}>
+      <CardTitle
+        name={reset ? 'reset_source' : 'update_source'}
+        extra={reset ? undefined : String(r.mode ?? '')}
+      />
+      {r.unchanged ? (
+        <p className="mt-1 text-sm text-fd-muted-foreground">Already running the original source.</p>
+      ) : (
+        <>
+          {patch && (
+            <div className="mt-2 font-mono">
+              <p className="text-[10px] text-fd-muted-foreground">−</p>
+              <pre className={`${diffPre} line-through opacity-60`}>{String(args.find)}</pre>
+              <p className="mt-1.5 text-[10px] text-fd-muted-foreground">+</p>
+              <pre className={diffPre}>{String(args.replace ?? '')}</pre>
+            </div>
+          )}
+          <p className="mt-2 text-sm text-fd-muted-foreground">
+            🧬 {String(r.note ?? 'hot-swaps in when this turn ends')}
+            {r.lines ? ` · ${String(r.lines)} lines` : ''}
+          </p>
+        </>
+      )}
     </div>
   );
 }

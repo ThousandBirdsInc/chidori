@@ -80,6 +80,12 @@ export interface Branch {
   label: string;
   blob: string;
   turns: number;
+  /**
+   * The agent source this timeline was running when stashed (its blob's
+   * bundle is the *transpiled* form, so the readable source rides along for
+   * display; absent on branches stashed before self-modification existed).
+   */
+  source?: string;
 }
 
 /** The persisted branch set: the active path's label plus stashed timelines. */

@@ -4,7 +4,7 @@ import { PlaygroundClient } from './playground-client';
 export const metadata: Metadata = {
   title: 'Playground — Chidori',
   description:
-    'Chat with a chidori agent running entirely in your browser: the pure-Rust engine compiled to WebAssembly, with tools, generative UI, and docs-grounded answers.',
+    'Chat with a chidori agent running entirely in your browser: the pure-Rust engine compiled to WebAssembly, with tools, generative UI, docs-grounded answers — and the ability to rewrite its own code mid-conversation.',
 };
 
 export default function PlaygroundPage() {
@@ -14,9 +14,11 @@ export default function PlaygroundPage() {
         Playground
       </h1>
       <p className="mt-3 text-fd-muted-foreground">
-        A chidori agent running entirely in this tab — ask it about chidori, or
-        hand it a tool. Every effect is journaled: reload mid-conversation and
-        it resumes, rewind any turn, or branch into an alternate timeline.
+        A chidori agent running entirely in this tab — ask it about chidori,
+        hand it a tool, or ask it to rewrite its own code. Every effect is
+        journaled: reload mid-conversation and it resumes, rewind any turn,
+        branch into an alternate timeline — or hot-swap the agent&apos;s
+        implementation and replay the same history against the new code.
       </p>
       <PlaygroundClient />
     </main>

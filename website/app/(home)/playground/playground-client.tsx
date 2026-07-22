@@ -8,13 +8,19 @@
  * chat box. The feed renders purely from the journaled console, so restored
  * and replayed runs repaint identically — cards included.
  *
+ * The agent's source is itself mutable *from inside the chat*: the
+ * update_source tool stages a replacement, validated by replaying the live
+ * journal against the new bundle, and when the turn ends the page hot-swaps
+ * the code in (modify-and-resume: same journal, new program).
+ *
  * The wasm engine + browser SDK load at runtime from /public (build artifacts
  * of scripts/build-wasm.sh, hence the webpackIgnore'd imports); the docs
  * index loads from /playground-docs.json (scripts/build-playground-context.mjs).
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AGENT_SOURCE } from './agent-source';
+import dynamic from 'next/dynamic';
+import { DEFAULT_AGENT_SOURCE } from './agent-source';
 import {
   type ChatMessage,
   type DocsIndex,
@@ -34,10 +40,21 @@ import {
   truncateAtTurn,
 } from './timeline';
 
+// The CodeMirror editor is a heavy chunk; load it only when the
+// "under the hood" panel is first opened.
+const SourceEditor = dynamic(
+  () => import('./source-editor').then((m) => m.SourceEditor),
+  {
+    ssr: false,
+    loading: () => <p className="mt-2 text-xs text-fd-muted-foreground">Loading editor…</p>,
+  },
+);
+
 const BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
 const ASSETS = `${BASE}/chidori-wasm`;
 const SAVE_KEY = 'chidori-playground-chat-v1';
 const BRANCH_KEY = 'chidori-playground-branches-v1';
+const SOURCE_KEY = 'chidori-playground-source-v1';
 // The exchanged OpenRouter key lives in sessionStorage: it survives the PKCE
 // redirect back to this page, and is gone when the tab closes.
 const OR_KEY = 'chidori-playground-openrouter-key';
@@ -45,9 +62,10 @@ const OR_KEY = 'chidori-playground-openrouter-key';
 const SUGGESTIONS = [
   'What is chidori, in one paragraph?',
   'How does offline replay work?',
+  'Show me your own source code',
+  'Rewrite your code: add a ⚡ to every reply',
   'Weather in Tokyo',
   'Chart the first 10 fibonacci numbers',
-  'What is 2^16 / 3?',
   'Roll 3d6',
   'A color palette for a storm at dusk',
 ];
@@ -62,6 +80,18 @@ interface AgentHandle {
   run(): Promise<RunView>;
   console(): string[];
   blob(): Uint8Array;
+}
+
+/** The slice of the wasm module's surface the hot-swap machinery touches. */
+interface WasmModule {
+  stripTypes(source: string, filename: string): string;
+  WasmRuntime: {
+    fromBlob(bytes: Uint8Array): {
+      runUntilBlocked(): string;
+      divergence(): string | undefined;
+      free?: () => void;
+    };
+  };
 }
 
 declare global {
@@ -102,6 +132,9 @@ export function PlaygroundClient() {
   const [orKey, setOrKey] = useState<string | null>(null);
   const [model, setModel] = useState('openrouter/auto');
   const [branchState, setBranchState] = useState<BranchStore>(freshBranches);
+  const [source, setSource] = useState(DEFAULT_AGENT_SOURCE);
+  /** Latches true the first time "under the hood" opens (mounts the editor). */
+  const [hoodOpened, setHoodOpened] = useState(false);
 
   const loadedRef = useRef<Loaded | null>(null);
   const loadedPromiseRef = useRef<Promise<Loaded | null> | null>(null);
@@ -117,6 +150,12 @@ export function PlaygroundClient() {
   const docsIndexRef = useRef<DocsIndex | null>(null);
   const feedBoxRef = useRef<HTMLDivElement | null>(null);
   const branchRef = useRef(branchState);
+  const sourceRef = useRef(source);
+  /** An update_source edit accepted this turn, waiting for the turn to end. */
+  const pendingSourceRef = useRef<string | null>(null);
+  /** Reverts an in-flight hot-swap if replaying the full journal fails. */
+  const swapFallbackRef = useRef<((err: string) => void) | null>(null);
+  const hotSwapRef = useRef<((next: string) => void) | null>(null);
 
   const updateBranches = useCallback((next: BranchStore) => {
     branchRef.current = next;
@@ -144,12 +183,73 @@ export function PlaygroundClient() {
     }
   }, []);
 
+  /** Make `next` the displayed + persisted agent source. */
+  const applySource = useCallback((next: string) => {
+    sourceRef.current = next;
+    setSource(next);
+    try {
+      if (next === DEFAULT_AGENT_SOURCE) localStorage.removeItem(SOURCE_KEY);
+      else localStorage.setItem(SOURCE_KEY, next);
+    } catch {
+      /* storage full/blocked — the swap still works, just not durable */
+    }
+  }, []);
+
+  /**
+   * Prove the conversation can move onto `next`: compile it, then restore a
+   * scratch runtime from the live blob with the bundle swapped and pump it to
+   * the journal frontier. An edit that changes any already-executed effect
+   * call fails replay (divergence) and throws here — inside the tool call —
+   * so the model reads the reason and can try a smaller patch.
+   */
+  const validateSwap = useCallback((next: string) => {
+    const loaded = loadedRef.current;
+    if (!loaded) throw new Error('engine not loaded yet');
+    const wasm = loaded.wasm as WasmModule;
+    const bundle = loaded.sdk.PRELUDE + wasm.stripTypes(next, 'agent.ts');
+    const agent = agentRef.current;
+    if (!agent) return; // no history yet — nothing to replay against
+    const blob = JSON.parse(new TextDecoder().decode(agent.blob())) as { bundle: string };
+    blob.bundle = bundle;
+    const scratch = wasm.WasmRuntime.fromBlob(new TextEncoder().encode(JSON.stringify(blob)));
+    try {
+      // Replayed entries resolve internally; one pump reaches the frontier.
+      // Divergence detected mid-pump unwinds the program to a quiet
+      // completion, so ask for it explicitly rather than relying on a throw.
+      const status = JSON.parse(scratch.runUntilBlocked()) as { status: string };
+      const diverged = scratch.divergence();
+      if (diverged) {
+        throw new Error(`the edit changes code that already ran, so the journal cannot replay: ${diverged}`);
+      }
+      if (status.status === 'completed') {
+        throw new Error(
+          'the new source ran to completion instead of waiting at chidori.input() — the chat would end',
+        );
+      }
+    } finally {
+      scratch.free?.();
+    }
+  }, []);
+
+  /** Validate `next` and stage it; the swap happens when the turn ends. */
+  const proposeSource = useCallback(
+    (next: string) => {
+      validateSwap(next);
+      pendingSourceRef.current = next;
+    },
+    [validateSwap],
+  );
+
   /** Host implementations for one agent generation. */
   const buildHost = useCallback(
     (token: number) => {
       const stale = () => token !== tokenRef.current;
       const hang = () => new Promise<never>(() => {});
-      const baseTools = makeTools(() => docsIndexRef.current);
+      const baseTools = makeTools(() => docsIndexRef.current, {
+        getSource: () => pendingSourceRef.current ?? sourceRef.current,
+        defaultSource: DEFAULT_AGENT_SOURCE,
+        propose: proposeSource,
+      });
       const tools: Record<string, (kwargs: Json) => Promise<Json>> = {};
       for (const [name, impl] of Object.entries(baseTools)) {
         tools[name] = async (kwargs) => {
@@ -189,6 +289,18 @@ export function PlaygroundClient() {
         tools,
         onInput: () => {
           if (stale()) return hang();
+          // Reaching input means the journal replayed cleanly — a hot-swap
+          // in flight has succeeded, so disarm its revert.
+          swapFallbackRef.current = null;
+          const staged = pendingSourceRef.current;
+          if (staged !== null) {
+            // The turn that staged an edit just ended: swap now. This agent
+            // is orphaned (its input hangs); the new one restores from the
+            // same journal with the new bundle and waits at input instead.
+            pendingSourceRef.current = null;
+            setTimeout(() => hotSwapRef.current?.(staged), 0);
+            return hang();
+          }
           setBusy(null);
           refreshFeed();
           persist();
@@ -200,7 +312,7 @@ export function PlaygroundClient() {
         },
       };
     },
-    [refreshFeed, persist],
+    [refreshFeed, persist, proposeSource],
   );
 
   const drive = useCallback(
@@ -215,6 +327,13 @@ export function PlaygroundClient() {
         .catch((err) => {
           if (token !== tokenRef.current) return;
           setBusy(null);
+          const fallback = swapFallbackRef.current;
+          if (fallback) {
+            // A hot-swapped journal failed to replay: put the old code back.
+            swapFallbackRef.current = null;
+            fallback(String(err));
+            return;
+          }
           setStatusLine(`Agent error: ${String(err)}`);
         });
     },
@@ -259,6 +378,15 @@ export function PlaygroundClient() {
       }
     } catch {
       /* corrupted branch store — start fresh */
+    }
+    try {
+      const savedSource = localStorage.getItem(SOURCE_KEY);
+      if (savedSource !== null) {
+        sourceRef.current = savedSource;
+        setSource(savedSource);
+      }
+    } catch {
+      /* storage blocked — run the default source */
     }
     const loading = loadAssets();
     loadedPromiseRef.current = loading.catch(() => null);
@@ -317,7 +445,7 @@ export function PlaygroundClient() {
     if (!loaded || agentRef.current) return;
     const token = tokenRef.current;
     const agent = loaded.sdk.BrowserAgent.start(loaded.wasm, {
-      source: AGENT_SOURCE,
+      source: sourceRef.current,
       ...buildHost(token),
     }) as AgentHandle;
     agentRef.current = agent;
@@ -412,6 +540,107 @@ export function PlaygroundClient() {
   );
 
   /**
+   * Move the conversation onto `next`: swap the durable blob's bundle for the
+   * newly compiled source and restore — the whole journal replays against the
+   * new code (modify-and-resume), so the chat keeps its history and even its
+   * feed re-renders through the new implementation. `proposeSource` already
+   * replay-validated up to the accepting tool call; the tail of that turn is
+   * covered by the revert armed in swapFallbackRef.
+   */
+  const hotSwap = useCallback(
+    (next: string) => {
+      const loaded = loadedRef.current;
+      const agent = agentRef.current;
+      if (!loaded || !agent) return;
+      const prevBlobText = new TextDecoder().decode(agent.blob());
+      const prevSource = sourceRef.current;
+      let nextBlobText: string;
+      try {
+        const wasm = loaded.wasm as WasmModule;
+        const blob = JSON.parse(prevBlobText) as { bundle: string };
+        blob.bundle = loaded.sdk.PRELUDE + wasm.stripTypes(next, 'agent.ts');
+        nextBlobText = JSON.stringify(blob);
+      } catch (err) {
+        setStatusLine(`Hot-swap failed: ${String(err)}`);
+        return;
+      }
+      // Unlike rewind/branch, a swap continues the same conversation — carry
+      // any message the user typed while the swapping turn ran.
+      const carried = [...queueRef.current];
+      const deliver = () => {
+        if (!carried.length) return;
+        const resolve = resolveRef.current;
+        if (resolve) {
+          // The restored agent already replayed to its input and is waiting.
+          resolveRef.current = null;
+          queueRef.current.push(...carried.slice(1));
+          resolve(carried[0]);
+        } else {
+          queueRef.current.push(...carried);
+        }
+      };
+      applySource(next);
+      swapFallbackRef.current = (err: string) => {
+        applySource(prevSource);
+        startFromBlob(
+          prevBlobText,
+          `⚠️ Hot-swap reverted — the journal could not replay under the new code: ${err}`,
+        );
+        deliver();
+      };
+      const ok = startFromBlob(
+        nextBlobText,
+        next === DEFAULT_AGENT_SOURCE
+          ? '🧬 Hot-swapped back to the original agent source — the journal replayed against it (modify-and-resume).'
+          : '🧬 Hot-swapped the agent’s source mid-conversation: same journal, new code — every past turn just re-rendered through the new implementation.',
+      );
+      if (!ok) {
+        const fallback = swapFallbackRef.current;
+        swapFallbackRef.current = null;
+        fallback?.('restore failed');
+        return;
+      }
+      deliver();
+    },
+    [applySource, startFromBlob],
+  );
+
+  useEffect(() => {
+    hotSwapRef.current = hotSwap;
+  }, [hotSwap]);
+
+  /**
+   * Manual edits from the source editor go through the same gate as the
+   * chat's update_source tool — compile, replay-validate, hot-swap — they
+   * just skip the "wait for the turn to end" step, because applying is only
+   * enabled while the agent sits idle at `chidori.input()`.
+   */
+  const applyManualEdit = useCallback(
+    (next: string): string | null => {
+      const loaded = loadedRef.current;
+      if (!loaded) return 'The engine is still loading.';
+      if (!next.includes('chidori.input')) {
+        return 'The source must keep awaiting chidori.input() in a loop, or the chat ends.';
+      }
+      try {
+        if (!agentRef.current) {
+          // Nothing recorded yet: compile-check now, run it on first message.
+          (loaded.wasm as WasmModule).stripTypes(next, 'agent.ts');
+          applySource(next);
+          setStatusLine('🧬 Source updated — your next message starts the agent on the edited code.');
+          return null;
+        }
+        validateSwap(next);
+        hotSwap(next);
+        return null;
+      } catch (err) {
+        return String(err);
+      }
+    },
+    [applySource, validateSwap, hotSwap],
+  );
+
+  /**
    * Rewind the active timeline to just before user turn `turn`: the journal
    * is truncated at that turn's `chidori.input()` entry and the shorter blob
    * restored — the surviving prefix replays offline and the agent waits at
@@ -455,7 +684,12 @@ export function PlaygroundClient() {
         nextId: store.nextId + 1,
         stashed: [
           ...store.stashed,
-          { label: store.activeLabel, blob: current, turns: countTurns(current) },
+          {
+            label: store.activeLabel,
+            blob: current,
+            turns: countTurns(current),
+            source: sourceRef.current,
+          },
         ],
       });
       setDraft(text);
@@ -476,6 +710,7 @@ export function PlaygroundClient() {
           label: store.activeLabel,
           blob: current,
           turns: countTurns(current),
+          source: sourceRef.current,
         });
       }
       if (
@@ -484,10 +719,13 @@ export function PlaygroundClient() {
           `⑂ Switched to “${target.label}” — restored from its saved blob and replayed offline.`,
         )
       ) {
+        // Timelines carry their own code: the blob's bundle is what runs, and
+        // the branch's stashed source keeps the display honest.
+        applySource(target.source ?? DEFAULT_AGENT_SOURCE);
         updateBranches({ activeLabel: target.label, nextId: store.nextId, stashed });
       }
     },
-    [currentBlobText, startFromBlob, updateBranches],
+    [currentBlobText, startFromBlob, updateBranches, applySource],
   );
 
   const dropBranch = useCallback(
@@ -506,15 +744,18 @@ export function PlaygroundClient() {
     agentRef.current = null;
     resolveRef.current = null;
     queueRef.current = [];
+    pendingSourceRef.current = null;
+    swapFallbackRef.current = null;
     localStorage.removeItem(SAVE_KEY);
     localStorage.removeItem(BRANCH_KEY);
     branchRef.current = freshBranches();
     setBranchState(branchRef.current);
+    applySource(DEFAULT_AGENT_SOURCE);
     setFeed([]);
     setBusy(null);
     setStatusLine('');
     setHasSaved(false);
-  }, []);
+  }, [applySource]);
 
   const connectOpenRouter = useCallback(() => {
     // Redirects to openrouter.ai's consent page; the redirect back lands on
@@ -758,7 +999,12 @@ export function PlaygroundClient() {
         </p>
       )}
 
-      <details className="mt-8 rounded-lg border border-fd-border p-4">
+      <details
+        className="mt-8 rounded-lg border border-fd-border p-4"
+        onToggle={(e) => {
+          if (e.currentTarget.open) setHoodOpened(true);
+        }}
+      >
         <summary className="cursor-pointer text-sm font-medium">Under the hood</summary>
         <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-fd-muted-foreground">
           <li>
@@ -777,13 +1023,33 @@ export function PlaygroundClient() {
             timeline is just another durable blob you can switch back to.
           </li>
           <li>
+            The agent can rewrite itself: <code>read_source</code> and <code>update_source</code>{' '}
+            are ordinary tools — and the editor below edits the same live program by hand. An
+            accepted edit is validated by replaying this conversation&apos;s journal against the
+            new code, then hot-swapped in (modify-and-resume: same journal, new program) — an
+            edit that would change already-journaled effect calls is rejected as divergence.
+          </li>
+          <li>
             Docs answers are grounded: these docs are indexed at build time, retrieved into the
             model&apos;s context, and exposed as the <code>search_docs</code> tool.
           </li>
         </ul>
-        <pre className="mt-3 overflow-x-auto rounded-lg border border-fd-border bg-fd-card p-4 text-xs">
-          {AGENT_SOURCE}
-        </pre>
+        <p className="mt-3 text-xs text-fd-muted-foreground" id="source-label">
+          agent.ts — the program running this chat, editable
+          {source !== DEFAULT_AGENT_SOURCE ? ' · rewritten (ask the agent to "reset your code" to undo)' : ''}
+        </p>
+        {hoodOpened ? (
+          <SourceEditor
+            source={source}
+            defaultSource={DEFAULT_AGENT_SOURCE}
+            busy={busy !== null}
+            onApply={applyManualEdit}
+          />
+        ) : (
+          <pre className="mt-1 overflow-x-auto rounded-lg border border-fd-border bg-fd-card p-4 text-xs">
+            {source}
+          </pre>
+        )}
       </details>
     </div>
   );

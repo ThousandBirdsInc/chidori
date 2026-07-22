@@ -10,8 +10,13 @@
  *
  * Each feed event is one JSON line on the console — the page renders the
  * chat (bubbles, tool cards) purely from the journaled console output.
+ *
+ * This is only the *default* implementation: the chat can rewrite it. The
+ * agent's tool set includes read_source / update_source / reset_source, and
+ * an accepted edit is hot-swapped in at the end of the turn — the journal
+ * replays against the new code (modify-and-resume).
  */
-export const AGENT_SOURCE = `type Decision = { tool?: string; args?: unknown; reply?: string };
+export const DEFAULT_AGENT_SOURCE = `type Decision = { tool?: string; args?: unknown; reply?: string };
 type Message = { role: string; content: string };
 
 const transcript: Message[] = [];

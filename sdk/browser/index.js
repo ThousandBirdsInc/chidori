@@ -278,6 +278,12 @@ export class BrowserAgent {
     let liveCalls = 0;
     for (;;) {
       const status = JSON.parse(this.runtime.runUntilBlocked());
+      // Divergence detected mid-pump surfaces as a clean completion of the
+      // rejected program — check for it at every exit so replaying a journal
+      // against edited code fails loud (the engine's fail-loud policy), not
+      // as a silently dead run.
+      const diverged = this.runtime.divergence();
+      if (diverged) throw new Error(`replay divergence: ${diverged}`);
       if (status.status === 'completed') {
         return { status: 'completed', console: this.runtime.consoleLines(), liveCalls };
       }
@@ -355,5 +361,23 @@ export class BrowserAgent {
   /** The durable artifact (bundle + effects + journal). Save it anywhere. */
   blob() {
     return this.runtime.toBlob();
+  }
+
+  /**
+   * Replay divergence message, or null. Set when the restored bundle made a
+   * different effect call than the journal recorded — i.e. an edit changed
+   * already-executed code before the resume point.
+   */
+  divergence() {
+    return this.runtime.divergence() ?? null;
+  }
+
+  /**
+   * True when this agent was restored with a bundle whose content hash
+   * differs from the one its journal was recorded against — the
+   * modify-and-resume case: same history, new code.
+   */
+  bundleChanged() {
+    return this.runtime.bundleChanged();
   }
 }
