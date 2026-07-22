@@ -19,6 +19,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import dynamic from 'next/dynamic';
 import { DEFAULT_AGENT_SOURCE } from './agent-source';
 import {
   type ChatMessage,
@@ -38,6 +39,16 @@ import {
   freshBranches,
   truncateAtTurn,
 } from './timeline';
+
+// The CodeMirror editor is a heavy chunk; load it only when the
+// "under the hood" panel is first opened.
+const SourceEditor = dynamic(
+  () => import('./source-editor').then((m) => m.SourceEditor),
+  {
+    ssr: false,
+    loading: () => <p className="mt-2 text-xs text-fd-muted-foreground">Loading editor…</p>,
+  },
+);
 
 const BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
 const ASSETS = `${BASE}/chidori-wasm`;
@@ -122,6 +133,8 @@ export function PlaygroundClient() {
   const [model, setModel] = useState('openrouter/auto');
   const [branchState, setBranchState] = useState<BranchStore>(freshBranches);
   const [source, setSource] = useState(DEFAULT_AGENT_SOURCE);
+  /** Latches true the first time "under the hood" opens (mounts the editor). */
+  const [hoodOpened, setHoodOpened] = useState(false);
 
   const loadedRef = useRef<Loaded | null>(null);
   const loadedPromiseRef = useRef<Promise<Loaded | null> | null>(null);
@@ -597,6 +610,37 @@ export function PlaygroundClient() {
   }, [hotSwap]);
 
   /**
+   * Manual edits from the source editor go through the same gate as the
+   * chat's update_source tool — compile, replay-validate, hot-swap — they
+   * just skip the "wait for the turn to end" step, because applying is only
+   * enabled while the agent sits idle at `chidori.input()`.
+   */
+  const applyManualEdit = useCallback(
+    (next: string): string | null => {
+      const loaded = loadedRef.current;
+      if (!loaded) return 'The engine is still loading.';
+      if (!next.includes('chidori.input')) {
+        return 'The source must keep awaiting chidori.input() in a loop, or the chat ends.';
+      }
+      try {
+        if (!agentRef.current) {
+          // Nothing recorded yet: compile-check now, run it on first message.
+          (loaded.wasm as WasmModule).stripTypes(next, 'agent.ts');
+          applySource(next);
+          setStatusLine('🧬 Source updated — your next message starts the agent on the edited code.');
+          return null;
+        }
+        validateSwap(next);
+        hotSwap(next);
+        return null;
+      } catch (err) {
+        return String(err);
+      }
+    },
+    [applySource, validateSwap, hotSwap],
+  );
+
+  /**
    * Rewind the active timeline to just before user turn `turn`: the journal
    * is truncated at that turn's `chidori.input()` entry and the shorter blob
    * restored — the surviving prefix replays offline and the agent waits at
@@ -955,7 +999,12 @@ export function PlaygroundClient() {
         </p>
       )}
 
-      <details className="mt-8 rounded-lg border border-fd-border p-4">
+      <details
+        className="mt-8 rounded-lg border border-fd-border p-4"
+        onToggle={(e) => {
+          if (e.currentTarget.open) setHoodOpened(true);
+        }}
+      >
         <summary className="cursor-pointer text-sm font-medium">Under the hood</summary>
         <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-fd-muted-foreground">
           <li>
@@ -975,10 +1024,10 @@ export function PlaygroundClient() {
           </li>
           <li>
             The agent can rewrite itself: <code>read_source</code> and <code>update_source</code>{' '}
-            are ordinary tools. An accepted edit is validated by replaying this conversation&apos;s
-            journal against the new code, then hot-swapped in at the end of the turn
-            (modify-and-resume: same journal, new program) — an edit that would change
-            already-journaled effect calls is rejected as divergence.
+            are ordinary tools — and the editor below edits the same live program by hand. An
+            accepted edit is validated by replaying this conversation&apos;s journal against the
+            new code, then hot-swapped in (modify-and-resume: same journal, new program) — an
+            edit that would change already-journaled effect calls is rejected as divergence.
           </li>
           <li>
             Docs answers are grounded: these docs are indexed at build time, retrieved into the
@@ -986,12 +1035,21 @@ export function PlaygroundClient() {
           </li>
         </ul>
         <p className="mt-3 text-xs text-fd-muted-foreground" id="source-label">
-          agent.ts — the program running this chat
-          {source !== DEFAULT_AGENT_SOURCE ? ' · rewritten via chat (ask it to "reset your code" to undo)' : ''}
+          agent.ts — the program running this chat, editable
+          {source !== DEFAULT_AGENT_SOURCE ? ' · rewritten (ask the agent to "reset your code" to undo)' : ''}
         </p>
-        <pre className="mt-1 overflow-x-auto rounded-lg border border-fd-border bg-fd-card p-4 text-xs">
-          {source}
-        </pre>
+        {hoodOpened ? (
+          <SourceEditor
+            source={source}
+            defaultSource={DEFAULT_AGENT_SOURCE}
+            busy={busy !== null}
+            onApply={applyManualEdit}
+          />
+        ) : (
+          <pre className="mt-1 overflow-x-auto rounded-lg border border-fd-border bg-fd-card p-4 text-xs">
+            {source}
+          </pre>
+        )}
       </details>
     </div>
   );
