@@ -10,7 +10,7 @@ import type { DocHit, Json } from './brain';
 const BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
 
 const card =
-  'w-full max-w-md rounded-xl border border-fd-border bg-fd-card p-4 shadow-sm';
+  'w-full max-w-md rounded-xl border border-fd-border bg-fd-card p-3.5 shadow-sm sm:p-4';
 
 const asObj = (v: Json | undefined): Record<string, Json> =>
   v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, Json>) : {};
@@ -58,7 +58,7 @@ export function ToolCard({ name, args, result }: { name: string; args?: Json; re
 
 function CardTitle({ name, extra }: { name: string; extra?: string }) {
   return (
-    <p className="text-[11px] font-medium uppercase tracking-wider text-fd-muted-foreground">
+    <p className="font-mono text-[11px] font-medium uppercase tracking-wider text-fd-muted-foreground">
       ⚙ {name}
       {extra ? <span className="normal-case tracking-normal"> · {extra}</span> : null}
     </p>

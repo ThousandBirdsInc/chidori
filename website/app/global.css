@@ -16,6 +16,12 @@
   --color-fd-background: hsl(0 0% 4%);
 }
 
+/* The chat feed scrolls inside the panel; keep its scrollbar quiet. */
+.chat-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, currentColor 25%, transparent) transparent;
+}
+
 /*
  * Per-turn controls (rewind/branch) are always visible so touch devices can
  * reach them; devices with a real hover pointer get the quieter hover-reveal.
