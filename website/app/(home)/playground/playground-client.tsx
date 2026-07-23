@@ -149,6 +149,8 @@ export function PlaygroundClient() {
   const modelRef = useRef(model);
   const docsIndexRef = useRef<DocsIndex | null>(null);
   const feedBoxRef = useRef<HTMLDivElement | null>(null);
+  /** Follow new feed events only while the reader is near the bottom. */
+  const pinnedRef = useRef(true);
   const branchRef = useRef(branchState);
   const sourceRef = useRef(source);
   /** An update_source edit accepted this turn, waiting for the turn to end. */
@@ -436,8 +438,15 @@ export function PlaygroundClient() {
 
   useEffect(() => {
     const box = feedBoxRef.current;
-    if (box) box.scrollTop = box.scrollHeight;
+    if (box && pinnedRef.current) box.scrollTop = box.scrollHeight;
   }, [feed, busy]);
+
+  /** Scrolling up unpins the feed so new events don't yank the view down. */
+  const onFeedScroll = useCallback(() => {
+    const box = feedBoxRef.current;
+    if (!box) return;
+    pinnedRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 96;
+  }, []);
 
   const ensureAgent = useCallback(async () => {
     if (agentRef.current) return;
@@ -458,6 +467,7 @@ export function PlaygroundClient() {
       if (!message || !ready) return;
       setDraft('');
       setStatusLine('');
+      pinnedRef.current = true;
       const resolve = resolveRef.current;
       if (resolve) {
         resolveRef.current = null;
@@ -656,7 +666,7 @@ export function PlaygroundClient() {
         return;
       }
       const dropped = countTurns(current) - turn;
-      const note = `⏪ Rewound to before turn ${turn + 1}: the journal was truncated at that chidori.input() and replayed offline (${dropped} turn${dropped === 1 ? '' : 's'} discarded).`;
+      const note = `⟲ Rewound to before turn ${turn + 1}: the journal was truncated at that chidori.input() and replayed offline (${dropped} turn${dropped === 1 ? '' : 's'} discarded).`;
       if (startFromBlob(cut, note)) setDraft(text);
     },
     [currentBlobText, startFromBlob],
@@ -778,7 +788,7 @@ export function PlaygroundClient() {
 
   if (loadError) {
     return (
-      <div className="mt-8 rounded-lg border border-fd-border bg-fd-card p-6 text-fd-muted-foreground">
+      <div className="mt-8 rounded-xl border border-fd-border bg-fd-card p-6 text-fd-muted-foreground">
         {loadError}
       </div>
     );
@@ -789,118 +799,162 @@ export function PlaygroundClient() {
   let userTurns = 0;
   const turnOf = feed.map((e) => (e.kind === 'user' ? userTurns++ : -1));
 
-  const button =
-    'rounded-lg border border-fd-border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-fd-accent disabled:pointer-events-none disabled:opacity-40';
+  const action =
+    'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-fd-border px-2.5 text-xs font-medium transition-colors hover:bg-fd-accent disabled:pointer-events-none disabled:opacity-40';
   const segment = (active: boolean) =>
-    `rounded-md px-2.5 py-1 text-sm font-medium transition-colors ${
+    `rounded-md px-2 py-1 text-xs font-medium transition-colors sm:px-2.5 ${
       active ? 'bg-fd-background shadow-sm' : 'text-fd-muted-foreground hover:text-fd-foreground'
     }`;
+  const turnControl =
+    'rounded-md border border-fd-border px-2.5 py-1.5 font-mono transition-colors hover:bg-fd-accent hover:text-fd-foreground';
 
   return (
-    <div className="mt-6">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
-        <div className="flex items-center gap-1 rounded-lg bg-fd-accent/60 p-1" role="group" aria-label="Brain">
-          <button id="provider-mock" className={segment(provider === 'mock')} onClick={() => pickProvider('mock')}>
-            Offline brain
-          </button>
-          <button
-            id="provider-openrouter"
-            className={segment(provider === 'openrouter')}
-            onClick={() => pickProvider('openrouter')}
-          >
-            OpenRouter
-          </button>
-        </div>
-        {provider === 'openrouter' &&
-          (orKey ? (
-            <span className="flex flex-wrap items-center gap-2">
-              <span id="or-connected" className="text-fd-muted-foreground">
-                ✓ connected
-              </span>
-              <input
-                id="or-model"
-                type="text"
-                value={model}
-                onChange={(e) => {
-                  modelRef.current = e.target.value;
-                  setModel(e.target.value);
-                }}
-                aria-label="OpenRouter model"
-                className="w-40 min-w-0 rounded-lg border border-fd-border bg-fd-background px-2 py-1 text-base sm:w-52 sm:text-sm"
-              />
-              <button id="or-disconnect" className={button} onClick={disconnectOpenRouter}>
-                Disconnect
-              </button>
-            </span>
-          ) : (
-            <button id="or-connect" className={button} onClick={connectOpenRouter} disabled={!ready}>
-              Connect OpenRouter
+    <div className="mt-4 sm:mt-6">
+      {/*
+       * The panel owns all of its chrome — brain picker, actions, timelines,
+       * status, composer — and sizes itself against the viewport so on phones
+       * it fills the screen below the (static-height) page header and behaves
+       * like a chat app: the composer rests at the bottom edge and only the
+       * feed scrolls. Anything dynamic lives inside the panel, so the budget
+       * in the calc() stays honest.
+       */}
+      <section
+        aria-label="Playground chat"
+        className="flex h-[calc(100dvh-16.5rem)] min-h-[20rem] flex-col overflow-hidden rounded-xl border border-fd-border bg-fd-card/50 sm:h-[min(44rem,calc(100dvh-25rem))]"
+      >
+        <div className="flex items-center gap-2 border-b border-fd-border px-2 py-2 sm:px-3">
+          <div className="flex shrink-0 items-center gap-0.5 rounded-lg bg-fd-accent/60 p-0.5" role="group" aria-label="Brain">
+            <button id="provider-mock" className={segment(provider === 'mock')} onClick={() => pickProvider('mock')}>
+              <span className="sm:hidden">Offline</span>
+              <span className="hidden sm:inline">Offline brain</span>
             </button>
-          ))}
-        <span className="ml-auto flex gap-2">
-          <button id="replay" className={button} disabled={!ready || !hasSaved} onClick={replay} title="Re-render this chat from its journal — zero live calls">
-            ↺ Replay offline
-          </button>
-          <button
-            id="clear"
-            className={button}
-            disabled={!hasSaved && feed.length === 0 && branchState.stashed.length === 0}
-            onClick={reset}
-            title="Clear this conversation and every branch"
-          >
-            ✕ Reset
-          </button>
-        </span>
-      </div>
-      {provider === 'openrouter' && !orKey && (
-        <p className="mt-2 text-xs text-fd-muted-foreground">
-          Not connected yet — messages fall back to the offline brain until you connect.
-        </p>
-      )}
-      {branchState.stashed.length > 0 && (
-        <div id="branches" className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-          <span className="text-fd-muted-foreground">Timelines:</span>
-          <span className="rounded-full border border-fd-primary/60 bg-fd-primary/10 px-2.5 py-1 font-medium">
-            ⑂ {branchState.activeLabel} · current
-          </span>
-          {branchState.stashed.map((b) => (
-            <span
-              key={b.label}
-              className="flex items-center overflow-hidden rounded-full border border-fd-border"
+            <button
+              id="provider-openrouter"
+              className={segment(provider === 'openrouter')}
+              onClick={() => pickProvider('openrouter')}
             >
-              <button
-                id={`switch-${b.label.replace(/\s+/g, '-')}`}
-                className="px-2.5 py-1 transition-colors hover:bg-fd-accent"
-                title={`Switch to “${b.label}” — the current chat is stashed, this branch's blob is restored and replayed`}
-                onClick={() => switchTo(b.label)}
-              >
-                ⑂ {b.label} · {b.turns} turn{b.turns === 1 ? '' : 's'}
-              </button>
-              <button
-                className="border-l border-fd-border px-1.5 py-1 text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-foreground"
-                title={`Delete branch “${b.label}”`}
-                aria-label={`Delete branch ${b.label}`}
-                onClick={() => dropBranch(b.label)}
-              >
-                ✕
-              </button>
+              OpenRouter
+            </button>
+          </div>
+          {feed.length > 0 && (
+            <span className="ml-auto hidden truncate font-mono text-[11px] text-fd-muted-foreground md:block">
+              ⚡ {feed.length} journaled event{feed.length === 1 ? '' : 's'}
+              {hasSaved ? ' · saved' : ''}
             </span>
-          ))}
+          )}
+          <span className="ml-auto flex gap-1.5 md:ml-2">
+            <button
+              id="replay"
+              className={action}
+              disabled={!ready || !hasSaved}
+              onClick={replay}
+              title="Re-render this chat from its journal — zero live calls"
+            >
+              ↺<span className="hidden sm:inline"> Replay offline</span>
+            </button>
+            <button
+              id="clear"
+              className={action}
+              disabled={!hasSaved && feed.length === 0 && branchState.stashed.length === 0}
+              onClick={reset}
+              title="Clear this conversation and every branch"
+            >
+              ✕<span className="hidden sm:inline"> Reset</span>
+            </button>
+          </span>
         </div>
-      )}
+        {provider === 'openrouter' && (
+          <div className="flex flex-wrap items-center gap-2 border-b border-fd-border bg-fd-accent/30 px-3 py-2">
+            {orKey ? (
+              <>
+                <span id="or-connected" className="shrink-0 text-xs text-fd-muted-foreground">
+                  ✓ connected
+                </span>
+                <input
+                  id="or-model"
+                  type="text"
+                  value={model}
+                  onChange={(e) => {
+                    modelRef.current = e.target.value;
+                    setModel(e.target.value);
+                  }}
+                  aria-label="OpenRouter model"
+                  className="h-8 w-32 min-w-0 flex-1 rounded-lg border border-fd-border bg-fd-background px-2 text-base sm:max-w-56 sm:text-xs"
+                />
+                <button id="or-disconnect" className={action} onClick={disconnectOpenRouter}>
+                  Disconnect
+                </button>
+              </>
+            ) : (
+              <>
+                <button id="or-connect" className={action} onClick={connectOpenRouter} disabled={!ready}>
+                  Connect OpenRouter
+                </button>
+                <span className="text-xs text-fd-muted-foreground">
+                  Not connected yet — replies use the offline brain.
+                </span>
+              </>
+            )}
+          </div>
+        )}
+        {branchState.stashed.length > 0 && (
+          <div
+            id="branches"
+            className="flex items-center gap-2 overflow-x-auto whitespace-nowrap border-b border-fd-border px-3 py-2 font-mono text-[11px]"
+          >
+            <span className="shrink-0 rounded-full border border-fd-primary/60 bg-fd-primary/10 px-2.5 py-1 font-medium">
+              ⑂ {branchState.activeLabel} · current
+            </span>
+            {branchState.stashed.map((b) => (
+              <span
+                key={b.label}
+                className="flex shrink-0 items-center overflow-hidden rounded-full border border-fd-border"
+              >
+                <button
+                  id={`switch-${b.label.replace(/\s+/g, '-')}`}
+                  className="px-2.5 py-1 transition-colors hover:bg-fd-accent"
+                  title={`Switch to “${b.label}” — the current chat is stashed, this branch's blob is restored and replayed`}
+                  onClick={() => switchTo(b.label)}
+                >
+                  ⑂ {b.label} · {b.turns} turn{b.turns === 1 ? '' : 's'}
+                </button>
+                <button
+                  className="border-l border-fd-border px-1.5 py-1 text-fd-muted-foreground transition-colors hover:bg-fd-accent hover:text-fd-foreground"
+                  title={`Delete branch “${b.label}”`}
+                  aria-label={`Delete branch ${b.label}`}
+                  onClick={() => dropBranch(b.label)}
+                >
+                  ✕
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
 
-      <div className="mt-3 overflow-hidden rounded-xl border border-fd-border bg-fd-card/50">
-        <div ref={feedBoxRef} className="h-[min(28rem,65dvh)] overflow-y-auto p-3 sm:p-4">
+        <div
+          ref={feedBoxRef}
+          onScroll={onFeedScroll}
+          className="chat-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain p-3 sm:p-4"
+        >
           {feed.length === 0 && !busy ? (
             <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
-              <p className="text-sm text-fd-muted-foreground">
-                {ready ? 'Ask about chidori, or put the tools to work:' : 'Loading the wasm engine…'}
-              </p>
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor" aria-hidden className="text-fd-muted-foreground/50">
+                <path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z" />
+              </svg>
+              <div>
+                <p className="text-sm font-medium">
+                  {ready ? 'Talk to a live chidori agent' : 'Loading the wasm engine…'}
+                </p>
+                <p className="mx-auto mt-1 max-w-xs text-xs text-fd-muted-foreground">
+                  It runs on the wasm engine in this tab — every turn journaled,
+                  rewindable, branchable.
+                </p>
+              </div>
               <div className="flex max-w-lg flex-wrap justify-center gap-2">
                 {SUGGESTIONS.map((s) => (
                   <button
                     key={s}
-                    className="rounded-full border border-fd-border px-3 py-1.5 text-xs transition-colors hover:bg-fd-accent disabled:opacity-40"
+                    className="rounded-full border border-fd-border px-3.5 py-2 text-xs transition-colors hover:bg-fd-accent disabled:opacity-40"
                     disabled={!ready}
                     onClick={() => send(s)}
                   >
@@ -922,15 +976,15 @@ export function PlaygroundClient() {
                       <span className="turn-controls mt-1 flex gap-1.5 text-[11px] text-fd-muted-foreground">
                         <button
                           id={`rewind-${turn}`}
-                          className="rounded border border-fd-border px-2 py-1 transition-colors hover:bg-fd-accent hover:text-fd-foreground"
+                          className={turnControl}
                           title="Rewind here: the journal is truncated just before this message and replayed — later turns on this path are discarded"
                           onClick={() => rewindTo(turn, event.text)}
                         >
-                          ⏪ Rewind
+                          ⟲ Rewind
                         </button>
                         <button
                           id={`branch-${turn}`}
-                          className="rounded border border-fd-border px-2 py-1 transition-colors hover:bg-fd-accent hover:text-fd-foreground"
+                          className={turnControl}
                           title="Branch here: stash this conversation as a switchable timeline, then rewind to try a different path"
                           onClick={() => branchFrom(turn, event.text)}
                         >
@@ -957,21 +1011,35 @@ export function PlaygroundClient() {
                   );
                 }
                 return (
-                  <p key={i} className="text-center text-xs text-fd-muted-foreground">
+                  <p key={i} className="text-center font-mono text-[11px] text-fd-muted-foreground">
                     {event.text}
                   </p>
                 );
               })}
               {busy && (
-                <p className="animate-pulse text-xs text-fd-muted-foreground" id="busy">
+                <p className="flex items-center gap-2 font-mono text-[11px] text-fd-muted-foreground" id="busy">
+                  <span aria-hidden className="flex gap-1">
+                    <span className="size-1 animate-pulse rounded-full bg-current" />
+                    <span className="size-1 animate-pulse rounded-full bg-current [animation-delay:200ms]" />
+                    <span className="size-1 animate-pulse rounded-full bg-current [animation-delay:400ms]" />
+                  </span>
                   {busy}
                 </p>
               )}
             </div>
           )}
         </div>
+
+        {statusLine && (
+          <p
+            id="status"
+            className="border-t border-fd-border bg-fd-accent/30 px-3 py-1.5 font-mono text-[11px] leading-relaxed text-fd-muted-foreground"
+          >
+            {statusLine}
+          </p>
+        )}
         <form
-          className="flex gap-2 border-t border-fd-border p-3"
+          className="flex items-center gap-2 border-t border-fd-border p-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))] sm:p-3"
           onSubmit={(e) => {
             e.preventDefault();
             send(draft);
@@ -985,27 +1053,29 @@ export function PlaygroundClient() {
             placeholder={ready ? 'Message the agent…' : 'Loading…'}
             disabled={!ready}
             autoComplete="off"
-            className="min-w-0 flex-1 rounded-lg border border-fd-border bg-fd-background px-3 py-2 text-base outline-none focus:ring-2 focus:ring-fd-primary/40 sm:text-sm"
+            enterKeyHint="send"
+            className="h-10 min-w-0 flex-1 rounded-lg border border-fd-border bg-fd-background px-3 text-base outline-none focus:ring-2 focus:ring-fd-primary/40 sm:h-9 sm:text-sm"
           />
-          <button id="send" type="submit" className={button} disabled={!ready || !draft.trim()}>
+          <button
+            id="send"
+            type="submit"
+            className="h-10 shrink-0 rounded-lg bg-fd-primary px-4 text-sm font-medium text-fd-primary-foreground transition-opacity hover:opacity-85 disabled:pointer-events-none disabled:opacity-40 sm:h-9"
+            disabled={!ready || !draft.trim()}
+          >
             Send
           </button>
         </form>
-      </div>
-
-      {statusLine && (
-        <p id="status" className="mt-2 text-sm text-fd-muted-foreground">
-          {statusLine}
-        </p>
-      )}
+      </section>
 
       <details
-        className="mt-8 rounded-lg border border-fd-border p-4"
+        className="mt-4 rounded-xl border border-fd-border bg-fd-card/30 p-4 sm:mt-6"
         onToggle={(e) => {
           if (e.currentTarget.open) setHoodOpened(true);
         }}
       >
-        <summary className="cursor-pointer text-sm font-medium">Under the hood</summary>
+        <summary className="cursor-pointer text-sm font-medium select-none marker:text-fd-muted-foreground">
+          Under the hood
+        </summary>
         <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-fd-muted-foreground">
           <li>
             This chat is a chidori agent — the source below — executed by the pure-Rust engine
