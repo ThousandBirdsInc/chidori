@@ -20,6 +20,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
+import { OPENROUTER_KEY_STORAGE } from '@/lib/openrouter';
 import { DEFAULT_AGENT_SOURCE } from './agent-source';
 import {
   type ChatMessage,
@@ -56,8 +57,10 @@ const SAVE_KEY = 'chidori-playground-chat-v1';
 const BRANCH_KEY = 'chidori-playground-branches-v1';
 const SOURCE_KEY = 'chidori-playground-source-v1';
 // The exchanged OpenRouter key lives in sessionStorage: it survives the PKCE
-// redirect back to this page, and is gone when the tab closes.
-const OR_KEY = 'chidori-playground-openrouter-key';
+// redirect back to this page, and is gone when the tab closes. The storage
+// key is shared site-wide (lib/openrouter.ts), so one login also powers the
+// docs pages' runnable examples — and a login started there works here.
+const OR_KEY = OPENROUTER_KEY_STORAGE;
 
 const SUGGESTIONS = [
   'What is chidori, in one paragraph?',
