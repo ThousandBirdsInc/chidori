@@ -3,8 +3,8 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "dev": "node scripts/build-playground-context.mjs && next dev",
-    "build": "node scripts/build-playground-context.mjs && next build",
+    "dev": "node scripts/build-playground-context.mjs && node scripts/build-runnable-examples.mjs && next dev",
+    "build": "node scripts/build-playground-context.mjs && node scripts/build-runnable-examples.mjs && next build",
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
