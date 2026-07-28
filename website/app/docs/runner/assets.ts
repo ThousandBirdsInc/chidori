@@ -24,6 +24,12 @@ export function loadEngine(): Promise<EngineAssets> {
     const sdk = await import(/* webpackIgnore: true */ `${ASSETS}/chidori-browser.js`);
     return { wasm, sdk } as EngineAssets;
   })();
+  // Don't cache a failure: callers fall back to the faked CLI for this
+  // action, and a later attempt (assets finished deploying, flaky network
+  // recovered) gets a fresh try.
+  assetsPromise.catch(() => {
+    assetsPromise = null;
+  });
   return assetsPromise;
 }
 

@@ -12,7 +12,8 @@
 import type { Json } from '../../(home)/playground/brain';
 import { buildHarnessSource } from '../runner/harness';
 import { createRunHost, type EngineAssets, type SignalRequest } from '../runner/run-host';
-import { dirname, type Vfs } from './vfs';
+import { fakeOutput, fakePendingPrompt } from './fake-cli';
+import { basename, dirname, type Vfs } from './vfs';
 
 interface Session {
   id: string;
@@ -146,7 +147,7 @@ async function createSession(
   server: Server,
   input: Json,
 ): Promise<Session> {
-  const engine = await deps.engine();
+  const engine = await deps.engine().catch(() => null);
   const id = `sess-${(++server.counter).toString().padStart(3, '0')}-${Math.random().toString(36).slice(2, 8)}`;
   const session: Session = {
     id,
@@ -166,6 +167,32 @@ async function createSession(
   if (code === null) {
     session.status = 'failed';
     session.error = `agent file not found: ${server.agentPath}`;
+    return session;
+  }
+
+  if (engine === null) {
+    // No wasm engine: fake the session. It pauses at the file's first
+    // input() prompt and completes on resume with a scripted output — the
+    // documented pause/resume flow, honestly labelled.
+    const pending = fakePendingPrompt(code);
+    const inputObj = input && typeof input === 'object' && !Array.isArray(input) ? (input as Record<string, Json>) : {};
+    if (pending) {
+      session.status = 'paused';
+      session.pendingPrompt = pending;
+      session.settled = new Promise<void>((settle) => {
+        session.resolveInput = (answer: string) => {
+          session.status = 'completed';
+          session.output = {
+            ...(fakeOutput(basename(server.agentPath), inputObj, [answer], []) as Record<string, Json>),
+            faked: true,
+          };
+          settle();
+        };
+      });
+    } else {
+      session.status = 'completed';
+      session.output = { ...(fakeOutput(basename(server.agentPath), inputObj, [], []) as Record<string, Json>), faked: true };
+    }
     return session;
   }
 
