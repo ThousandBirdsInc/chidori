@@ -7,9 +7,12 @@
  */
 
 export interface RunnableInfo {
-  mode: 'program' | 'fragment';
+  /** ts/js blocks run on the wasm engine; shell blocks play in the VM terminal. */
+  mode: 'program' | 'fragment' | 'shell';
   /** Editable-input template for program-mode examples ({} when absent). */
   input?: Record<string, unknown>;
+  /** Build-time stand-ins for identifiers the docs prose establishes around a fragment. */
+  ambient?: string;
 }
 
 export interface RunnableExample extends RunnableInfo {

@@ -30,12 +30,15 @@ export type RunEvent =
   | { k: 'tool'; name: string; args: Json; result: Json }
   | { k: 'input'; prompt: string; answer: string }
   | { k: 'fetch'; url: string; status: number; ok: boolean; simulated: boolean }
+  | { k: 'signal'; phase: 'waiting' | 'receiving' | 'received' | 'timeout' | 'poll-empty'; names: string[]; timeoutMs?: number | null; result?: Json }
+  | { k: 'op'; op: string; label: string; data?: Json }
+  | { k: 'dom'; html: string; ops: number }
   | { k: 'result'; value: Json }
   | { k: 'error'; text: string }
   | { k: 'done' }
   | { k: 'note'; text: string };
 
-const KINDS = new Set(['log', 'prompt', 'tool', 'input', 'fetch', 'result', 'error', 'done', 'note']);
+const KINDS = new Set(['log', 'prompt', 'tool', 'input', 'fetch', 'signal', 'op', 'dom', 'result', 'error', 'done', 'note']);
 
 /** Journaled console lines (one JSON event per line) → renderable feed. */
 export function parseRunFeed(lines: string[]): RunEvent[] {
@@ -157,7 +160,9 @@ export async function decidePrompt(payload: { text: string; opts?: unknown }): P
     }
     return JSON.stringify({ reply: String(message.content ?? '') } satisfies ToolLoopDecision);
   }
-  if (!key) return OFFLINE_REPLY;
+  // Honor format:"json" in the offline stand-in: the harness parses the
+  // reply, so hand it a valid JSON string literal instead of bare prose.
+  if (!key) return opts.format === 'json' ? JSON.stringify(OFFLINE_REPLY) : OFFLINE_REPLY;
   const message = await chatCompletion(key, {
     model: getOpenRouterModel(),
     messages: [...systemMessages(opts), { role: 'user', content: payload.text }],
@@ -171,9 +176,11 @@ const asObj = (kwargs: Json): Record<string, Json> =>
   kwargs && typeof kwargs === 'object' && !Array.isArray(kwargs) ? kwargs : {};
 
 /**
- * The registry behind `chidori.tool()` calls in docs examples. Small on
- * purpose: docs search (both spellings the docs use), plus the playground's
- * deterministic calculator.
+ * The registry behind `chidori.tool()` calls in docs examples: docs search
+ * (both spellings the docs use), the playground's deterministic calculator,
+ * and the Hacker News research tools the usability-review walkthroughs use
+ * (Algolia's API is CORS-enabled, so they work live from the browser; when
+ * the network is unavailable they degrade to a labelled simulated result).
  */
 export function makeDocsTools(
   getIndex: () => DocsIndex | null,
@@ -187,12 +194,52 @@ export function makeDocsTools(
       ...(index ? {} : { note: 'docs index not loaded' }),
     };
   };
+  const hnFetch = async (url: string): Promise<Json> => {
+    const res = await fetchWithSimulatedFallback(url);
+    return (await res.json()) as Json;
+  };
   return {
     docs_search: search,
     search_docs: search,
     calculate: (kwargs) => {
       const expression = String(asObj(kwargs).expression ?? '');
       return { expression, value: evaluateExpression(expression) };
+    },
+    hn_search: async (kwargs) => {
+      const args = asObj(kwargs);
+      const endpoint = args.sortBy === 'date' ? 'search_by_date' : 'search';
+      const data = asObj(
+        await hnFetch(
+          `https://hn.algolia.com/api/v1/${endpoint}?tags=story&hitsPerPage=8&query=${encodeURIComponent(String(args.query ?? ''))}`,
+        ),
+      );
+      if (data.__simulated) return { query: args.query ?? '', hits: [], note: 'offline — simulated empty result' } as Json;
+      const hits = (Array.isArray(data.hits) ? data.hits : []).map((h) => {
+        const hit = asObj(h);
+        return {
+          objectID: hit.objectID ?? null,
+          title: hit.title ?? null,
+          url: hit.url ?? null,
+          points: hit.points ?? null,
+          numComments: hit.num_comments ?? null,
+          createdAt: hit.created_at ?? null,
+        };
+      });
+      return { query: args.query ?? '', hits } as Json;
+    },
+    hn_thread: async (kwargs) => {
+      const args = asObj(kwargs);
+      const data = asObj(await hnFetch(`https://hn.algolia.com/api/v1/items/${encodeURIComponent(String(args.objectID ?? ''))}`));
+      if (data.__simulated) return { objectID: args.objectID ?? '', note: 'offline — simulated empty thread', comments: [] } as Json;
+      const strip = (html: unknown) => String(html ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      const comments = (Array.isArray(data.children) ? data.children : [])
+        .slice(0, 12)
+        .map((c) => {
+          const comment = asObj(c);
+          return { author: comment.author ?? null, text: strip(comment.text).slice(0, 600) };
+        })
+        .filter((c) => c.text);
+      return { objectID: args.objectID ?? '', title: data.title ?? null, points: data.points ?? null, comments } as Json;
     },
   };
 }

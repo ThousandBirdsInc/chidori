@@ -65,9 +65,11 @@ node_modules/
 # Docs index for the /playground chat agent (regenerate with
 # website/scripts/build-playground-context.mjs; runs as part of npm run build)
 /website/public/playground-docs.json
-# Runnable docs-example index for the example-runner panel (regenerate with
+# Runnable docs-example index for the example-runner panel and the docs VM's
+# seeded filesystem (regenerate with
 # website/scripts/build-runnable-examples.mjs; runs as part of npm run build)
 /website/public/runnable-examples.json
+/website/public/vm-seed.json
 
 # Secrets / local env
 .env
