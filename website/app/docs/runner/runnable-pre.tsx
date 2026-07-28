@@ -3,9 +3,10 @@
 /**
  * The docs site's code-block renderer: fumadocs' default CodeBlock, plus a
  * "Run" button on every block that the build-time analysis
- * (scripts/build-runnable-examples.mjs) proved can execute in the browser
- * sandbox. Clicking it opens the example-runner side panel with this
- * block's code.
+ * (scripts/build-runnable-examples.mjs) proved can execute in the browser.
+ * ts/js blocks open the example-runner side panel and execute on the wasm
+ * chidori engine; shell blocks open the docs VM terminal, which plays the
+ * commands in a simulated Linux with a real in-browser chidori CLI.
  *
  * The block's text is read from the rendered DOM (shiki preserves the code
  * verbatim) and matched against the runnable index by content hash — no
@@ -35,6 +36,7 @@ export function RunnablePre(props: ComponentProps<'pre'>) {
     };
   }, []);
 
+  const shell = runnable?.mode === 'shell';
   return (
     <div ref={boxRef} className="relative">
       <CodeBlock {...props}>
@@ -45,7 +47,11 @@ export function RunnablePre(props: ComponentProps<'pre'>) {
           type="button"
           data-runnable-example={runnable.id}
           className="absolute bottom-2 right-2 inline-flex h-7 items-center gap-1 rounded-full border border-fd-primary/50 bg-fd-background/90 px-2.5 text-xs font-medium shadow-sm backdrop-blur transition-colors hover:bg-fd-accent"
-          title="Run this example on the wasm chidori engine, right here in your browser"
+          title={
+            shell
+              ? 'Play these commands in the docs VM — a simulated Linux terminal with a real in-browser chidori CLI'
+              : 'Run this example on the wasm chidori engine, right here in your browser'
+          }
           onClick={() =>
             openRunner({
               ...runnable,
@@ -54,7 +60,7 @@ export function RunnablePre(props: ComponentProps<'pre'>) {
             })
           }
         >
-          ▶ Run
+          {shell ? '⌨ Run in VM' : '▶ Run'}
         </button>
       )}
     </div>
