@@ -95,12 +95,24 @@ if [[ "$MODE" == "chidori" ]]; then
     # Offline, deterministic agents only: no LLM calls, no user interaction.
     # train.ts carries the interpreter hot paths; the examples cover CLI
     # startup, TS stripping, the journal, and the actor/process runtime.
+    #
+    # Training runs with isolation off. Since it went default-on, `chidori
+    # run` executes the agent in a sandboxed worker child (supervisor.rs),
+    # and the sandbox denies that child's profile write — "Operation not
+    # permitted" on macOS, and on the CI runners a corrupt merge header
+    # ("Runtime and instrumentation version mismatch") that left the whole
+    # corpus with no .profraw at all. The interpreter hot paths this corpus
+    # exists to profile run *inside* that child, so with isolation on their
+    # profile is lost even where the write succeeds. Running in-process (what
+    # the corpus profiled when PGO landed, before isolation flipped on) keeps
+    # one writable, unsandboxed process. The worker executes the same
+    # functions in the same binary, so the profile stays representative.
     for agent in \
         scripts/pgo-train/train.ts \
         examples/agents/hello.ts \
         examples/agents/actor_pipeline.ts; do
         echo "   $agent"
-        "$BIN" run "$agent" > /dev/null
+        CHIDORI_ISOLATE=off "$BIN" run "$agent" > /dev/null
     done
 else
     # startup.js is the startup-baseline probe, but include it too: real
