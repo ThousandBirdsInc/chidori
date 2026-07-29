@@ -139,9 +139,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins stable; install it up front so the first
-      # cargo invocation in publish.sh doesn't pay the auto-fetch.
-      - uses: dtolnay/rust-toolchain@stable
+      # Install the *pinned* toolchain up front so the first cargo invocation
+      # in publish.sh doesn't pay the auto-fetch. Installing `stable` here
+      # didn't achieve that — rust-toolchain.toml pins a concrete channel, so
+      # cargo auto-fetched it anyway and the stable install went unused.
+      # Argument-less `rustup toolchain install` reads rust-toolchain.toml.
+      - name: Install pinned toolchain
+        run: rustup toolchain install
 
       # publish.sh handles dependency order (chidori-js -> chidori), skips
       # versions already on crates.io, and waits for the index between crates.
@@ -206,10 +210,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-          components: llvm-tools # llvm-profdata, for the PGO merge step
+      # rust-toolchain.toml pins the channel and cargo always builds with that
+      # pinned toolchain — so the cross target and llvm-tools have to be added
+      # to *it*, not to `stable`. Installing them via
+      # dtolnay/rust-toolchain@stable put them on a toolchain the build never
+      # uses, so cross-compiles died with E0463 (can't find crate for `core`)
+      # and the PGO script with "llvm-profdata not found". Same bug #149 fixed
+      # in docs.yml; this job just hadn't run since the pin moved off stable.
+      # Argument-less `rustup toolchain install` reads rust-toolchain.toml.
+      - name: Install pinned toolchain with target + llvm-tools
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          rustup component add llvm-tools # llvm-profdata, for the PGO merge step
 
       - name: Build release binary (PGO)
         if: matrix.pgo
