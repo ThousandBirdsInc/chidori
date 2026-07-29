@@ -177,14 +177,15 @@ jobs:
   # runs on dispatch too (a build smoke test) but only the github-release job
   # below publishes the artifacts.
   #
-  # Targets the runner can execute natively are built with PGO
-  # (scripts/pgo-build.sh --bin chidori): instrument, run the offline training
-  # agents, rebuild with feedback. Measured on the shipped binary: -19%
-  # wall-clock on in-corpus interpreter-heavy work, -7% on a held-out
-  # JS-heavy agent, ~-2% on startup/actor-IPC-bound runs (byte-identical
-  # agent outputs). PGO has to *run* the instrumented binary, so the
-  # cross-compiled x86_64-apple-darwin target keeps the plain release build
-  # rather than gambling on Rosetta.
+  # The Linux targets are built with PGO (scripts/pgo-build.sh --bin chidori):
+  # instrument, run the offline training agents, rebuild with feedback.
+  # Measured on the shipped binary: -19% wall-clock on in-corpus
+  # interpreter-heavy work, -7% on a held-out JS-heavy agent, ~-2% on
+  # startup/actor-IPC-bound runs (byte-identical agent outputs). Neither
+  # macOS target is PGO'd today: PGO has to *run* the instrumented binary, so
+  # the cross-compiled x86_64-apple-darwin target keeps the plain release build
+  # rather than gambling on Rosetta, and aarch64-apple-darwin is disabled by
+  # the profile-runtime mismatch documented on its matrix entry below.
   binaries:
     name: Build ${{ matrix.target }}
     needs: verify
@@ -197,7 +198,18 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-14
-            pgo: true
+            # PGO disabled: on the macos-14 runner the instrumented binary
+            # writes no profile, failing with "LLVM Profile Error: Runtime and
+            # instrumentation version mismatch : expected 10, but get 8" — the
+            # linked profile runtime disagrees with the raw-profile version
+            # rustc's LLVM emits, so the training corpus produces no .profraw
+            # and the build dies. Not reproducible locally on the same target
+            # and toolchain (1.97, aarch64-apple-darwin), where the same corpus
+            # profiles and merges cleanly, which points at the runner's Xcode
+            # clang_rt being linked instead of Rust's profiler_builtins. This
+            # ships the plain release build — correct, just without PGO's
+            # measured -19% on interpreter-heavy work — until that is resolved.
+            pgo: false
           - target: x86_64-apple-darwin
             os: macos-14 # cross-compiled from Apple Silicon; macos-13 Intel runners are scarce
             pgo: false # can't natively run the instrumented binary (see above)
