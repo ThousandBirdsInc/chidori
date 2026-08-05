@@ -108,6 +108,7 @@ oxc_sourcemap = "6"
 nodejs-semver = "5.0.0"
 tar = "0.4.46"
 flate2 = "1.1.9"
+brotli = "8.0.4"
 
 # Unix-only: apply per-process resource limits (setrlimit) and deadline-kill
 # (kill) to the OS-isolation worker child. See `runtime::isolate::limits`.

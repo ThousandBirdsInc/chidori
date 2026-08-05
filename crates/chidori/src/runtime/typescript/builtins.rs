@@ -1864,10 +1864,13 @@ mod tests {
         assert!(shim_source("module").unwrap().contains("builtinModules"));
         // …the module shim's builtin list is spliced from the live allowlist…
         assert!(shim_source("module").unwrap().contains("\"stream\""));
-        // …zlib routes through the flate2-backed native (brotli stays
-        // fail-loud)…
+        // …zlib (deflate/gzip AND brotli families) routes through the
+        // compression native…
         assert!(shim_source("zlib").unwrap().contains("__chidori_zlib"));
-        assert!(shim_source("zlib").unwrap().contains("no Brotli codec"));
+        assert!(shim_source("zlib").unwrap().contains("brotliCompress"));
+        assert!(shim_source("zlib")
+            .unwrap()
+            .contains("BROTLI_PARAM_QUALITY"));
         // …and capability stubs fail loud, not silent.
         for name in ["child_process", "vm", "tls", "wasi", "dgram"] {
             assert!(

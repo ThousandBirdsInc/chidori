@@ -3223,14 +3223,14 @@ mod tests {
             "node-stubs",
             r#"
             import { spawn } from "node:child_process";
-            import zlib from "node:zlib";
+            import vm from "node:vm";
             import { Worker, MessageChannel } from "node:worker_threads";
             import cluster from "node:cluster";
             import { lookup } from "node:dns";
             export async function agent() {
                 const errors = {};
                 try { spawn("ls"); } catch (e) { errors.spawn = e.message; }
-                try { zlib.brotliCompressSync("data"); } catch (e) { errors.brotli = e.message; }
+                try { vm.runInNewContext("1 + 1", {}); } catch (e) { errors.vm = e.message; }
                 try { new Worker("./w.js"); } catch (e) { errors.worker = e.message; }
                 const dnsError = await new Promise((resolve) => {
                     lookup("example.com", (err) => resolve(err ? err.code : null));
@@ -3241,7 +3241,7 @@ mod tests {
                 port1.postMessage({ hello: true });
                 return {
                     spawn: errors.spawn,
-                    brotli: errors.brotli,
+                    vm: errors.vm,
                     worker: errors.worker,
                     dnsError,
                     isPrimary: cluster.isPrimary,
@@ -3255,8 +3255,11 @@ mod tests {
             spawn_msg.contains("not supported in the Chidori runtime"),
             "{spawn_msg}"
         );
-        let brotli_msg = out["brotli"].as_str().unwrap();
-        assert!(brotli_msg.contains("no Brotli codec"), "{brotli_msg}");
+        let vm_msg = out["vm"].as_str().unwrap();
+        assert!(
+            vm_msg.contains("not supported in the Chidori runtime"),
+            "{vm_msg}"
+        );
         let worker_msg = out["worker"].as_str().unwrap();
         assert!(worker_msg.contains("single-threaded"), "{worker_msg}");
         assert_eq!(out["dnsError"], serde_json::json!("ENOTSUP"));
@@ -3317,6 +3320,24 @@ mod tests {
                 let streamed = "";
                 for (const c of restoredChunks) streamed += Buffer.from(c).toString("utf8");
 
+                // Brotli family: sync round trip, Node's params-keyed quality
+                // option, and the callback form.
+                const br = zlib.brotliCompressSync(input);
+                const roundBrotli = zlib.brotliDecompressSync(br).toString("utf8");
+                const brFast = zlib.brotliCompressSync(input, {
+                    params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 1 },
+                });
+                const roundBrotliFast = zlib.brotliDecompressSync(brFast).toString("utf8");
+                const asyncBrotli = await new Promise((resolve, reject) => {
+                    zlib.brotliCompress(input, (err, compressed) => {
+                        if (err) return reject(err);
+                        zlib.brotliDecompress(compressed, (err2, restored) => {
+                            if (err2) return reject(err2);
+                            resolve(restored.toString("utf8"));
+                        });
+                    });
+                });
+
                 // Corrupt input errors cleanly; determinism holds.
                 let corruptError = null;
                 try { zlib.gunzipSync("definitely not gzip"); } catch (e) { corruptError = e.message; }
@@ -3330,9 +3351,14 @@ mod tests {
                     roundUnzip: roundUnzip === input,
                     asyncRound: asyncRound === input,
                     streamed: streamed === input,
+                    brotliSmaller: br.length < input.length,
+                    roundBrotli: roundBrotli === input,
+                    roundBrotliFast: roundBrotliFast === input,
+                    asyncBrotli: asyncBrotli === input,
                     corruptError,
                     deterministic,
                     hasConstants: zlib.constants.Z_BEST_COMPRESSION,
+                    brotliDefaultQuality: zlib.constants.BROTLI_DEFAULT_QUALITY,
                 };
             }
             "#,
@@ -3344,6 +3370,10 @@ mod tests {
         assert_eq!(out["roundUnzip"], serde_json::json!(true));
         assert_eq!(out["asyncRound"], serde_json::json!(true));
         assert_eq!(out["streamed"], serde_json::json!(true));
+        assert_eq!(out["brotliSmaller"], serde_json::json!(true));
+        assert_eq!(out["roundBrotli"], serde_json::json!(true));
+        assert_eq!(out["roundBrotliFast"], serde_json::json!(true));
+        assert_eq!(out["asyncBrotli"], serde_json::json!(true));
         assert!(
             out["corruptError"].as_str().unwrap().contains("gunzip"),
             "{:?}",
@@ -3351,6 +3381,7 @@ mod tests {
         );
         assert_eq!(out["deterministic"], serde_json::json!(true));
         assert_eq!(out["hasConstants"], serde_json::json!(9));
+        assert_eq!(out["brotliDefaultQuality"], serde_json::json!(11));
     }
 
     #[test]

@@ -2079,13 +2079,12 @@ export default { WASI };
 "#;
 
 // node:zlib — functional, backed by the `__chidori_zlib` sync native
-// (flate2/miniz in Rust; see runtime::compress). Codecs are pure functions of
-// (input, level), so like node:crypto hashing they run inline with nothing
-// captured, and record/replay agrees byte-for-byte. The streaming classes
-// buffer their input and codec at flush — output for a complete stream
-// matches the one-shot form (chidori streams are in-memory anyway). Brotli is
-// the one codec family not provided (no Brotli codec in the runtime); those
-// entry points stay fail-loud.
+// (flate2/miniz + pure-Rust brotli; see runtime::compress). Codecs are pure
+// functions of (input, level/quality), so like node:crypto hashing they run
+// inline with nothing captured, and record/replay agrees byte-for-byte. The
+// streaming classes buffer their input and codec at flush — output for a
+// complete stream matches the one-shot form (chidori streams are in-memory
+// anyway).
 const ZLIB_SHIM: &str = r#"
 import { Buffer } from "node:buffer";
 import { Transform } from "node:stream";
@@ -2176,17 +2175,6 @@ export function createInflate(options) { return codecStream("inflate", options);
 export function createInflateRaw(options) { return codecStream("inflateRaw", options); }
 export function createGunzip(options) { return codecStream("gunzip", options); }
 export function createUnzip(options) { return codecStream("unzip", options); }
-function noBrotli(name) {
-    return function () {
-        throw new Error("zlib." + name + " is not supported in the Chidori runtime (no Brotli codec; use the gzip/deflate family)");
-    };
-}
-export const brotliCompress = noBrotli("brotliCompress");
-export const brotliCompressSync = noBrotli("brotliCompressSync");
-export const brotliDecompress = noBrotli("brotliDecompress");
-export const brotliDecompressSync = noBrotli("brotliDecompressSync");
-export const createBrotliCompress = noBrotli("createBrotliCompress");
-export const createBrotliDecompress = noBrotli("createBrotliDecompress");
 export const constants = Object.freeze({
     Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3,
     Z_FINISH: 4, Z_BLOCK: 5,
@@ -2194,8 +2182,68 @@ export const constants = Object.freeze({
     Z_NO_COMPRESSION: 0, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9,
     Z_DEFAULT_COMPRESSION: -1,
     Z_DEFAULT_STRATEGY: 0,
+    BROTLI_OPERATION_PROCESS: 0, BROTLI_OPERATION_FLUSH: 1,
+    BROTLI_OPERATION_FINISH: 2,
+    BROTLI_PARAM_MODE: 0, BROTLI_PARAM_QUALITY: 1, BROTLI_PARAM_LGWIN: 2,
+    BROTLI_PARAM_LGBLOCK: 3, BROTLI_PARAM_SIZE_HINT: 5,
+    BROTLI_MODE_GENERIC: 0, BROTLI_MODE_TEXT: 1, BROTLI_MODE_FONT: 2,
     BROTLI_MIN_QUALITY: 0, BROTLI_MAX_QUALITY: 11,
+    BROTLI_DEFAULT_QUALITY: 11, BROTLI_DEFAULT_WINDOW: 22,
 });
+// Brotli quality rides Node's option shape: options.params keyed by
+// BROTLI_PARAM_QUALITY. Other params (lgwin, mode) are accepted and ignored —
+// the codec uses its defaults for them.
+function brotliQuality(options) {
+    if (options && typeof options === "object" && options.params && typeof options.params === "object") {
+        const quality = options.params[constants.BROTLI_PARAM_QUALITY];
+        if (typeof quality === "number") return quality;
+    }
+    return null;
+}
+function brotliCodec(op, data, options) {
+    const b64 = globalThis.__chidori_zlib(op, bytesToBase64(toBytes(data)), brotliQuality(options));
+    return Buffer.from(base64ToBytes(b64));
+}
+export function brotliCompressSync(data, options) { return brotliCodec("brotliCompress", data, options); }
+export function brotliDecompressSync(data, options) { return brotliCodec("brotliDecompress", data, options); }
+function brotliAsyncify(op) {
+    return function (data, options, callback) {
+        if (typeof options === "function") { callback = options; options = undefined; }
+        if (typeof callback !== "function") throw new TypeError("zlib: callback must be a function");
+        queueMicrotask(() => {
+            try {
+                callback(null, brotliCodec(op, data, options));
+            } catch (err) {
+                callback(err);
+            }
+        });
+    };
+}
+export const brotliCompress = brotliAsyncify("brotliCompress");
+export const brotliDecompress = brotliAsyncify("brotliDecompress");
+function brotliStream(op, options) {
+    const chunks = [];
+    return new Transform({
+        transform(chunk, encoding, callback) {
+            try { chunks.push(toBytes(chunk)); } catch (err) { return callback(err); }
+            callback(null);
+        },
+        flush(callback) {
+            try {
+                let total = 0;
+                for (const c of chunks) total += c.length;
+                const all = new Uint8Array(total);
+                let offset = 0;
+                for (const c of chunks) { all.set(c, offset); offset += c.length; }
+                callback(null, brotliCodec(op, all, options));
+            } catch (err) {
+                callback(err);
+            }
+        },
+    });
+}
+export function createBrotliCompress(options) { return brotliStream("brotliCompress", options); }
+export function createBrotliDecompress(options) { return brotliStream("brotliDecompress", options); }
 export default {
     deflate, deflateSync, deflateRaw, deflateRawSync,
     inflate, inflateSync, inflateRaw, inflateRawSync,

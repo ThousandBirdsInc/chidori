@@ -1,13 +1,15 @@
 //! Deterministic compression backing the `node:zlib` shim.
 //!
-//! Compression is a pure function of `(input, level)` for a fixed miniz
+//! Compression is a pure function of `(input, level)` for a fixed codec
 //! version, so — exactly like `node:crypto` hashing — the codecs run inline
 //! with no capture: two runs (and record/replay) produce identical bytes.
 //! Decompressed output is bounded so hostile input (a zip bomb inside
 //! fetched data) fails with a clear error instead of exhausting the host.
 //!
-//! Brotli is NOT provided here: there is no Brotli codec in the dependency
-//! tree, and the shim keeps those entry points fail-loud.
+//! The deflate/gzip family is flate2/miniz; the Brotli family is the pure-Rust
+//! `brotli` crate (Bun's Rust port backs `node:zlib` brotli with C bindings —
+//! `src/brotli_sys` — but chidori's no-native-bindings posture calls for the
+//! pure-Rust codec, which produces the same format).
 
 use std::io::{Read, Write};
 
@@ -58,10 +60,29 @@ fn bounded_decode(reader: impl Read, what: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Map a Node brotli quality (params[BROTLI_PARAM_QUALITY], 0-11; Node's
+/// default is BROTLI_DEFAULT_QUALITY = 11) to encoder params.
+fn brotli_params(quality: Option<i64>) -> Result<brotli::enc::BrotliEncoderParams, String> {
+    let q = match quality {
+        None => 11,
+        Some(q @ 0..=11) => q as i32,
+        Some(other) => {
+            return Err(format!(
+                "zlib: invalid brotli quality {other} (expected 0 through 11)"
+            ))
+        }
+    };
+    let mut params = brotli::enc::BrotliEncoderParams::default();
+    params.quality = q;
+    Ok(params)
+}
+
 /// Run one zlib codec op. `op` matches the `node:zlib` function family:
 /// `deflate`/`inflate` (zlib wrapper), `deflateRaw`/`inflateRaw` (bare
-/// DEFLATE), `gzip`/`gunzip`, and `unzip` (auto-detects gzip vs zlib by the
-/// gzip magic bytes, like Node).
+/// DEFLATE), `gzip`/`gunzip`, `unzip` (auto-detects gzip vs zlib by the
+/// gzip magic bytes, like Node), and `brotliCompress`/`brotliDecompress`.
+/// `level` carries the deflate-family level (-1, 0-9) or the brotli quality
+/// (0-11), per op family.
 pub fn zlib_op(op: &str, data: &[u8], level: Option<i64>) -> Result<Vec<u8>, String> {
     match op {
         "deflate" => encode(
@@ -92,6 +113,17 @@ pub fn zlib_op(op: &str, data: &[u8], level: Option<i64>) -> Result<Vec<u8>, Str
                 bounded_decode(ZlibDecoder::new(data), "unzip")
             }
         }
+        "brotliCompress" => {
+            let params = brotli_params(level)?;
+            let mut out = Vec::new();
+            brotli::enc::BrotliCompress(&mut std::io::Cursor::new(data), &mut out, &params)
+                .map_err(|e| format!("zlib: brotliCompress failed: {e}"))?;
+            Ok(out)
+        }
+        "brotliDecompress" => bounded_decode(
+            brotli::Decompressor::new(data, 4096),
+            "brotliDecompress",
+        ),
         other => Err(format!("zlib: unknown codec op `{other}`")),
     }
 }
@@ -134,6 +166,23 @@ mod tests {
         let stored = zlib_op("deflate", SAMPLE, Some(0)).unwrap();
         let best = zlib_op("deflate", SAMPLE, Some(9)).unwrap();
         assert!(best.len() < stored.len());
+    }
+
+    #[test]
+    fn brotli_round_trips_and_respects_quality() {
+        let compressed = zlib_op("brotliCompress", SAMPLE, None).unwrap();
+        assert_ne!(compressed, SAMPLE);
+        let restored = zlib_op("brotliDecompress", &compressed, None).unwrap();
+        assert_eq!(restored, SAMPLE);
+        // Deterministic at a fixed quality; quality 0 also round-trips.
+        let a = zlib_op("brotliCompress", SAMPLE, Some(5)).unwrap();
+        let b = zlib_op("brotliCompress", SAMPLE, Some(5)).unwrap();
+        assert_eq!(a, b);
+        let fast = zlib_op("brotliCompress", SAMPLE, Some(0)).unwrap();
+        assert_eq!(zlib_op("brotliDecompress", &fast, None).unwrap(), SAMPLE);
+        assert!(zlib_op("brotliCompress", SAMPLE, Some(12))
+            .unwrap_err()
+            .contains("invalid brotli quality"));
     }
 
     #[test]
