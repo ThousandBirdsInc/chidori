@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod mcp;
 pub mod mem_guard;
+pub mod node_compat;
 pub mod pkg;
 pub mod policy;
 pub mod providers;

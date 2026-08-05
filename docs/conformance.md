@@ -14,6 +14,14 @@ language-conformance numbers against. Test262 is therefore the apples-to-apples
 yardstick; runtime-specific suites (`Bun.serve`, `node:test` internals, etc.)
 test product surface that does not generalize.
 
+Test262 measures the *language*. For the **Node builtin shims** (`node:fs`,
+`node:stream`, …) the equivalent yardstick is Node core's own test suite — a
+curated subset is vendored and run by the node-compat harness
+(`crates/chidori/src/node_compat.rs`), with results tracked in
+[`docs/node-compat-report.md`](node-compat-report.md) and gated in CI by
+`crates/chidori/tests/node_compat/expectations.json` (same
+baseline-with-intentional-updates model as the Test262 gate below).
+
 Because `chidori-js` has no fallback engine, conformance is load-bearing: a
 language regression directly breaks real agents. CI gates every
 engine change against a committed baseline (see [CI gate](#ci-gate)).

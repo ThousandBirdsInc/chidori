@@ -12,6 +12,9 @@ categories = ["development-tools", "command-line-utilities"]
 readme.workspace = true
 repository.workspace = true
 license.workspace = true
+# Vendored Node.js core tests (MIT, see tests/node_compat/README.md) are
+# repo-only compatibility fixtures — keep them out of the published package.
+exclude = ["tests/node_compat/suite/*"]
 
 [[bin]]
 name = "chidori"

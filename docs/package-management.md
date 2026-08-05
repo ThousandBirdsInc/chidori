@@ -146,6 +146,10 @@ three cliffs, concretely:
    `node:test`) still fail at resolve time with an error naming the
    importing file. (Networking is `fetch` plus the `node:http`/`node:https`
    client shims, all captured for replay.)
+
+   How faithful each shim is, is measured — not asserted: a vendored subset
+   of Node core's own test suite runs against the shims in CI, with per-file
+   results in [`docs/node-compat-report.md`](node-compat-report.md).
 3. **No native addons.** There is no node-gyp build step (lifecycle scripts
    never run) and no way to load a `.node` binary. Packages that depend on
    `node-gyp-build`, `prebuild-install`, `bindings`, etc. cannot work, even

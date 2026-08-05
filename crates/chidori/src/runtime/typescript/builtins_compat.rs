@@ -707,6 +707,17 @@ export default {
 const DIAGNOSTICS_CHANNEL_SHIM: &str = r#"
 const registry = Object.create(null);
 
+function invalidArg(message) {
+    const err = new TypeError(message);
+    err.code = "ERR_INVALID_ARG_TYPE";
+    return err;
+}
+function checkChannelName(name) {
+    if (typeof name !== "string" && typeof name !== "symbol") {
+        throw invalidArg('The "channel" argument must be one of type string or symbol');
+    }
+}
+
 class Channel {
     constructor(name) {
         this.name = name;
@@ -714,7 +725,9 @@ class Channel {
     }
     get hasSubscribers() { return this._subscribers.length > 0; }
     subscribe(onMessage) {
-        if (typeof onMessage !== "function") throw new TypeError("subscriber must be a function");
+        if (typeof onMessage !== "function") {
+            throw invalidArg('The "subscription" argument must be of type function');
+        }
         this._subscribers.push(onMessage);
     }
     unsubscribe(onMessage) {
@@ -735,11 +748,13 @@ class Channel {
     }
 }
 export function channel(name) {
+    checkChannelName(name);
     return registry[name] || (registry[name] = new Channel(name));
 }
 export function subscribe(name, onMessage) { channel(name).subscribe(onMessage); }
 export function unsubscribe(name, onMessage) { return channel(name).unsubscribe(onMessage); }
 export function hasSubscribers(name) {
+    checkChannelName(name);
     const ch = registry[name];
     return ch ? ch.hasSubscribers : false;
 }
@@ -1068,8 +1083,16 @@ export default { isatty, ReadStream, WriteStream };
 // `fetch`/`node:http(s)`, which route through the captured, policy-gated
 // HTTP host op.)
 const NET_SHIM: &str = r#"
+// Node coerces object inputs through toString but rejects non-string
+// primitives (numbers, booleans, null).
+function ipInput(input) {
+    if (typeof input === "string") return input;
+    if (input !== null && typeof input === "object") return String(input);
+    return null;
+}
 export function isIPv4(input) {
-    if (typeof input !== "string") return false;
+    input = ipInput(input);
+    if (input === null) return false;
     const parts = input.split(".");
     if (parts.length !== 4) return false;
     for (const part of parts) {
@@ -1080,8 +1103,16 @@ export function isIPv4(input) {
     return true;
 }
 export function isIPv6(input) {
-    if (typeof input !== "string" || input.length === 0) return false;
+    input = ipInput(input);
+    if (input === null || input.length === 0) return false;
     let s = input;
+    // Zone identifier (fe80::1%eth0): strip and validate before parsing.
+    const percent = s.indexOf("%");
+    if (percent !== -1) {
+        const zone = s.slice(percent + 1);
+        if (zone.length === 0 || !/^[0-9a-zA-Z._-]+$/.test(zone)) return false;
+        s = s.slice(0, percent);
+    }
     const lastColon = s.lastIndexOf(":");
     if (lastColon === -1) return false;
     if (s.indexOf(".", lastColon) !== -1) {
@@ -1093,10 +1124,16 @@ export function isIPv6(input) {
     if (doubleColon !== s.lastIndexOf("::")) return false;
     let groups;
     if (doubleColon !== -1) {
-        const head = s.slice(0, doubleColon).split(":").filter((g) => g.length > 0);
-        const tail = s.slice(doubleColon + 2).split(":").filter((g) => g.length > 0);
-        if (head.length + tail.length > 7) return false;
-        groups = head.concat(tail);
+        // A stray single colon at either boundary (":1::2", "1::2:") is
+        // invalid — empty segments must not be silently dropped.
+        const head = s.slice(0, doubleColon);
+        const tail = s.slice(doubleColon + 2);
+        if (head.startsWith(":") || head.endsWith(":")) return false;
+        if (tail.startsWith(":") || tail.endsWith(":")) return false;
+        const headGroups = head === "" ? [] : head.split(":");
+        const tailGroups = tail === "" ? [] : tail.split(":");
+        if (headGroups.length + tailGroups.length > 7) return false;
+        groups = headGroups.concat(tailGroups);
         if (groups.length === 0) return true;
     } else {
         groups = s.split(":");
@@ -1145,24 +1182,30 @@ const STREAM_SHIM: &str = r#"
 import { EventEmitter } from "node:events";
 import { Buffer } from "node:buffer";
 
-class Stream extends EventEmitter {
-    pipe(dest, options) {
-        const src = this;
-        const end = !options || options.end !== false;
-        function onData(chunk) { dest.write(chunk); }
-        src.on("data", onData);
-        src.once("end", function () {
-            src.off("data", onData);
-            if (end && typeof dest.end === "function") dest.end();
-        });
-        src.once("error", function (err) {
-            src.off("data", onData);
-            if (typeof dest.destroy === "function") dest.destroy(err);
-        });
-        dest.emit("pipe", src);
-        return dest;
-    }
+// ES5-style constructor (not a class): the classic `Stream.call(this)` +
+// `Object.setPrototypeOf` inheritance idiom must keep working — Node's own
+// suite and a long tail of npm packages rely on it.
+function Stream(opts) {
+    EventEmitter.call(this, opts);
 }
+Object.setPrototypeOf(Stream.prototype, EventEmitter.prototype);
+Object.setPrototypeOf(Stream, EventEmitter);
+Stream.prototype.pipe = function pipe(dest, options) {
+    const src = this;
+    const end = !options || options.end !== false;
+    function onData(chunk) { dest.write(chunk); }
+    src.on("data", onData);
+    src.once("end", function () {
+        src.off("data", onData);
+        if (end && typeof dest.end === "function") dest.end();
+    });
+    src.once("error", function (err) {
+        src.off("data", onData);
+        if (typeof dest.destroy === "function") dest.destroy(err);
+    });
+    dest.emit("pipe", src);
+    return dest;
+};
 
 function maybeEmitEnd(stream) {
     const st = stream._readableState;

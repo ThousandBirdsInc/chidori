@@ -102,80 +102,248 @@ export { process as default, env, argv, platform, version, versions, nextTick, c
 "#;
 
 const BUFFER_SHIM: &str = r#"
-// Minimal node:buffer shim. Real Buffer is a Uint8Array subclass with helpers;
-// most agent code needs construction, length, and string conversion across the
-// common encodings (utf8, hex, base64, latin1, ascii). Anything beyond that
-// throws so silent gaps surface.
+// node:buffer shim. A Uint8Array subclass covering the construction,
+// comparison, encoding, and byte-manipulation surface packages actually
+// touch. Encodings: utf8, hex, base64, base64url, latin1/binary, ascii,
+// utf16le/ucs2.
 function normEnc(encoding) {
-    if (!encoding) return "utf8";
+    if (encoding === undefined || encoding === null) return "utf8";
     const e = String(encoding).toLowerCase();
     if (e === "utf-8") return "utf8";
     if (e === "binary") return "latin1";
+    if (e === "ucs2" || e === "ucs-2" || e === "utf-16le") return "utf16le";
     return e;
 }
-class Buffer extends Uint8Array {
-    static from(input, encoding) {
-        if (typeof input === "string") {
-            const enc = normEnc(encoding);
-            if (enc === "base64") {
-                const bin = atob(input);
-                const out = new Uint8Array(bin.length);
-                for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-                return new Buffer(out.buffer);
-            }
-            if (enc === "hex") {
-                const out = new Uint8Array(input.length / 2);
-                for (let i = 0; i < out.length; i++) out[i] = parseInt(input.substr(i * 2, 2), 16);
-                return new Buffer(out.buffer);
-            }
-            if (enc === "latin1" || enc === "ascii") {
-                const out = new Uint8Array(input.length);
-                for (let i = 0; i < input.length; i++) out[i] = input.charCodeAt(i) & 0xff;
-                return new Buffer(out.buffer);
-            }
-            const bytes = new TextEncoder().encode(input);
-            return new Buffer(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-        }
-        if (input instanceof ArrayBuffer) return new Buffer(input);
-        if (ArrayBuffer.isView(input)) return new Buffer(input.buffer, input.byteOffset, input.byteLength);
-        if (Array.isArray(input)) return new Buffer(new Uint8Array(input).buffer);
-        throw new TypeError("Buffer.from: unsupported input shape");
-    }
-    static alloc(size) { return new Buffer(new ArrayBuffer(size)); }
-    static isBuffer(value) { return value instanceof Buffer; }
-    static concat(list) {
-        let total = 0;
-        for (const b of list) total += b.length;
-        const out = new Buffer(new ArrayBuffer(total));
-        let o = 0;
-        for (const b of list) { out.set(b, o); o += b.length; }
+const ENCODINGS = ["utf8", "hex", "base64", "base64url", "latin1", "ascii", "utf16le"];
+function decodeString(input, enc) {
+    if (enc === "base64" || enc === "base64url") {
+        let b64 = input.replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/=]/g, "");
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
         return out;
     }
-    toString(encoding) {
+    if (enc === "hex") {
+        const n = input.length >>> 1;
+        const out = new Uint8Array(n);
+        for (let i = 0; i < n; i++) {
+            const byte = parseInt(input.substr(i * 2, 2), 16);
+            if (Number.isNaN(byte)) return out.subarray(0, i);
+            out[i] = byte;
+        }
+        return out;
+    }
+    if (enc === "latin1" || enc === "ascii") {
+        const out = new Uint8Array(input.length);
+        for (let i = 0; i < input.length; i++) out[i] = input.charCodeAt(i) & (enc === "ascii" ? 0x7f : 0xff);
+        return out;
+    }
+    if (enc === "utf16le") {
+        const out = new Uint8Array(input.length * 2);
+        for (let i = 0; i < input.length; i++) {
+            const c = input.charCodeAt(i);
+            out[i * 2] = c & 0xff;
+            out[i * 2 + 1] = c >> 8;
+        }
+        return out;
+    }
+    return new TextEncoder().encode(input);
+}
+class Buffer extends Uint8Array {
+    static from(input, encodingOrOffset, length) {
+        if (typeof input === "string") {
+            return wrap(decodeString(input, normEnc(encodingOrOffset)));
+        }
+        if (input instanceof ArrayBuffer) {
+            // Shares the ArrayBuffer's memory, like Node.
+            return new Buffer(input, encodingOrOffset || 0, length);
+        }
+        if (ArrayBuffer.isView(input)) {
+            // Copies, like Node (share requires the ArrayBuffer form).
+            return wrap(new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice());
+        }
+        if (Array.isArray(input)) return wrap(Uint8Array.from(input));
+        if (input !== null && typeof input === "object") {
+            // JSON round trip shape.
+            if (input.type === "Buffer" && Array.isArray(input.data)) {
+                return wrap(Uint8Array.from(input.data));
+            }
+            // Array-likes.
+            if (typeof input.length === "number") {
+                return wrap(Uint8Array.from(input));
+            }
+            // Boxed primitives / objects with a primitive value.
+            if (typeof input.valueOf === "function") {
+                const value = input.valueOf();
+                if (value !== input && (typeof value === "string" || typeof value === "object")) {
+                    return Buffer.from(value, encodingOrOffset, length);
+                }
+            }
+            const primitive = input[Symbol.toPrimitive];
+            if (typeof primitive === "function") {
+                return Buffer.from(primitive.call(input, "string"), encodingOrOffset, length);
+            }
+        }
+        const err = new TypeError(
+            "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received " + typeof input
+        );
+        err.code = "ERR_INVALID_ARG_TYPE";
+        throw err;
+    }
+    static alloc(size, fill, encoding) {
+        const buf = new Buffer(new ArrayBuffer(size >>> 0));
+        if (fill !== undefined && fill !== 0) buf.fill(fill, 0, buf.length, encoding);
+        return buf;
+    }
+    static allocUnsafe(size) { return new Buffer(new ArrayBuffer(size >>> 0)); }
+    static allocUnsafeSlow(size) { return new Buffer(new ArrayBuffer(size >>> 0)); }
+    static of(...items) { return wrap(Uint8Array.from(items)); }
+    static isBuffer(value) { return value instanceof Buffer; }
+    static isEncoding(encoding) {
+        if (typeof encoding !== "string" || encoding.length === 0) return false;
+        return ENCODINGS.indexOf(normEnc(encoding)) !== -1;
+    }
+    static byteLength(input, encoding) {
+        if (typeof input === "string") return decodeString(input, normEnc(encoding)).length;
+        if (ArrayBuffer.isView(input)) return input.byteLength;
+        if (input instanceof ArrayBuffer) return input.byteLength;
+        const err = new TypeError("Buffer.byteLength expects a string, Buffer, or ArrayBuffer");
+        err.code = "ERR_INVALID_ARG_TYPE";
+        throw err;
+    }
+    static compare(a, b) {
+        const len = Math.min(a.length, b.length);
+        for (let i = 0; i < len; i++) {
+            if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+        }
+        if (a.length !== b.length) return a.length < b.length ? -1 : 1;
+        return 0;
+    }
+    static concat(list, totalLength) {
+        if (!Array.isArray(list)) {
+            const err = new TypeError('The "list" argument must be an instance of Array');
+            err.code = "ERR_INVALID_ARG_TYPE";
+            throw err;
+        }
+        let total = 0;
+        for (const b of list) total += b.length;
+        if (totalLength !== undefined) total = totalLength >>> 0;
+        const out = Buffer.allocUnsafe(total);
+        let offset = 0;
+        for (const b of list) {
+            if (offset >= total) break;
+            const chunk = b.length > total - offset ? b.subarray(0, total - offset) : b;
+            out.set(chunk, offset);
+            offset += chunk.length;
+        }
+        return out;
+    }
+    equals(other) { return Buffer.compare(this, other) === 0; }
+    compare(other) { return Buffer.compare(this, other); }
+    copy(target, targetStart, sourceStart, sourceEnd) {
+        targetStart = targetStart === undefined ? 0 : targetStart;
+        sourceStart = sourceStart === undefined ? 0 : sourceStart;
+        sourceEnd = sourceEnd === undefined ? this.length : sourceEnd;
+        const chunk = this.subarray(sourceStart, sourceEnd);
+        const room = target.length - targetStart;
+        const sliced = chunk.length > room ? chunk.subarray(0, room) : chunk;
+        target.set(sliced, targetStart);
+        return sliced.length;
+    }
+    fill(value, start, end, encoding) {
+        start = start === undefined ? 0 : start;
+        end = end === undefined ? this.length : end;
+        if (typeof value === "string") {
+            const bytes = decodeString(value, normEnc(encoding));
+            if (bytes.length === 0) return this;
+            for (let i = start; i < end; i++) this[i] = bytes[(i - start) % bytes.length];
+            return this;
+        }
+        if (ArrayBuffer.isView(value)) {
+            const bytes = value;
+            if (bytes.length === 0) return this;
+            for (let i = start; i < end; i++) this[i] = bytes[(i - start) % bytes.length];
+            return this;
+        }
+        Uint8Array.prototype.fill.call(this, value, start, end);
+        return this;
+    }
+    write(string, offset, length, encoding) {
+        if (typeof offset === "string") { encoding = offset; offset = 0; length = undefined; }
+        else if (typeof length === "string") { encoding = length; length = undefined; }
+        offset = offset === undefined ? 0 : offset;
+        const bytes = decodeString(String(string), normEnc(encoding));
+        const room = this.length - offset;
+        const n = Math.min(bytes.length, length === undefined ? room : Math.min(length, room));
+        this.set(bytes.subarray(0, n), offset);
+        return n;
+    }
+    subarray(start, end) {
+        const view = Uint8Array.prototype.subarray.call(this, start, end);
+        return new Buffer(view.buffer, view.byteOffset, view.byteLength);
+    }
+    slice(start, end) { return this.subarray(start, end); }
+    indexOf(value, byteOffset, encoding) {
+        if (typeof byteOffset === "string") { encoding = byteOffset; byteOffset = 0; }
+        byteOffset = byteOffset === undefined ? 0 : byteOffset;
+        if (typeof value === "number") {
+            return Uint8Array.prototype.indexOf.call(this, value & 0xff, byteOffset);
+        }
+        const needle = typeof value === "string" ? decodeString(value, normEnc(encoding)) : value;
+        if (needle.length === 0) return byteOffset <= this.length ? byteOffset : this.length;
+        outer: for (let i = byteOffset; i + needle.length <= this.length; i++) {
+            for (let j = 0; j < needle.length; j++) {
+                if (this[i + j] !== needle[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+    includes(value, byteOffset, encoding) {
+        return this.indexOf(value, byteOffset, encoding) !== -1;
+    }
+    toString(encoding, start, end) {
         const enc = normEnc(encoding);
-        if (enc === "base64") {
+        const view = start !== undefined || end !== undefined ? this.subarray(start, end) : this;
+        if (enc === "base64" || enc === "base64url") {
             let s = "";
-            for (let i = 0; i < this.length; i++) s += String.fromCharCode(this[i]);
-            return btoa(s);
+            for (let i = 0; i < view.length; i++) s += String.fromCharCode(view[i]);
+            const b64 = btoa(s);
+            return enc === "base64url"
+                ? b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+                : b64;
         }
         if (enc === "hex") {
             let h = "";
-            for (let i = 0; i < this.length; i++) h += this[i].toString(16).padStart(2, "0");
+            for (let i = 0; i < view.length; i++) h += view[i].toString(16).padStart(2, "0");
             return h;
         }
         if (enc === "latin1" || enc === "ascii") {
             let s = "";
-            for (let i = 0; i < this.length; i++) s += String.fromCharCode(this[i] & 0xff);
+            for (let i = 0; i < view.length; i++) s += String.fromCharCode(view[i] & (enc === "ascii" ? 0x7f : 0xff));
             return s;
         }
-        return new TextDecoder().decode(this);
+        if (enc === "utf16le") {
+            let s = "";
+            for (let i = 0; i + 1 < view.length; i += 2) s += String.fromCharCode(view[i] | (view[i + 1] << 8));
+            return s;
+        }
+        return new TextDecoder().decode(view);
     }
     toJSON() {
         return { type: "Buffer", data: Array.from(this) };
     }
 }
-export { Buffer };
-export default { Buffer };
+function wrap(bytes) {
+    return new Buffer(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+const INSPECT_MAX_BYTES = 50;
+const kMaxLength = 2147483647;
+const constants = Object.freeze({ MAX_LENGTH: kMaxLength, MAX_STRING_LENGTH: 536870888 });
+function atobExport(data) { return atob(data); }
+function btoaExport(data) { return btoa(data); }
+export { Buffer, INSPECT_MAX_BYTES, kMaxLength, constants, atobExport as atob, btoaExport as btoa };
+export default { Buffer, INSPECT_MAX_BYTES, kMaxLength, constants, atob: atobExport, btoa: btoaExport };
 "#;
 
 const UTIL_SHIM: &str = r#"
@@ -978,88 +1146,201 @@ export { sep, delimiter, normalize, isAbsolute, join, resolve, dirname, basename
 export default path;
 "#;
 
-// node:events shim. A faithful EventEmitter subset: on/once/off/addListener/
-// removeListener/removeAllListeners/emit/listeners/listenerCount/eventNames,
-// plus prependListener/prependOnceListener and the `newListener`/`error`
-// conventions. The class is the default export *and* a named `EventEmitter`
-// export, and `EventEmitter.EventEmitter` self-references, matching Node so all
-// the common import shapes work.
+// node:events shim. Matches Node's shape, not just its surface: EventEmitter
+// is an ES5-style constructor *function* with lazy `_events` initialization,
+// because the classic inheritance idiom — `EventEmitter.call(this)` /
+// `Stream.call(this)` + `Object.setPrototypeOf` — is everywhere in older npm
+// packages (and throughout Node's own test suite) and a `class` constructor
+// cannot be `.call()`ed. Validation errors carry Node's error codes
+// (ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE / ERR_UNHANDLED_ERROR) so
+// `assert.throws({ code })` checks hold.
 const EVENTS_SHIM: &str = r#"
-class EventEmitter {
-    constructor() {
+function invalidArg(message) {
+    const err = new TypeError(message);
+    err.code = "ERR_INVALID_ARG_TYPE";
+    return err;
+}
+function checkListener(listener) {
+    if (typeof listener !== "function") {
+        throw invalidArg('The "listener" argument must be of type function');
+    }
+}
+function ensureEvents(target) {
+    if (target._events === undefined) {
+        target._events = Object.create(null);
+    }
+    return target._events;
+}
+
+function EventEmitter(opts) {
+    EventEmitter.init.call(this, opts);
+}
+EventEmitter.init = function init() {
+    if (this._events === undefined) {
         this._events = Object.create(null);
+    }
+    if (this._maxListeners === undefined) {
         this._maxListeners = undefined;
     }
-    setMaxListeners(n) { this._maxListeners = n; return this; }
-    getMaxListeners() { return this._maxListeners === undefined ? EventEmitter.defaultMaxListeners : this._maxListeners; }
-    _list(type) { return this._events[type] || (this._events[type] = []); }
-    addListener(type, listener) { return this.on(type, listener); }
-    on(type, listener) {
-        if (typeof listener !== "function") throw new TypeError("listener must be a function");
-        if (this._events.newListener !== undefined) this.emit("newListener", type, listener);
-        this._list(type).push(listener);
-        return this;
+};
+EventEmitter.prototype.setMaxListeners = function setMaxListeners(n) {
+    if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
+        const err = new RangeError(
+            'The value of "n" is out of range. It must be a non-negative number. Received ' + n
+        );
+        err.code = "ERR_OUT_OF_RANGE";
+        throw err;
     }
-    prependListener(type, listener) {
-        if (typeof listener !== "function") throw new TypeError("listener must be a function");
-        this._list(type).unshift(listener);
-        return this;
+    this._maxListeners = n;
+    return this;
+};
+EventEmitter.prototype.getMaxListeners = function getMaxListeners() {
+    return this._maxListeners === undefined ? EventEmitter.defaultMaxListeners : this._maxListeners;
+};
+EventEmitter.prototype.addListener = function addListener(type, listener) {
+    return this.on(type, listener);
+};
+EventEmitter.prototype.on = function on(type, listener) {
+    checkListener(listener);
+    const events = ensureEvents(this);
+    if (events.newListener !== undefined) {
+        this.emit("newListener", type, listener.listener || listener);
     }
-    once(type, listener) { return this.on(type, this._onceWrap(type, listener)); }
-    prependOnceListener(type, listener) { return this.prependListener(type, this._onceWrap(type, listener)); }
-    _onceWrap(type, listener) {
-        const self = this;
-        let fired = false;
-        function wrapper(...args) {
-            if (fired) return;
-            fired = true;
-            self.off(type, wrapper);
-            return listener.apply(self, args);
+    (events[type] = events[type] || []).push(listener);
+    return this;
+};
+EventEmitter.prototype.prependListener = function prependListener(type, listener) {
+    checkListener(listener);
+    const events = ensureEvents(this);
+    if (events.newListener !== undefined) {
+        this.emit("newListener", type, listener.listener || listener);
+    }
+    (events[type] = events[type] || []).unshift(listener);
+    return this;
+};
+function onceWrap(target, type, listener) {
+    let fired = false;
+    function wrapper(...args) {
+        if (fired) return;
+        fired = true;
+        target.removeListener(type, wrapper);
+        return listener.apply(target, args);
+    }
+    wrapper.listener = listener;
+    return wrapper;
+}
+EventEmitter.prototype.once = function once(type, listener) {
+    checkListener(listener);
+    return this.on(type, onceWrap(this, type, listener));
+};
+EventEmitter.prototype.prependOnceListener = function prependOnceListener(type, listener) {
+    checkListener(listener);
+    return this.prependListener(type, onceWrap(this, type, listener));
+};
+EventEmitter.prototype.off = function off(type, listener) {
+    return this.removeListener(type, listener);
+};
+EventEmitter.prototype.removeListener = function removeListener(type, listener) {
+    checkListener(listener);
+    const events = ensureEvents(this);
+    const list = events[type];
+    if (!list) return this;
+    for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i] === listener || list[i].listener === listener) {
+            const removed = list[i].listener || list[i];
+            list.splice(i, 1);
+            if (list.length === 0) delete events[type];
+            if (events.removeListener !== undefined) {
+                this.emit("removeListener", type, removed);
+            }
+            break;
         }
-        wrapper.listener = listener;
-        return wrapper;
     }
-    off(type, listener) { return this.removeListener(type, listener); }
-    removeListener(type, listener) {
-        const list = this._events[type];
-        if (!list) return this;
-        for (let i = list.length - 1; i >= 0; i--) {
-            if (list[i] === listener || list[i].listener === listener) {
+    return this;
+};
+EventEmitter.prototype.removeAllListeners = function removeAllListeners(type) {
+    const events = ensureEvents(this);
+    if (arguments.length === 0) {
+        // Emit 'removeListener' for each listener (Node does), unless there
+        // is no such listener registered.
+        if (events.removeListener !== undefined) {
+            for (const key of Object.keys(events)) {
+                if (key === "removeListener") continue;
+                this.removeAllListeners(key);
+            }
+            this.removeAllListeners("removeListener");
+        }
+        this._events = Object.create(null);
+        return this;
+    }
+    const list = events[type];
+    if (list) {
+        if (events.removeListener !== undefined) {
+            for (let i = list.length - 1; i >= 0; i--) {
                 const removed = list[i].listener || list[i];
                 list.splice(i, 1);
-                if (this._events.removeListener !== undefined) this.emit("removeListener", type, removed);
-                break;
+                this.emit("removeListener", type, removed);
             }
+            delete events[type];
+        } else {
+            delete events[type];
         }
-        if (list.length === 0) delete this._events[type];
-        return this;
     }
-    removeAllListeners(type) {
-        if (type === undefined) { this._events = Object.create(null); return this; }
-        delete this._events[type];
-        return this;
+    return this;
+};
+EventEmitter.prototype.emit = function emit(type, ...args) {
+    const events = ensureEvents(this);
+    if (type === "error" && events[EventEmitter.errorMonitor] !== undefined) {
+        for (const fn of events[EventEmitter.errorMonitor].slice()) fn.apply(this, args);
     }
-    emit(type, ...args) {
-        const list = this._events[type] ? this._events[type].slice() : [];
-        if (list.length === 0) {
-            if (type === "error") {
-                const err = args[0];
-                throw err instanceof Error ? err : new Error("Unhandled 'error' event");
-            }
-            return false;
+    const list = events[type] ? events[type].slice() : [];
+    if (list.length === 0) {
+        if (type === "error") {
+            const err = args[0];
+            if (err instanceof Error) throw err;
+            const wrapped = new Error(
+                "Unhandled error." + (err !== undefined ? " (" + String(err) + ")" : "")
+            );
+            wrapped.code = "ERR_UNHANDLED_ERROR";
+            wrapped.context = err;
+            throw wrapped;
         }
-        for (const fn of list) fn.apply(this, args);
-        return true;
+        return false;
     }
-    listeners(type) {
-        return (this._events[type] || []).map((l) => l.listener || l);
+    for (const fn of list) fn.apply(this, args);
+    return true;
+};
+EventEmitter.prototype.listeners = function listeners(type) {
+    const events = ensureEvents(this);
+    return (events[type] || []).map((l) => l.listener || l);
+};
+EventEmitter.prototype.rawListeners = function rawListeners(type) {
+    const events = ensureEvents(this);
+    return (events[type] || []).slice();
+};
+EventEmitter.prototype.listenerCount = function listenerCount(type, listener) {
+    const events = ensureEvents(this);
+    const list = events[type];
+    if (!list) return 0;
+    if (listener === undefined) return list.length;
+    let count = 0;
+    for (const l of list) {
+        if (l === listener || l.listener === listener) count++;
     }
-    rawListeners(type) { return (this._events[type] || []).slice(); }
-    listenerCount(type) { return this._events[type] ? this._events[type].length : 0; }
-    eventNames() { return Object.keys(this._events); }
-}
+    return count;
+};
+EventEmitter.prototype.eventNames = function eventNames() {
+    const events = ensureEvents(this);
+    return Object.keys(events).concat(Object.getOwnPropertySymbols(events));
+};
 EventEmitter.defaultMaxListeners = 10;
 EventEmitter.EventEmitter = EventEmitter;
+EventEmitter.errorMonitor = Symbol("events.errorMonitor");
+EventEmitter.captureRejectionSymbol = Symbol.for("nodejs.rejection");
+// Legacy static form, still exercised by Node's suite and old packages.
+EventEmitter.listenerCount = function (emitter, type) {
+    return emitter.listenerCount(type);
+};
 
 function once(emitter, name) {
     return new Promise((resolve, reject) => {
@@ -1070,8 +1351,23 @@ function once(emitter, name) {
         if (name !== "error") emitter.once("error", onError);
     });
 }
+function getEventListeners(emitter, name) {
+    return emitter.rawListeners(name);
+}
+function getMaxListeners(emitter) {
+    return emitter.getMaxListeners();
+}
+function setMaxListeners(n, ...emitters) {
+    if (emitters.length === 0) {
+        EventEmitter.defaultMaxListeners = n;
+        return;
+    }
+    for (const emitter of emitters) emitter.setMaxListeners(n);
+}
+const errorMonitor = EventEmitter.errorMonitor;
+const captureRejectionSymbol = EventEmitter.captureRejectionSymbol;
 
-export { EventEmitter, once };
+export { EventEmitter, once, getEventListeners, getMaxListeners, setMaxListeners, errorMonitor, captureRejectionSymbol };
 export default EventEmitter;
 "#;
 
@@ -1831,9 +2127,10 @@ mod tests {
         assert!(shim_source("url")
             .unwrap()
             .contains("class URLSearchParams"));
+        // ES5-style constructor: `EventEmitter.call(this)` must keep working.
         assert!(shim_source("events")
             .unwrap()
-            .contains("class EventEmitter"));
+            .contains("function EventEmitter"));
     }
 
     #[test]
