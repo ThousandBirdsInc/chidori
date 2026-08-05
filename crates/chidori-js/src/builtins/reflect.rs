@@ -131,6 +131,7 @@ pub fn install(vm: &mut Vm) {
             if vm.is_proxy(&target) {
                 return vm.proxy_get_own_descriptor(&target, &key);
             }
+            super::materialize_lazy_for_key(vm, &target, &key);
             let prop = own_property_descriptor(&target, &key);
             match prop {
                 None => Ok(Value::Undefined),

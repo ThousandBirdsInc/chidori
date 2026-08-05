@@ -172,6 +172,11 @@ pub(crate) fn define_own_property(
     d: &PropDesc,
     throw_on_fail: bool,
 ) -> Result<bool, Value> {
+    // [[DefineOwnProperty]] validates against the CURRENT descriptor, so a
+    // lazy section stub must give way to its real binding first — both for
+    // correct validation and so a later sibling-name materialization can
+    // never clobber what was defined here.
+    super::materialize_lazy_for_key(vm, obj, key);
     let args_index = if matches!(obj.borrow().internal, Internal::Arguments(_)) {
         key.array_index()
     } else {
@@ -1172,6 +1177,7 @@ fn install_object(vm: &mut Vm) {
         if vm.is_proxy(&o) {
             return vm.proxy_get_own_descriptor(&o, &key);
         }
+        super::materialize_lazy_for_key(vm, &o, &key);
         let prop = own_property_descriptor(&o, &key);
         match prop {
             None => Ok(Value::Undefined),
@@ -1233,6 +1239,7 @@ fn install_object_extra(vm: &mut Vm) {
     };
     vm.define_method(&ctor, "getOwnPropertyDescriptors", 1, |vm, _t, args| {
         let o = vm.to_object(&arg(args, 0))?;
+        super::materialize_all_lazy(vm, &o);
         let result = vm.new_object();
         for key in vm.own_keys(&o) {
             let prop = own_property_descriptor(&o, &key);
@@ -1278,6 +1285,9 @@ fn install_object_extra(vm: &mut Vm) {
 /// per own key, in [[OwnPropertyKeys]] order: `{configurable: false}` for
 /// sealing, plus `{writable: false}` for frozen DATA keys.
 pub(crate) fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Result<(), Value> {
+    // Freezing/sealing the global must lock the REAL bindings, not the lazy
+    // stubs (which could otherwise never self-replace afterwards).
+    super::materialize_all_lazy(vm, o);
     let ok = if vm.is_proxy(o) {
         vm.proxy_prevent_extensions(o)?
     } else {
@@ -1381,6 +1391,7 @@ pub(crate) fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Re
 /// own key must be non-configurable (and, for `frozen`, data keys
 /// non-writable).
 fn test_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Result<bool, Value> {
+    super::materialize_all_lazy(vm, o);
     let extensible = if vm.is_proxy(o) {
         vm.proxy_is_extensible(o)?
     } else {
@@ -1437,6 +1448,9 @@ fn lookup_accessor(
     key: &PropertyKey,
     want_get: bool,
 ) -> Result<Value, Value> {
+    // `globalThis.__lookupGetter__("Date")` must answer `undefined` (a data
+    // property), never a lazy section stub's internal getter.
+    super::materialize_lazy_for_key(vm, o, key);
     let mut cur = Some(o.clone());
     while let Some(obj) = cur {
         // For a Proxy, [[GetOwnProperty]] and [[GetPrototypeOf]] dispatch to the

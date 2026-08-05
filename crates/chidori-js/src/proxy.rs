@@ -546,6 +546,10 @@ impl Vm {
                 if matches!(target.borrow().internal, Internal::Proxy(_)) {
                     return self.proxy_get_own_descriptor(&target, key);
                 }
+                // A trapless proxy over the global forwards to the target's
+                // [[GetOwnProperty]] — same transparency rule as the direct
+                // reflection paths.
+                crate::builtins::materialize_lazy_for_key(self, &target, key);
                 Ok(match own_property_descriptor(&target, key) {
                     Some(p) => descriptor_to_object(self, &p),
                     None => Value::Undefined,

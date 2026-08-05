@@ -8,6 +8,15 @@ use std::rc::Rc;
 use crate::value::*;
 use crate::vm::Vm;
 
+/// One lazily-installed builtin section (see `builtins::install_lazy_globals`):
+/// the global names its stubs occupy, the real installer, and the shared
+/// once-flag (the same `Rc` the stub accessors carry).
+pub struct LazySection {
+    pub names: &'static [&'static str],
+    pub install: fn(&mut Vm),
+    pub done: Rc<std::cell::Cell<bool>>,
+}
+
 pub struct Realm {
     pub global: JsObject,
     /// The %eval% intrinsic function object — `Op::DirectEval` compares the
@@ -127,6 +136,13 @@ pub struct Realm {
     /// (locale/style/digit/grouping options). The brand for the receiver checks.
     pub symbol_intl_number_format: JsSymbol,
 
+    /// Builtin sections installed lazily (see
+    /// `builtins::install_lazy_globals`): their global names sit behind
+    /// self-replacing accessor stubs until first use. Reflection entry points
+    /// (descriptor reads, defineProperty, freeze/seal) consult this registry
+    /// to materialize a pending section before answering, so a stub is never
+    /// observable through them.
+    pub lazy_sections: Vec<LazySection>,
     /// Registry for `Symbol.for`.
     pub symbol_registry: indexmap::IndexMap<String, JsSymbol>,
     /// The empty root of this realm's shape transition tree (see
@@ -264,6 +280,7 @@ impl Realm {
             symbol_intl_locale: bare_symbol(18, "[[InitializedLocale]]"),
             symbol_intl_plural_rules: bare_symbol(19, "[[InitializedPluralRules]]"),
             symbol_intl_number_format: bare_symbol(20, "[[InitializedNumberFormat]]"),
+            lazy_sections: Vec::new(),
             symbol_registry: indexmap::IndexMap::new(),
             shape_root: crate::shape::Shape::new_root(),
         }

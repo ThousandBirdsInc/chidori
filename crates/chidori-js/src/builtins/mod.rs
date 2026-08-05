@@ -37,20 +37,181 @@ pub const SECTIONS: &[(&str, fn(&mut Vm))] = &[
     ("string", string::install),
     ("regexp", regexp_builtin::install),
     ("collections", collections::install),
-    ("date", date::install),
+    ("date", install_date_lazy),
     ("async", async_builtins::install),
     ("reflect", reflect::install),
-    ("typedarray", typedarray::install),
+    ("typedarray", install_typedarray_lazy),
     ("proxy", crate::proxy::install),
     ("disposable", disposable::install),
-    ("intl", intl::install),
-    ("temporal", temporal::install),
+    ("intl", install_intl_lazy),
+    ("temporal", install_temporal_lazy),
     ("globals", install_globals),
 ];
 
 pub fn install(vm: &mut Vm) {
     for (_, section) in SECTIONS {
         section(vm);
+    }
+}
+
+fn install_intl_lazy(vm: &mut Vm) {
+    install_lazy_globals(vm, &["Intl"], intl::install);
+}
+
+fn install_temporal_lazy(vm: &mut Vm) {
+    install_lazy_globals(vm, &["Temporal"], temporal::install);
+}
+
+fn install_date_lazy(vm: &mut Vm) {
+    install_lazy_globals(vm, &["Date"], date::install);
+}
+
+fn install_typedarray_lazy(vm: &mut Vm) {
+    install_lazy_globals(
+        vm,
+        &[
+            "ArrayBuffer",
+            "SharedArrayBuffer",
+            "Int8Array",
+            "Uint8Array",
+            "Uint8ClampedArray",
+            "Int16Array",
+            "Uint16Array",
+            "Int32Array",
+            "Uint32Array",
+            "Float32Array",
+            "Float64Array",
+            "BigInt64Array",
+            "BigUint64Array",
+            "DataView",
+            "Atomics",
+        ],
+        typedarray::install,
+    );
+}
+
+/// Install a builtin section lazily: each of `names` becomes a configurable,
+/// non-enumerable accessor on the global whose first read runs `install` —
+/// which defines the real bindings as ordinary data properties, replacing
+/// every stub in place (same insertion slots, so global key order matches an
+/// eager build) — and returns the just-installed value. Assignment to a stub
+/// materializes the section first and then overwrites that one binding — the
+/// end state an eager build reaches (all sibling bindings present, the
+/// assigned one holding the new value); `delete` works either way
+/// (configurable).
+///
+/// Only sections whose objects are reachable exclusively THROUGH these global
+/// names qualify: nothing may hang off a primitive (`"".x`, `(0).x`) or be
+/// constructed internally by the engine before the section installs. That
+/// holds for Date, the ArrayBuffer/TypedArray/DataView/Atomics family,
+/// Temporal, and Intl — and those four are exactly the sections that dominate
+/// realm-construction time while almost no script touches them, so deferral
+/// moves their cost off every `Engine::new()` onto the first actual use.
+///
+/// Reflection stays transparent too: every section is registered in
+/// `realm.lazy_sections`, and the reflection entry points that would otherwise
+/// observe a stub's shape — descriptor reads (`Object.getOwnPropertyDescriptor(s)`,
+/// `Reflect.getOwnPropertyDescriptor`, `__lookupGetter__`/`__lookupSetter__`),
+/// `[[DefineOwnProperty]]`, and freeze/seal/isFrozen/isSealed — call
+/// [`materialize_lazy_for_key`] / [`materialize_all_lazy`] first, so they see
+/// the same ordinary data property an eager build has. Reads, writes,
+/// `typeof`, `in`, `new`, enumeration, and deletion never see a difference to
+/// begin with.
+fn install_lazy_globals(vm: &mut Vm, names: &'static [&'static str], install: fn(&mut Vm)) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let done: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    vm.realm.lazy_sections.push(crate::realm::LazySection {
+        names,
+        install,
+        done: done.clone(),
+    });
+    let global = vm.realm.global.clone();
+    for name in names {
+        let getter = {
+            let done = done.clone();
+            vm.new_native(&format!("get {name}"), 0, move |vm, _t, _a| {
+                if !done.replace(true) {
+                    install(vm);
+                }
+                // Read the own slot directly (not a generic [[Get]]) so a
+                // stale getter reference can never re-enter itself.
+                let g = vm.realm.global.clone();
+                let v = g
+                    .borrow()
+                    .own_get(&PropertyKey::str(name))
+                    .and_then(|p| p.value().cloned());
+                Ok(v.unwrap_or(Value::Undefined))
+            })
+        };
+        let setter = {
+            let done = done.clone();
+            vm.new_native(&format!("set {name}"), 1, move |vm, _t, args| {
+                // Materialize the whole section BEFORE assigning, so the
+                // sibling bindings exist and a later install can never clobber
+                // the assigned value.
+                if !done.replace(true) {
+                    install(vm);
+                }
+                let g = vm.realm.global.clone();
+                g.borrow_mut()
+                    .own_insert(PropertyKey::str(name), Property::builtin(arg(args, 0)));
+                Ok(Value::Undefined)
+            })
+        };
+        global.borrow_mut().own_insert(
+            PropertyKey::str(name),
+            Property {
+                kind: PropertyKind::Accessor {
+                    get: Some(Value::Object(getter)),
+                    set: Some(Value::Object(setter)),
+                },
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+}
+
+/// If `obj` is the realm's global and `key` names a still-pending lazy
+/// section stub, run that section's install so the caller sees the real data
+/// property. Reflection entry points call this before reading or defining an
+/// own property descriptor; everywhere else the stubs answer for themselves.
+pub(crate) fn materialize_lazy_for_key(vm: &mut Vm, obj: &JsObject, key: &PropertyKey) {
+    if vm.realm.lazy_sections.is_empty() || !obj.same(&vm.realm.global) {
+        return;
+    }
+    let PropertyKey::Str(s) = key else { return };
+    let name = s.as_str();
+    let mut install = None;
+    for sec in &vm.realm.lazy_sections {
+        if !sec.done.get() && sec.names.contains(&name) {
+            sec.done.set(true);
+            install = Some(sec.install);
+            break;
+        }
+    }
+    if let Some(f) = install {
+        f(vm);
+    }
+}
+
+/// If `obj` is the realm's global, run every still-pending lazy section.
+/// Whole-object reflection (`Object.getOwnPropertyDescriptors`, freeze/seal
+/// and their probes) calls this so no stub is left to observe.
+pub(crate) fn materialize_all_lazy(vm: &mut Vm, obj: &JsObject) {
+    if vm.realm.lazy_sections.is_empty() || !obj.same(&vm.realm.global) {
+        return;
+    }
+    let pending: Vec<fn(&mut Vm)> = vm
+        .realm
+        .lazy_sections
+        .iter()
+        .filter(|sec| !sec.done.replace(true))
+        .map(|sec| sec.install)
+        .collect();
+    for f in pending {
+        f(vm);
     }
 }
 

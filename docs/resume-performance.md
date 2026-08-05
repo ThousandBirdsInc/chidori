@@ -129,9 +129,10 @@ bound.
 
 ## 4. What these caches do NOT fix
 
-The **O(history) re-execution term** and the **realm build** are untouched.
-Bounding re-execution is `chidori.step`'s job today (`value-checkpoints.md`)
-and warm-standby's job tomorrow (§5).
+The **O(history) re-execution term** is untouched. Bounding re-execution is
+`chidori.step`'s job today (`value-checkpoints.md`) and warm-standby's job
+tomorrow (§5). The **realm build** has since been attacked directly: see
+§4.2.
 
 ### 4.1 The realm build, actually measured
 
@@ -155,13 +156,37 @@ Two conclusions. First, **re-measure before optimizing**: on this machine the
 realm build is ~0.6 ms min-of-N, not 3.6 — still worth removing for
 high-frequency resume/test loops, but a fraction of the transpile win, not
 four times it.
-Second, **there is no cheap targeted fix**: no single section dominates
-enough that a spot optimization moves the total much. The real levers remain
-the invasive ones — lazily materializing rarely-used namespaces (`Temporal`
-is both the largest single section and the least likely to be touched by an
-agent, so it goes first), or build-once-clone-many shared templates — and
-they should be taken up only after warm-standby (§5), which removes far more
-per resume for comparable effort.
+Second, warm min-of-N **understates the cold cost**: the first realm a fresh
+process builds pays first-touch page faults and lazy statics on top (the
+`Temporal` section alone measured 0.3–0.7 ms cold vs ~0.2 warm). The
+permanent tool for the cold view is
+`cargo run --release --example startup_cold -p chidori-js -- <script>`,
+which phases one fresh-process run into read / `Engine::new` / eval / print.
+
+### 4.2 Landed: lazy realm sections
+
+The first lever from the list above — lazily materializing rarely-used
+namespaces — is in (`builtins/mod.rs::install_lazy_globals`). The four
+sections whose objects are reachable only through their global names and
+that dominated the build while almost no agent touches them — `Temporal`,
+`Intl`, `Date`, and the ArrayBuffer/TypedArray/DataView/Atomics family —
+now install as configurable accessor stubs on the global; the first read of
+any of a section's names runs the real install, which replaces the stubs in
+place (same slots, so global key order matches an eager build) and restores
+the ordinary data-property fast paths. Reflection is kept transparent by a
+per-realm registry (`realm.lazy_sections`): descriptor reads, `[[DefineOwnProperty]]`,
+`__lookupGetter__`/`__lookupSetter__`, and freeze/seal materialize a pending
+section before answering, so even `Object.getOwnPropertyDescriptor(globalThis,
+"Date")` before first use sees the eager build's data property (pinned by
+`tests/lazy_builtins.rs` and the test262 gate). Sections that hang methods off
+primitives (`String`, `Number`, `Array`…) cannot be deferred this way —
+`"a".toUpperCase()` never reads the global — and stay eager.
+
+Measured cold in a fresh process (release, this container): `Engine::new()`
+~0.5 ms, down from ~0.9–1.1 ms eager; whole-process `spawn → eval → exit` on
+the near-empty startup workload dropped ~0.4 ms. Scripts that do touch a
+deferred namespace pay its install cost once, at first use, instead of every
+engine paying all of them up front.
 
 ## 5. Proposed: warm-standby resume (design note)
 
@@ -229,8 +254,10 @@ where the replay number grows with it.
 1. ~~**Warm-standby conversion (§5)**~~ — landed for input pauses (§5.1);
    signal/approval pauses still resume by replay (now fast: the journal
    replay path itself was made O(history) with small constants).
-2. **Lazy / shared-template realm construction** — removes most of the fixed
-   ~3.6 ms per engine (`interpreter-optimization.md` §11.4 bonus row).
+2. ~~**Lazy / shared-template realm construction**~~ — landed for the lazy
+   half (§4.2): the four deferrable namespace sections now materialize on
+   first use, cutting the cold realm build roughly in half.
+   Build-once-clone-many shared templates remain unexplored.
 3. **Per-segment replay-cost tracing** — a `chidori trace` view attributing
    replay time to inter-effect segments, so authors know exactly what to wrap
    in `chidori.step`.
