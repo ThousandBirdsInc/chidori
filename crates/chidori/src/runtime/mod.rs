@@ -18,6 +18,15 @@ pub mod host_core;
 pub mod isolate;
 pub mod memory;
 pub mod native;
+// OTLP span export (tael/Jaeger/Tempo). The real implementation carries the
+// heavy OTLP/gRPC dependency tree, so it is feature-gated; without `otel` a
+// no-op module with the identical public surface compiles in its place, and
+// every call site works unchanged (start_run_span returns None, so all span
+// paths are dead).
+#[cfg(feature = "otel")]
+pub mod otel;
+#[cfg(not(feature = "otel"))]
+#[path = "otel_noop.rs"]
 pub mod otel;
 pub mod prompt_cache;
 /// Pure-Rust JS engine integration — the only JavaScript engine.

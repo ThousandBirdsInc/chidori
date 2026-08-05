@@ -20,6 +20,14 @@ exclude = ["tests/node_compat/suite/*"]
 name = "chidori"
 path = "src/main.rs"
 
+[features]
+# OTLP span export for tael/Jaeger/Tempo (runtime/otel.rs). Default-on so
+# released binaries keep observability; `--no-default-features` (or
+# `default-features = false` downstream) swaps in a no-op stub and drops the
+# tonic/prost/hyper gRPC build tree for materially faster builds.
+default = ["otel"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -90,10 +98,15 @@ serde_yaml = "0.9"
 
 # OpenTelemetry OTLP export — emits one span per host function call so agents
 # can be shipped into any OTLP-compatible backend (tael, Jaeger, Tempo, etc.).
-# Activated at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is set.
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+# Activated at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is set, and gated at
+# compile time behind the default-on `otel` feature: the OTLP/gRPC tree
+# (tonic → prost → hyper → tower) is one of the heaviest builds in the
+# dependency graph, so dev builds can drop it with `--no-default-features`
+# (runtime/otel.rs is swapped for a no-op stub; everything else compiles
+# unchanged).
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
 
 # Checkpoint export: `chidori checkpoint export <run_id>` archives a run dir
 # as a .tar.gz so a golden eval case's fixture can be committed to git or
