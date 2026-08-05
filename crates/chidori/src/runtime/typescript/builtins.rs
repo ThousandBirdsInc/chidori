@@ -115,6 +115,143 @@ function normEnc(encoding) {
     return e;
 }
 const ENCODINGS = ["utf8", "hex", "base64", "base64url", "latin1", "ascii", "utf16le"];
+// Node renders the offending value into ERR_INVALID_ARG_TYPE /
+// ERR_OUT_OF_RANGE messages (lib/internal/errors.js `invalidArgTypeHelper`);
+// packages assert on those strings, so mirror the shapes exactly.
+function inspectValue(input) {
+    const t = typeof input;
+    if (t === "string") return "'" + input + "'";
+    if (t === "bigint") return String(input) + "n";
+    if (t === "symbol") return input.toString();
+    return String(input);
+}
+function receivedHelper(input) {
+    if (input === null) return " Received null";
+    if (input === undefined) return " Received undefined";
+    const t = typeof input;
+    if (t === "function") return " Received function " + (input.name || "(anonymous)");
+    if (t === "object") {
+        const ctor = input.constructor;
+        if (ctor && typeof ctor.name === "string" && ctor.name.length !== 0) {
+            return " Received an instance of " + ctor.name;
+        }
+        return " Received [Object: null prototype] {}";
+    }
+    let inspected = inspectValue(input);
+    if (inspected.length > 25) inspected = inspected.slice(0, 25) + "...";
+    return " Received type " + t + " (" + inspected + ")";
+}
+function invalidArgType(name, expected, actual) {
+    // Node leaves already-qualified names ("first argument") unquoted.
+    const subject = name.endsWith(" argument")
+        ? "The " + name
+        : 'The "' + name + '" ' + (name.indexOf(".") !== -1 ? "property" : "argument");
+    const err = new TypeError(subject + " must be " + expected + "." + receivedHelper(actual));
+    err.code = "ERR_INVALID_ARG_TYPE";
+    return err;
+}
+function outOfRange(name, range, actual) {
+    const err = new RangeError(
+        'The value of "' + name + '" is out of range. It must be ' + range + ". Received " + inspectValue(actual)
+    );
+    err.code = "ERR_OUT_OF_RANGE";
+    return err;
+}
+function rangeText(min, max) {
+    if (min !== undefined && max !== undefined) return ">= " + min + " && <= " + max;
+    if (min !== undefined) return ">= " + min;
+    return "<= " + max;
+}
+// Node's `validateOffset` (a number in [min, max]); NaN counts as out of range.
+function validateOffset(value, name, min, max) {
+    if (typeof value !== "number") throw invalidArgType(name, "of type number", value);
+    if (Number.isNaN(value) || value < min || value > max) {
+        throw outOfRange(name, rangeText(min, max), value);
+    }
+    return value;
+}
+// Node's `validateInteger` (an integer in [min, max]).
+function validateInteger(value, name, min, max) {
+    if (typeof value !== "number") throw invalidArgType(name, "of type number", value);
+    if (!Number.isInteger(value)) throw outOfRange(name, "an integer", value);
+    if ((min !== undefined && value < min) || (max !== undefined && value > max)) {
+        throw outOfRange(name, rangeText(min, max), value);
+    }
+    return value;
+}
+function compareBytes(a, aStart, aEnd, b, bStart, bEnd) {
+    const aLen = aEnd - aStart;
+    const bLen = bEnd - bStart;
+    const len = Math.min(aLen, bLen);
+    for (let i = 0; i < len; i++) {
+        const x = a[aStart + i];
+        const y = b[bStart + i];
+        if (x !== y) return x < y ? -1 : 1;
+    }
+    if (aLen !== bLen) return aLen < bLen ? -1 : 1;
+    return 0;
+}
+const BUF_OR_U8 = "an instance of Buffer or Uint8Array";
+// UTF-8 decoding, done here rather than through TextDecoder: the engine's
+// strings are UTF-8, so `String.fromCharCode` cannot join a surrogate pair
+// (each half becomes U+FFFD) and everything outside the BMP comes back
+// mangled. `String.fromCodePoint` builds those characters directly. The
+// error handling is the WHATWG one — a maximal invalid subsequence collapses
+// to a single U+FFFD and decoding resumes at the byte that ended it — which
+// is what Buffer.toString and string_decoder are specified against.
+function decodeUtf8(bytes) {
+    const len = bytes.length;
+    let out = "";
+    let i = 0;
+    while (i < len) {
+        const b0 = bytes[i];
+        if (b0 < 0x80) {
+            out += String.fromCharCode(b0);
+            i++;
+            continue;
+        }
+        let need;
+        let cp;
+        let lower = 0x80;
+        let upper = 0xbf;
+        if (b0 >= 0xc2 && b0 <= 0xdf) {
+            need = 1;
+            cp = b0 & 0x1f;
+        } else if (b0 >= 0xe0 && b0 <= 0xef) {
+            need = 2;
+            cp = b0 & 0x0f;
+            if (b0 === 0xe0) lower = 0xa0;       // no overlong encodings
+            else if (b0 === 0xed) upper = 0x9f;  // no surrogate code points
+        } else if (b0 >= 0xf0 && b0 <= 0xf4) {
+            need = 3;
+            cp = b0 & 0x07;
+            if (b0 === 0xf0) lower = 0x90;
+            else if (b0 === 0xf4) upper = 0x8f;  // no code points above U+10FFFF
+        } else {
+            // Continuation byte with no lead, or a byte UTF-8 never uses.
+            out += "�";
+            i++;
+            continue;
+        }
+        let j = i + 1;
+        let complete = true;
+        for (let k = 0; k < need; k++) {
+            const b = bytes[j];
+            const lo = k === 0 ? lower : 0x80;
+            const hi = k === 0 ? upper : 0xbf;
+            if (j >= len || b < lo || b > hi) {
+                complete = false;
+                break;
+            }
+            cp = (cp << 6) | (b & 0x3f);
+            j++;
+        }
+        // `j` stops on the offending byte, which is re-examined from scratch.
+        out += complete ? String.fromCodePoint(cp) : "�";
+        i = j;
+    }
+    return out;
+}
 function decodeString(input, enc) {
     if (enc === "base64" || enc === "base64url") {
         let b64 = input.replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/=]/g, "");
@@ -164,6 +301,17 @@ class Buffer extends Uint8Array {
         }
         if (Array.isArray(input)) return wrap(Uint8Array.from(input));
         if (input !== null && typeof input === "object") {
+            // Boxed primitives / objects with a primitive value. Node consults
+            // valueOf() first and only accepts a string or object result.
+            if (typeof input.valueOf === "function") {
+                const value = input.valueOf();
+                if (
+                    value !== null && value !== undefined && value !== input &&
+                    (typeof value === "string" || typeof value === "object")
+                ) {
+                    return Buffer.from(value, encodingOrOffset, length);
+                }
+            }
             // JSON round trip shape.
             if (input.type === "Buffer" && Array.isArray(input.data)) {
                 return wrap(Uint8Array.from(input.data));
@@ -172,23 +320,46 @@ class Buffer extends Uint8Array {
             if (typeof input.length === "number") {
                 return wrap(Uint8Array.from(input));
             }
-            // Boxed primitives / objects with a primitive value.
-            if (typeof input.valueOf === "function") {
-                const value = input.valueOf();
-                if (value !== input && (typeof value === "string" || typeof value === "object")) {
-                    return Buffer.from(value, encodingOrOffset, length);
-                }
-            }
             const primitive = input[Symbol.toPrimitive];
             if (typeof primitive === "function") {
-                return Buffer.from(primitive.call(input, "string"), encodingOrOffset, length);
+                const value = primitive.call(input, "string");
+                // A non-string primitive is *not* accepted, it falls through
+                // to the ERR_INVALID_ARG_TYPE below (naming the original input).
+                if (typeof value === "string") {
+                    return wrap(decodeString(value, normEnc(encodingOrOffset)));
+                }
             }
         }
-        const err = new TypeError(
-            "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received " + typeof input
+        throw invalidArgType(
+            "first argument",
+            "of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object",
+            input
         );
-        err.code = "ERR_INVALID_ARG_TYPE";
-        throw err;
+    }
+    // Copies the *bytes* of a TypedArray, independent of its element width.
+    static copyBytesFrom(view, offset, length) {
+        if (!ArrayBuffer.isView(view) || typeof view.BYTES_PER_ELEMENT !== "number") {
+            throw invalidArgType("view", "an instance of TypedArray", view);
+        }
+        const viewLength = view.length;
+        if (viewLength === 0) return Buffer.alloc(0);
+        if (offset !== undefined || length !== undefined) {
+            if (offset === undefined) {
+                offset = 0;
+            } else {
+                validateInteger(offset, "offset", 0);
+                if (offset >= viewLength) return Buffer.alloc(0);
+            }
+            let end;
+            if (length === undefined) {
+                end = viewLength;
+            } else {
+                validateInteger(length, "length", 0);
+                end = offset + length;
+            }
+            view = view.slice(offset, end);
+        }
+        return wrap(new Uint8Array(view.buffer, view.byteOffset, view.byteLength).slice());
     }
     static alloc(size, fill, encoding) {
         const buf = new Buffer(new ArrayBuffer(size >>> 0));
@@ -207,39 +378,79 @@ class Buffer extends Uint8Array {
         if (typeof input === "string") return decodeString(input, normEnc(encoding)).length;
         if (ArrayBuffer.isView(input)) return input.byteLength;
         if (input instanceof ArrayBuffer) return input.byteLength;
-        const err = new TypeError("Buffer.byteLength expects a string, Buffer, or ArrayBuffer");
-        err.code = "ERR_INVALID_ARG_TYPE";
-        throw err;
+        throw invalidArgType(
+            "string",
+            "of type string or an instance of Buffer or ArrayBuffer",
+            input
+        );
     }
-    static compare(a, b) {
-        const len = Math.min(a.length, b.length);
-        for (let i = 0; i < len; i++) {
-            if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
-        }
-        if (a.length !== b.length) return a.length < b.length ? -1 : 1;
-        return 0;
+    static compare(buf1, buf2) {
+        if (!(buf1 instanceof Uint8Array)) throw invalidArgType("buf1", BUF_OR_U8, buf1);
+        if (!(buf2 instanceof Uint8Array)) throw invalidArgType("buf2", BUF_OR_U8, buf2);
+        return compareBytes(buf1, 0, buf1.length, buf2, 0, buf2.length);
     }
     static concat(list, totalLength) {
-        if (!Array.isArray(list)) {
-            const err = new TypeError('The "list" argument must be an instance of Array');
-            err.code = "ERR_INVALID_ARG_TYPE";
-            throw err;
+        if (!Array.isArray(list)) throw invalidArgType("list", "an instance of Array", list);
+        // Node returns an empty buffer for an empty list, whatever totalLength says.
+        if (list.length === 0) return Buffer.alloc(0);
+        if (totalLength === undefined) {
+            totalLength = 0;
+            for (let i = 0; i < list.length; i++) {
+                const buf = list[i];
+                if (!(buf instanceof Uint8Array)) {
+                    throw invalidArgType("list[" + i + "]", BUF_OR_U8, buf);
+                }
+                totalLength += buf.length;
+            }
+        } else {
+            validateOffset(totalLength, "totalLength", 0, kMaxLength);
         }
-        let total = 0;
-        for (const b of list) total += b.length;
-        if (totalLength !== undefined) total = totalLength >>> 0;
-        const out = Buffer.allocUnsafe(total);
-        let offset = 0;
-        for (const b of list) {
-            if (offset >= total) break;
-            const chunk = b.length > total - offset ? b.subarray(0, total - offset) : b;
-            out.set(chunk, offset);
-            offset += chunk.length;
+        const out = Buffer.allocUnsafe(totalLength);
+        let pos = 0;
+        for (let i = 0; i < list.length; i++) {
+            const buf = list[i];
+            if (!(buf instanceof Uint8Array)) {
+                throw invalidArgType("list[" + i + "]", BUF_OR_U8, buf);
+            }
+            if (pos + buf.length > totalLength) {
+                out.set(buf.subarray(0, totalLength - pos), pos);
+                pos = totalLength;
+                break;
+            }
+            out.set(buf, pos);
+            pos += buf.length;
         }
+        // Anything the sources did not cover stays zero-filled.
+        if (pos < totalLength) Uint8Array.prototype.fill.call(out, 0, pos, totalLength);
         return out;
     }
-    equals(other) { return Buffer.compare(this, other) === 0; }
-    compare(other) { return Buffer.compare(this, other); }
+    equals(other) {
+        if (!(other instanceof Uint8Array)) throw invalidArgType("otherBuffer", BUF_OR_U8, other);
+        return compareBytes(this, 0, this.length, other, 0, other.length) === 0;
+    }
+    compare(target, targetStart, targetEnd, sourceStart, sourceEnd) {
+        if (!(target instanceof Uint8Array)) throw invalidArgType("target", BUF_OR_U8, target);
+        if (
+            targetStart === undefined && targetEnd === undefined &&
+            sourceStart === undefined && sourceEnd === undefined
+        ) {
+            return compareBytes(this, 0, this.length, target, 0, target.length);
+        }
+        if (targetStart === undefined) targetStart = 0;
+        else validateOffset(targetStart, "targetStart", 0, kMaxLength);
+        if (targetEnd === undefined) targetEnd = target.length;
+        else validateOffset(targetEnd, "targetEnd", 0, target.length);
+        if (sourceStart === undefined) sourceStart = 0;
+        else validateOffset(sourceStart, "sourceStart", 0, kMaxLength);
+        if (sourceEnd === undefined) sourceEnd = this.length;
+        else validateOffset(sourceEnd, "sourceEnd", 0, this.length);
+        if (sourceStart >= sourceEnd) return targetStart >= targetEnd ? 0 : -1;
+        if (targetStart >= targetEnd) return 1;
+        return compareBytes(
+            this, sourceStart, Math.min(sourceEnd, this.length),
+            target, targetStart, Math.min(targetEnd, target.length)
+        );
+    }
     copy(target, targetStart, sourceStart, sourceEnd) {
         targetStart = targetStart === undefined ? 0 : targetStart;
         sourceStart = sourceStart === undefined ? 0 : sourceStart;
@@ -325,10 +536,24 @@ class Buffer extends Uint8Array {
         }
         if (enc === "utf16le") {
             let s = "";
-            for (let i = 0; i + 1 < view.length; i += 2) s += String.fromCharCode(view[i] | (view[i + 1] << 8));
+            for (let i = 0; i + 1 < view.length; i += 2) {
+                const c = view[i] | (view[i + 1] << 8);
+                // Join surrogate pairs into one code point: the engine's
+                // strings are UTF-8, so appending the halves separately loses
+                // the character (see decodeUtf8 above).
+                if (c >= 0xd800 && c <= 0xdbff && i + 3 < view.length) {
+                    const c2 = view[i + 2] | (view[i + 3] << 8);
+                    if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+                        s += String.fromCodePoint(0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00));
+                        i += 2;
+                        continue;
+                    }
+                }
+                s += String.fromCharCode(c);
+            }
             return s;
         }
-        return new TextDecoder().decode(view);
+        return decodeUtf8(view);
     }
     toJSON() {
         return { type: "Buffer", data: Array.from(this) };
@@ -2150,7 +2375,7 @@ mod tests {
         assert!(shim_source("querystring").unwrap().contains("function parse"));
         assert!(shim_source("string_decoder")
             .unwrap()
-            .contains("class StringDecoder"));
+            .contains("function StringDecoder"));
         assert!(shim_source("punycode").unwrap().contains("xn--"));
         assert!(shim_source("timers/promises")
             .unwrap()
