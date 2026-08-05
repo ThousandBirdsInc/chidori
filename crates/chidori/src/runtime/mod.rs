@@ -3,6 +3,7 @@ pub mod call_log;
 pub mod capability;
 pub mod context;
 pub mod cost;
+pub mod compress;
 pub mod crypto;
 pub mod engine;
 /// Typed error taxonomy: the pause interrupt and run-failure classification.

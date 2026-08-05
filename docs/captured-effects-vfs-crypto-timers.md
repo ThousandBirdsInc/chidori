@@ -99,11 +99,12 @@ allowlists a fixed set of builtins — the full Node builtin module suite. The
 core captured/virtualized modules are `process`, `buffer`, `util`, `fs`,
 `fs/promises`, `crypto`, `http`, `https`; the pure-logic / virtualized modules
 (`path`, `events`, `url`, `assert`, `os`, `querystring`, `string_decoder`,
-`punycode`, `stream`, `timers`, `perf_hooks`, …) are deterministic by
+`punycode`, `stream`, `timers`, `perf_hooks`, `zlib`, …) are deterministic by
 construction — `os`, like `process.platform`, returns fixed virtualized
-constants and `timers`/`perf_hooks` read the virtual clock; and the modules
+constants, `timers`/`perf_hooks` read the virtual clock, and `zlib` runs
+inline through a flate2-backed native (pure like hashing); the modules
 whose capabilities the runtime does not grant (`child_process`, `tls`, `vm`,
-`zlib`, …) link but throw a clear unsupported error at first use. The
+…) link but throw a clear unsupported error at first use. The
 authoritative list is `NODE_BUILTIN_ALLOWLIST` (`transpile.rs`), kept in sync
 with `BUILTIN_NAMES` (`builtins.rs`).
 

@@ -3,11 +3,12 @@
 //! `builtins.rs` holds the original, heavily-exercised shims (`process`,
 //! `buffer`, `fs`, `crypto`, `http`, …); this module completes coverage so
 //! *every* Node builtin specifier resolves and links. Modules whose behavior
-//! is expressible deterministically in pure JS (`querystring`, `stream`,
-//! `string_decoder`, `punycode`, `diagnostics_channel`, …) get working
-//! implementations; modules that require capabilities the runtime
-//! deliberately does not grant (subprocesses, raw sockets, threads,
-//! compression, arbitrary eval contexts) get fail-loud stubs: the import
+//! is expressible deterministically (`querystring`, `stream`,
+//! `string_decoder`, `punycode`, `diagnostics_channel`, `zlib` via the
+//! flate2-backed native, …) get working implementations; modules that
+//! require capabilities the runtime deliberately does not grant
+//! (subprocesses, raw sockets, threads, arbitrary eval contexts) get
+//! fail-loud stubs: the import
 //! links, the module exposes Node's surface, and each entry point throws a
 //! clear "not supported in the Chidori runtime" error at first use — never a
 //! silent no-op.
@@ -2077,43 +2078,115 @@ export class WASI {
 export default { WASI };
 "#;
 
-// node:zlib — no compression capability in the embedded engine. Constants
-// are provided (packages read them at module scope); every codec entry point
-// throws. Async variants throw synchronously as well: failing loud beats
-// pretending a compression backend exists.
+// node:zlib — functional, backed by the `__chidori_zlib` sync native
+// (flate2/miniz in Rust; see runtime::compress). Codecs are pure functions of
+// (input, level), so like node:crypto hashing they run inline with nothing
+// captured, and record/replay agrees byte-for-byte. The streaming classes
+// buffer their input and codec at flush — output for a complete stream
+// matches the one-shot form (chidori streams are in-memory anyway). Brotli is
+// the one codec family not provided (no Brotli codec in the runtime); those
+// entry points stay fail-loud.
 const ZLIB_SHIM: &str = r#"
-function unsupported(name) {
-    return function () {
-        throw new Error("zlib." + name + " is not supported in the Chidori runtime (no compression capability)");
+import { Buffer } from "node:buffer";
+import { Transform } from "node:stream";
+
+function bytesToBase64(bytes) {
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+}
+function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+function toBytes(data) {
+    if (typeof data === "string") return new TextEncoder().encode(data);
+    if (data instanceof Uint8Array) return data;
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    throw new TypeError("zlib: unsupported input type (expected string, Buffer, typed array, or ArrayBuffer)");
+}
+function levelOf(options) {
+    if (options && typeof options === "object" && typeof options.level === "number") {
+        return options.level;
+    }
+    return null;
+}
+function codec(op, data, options) {
+    const b64 = globalThis.__chidori_zlib(op, bytesToBase64(toBytes(data)), levelOf(options));
+    return Buffer.from(base64ToBytes(b64));
+}
+// node signature: fn(data[, options], callback) — result on a microtask.
+function asyncify(op) {
+    return function (data, options, callback) {
+        if (typeof options === "function") { callback = options; options = undefined; }
+        if (typeof callback !== "function") throw new TypeError("zlib: callback must be a function");
+        queueMicrotask(() => {
+            try {
+                callback(null, codec(op, data, options));
+            } catch (err) {
+                callback(err);
+            }
+        });
     };
 }
-export const deflate = unsupported("deflate");
-export const deflateSync = unsupported("deflateSync");
-export const deflateRaw = unsupported("deflateRaw");
-export const deflateRawSync = unsupported("deflateRawSync");
-export const inflate = unsupported("inflate");
-export const inflateSync = unsupported("inflateSync");
-export const inflateRaw = unsupported("inflateRaw");
-export const inflateRawSync = unsupported("inflateRawSync");
-export const gzip = unsupported("gzip");
-export const gzipSync = unsupported("gzipSync");
-export const gunzip = unsupported("gunzip");
-export const gunzipSync = unsupported("gunzipSync");
-export const unzip = unsupported("unzip");
-export const unzipSync = unsupported("unzipSync");
-export const brotliCompress = unsupported("brotliCompress");
-export const brotliCompressSync = unsupported("brotliCompressSync");
-export const brotliDecompress = unsupported("brotliDecompress");
-export const brotliDecompressSync = unsupported("brotliDecompressSync");
-export const createDeflate = unsupported("createDeflate");
-export const createDeflateRaw = unsupported("createDeflateRaw");
-export const createInflate = unsupported("createInflate");
-export const createInflateRaw = unsupported("createInflateRaw");
-export const createGzip = unsupported("createGzip");
-export const createGunzip = unsupported("createGunzip");
-export const createUnzip = unsupported("createUnzip");
-export const createBrotliCompress = unsupported("createBrotliCompress");
-export const createBrotliDecompress = unsupported("createBrotliDecompress");
+// Streaming form: buffer chunks, codec the concatenation at flush. Complete-
+// stream output is identical to the one-shot functions.
+function codecStream(op, options) {
+    const chunks = [];
+    return new Transform({
+        transform(chunk, encoding, callback) {
+            try { chunks.push(toBytes(chunk)); } catch (err) { return callback(err); }
+            callback(null);
+        },
+        flush(callback) {
+            try {
+                let total = 0;
+                for (const c of chunks) total += c.length;
+                const all = new Uint8Array(total);
+                let offset = 0;
+                for (const c of chunks) { all.set(c, offset); offset += c.length; }
+                callback(null, codec(op, all, options));
+            } catch (err) {
+                callback(err);
+            }
+        },
+    });
+}
+export function deflateSync(data, options) { return codec("deflate", data, options); }
+export function deflateRawSync(data, options) { return codec("deflateRaw", data, options); }
+export function gzipSync(data, options) { return codec("gzip", data, options); }
+export function inflateSync(data, options) { return codec("inflate", data, options); }
+export function inflateRawSync(data, options) { return codec("inflateRaw", data, options); }
+export function gunzipSync(data, options) { return codec("gunzip", data, options); }
+export function unzipSync(data, options) { return codec("unzip", data, options); }
+export const deflate = asyncify("deflate");
+export const deflateRaw = asyncify("deflateRaw");
+export const gzip = asyncify("gzip");
+export const inflate = asyncify("inflate");
+export const inflateRaw = asyncify("inflateRaw");
+export const gunzip = asyncify("gunzip");
+export const unzip = asyncify("unzip");
+export function createDeflate(options) { return codecStream("deflate", options); }
+export function createDeflateRaw(options) { return codecStream("deflateRaw", options); }
+export function createGzip(options) { return codecStream("gzip", options); }
+export function createInflate(options) { return codecStream("inflate", options); }
+export function createInflateRaw(options) { return codecStream("inflateRaw", options); }
+export function createGunzip(options) { return codecStream("gunzip", options); }
+export function createUnzip(options) { return codecStream("unzip", options); }
+function noBrotli(name) {
+    return function () {
+        throw new Error("zlib." + name + " is not supported in the Chidori runtime (no Brotli codec; use the gzip/deflate family)");
+    };
+}
+export const brotliCompress = noBrotli("brotliCompress");
+export const brotliCompressSync = noBrotli("brotliCompressSync");
+export const brotliDecompress = noBrotli("brotliDecompress");
+export const brotliDecompressSync = noBrotli("brotliDecompressSync");
+export const createBrotliCompress = noBrotli("createBrotliCompress");
+export const createBrotliDecompress = noBrotli("createBrotliDecompress");
 export const constants = Object.freeze({
     Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3,
     Z_FINISH: 4, Z_BLOCK: 5,

@@ -132,11 +132,12 @@ three cliffs, concretely:
      `diagnostics_channel`, `domain`, `perf_hooks` (virtual clock), `net`
      (`isIP` helpers only), `worker_threads` (main-thread surface +
      MessageChannel), `sys`, `v8` (introspection stubs), `tty`
-     (`isatty` → false).
+     (`isatty` → false), `zlib` (deflate/gzip families — sync, callback,
+     and streaming — via a flate2-backed native; Brotli is fail-loud).
    - **Fail-loud:** capabilities the runtime deliberately does not grant —
      `child_process`, `cluster`, `dgram`, `dns` (+ `dns/promises`), `http2`,
      `inspector`, `readline`, `repl`, `tls`, `trace_events`, `vm`, `wasi`,
-     `zlib`, plus server/socket surfaces of `net` and `http`. These import
+     plus server/socket surfaces of `net` and `http`. These import
      and link cleanly (packages import them at module scope), but every
      entry point throws a clear "not supported in the Chidori runtime"
      error at first use — never a silent no-op.

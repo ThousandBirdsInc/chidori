@@ -828,6 +828,7 @@ const SYNC_NATIVE_NAMES: &[(&str, u32)] = &[
     ("__chidori_fs_rm", 3),
     ("__chidori_fs_rename", 2),
     ("__chidori_fs_stat", 1),
+    ("__chidori_zlib", 3),
     ("__chidori_note_capability", 1),
 ];
 
@@ -1032,6 +1033,16 @@ pub(crate) fn build_sync_native_dispatch(
                 "__chidori_fs_stat" => {
                     fs_policy_guard(&policy)?;
                     ctx.vfs_stat(&str_arg(0)?)
+                }
+                "__chidori_zlib" => {
+                    // Pure inline computation (like hashing): output is a
+                    // function of (input, level) alone, so nothing is captured
+                    // and no policy gates it.
+                    let op = str_arg(0)?;
+                    let data = b64_decode(&str_arg(1)?)?;
+                    let level = args.get(2).and_then(|v| v.as_i64());
+                    let out = crate::runtime::compress::zlib_op(&op, &data, level)?;
+                    Ok(Value::String(b64_encode(&out)))
                 }
                 "__chidori_note_capability" => {
                     let cap = match str_arg(0)?.as_str() {
@@ -3219,7 +3230,7 @@ mod tests {
             export async function agent() {
                 const errors = {};
                 try { spawn("ls"); } catch (e) { errors.spawn = e.message; }
-                try { zlib.gzipSync("data"); } catch (e) { errors.gzip = e.message; }
+                try { zlib.brotliCompressSync("data"); } catch (e) { errors.brotli = e.message; }
                 try { new Worker("./w.js"); } catch (e) { errors.worker = e.message; }
                 const dnsError = await new Promise((resolve) => {
                     lookup("example.com", (err) => resolve(err ? err.code : null));
@@ -3230,7 +3241,7 @@ mod tests {
                 port1.postMessage({ hello: true });
                 return {
                     spawn: errors.spawn,
-                    gzip: errors.gzip,
+                    brotli: errors.brotli,
                     worker: errors.worker,
                     dnsError,
                     isPrimary: cluster.isPrimary,
@@ -3244,13 +3255,102 @@ mod tests {
             spawn_msg.contains("not supported in the Chidori runtime"),
             "{spawn_msg}"
         );
-        let gzip_msg = out["gzip"].as_str().unwrap();
-        assert!(gzip_msg.contains("no compression capability"), "{gzip_msg}");
+        let brotli_msg = out["brotli"].as_str().unwrap();
+        assert!(brotli_msg.contains("no Brotli codec"), "{brotli_msg}");
         let worker_msg = out["worker"].as_str().unwrap();
         assert!(worker_msg.contains("single-threaded"), "{worker_msg}");
         assert_eq!(out["dnsError"], serde_json::json!("ENOTSUP"));
         assert_eq!(out["isPrimary"], serde_json::json!(true));
         assert_eq!(out["message"], serde_json::json!({ "hello": true }));
+    }
+
+    #[test]
+    fn run_agent_node_zlib_round_trips() {
+        let out = run_compute_agent(
+            "node-zlib",
+            r#"
+            import zlib from "node:zlib";
+            import { pipeline } from "node:stream/promises";
+            import { Readable, Writable } from "node:stream";
+            import { Buffer } from "node:buffer";
+            export async function agent() {
+                const input = "the quick brown fox jumps over the lazy dog ".repeat(20);
+
+                // Sync round trips across the codec families.
+                const gz = zlib.gzipSync(input);
+                const roundGzip = zlib.gunzipSync(gz).toString("utf8");
+                const fl = zlib.deflateSync(input, { level: 9 });
+                const roundDeflate = zlib.inflateSync(fl).toString("utf8");
+                const raw = zlib.deflateRawSync(input);
+                const roundRaw = zlib.inflateRawSync(raw).toString("utf8");
+                // unzip auto-detects gzip vs zlib framing.
+                const roundUnzip = zlib.unzipSync(gz).toString("utf8");
+
+                // Callback form.
+                const asyncRound = await new Promise((resolve, reject) => {
+                    zlib.gzip(input, (err, compressed) => {
+                        if (err) return reject(err);
+                        zlib.gunzip(compressed, (err2, restored) => {
+                            if (err2) return reject(err2);
+                            resolve(restored.toString("utf8"));
+                        });
+                    });
+                });
+
+                // Streaming form: compress then decompress through pipelines.
+                const compressedChunks = [];
+                await pipeline(
+                    Readable.from([input.slice(0, 100), input.slice(100)]),
+                    zlib.createGzip(),
+                    new Writable({
+                        write(chunk, encoding, callback) { compressedChunks.push(chunk); callback(null); },
+                    })
+                );
+                const restoredChunks = [];
+                await pipeline(
+                    Readable.from(compressedChunks),
+                    zlib.createGunzip(),
+                    new Writable({
+                        write(chunk, encoding, callback) { restoredChunks.push(chunk); callback(null); },
+                    })
+                );
+                let streamed = "";
+                for (const c of restoredChunks) streamed += Buffer.from(c).toString("utf8");
+
+                // Corrupt input errors cleanly; determinism holds.
+                let corruptError = null;
+                try { zlib.gunzipSync("definitely not gzip"); } catch (e) { corruptError = e.message; }
+                const deterministic = zlib.gzipSync(input).toString("hex") === gz.toString("hex");
+
+                return {
+                    smaller: gz.length < input.length,
+                    roundGzip: roundGzip === input,
+                    roundDeflate: roundDeflate === input,
+                    roundRaw: roundRaw === input,
+                    roundUnzip: roundUnzip === input,
+                    asyncRound: asyncRound === input,
+                    streamed: streamed === input,
+                    corruptError,
+                    deterministic,
+                    hasConstants: zlib.constants.Z_BEST_COMPRESSION,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["smaller"], serde_json::json!(true));
+        assert_eq!(out["roundGzip"], serde_json::json!(true));
+        assert_eq!(out["roundDeflate"], serde_json::json!(true));
+        assert_eq!(out["roundRaw"], serde_json::json!(true));
+        assert_eq!(out["roundUnzip"], serde_json::json!(true));
+        assert_eq!(out["asyncRound"], serde_json::json!(true));
+        assert_eq!(out["streamed"], serde_json::json!(true));
+        assert!(
+            out["corruptError"].as_str().unwrap().contains("gunzip"),
+            "{:?}",
+            out["corruptError"]
+        );
+        assert_eq!(out["deterministic"], serde_json::json!(true));
+        assert_eq!(out["hasConstants"], serde_json::json!(9));
     }
 
     #[test]
