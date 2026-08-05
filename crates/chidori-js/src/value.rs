@@ -31,6 +31,18 @@ pub struct JsString(Repr);
 
 #[derive(Clone)]
 enum Repr {
+    /// Short well-formed UTF-8 stored inline — no allocation, no refcount,
+    /// clone is a 24-byte copy. This is the overwhelming majority of strings
+    /// an agent program churns through: property keys, number→string
+    /// conversions, JSON keys and small values, glue-code fragments. The cap
+    /// is chosen so the enum stays the same 24 bytes the `Utf8` arm forces.
+    /// Interned/constant strings deliberately do NOT take this arm (see
+    /// [`JsString::from_rc_str`]): they keep the shared `Rc` so the
+    /// pointer-equality fast paths in `eq` keep confirming in one compare.
+    /// `meta` packs the byte length (low bits) with an is-ASCII flag
+    /// ([`INLINE_ASCII`], computed once at construction) so the per-code-unit
+    /// hot paths (`code_unit_at`, `len_utf16`) stay O(1) without a rescan.
+    Inline { meta: u8, buf: [u8; INLINE_CAP] },
     /// No unpaired surrogate: the bytes are valid UTF-8 (== the legacy model).
     /// The `Cell` caches the UTF-16 code-unit count ([`UNITS_UNKNOWN`] until
     /// first computed by `len_utf16`), so repeated `.length` reads are O(1)
@@ -79,17 +91,77 @@ pub(crate) const ROPE_MIN_BYTES: usize = 64;
 /// below `u32::MAX`.
 const UNITS_UNKNOWN: u32 = u32::MAX;
 
+/// Byte capacity of [`Repr::Inline`]: the largest inline buffer that keeps
+/// the `Repr` enum at the 24 bytes the `Utf8` arm (16-byte fat `Rc<str>` +
+/// 4-byte cell + tag) already forces.
+const INLINE_CAP: usize = 22;
+
+/// Bit in `Repr::Inline::meta` marking a pure-ASCII buffer (unit count ==
+/// byte count, and byte index == unit index). The low bits hold the length.
+const INLINE_ASCII: u8 = 0x80;
+
+/// Decode an inline `meta` byte into the byte length.
+fn inline_len(meta: u8) -> usize {
+    (meta & !INLINE_ASCII) as usize
+}
+
 /// A fresh `Utf8` arm with its unit count not yet computed. O(1) — callers on
 /// hot paths (bytecode constant loads) must not pay a scan here.
 fn utf8_repr(s: Rc<str>) -> Repr {
     Repr::Utf8(s, std::cell::Cell::new(UNITS_UNKNOWN))
 }
 
-thread_local! {
-    /// Shared empty backing for [`Rope`]'s iterative `Drop` (placeholder the
-    /// children are replaced with while dismantling — an `Rc` bump, not an
-    /// allocation per node).
-    static EMPTY_RC_STR: Rc<str> = Rc::from("");
+/// The representation for freshly-built well-formed text: inline when it
+/// fits, heap `Rc` otherwise.
+fn well_formed_repr(s: &str) -> Repr {
+    match inline_repr(s) {
+        Some(r) => r,
+        None => utf8_repr(Rc::from(s)),
+    }
+}
+
+/// The inline representation of `s`, if it fits.
+fn inline_repr(s: &str) -> Option<Repr> {
+    if s.len() <= INLINE_CAP {
+        let mut buf = [0u8; INLINE_CAP];
+        buf[..s.len()].copy_from_slice(s.as_bytes());
+        let ascii = if s.is_ascii() { INLINE_ASCII } else { 0 };
+        Some(Repr::Inline {
+            meta: s.len() as u8 | ascii,
+            buf,
+        })
+    } else {
+        None
+    }
+}
+
+/// Assemble an inline repr directly from well-formed UTF-8 bytes (both
+/// halves come out of existing `JsString`s, so no validation is needed —
+/// only the ASCII scan for the meta bit).
+fn inline_from_wf_bytes(a: &[u8], b: &[u8]) -> Repr {
+    let mut buf = [0u8; INLINE_CAP];
+    buf[..a.len()].copy_from_slice(a);
+    buf[a.len()..a.len() + b.len()].copy_from_slice(b);
+    let len = a.len() + b.len();
+    let ascii = if buf[..len].is_ascii() {
+        INLINE_ASCII
+    } else {
+        0
+    };
+    Repr::Inline {
+        meta: len as u8 | ascii,
+        buf,
+    }
+}
+
+/// The `&str` view of an inline buffer. Inline strings are only ever built
+/// from `&str` slices, so the check cannot fail — and on ≤[`INLINE_CAP`]
+/// bytes the re-validation is a handful of instructions, which
+/// `#![forbid(unsafe_code)]` makes the right trade. Byte-level consumers
+/// (equality, hashing, JSON quoting, concat assembly) go through
+/// `wtf8_bytes` instead and skip it entirely.
+fn inline_str(buf: &[u8; INLINE_CAP], meta: u8) -> &str {
+    std::str::from_utf8(&buf[..inline_len(meta)]).expect("inline string holds valid UTF-8")
 }
 
 impl Rope {
@@ -99,6 +171,7 @@ impl Rope {
         let mut stack: Vec<&JsString> = vec![&self.right, &self.left];
         while let Some(part) = stack.pop() {
             match &part.0 {
+                Repr::Inline { meta, buf } => out.push_str(inline_str(buf, *meta)),
                 Repr::Utf8(s, _) => out.push_str(s),
                 Repr::Rope(r) => match r.flat.get() {
                     Some(f) => out.push_str(f),
@@ -118,9 +191,15 @@ impl Drop for Rope {
     /// Dismantle iteratively: dropping a chain of N appends must not recurse
     /// N deep through nested `Rc<Rope>` drops.
     fn drop(&mut self) {
-        let empty = EMPTY_RC_STR.with(|e| e.clone());
-        let take =
-            |slot: &mut JsString| std::mem::replace(slot, JsString(utf8_repr(empty.clone())));
+        let take = |slot: &mut JsString| {
+            std::mem::replace(
+                slot,
+                JsString(Repr::Inline {
+                    meta: INLINE_ASCII,
+                    buf: [0; INLINE_CAP],
+                }),
+            )
+        };
         let mut stack = vec![take(&mut self.left), take(&mut self.right)];
         while let Some(part) = stack.pop() {
             if let Repr::Rope(r) = part.0 {
@@ -169,9 +248,10 @@ impl Iterator for CodeUnits<'_> {
 
 impl JsString {
     /// Build from valid UTF-8 (the source of nearly every string: literals,
-    /// number/JSON conversions, host input). Always the cheap `Utf8` arm.
+    /// number/JSON conversions, host input). Short text stays inline —
+    /// allocation-free; longer text takes the `Utf8` arm.
     pub fn new(s: impl AsRef<str>) -> Self {
-        JsString(utf8_repr(Rc::from(s.as_ref())))
+        JsString(well_formed_repr(s.as_ref()))
     }
     /// Adopt an existing `Rc<str>` without reallocating — used for bytecode
     /// string-constant loads, which are a hot path.
@@ -183,9 +263,14 @@ impl JsString {
     pub fn from_code_units(units: &[u16]) -> Self {
         if crate::wtf8::is_well_formed(units) {
             // Well-formed ⇒ `from_utf16` cannot fail. The unit count is the
-            // input length — record it rather than rediscovering it later.
+            // input length — record it rather than rediscovering it later
+            // (inline strings recount on demand: ≤22 bytes).
+            let s = String::from_utf16_lossy(units);
+            if let Some(r) = inline_repr(&s) {
+                return JsString(r);
+            }
             JsString(Repr::Utf8(
-                Rc::from(String::from_utf16_lossy(units).as_str()),
+                Rc::from(s.as_str()),
                 std::cell::Cell::new(units.len() as u32),
             ))
         } else {
@@ -205,6 +290,7 @@ impl JsString {
     /// preserve surrogates use the code-unit API instead.
     pub fn as_str(&self) -> &str {
         match &self.0 {
+            Repr::Inline { meta, buf } => inline_str(buf, *meta),
             Repr::Utf8(s, _) => s,
             Repr::Wtf8(w) => &w.lossy,
             Repr::Rope(r) => r.flat.get_or_init(|| {
@@ -218,6 +304,7 @@ impl JsString {
     /// engine's string-size guard on every concatenation.
     pub fn byte_len(&self) -> usize {
         match &self.0 {
+            Repr::Inline { meta, .. } => inline_len(*meta),
             Repr::Utf8(s, _) => s.len(),
             Repr::Wtf8(w) => w.bytes.len(),
             Repr::Rope(r) => r.bytes,
@@ -226,6 +313,7 @@ impl JsString {
     /// Canonical well-formed WTF-8 bytes — the basis for equality and hashing.
     pub fn wtf8_bytes(&self) -> &[u8] {
         match &self.0 {
+            Repr::Inline { meta, buf } => &buf[..inline_len(*meta)],
             Repr::Utf8(s, _) => s.as_bytes(),
             Repr::Wtf8(w) => &w.bytes,
             // A rope is well-formed UTF-8; observing its bytes flattens once.
@@ -237,6 +325,15 @@ impl JsString {
     /// read in a loop condition must not rescan the string per iteration.
     pub fn len_utf16(&self) -> usize {
         match &self.0 {
+            // ≤22 bytes: recounting beats carrying a cache. Pure-ASCII (the
+            // common case) short-circuits to the byte length.
+            Repr::Inline { meta, buf } => {
+                if *meta & INLINE_ASCII != 0 {
+                    inline_len(*meta)
+                } else {
+                    inline_str(buf, *meta).chars().map(|c| c.len_utf16()).sum()
+                }
+            }
             Repr::Utf8(s, units) => {
                 let cached = units.get();
                 if cached != UNITS_UNKNOWN {
@@ -256,6 +353,9 @@ impl JsString {
     /// this, so the ASCII case must not walk the prefix per call.
     pub fn code_unit_at(&self, i: usize) -> Option<u16> {
         match &self.0 {
+            Repr::Inline { meta, buf } if *meta & INLINE_ASCII != 0 => {
+                buf[..inline_len(*meta)].get(i).map(|&b| b as u16)
+            }
             Repr::Utf8(s, units) if units.get() as usize == s.len() => {
                 s.as_bytes().get(i).map(|&b| b as u16)
             }
@@ -268,6 +368,7 @@ impl JsString {
     /// Iterate the UTF-16 code units.
     pub fn code_units(&self) -> CodeUnits<'_> {
         match &self.0 {
+            Repr::Inline { meta, buf } => CodeUnits::Utf8(inline_str(buf, *meta).encode_utf16()),
             Repr::Utf8(s, _) => CodeUnits::Utf8(s.encode_utf16()),
             Repr::Wtf8(w) => CodeUnits::Wtf8(crate::wtf8::decode_units(&w.bytes)),
             Repr::Rope(_) => CodeUnits::Utf8(self.as_str().encode_utf16()),
@@ -294,19 +395,20 @@ impl JsString {
     }
     /// `true` if the string contains no unpaired surrogate.
     pub fn is_well_formed(&self) -> bool {
-        matches!(self.0, Repr::Utf8(..) | Repr::Rope(_))
+        !matches!(self.0, Repr::Wtf8(_))
     }
     /// Replace every unpaired surrogate with U+FFFD (`String.prototype.toWellFormed`).
     pub fn to_well_formed(&self) -> JsString {
         match &self.0 {
-            Repr::Utf8(..) | Repr::Rope(_) => self.clone(),
             Repr::Wtf8(w) => JsString::new(&*w.lossy),
+            _ => self.clone(),
         }
     }
     /// The borrowed UTF-8 view IF this is a plain (non-rope, well-formed)
     /// string — O(1), never flattens a rope. `None` for ropes and WTF-8.
     pub fn as_flat_utf8(&self) -> Option<&str> {
         match &self.0 {
+            Repr::Inline { meta, buf } => Some(inline_str(buf, *meta)),
             Repr::Utf8(s, _) => Some(s),
             _ => None,
         }
@@ -317,6 +419,7 @@ impl JsString {
     /// a kernel's per-access reads — are O(1)). `None` for WTF-8 strings.
     pub fn flatten_utf8(&self) -> Option<&str> {
         match &self.0 {
+            Repr::Inline { meta, buf } => Some(inline_str(buf, *meta)),
             Repr::Utf8(s, _) => Some(s),
             Repr::Rope(_) => Some(self.as_str()),
             Repr::Wtf8(_) => None,
@@ -332,13 +435,21 @@ impl JsString {
             // enough to matter; eager copy below the threshold (small-string
             // behavior unchanged, no node overhead). This turns the
             // `s += chunk` build loop from O(total²) into O(total).
-            (Repr::Utf8(..) | Repr::Rope(_), Repr::Utf8(..) | Repr::Rope(_)) => {
+            (
+                Repr::Inline { .. } | Repr::Utf8(..) | Repr::Rope(_),
+                Repr::Inline { .. } | Repr::Utf8(..) | Repr::Rope(_),
+            ) => {
                 let (lb, rb) = (self.byte_len(), other.byte_len());
                 if lb == 0 {
                     return other.clone();
                 }
                 if rb == 0 {
                     return self.clone();
+                }
+                if lb + rb <= INLINE_CAP {
+                    // Small + small: assemble inline from the raw well-formed
+                    // bytes — no heap, no UTF-8 revalidation.
+                    return JsString(inline_from_wf_bytes(self.wtf8_bytes(), other.wtf8_bytes()));
                 }
                 if lb + rb >= ROPE_MIN_BYTES {
                     // `len_utf16` is O(1) for a rope child (stored), so the
@@ -397,7 +508,7 @@ impl From<&str> for JsString {
 }
 impl From<String> for JsString {
     fn from(s: String) -> Self {
-        JsString(utf8_repr(Rc::from(s.as_str())))
+        JsString(well_formed_repr(s.as_str()))
     }
 }
 

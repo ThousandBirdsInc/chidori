@@ -933,7 +933,7 @@ fn install_json(vm: &mut Vm) {
         holder
             .borrow_mut()
             .own_insert(PropertyKey::str(""), Property::data(value));
-        let mut out = String::with_capacity(128);
+        let mut out = Vec::with_capacity(128);
         let root_key = JsString::from("");
         if json_stringify(
             vm,
@@ -943,7 +943,12 @@ fn install_json(vm: &mut Vm) {
             &mut state,
             &mut out,
         )? {
-            Ok(Value::str(out))
+            // One shared byte buffer for the whole tree; every write above is
+            // either a well-formed-string slice or ASCII punctuation, so this
+            // single end-of-serialize validation cannot fail.
+            Ok(Value::str(
+                String::from_utf8(out).expect("JSON output is UTF-8"),
+            ))
         } else {
             Ok(Value::Undefined)
         }
@@ -1512,31 +1517,40 @@ impl<'a> JsonParser<'a> {
 /// need escaping — all single ASCII bytes — so the scan copies maximal
 /// clean RUNS (multi-byte UTF-8 included wholesale; every continuation byte
 /// is ≥ 0x80 and never matches) instead of pushing char by char.
-fn json_quote_into(s: &str, out: &mut String) {
-    out.push('"');
-    let bytes = s.as_bytes();
+fn json_quote_into(s: &JsString, out: &mut Vec<u8>) {
+    out.push(b'"');
+    // Well-formed strings (the inline/heap/rope arms) quote straight from
+    // their raw UTF-8 bytes — no re-validation; a WTF-8 string uses its
+    // stored lossy view, exactly as before.
+    let bytes: &[u8] = if s.is_well_formed() {
+        s.wtf8_bytes()
+    } else {
+        s.as_str().as_bytes()
+    };
     let mut run = 0usize;
     for (i, &c) in bytes.iter().enumerate() {
         if c == b'"' || c == b'\\' || c < 0x20 {
-            out.push_str(&s[run..i]);
+            out.extend_from_slice(&bytes[run..i]);
             match c {
-                b'"' => out.push_str("\\\""),
-                b'\\' => out.push_str("\\\\"),
-                b'\n' => out.push_str("\\n"),
-                b'\r' => out.push_str("\\r"),
-                b'\t' => out.push_str("\\t"),
-                0x08 => out.push_str("\\b"),
-                0x0c => out.push_str("\\f"),
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                0x08 => out.extend_from_slice(b"\\b"),
+                0x0c => out.extend_from_slice(b"\\f"),
                 c => {
-                    use std::fmt::Write;
-                    let _ = write!(out, "\\u{:04x}", c);
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    out.extend_from_slice(b"\\u00");
+                    out.push(HEX[(c >> 4) as usize]);
+                    out.push(HEX[(c & 0xf) as usize]);
                 }
             }
             run = i + 1;
         }
     }
-    out.push_str(&s[run..]);
-    out.push('"');
+    out.extend_from_slice(&bytes[run..]);
+    out.push(b'"');
 }
 
 /// SerializeJSONProperty: stringify `holder[key]` APPENDED to `out`,
@@ -1553,7 +1567,7 @@ fn json_stringify(
     key: &JsString,
     cur_indent: &str,
     state: &mut StringifyState,
-    out: &mut String,
+    out: &mut Vec<u8>,
 ) -> Result<bool, Value> {
     let mut value = vm.get_prop(holder, &PropertyKey::Str(key.clone()))?;
 
@@ -1618,23 +1632,27 @@ fn json_stringify(
         | Value::Symbol(_)
         | Value::BigInt(_) => false,
         Value::Null => {
-            out.push_str("null");
+            out.extend_from_slice(b"null");
             true
         }
         Value::Bool(b) => {
-            out.push_str(if *b { "true" } else { "false" });
+            out.extend_from_slice(if *b {
+                b"true".as_slice()
+            } else {
+                b"false".as_slice()
+            });
             true
         }
         Value::Number(n) => {
             if n.is_finite() {
-                crate::vm::push_number_string(*n, out);
+                crate::vm::push_number_bytes(*n, out);
             } else {
-                out.push_str("null");
+                out.extend_from_slice(b"null");
             }
             true
         }
         Value::String(s) => {
-            json_quote_into(s.as_str(), out);
+            json_quote_into(s, out);
             true
         }
         Value::Object(o) => {
@@ -1661,21 +1679,21 @@ fn json_stringify(
                 // fires) and ToLength; elements go through [[Get]] too.
                 let len_v = vm.get_prop(&value, &PropertyKey::str("length"))?;
                 let len = vm.to_length(&len_v)?;
-                out.push('[');
+                out.push(b'[');
                 if len != 0 {
                     for i in 0..len {
                         if i > 0 {
-                            out.push(',');
+                            out.push(b',');
                         }
-                        out.push_str(&nl);
+                        out.extend_from_slice(nl.as_bytes());
                         let k = JsString::from(i.to_string());
                         if !json_stringify(vm, &value, &k, &new_indent, state, out)? {
-                            out.push_str("null");
+                            out.extend_from_slice(b"null");
                         }
                     }
-                    out.push_str(&close_nl);
+                    out.extend_from_slice(close_nl.as_bytes());
                 }
-                out.push(']');
+                out.push(b']');
             } else {
                 // Property key list: the allowlist if present, else all enumerable
                 // own string keys.
@@ -1692,7 +1710,7 @@ fn json_stringify(
                         })
                         .collect()
                 };
-                out.push('{');
+                out.push(b'{');
                 let mut first = true;
                 for k in keys {
                     // Write the member prefix, then the value; an OMITTED
@@ -1701,12 +1719,12 @@ fn json_stringify(
                     // replacer) still ran — exactly as the spec orders.
                     let mark = out.len();
                     if !first {
-                        out.push(',');
+                        out.push(b',');
                     }
-                    out.push_str(&nl);
-                    json_quote_into(k.as_str(), out);
-                    out.push(':');
-                    out.push_str(sp);
+                    out.extend_from_slice(nl.as_bytes());
+                    json_quote_into(&k, out);
+                    out.push(b':');
+                    out.extend_from_slice(sp.as_bytes());
                     if json_stringify(vm, &value, &k, &new_indent, state, out)? {
                         first = false;
                     } else {
@@ -1714,9 +1732,9 @@ fn json_stringify(
                     }
                 }
                 if !first {
-                    out.push_str(&close_nl);
+                    out.extend_from_slice(close_nl.as_bytes());
                 }
-                out.push('}');
+                out.push(b'}');
             }
             state.seen.pop();
             true

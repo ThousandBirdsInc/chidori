@@ -2322,6 +2322,32 @@ pub fn push_number_string(n: f64, out: &mut String) {
     }
 }
 
+/// [`push_number_string`] writing into a byte buffer (the JSON serializer's
+/// single UTF-8 output buffer): same output, no intermediate `String` on the
+/// integer fast path.
+pub fn push_number_bytes(n: f64, out: &mut Vec<u8>) {
+    if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_992.0 {
+        let mut i = n as i64; // -0.0 casts to 0: prints "0" like the spec
+        if i < 0 {
+            out.push(b'-');
+            i = -i;
+        }
+        let mut buf = [0u8; 16]; // 2^53 has 16 digits
+        let mut p = buf.len();
+        loop {
+            p -= 1;
+            buf[p] = b'0' + (i % 10) as u8;
+            i /= 10;
+            if i == 0 {
+                break;
+            }
+        }
+        out.extend_from_slice(&buf[p..]);
+    } else {
+        out.extend_from_slice(number_to_string(n).as_bytes());
+    }
+}
+
 /// ECMAScript Number::toString (radix 10).
 pub fn number_to_string(n: f64) -> String {
     if n.is_nan() {
