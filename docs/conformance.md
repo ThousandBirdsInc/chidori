@@ -39,7 +39,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 39837  fail 357  skip 7097  =>  99.11% of executed
+  pass 40556  fail 208  skip 6527  =>  99.49% of executed
 ```
 
 ## Current result
@@ -49,10 +49,16 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 39,837 | 357 | 7,097 | **99.11%** |
+| chidori pure-Rust engine, bare context | 40,556 | 208 | 6,527 | **99.49%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
+
+Recently promoted out of the skip list (implemented and now held to
+account): iterator helpers, `Array.fromAsync`, `Uint8Array` base64/hex, and
+duplicate named capture groups. `built-ins/RegExp`, `built-ins/Promise`,
+`built-ins/Function`, `built-ins/Array`, `built-ins/TypedArray`, and the
+whole iterator/async-iterator surface each pass 100% of executed tests.
 
 ## What is measured, and why "bare context"
 

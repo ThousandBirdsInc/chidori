@@ -57,6 +57,14 @@ pub fn install(vm: &mut Vm) {
         // surrogates are preserved exactly (`JsString::from_code_units` takes
         // the WTF-8 arm when needed) — the property-escape sweeps build their
         // surrogate test strings through here.
+        //
+        // Known residual gap: source text handed to `eval` flows through the
+        // UTF-8 oxc front end, which cannot carry a lone surrogate, so
+        // `eval("/" + String.fromCharCode(0xD800) + "/").source` yields
+        // U+FFFD and no longer round-trips (the four
+        // `language/literals/regexp/S7.8.5_*_T2` tests, which previously
+        // "passed" only because BOTH sides were lossy). Fixing that means a
+        // WTF-8-aware source pipeline, tracked as out of scope here.
         let mut units: Vec<u16> = Vec::with_capacity(args.len());
         for a in args {
             units.push(vm.to_uint32(a)? as u16);
