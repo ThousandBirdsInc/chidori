@@ -2920,6 +2920,60 @@ mod tests {
     }
 
     #[test]
+    fn run_agent_node_path_win32_table_is_real() {
+        // `path.win32` is a real win32 implementation, not an alias of posix:
+        // backslash separator, `;` delimiter, drive letters, drive-relative
+        // paths and UNC roots. The module default stays posix (the chidori VFS
+        // is posix), and `node:path/win32` serves the same object.
+        let out = run_compute_agent(
+            "node-path-win32",
+            r#"
+            import path from "node:path";
+            import win32, { join as win32Join } from "node:path/win32";
+            export async function agent() {
+                return {
+                    sep: path.win32.sep,
+                    delimiter: path.win32.delimiter,
+                    defaultSep: path.sep,
+                    join: path.win32.join("C:\\foo", "..", "bar\\baz.txt"),
+                    unc: path.win32.join("//server", "share"),
+                    driveRelative: path.win32.normalize("C:..\\abc"),
+                    resolve: path.win32.resolve("c:/blah\\blah", "d:/games", "c:../a"),
+                    isAbsolute: path.win32.isAbsolute("C:\\x"),
+                    driveNotAbsolute: path.win32.isAbsolute("C:x"),
+                    parsedRoot: path.win32.parse("\\\\server\\share\\file").root,
+                    namespaced: path.win32.toNamespacedPath("C:\\foo"),
+                    relative: path.win32.relative("c:/AaAa/bbbb", "c:/aaaa/cccc"),
+                    posixUntouched: path.join("/a", "b\\c"),
+                    subpathSame: win32 === path.win32,
+                    subpathJoin: win32Join("C:\\a", "b"),
+                    selfAlias: path.win32.win32 === path.win32,
+                    crossAlias: path.win32.posix === path.posix,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["sep"], serde_json::json!("\\"));
+        assert_eq!(out["delimiter"], serde_json::json!(";"));
+        assert_eq!(out["defaultSep"], serde_json::json!("/"));
+        assert_eq!(out["join"], serde_json::json!("C:\\bar\\baz.txt"));
+        assert_eq!(out["unc"], serde_json::json!("\\\\server\\share\\"));
+        assert_eq!(out["driveRelative"], serde_json::json!("C:..\\abc"));
+        assert_eq!(out["resolve"], serde_json::json!("c:\\blah\\a"));
+        assert_eq!(out["isAbsolute"], serde_json::json!(true));
+        assert_eq!(out["driveNotAbsolute"], serde_json::json!(false));
+        assert_eq!(out["parsedRoot"], serde_json::json!("\\\\server\\share\\"));
+        assert_eq!(out["namespaced"], serde_json::json!("\\\\?\\C:\\foo"));
+        assert_eq!(out["relative"], serde_json::json!("..\\cccc"));
+        // The posix table keeps treating a backslash as an ordinary character.
+        assert_eq!(out["posixUntouched"], serde_json::json!("/a/b\\c"));
+        assert_eq!(out["subpathSame"], serde_json::json!(true));
+        assert_eq!(out["subpathJoin"], serde_json::json!("C:\\a\\b"));
+        assert_eq!(out["selfAlias"], serde_json::json!(true));
+        assert_eq!(out["crossAlias"], serde_json::json!(true));
+    }
+
+    #[test]
     fn run_agent_node_events_emitter_surface() {
         let out = run_compute_agent(
             "node-events",
