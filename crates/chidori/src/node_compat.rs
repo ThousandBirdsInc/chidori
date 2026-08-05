@@ -102,6 +102,34 @@ const __common = {
         });
     },
     mustNotMutateObjectDeep(value) { return value; },
+    // Mirrors Node's helper: every typed-array/DataView view over the same
+    // bytes, skipping constructors the engine lacks or lengths that don't
+    // divide evenly.
+    getArrayBufferViews(buf) {
+        const out = [];
+        const ctors = [
+            globalThis.Uint8Array, globalThis.Int8Array, globalThis.Uint8ClampedArray,
+            globalThis.Uint16Array, globalThis.Int16Array,
+            globalThis.Uint32Array, globalThis.Int32Array,
+            globalThis.Float32Array, globalThis.Float64Array,
+            globalThis.BigInt64Array, globalThis.BigUint64Array,
+            globalThis.DataView,
+        ];
+        for (const ctor of ctors) {
+            if (typeof ctor !== "function") continue;
+            const bytesPer = ctor === globalThis.DataView ? 1 : ctor.BYTES_PER_ELEMENT;
+            if (buf.byteLength % bytesPer !== 0) continue;
+            if (ctor === globalThis.DataView) {
+                out.push(new ctor(buf.buffer, buf.byteOffset, buf.byteLength));
+            } else {
+                out.push(new ctor(buf.buffer, buf.byteOffset, buf.byteLength / bytesPer));
+            }
+        }
+        return out;
+    },
+    getBufferSources(buf) {
+        return [...__common.getArrayBufferViews(buf), buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)];
+    },
     skip(message) { throw { __chidori_skip: String(message || "skipped") }; },
     printSkipMessage() {},
     expectsError(settings) {
