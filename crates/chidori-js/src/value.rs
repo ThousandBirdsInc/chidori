@@ -1579,6 +1579,7 @@ impl ObjectData {
             Internal::Proxy(_) => "Proxy",
             Internal::ModuleNamespace(_) => "Module",
             Internal::Temporal(_) => "Temporal",
+            Internal::IteratorHelper(_) => "Object",
         }
     }
 }
@@ -1634,6 +1635,47 @@ pub enum Internal {
     /// slot holds the immutable backing value (no JS references, so the GC
     /// treats it as a leaf).
     Temporal(Box<TemporalSlot>),
+    /// An Iterator Helper (`Iterator.prototype.map/filter/take/drop/flatMap`
+    /// result) or an `Iterator.from` wrapper: a generator-like object driving
+    /// an underlying iterator record through one transformation.
+    IteratorHelper(Box<IteratorHelperData>),
+}
+
+/// State backing an `Internal::IteratorHelper` object.
+pub struct IteratorHelperData {
+    /// Underlying iterator record: the iterator object and its `next` method
+    /// captured at helper creation (GetIteratorDirect).
+    pub iter: Value,
+    pub next: Value,
+    /// Helper completed (a done result was produced, an error unwound it, or
+    /// `return()` closed it).
+    pub done: bool,
+    /// Re-entrancy guard — resuming a helper from inside its own callback
+    /// throws, matching generator semantics.
+    pub running: bool,
+    /// Zero-based count of values taken from the underlying iterator, passed
+    /// as the second callback argument for map/filter/flatMap.
+    pub counter: f64,
+    pub kind: HelperKind,
+}
+
+/// Which transformation an iterator helper applies.
+pub enum HelperKind {
+    /// `map(mapper)`.
+    Map(Value),
+    /// `filter(predicate)`.
+    Filter(Value),
+    /// `take(limit)`: values remaining to yield (integer or +∞).
+    Take(f64),
+    /// `drop(limit)`: values still to skip (integer or +∞).
+    Drop(f64),
+    /// `flatMap(mapper)`: `inner` is the live inner iterator record, if any.
+    FlatMap {
+        mapper: Value,
+        inner: Option<(Value, Value)>,
+    },
+    /// `Iterator.from` wrap: forwards `next`/`return` to the record verbatim.
+    Wrap,
 }
 
 /// The backing value of a `Temporal.*` object (see `Internal::Temporal`).

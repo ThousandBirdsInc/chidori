@@ -3164,7 +3164,12 @@ impl Vm {
                 Err(self.throw_type(&format!("{n} is not a constructor")))
             }
             Disp::Native(c) => {
-                let r = c(self, Value::Undefined, args)?;
+                // Stash new.target for hooks that need it (the abstract
+                // `Iterator` constructor); overwritten per native construct.
+                self.native_new_target = Some(new_target.clone());
+                let r = c(self, Value::Undefined, args);
+                self.native_new_target = None;
+                let r = r?;
                 // GetPrototypeFromConstructor: when constructed via a different
                 // new.target (a subclass `super()` or Reflect.construct), the
                 // fresh instance's [[Prototype]] comes from new_target.prototype

@@ -248,6 +248,12 @@ pub struct Vm {
     pub host: Option<Box<dyn crate::host::HostDispatch>>,
     /// Collected console output (for tests / capture).
     pub console_log: Vec<String>,
+    /// The `new.target` for the native-constructor hook currently being
+    /// invoked, stashed by `construct_inner` immediately before the call.
+    /// Only hooks that need it (the abstract `Iterator` constructor) read
+    /// it; it is overwritten on every native construct, so stale values are
+    /// never observed.
+    pub(crate) native_new_target: Option<Value>,
     /// Unhandled rejections detected during the last drain.
     pub unhandled_rejections: Vec<Value>,
     /// PRNG state for `Math.random` when no host RNG is installed. Deterministic
@@ -438,6 +444,7 @@ impl Vm {
             next_host_id: 1,
             host: None,
             console_log: Vec::new(),
+            native_new_target: None,
             unhandled_rejections: Vec::new(),
             rng_state: 0x2545F4914F6CDD1D,
             op_budget: None,
@@ -2149,6 +2156,32 @@ fn break_internal_cycles(internal: &mut Internal, stack: &mut Vec<JsObject>) {
         Internal::Iterator(it) => {
             if let Some(t) = it.target.take() {
                 stack.push(t);
+            }
+        }
+        Internal::IteratorHelper(h) => {
+            let h = std::mem::replace(
+                h.as_mut(),
+                IteratorHelperData {
+                    iter: Value::Undefined,
+                    next: Value::Undefined,
+                    done: true,
+                    running: false,
+                    counter: 0.0,
+                    kind: HelperKind::Wrap,
+                },
+            );
+            push_dispose_obj(h.iter, stack);
+            push_dispose_obj(h.next, stack);
+            match h.kind {
+                HelperKind::Map(v) | HelperKind::Filter(v) => push_dispose_obj(v, stack),
+                HelperKind::FlatMap { mapper, inner } => {
+                    push_dispose_obj(mapper, stack);
+                    if let Some((i, n)) = inner {
+                        push_dispose_obj(i, stack);
+                        push_dispose_obj(n, stack);
+                    }
+                }
+                HelperKind::Take(_) | HelperKind::Drop(_) | HelperKind::Wrap => {}
             }
         }
         Internal::Function(f) => match f {

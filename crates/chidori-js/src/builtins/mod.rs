@@ -12,6 +12,7 @@ mod disposable;
 mod date;
 pub(crate) mod fundamental;
 mod intl;
+mod iterator_helpers;
 pub(crate) mod numbers;
 
 mod regexp_builtin;
@@ -37,6 +38,7 @@ pub const SECTIONS: &[(&str, fn(&mut Vm))] = &[
     ("string", string::install),
     ("regexp", regexp_builtin::install),
     ("collections", collections::install),
+    ("iterator", iterator_helpers::install),
     ("date", install_date_lazy),
     ("async", async_builtins::install),
     ("reflect", reflect::install),

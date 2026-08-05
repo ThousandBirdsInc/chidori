@@ -76,6 +76,12 @@ pub struct Realm {
     pub string_iterator_proto: JsObject,
     pub map_iterator_proto: JsObject,
     pub set_iterator_proto: JsObject,
+    /// %IteratorHelperPrototype% — the prototype of `map`/`filter`/`take`/
+    /// `drop`/`flatMap` helper objects.
+    pub iterator_helper_proto: JsObject,
+    /// %WrapForValidIteratorPrototype% — the prototype of `Iterator.from`
+    /// wrappers around foreign iterators.
+    pub wrap_valid_iterator_proto: JsObject,
     pub generator_proto: JsObject,
     pub async_generator_proto: JsObject,
     /// `%GeneratorFunction.prototype%` etc. — the `[[Prototype]]` of generator /
@@ -181,6 +187,8 @@ impl Realm {
             self.string_iterator_proto.clone(),
             self.map_iterator_proto.clone(),
             self.set_iterator_proto.clone(),
+            self.iterator_helper_proto.clone(),
+            self.wrap_valid_iterator_proto.clone(),
             self.generator_proto.clone(),
             self.async_generator_proto.clone(),
             self.generator_function_proto.clone(),
@@ -244,6 +252,8 @@ impl Realm {
             string_iterator_proto: bare(),
             map_iterator_proto: bare(),
             set_iterator_proto: bare(),
+            iterator_helper_proto: bare(),
+            wrap_valid_iterator_proto: bare(),
             generator_proto: bare(),
             async_generator_proto: bare(),
             generator_function_proto: bare(),
@@ -340,6 +350,8 @@ pub fn init_realm(vm: &mut Vm) {
         &vm.realm.set_iterator_proto,
         &vm.realm.generator_proto,
         &vm.realm.async_generator_proto,
+        &vm.realm.iterator_helper_proto,
+        &vm.realm.wrap_valid_iterator_proto,
     ] {
         set_proto(p, &ip);
     }
