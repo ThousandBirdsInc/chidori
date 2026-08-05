@@ -14,7 +14,7 @@
   "test-diagnostics-channel-safe-subscriber-errors.js": "fail",
   "test-diagnostics-channel-symbol-named.js": "fail",
   "test-event-emitter-add-listeners.js": "fail",
-  "test-event-emitter-emit-context.js": "fail",
+  "test-event-emitter-emit-context.js": "pass",
   "test-event-emitter-errors.js": "fail",
   "test-event-emitter-get-max-listeners.js": "pass",
   "test-event-emitter-listener-count.js": "pass",

@@ -1,0 +1,84 @@
+node-compat: fail test-assert-async.js JavaScript exception: Error: mustCall: expected exactly 1 call(s), got 0
+node-compat: fail test-assert-fail.js JavaScript exception: Error: node-compat: cannot require('node:test'): module not provided by the chidori runtime
+node-compat: fail test-assert.js JavaScript exception: Error: node-compat: cannot require('node:test'): module not provided by the chidori runtime
+node-compat: fail test-async-local-storage-bind.js JavaScript exception: AssertionError: Missing expected exception.
+node-compat: fail test-async-local-storage-snapshot.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-buffer-compare.js JavaScript exception: AssertionError: Missing expected exception.
+node-compat: fail test-buffer-concat.js JavaScript exception: TypeError: The "list" argument must be an instance of Array
+node-compat: fail test-buffer-from.js JavaScript exception: Error: vm.runInNewContext is not supported in the Chidori runtime (secondary evaluation contexts would bypass the determinism prelude and …
+node-compat: pass test-buffer-isencoding.js 
+node-compat: pass test-buffer-tojson.js 
+node-compat: pass test-diagnostics-channel-has-subscribers.js 
+node-compat: pass test-diagnostics-channel-pub-sub.js 
+node-compat: fail test-diagnostics-channel-safe-subscriber-errors.js JavaScript exception: Error: nope
+node-compat: fail test-diagnostics-channel-symbol-named.js JavaScript exception: AssertionError: Got unwanted exception.
+node-compat: fail test-event-emitter-add-listeners.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-event-emitter-emit-context.js JavaScript exception: AssertionError: Got unwanted exception.
+node-compat: fail test-event-emitter-errors.js JavaScript exception: Error: Unhandled error. (Accepts a string)
+node-compat: pass test-event-emitter-get-max-listeners.js 
+node-compat: pass test-event-emitter-listener-count.js 
+node-compat: pass test-event-emitter-listeners.js 
+node-compat: fail test-event-emitter-max-listeners.js JavaScript exception: AssertionError: Missing expected exception.
+node-compat: pass test-event-emitter-num-args.js 
+node-compat: pass test-event-emitter-once.js 
+node-compat: pass test-event-emitter-prepend.js 
+node-compat: fail test-event-emitter-remove-all-listeners.js JavaScript exception: Error: mustCall: expected exactly 1 call(s), got 0
+node-compat: fail test-event-emitter-remove-listeners.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-event-emitter-special-event-names.js JavaScript exception: Error: mustCall: expected exactly 1 call(s), got 0
+node-compat: fail test-event-emitter-subclass.js JavaScript exception: AssertionError: Assertion failed
+node-compat: pass test-event-emitter-symbols.js 
+node-compat: fail test-events-once.js JavaScript exception: Error: node-compat: cannot require('internal/event_target'): module not provided by the chidori runtime
+node-compat: fail test-module-isBuiltin.js JavaScript exception: AssertionError: The expression evaluated to a falsy value:
+node-compat: pass test-net-isip.js 
+node-compat: pass test-net-isipv4.js 
+node-compat: pass test-net-isipv6.js 
+node-compat: fail test-path-basename.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-path-dirname.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-path-extname.js JavaScript exception: AssertionError:
+node-compat: fail test-path-isabsolute.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-path-join.js JavaScript exception: AssertionError:
+node-compat: fail test-path-normalize.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-path-parse-format.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-path-relative.js JavaScript exception: AssertionError:
+node-compat: skip test-path-resolve.js requires Node test-suite facility '../common/fixtures'
+node-compat: pass test-path-zero-length-strings.js 
+node-compat: fail test-path.js JavaScript exception: TypeError: Path "path" must be a string. Received boolean
+node-compat: fail test-process-env-allowed-flags.js JavaScript exception: TypeError: undefined is not a function
+node-compat: fail test-punycode.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-querystring-escape.js JavaScript exception: AssertionError: Assertion failed
+node-compat: pass test-querystring-maxKeys-non-finite.js 
+node-compat: pass test-querystring-multichar-separator.js 
+node-compat: fail test-querystring.js JavaScript exception: Error: vm.runInNewContext is not supported in the Chidori runtime (secondary evaluation contexts would bypass the determinism prelude and …
+node-compat: pass test-stream-duplex-writable-finished.js 
+node-compat: fail test-stream-passthrough-drain.js JavaScript exception: AssertionError: The expression evaluated to a falsy value:
+node-compat: pass test-stream-push-strings.js 
+node-compat: pass test-stream-readable-data.js 
+node-compat: fail test-stream-transform-callback-twice.js JavaScript exception: Error: mustCall: expected exactly 1 call(s), got 0
+node-compat: pass test-stream-writable-ended-state.js 
+node-compat: pass test-stream-writable-finished-state.js 
+node-compat: fail test-string-decoder-end.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-string-decoder.js JavaScript exception: TypeError: Class constructor StringDecoder cannot be invoked without 'new'
+node-compat: pass test-timers-clearImmediate.js 
+node-compat: fail test-timers-immediate-queue.js JavaScript exception: RangeError: execution budget exceeded
+node-compat: pass test-timers-same-timeout-wrong-list-deleted.js 
+node-compat: pass test-timers-zero-timeout.js 
+node-compat: fail test-url-fileurltopath.js JavaScript exception: Error: node-compat: cannot require('node:test'): module not provided by the chidori runtime
+node-compat: fail test-url-format-invalid-input.js JavaScript exception: Error: node-compat: cannot require('node:test'): module not provided by the chidori runtime
+node-compat: fail test-url-parse-format.js JavaScript exception: Error: node-compat: cannot require('node:test'): module not provided by the chidori runtime
+node-compat: fail test-url-pathtofileurl.js JavaScript exception: AssertionError: The expression evaluated to a falsy value:
+node-compat: fail test-url-relative.js JavaScript exception: TypeError: undefined is not a function
+node-compat: pass test-util-deprecate.js 
+node-compat: fail test-util-format.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-util-inherits.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-util-isDeepStrictEqual.js JavaScript exception: AssertionError: Assertion failed
+node-compat: fail test-util-promisify.js JavaScript exception: Error: node-compat: cannot require('internal/util'): module not provided by the chidori runtime
+node-compat: fail test-util-types.js JavaScript exception: Error: node-compat: cannot require('internal/test/binding'): module not provided by the chidori runtime
+node-compat: pass test-zlib-brotli-from-string.js 
+node-compat: skip test-zlib-brotli.js requires Node test-suite facility '../common/fixtures'
+node-compat: fail test-zlib-convenience-methods.js JavaScript exception: TypeError: undefined is not a function
+node-compat: fail test-zlib-deflate-constructors.js JavaScript exception: TypeError: undefined is not a function
+node-compat: pass test-zlib-empty-buffer.js 
+node-compat: fail test-zlib-not-string-or-buffer.js JavaScript exception: TypeError: zlib: unsupported input type (expected string, Buffer, typed array, or ArrayBuffer)
+node-compat: fail test-zlib-sync-no-event.js JavaScript exception: TypeError: not a constructor
+node-compat: fail test-zlib-zero-byte.js JavaScript exception: Error: node-compat: cannot require('node:test'): module not provided by the chidori runtime
+node-compat: expectations and docs/node-compat-report.md updated

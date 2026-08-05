@@ -106,6 +106,9 @@ const __common = {
     printSkipMessage() {},
     expectsError(settings) {
         const expected = settings || {};
+        // Returns true on match: Node's assert.throws treats a validator
+        // function's return value as the verdict, and the real
+        // common.expectsError returns true.
         return __common.mustCall(function (err) {
             if (expected.code !== undefined && err.code !== expected.code) {
                 throw new Error("expectsError: code " + err.code + " !== " + expected.code);
@@ -113,13 +116,43 @@ const __common = {
             if (expected.name !== undefined && err.name !== expected.name) {
                 throw new Error("expectsError: name " + err.name + " !== " + expected.name);
             }
+            if (expected.message instanceof RegExp && !expected.message.test(err.message)) {
+                throw new Error("expectsError: message " + err.message + " !~ " + expected.message);
+            }
+            if (typeof expected.message === "string" && err.message !== expected.message) {
+                throw new Error("expectsError: message " + err.message + " !== " + expected.message);
+            }
+            return true;
         });
     },
     expectWarning() {},
     allowGlobals() {},
     platformTimeout(t) { return t; },
     busyLoop() {},
-    invalidArgTypeHelper(input) { return " Received " + String(input); },
+    // Mirrors Node's test/common/index.js helper (which mirrors the runtime's
+    // ERR_INVALID_ARG_TYPE message tail) — several vendored tests build their
+    // expected error messages through it.
+    invalidArgTypeHelper(input) {
+        function inspectPrimitive(value) {
+            if (typeof value === "string") return "'" + value + "'";
+            if (typeof value === "bigint") return String(value) + "n";
+            if (typeof value === "symbol") return value.toString();
+            return String(value);
+        }
+        if (input === null || input === undefined) return " Received " + String(input);
+        if (typeof input === "function") {
+            return " Received function " + (input.name || "");
+        }
+        if (typeof input === "object") {
+            if (input.constructor && input.constructor.name) {
+                return " Received an instance of " + input.constructor.name;
+            }
+            return " Received " + Object.prototype.toString.call(input);
+        }
+        let inspected = inspectPrimitive(input);
+        if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+        return " Received type " + typeof input + " (" + inspected + ")";
+    },
     canCreateSymLink() { return false; },
     hasCrypto: true,
     hasIntl: false,
