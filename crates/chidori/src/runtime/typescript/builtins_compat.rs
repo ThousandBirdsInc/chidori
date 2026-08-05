@@ -517,13 +517,29 @@ const types = {
 export default types;
 "#;
 
-// node:path/win32 — the chidori VFS is posix-only, so `path.win32` has always
-// aliased the posix implementation (see the node:path shim); the subpath
-// module re-exports the same surface.
+// node:path/win32 — re-exports the real win32 table from the node:path shim
+// (backslash separator, `;` delimiter, drive letters, UNC roots). node:path's
+// own top-level surface stays posix because the chidori VFS is posix, so this
+// subpath cannot re-export node:path's named exports; it lifts them off the
+// `win32` object instead.
 const PATH_WIN32_SHIM: &str = r#"
-import path from "node:path";
-export { sep, delimiter, normalize, isAbsolute, join, resolve, dirname, basename, extname, relative, parse, format, posix, win32 } from "node:path";
-export default path;
+import { win32 as __win32 } from "node:path";
+export const sep = __win32.sep;
+export const delimiter = __win32.delimiter;
+export const normalize = __win32.normalize;
+export const isAbsolute = __win32.isAbsolute;
+export const join = __win32.join;
+export const resolve = __win32.resolve;
+export const relative = __win32.relative;
+export const toNamespacedPath = __win32.toNamespacedPath;
+export const dirname = __win32.dirname;
+export const basename = __win32.basename;
+export const extname = __win32.extname;
+export const format = __win32.format;
+export const parse = __win32.parse;
+export const posix = __win32.posix;
+export const win32 = __win32;
+export default __win32;
 "#;
 
 // node:sys — legacy alias of node:util.
