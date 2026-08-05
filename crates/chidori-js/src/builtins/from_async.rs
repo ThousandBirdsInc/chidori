@@ -219,13 +219,29 @@ pub(super) fn install(vm: &mut Vm) {
         debug_assert!(false, "Array.prototype.constructor missing");
         return;
     };
-    let Some(body) = instantiate(vm) else {
-        return;
-    };
+    // The self-hosted body compiles LAZILY, on the first `fromAsync` call:
+    // realm construction must not pay the script parse+evaluate (a fresh
+    // process would spend ~0.5 ms of cold oxc work on a function most
+    // programs never touch). The instantiated closure is memoized per realm
+    // in the cell below; behavior is indistinguishable because nothing about
+    // the body is observable until the first call.
+    let body_cell: std::rc::Rc<std::cell::RefCell<Option<Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     let f = vm.new_native("fromAsync", 1, move |vm, this, args| {
+        let cached = body_cell.borrow().clone();
+        let body = match cached {
+            Some(b) => b,
+            None => {
+                let Some(b) = instantiate(vm) else {
+                    return Err(vm.throw_type("Array.fromAsync failed to initialize"));
+                };
+                *body_cell.borrow_mut() = Some(b.clone());
+                b
+            }
+        };
         // The body is an async function: it never completes abruptly, so the
         // spec's "all errors reject the returned promise" holds by construction.
-        vm.call(body.clone(), this, args)
+        vm.call(body, this, args)
     });
     array_ctor.borrow_mut().own_insert(
         PropertyKey::str("fromAsync"),
