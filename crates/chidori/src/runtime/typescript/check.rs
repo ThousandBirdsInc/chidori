@@ -167,11 +167,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(pkg.join("index.js"), "export * from \"./impl.js\";\n").unwrap();
-        // `node:test` is a real Node builtin the runtime does not provide (the
-        // shim suite covers the module-loading builtins, not the test runner).
+        // `node:sqlite` is a real Node builtin the runtime does not provide
+        // (an embedded database is host state the determinism policy excludes).
         std::fs::write(
             pkg.join("impl.js"),
-            "import { test } from \"node:test\";\nexport const x = 1;\n",
+            "import { DatabaseSync } from \"node:sqlite\";\nexport const x = 1;\n",
         )
         .unwrap();
         std::fs::write(

@@ -91,6 +91,7 @@ pub const NODE_BUILTIN_ALLOWLIST: &[&str] = &[
     "stream/web",
     "string_decoder",
     "sys",
+    "test",
     "timers",
     "timers/promises",
     "tty",

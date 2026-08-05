@@ -91,7 +91,9 @@ const __common = {
         return __registerMustCall(fn, minimum === undefined ? 1 : minimum, "atLeast", "mustCallAtLeast");
     },
     mustNotCall(message) {
-        return function () {
+        // Named, exactly as Node's `test/common` names it: assertion messages
+        // that embed the expected function's `name` are compared verbatim.
+        return function mustNotCall() {
             throw new Error("mustNotCall violated: " + (message || "function should not have been called"));
         };
     },

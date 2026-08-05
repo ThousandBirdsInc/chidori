@@ -53,6 +53,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "stream/web",
     "string_decoder",
     "sys",
+    "test",
     "timers",
     "timers/promises",
     "tty",
@@ -3559,186 +3560,760 @@ export { URL, URLSearchParams, parse, format, fileURLToPath, pathToFileURL };
 export default { URL, URLSearchParams, parse, format, fileURLToPath, pathToFileURL };
 "##;
 
-// node:assert shim. The strict-mode variants are the defaults here (equal uses
-// ===), matching modern Node guidance; `assert/strict` re-exports the same
-// surface. Deep equality is a structural recursive compare adequate for plain
-// JSON-ish data, arrays, dates, and regexps.
+// node:assert shim, modelled on Node's `lib/assert.js`: vendored Node tests
+// match on error *shape*, so `AssertionError` carries `code`/`operator`/
+// `generatedMessage`, argument validation throws Node's `ERR_*` codes, and the
+// generated messages reuse Node's wording. Two deliberate simplifications:
+// `ok()` cannot quote the failing expression (the engine exposes no
+// source-position API for a call site) so it falls back to Node's
+// `<actual> == true` form, and the value diff is a common prefix/suffix
+// listing rather than Node's line-by-line LCS diff.
 const ASSERT_SHIM: &str = r#"
+const kNoException = Symbol("assert.noException");
+const kMaxShortLength = 14;
+
+const kReadableOperator = {
+    deepStrictEqual: "Expected values to be strictly deep-equal:",
+    strictEqual: "Expected values to be strictly equal:",
+    strictEqualObject: 'Expected "actual" to be reference-equal to "expected":',
+    deepEqual: "Expected values to be loosely deep-equal:",
+    notDeepStrictEqual: 'Expected "actual" not to be strictly deep-equal to:',
+    notStrictEqual: 'Expected "actual" to be strictly unequal to:',
+    notStrictEqualObject: 'Expected "actual" not to be reference-equal to "expected":',
+    notDeepEqual: 'Expected "actual" not to be loosely deep-equal to:',
+    notDeepEqualUnequal: "Expected values not to be loosely deep-equal:",
+    notIdentical: "Values have same structure but are not reference-equal:",
+};
+
+function isIdentifierKey(key) { return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key); }
+
+function isErrorValue(value) {
+    return value instanceof Error || Object.prototype.toString.call(value) === "[object Error]";
+}
+
+function ctorNameOf(value) {
+    const proto = Object.getPrototypeOf(value);
+    if (proto === null) return null;
+    const ctor = proto.constructor;
+    return ctor && typeof ctor.name === "string" ? ctor.name : "";
+}
+
+function inspectString(str) {
+    let quote = "'";
+    if (str.indexOf("'") !== -1) {
+        if (str.indexOf('"') === -1) quote = '"';
+        else if (str.indexOf("`") === -1) quote = "`";
+    }
+    let out = quote;
+    for (let i = 0; i < str.length; i++) {
+        const ch = str[i];
+        const code = str.charCodeAt(i);
+        if (ch === quote || ch === "\\") out += "\\" + ch;
+        else if (ch === "\n") out += "\\n";
+        else if (ch === "\r") out += "\\r";
+        else if (ch === "\t") out += "\\t";
+        else if (code < 0x20 || code === 0x7f) out += "\\x" + code.toString(16).padStart(2, "0");
+        else out += ch;
+    }
+    return out + quote;
+}
+
+// `compact` mirrors Node's default `util.inspect` (single-line, insertion
+// order); the multi-line, key-sorted form is what `assert` uses to build its
+// diffs (Node's `inspectValue`, i.e. `{ compact: false, sorted: true }`).
+function inspectAny(value, compact, depth, seen) {
+    const kind = typeof value;
+    if (kind === "string") return inspectString(value);
+    if (kind === "symbol") return String(value);
+    if (kind === "bigint") return String(value) + "n";
+    if (kind === "function") {
+        return value.name ? "[Function: " + value.name + "]" : "[Function (anonymous)]";
+    }
+    if (value === null) return "null";
+    if (kind !== "object") return String(value);
+    if (seen.indexOf(value) !== -1) return "[Circular *1]";
+    if (value instanceof RegExp) return String(value);
+    if (value instanceof Date) {
+        return Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
+    }
+    if (isErrorValue(value)) {
+        const name = value.name === undefined ? "Error" : String(value.name);
+        const message = value.message === undefined ? "" : String(value.message);
+        return "[" + (message ? name + ": " + message : name) + "]";
+    }
+    if (depth > 4) return Array.isArray(value) ? "[Array]" : "[Object]";
+
+    const next = seen.concat([value]);
+    const entries = [];
+    let open = "{";
+    let close = "}";
+    let prefix = "";
+    if (Array.isArray(value)) {
+        open = "[";
+        close = "]";
+        for (let i = 0; i < value.length; i++) {
+            entries.push(inspectAny(value[i], compact, depth + 1, next));
+        }
+        for (const key of Object.keys(value)) {
+            if (!/^\d+$/.test(key)) {
+                entries.push(formatKey(key) + ": " + inspectAny(value[key], compact, depth + 1, next));
+            }
+        }
+    } else if (value instanceof Map) {
+        prefix = "Map(" + value.size + ") ";
+        for (const entry of value) {
+            entries.push(
+                inspectAny(entry[0], compact, depth + 1, next) + " => " +
+                inspectAny(entry[1], compact, depth + 1, next)
+            );
+        }
+    } else if (value instanceof Set) {
+        prefix = "Set(" + value.size + ") ";
+        for (const entry of value) entries.push(inspectAny(entry, compact, depth + 1, next));
+    } else if (ArrayBuffer.isView(value) && typeof value.length === "number") {
+        prefix = ctorNameOf(value) + "(" + value.length + ") ";
+        open = "[";
+        close = "]";
+        for (let i = 0; i < value.length; i++) entries.push(String(value[i]));
+    } else {
+        const name = ctorNameOf(value);
+        if (name === null) prefix = "[Object: null prototype] ";
+        else if (name && name !== "Object") prefix = name + " ";
+        const keys = Object.keys(value);
+        if (!compact) keys.sort();
+        for (const key of keys) {
+            entries.push(formatKey(key) + ": " + inspectAny(value[key], compact, depth + 1, next));
+        }
+        for (const sym of Object.getOwnPropertySymbols(value)) {
+            if (Object.prototype.propertyIsEnumerable.call(value, sym)) {
+                entries.push("[" + String(sym) + "]: " + inspectAny(value[sym], compact, depth + 1, next));
+            }
+        }
+    }
+    if (entries.length === 0) return prefix + open + close;
+    if (compact) return prefix + open + " " + entries.join(", ") + " " + close;
+    const indent = "  ".repeat(depth + 1);
+    return prefix + open + "\n" + indent + entries.join(",\n" + indent) + "\n" + "  ".repeat(depth) + close;
+}
+
+function formatKey(key) { return isIdentifierKey(key) ? key : inspectString(key); }
+function inspect(value) { return inspectAny(value, true, 0, []); }
+function inspectValue(value) { return inspectAny(value, false, 0, []); }
+// Node renders the *thrown* value at `depth: -1` when naming it in a message.
+function inspectShallow(value) {
+    if (value !== null && typeof value === "object") return Array.isArray(value) ? "[Array]" : "[Object]";
+    return inspect(value);
+}
+
+function determineSpecificType(value) {
+    if (value === null || value === undefined) return String(value);
+    if (typeof value === "function" && value.name) return "function " + value.name;
+    if (typeof value === "object") {
+        const name = ctorNameOf(value);
+        return name ? "an instance of " + name : inspect(value);
+    }
+    let inspected = inspect(value);
+    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+    return "type " + typeof value + " (" + inspected + ")";
+}
+
+function codedTypeError(code, message) {
+    const err = new TypeError(message);
+    err.code = code;
+    err.stack = "TypeError [" + code + "]: " + message;
+    return err;
+}
+function invalidArgType(name, expectation, value) {
+    return codedTypeError(
+        "ERR_INVALID_ARG_TYPE",
+        'The "' + name + '" argument must be ' + expectation + ". Received " + determineSpecificType(value)
+    );
+}
+function invalidReturnValue(name, value) {
+    return codedTypeError(
+        "ERR_INVALID_RETURN_VALUE",
+        'Expected instance of Promise to be returned from the "' + name +
+        '" function but got ' + determineSpecificType(value) + "."
+    );
+}
+function invalidArgValue(name, value, reason) {
+    return codedTypeError(
+        "ERR_INVALID_ARG_VALUE",
+        "The argument '" + name + "' " + reason + ". Received " + inspect(value)
+    );
+}
+function ambiguousArgument(name, details) {
+    return codedTypeError("ERR_AMBIGUOUS_ARGUMENT", 'The "' + name + '" argument is ambiguous. ' + details);
+}
+function missingArgs() {
+    return codedTypeError("ERR_MISSING_ARGS", 'The "actual" and "expected" arguments must be specified');
+}
+
+function diffLines(actualLines, expectedLines, header, indicator) {
+    let prefix = 0;
+    while (prefix < actualLines.length && prefix < expectedLines.length &&
+           actualLines[prefix] === expectedLines[prefix]) prefix++;
+    let suffix = 0;
+    while (suffix < actualLines.length - prefix && suffix < expectedLines.length - prefix &&
+           actualLines[actualLines.length - 1 - suffix] === expectedLines[expectedLines.length - 1 - suffix]) suffix++;
+
+    const out = [];
+    let skipped = false;
+    if (prefix > 7) {
+        for (let i = 0; i < 5; i++) out.push("  " + actualLines[i]);
+        out.push("...");
+        out.push("  " + actualLines[prefix - 1]);
+        skipped = true;
+    } else {
+        for (let i = 0; i < prefix; i++) out.push("  " + actualLines[i]);
+    }
+    for (let i = prefix; i < actualLines.length - suffix; i++) out.push("+ " + actualLines[i]);
+    for (let i = prefix; i < expectedLines.length - suffix; i++) out.push("- " + expectedLines[i]);
+    for (let i = actualLines.length - suffix; i < actualLines.length; i++) out.push("  " + actualLines[i]);
+    return header + "\n+ actual - expected" + (skipped ? "\n... Skipped lines" : "") +
+        "\n\n" + out.join("\n") + indicator + "\n";
+}
+
+function createErrDiff(actual, expected, operator) {
+    const actualLines = inspectValue(actual).split("\n");
+    const expectedLines = inspectValue(expected).split("\n");
+    if (operator === "strictEqual" &&
+        typeof actual === "object" && actual !== null &&
+        typeof expected === "object" && expected !== null) {
+        operator = "strictEqualObject";
+    }
+    if (actualLines.join("\n") === expectedLines.join("\n")) {
+        return kReadableOperator.notIdentical + "\n\n" + actualLines.join("\n") + "\n";
+    }
+    let indicator = "";
+    if (actualLines.length === 1 && expectedLines.length === 1) {
+        const inputLength = actualLines[0].length + expectedLines[0].length;
+        if (inputLength <= kMaxShortLength) {
+            if ((typeof actual !== "object" || actual === null) &&
+                (typeof expected !== "object" || expected === null) &&
+                (actual !== 0 || expected !== 0)) {
+                return kReadableOperator[operator] + "\n\n" + actualLines[0] + " !== " + expectedLines[0] + "\n";
+            }
+        } else if (operator !== "strictEqualObject" && inputLength <= 80) {
+            let i = 0;
+            while (i < actualLines[0].length && actualLines[0][i] === expectedLines[0][i]) i++;
+            if (i > 2) indicator = "\n  " + " ".repeat(i) + "^";
+        }
+    }
+    return diffLines(actualLines, expectedLines, kReadableOperator[operator], indicator);
+}
+
+function generateMessage(operator, actual, expected) {
+    if (operator === "deepStrictEqual" || operator === "strictEqual") {
+        return createErrDiff(actual, expected, operator);
+    }
+    if (operator === "notDeepStrictEqual" || operator === "notStrictEqual") {
+        let base = kReadableOperator[operator];
+        if (operator === "notStrictEqual" &&
+            ((typeof actual === "object" && actual !== null) || typeof actual === "function")) {
+            base = kReadableOperator.notStrictEqualObject;
+        }
+        const lines = inspectValue(actual).split("\n");
+        if (lines.length > 50) {
+            lines[46] = "...";
+            while (lines.length > 47) lines.pop();
+        }
+        if (lines.length === 1) return base + (lines[0].length > 5 ? "\n\n" : " ") + lines[0];
+        return base + "\n\n" + lines.join("\n") + "\n";
+    }
+    const res = inspectValue(actual);
+    const other = inspectValue(expected);
+    const known = kReadableOperator[operator];
+    if (operator === "notDeepEqual" && res === other) return known + "\n\n" + res;
+    if (operator === "deepEqual") return known + "\n\n" + res + "\n\nshould loosely deep-equal\n\n" + other;
+    const unequal = kReadableOperator[operator + "Unequal"];
+    if (unequal) return unequal + "\n\n" + res + "\n\nshould not loosely deep-equal\n\n" + other;
+    return res + " " + operator + " " + other;
+}
+
 class AssertionError extends Error {
     constructor(options) {
-        const opts = options || {};
-        super(opts.message || "Assertion failed");
+        if (options === null || typeof options !== "object") {
+            throw invalidArgType("options", "of type object", options);
+        }
+        const operator = options.operator;
+        const actual = options.actual;
+        const expected = options.expected;
+        let generatedMessage = false;
+        let text;
+        if (options.message === undefined || options.message === null) {
+            generatedMessage = true;
+            text = generateMessage(operator, actual, expected);
+        } else {
+            text = String(options.message);
+        }
+        super(text);
         this.name = "AssertionError";
         this.code = "ERR_ASSERTION";
-        this.actual = opts.actual;
-        this.expected = opts.expected;
-        this.operator = opts.operator;
+        this.generatedMessage = generatedMessage;
+        this.actual = actual;
+        this.expected = expected;
+        this.operator = operator;
+        // The engine builds `stack` once, at construction, from the message and
+        // the *base* Error name; restate it so tests that match on `stack`
+        // (`/Failed/`, `!stack.includes('at Function.throws')`) see Node's text.
+        this.stack = "AssertionError [ERR_ASSERTION]: " + text;
     }
 }
 
-function fail(actual, expected, message, operator) {
-    if (arguments.length === 1) { throw new AssertionError({ message: actual }); }
-    if (message instanceof Error) throw message;
-    throw new AssertionError({ message, actual, expected, operator: operator || "fail" });
+// Node's async assertions keep their own frame in the stack — only the
+// synchronous internals are elided by `stackStartFn` — and vendored tests
+// match on it (`assert.match(err.stack, /rejects/)`).
+function markAsyncFrame(err, name) {
+    if (err instanceof AssertionError && typeof err.stack === "string" &&
+        err.stack.indexOf("at async " + name) === -1) {
+        err.stack += "\n    at async " + name + " (node:internal/assert)";
+    }
+    return err;
 }
 
-function ok(value, message) {
-    if (!value) {
-        throw new AssertionError({ message: message || `The expression evaluated to a falsy value:`, actual: value, expected: true, operator: "==" });
-    }
+function innerFail(options) {
+    if (options.message instanceof Error) throw options.message;
+    throw new AssertionError(options);
 }
 
-function deepEqualImpl(a, b, strict, seen) {
-    if (strict ? a === b : a == b) return true;
-    if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
-        if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
-        return !strict && a == b;
+function ownEnumerableKeys(value) {
+    const keys = Object.keys(value);
+    for (const sym of Object.getOwnPropertySymbols(value)) {
+        if (Object.prototype.propertyIsEnumerable.call(value, sym)) keys.push(sym);
     }
-    if (a instanceof Date || b instanceof Date) {
-        return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
+    return keys;
+}
+
+function bytesEqual(a, b) {
+    if (a.byteLength !== b.byteLength) return false;
+    const va = new Uint8Array(a.buffer || a, a.buffer ? a.byteOffset : 0, a.byteLength);
+    const vb = new Uint8Array(b.buffer || b, b.buffer ? b.byteOffset : 0, b.byteLength);
+    for (let i = 0; i < va.length; i++) if (va[i] !== vb[i]) return false;
+    return true;
+}
+
+// `seenA`/`seenB` are parallel plain arrays rather than a Map: the snapshot
+// policy keeps recursion state cheap to clone across the comparison.
+function isDeepEqual(a, b, strict, seenA, seenB) {
+    if (strict ? Object.is(a, b) : a === b) return true;
+
+    const aObj = a !== null && typeof a === "object";
+    const bObj = b !== null && typeof b === "object";
+    if (!aObj || !bObj) {
+        if (strict) return false;
+        if (typeof a === "number" && typeof b === "number") {
+            return Number.isNaN(a) && Number.isNaN(b);
+        }
+        return a == b;
     }
-    if (a instanceof RegExp || b instanceof RegExp) {
-        return a instanceof RegExp && b instanceof RegExp && a.source === b.source && a.flags === b.flags;
+
+    if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+
+    const tag = Object.prototype.toString.call(a);
+    if (tag !== Object.prototype.toString.call(b)) return false;
+
+    if (tag === "[object Date]") return Object.is(a.getTime(), b.getTime());
+    if (tag === "[object RegExp]") return a.source === b.source && a.flags === b.flags;
+    if (tag === "[object Number]" || tag === "[object String]" || tag === "[object Boolean]") {
+        if (!Object.is(a.valueOf(), b.valueOf())) return false;
     }
-    // Plain-array cycle guard: the snapshot policy disables Set/WeakSet, so we
-    // track visited objects in an array we carry through the recursion.
-    seen = seen || [];
-    if (seen.indexOf(a) !== -1) return true;
-    seen.push(a);
-    if (Array.isArray(a) !== Array.isArray(b)) return false;
-    const ka = Object.keys(a);
-    const kb = Object.keys(b);
+    if (tag === "[object Symbol]" || tag === "[object BigInt]") {
+        if (a.valueOf() !== b.valueOf()) return false;
+    }
+    if (isErrorValue(a) && (a.name !== b.name || a.message !== b.message)) return false;
+    if (ArrayBuffer.isView(a)) return bytesEqual(a, b);
+    if (tag === "[object ArrayBuffer]") return bytesEqual(a, b);
+    if (Array.isArray(a) && a.length !== b.length) return false;
+
+    seenA = seenA || [];
+    seenB = seenB || [];
+    const seenIndex = seenA.indexOf(a);
+    if (seenIndex !== -1) return seenB[seenIndex] === b;
+    const nextA = seenA.concat([a]);
+    const nextB = seenB.concat([b]);
+
+    if (a instanceof Map) {
+        if (a.size !== b.size) return false;
+        for (const entry of a) {
+            if (b.has(entry[0])) {
+                if (!isDeepEqual(entry[1], b.get(entry[0]), strict, nextA, nextB)) return false;
+                continue;
+            }
+            let found = false;
+            for (const other of b) {
+                if (isDeepEqual(entry[0], other[0], strict, nextA, nextB) &&
+                    isDeepEqual(entry[1], other[1], strict, nextA, nextB)) { found = true; break; }
+            }
+            if (!found) return false;
+        }
+    } else if (a instanceof Set) {
+        if (a.size !== b.size) return false;
+        for (const entry of a) {
+            if (b.has(entry)) continue;
+            let found = false;
+            for (const other of b) {
+                if (isDeepEqual(entry, other, strict, nextA, nextB)) { found = true; break; }
+            }
+            if (!found) return false;
+        }
+    }
+
+    const ka = ownEnumerableKeys(a);
+    const kb = ownEnumerableKeys(b);
     if (ka.length !== kb.length) return false;
-    for (const k of ka) {
-        if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-        if (!deepEqualImpl(a[k], b[k], strict, seen)) return false;
+    for (const key of ka) {
+        if (!Object.prototype.propertyIsEnumerable.call(b, key)) return false;
+        if (!isDeepEqual(a[key], b[key], strict, nextA, nextB)) return false;
     }
     return true;
 }
 
+function innerOk(argLen, value, message) {
+    if (value) return;
+    let generatedMessage = false;
+    if (argLen === 0) {
+        generatedMessage = true;
+        message = "No value argument passed to `assert.ok()`";
+    } else if (message instanceof Error) {
+        throw message;
+    } else if (message === undefined || message === null) {
+        generatedMessage = true;
+        message = undefined;
+    }
+    const err = new AssertionError({ actual: value, expected: true, message, operator: "==" });
+    err.generatedMessage = generatedMessage;
+    throw err;
+}
+
+function ok(...args) { innerOk(args.length, args[0], args[1]); }
+
+function fail(actual, expected, message, operator) {
+    const argsLen = arguments.length;
+    let internalMessage;
+    if (argsLen === 0) {
+        internalMessage = "Failed";
+    } else if (argsLen === 1) {
+        message = actual;
+        actual = undefined;
+    } else if (argsLen === 2) {
+        operator = "!=";
+    }
+    if (message instanceof Error) throw message;
+    const err = new AssertionError({
+        actual,
+        expected,
+        operator: operator === undefined ? "fail" : operator,
+        message,
+    });
+    if (internalMessage !== undefined) {
+        err.message = internalMessage;
+        err.generatedMessage = true;
+        err.stack = "AssertionError [ERR_ASSERTION]: " + internalMessage;
+    }
+    throw err;
+}
+
 function equal(actual, expected, message) {
-    if (actual != expected) {
-        throw new AssertionError({ message, actual, expected, operator: "==" });
+    if (arguments.length < 2) throw missingArgs();
+    if (actual != expected && (!Number.isNaN(actual) || !Number.isNaN(expected))) {
+        innerFail({ actual, expected, message, operator: "==" });
     }
 }
 function notEqual(actual, expected, message) {
-    if (actual == expected) {
-        throw new AssertionError({ message, actual, expected, operator: "!=" });
+    if (arguments.length < 2) throw missingArgs();
+    if (actual == expected || (Number.isNaN(actual) && Number.isNaN(expected))) {
+        innerFail({ actual, expected, message, operator: "!=" });
     }
 }
 function strictEqual(actual, expected, message) {
+    if (arguments.length < 2) throw missingArgs();
     if (!Object.is(actual, expected)) {
-        throw new AssertionError({ message, actual, expected, operator: "strictEqual" });
+        innerFail({ actual, expected, message, operator: "strictEqual" });
     }
 }
 function notStrictEqual(actual, expected, message) {
+    if (arguments.length < 2) throw missingArgs();
     if (Object.is(actual, expected)) {
-        throw new AssertionError({ message, actual, expected, operator: "notStrictEqual" });
+        innerFail({ actual, expected, message, operator: "notStrictEqual" });
     }
 }
 function deepEqual(actual, expected, message) {
-    if (!deepEqualImpl(actual, expected, false)) {
-        throw new AssertionError({ message, actual, expected, operator: "deepEqual" });
+    if (arguments.length < 2) throw missingArgs();
+    if (!isDeepEqual(actual, expected, false)) {
+        innerFail({ actual, expected, message, operator: "deepEqual" });
     }
 }
 function notDeepEqual(actual, expected, message) {
-    if (deepEqualImpl(actual, expected, false)) {
-        throw new AssertionError({ message, actual, expected, operator: "notDeepEqual" });
+    if (arguments.length < 2) throw missingArgs();
+    if (isDeepEqual(actual, expected, false)) {
+        innerFail({ actual, expected, message, operator: "notDeepEqual" });
     }
 }
 function deepStrictEqual(actual, expected, message) {
-    if (!deepEqualImpl(actual, expected, true)) {
-        throw new AssertionError({ message, actual, expected, operator: "deepStrictEqual" });
+    if (arguments.length < 2) throw missingArgs();
+    if (!isDeepEqual(actual, expected, true)) {
+        innerFail({ actual, expected, message, operator: "deepStrictEqual" });
     }
 }
 function notDeepStrictEqual(actual, expected, message) {
-    if (deepEqualImpl(actual, expected, true)) {
-        throw new AssertionError({ message, actual, expected, operator: "notDeepStrictEqual" });
+    if (arguments.length < 2) throw missingArgs();
+    if (isDeepEqual(actual, expected, true)) {
+        innerFail({ actual, expected, message, operator: "notDeepStrictEqual" });
     }
 }
 
-function matchError(err, expected) {
-    if (expected === undefined) return true;
-    if (typeof expected === "function") {
-        if (expected === Error || Object.prototype.isPrototypeOf.call(Error, expected) || expected.prototype instanceof Error) {
-            return err instanceof expected;
+class Comparison {
+    constructor(obj, keys, actual) {
+        for (const key of keys) {
+            if (!(key in obj)) continue;
+            if (actual !== undefined && typeof actual[key] === "string" &&
+                obj[key] instanceof RegExp && obj[key].test(actual[key])) {
+                this[key] = actual[key];
+            } else {
+                this[key] = obj[key];
+            }
         }
-        return expected(err) === true;
     }
-    if (expected instanceof RegExp) return expected.test(String(err && err.message !== undefined ? err.message : err));
-    if (expected instanceof Error) return err && err.message === expected.message;
-    if (typeof expected === "object") {
-        for (const k of Object.keys(expected)) {
-            if (!err || err[k] !== expected[k]) return false;
+}
+
+function compareExceptionKey(actual, expected, key, message, keys, operator) {
+    if (key in actual && isDeepEqual(actual[key], expected[key], true)) return;
+    if (!message) {
+        const err = new AssertionError({
+            actual: new Comparison(actual, keys),
+            expected: new Comparison(expected, keys, actual),
+            operator: "deepStrictEqual",
+        });
+        err.actual = actual;
+        err.expected = expected;
+        err.operator = operator;
+        throw err;
+    }
+    innerFail({ actual, expected, message, operator });
+}
+
+function expectedException(actual, expected, message, operator) {
+    let generatedMessage = false;
+    let throwError = false;
+
+    if (typeof expected !== "function") {
+        if (expected instanceof RegExp) {
+            const str = String(actual);
+            if (expected.test(str)) return true;
+            if (!message) {
+                generatedMessage = true;
+                message = "The input did not match the regular expression " + String(expected) +
+                    ". Input:\n\n" + inspect(str) + "\n";
+            }
+            throwError = true;
+        } else if (typeof actual !== "object" || actual === null) {
+            const err = new AssertionError({ actual, expected, message, operator: "deepStrictEqual" });
+            err.operator = operator;
+            throw err;
+        } else {
+            const keys = Object.keys(expected);
+            if (expected instanceof Error) keys.push("name", "message");
+            else if (keys.length === 0) throw invalidArgValue("error", expected, "may not be an empty object");
+            for (const key of keys) {
+                if (typeof actual[key] === "string" && expected[key] instanceof RegExp &&
+                    expected[key].test(actual[key])) continue;
+                compareExceptionKey(actual, expected, key, message, keys, operator);
+            }
+            return true;
         }
+    } else if (expected.prototype !== undefined && actual instanceof expected) {
         return true;
-    }
-    return false;
-}
-
-function throws(fn, expected, message) {
-    let threw = false;
-    let caught;
-    try { fn(); } catch (e) { threw = true; caught = e; }
-    if (!threw) {
-        throw new AssertionError({ message: message || "Missing expected exception.", operator: "throws" });
-    }
-    if (!matchError(caught, expected)) {
-        if (caught instanceof Error && !(expected instanceof RegExp || typeof expected === "function")) throw caught;
-        throw new AssertionError({ message: message || "Got unwanted exception.", actual: caught, expected, operator: "throws" });
-    }
-}
-
-function doesNotThrow(fn, expected, message) {
-    try { fn(); } catch (e) {
-        if (matchError(e, expected)) {
-            throw new AssertionError({ message: message || "Got unwanted exception.", actual: e, operator: "doesNotThrow" });
+    } else if (Object.prototype.isPrototypeOf.call(Error, expected)) {
+        if (!message) {
+            generatedMessage = true;
+            message = 'The error is expected to be an instance of "' + expected.name + '". Received ';
+            if (isErrorValue(actual)) {
+                const name = (actual.constructor && actual.constructor.name) || actual.name;
+                if (expected.name === name) {
+                    message += "an error with identical name but a different prototype.";
+                } else {
+                    message += '"' + name + '"';
+                }
+                message += "\n\nError message:\n\n" + actual.message;
+            } else {
+                message += '"' + inspectShallow(actual) + '"';
+            }
         }
-        throw e;
-    }
-}
-
-async function rejects(promiseOrFn, expected, message) {
-    let caught;
-    let threw = false;
-    try {
-        const p = typeof promiseOrFn === "function" ? promiseOrFn() : promiseOrFn;
-        await p;
-    } catch (e) { threw = true; caught = e; }
-    if (!threw) {
-        throw new AssertionError({ message: message || "Missing expected rejection.", operator: "rejects" });
-    }
-    if (!matchError(caught, expected)) {
-        throw new AssertionError({ message: message || "Got unwanted rejection.", actual: caught, expected, operator: "rejects" });
-    }
-}
-
-async function doesNotReject(promiseOrFn, expected, message) {
-    try {
-        const p = typeof promiseOrFn === "function" ? promiseOrFn() : promiseOrFn;
-        await p;
-    } catch (e) {
-        if (matchError(e, expected)) {
-            throw new AssertionError({ message: message || "Got unwanted rejection.", actual: e, operator: "doesNotReject" });
+        throwError = true;
+    } else {
+        const res = expected.call({}, actual);
+        if (res !== true) {
+            if (!message) {
+                generatedMessage = true;
+                message = (expected.name ? 'The "' + expected.name + '" validation function' : "The validation function") +
+                    ' is expected to return "true". Received ' + inspect(res);
+                if (isErrorValue(actual)) message += "\n\nCaught error:\n\n" + String(actual);
+            }
+            throwError = true;
         }
-        throw e;
+    }
+
+    if (throwError) {
+        const err = new AssertionError({ actual, expected, message, operator });
+        err.generatedMessage = generatedMessage;
+        throw err;
+    }
+    return true;
+}
+
+function expectsError(operator, actual, args) {
+    let error = args[0];
+    let message = args[1];
+    if (typeof error === "string") {
+        if (args.length === 2) {
+            throw invalidArgType("error", "of type function or an instance of Error, RegExp, or Object", error);
+        }
+        if (typeof actual === "object" && actual !== null) {
+            if (actual.message === error) {
+                throw ambiguousArgument("error/message",
+                    'The error message "' + actual.message + '" is identical to the message.');
+            }
+        } else if (actual === error) {
+            throw ambiguousArgument("error/message",
+                'The error "' + actual + '" is identical to the message.');
+        }
+        message = error;
+        error = undefined;
+    } else if (error !== null && error !== undefined &&
+               typeof error !== "object" && typeof error !== "function") {
+        throw invalidArgType("error", "of type function or an instance of Error, RegExp, or Object", error);
+    }
+
+    if (actual === kNoException) {
+        let details = "";
+        if (error && error.name) details += " (" + error.name + ")";
+        details += message ? ": " + message : ".";
+        innerFail({
+            actual: undefined,
+            expected: error,
+            operator,
+            message: "Missing expected " + (operator === "rejects" ? "rejection" : "exception") + details,
+        });
+    }
+    if (!error) return;
+    expectedException(actual, error, message, operator);
+}
+
+// `doesNotThrow`/`doesNotReject` need a *predicate*, not the throwing matcher:
+// a non-matching error is re-thrown untouched, a matching one becomes an
+// AssertionError. Only functions and regular expressions are legal here.
+function matchesUnwanted(actual, expected) {
+    if (expected instanceof RegExp) return expected.test(String(actual));
+    if (typeof expected !== "function") {
+        throw invalidArgType("expected", "of type function or an instance of RegExp", expected);
+    }
+    if (expected.prototype !== undefined && actual instanceof expected) return true;
+    if (Object.prototype.isPrototypeOf.call(Error, expected)) return false;
+    return expected.call({}, actual) === true;
+}
+
+function expectsNoError(operator, actual, args) {
+    if (actual === kNoException) return;
+    let error = args[0];
+    let message = args[1];
+    if (typeof error === "string") {
+        message = error;
+        error = undefined;
+    }
+    if (!error || matchesUnwanted(actual, error)) {
+        innerFail({
+            actual,
+            expected: error,
+            operator,
+            message: "Got unwanted " + (operator === "doesNotReject" ? "rejection" : "exception") +
+                (message ? ": " + message : ".") +
+                '\nActual message: "' + (actual && actual.message) + '"',
+        });
+    }
+    throw actual;
+}
+
+function getActual(fn) {
+    if (typeof fn !== "function") throw invalidArgType("fn", "of type function", fn);
+    try { fn(); } catch (err) { return err; }
+    return kNoException;
+}
+
+function isPromiseLike(value) {
+    return value !== null && typeof value === "object" &&
+        typeof value.then === "function" && typeof value.catch === "function";
+}
+
+async function waitForActual(promiseFn) {
+    let result;
+    if (typeof promiseFn === "function") {
+        result = promiseFn();
+        if (!isPromiseLike(result)) throw invalidReturnValue("promiseFn", result);
+    } else if (isPromiseLike(promiseFn)) {
+        result = promiseFn;
+    } else {
+        throw invalidArgType("promiseFn", "of type function or an instance of Promise", promiseFn);
+    }
+    try { await result; } catch (err) { return err; }
+    return kNoException;
+}
+
+function throws(fn, ...args) { expectsError("throws", getActual(fn), args); }
+function doesNotThrow(fn, ...args) { expectsNoError("doesNotThrow", getActual(fn), args); }
+
+async function rejects(promiseFn, ...args) {
+    try {
+        expectsError("rejects", await waitForActual(promiseFn), args);
+    } catch (err) {
+        throw markAsyncFrame(err, "rejects");
     }
 }
 
-function match(value, regexp, message) {
-    if (!(regexp instanceof RegExp)) throw new TypeError("regexp must be a RegExp");
-    if (!regexp.test(value)) {
-        throw new AssertionError({ message, actual: value, expected: regexp, operator: "match" });
-    }
-}
-function doesNotMatch(value, regexp, message) {
-    if (!(regexp instanceof RegExp)) throw new TypeError("regexp must be a RegExp");
-    if (regexp.test(value)) {
-        throw new AssertionError({ message, actual: value, expected: regexp, operator: "doesNotMatch" });
+async function doesNotReject(promiseFn, ...args) {
+    try {
+        expectsNoError("doesNotReject", await waitForActual(promiseFn), args);
+    } catch (err) {
+        throw markAsyncFrame(err, "doesNotReject");
     }
 }
 
-function assert(value, message) { ok(value, message); }
+function internalMatch(string, regexp, message, shouldMatch, operator) {
+    if (!(regexp instanceof RegExp)) throw invalidArgType("regexp", "an instance of RegExp", regexp);
+    const matched = typeof string === "string" && regexp.test(string);
+    if (typeof string === "string" && matched === shouldMatch) return;
+    if (message instanceof Error) throw message;
+    const generatedMessage = !message;
+    if (!message) {
+        if (typeof string !== "string") {
+            message = 'The "string" argument must be of type string. Received type ' +
+                typeof string + " (" + inspect(string) + ")";
+        } else if (shouldMatch) {
+            message = "The input did not match the regular expression " + String(regexp) +
+                ". Input:\n\n" + inspect(string) + "\n";
+        } else {
+            message = "The input was expected to not match the regular expression " + String(regexp) +
+                ". Input:\n\n" + inspect(string) + "\n";
+        }
+    }
+    const err = new AssertionError({ actual: string, expected: regexp, message, operator });
+    err.generatedMessage = generatedMessage;
+    throw err;
+}
+
+function match(string, regexp, message) { internalMatch(string, regexp, message, true, "match"); }
+function doesNotMatch(string, regexp, message) { internalMatch(string, regexp, message, false, "doesNotMatch"); }
+
+function ifError(value) {
+    if (value === null || value === undefined) return;
+    const message = "ifError got unwanted exception: " +
+        (isErrorValue(value) ? (value.message || String(value)) : inspect(value));
+    const err = new AssertionError({ actual: value, expected: null, operator: "ifError", message });
+    err.generatedMessage = true;
+    throw err;
+}
+
+function assert(...args) { innerOk(args.length, args[0], args[1]); }
 assert.ok = ok;
 assert.fail = fail;
 assert.equal = equal;
@@ -3755,20 +4330,39 @@ assert.rejects = rejects;
 assert.doesNotReject = doesNotReject;
 assert.match = match;
 assert.doesNotMatch = doesNotMatch;
+assert.ifError = ifError;
 assert.AssertionError = AssertionError;
-assert.strict = assert;
 
-export { ok, fail, equal, notEqual, strictEqual, notStrictEqual, deepEqual, notDeepEqual, deepStrictEqual, notDeepStrictEqual, throws, doesNotThrow, rejects, doesNotReject, match, doesNotMatch, AssertionError };
+// `assert.strict` is a distinct namespace whose loose aliases point at the
+// strict implementations (Node exposes exactly the same key set on both).
+function strict(...args) { innerOk(args.length, args[0], args[1]); }
+Object.assign(strict, assert);
+strict.equal = strictEqual;
+strict.notEqual = notStrictEqual;
+strict.deepEqual = deepStrictEqual;
+strict.notDeepEqual = notDeepStrictEqual;
+strict.strict = strict;
+assert.strict = strict;
+
+export { ok, fail, equal, notEqual, strictEqual, notStrictEqual, deepEqual, notDeepEqual, deepStrictEqual, notDeepStrictEqual, throws, doesNotThrow, rejects, doesNotReject, match, doesNotMatch, ifError, AssertionError, strict };
 export default assert;
 "#;
 
-// node:assert/strict re-exports node:assert (whose default is already strict)
-// and exposes the same default. Named re-exports are spelled out because the
-// bundler does not support `export *`.
+// node:assert/strict exposes `assert.strict` as its default and binds the
+// loose names to the strict implementations. Named re-exports are spelled out
+// because the bundler does not support `export *`.
 const ASSERT_STRICT_SHIM: &str = r#"
 import assert from "node:assert";
-export { ok, fail, equal, notEqual, strictEqual, notStrictEqual, deepEqual, notDeepEqual, deepStrictEqual, notDeepStrictEqual, throws, doesNotThrow, rejects, doesNotReject, match, doesNotMatch, AssertionError } from "node:assert";
-export default assert;
+import { ok, fail, strictEqual, notStrictEqual, deepStrictEqual, notDeepStrictEqual, throws, doesNotThrow, rejects, doesNotReject, match, doesNotMatch, ifError, AssertionError } from "node:assert";
+
+const strict = assert.strict;
+const equal = strictEqual;
+const notEqual = notStrictEqual;
+const deepEqual = deepStrictEqual;
+const notDeepEqual = notDeepStrictEqual;
+
+export { ok, fail, equal, notEqual, strictEqual, notStrictEqual, deepEqual, notDeepEqual, deepStrictEqual, notDeepStrictEqual, throws, doesNotThrow, rejects, doesNotReject, match, doesNotMatch, ifError, AssertionError, strict };
+export default strict;
 "#;
 
 // node:os shim. The host's real OS details are nondeterministic, so — exactly
