@@ -458,6 +458,12 @@ pub fn lookup(name: &str) -> Option<&'static [(u32, u32)]> {
 
     with open(OUT, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+    # Emit in the same shape `cargo fmt` produces, so a formatting pass after
+    # regeneration is a no-op and the checked-in file always matches the
+    # generator byte for byte.
+    import subprocess
+
+    subprocess.run(["rustfmt", "--edition", "2021", OUT], check=True)
 
 
 def main():
