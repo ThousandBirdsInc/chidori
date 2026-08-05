@@ -121,7 +121,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "import-assertions",
     "import-attributes",
     "regexp-modifiers",
-    "regexp-duplicate-named-groups",
     "regexp-v-flag",
     "source-phase-imports",
     "FinalizationRegistry",

@@ -19,7 +19,9 @@
 //!     `\b \B` word-boundary assertions
 //!   * anchors `^` and `$` (line-aware under the `m` flag)
 //!   * capturing groups `(...)`, non-capturing groups `(?:...)`, named capture
-//!     groups `(?<name>...)`
+//!     groups `(?<name>...)` — including ES2025 duplicate names, which are legal
+//!     exactly when the groups sharing a name sit in different alternatives of
+//!     some enclosing disjunction (so at most one can ever participate)
 //!   * lookahead `(?=...)` / `(?!...)` and lookbehind `(?<=...)` / `(?<!...)`
 //!     (the latter implemented by trying to match the sub-pattern that *ends* at
 //!     the current position — works for both fixed and variable width)
@@ -118,7 +120,23 @@ fn compile_cached(pattern: &str, flags: &str) -> Result<std::rc::Rc<Regex>, Stri
     })
 }
 
-/// Like [`regex_exec`], but additionally returns the `name -> group index`
+/// A pattern's named capture groups: one entry per distinct name, in the order
+/// the name is first declared, carrying every capture-group index that declares
+/// it. ES2025 allows the same name on several groups as long as they live in
+/// different alternatives, so at most one index per entry can have participated
+/// in any single match — see [`participating_group`].
+pub type GroupNames = Vec<(String, Vec<usize>)>;
+
+/// The index of whichever group in `idxs` participated in `m`, if any. With
+/// duplicate names the spec guarantees at most one can have participated (the
+/// duplicates are in mutually exclusive alternatives, and a quantifier resets
+/// its body's captures each iteration), so the first hit is the answer.
+pub fn participating_group(m: &ReMatch, idxs: &[usize]) -> Option<(usize, usize)> {
+    idxs.iter()
+        .find_map(|i| m.groups.get(*i).copied().flatten())
+}
+
+/// Like [`regex_exec`], but additionally returns the `name -> group indices`
 /// mapping declared by any named capture groups `(?<name>...)` in the pattern
 /// (in declaration order). Callers (e.g. `RegExp.prototype.exec`) use this to
 /// populate the `groups` object on a match result. The returned `ReMatch` is
@@ -129,7 +147,7 @@ pub fn regex_exec_named(
     flags: &str,
     input: &[u16],
     start: usize,
-) -> Result<Option<(ReMatch, Vec<(String, usize)>)>, BudgetExceeded> {
+) -> Result<Option<(ReMatch, GroupNames)>, BudgetExceeded> {
     let Ok(re) = compile_cached(pattern, flags) else {
         return Ok(None);
     };
@@ -137,11 +155,11 @@ pub fn regex_exec_named(
     Ok(re.exec(input, start)?.map(|m| (m, names)))
 }
 
-/// Returns the `name -> group index` mapping for any named capture groups in
+/// Returns the `name -> group indices` mapping for any named capture groups in
 /// `pattern`/`flags`, or an empty list if there are none (or the pattern fails
 /// to compile). Lets callers attach a `groups` object even on a `null` exec
 /// where the match itself failed.
-pub fn regexp_group_names(pattern: &str, flags: &str) -> Vec<(String, usize)> {
+pub fn regexp_group_names(pattern: &str, flags: &str) -> GroupNames {
     match compile_cached(pattern, flags) {
         Ok(re) => re.group_names.clone(),
         Err(_) => Vec::new(),
@@ -241,9 +259,19 @@ enum Node {
         min: usize,
         max: Option<usize>,
         greedy: bool,
+        /// Inclusive range of capture-group indices declared inside `node`
+        /// (`None` when the body captures nothing). RepeatMatcher resets these
+        /// slots at the start of every iteration, so a group that matched in an
+        /// earlier iteration reads as "did not participate" in a later one.
+        body_caps: Option<(usize, usize)>,
     },
     /// Backreference `\1` .. `\99` or named `\k<name>` (resolved to an index).
     Backref(usize),
+    /// A named backreference `\k<name>` whose name is declared by more than one
+    /// capture group (ES2025 duplicate names). At most one of them can have
+    /// participated; that one's capture is matched, and if none did the
+    /// backreference matches the empty string.
+    BackrefMulti(std::rc::Rc<Vec<usize>>),
 }
 
 #[derive(Clone, Debug)]
@@ -268,19 +296,39 @@ enum ClassItem {
 // Parser
 // =========================================================================
 
+/// One in-flight disjunction, used to enforce the ES2025 duplicate-named-group
+/// rule: two groups may share a name only if some enclosing disjunction puts
+/// them in *different* alternatives (so they can never both participate).
+///
+/// `current` accumulates the names declared so far in the alternative being
+/// parsed; a name already there is a same-alternative duplicate (a
+/// SyntaxError). `seen` unions the names of the alternatives already finished,
+/// and is what the disjunction contributes to its own enclosing alternative
+/// once it closes.
+#[derive(Default)]
+struct AltScope {
+    current: Vec<String>,
+    seen: Vec<String>,
+}
+
 struct Parser<'a> {
     src: &'a [char],
     pos: usize,
     group_count: usize,
-    /// `(name, group_index)` for each named capture group, in declaration order.
+    /// `(name, group_index)` for each named capture group, in declaration
+    /// order. A name may repeat when its groups are in disjoint alternatives.
     group_names: Vec<(String, usize)>,
+    /// Stack of enclosing disjunctions; the innermost frame tracks the names
+    /// declared in the alternative currently being parsed.
+    alt_scopes: Vec<AltScope>,
     /// Named backreferences `\k<name>` whose target may appear later in the
     /// pattern; resolved after the full parse.
     pending_named_backrefs: Vec<(String, usize)>, // (name, AST Backref placeholder slot id)
-    /// Backing store for the placeholder backref indices recorded above; index
-    /// into this vec is the placeholder id, value is the resolved group index
-    /// (0 until resolved, which makes the backref match the empty string).
-    named_backref_targets: Vec<usize>,
+    /// Backing store for the placeholder backref targets recorded above; index
+    /// into this vec is the placeholder id, value is the list of group indices
+    /// declaring that name (empty until resolved, which makes the backref match
+    /// the empty string).
+    named_backref_targets: Vec<Vec<usize>>,
     /// Whether the `u`/`v` flag is set (affects `\p`, strict escapes).
     unicode: bool,
 }
@@ -292,10 +340,49 @@ impl<'a> Parser<'a> {
             pos: 0,
             group_count: 0,
             group_names: Vec::new(),
+            alt_scopes: Vec::new(),
             pending_named_backrefs: Vec::new(),
             named_backref_targets: Vec::new(),
             unicode,
         }
+    }
+
+    /// Record a capture-group name in the alternative being parsed, rejecting a
+    /// name that could participate alongside an identical one already declared.
+    fn declare_group_name(&mut self, name: &str) -> Result<(), String> {
+        if let Some(scope) = self.alt_scopes.last_mut() {
+            if scope.current.iter().any(|n| n == name) {
+                return Err(format!("Duplicate capture group name '{name}'"));
+            }
+            scope.current.push(name.to_string());
+        }
+        Ok(())
+    }
+
+    /// Close the alternative just parsed: its names fold into the disjunction's
+    /// union, and the next alternative starts from a clean slate (which is what
+    /// makes `(?<x>a)|(?<x>b)` legal).
+    fn end_alternative(&mut self) {
+        if let Some(scope) = self.alt_scopes.last_mut() {
+            for name in scope.current.drain(..) {
+                if !scope.seen.contains(&name) {
+                    scope.seen.push(name);
+                }
+            }
+        }
+    }
+
+    /// Close a disjunction: every name it can declare becomes a name of the
+    /// enclosing alternative (groups outside the disjunction might participate
+    /// alongside any of them, so a clash there is a SyntaxError).
+    fn pop_alt_scope(&mut self) -> Result<(), String> {
+        let Some(scope) = self.alt_scopes.pop() else {
+            return Ok(());
+        };
+        for name in scope.seen {
+            self.declare_group_name(&name)?;
+        }
+        Ok(())
     }
 
     fn peek(&self) -> Option<char> {
@@ -333,15 +420,18 @@ impl<'a> Parser<'a> {
         // Collect into a local first so we don't hold overlapping field borrows.
         let pending: Vec<(String, usize)> = std::mem::take(&mut self.pending_named_backrefs);
         for (name, slot) in &pending {
-            let target = self
+            // A duplicated name resolves to *every* group declaring it; the
+            // matcher then uses whichever one participated.
+            let targets: Vec<usize> = self
                 .group_names
                 .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, idx)| *idx);
-            match target {
-                Some(idx) => self.named_backref_targets[*slot] = idx,
-                None => return Err(format!("Invalid named capture referenced: '{name}'")),
+                .filter(|(n, _)| n == name)
+                .map(|(_, idx)| *idx)
+                .collect();
+            if targets.is_empty() {
+                return Err(format!("Invalid named capture referenced: '{name}'"));
             }
+            self.named_backref_targets[*slot] = targets;
         }
         // Rewrite placeholder backrefs (encoded as Backref(usize::MAX - slot))
         // with their resolved group indices.
@@ -358,10 +448,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_alternation(&mut self) -> Result<Node, String> {
+        self.alt_scopes.push(AltScope::default());
         let mut branches = vec![self.parse_concat()?];
+        self.end_alternative();
         while self.eat('|') {
             branches.push(self.parse_concat()?);
+            self.end_alternative();
         }
+        self.pop_alt_scope()?;
         if branches.len() == 1 {
             Ok(branches.pop().unwrap())
         } else {
@@ -443,11 +537,13 @@ impl<'a> Parser<'a> {
             return Err("Invalid quantifier on lookbehind assertion".to_string());
         }
         let greedy = !self.eat('?');
+        let body_caps = capture_range(&atom);
         Ok(Node::Repeat {
             node: Box::new(atom),
             min,
             max,
             greedy,
+            body_caps,
         })
     }
 
@@ -610,9 +706,7 @@ impl<'a> Parser<'a> {
             self.group_count += 1;
             let i = self.group_count;
             if let Some(name) = group_name {
-                if self.group_names.iter().any(|(n, _)| *n == name) {
-                    return Err(format!("Duplicate capture group name '{name}'"));
-                }
+                self.declare_group_name(&name)?;
                 self.group_names.push((name, i));
             }
             Some(i)
@@ -1045,7 +1139,7 @@ impl<'a> Parser<'a> {
                 let name = self.parse_group_name()?;
                 // Record a placeholder; resolve after the whole pattern parses.
                 let slot = self.named_backref_targets.len();
-                self.named_backref_targets.push(0);
+                self.named_backref_targets.push(Vec::new());
                 self.pending_named_backrefs.push((name, slot));
                 Node::Backref(named_backref_placeholder(slot))
             }
@@ -1231,11 +1325,20 @@ fn is_named_backref_placeholder(idx: usize) -> Option<usize> {
 }
 
 /// Rewrite placeholder named-backref nodes with their resolved group indices.
-fn resolve_named_backrefs(node: &mut Node, targets: &[usize]) {
+/// A name declared once collapses to a plain [`Node::Backref`]; a duplicated
+/// name keeps the whole candidate list in a [`Node::BackrefMulti`].
+fn resolve_named_backrefs(node: &mut Node, targets: &[Vec<usize>]) {
     match node {
         Node::Backref(i) => {
             if let Some(slot) = is_named_backref_placeholder(*i) {
-                *i = targets.get(slot).copied().unwrap_or(0);
+                match targets.get(slot).map(|t| t.as_slice()) {
+                    // Unresolved: slot 0 is the whole match, which is still
+                    // unset while matching, so the backref matches the empty
+                    // string.
+                    None | Some([]) => *i = 0,
+                    Some([single]) => *i = *single,
+                    Some(many) => *node = Node::BackrefMulti(std::rc::Rc::new(many.to_vec())),
+                }
             }
         }
         Node::Group { node, .. } | Node::Look { node, .. } => resolve_named_backrefs(node, targets),
@@ -1260,6 +1363,34 @@ fn is_id_start(c: char) -> bool {
 
 fn is_id_continue(c: char) -> bool {
     c == '$' || c == '_' || c.is_alphanumeric() || c == '\u{200C}' || c == '\u{200D}'
+}
+
+/// The inclusive range of capture-group indices declared inside `node`, or
+/// `None` when it declares none. Indices are handed out in source order, so the
+/// groups within any subtree form a contiguous range — which is exactly the
+/// span RepeatMatcher resets per iteration.
+fn capture_range(node: &Node) -> Option<(usize, usize)> {
+    fn walk(node: &Node, lo: &mut usize, hi: &mut usize) {
+        match node {
+            Node::Group { idx, node } => {
+                if let Some(i) = idx {
+                    *lo = (*lo).min(*i);
+                    *hi = (*hi).max(*i);
+                }
+                walk(node, lo, hi);
+            }
+            Node::Look { node, .. } | Node::Repeat { node, .. } => walk(node, lo, hi),
+            Node::Alt(items) | Node::Concat(items) => {
+                for n in items {
+                    walk(n, lo, hi);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut lo, mut hi) = (usize::MAX, 0usize);
+    walk(node, &mut lo, &mut hi);
+    (lo <= hi).then_some((lo, hi))
 }
 
 /// Walk the AST checking for a numeric backreference whose target group index
@@ -1303,8 +1434,9 @@ struct Regex {
     root: Node,
     flags: Flags,
     group_count: usize,
-    /// `(name, group index)` for each named capture group, declaration order.
-    group_names: Vec<(String, usize)>,
+    /// One entry per distinct capture-group name, in first-declaration order,
+    /// listing every group index that declares it (see [`GroupNames`]).
+    group_names: GroupNames,
 }
 
 /// Mutable capture state during a match attempt. `slots[i]` holds the span for
@@ -1317,11 +1449,20 @@ impl Regex {
         let chars: Vec<char> = pattern.chars().collect();
         let mut parser = Parser::new(&chars, flags.unicode);
         let root = parser.parse()?;
+        // Collapse the flat declaration list into one entry per name, keeping
+        // first-declaration order (the enumeration order of `groups`).
+        let mut group_names: GroupNames = Vec::new();
+        for (name, idx) in parser.group_names {
+            match group_names.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, idxs)) => idxs.push(idx),
+                None => group_names.push((name, vec![idx])),
+            }
+        }
         Ok(Regex {
             root,
             flags,
             group_count: parser.group_count,
-            group_names: parser.group_names,
+            group_names,
         })
     }
 
@@ -1572,27 +1713,43 @@ impl<'a> MatchCtx<'a> {
                 min,
                 max,
                 greedy,
-            } => self.match_repeat(node, *min, *max, *greedy, 0, pos, caps, k),
+                body_caps,
+            } => self.match_repeat(node, *min, *max, *greedy, *body_caps, 0, pos, caps, k),
             Node::Backref(i) => {
                 let span = if *i < caps.len() { caps[*i] } else { None };
-                match span {
-                    // An unparticipating group matches the empty string.
-                    None => k(pos, caps),
-                    Some((s, e)) => {
-                        let len = e - s;
-                        if pos + len > self.input.len() {
-                            return None;
-                        }
-                        for j in 0..len {
-                            if !self.char_eq(self.input[pos + j] as u32, self.input[s + j] as u32) {
-                                return None;
-                            }
-                        }
-                        k(pos + len, caps)
-                    }
-                }
+                self.match_backref(span, pos, caps, k)
+            }
+            Node::BackrefMulti(idxs) => {
+                // Duplicate names live in mutually exclusive alternatives, so
+                // at most one of the candidates can have participated.
+                let span = idxs.iter().find_map(|i| caps.get(*i).copied().flatten());
+                self.match_backref(span, pos, caps, k)
             }
         }
+    }
+
+    /// Match a backreference to `span` (the referenced group's capture, or
+    /// `None` when it did not participate — which matches the empty string).
+    fn match_backref(
+        &self,
+        span: Option<(usize, usize)>,
+        pos: usize,
+        caps: &mut Caps,
+        k: &Cont<'_>,
+    ) -> Option<usize> {
+        let Some((s, e)) = span else {
+            return k(pos, caps);
+        };
+        let len = e - s;
+        if pos + len > self.input.len() {
+            return None;
+        }
+        for j in 0..len {
+            if !self.char_eq(self.input[pos + j] as u32, self.input[s + j] as u32) {
+                return None;
+            }
+        }
+        k(pos + len, caps)
     }
 
     /// Match a lookaround assertion. Lookahead tries to match `node` starting at
@@ -1789,28 +1946,43 @@ impl<'a> MatchCtx<'a> {
                 min,
                 max,
                 greedy,
-            } => self.match_repeat_back(node, *min, *max, *greedy, 0, pos, caps, k),
+                body_caps,
+            } => self.match_repeat_back(node, *min, *max, *greedy, *body_caps, 0, pos, caps, k),
             Node::Backref(i) => {
                 let span = if *i < caps.len() { caps[*i] } else { None };
-                match span {
-                    None => k(pos, caps),
-                    Some((s, e)) => {
-                        let len = e - s;
-                        if len > pos {
-                            return None;
-                        }
-                        for j in 0..len {
-                            if !self
-                                .char_eq(self.input[pos - len + j] as u32, self.input[s + j] as u32)
-                            {
-                                return None;
-                            }
-                        }
-                        k(pos - len, caps)
-                    }
-                }
+                self.match_backref_back(span, pos, caps, k)
+            }
+            Node::BackrefMulti(idxs) => {
+                // Duplicate names live in mutually exclusive alternatives, so
+                // at most one of the candidates can have participated.
+                let span = idxs.iter().find_map(|i| caps.get(*i).copied().flatten());
+                self.match_backref_back(span, pos, caps, k)
             }
         }
+    }
+
+    /// Backwards [`MatchCtx::match_backref`]: the referenced text must END at
+    /// `pos`; the continuation receives its start.
+    fn match_backref_back(
+        &self,
+        span: Option<(usize, usize)>,
+        pos: usize,
+        caps: &mut Caps,
+        k: &Cont<'_>,
+    ) -> Option<usize> {
+        let Some((s, e)) = span else {
+            return k(pos, caps);
+        };
+        let len = e - s;
+        if len > pos {
+            return None;
+        }
+        for j in 0..len {
+            if !self.char_eq(self.input[pos - len + j] as u32, self.input[s + j] as u32) {
+                return None;
+            }
+        }
+        k(pos - len, caps)
     }
 
     /// Match `items[..i]` right-to-left ending at `pos` (the backwards mirror
@@ -1840,25 +2012,20 @@ impl<'a> MatchCtx<'a> {
         min: usize,
         max: Option<usize>,
         greedy: bool,
+        body_caps: Option<(usize, usize)>,
         done: usize,
         pos: usize,
         caps: &mut Caps,
         k: &Cont<'_>,
     ) -> Option<usize> {
-        let contained = contained_captures(node);
         if done < min {
             let more = move |p: usize, caps: &mut Caps| {
                 if p == pos && done >= 1 {
                     return None;
                 }
-                self.match_repeat_back(node, min, max, greedy, done + 1, p, caps, k)
+                self.match_repeat_back(node, min, max, greedy, body_caps, done + 1, p, caps, k)
             };
-            let saved = clear_captures(caps, &contained);
-            let r = self.match_node_back(node, pos, caps, &more);
-            if r.is_none() {
-                restore_captures(caps, saved);
-            }
-            return r;
+            return self.match_repeat_body_back(node, body_caps, pos, caps, &more);
         }
         let at_max = matches!(max, Some(m) if done >= m);
         if greedy {
@@ -1867,13 +2034,11 @@ impl<'a> MatchCtx<'a> {
                     if p == pos {
                         return None;
                     }
-                    self.match_repeat_back(node, min, max, greedy, done + 1, p, caps, k)
+                    self.match_repeat_back(node, min, max, greedy, body_caps, done + 1, p, caps, k)
                 };
-                let saved = clear_captures(caps, &contained);
-                if let Some(r) = self.match_node_back(node, pos, caps, &more) {
+                if let Some(r) = self.match_repeat_body_back(node, body_caps, pos, caps, &more) {
                     return Some(r);
                 }
-                restore_captures(caps, saved);
             }
             k(pos, caps)
         } else {
@@ -1885,16 +2050,49 @@ impl<'a> MatchCtx<'a> {
                     if p == pos {
                         return None;
                     }
-                    self.match_repeat_back(node, min, max, greedy, done + 1, p, caps, k)
+                    self.match_repeat_back(node, min, max, greedy, body_caps, done + 1, p, caps, k)
                 };
-                let saved = clear_captures(caps, &contained);
-                let r = self.match_node_back(node, pos, caps, &more);
-                if r.is_none() {
-                    restore_captures(caps, saved);
-                }
-                return r;
+                return self.match_repeat_body_back(node, body_caps, pos, caps, &more);
             }
             None
+        }
+    }
+
+    /// The backwards mirror of [`MatchCtx::match_repeat_body`]: one
+    /// repetition attempt with the body's captures cleared first, restored if
+    /// the attempt fails.
+    fn match_repeat_body_back(
+        &self,
+        node: &Node,
+        body_caps: Option<(usize, usize)>,
+        pos: usize,
+        caps: &mut Caps,
+        k: &Cont<'_>,
+    ) -> Option<usize> {
+        let Some((lo, hi)) = body_caps else {
+            return self.match_node_back(node, pos, caps, k);
+        };
+        let hi = hi.min(caps.len().saturating_sub(1));
+        if lo > hi || caps[lo..=hi].iter().all(|c| c.is_none()) {
+            return self.match_node_back(node, pos, caps, k);
+        }
+        const INLINE: usize = 8;
+        let n = hi - lo + 1;
+        let mut inline = [None; INLINE];
+        let mut spill: Vec<Option<(usize, usize)>> = Vec::new();
+        if n <= INLINE {
+            inline[..n].copy_from_slice(&caps[lo..=hi]);
+        } else {
+            spill.extend_from_slice(&caps[lo..=hi]);
+        }
+        let saved: &[Option<(usize, usize)>] = if n <= INLINE { &inline[..n] } else { &spill };
+        caps[lo..=hi].fill(None);
+        match self.match_node_back(node, pos, caps, k) {
+            Some(r) => Some(r),
+            None => {
+                caps[lo..=hi].copy_from_slice(saved);
+                None
+            }
         }
     }
 
@@ -1931,12 +2129,61 @@ impl<'a> MatchCtx<'a> {
         Some(p - pos)
     }
 
+    /// Match one iteration of a quantifier body, starting it from a clean set
+    /// of captures for the groups the body declares (RepeatMatcher step 4: a
+    /// group that matched in an earlier iteration reads as "did not
+    /// participate" in this one, which is what makes `/(?:(a)|(b))+/` on "ab"
+    /// report `[..., undefined, "b"]`). The saved spans are put back if this
+    /// iteration — and everything the continuation tries after it — fails, so
+    /// the fall-back-to-fewer-iterations path still sees the earlier captures.
+    fn match_repeat_body(
+        &self,
+        node: &Node,
+        body_caps: Option<(usize, usize)>,
+        pos: usize,
+        caps: &mut Caps,
+        k: &Cont<'_>,
+    ) -> Option<usize> {
+        let Some((lo, hi)) = body_caps else {
+            return self.match_node(node, pos, caps, k);
+        };
+        let hi = hi.min(caps.len().saturating_sub(1));
+        // Nothing to reset: no groups in range, or none of them participated
+        // yet (the usual case on the first iteration).
+        if lo > hi || caps[lo..=hi].iter().all(|c| c.is_none()) {
+            return self.match_node(node, pos, caps, k);
+        }
+        // Save the body's slots without touching the heap for the handful of
+        // groups a quantifier body normally has — this runs per iteration, in
+        // the middle of backtracking.
+        const INLINE: usize = 8;
+        let n = hi - lo + 1;
+        let mut inline = [None; INLINE];
+        let mut spill: Vec<Option<(usize, usize)>> = Vec::new();
+        if n <= INLINE {
+            inline[..n].copy_from_slice(&caps[lo..=hi]);
+        } else {
+            spill.extend_from_slice(&caps[lo..=hi]);
+        }
+        let saved: &[Option<(usize, usize)>] = if n <= INLINE { &inline[..n] } else { &spill };
+        caps[lo..=hi].fill(None);
+        match self.match_node(node, pos, caps, k) {
+            Some(r) => Some(r),
+            None => {
+                caps[lo..=hi].copy_from_slice(saved);
+                None
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn match_repeat(
         &self,
         node: &Node,
         min: usize,
         max: Option<usize>,
         greedy: bool,
+        body_caps: Option<(usize, usize)>,
         done: usize,
         pos: usize,
         caps: &mut Caps,
@@ -1996,12 +2243,6 @@ impl<'a> MatchCtx<'a> {
                 }
             }
         }
-        // Spec RepeatMatcher: every repetition ATTEMPT starts with the
-        // captures inside the Atom cleared (`/(z)((a+)?(b+)?(c))*/` must
-        // report group 4 undefined when the final iteration matched "ac").
-        // Cleared state is restored if the attempt fails so completed
-        // iterations keep their captures.
-        let contained = contained_captures(node);
         // Still obligated to match more.
         if done < min {
             let more = move |p: usize, caps: &mut Caps| {
@@ -2009,14 +2250,9 @@ impl<'a> MatchCtx<'a> {
                 if p == pos && done >= 1 {
                     return None;
                 }
-                self.match_repeat(node, min, max, greedy, done + 1, p, caps, k)
+                self.match_repeat(node, min, max, greedy, body_caps, done + 1, p, caps, k)
             };
-            let saved = clear_captures(caps, &contained);
-            let r = self.match_node(node, pos, caps, &more);
-            if r.is_none() {
-                restore_captures(caps, saved);
-            }
-            return r;
+            return self.match_repeat_body(node, body_caps, pos, caps, &more);
         }
         let at_max = matches!(max, Some(m) if done >= m);
 
@@ -2027,13 +2263,11 @@ impl<'a> MatchCtx<'a> {
                         // zero-width iteration: stop expanding to avoid looping.
                         return None;
                     }
-                    self.match_repeat(node, min, max, greedy, done + 1, p, caps, k)
+                    self.match_repeat(node, min, max, greedy, body_caps, done + 1, p, caps, k)
                 };
-                let saved = clear_captures(caps, &contained);
-                if let Some(r) = self.match_node(node, pos, caps, &more) {
+                if let Some(r) = self.match_repeat_body(node, body_caps, pos, caps, &more) {
                     return Some(r);
                 }
-                restore_captures(caps, saved);
             }
             k(pos, caps)
         } else {
@@ -2046,60 +2280,12 @@ impl<'a> MatchCtx<'a> {
                     if p == pos {
                         return None;
                     }
-                    self.match_repeat(node, min, max, greedy, done + 1, p, caps, k)
+                    self.match_repeat(node, min, max, greedy, body_caps, done + 1, p, caps, k)
                 };
-                let saved = clear_captures(caps, &contained);
-                let r = self.match_node(node, pos, caps, &more);
-                if r.is_none() {
-                    restore_captures(caps, saved);
-                }
-                return r;
+                return self.match_repeat_body(node, body_caps, pos, caps, &more);
             }
             None
         }
-    }
-}
-
-/// The capture indices of every capturing group inside `node` (the Atom of a
-/// quantifier), for RepeatMatcher's clear-before-each-attempt rule.
-fn contained_captures(node: &Node) -> Vec<usize> {
-    fn walk(node: &Node, out: &mut Vec<usize>) {
-        match node {
-            Node::Group { idx, node } => {
-                if let Some(i) = idx {
-                    out.push(*i);
-                }
-                walk(node, out);
-            }
-            Node::Look { node, .. } | Node::Repeat { node, .. } => walk(node, out),
-            Node::Alt(items) | Node::Concat(items) => {
-                for n in items {
-                    walk(n, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(node, &mut out);
-    out
-}
-
-/// Clear the given capture slots, returning what they held.
-#[allow(clippy::type_complexity)]
-fn clear_captures(caps: &mut Caps, idxs: &[usize]) -> Vec<(usize, Option<(usize, usize)>)> {
-    let mut saved = Vec::with_capacity(idxs.len());
-    for &i in idxs {
-        if i < caps.len() {
-            saved.push((i, caps[i].take()));
-        }
-    }
-    saved
-}
-
-fn restore_captures(caps: &mut Caps, saved: Vec<(usize, Option<(usize, usize)>)>) {
-    for (i, v) in saved {
-        caps[i] = v;
     }
 }
 

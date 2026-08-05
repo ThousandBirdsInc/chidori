@@ -17,7 +17,8 @@
 
 use super::arg;
 use crate::regexp::{
-    is_regexp, regex_exec, regexp_group_names, regexp_source_flags, ReMatch, REGEXP_MARK,
+    is_regexp, participating_group, regex_exec, regexp_group_names, regexp_source_flags, ReMatch,
+    REGEXP_MARK,
 };
 use crate::value::*;
 use crate::vm::Vm;
@@ -953,12 +954,16 @@ fn get_substitution(
 /// pattern declares named groups, `groups` is a null-prototype object mapping
 /// each name to its captured substring (or `undefined`); otherwise it is
 /// `undefined` (the property is always present).
+///
+/// A name may be declared by several groups (ES2025 duplicate named groups);
+/// the property reports whichever of them participated in this match, and the
+/// key order follows the name's first declaration in the source.
 pub fn build_match_array(
     vm: &mut Vm,
     units: &[u16],
     mat: &ReMatch,
     input: &JsString,
-    names: &[(String, usize)],
+    names: &[(String, Vec<usize>)],
     has_indices: bool,
 ) -> Value {
     let mut elems: Vec<Value> = Vec::with_capacity(mat.groups.len());
@@ -978,8 +983,8 @@ pub fn build_match_array(
         let obj = vm.alloc_ordinary(None);
         {
             let mut gb = obj.borrow_mut();
-            for (name, idx) in names {
-                let val = match mat.groups.get(*idx).and_then(|g| *g) {
+            for (name, idxs) in names {
+                let val = match participating_group(mat, idxs) {
                     Some((s, e)) => Value::String(JsString::from_code_units(&units[s..e])),
                     None => Value::Undefined,
                 };
@@ -1008,8 +1013,8 @@ pub fn build_match_array(
             Value::Undefined
         } else {
             let obj = vm.alloc_ordinary(None);
-            for (name, gidx) in names {
-                let val = match mat.groups.get(*gidx).and_then(|g| *g) {
+            for (name, gidxs) in names {
+                let val = match participating_group(mat, gidxs) {
                     Some((s, e)) => pair(s, e, vm),
                     None => Value::Undefined,
                 };
