@@ -116,6 +116,11 @@ pub const NODE_BUILTIN_ALLOWLIST: &[&str] = &[
     "zlib",
 ];
 
+/// Builtins Node only accepts with the `node:` prefix: they are excluded from
+/// `module.builtinModules`, `isBuiltin("test")` is false, and a bare `test`
+/// specifier resolves through node_modules, not to the shim.
+pub const NODE_PREFIX_ONLY_BUILTINS: &[&str] = &["test"];
+
 /// Walk up from `start` looking for a `package.json` and return the directory
 /// that contains it. Falls back to `start`'s parent (or the cwd) if none
 /// exists in the chain — this keeps single-file agent harnesses working.

@@ -140,8 +140,12 @@ impl Resolver {
         // the same shims as their `node:`-prefixed forms. Node gives core
         // modules priority over node_modules for unprefixed names, so packages
         // that import builtins without the prefix — most of npm — link
-        // identically here.
-        if self.builtin_allowlist.iter().any(|b| b == specifier) {
+        // identically here. Prefix-only builtins (`node:test`) are exempt:
+        // Node routes their bare names through node_modules.
+        if self.builtin_allowlist.iter().any(|b| b == specifier)
+            && !crate::runtime::typescript::transpile::NODE_PREFIX_ONLY_BUILTINS
+                .contains(&specifier)
+        {
             return self.resolve_node_builtin(specifier);
         }
 

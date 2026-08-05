@@ -2487,20 +2487,34 @@ export default {
 
 // node:module — resolver introspection. `builtinModules` reflects the actual
 // allowlist (spliced in from `NODE_BUILTIN_ALLOWLIST` so there is one source
-// of truth); createRequire links but the returned require throws, matching
-// the loader's leaf-only CommonJS stance.
+// of truth), minus the `node:`-prefix-only names, which Node excludes from
+// `builtinModules` and rejects from bare `isBuiltin` lookups; createRequire
+// links but the returned require throws, matching the loader's leaf-only
+// CommonJS stance.
 static MODULE_SHIM: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let names = crate::runtime::typescript::transpile::NODE_BUILTIN_ALLOWLIST;
-    let list = serde_json::to_string(names).expect("builtin allowlist serializes");
+    use crate::runtime::typescript::transpile::{
+        NODE_BUILTIN_ALLOWLIST, NODE_PREFIX_ONLY_BUILTINS,
+    };
+    let bare: Vec<&str> = NODE_BUILTIN_ALLOWLIST
+        .iter()
+        .copied()
+        .filter(|name| !NODE_PREFIX_ONLY_BUILTINS.contains(name))
+        .collect();
+    let list = serde_json::to_string(&bare).expect("builtin allowlist serializes");
+    let prefix_only =
+        serde_json::to_string(NODE_PREFIX_ONLY_BUILTINS).expect("prefix-only list serializes");
     format!(
         r#"
 const builtinModules = Object.freeze({list});
+const prefixOnlyBuiltins = Object.freeze({prefix_only});
 export {{ builtinModules }};
 export function isBuiltin(specifier) {{
-    const name = String(specifier).startsWith("node:")
-        ? String(specifier).slice(5)
-        : String(specifier);
-    return builtinModules.indexOf(name) !== -1;
+    const spec = String(specifier);
+    if (spec.startsWith("node:")) {{
+        const name = spec.slice(5);
+        return builtinModules.indexOf(name) !== -1 || prefixOnlyBuiltins.indexOf(name) !== -1;
+    }}
+    return builtinModules.indexOf(spec) !== -1;
 }}
 export function createRequire(filename) {{
     function require(specifier) {{
