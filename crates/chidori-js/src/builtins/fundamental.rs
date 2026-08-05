@@ -2349,6 +2349,55 @@ fn install_errors(vm: &mut Vm) {
         });
     }
 
+    // Error.captureStackTrace(target [, constructorOpt]) — V8's API, which
+    // Node's own `assert`/`errors` internals (and a great many npm packages)
+    // call unconditionally. It resets `target.stack` to the creation-time head
+    // and, when `constructorOpt` is given, arranges for `constructorOpt`'s own
+    // activation and everything it called to be *absent* from the trace.
+    //
+    // chidori builds stack traces on the unwind path (see
+    // `Vm::record_unwind_frame`), innermost frame first, so the cut is
+    // recorded as an engine-private marker on the error and consumed when the
+    // throw leaves `constructorOpt`. That is a strictly lazier model than
+    // V8's snapshot-at-call — an error that is never thrown carries only the
+    // head, which is also what V8 produces once `stackTraceLimit` is 0 — but
+    // the frames a *thrown* error ends up showing are the same set.
+    //
+    // The one shape that differs: if the error is thrown from somewhere that
+    // never unwinds through `constructorOpt`, the cut is never reached and the
+    // trace stays empty. That is the conservative direction (fewer frames, not
+    // wrong ones), and it does not arise in the pattern the API exists for —
+    // capture inside a helper, throw from that same helper.
+    if let Some(ec) = &error_ctor {
+        vm.define_method(ec, "captureStackTrace", 2, |vm, _t, args| {
+            let Value::Object(target) = arg(args, 0) else {
+                return Err(vm.throw_type(
+                    "Error.captureStackTrace requires that the first argument be an object",
+                ));
+            };
+            install_error_stack(vm, &target);
+            let marker_key = PropertyKey::Sym(vm.realm.symbol_stack_start.clone());
+            match arg(args, 1) {
+                Value::Object(f) if f.borrow().is_callable() => {
+                    target
+                        .borrow_mut()
+                        .own_insert(marker_key, Property::builtin(Value::Object(f)));
+                }
+                _ => {
+                    target.borrow_mut().own_remove(&marker_key);
+                }
+            }
+            Ok(Value::Undefined)
+        });
+        // V8 exposes this as a plain writable data property; code that saves,
+        // zeroes and restores it (Node's assert does exactly that) must not
+        // trip over a missing property.
+        ec.borrow_mut().own_insert(
+            PropertyKey::str("stackTraceLimit"),
+            Property::builtin(Value::Number(10.0)),
+        );
+    }
+
     // AggregateError(errors, message): collects an iterable of errors.
     install_aggregate_error(vm, error_ctor.as_ref());
     // SuppressedError(error, suppressed, message): a disposal error that wraps an
