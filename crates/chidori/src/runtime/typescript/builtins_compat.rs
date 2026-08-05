@@ -489,12 +489,25 @@ export function isGeneratorObject(value) {
         typeof value.next === "function" && typeof value.throw === "function";
 }
 export function isProxy() { return false; }
-export function isSymbolObject() { return false; }
-export function isStringObject(value) { return typeof value === "object" && value !== null && value instanceof String; }
-export function isNumberObject(value) { return typeof value === "object" && value !== null && value instanceof Number; }
-export function isBooleanObject(value) { return typeof value === "object" && value !== null && value instanceof Boolean; }
+// Boxed primitives are identified by their internal slot, not by `instanceof`:
+// the prototype and `Symbol.toStringTag` of a wrapper are both writable, so
+// only invoking the matching `valueOf` distinguishes (say) a Boolean object
+// wearing `String.prototype` from a real String object. `util.isDeepStrictEqual`
+// depends on the distinction.
+function hasBrand(valueOf, value) {
+    if (value === null || typeof value !== "object") return false;
+    try { valueOf.call(value); return true; } catch { return false; }
+}
+export function isStringObject(value) { return hasBrand(String.prototype.valueOf, value); }
+export function isNumberObject(value) { return hasBrand(Number.prototype.valueOf, value); }
+export function isBooleanObject(value) { return hasBrand(Boolean.prototype.valueOf, value); }
+export function isSymbolObject(value) { return hasBrand(Symbol.prototype.valueOf, value); }
+export function isBigIntObject(value) {
+    return typeof BigInt !== "undefined" && hasBrand(BigInt.prototype.valueOf, value);
+}
 export function isBoxedPrimitive(value) {
-    return isStringObject(value) || isNumberObject(value) || isBooleanObject(value);
+    return isStringObject(value) || isNumberObject(value) || isBooleanObject(value) ||
+        isSymbolObject(value) || isBigIntObject(value);
 }
 export function isArgumentsObject(value) {
     return Object.prototype.toString.call(value) === "[object Arguments]";
@@ -510,9 +523,9 @@ const types = {
     isUint16Array, isUint32Array, isInt8Array, isInt16Array, isInt32Array,
     isFloat32Array, isFloat64Array, isBigInt64Array, isBigUint64Array,
     isMap, isSet, isWeakMap, isWeakSet, isAsyncFunction, isGeneratorFunction,
-    isGeneratorObject, isProxy, isSymbolObject, isStringObject, isNumberObject,
-    isBooleanObject, isBoxedPrimitive, isArgumentsObject, isSharedArrayBuffer,
-    isExternal, isModuleNamespaceObject,
+    isGeneratorObject, isProxy, isSymbolObject, isBigIntObject, isStringObject,
+    isNumberObject, isBooleanObject, isBoxedPrimitive, isArgumentsObject,
+    isSharedArrayBuffer, isExternal, isModuleNamespaceObject,
 };
 export default types;
 "#;

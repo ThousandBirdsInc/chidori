@@ -347,59 +347,543 @@ export default { Buffer, INSPECT_MAX_BYTES, kMaxLength, constants, atob: atobExp
 "#;
 
 const UTIL_SHIM: &str = r#"
-// node:util shim. `inspect` delegates to JSON.stringify with a fallback for
-// circular structures; `promisify` supports the custom-symbol override;
-// `format` covers the printf-ish specifiers packages actually use. The type
-// predicates live in node:util/types and are re-exported as `types`.
+// node:util shim. `inspect` is a real (if abbreviated) reimplementation of
+// Node's algorithm — quoted strings inside containers, class/null-prototype
+// prefixes, depth limiting, circular marking and the `util.inspect.custom`
+// hook — because `format`, `console` and node:events' unhandled-'error'
+// message all render through it and Node's output shape is observable.
+// `format` follows Node's specifier rules (%s/%d/%i/%f/%j/%o/%O/%c, `%%`
+// escaping, and inspection of the leftover arguments). The type predicates
+// live in node:util/types and are re-exported as `types`.
 import types from "node:util/types";
 
-function inspect(value) {
-    if (typeof value === "string") return value;
-    try { return JSON.stringify(value); } catch { return String(value); }
+const customInspectSymbol = Symbol.for("nodejs.util.inspect.custom");
+const kCustomPromisifiedSymbol = Symbol.for("nodejs.util.promisify.custom");
+const kCustomPromisifyArgsSymbol = Symbol.for("nodejs.util.promisify.customArgs");
+
+function invalidArgType(name, expected, actual) {
+    const received = actual === null
+        ? "null"
+        : typeof actual === "object"
+            ? "an instance of " + ((actual.constructor && actual.constructor.name) || "Object")
+            : "type " + typeof actual + " (" + String(actual) + ")";
+    const err = new TypeError(
+        'The "' + name + '" argument must be of type ' + expected + ". Received " + received
+    );
+    err.code = "ERR_INVALID_ARG_TYPE";
+    return err;
 }
-function format(f, ...args) {
-    if (typeof f !== "string") {
-        const all = [f, ...args];
-        const parts = [];
-        for (const a of all) parts.push(inspect(a));
-        return parts.join(" ");
+
+// ---------------------------------------------------------------- inspect
+
+const kIdentifierKey = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const kEscapes = { "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r" };
+
+// Node prefers single quotes, falling back to double then backtick so the
+// contents never need escaping when a cheaper quote is available.
+function strEscape(str) {
+    let quote = "'";
+    if (str.indexOf("'") !== -1) {
+        if (str.indexOf('"') === -1) quote = '"';
+        else if (str.indexOf("`") === -1) quote = "`";
     }
-    let i = 0;
-    let out = f.replace(/%[sdijfoOc%]/g, (spec) => {
-        if (spec === "%%") return "%";
-        if (i >= args.length) return spec;
-        const a = args[i++];
-        switch (spec) {
-            case "%s": return typeof a === "string" ? a : inspect(a);
-            case "%d": return String(Number(a));
-            case "%i": return String(parseInt(a, 10));
-            case "%f": return String(parseFloat(a));
-            case "%j":
-                try { return JSON.stringify(a); } catch { return "[Circular]"; }
-            case "%o":
-            case "%O": return inspect(a);
-            case "%c": return "";
-            default: return spec;
+    let out = "";
+    for (let i = 0; i < str.length; i++) {
+        const ch = str[i];
+        if (ch === quote || ch === "\\") { out += "\\" + ch; continue; }
+        const mapped = kEscapes[ch];
+        if (mapped !== undefined) { out += mapped; continue; }
+        const code = str.charCodeAt(i);
+        if (code < 0x20 || code === 0x7f) {
+            out += "\\x" + (code < 16 ? "0" : "") + code.toString(16);
+            continue;
         }
-    });
-    for (; i < args.length; i++) out += " " + inspect(args[i]);
-    return out;
+        out += ch;
+    }
+    return quote + out + quote;
 }
-function promisify(fn) {
-    if (typeof fn !== "function") throw new TypeError("promisify expects a function");
-    const custom = fn[promisify.custom];
-    if (typeof custom === "function") return custom;
-    return function (...args) {
-        return new Promise((resolve, reject) => {
-            try {
-                fn.call(this, ...args, (err, value) => err ? reject(err) : resolve(value));
-            } catch (e) { reject(e); }
-        });
+
+function formatNumber(number) {
+    return Object.is(number, -0) ? "-0" : String(number);
+}
+function formatPrimitive(value) {
+    switch (typeof value) {
+        case "string": return strEscape(value);
+        case "number": return formatNumber(value);
+        case "bigint": return String(value) + "n";
+        case "symbol": return value.toString();
+        case "undefined": return "undefined";
+        default: return String(value);
+    }
+}
+function formatFunctionBase(value, ctorName) {
+    const type = ctorName === "GeneratorFunction" || ctorName === "AsyncGeneratorFunction"
+        ? "GeneratorFunction"
+        : "Function";
+    const isClass = /^\s*class[\s{]/.test(Function.prototype.toString.call(value));
+    if (isClass) return value.name ? "[class " + value.name + "]" : "[class (anonymous)]";
+    return value.name ? "[" + type + ": " + value.name + "]" : "[" + type + " (anonymous)]";
+}
+
+// Walks the prototype chain for the nearest own `constructor` with a name;
+// `null` means the value has (or reached) a null prototype.
+function getCtorName(value) {
+    let obj = value;
+    while (obj !== null && obj !== undefined) {
+        let descriptor;
+        try { descriptor = Object.getOwnPropertyDescriptor(obj, "constructor"); } catch { return null; }
+        if (descriptor !== undefined && typeof descriptor.value === "function" &&
+            descriptor.value.name !== "") {
+            return descriptor.value.name;
+        }
+        obj = Object.getPrototypeOf(obj);
+    }
+    return null;
+}
+
+function isBelowBreakLength(ctx, output, start) {
+    let total = output.length + start;
+    if (total + output.length > ctx.breakLength) return false;
+    for (let i = 0; i < output.length; i++) {
+        total += output[i].length;
+        if (total > ctx.breakLength) return false;
+    }
+    return true;
+}
+function reduceToSingleString(ctx, output, base, braces) {
+    const start = output.length + ctx.indentationLvl + braces[0].length + base.length + 10;
+    if (isBelowBreakLength(ctx, output, start)) {
+        const joined = output.join(", ");
+        if (joined.indexOf("\n") === -1) {
+            return (base ? base + " " : "") +
+                (output.length === 0 ? braces[0] + braces[1] : braces[0] + " " + joined + " " + braces[1]);
+        }
+    }
+    const indent = "\n" + " ".repeat(ctx.indentationLvl);
+    return (base ? base + " " : "") + braces[0] + indent + "  " +
+        output.join("," + indent + "  ") + indent + braces[1];
+}
+
+function formatKey(key) {
+    if (typeof key === "symbol") return "[" + key.toString() + "]";
+    return kIdentifierKey.test(key) ? key : strEscape(key);
+}
+function formatProperty(ctx, value, recurseTimes, key) {
+    let descriptor;
+    try { descriptor = Object.getOwnPropertyDescriptor(value, key); } catch { descriptor = undefined; }
+    let str;
+    if (descriptor !== undefined && descriptor.get !== undefined) {
+        str = descriptor.set !== undefined ? "[Getter/Setter]" : "[Getter]";
+    } else if (descriptor !== undefined && descriptor.set !== undefined) {
+        str = "[Setter]";
+    } else {
+        ctx.indentationLvl += 2;
+        try { str = formatValue(ctx, value[key], recurseTimes + 1); }
+        finally { ctx.indentationLvl -= 2; }
+    }
+    return formatKey(key) + ": " + str;
+}
+function isIndexKey(key) {
+    const n = Number(key);
+    return Number.isInteger(n) && n >= 0 && String(n) === key;
+}
+function extraKeys(value, skipIndices) {
+    const keys = [];
+    for (const key of Object.keys(value)) {
+        if (skipIndices && isIndexKey(key)) continue;
+        keys.push(key);
+    }
+    const symbols = Object.getOwnPropertySymbols(value);
+    for (const sym of symbols) {
+        if (Object.prototype.propertyIsEnumerable.call(value, sym)) keys.push(sym);
+    }
+    return keys;
+}
+
+function formatValue(ctx, value, recurseTimes) {
+    if (typeof value !== "object" && typeof value !== "function") return formatPrimitive(value);
+    if (value === null) return "null";
+
+    // `util.inspect.custom` wins over every built-in rendering, exactly like
+    // Node — including when it throws, which callers are expected to handle.
+    let custom;
+    try { custom = value[customInspectSymbol]; } catch { custom = undefined; }
+    if (typeof custom === "function" && custom !== inspect) {
+        const depth = ctx.depth === Infinity ? null : ctx.depth - recurseTimes;
+        const ret = custom.call(value, depth, { depth, colors: false, showHidden: ctx.showHidden }, inspect);
+        if (ret !== value) return typeof ret === "string" ? ret : formatValue(ctx, ret, recurseTimes);
+    }
+
+    if (ctx.seen.indexOf(value) !== -1) return "[Circular *1]";
+
+    ctx.seen.push(value);
+    try {
+        return formatRaw(ctx, value, recurseTimes);
+    } finally {
+        ctx.seen.pop();
+    }
+}
+
+function formatRaw(ctx, value, recurseTimes) {
+    const ctorName = getCtorName(value);
+    let tag = "";
+    try {
+        const raw = value[Symbol.toStringTag];
+        if (typeof raw === "string" && raw !== ctorName) tag = raw;
+    } catch { tag = ""; }
+
+    let base = "";
+    let braces;
+    let output;
+    let keys;
+
+    if (Array.isArray(value)) {
+        if (recurseTimes > ctx.depth) return ctorName === "Array" ? "[Array]" : "[" + ctorName + "]";
+        const prefix = ctorName === "Array"
+            ? ""
+            : (ctorName === null ? "[Array: null prototype] " : ctorName + "(" + value.length + ") ");
+        braces = [prefix + "[", "]"];
+        keys = extraKeys(value, true);
+        output = [];
+        ctx.indentationLvl += 2;
+        try {
+            for (let i = 0; i < value.length && i < ctx.maxArrayLength; i++) {
+                output.push(Object.prototype.hasOwnProperty.call(value, i)
+                    ? formatValue(ctx, value[i], recurseTimes + 1)
+                    : "<1 empty item>");
+            }
+            if (value.length > ctx.maxArrayLength) {
+                output.push("... " + (value.length - ctx.maxArrayLength) + " more items");
+            }
+        } finally { ctx.indentationLvl -= 2; }
+    } else if (ArrayBuffer.isView(value) && !types.isDataView(value)) {
+        if (recurseTimes > ctx.depth) return "[" + (ctorName || "TypedArray") + "]";
+        braces = [(ctorName || "TypedArray") + "(" + value.length + ") [", "]"];
+        keys = extraKeys(value, true);
+        output = [];
+        for (let i = 0; i < value.length && i < ctx.maxArrayLength; i++) {
+            output.push(formatPrimitive(value[i]));
+        }
+        if (value.length > ctx.maxArrayLength) {
+            output.push("... " + (value.length - ctx.maxArrayLength) + " more items");
+        }
+    } else if (types.isMap(value)) {
+        if (recurseTimes > ctx.depth) return "[Map]";
+        braces = [(ctorName || "Map") + "(" + value.size + ") {", "}"];
+        keys = extraKeys(value, false);
+        output = [];
+        ctx.indentationLvl += 2;
+        try {
+            for (const entry of value) {
+                output.push(formatValue(ctx, entry[0], recurseTimes + 1) + " => " +
+                    formatValue(ctx, entry[1], recurseTimes + 1));
+            }
+        } finally { ctx.indentationLvl -= 2; }
+    } else if (types.isSet(value)) {
+        if (recurseTimes > ctx.depth) return "[Set]";
+        braces = [(ctorName || "Set") + "(" + value.size + ") {", "}"];
+        keys = extraKeys(value, false);
+        output = [];
+        ctx.indentationLvl += 2;
+        try {
+            for (const entry of value) output.push(formatValue(ctx, entry, recurseTimes + 1));
+        } finally { ctx.indentationLvl -= 2; }
+    } else if (types.isDate(value)) {
+        const time = Date.prototype.getTime.call(value);
+        base = Number.isNaN(time) ? "Invalid Date" : Date.prototype.toISOString.call(value);
+        braces = ["{", "}"];
+        keys = extraKeys(value, false);
+        output = [];
+    } else if (types.isRegExp(value)) {
+        base = RegExp.prototype.toString.call(value);
+        braces = ["{", "}"];
+        keys = extraKeys(value, false);
+        output = [];
+    } else if (value instanceof Error) {
+        base = typeof value.stack === "string" && value.stack.length !== 0
+            ? value.stack
+            : "[" + (value.name || "Error") + (value.message ? ": " + value.message : "") + "]";
+        braces = ["{", "}"];
+        keys = extraKeys(value, false);
+        output = [];
+    } else if (typeof value === "function") {
+        base = formatFunctionBase(value, ctorName);
+        braces = ["{", "}"];
+        keys = extraKeys(value, false);
+        output = [];
+    } else if (types.isBoxedPrimitive(value)) {
+        base = "[" + (types.isStringObject(value) ? "String" :
+            types.isNumberObject(value) ? "Number" :
+            types.isBooleanObject(value) ? "Boolean" :
+            types.isBigIntObject(value) ? "BigInt" : "Symbol") +
+            ": " + formatPrimitive(boxedValueOf(value)) + "]";
+        braces = ["{", "}"];
+        keys = extraKeys(value, types.isStringObject(value));
+        output = [];
+    } else if (types.isPromise(value)) {
+        base = "Promise";
+        braces = ["{", "}"];
+        keys = extraKeys(value, false);
+        output = ["<pending>"];
+    } else {
+        if (recurseTimes > ctx.depth) {
+            return ctorName === "Object" || ctorName === null ? "[Object]" : "[" + ctorName + "]";
+        }
+        const prefix = ctorName === "Object"
+            ? (tag ? "Object [" + tag + "] " : "")
+            : ctorName === null
+                ? "[Object: null prototype] "
+                : ctorName + (tag ? " [" + tag + "] " : " ");
+        braces = [prefix + "{", "}"];
+        keys = extraKeys(value, false);
+        output = [];
+    }
+
+    for (const key of keys) output.push(formatProperty(ctx, value, recurseTimes, key));
+    if (output.length === 0 && base !== "") return base;
+    return reduceToSingleString(ctx, output, base, braces);
+}
+
+function boxedValueOf(value) {
+    if (types.isStringObject(value)) return String.prototype.valueOf.call(value);
+    if (types.isNumberObject(value)) return Number.prototype.valueOf.call(value);
+    if (types.isBooleanObject(value)) return Boolean.prototype.valueOf.call(value);
+    if (types.isBigIntObject(value)) return BigInt.prototype.valueOf.call(value);
+    return Symbol.prototype.valueOf.call(value);
+}
+
+// `showHidden` is accepted and forwarded to `util.inspect.custom` hooks, but
+// non-enumerable properties are not rendered — enumerating internal slots the
+// way Node's `%o` does needs engine support this runtime does not have. The
+// same goes for `colors`, `numericSeparator` and `sorted`: they round-trip
+// through `defaultOptions` for callers that read them back, and are otherwise
+// inert.
+function inspect(value, opts) {
+    const ctx = {
+        depth: inspect.defaultOptions.depth,
+        showHidden: inspect.defaultOptions.showHidden,
+        breakLength: inspect.defaultOptions.breakLength,
+        maxArrayLength: inspect.defaultOptions.maxArrayLength,
+        seen: [],
+        indentationLvl: 0,
     };
+    if (typeof opts === "boolean") {
+        ctx.showHidden = opts;
+        if (typeof arguments[2] === "number") ctx.depth = arguments[2];
+    } else if (opts !== null && typeof opts === "object") {
+        if (opts.depth !== undefined) ctx.depth = opts.depth === null ? Infinity : opts.depth;
+        if (opts.showHidden !== undefined) ctx.showHidden = opts.showHidden;
+        if (opts.breakLength !== undefined) ctx.breakLength = opts.breakLength;
+        if (opts.maxArrayLength !== undefined) {
+            ctx.maxArrayLength = opts.maxArrayLength === null ? Infinity : opts.maxArrayLength;
+        }
+    }
+    return formatValue(ctx, value, 0);
 }
-promisify.custom = Symbol.for("nodejs.util.promisify.custom");
+inspect.custom = customInspectSymbol;
+inspect.defaultOptions = {
+    depth: 2,
+    showHidden: false,
+    colors: false,
+    breakLength: 128,
+    maxArrayLength: 100,
+    compact: 3,
+    numericSeparator: false,
+    sorted: false,
+    getters: false,
+};
+
+// ----------------------------------------------------------------- format
+
+let circularErrorMessage;
+function tryStringify(arg) {
+    try {
+        return JSON.stringify(arg);
+    } catch (err) {
+        if (circularErrorMessage === undefined) {
+            circularErrorMessage = null;
+            try {
+                const probe = {};
+                probe.probe = probe;
+                JSON.stringify(probe);
+            } catch (circularError) {
+                circularErrorMessage = circularError.message;
+            }
+        }
+        if (err instanceof TypeError && err.message === circularErrorMessage) return "[Circular]";
+        throw err;
+    }
+}
+
+const kBuiltinPrototypes = [
+    Object.prototype, Array.prototype, Function.prototype, Error.prototype,
+    Date.prototype, RegExp.prototype, Number.prototype, String.prototype,
+    Boolean.prototype, Symbol.prototype,
+];
+// `%s` renders an object through its own `toString`/`Symbol.toPrimitive` when
+// it has one, and through `inspect` otherwise (Node's rule — it is what makes
+// `%s` on a plain object print `{ a: [Array] }` rather than `[object Object]`).
+function hasCustomToString(value) {
+    try {
+        if (typeof value[Symbol.toPrimitive] === "function") return true;
+        let obj = value;
+        while (obj !== null) {
+            const descriptor = Object.getOwnPropertyDescriptor(obj, "toString");
+            if (descriptor !== undefined) {
+                return typeof descriptor.value === "function" && kBuiltinPrototypes.indexOf(obj) === -1;
+            }
+            obj = Object.getPrototypeOf(obj);
+        }
+    } catch { return false; }
+    return false;
+}
+
+function formatWithOptionsInternal(inspectOptions, args) {
+    const first = args[0];
+    let a = 0;
+    let str = "";
+    let join = "";
+
+    if (typeof first === "string") {
+        if (args.length === 1) return first;
+        let tempStr;
+        let lastPos = 0;
+        for (let i = 0; i < first.length - 1; i++) {
+            if (first.charCodeAt(i) !== 37) continue; // '%'
+            const nextChar = first.charCodeAt(++i);
+            if (a + 1 !== args.length) {
+                switch (nextChar) {
+                    case 115: { // 's'
+                        const tempArg = args[++a];
+                        if (typeof tempArg === "number") tempStr = formatNumber(tempArg);
+                        else if (typeof tempArg === "bigint") tempStr = String(tempArg) + "n";
+                        else if (typeof tempArg !== "object" || tempArg === null || hasCustomToString(tempArg)) {
+                            tempStr = String(tempArg);
+                        } else {
+                            tempStr = inspect(tempArg, { ...inspectOptions, depth: 0 });
+                        }
+                        break;
+                    }
+                    case 106: // 'j'
+                        tempStr = tryStringify(args[++a]);
+                        break;
+                    case 100: { // 'd'
+                        const tempNum = args[++a];
+                        if (typeof tempNum === "bigint") tempStr = String(tempNum) + "n";
+                        else if (typeof tempNum === "symbol") tempStr = "NaN";
+                        else tempStr = formatNumber(Number(tempNum));
+                        break;
+                    }
+                    case 79: // 'O'
+                        tempStr = inspect(args[++a], inspectOptions);
+                        break;
+                    case 111: // 'o'
+                        tempStr = inspect(args[++a], { ...inspectOptions, showHidden: true, depth: 4 });
+                        break;
+                    case 105: { // 'i'
+                        const tempInteger = args[++a];
+                        if (typeof tempInteger === "bigint") tempStr = String(tempInteger) + "n";
+                        else if (typeof tempInteger === "symbol") tempStr = "NaN";
+                        else tempStr = formatNumber(parseInt(tempInteger, 10));
+                        break;
+                    }
+                    case 102: { // 'f'
+                        const tempFloat = args[++a];
+                        if (typeof tempFloat === "symbol") tempStr = "NaN";
+                        else tempStr = formatNumber(parseFloat(tempFloat));
+                        break;
+                    }
+                    case 99: // 'c'
+                        a += 1;
+                        tempStr = "";
+                        break;
+                    case 37: // '%'
+                        str += first.slice(lastPos, i);
+                        lastPos = i + 1;
+                        continue;
+                    default:
+                        continue;
+                }
+                if (lastPos !== i - 1) str += first.slice(lastPos, i - 1);
+                str += tempStr;
+                lastPos = i + 1;
+            } else if (nextChar === 37) {
+                str += first.slice(lastPos, i);
+                lastPos = i + 1;
+            }
+        }
+        if (lastPos !== 0) {
+            a++;
+            join = " ";
+            if (lastPos < first.length) str += first.slice(lastPos);
+        }
+    }
+
+    while (a < args.length) {
+        const value = args[a];
+        str += join;
+        str += typeof value !== "string" ? inspect(value, inspectOptions) : value;
+        join = " ";
+        a++;
+    }
+    return str;
+}
+
+function format(...args) {
+    return formatWithOptionsInternal({}, args);
+}
+function formatWithOptions(inspectOptions, ...args) {
+    if (inspectOptions === null || typeof inspectOptions !== "object") {
+        throw invalidArgType("inspectOptions", "object", inspectOptions);
+    }
+    return formatWithOptionsInternal(inspectOptions, args);
+}
+
+// --------------------------------------------------------------- promisify
+
+function promisify(original) {
+    if (typeof original !== "function") throw invalidArgType("original", "function", original);
+
+    if (original[kCustomPromisifiedSymbol]) {
+        const fn = original[kCustomPromisifiedSymbol];
+        if (typeof fn !== "function") {
+            throw invalidArgType("util.promisify.custom", "function", fn);
+        }
+        Object.defineProperty(fn, kCustomPromisifiedSymbol, {
+            value: fn, enumerable: false, writable: false, configurable: true,
+        });
+        return fn;
+    }
+
+    // `customPromisifyArgs` lets a multi-value callback resolve to an object.
+    const argumentNames = original[kCustomPromisifyArgsSymbol];
+
+    function fn(...args) {
+        return new Promise((resolve, reject) => {
+            args.push((err, ...values) => {
+                if (err) { reject(err); return; }
+                if (argumentNames !== undefined && values.length > 1) {
+                    const obj = {};
+                    for (let i = 0; i < argumentNames.length; i++) obj[argumentNames[i]] = values[i];
+                    resolve(obj);
+                } else {
+                    resolve(values[0]);
+                }
+            });
+            original.apply(this, args);
+        });
+    }
+    Object.setPrototypeOf(fn, Object.getPrototypeOf(original));
+    Object.defineProperty(fn, kCustomPromisifiedSymbol, {
+        value: fn, enumerable: false, writable: false, configurable: true,
+    });
+    try { Object.defineProperties(fn, Object.getOwnPropertyDescriptors(original)); } catch {}
+    return fn;
+}
+promisify.custom = kCustomPromisifiedSymbol;
+
 function callbackify(fn) {
-    if (typeof fn !== "function") throw new TypeError("callbackify expects a function");
+    if (typeof fn !== "function") throw invalidArgType("original", "function", fn);
     return function (...args) {
         const cb = args.pop();
         Promise.resolve(fn.apply(this, args)).then(
@@ -408,43 +892,160 @@ function callbackify(fn) {
         );
     };
 }
-function deprecate(fn, message) {
+// Node de-duplicates by `code` when one is supplied, so two wrappers sharing a
+// code warn once between them.
+const emittedDeprecations = Object.create(null);
+function deprecate(fn, message, code) {
+    if (code !== undefined && emittedDeprecations[code] === undefined) {
+        emittedDeprecations[code] = false;
+    }
     let warned = false;
-    return function (...args) {
-        if (!warned) {
+    function deprecated(...args) {
+        const already = code !== undefined ? emittedDeprecations[code] : warned;
+        if (!already) {
             warned = true;
-            if (globalThis.console && typeof globalThis.console.warn === "function") {
+            if (code !== undefined) emittedDeprecations[code] = true;
+            const warning = new Error(message);
+            warning.name = "DeprecationWarning";
+            if (code !== undefined) warning.code = code;
+            if (globalThis.process && typeof globalThis.process.emitWarning === "function") {
+                globalThis.process.emitWarning(warning);
+            } else if (globalThis.console && typeof globalThis.console.warn === "function") {
                 globalThis.console.warn("DeprecationWarning: " + message);
             }
         }
         return fn.apply(this, args);
-    };
+    }
+    return deprecated;
 }
 function inherits(ctor, superCtor) {
     ctor.super_ = superCtor;
     Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
 }
-function isDeepStrictEqual(a, b) {
-    if (Object.is(a, b)) return true;
-    if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
-        return false;
+
+// -------------------------------------------------------- isDeepStrictEqual
+
+function ownEnumerableKeys(value) {
+    const keys = Object.keys(value);
+    for (const sym of Object.getOwnPropertySymbols(value)) {
+        if (Object.prototype.propertyIsEnumerable.call(value, sym)) keys.push(sym);
     }
-    if (a instanceof Date || b instanceof Date) {
-        return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
+    return keys;
+}
+// Boxed primitives compare by their *internal* value, and the brand checks in
+// node:util/types are slot-based, so a swapped prototype or a forged
+// Symbol.toStringTag cannot make a Boolean object look like a String one.
+function isEqualBoxedPrimitive(val1, val2) {
+    if (types.isNumberObject(val1)) {
+        return types.isNumberObject(val2) &&
+            Object.is(Number.prototype.valueOf.call(val1), Number.prototype.valueOf.call(val2));
     }
-    if (a instanceof RegExp || b instanceof RegExp) {
-        return a instanceof RegExp && b instanceof RegExp && a.source === b.source && a.flags === b.flags;
+    if (types.isStringObject(val1)) {
+        return types.isStringObject(val2) &&
+            String.prototype.valueOf.call(val1) === String.prototype.valueOf.call(val2);
     }
-    if (Array.isArray(a) !== Array.isArray(b)) return false;
-    const ka = Object.keys(a);
-    const kb = Object.keys(b);
-    if (ka.length !== kb.length) return false;
-    for (const k of ka) {
-        if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-        if (!isDeepStrictEqual(a[k], b[k])) return false;
+    if (types.isBooleanObject(val1)) {
+        return types.isBooleanObject(val2) &&
+            Boolean.prototype.valueOf.call(val1) === Boolean.prototype.valueOf.call(val2);
+    }
+    if (types.isBigIntObject(val1)) {
+        return types.isBigIntObject(val2) &&
+            BigInt.prototype.valueOf.call(val1) === BigInt.prototype.valueOf.call(val2);
+    }
+    return types.isSymbolObject(val2) &&
+        Symbol.prototype.valueOf.call(val1) === Symbol.prototype.valueOf.call(val2);
+}
+function byteEqual(a, b) {
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+}
+// The snapshot policy cannot rely on Set/WeakSet being present, so cycles are
+// tracked with a plain array of visited pairs (the node:assert shim does the
+// same).
+function innerDeepEqual(val1, val2, memos) {
+    if (val1 === val2) return val1 !== 0 || Object.is(val1, val2);
+    if (typeof val1 !== "object" || val1 === null) {
+        return typeof val1 === "number" && Number.isNaN(val1) &&
+            typeof val2 === "number" && Number.isNaN(val2);
+    }
+    if (typeof val2 !== "object" || val2 === null) return false;
+    if (Object.getPrototypeOf(val1) !== Object.getPrototypeOf(val2)) return false;
+    if (Object.prototype.toString.call(val1) !== Object.prototype.toString.call(val2)) return false;
+
+    if (Array.isArray(val1)) {
+        if (!Array.isArray(val2) || val1.length !== val2.length) return false;
+    } else if (types.isDate(val1)) {
+        if (Date.prototype.getTime.call(val1) !== Date.prototype.getTime.call(val2)) return false;
+    } else if (types.isRegExp(val1)) {
+        if (val1.source !== val2.source || val1.flags !== val2.flags ||
+            val1.lastIndex !== val2.lastIndex) return false;
+    } else if (val1 instanceof Error) {
+        if (val1.message !== val2.message || val1.name !== val2.name) return false;
+    } else if (ArrayBuffer.isView(val1)) {
+        if (!ArrayBuffer.isView(val2) || val1.byteLength !== val2.byteLength) return false;
+        if (!byteEqual(new Uint8Array(val1.buffer, val1.byteOffset, val1.byteLength),
+                       new Uint8Array(val2.buffer, val2.byteOffset, val2.byteLength))) return false;
+    } else if (types.isArrayBuffer(val1)) {
+        if (val1.byteLength !== val2.byteLength) return false;
+        if (!byteEqual(new Uint8Array(val1), new Uint8Array(val2))) return false;
+    } else if (types.isSet(val1)) {
+        if (val1.size !== val2.size) return false;
+        if (!setEquiv(val1, val2, memos)) return false;
+    } else if (types.isMap(val1)) {
+        if (val1.size !== val2.size) return false;
+        if (!mapEquiv(val1, val2, memos)) return false;
+    } else if (types.isBoxedPrimitive(val1)) {
+        if (!isEqualBoxedPrimitive(val1, val2)) return false;
+    }
+
+    for (const pair of memos) {
+        if (pair[0] === val1 && pair[1] === val2) return true;
+    }
+    memos.push([val1, val2]);
+    try {
+        const keys1 = ownEnumerableKeys(val1);
+        const keys2 = ownEnumerableKeys(val2);
+        if (keys1.length !== keys2.length) return false;
+        for (const key of keys1) {
+            if (!Object.prototype.hasOwnProperty.call(val2, key)) return false;
+            if (!innerDeepEqual(val1[key], val2[key], memos)) return false;
+        }
+        return true;
+    } finally {
+        memos.pop();
+    }
+}
+function setEquiv(a, b, memos) {
+    const remaining = [];
+    for (const item of b) remaining.push(item);
+    for (const item of a) {
+        let matched = -1;
+        for (let i = 0; i < remaining.length; i++) {
+            if (innerDeepEqual(item, remaining[i], memos)) { matched = i; break; }
+        }
+        if (matched === -1) return false;
+        remaining.splice(matched, 1);
     }
     return true;
 }
+function mapEquiv(a, b, memos) {
+    const remaining = [];
+    for (const entry of b) remaining.push(entry);
+    for (const entry of a) {
+        let matched = -1;
+        for (let i = 0; i < remaining.length; i++) {
+            if (innerDeepEqual(entry[0], remaining[i][0], memos) &&
+                innerDeepEqual(entry[1], remaining[i][1], memos)) { matched = i; break; }
+        }
+        if (matched === -1) return false;
+        remaining.splice(matched, 1);
+    }
+    return true;
+}
+function isDeepStrictEqual(a, b) {
+    return innerDeepEqual(a, b, []);
+}
+
 // Legacy predicates, still imported by older packages.
 const isArray = Array.isArray;
 function isBoolean(v) { return typeof v === "boolean"; }
@@ -465,14 +1066,14 @@ const TextEncoder = globalThis.TextEncoder;
 const TextDecoder = globalThis.TextDecoder;
 function debuglog() { return function () {}; }
 export {
-    inspect, format, promisify, callbackify, deprecate, inherits, types,
+    inspect, format, formatWithOptions, promisify, callbackify, deprecate, inherits, types,
     isDeepStrictEqual, debuglog, TextEncoder, TextDecoder,
     isArray, isBoolean, isNull, isNullOrUndefined, isNumber, isString,
     isSymbol, isUndefined, isObject, isFunction, isPrimitive, isRegExp,
     isDate, isError, isBuffer,
 };
 export default {
-    inspect, format, promisify, callbackify, deprecate, inherits, types,
+    inspect, format, formatWithOptions, promisify, callbackify, deprecate, inherits, types,
     isDeepStrictEqual, debuglog, TextEncoder, TextDecoder,
     isArray, isBoolean, isNull, isNullOrUndefined, isNumber, isString,
     isSymbol, isUndefined, isObject, isFunction, isPrimitive, isRegExp,
@@ -1155,188 +1756,431 @@ export default path;
 // (ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE / ERR_UNHANDLED_ERROR) so
 // `assert.throws({ code })` checks hold.
 const EVENTS_SHIM: &str = r#"
-function invalidArg(message) {
-    const err = new TypeError(message);
+import { inspect } from "node:util";
+
+// Node keeps `_events[type]` as the listener *itself* when there is exactly
+// one, and only promotes to an array on the second registration. Packages and
+// Node's own test suite observe that shape directly (`ee._events.foo === fn`),
+// so the storage mirrors it rather than always using arrays.
+const kCapture = Symbol("kCapture");
+const kShapeMode = Symbol("shapeMode");
+let defaultMaxListeners = 10;
+
+function argTypeSuffix(actual) {
+    if (actual === null) return "null";
+    if (typeof actual === "object") {
+        const ctor = actual.constructor;
+        return "an instance of " + (ctor && ctor.name ? ctor.name : "Object");
+    }
+    if (typeof actual === "string") return "type string ('" + actual + "')";
+    return "type " + typeof actual + " (" + String(actual) + ")";
+}
+function invalidArgType(name, expected, actual) {
+    const err = new TypeError(
+        'The "' + name + '" argument must be of type ' + expected +
+        ". Received " + argTypeSuffix(actual)
+    );
     err.code = "ERR_INVALID_ARG_TYPE";
     return err;
 }
+function outOfRange(name, range, actual) {
+    const err = new RangeError(
+        'The value of "' + name + '" is out of range. It must be ' + range +
+        ". Received " + String(actual)
+    );
+    err.code = "ERR_OUT_OF_RANGE";
+    return err;
+}
+// Node's internal validateNumber(value, name, min): a non-number is a type
+// error, NaN and out-of-band values are range errors.
+function validateNumber(value, name, min) {
+    if (typeof value !== "number") throw invalidArgType(name, "number", value);
+    if (value < min || Number.isNaN(value)) throw outOfRange(name, ">= " + min, value);
+}
 function checkListener(listener) {
     if (typeof listener !== "function") {
-        throw invalidArg('The "listener" argument must be of type function');
+        throw invalidArgType("listener", "function", listener);
     }
 }
-function ensureEvents(target) {
-    if (target._events === undefined) {
-        target._events = Object.create(null);
+function ownKeys(target) {
+    if (typeof Reflect !== "undefined" && typeof Reflect.ownKeys === "function") {
+        return Reflect.ownKeys(target);
     }
-    return target._events;
+    return Object.getOwnPropertyNames(target).concat(Object.getOwnPropertySymbols(target));
+}
+function arrayClone(arr) {
+    const copy = new Array(arr.length);
+    for (let i = 0; i < arr.length; i++) copy[i] = arr[i];
+    return copy;
+}
+function spliceOne(list, index) {
+    for (; index + 1 < list.length; index++) list[index] = list[index + 1];
+    list.pop();
 }
 
 function EventEmitter(opts) {
     EventEmitter.init.call(this, opts);
 }
-EventEmitter.init = function init() {
-    if (this._events === undefined) {
-        this._events = Object.create(null);
-    }
-    if (this._maxListeners === undefined) {
-        this._maxListeners = undefined;
-    }
-};
-EventEmitter.prototype.setMaxListeners = function setMaxListeners(n) {
-    if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
-        const err = new RangeError(
-            'The value of "n" is out of range. It must be a non-negative number. Received ' + n
-        );
-        err.code = "ERR_OUT_OF_RANGE";
-        throw err;
-    }
-    this._maxListeners = n;
-    return this;
-};
-EventEmitter.prototype.getMaxListeners = function getMaxListeners() {
-    return this._maxListeners === undefined ? EventEmitter.defaultMaxListeners : this._maxListeners;
-};
-EventEmitter.prototype.addListener = function addListener(type, listener) {
-    return this.on(type, listener);
-};
-EventEmitter.prototype.on = function on(type, listener) {
-    checkListener(listener);
-    const events = ensureEvents(this);
-    if (events.newListener !== undefined) {
-        this.emit("newListener", type, listener.listener || listener);
-    }
-    (events[type] = events[type] || []).push(listener);
-    return this;
-};
-EventEmitter.prototype.prependListener = function prependListener(type, listener) {
-    checkListener(listener);
-    const events = ensureEvents(this);
-    if (events.newListener !== undefined) {
-        this.emit("newListener", type, listener.listener || listener);
-    }
-    (events[type] = events[type] || []).unshift(listener);
-    return this;
-};
-function onceWrap(target, type, listener) {
-    let fired = false;
-    function wrapper(...args) {
-        if (fired) return;
-        fired = true;
-        target.removeListener(type, wrapper);
-        return listener.apply(target, args);
-    }
-    wrapper.listener = listener;
-    return wrapper;
-}
-EventEmitter.prototype.once = function once(type, listener) {
-    checkListener(listener);
-    return this.on(type, onceWrap(this, type, listener));
-};
-EventEmitter.prototype.prependOnceListener = function prependOnceListener(type, listener) {
-    checkListener(listener);
-    return this.prependListener(type, onceWrap(this, type, listener));
-};
-EventEmitter.prototype.off = function off(type, listener) {
-    return this.removeListener(type, listener);
-};
-EventEmitter.prototype.removeListener = function removeListener(type, listener) {
-    checkListener(listener);
-    const events = ensureEvents(this);
-    const list = events[type];
-    if (!list) return this;
-    for (let i = list.length - 1; i >= 0; i--) {
-        if (list[i] === listener || list[i].listener === listener) {
-            const removed = list[i].listener || list[i];
-            list.splice(i, 1);
-            if (list.length === 0) delete events[type];
-            if (events.removeListener !== undefined) {
-                this.emit("removeListener", type, removed);
-            }
-            break;
-        }
-    }
-    return this;
-};
-EventEmitter.prototype.removeAllListeners = function removeAllListeners(type) {
-    const events = ensureEvents(this);
-    if (arguments.length === 0) {
-        // Emit 'removeListener' for each listener (Node does), unless there
-        // is no such listener registered.
-        if (events.removeListener !== undefined) {
-            for (const key of Object.keys(events)) {
-                if (key === "removeListener") continue;
-                this.removeAllListeners(key);
-            }
-            this.removeAllListeners("removeListener");
-        }
-        this._events = Object.create(null);
-        return this;
-    }
-    const list = events[type];
-    if (list) {
-        if (events.removeListener !== undefined) {
-            for (let i = list.length - 1; i >= 0; i--) {
-                const removed = list[i].listener || list[i];
-                list.splice(i, 1);
-                this.emit("removeListener", type, removed);
-            }
-            delete events[type];
-        } else {
-            delete events[type];
-        }
-    }
-    return this;
-};
-EventEmitter.prototype.emit = function emit(type, ...args) {
-    const events = ensureEvents(this);
-    if (type === "error" && events[EventEmitter.errorMonitor] !== undefined) {
-        for (const fn of events[EventEmitter.errorMonitor].slice()) fn.apply(this, args);
-    }
-    const list = events[type] ? events[type].slice() : [];
-    if (list.length === 0) {
-        if (type === "error") {
-            const err = args[0];
-            if (err instanceof Error) throw err;
-            const wrapped = new Error(
-                "Unhandled error." + (err !== undefined ? " (" + String(err) + ")" : "")
-            );
-            wrapped.code = "ERR_UNHANDLED_ERROR";
-            wrapped.context = err;
-            throw wrapped;
-        }
-        return false;
-    }
-    for (const fn of list) fn.apply(this, args);
-    return true;
-};
-EventEmitter.prototype.listeners = function listeners(type) {
-    const events = ensureEvents(this);
-    return (events[type] || []).map((l) => l.listener || l);
-};
-EventEmitter.prototype.rawListeners = function rawListeners(type) {
-    const events = ensureEvents(this);
-    return (events[type] || []).slice();
-};
-EventEmitter.prototype.listenerCount = function listenerCount(type, listener) {
-    const events = ensureEvents(this);
-    const list = events[type];
-    if (!list) return 0;
-    if (listener === undefined) return list.length;
-    let count = 0;
-    for (const l of list) {
-        if (l === listener || l.listener === listener) count++;
-    }
-    return count;
-};
-EventEmitter.prototype.eventNames = function eventNames() {
-    const events = ensureEvents(this);
-    return Object.keys(events).concat(Object.getOwnPropertySymbols(events));
-};
-EventEmitter.defaultMaxListeners = 10;
 EventEmitter.EventEmitter = EventEmitter;
 EventEmitter.errorMonitor = Symbol("events.errorMonitor");
 EventEmitter.captureRejectionSymbol = Symbol.for("nodejs.rejection");
+Object.defineProperty(EventEmitter, "defaultMaxListeners", {
+    enumerable: true,
+    configurable: true,
+    get() { return defaultMaxListeners; },
+    set(arg) {
+        validateNumber(arg, "defaultMaxListeners", 0);
+        defaultMaxListeners = arg;
+    },
+});
+Object.defineProperty(EventEmitter, "captureRejections", {
+    enumerable: true,
+    configurable: true,
+    get() { return EventEmitter.prototype[kCapture]; },
+    set(value) {
+        if (typeof value !== "boolean") {
+            throw invalidArgType("options.captureRejections", "boolean", value);
+        }
+        EventEmitter.prototype[kCapture] = value;
+    },
+});
+EventEmitter.prototype._events = undefined;
+EventEmitter.prototype._eventsCount = 0;
+EventEmitter.prototype._maxListeners = undefined;
+EventEmitter.prototype[kCapture] = false;
+
+// `_events` is only reset when it is genuinely this instance's own — the
+// prototype comparison is what makes `MyEE.prototype = new EventEmitter()`
+// (an old but still common inheritance idiom) give each instance its own
+// listener map instead of sharing the prototype's.
+EventEmitter.init = function init(opts) {
+    const proto = Object.getPrototypeOf(this);
+    if (this._events === undefined ||
+        (proto !== null && this._events === proto._events)) {
+        this._events = Object.create(null);
+        this._eventsCount = 0;
+        this[kShapeMode] = false;
+    } else {
+        this[kShapeMode] = true;
+    }
+    this._maxListeners = this._maxListeners || undefined;
+    if (opts && opts.captureRejections) {
+        if (typeof opts.captureRejections !== "boolean") {
+            throw invalidArgType("options.captureRejections", "boolean", opts.captureRejections);
+        }
+        this[kCapture] = Boolean(opts.captureRejections);
+    } else {
+        this[kCapture] = EventEmitter.prototype[kCapture];
+    }
+};
+
+// `events.setMaxListeners(n[, ...emitters])` — the module-level form.
+EventEmitter.setMaxListeners = function setMaxListeners(n, ...eventTargets) {
+    if (n === undefined) n = defaultMaxListeners;
+    validateNumber(n, "setMaxListeners", 0);
+    if (eventTargets.length === 0) {
+        defaultMaxListeners = n;
+        return;
+    }
+    for (const target of eventTargets) {
+        if (target && typeof target.setMaxListeners === "function") {
+            target.setMaxListeners(n);
+        } else {
+            throw invalidArgType("eventTargets", "EventEmitter or EventTarget", target);
+        }
+    }
+};
+
+EventEmitter.prototype.setMaxListeners = function setMaxListeners(n) {
+    validateNumber(n, "setMaxListeners", 0);
+    this._maxListeners = n;
+    return this;
+};
+function _getMaxListeners(that) {
+    return that._maxListeners === undefined ? defaultMaxListeners : that._maxListeners;
+}
+EventEmitter.prototype.getMaxListeners = function getMaxListeners() {
+    return _getMaxListeners(this);
+};
+
+function addCatch(that, promise, type, args) {
+    if (!that[kCapture]) return;
+    try {
+        const then = promise.then;
+        if (typeof then === "function") {
+            then.call(promise, undefined, function (err) {
+                emitUnhandledRejectionOrErr(that, err, type, args);
+            });
+        }
+    } catch (err) {
+        that.emit("error", err);
+    }
+}
+function emitUnhandledRejectionOrErr(that, err, type, args) {
+    if (typeof that[EventEmitter.captureRejectionSymbol] === "function") {
+        that[EventEmitter.captureRejectionSymbol](err, type, ...args);
+    } else {
+        that.emit("error", err);
+    }
+}
+
+function _addListener(target, type, listener, prepend) {
+    checkListener(listener);
+    let events = target._events;
+    let existing;
+    if (events === undefined) {
+        events = target._events = Object.create(null);
+        target._eventsCount = 0;
+    } else {
+        // 'newListener' is emitted *before* the listener is stored, so a
+        // handler observing `listeners(type)` sees the pre-insertion state
+        // (and a handler that registers its own listener lands ahead of it).
+        if (events.newListener !== undefined) {
+            target.emit("newListener", type, listener.listener || listener);
+            // A newListener handler may have replaced the whole map.
+            events = target._events;
+        }
+        existing = events[type];
+    }
+
+    if (existing === undefined) {
+        events[type] = listener;
+        ++target._eventsCount;
+    } else {
+        if (typeof existing === "function") {
+            existing = events[type] = prepend ? [listener, existing] : [existing, listener];
+        } else if (prepend) {
+            existing.unshift(listener);
+        } else {
+            existing.push(listener);
+        }
+        const m = _getMaxListeners(target);
+        if (m > 0 && existing.length > m && !existing.warned) {
+            existing.warned = true;
+            const w = new Error(
+                "Possible EventEmitter memory leak detected. " + existing.length + " " +
+                String(type) + " listeners added. Use emitter.setMaxListeners() to increase limit"
+            );
+            w.name = "MaxListenersExceededWarning";
+            w.emitter = target;
+            w.type = type;
+            w.count = existing.length;
+            if (globalThis.process && typeof globalThis.process.emitWarning === "function") {
+                globalThis.process.emitWarning(w);
+            }
+        }
+    }
+    return target;
+}
+
+EventEmitter.prototype.addListener = function addListener(type, listener) {
+    return _addListener(this, type, listener, false);
+};
+// Node aliases the two; `assert.strictEqual(ee.addListener, ee.on)` holds.
+EventEmitter.prototype.on = EventEmitter.prototype.addListener;
+EventEmitter.prototype.prependListener = function prependListener(type, listener) {
+    return _addListener(this, type, listener, true);
+};
+
+function onceWrapper() {
+    if (!this.fired) {
+        this.target.removeListener(this.type, this.wrapFn);
+        this.fired = true;
+        return this.listener.apply(this.target, arguments);
+    }
+}
+function _onceWrap(target, type, listener) {
+    const state = { fired: false, wrapFn: undefined, target, type, listener };
+    const wrapped = onceWrapper.bind(state);
+    wrapped.listener = listener;
+    state.wrapFn = wrapped;
+    return wrapped;
+}
+EventEmitter.prototype.once = function once(type, listener) {
+    checkListener(listener);
+    this.on(type, _onceWrap(this, type, listener));
+    return this;
+};
+EventEmitter.prototype.prependOnceListener = function prependOnceListener(type, listener) {
+    checkListener(listener);
+    this.prependListener(type, _onceWrap(this, type, listener));
+    return this;
+};
+
+EventEmitter.prototype.removeListener = function removeListener(type, listener) {
+    checkListener(listener);
+    const events = this._events;
+    if (events === undefined) return this;
+    const list = events[type];
+    if (list === undefined) return this;
+
+    if (list === listener || list.listener === listener) {
+        this._eventsCount -= 1;
+        if (this[kShapeMode]) {
+            events[type] = undefined;
+        } else if (this._eventsCount === 0) {
+            this._events = Object.create(null);
+        } else {
+            delete events[type];
+            if (events.removeListener) {
+                this.emit("removeListener", type, list.listener || listener);
+            }
+        }
+    } else if (typeof list !== "function") {
+        let position = -1;
+        for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i] === listener || list[i].listener === listener) {
+                position = i;
+                break;
+            }
+        }
+        if (position < 0) return this;
+        if (position === 0) list.shift();
+        else spliceOne(list, position);
+        if (list.length === 1) events[type] = list[0];
+        if (events.removeListener !== undefined) {
+            this.emit("removeListener", type, listener);
+        }
+    }
+    return this;
+};
+EventEmitter.prototype.off = EventEmitter.prototype.removeListener;
+
+EventEmitter.prototype.removeAllListeners = function removeAllListeners(type) {
+    const events = this._events;
+    if (events === undefined) return this;
+
+    // Nobody is listening for 'removeListener', so the whole map can go.
+    if (events.removeListener === undefined) {
+        if (arguments.length === 0) {
+            this._events = Object.create(null);
+            this._eventsCount = 0;
+        } else if (events[type] !== undefined) {
+            if (--this._eventsCount === 0) this._events = Object.create(null);
+            else delete events[type];
+        }
+        this[kShapeMode] = false;
+        return this;
+    }
+
+    if (arguments.length === 0) {
+        for (const key of ownKeys(events)) {
+            if (key === "removeListener") continue;
+            this.removeAllListeners(key);
+        }
+        this.removeAllListeners("removeListener");
+        this._events = Object.create(null);
+        this._eventsCount = 0;
+        this[kShapeMode] = false;
+        return this;
+    }
+
+    const listeners = events[type];
+    if (typeof listeners === "function") {
+        this.removeListener(type, listeners);
+    } else if (listeners !== undefined) {
+        // LIFO order, one removeListener emission per listener.
+        for (let i = listeners.length - 1; i >= 0; i--) {
+            this.removeListener(type, listeners[i]);
+        }
+    }
+    return this;
+};
+
+EventEmitter.prototype.emit = function emit(type, ...args) {
+    let doError = type === "error";
+    const events = this._events;
+    if (events !== undefined) {
+        if (doError && events[EventEmitter.errorMonitor] !== undefined) {
+            this.emit(EventEmitter.errorMonitor, ...args);
+        }
+        doError = doError && events.error === undefined;
+    } else if (!doError) {
+        return false;
+    }
+
+    if (doError) {
+        const er = args.length > 0 ? args[0] : undefined;
+        if (er instanceof Error) throw er;
+        // Node stringifies the context with `inspect` (so a string argument
+        // shows up quoted) and falls back to plain coercion when a custom
+        // inspect implementation throws.
+        let stringifiedEr;
+        try { stringifiedEr = inspect(er); } catch { stringifiedEr = er; }
+        const err = new Error(
+            stringifiedEr === undefined ? "Unhandled error." : "Unhandled error. (" + stringifiedEr + ")"
+        );
+        err.code = "ERR_UNHANDLED_ERROR";
+        err.context = er;
+        throw err;
+    }
+
+    const handler = events[type];
+    if (handler === undefined) return false;
+
+    if (typeof handler === "function") {
+        const result = handler.apply(this, args);
+        if (result !== undefined && result !== null) addCatch(this, result, type, args);
+    } else {
+        // Emission runs against a snapshot: a listener removed mid-emit still
+        // runs for the in-flight emit, exactly like Node.
+        const listeners = arrayClone(handler);
+        for (let i = 0; i < listeners.length; ++i) {
+            const result = listeners[i].apply(this, args);
+            if (result !== undefined && result !== null) addCatch(this, result, type, args);
+        }
+    }
+    return true;
+};
+
+function _listeners(target, type, unwrap) {
+    const events = target._events;
+    if (events === undefined) return [];
+    const evlistener = events[type];
+    if (evlistener === undefined) return [];
+    if (typeof evlistener === "function") {
+        return unwrap ? [evlistener.listener || evlistener] : [evlistener];
+    }
+    const ret = arrayClone(evlistener);
+    if (unwrap) {
+        for (let i = 0; i < ret.length; ++i) {
+            const orig = ret[i].listener;
+            if (typeof orig === "function") ret[i] = orig;
+        }
+    }
+    return ret;
+}
+EventEmitter.prototype.listeners = function listeners(type) {
+    return _listeners(this, type, true);
+};
+EventEmitter.prototype.rawListeners = function rawListeners(type) {
+    return _listeners(this, type, false);
+};
+EventEmitter.prototype.listenerCount = function listenerCount(type, listener) {
+    const events = this._events;
+    if (events !== undefined) {
+        const evlistener = events[type];
+        if (typeof evlistener === "function") {
+            if (listener !== undefined && listener !== null) {
+                return listener === evlistener || listener === evlistener.listener ? 1 : 0;
+            }
+            return 1;
+        } else if (evlistener !== undefined) {
+            if (listener !== undefined && listener !== null) {
+                let matching = 0;
+                for (let i = 0; i < evlistener.length; i++) {
+                    if (evlistener[i] === listener || evlistener[i].listener === listener) matching++;
+                }
+                return matching;
+            }
+            return evlistener.length;
+        }
+    }
+    return 0;
+};
+EventEmitter.prototype.eventNames = function eventNames() {
+    return this._eventsCount > 0 ? ownKeys(this._events) : [];
+};
 // Legacy static form, still exercised by Node's suite and old packages.
 EventEmitter.listenerCount = function (emitter, type) {
     return emitter.listenerCount(type);
@@ -1357,13 +2201,7 @@ function getEventListeners(emitter, name) {
 function getMaxListeners(emitter) {
     return emitter.getMaxListeners();
 }
-function setMaxListeners(n, ...emitters) {
-    if (emitters.length === 0) {
-        EventEmitter.defaultMaxListeners = n;
-        return;
-    }
-    for (const emitter of emitters) emitter.setMaxListeners(n);
-}
+const setMaxListeners = EventEmitter.setMaxListeners;
 const errorMonitor = EventEmitter.errorMonitor;
 const captureRejectionSymbol = EventEmitter.captureRejectionSymbol;
 
