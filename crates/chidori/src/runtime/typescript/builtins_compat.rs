@@ -296,68 +296,92 @@ function copyInto(src, dst, dstStart, srcStart, srcEnd) {
     dst.set(src.subarray(srcStart, srcEnd), dstStart);
 }
 
-// Total width and the legal range of the *second* byte for a UTF-8 lead byte,
-// or null when the byte cannot start a sequence (a stray continuation byte, or
-// one of C0/C1/F5..FF which UTF-8 never uses). The second-byte range is what
-// rules out overlong encodings, surrogate code points and anything above
-// U+10FFFF, so partial sequences are rejected as early as Buffer.toString does.
-function utf8Lead(b) {
-    if (b >= 0xc2 && b <= 0xdf) return [2, 0x80, 0xbf];
-    if (b >= 0xe0 && b <= 0xef) return [3, b === 0xe0 ? 0xa0 : 0x80, b === 0xed ? 0x9f : 0xbf];
-    if (b >= 0xf0 && b <= 0xf4) return [4, b === 0xf0 ? 0x90 : 0x80, b === 0xf4 ? 0x8f : 0xbf];
-    return null;
+// The decoder tracks two counters, surfaced to callers Node-style as
+// lastNeed (bytes still missing) and lastTotal (bytes buffered + missing).
+function setUtf8State(self, buffered, missing) {
+    self.lastNeed = missing;
+    self.lastTotal = buffered + missing;
 }
-// How many trailing bytes of `buf` form a sequence that is still valid but not
-// yet complete, and so must wait for the next chunk. Anything already known to
-// be malformed stays in place for the decoder to turn into U+FFFD.
-function utf8IncompleteTail(buf, i) {
-    const len = buf.length;
-    for (let back = 1; back <= 3 && len - back >= i; back++) {
-        const p = len - back;
-        const lead = utf8Lead(buf[p]);
-        if (lead === null) {
-            // A continuation byte may still belong to a lead further back.
-            if (buf[p] >= 0x80 && buf[p] <= 0xbf) continue;
-            return 0;
-        }
-        if (lead[0] <= back) return 0;
-        for (let k = 1; k < back; k++) {
-            const b = buf[p + k];
-            const lo = k === 1 ? lead[1] : 0x80;
-            const hi = k === 1 ? lead[2] : 0xbf;
-            if (b < lo || b > hi) return 0;
-        }
-        return back;
-    }
-    return 0;
-}
-function utf8Text(self, buf, i) {
-    const keep = utf8IncompleteTail(buf, i);
-    if (keep === 0) {
-        self.lastNeed = 0;
-        self.lastTotal = 0;
-        return buf.toString("utf8", i);
-    }
-    const start = buf.length - keep;
-    self.lastTotal = utf8Lead(buf[start])[0];
-    self.lastNeed = self.lastTotal - keep;
-    copyInto(buf, self.lastChar, 0, start, buf.length);
-    return buf.toString("utf8", i, start);
-}
-// UTF-8 carries the held-back bytes forward by prepending them to the next
-// chunk: they produced no output on their own, so re-decoding them is free of
-// side effects and keeps invalid-sequence handling identical to a single write.
+// Faithful port of StringDecoder::DecodeData from Node's src/string_decoder.cc
+// (v22), UTF-8 branch. Two properties of that implementation matter for
+// byte-at-a-time chunking: hold-back at a chunk boundary is decided purely by
+// the lead byte's width bits (so even a lead UTF-8 never uses, like F6, is
+// buffered), and when the next chunk arrives each byte filling the incomplete
+// character must be a continuation byte — the first that is not flushes the
+// partial sequence through the regular decoder, which renders its maximal
+// invalid subsequences as U+FFFD.
 function utf8Write(self, buf) {
-    if (self.lastTotal !== 0) {
-        const seen = self.lastTotal - self.lastNeed;
-        const merged = Buffer.allocUnsafe(seen + buf.length);
-        copyInto(self.lastChar, merged, 0, 0, seen);
-        copyInto(buf, merged, seen, 0, buf.length);
-        self.lastNeed = 0;
-        self.lastTotal = 0;
-        buf = merged;
+    let prepend = null;
+    let buffered = self.lastTotal - self.lastNeed;
+    let missing = self.lastNeed;
+    if (missing > 0) {
+        const lim = Math.min(buf.length, missing);
+        for (let i = 0; i < lim; i++) {
+            if ((buf[i] & 0xc0) !== 0x80) {
+                // Not the continuation byte the sequence needs: stop filling,
+                // keep what arrived so far, and let the unexpected byte start
+                // a fresh character.
+                missing = 0;
+                copyInto(buf, self.lastChar, buffered, 0, i);
+                buffered += i;
+                buf = buf.subarray(i);
+                break;
+            }
+        }
+        const found = Math.min(buf.length, missing);
+        copyInto(buf, self.lastChar, buffered, 0, found);
+        buf = buf.subarray(found);
+        missing -= found;
+        buffered += found;
+        if (missing === 0) {
+            prepend = self.lastChar.toString("utf8", 0, buffered);
+            buffered = 0;
+        }
+        setUtf8State(self, buffered, missing);
     }
-    return utf8Text(self, buf, 0);
+    if (buf.length === 0) return prepend !== null ? prepend : "";
+    // See whether a character at the end of this chunk must wait for the next.
+    let hold = 0;
+    if (buf[buf.length - 1] & 0x80) {
+        for (let i = buf.length - 1; ; i--) {
+            hold++;
+            if ((buf[i] & 0xc0) === 0x80) {
+                if (hold >= 4 || i === 0) {
+                    // Too many trailing continuation bytes for one character,
+                    // or nothing but continuations: invalid either way, so let
+                    // the engine's decoder replace them now.
+                    hold = 0;
+                    break;
+                }
+            } else {
+                let width = 0;
+                if ((buf[i] & 0xe0) === 0xc0) width = 2;
+                else if ((buf[i] & 0xf0) === 0xe0) width = 3;
+                else if ((buf[i] & 0xf8) === 0xf0) width = 4;
+                else {
+                    // F8..FF cannot lead any character; decode (and replace)
+                    // immediately.
+                    hold = 0;
+                    break;
+                }
+                if (hold >= width) {
+                    // Complete (or over-long, i.e. invalid) — nothing to hold.
+                    hold = 0;
+                } else {
+                    missing = width - hold;
+                }
+                break;
+            }
+        }
+    }
+    let end = buf.length;
+    if (hold > 0) {
+        end = buf.length - hold;
+        copyInto(buf, self.lastChar, 0, end, buf.length);
+        setUtf8State(self, hold, missing);
+    }
+    const body = end > 0 ? buf.toString("utf8", 0, end) : "";
+    return prepend !== null ? prepend + body : body;
 }
 // UTF-16LE needs byte pairs, and a trailing high surrogate must wait for its
 // low half before it can be emitted.
@@ -421,16 +445,13 @@ function StringDecoder(encoding) {
 }
 
 // Returns only the complete characters in `buf` from index `i`, buffering any
-// trailing partial character. Undocumented in Node but part of its surface.
+// trailing partial character. Undocumented in Node but part of its surface;
+// Node implements it as a state reset followed by a write of the slice.
 StringDecoder.prototype.text = function text(buf, i) {
     checkThis(this);
-    const bytes = asBuffer(buf);
-    if (this.encoding === "utf8") return utf8Text(this, bytes, i);
-    if (this.encoding === "utf16le") return utf16Text(this, bytes, i);
-    if (this.encoding === "base64" || this.encoding === "base64url") {
-        return base64Text(this, bytes, i);
-    }
-    return bytes.toString(this.encoding, i);
+    this.lastNeed = 0;
+    this.lastTotal = 0;
+    return this.write(asBuffer(buf).slice(i));
 };
 
 StringDecoder.prototype.write = function write(buf) {
@@ -458,7 +479,9 @@ StringDecoder.prototype.write = function write(buf) {
         i = 0;
     }
     if (i < bytes.length) {
-        const rest = this.text(bytes, i);
+        const rest = this.encoding === "utf16le" ? utf16Text(this, bytes, i)
+            : this.encoding === "base64" || this.encoding === "base64url" ? base64Text(this, bytes, i)
+            : bytes.toString(this.encoding, i);
         return r ? r + rest : rest;
     }
     return r || "";
@@ -470,9 +493,9 @@ StringDecoder.prototype.end = function end(buf) {
     if (this.lastNeed) {
         const enc = this.encoding;
         if (enc === "utf8") {
-            // One replacement character for the truncated sequence, however
-            // many of its bytes had already arrived.
-            r += "�";
+            // Flush the buffered partial character through the regular
+            // decoder; each maximal invalid subsequence becomes U+FFFD.
+            r += this.lastChar.toString("utf8", 0, this.lastTotal - this.lastNeed);
         } else if (enc === "utf16le") {
             r += this.lastChar.toString("utf16le", 0, this.lastTotal - this.lastNeed);
         } else if (enc === "base64" || enc === "base64url") {
@@ -767,21 +790,40 @@ export function isRegExp(value) { return value instanceof RegExp; }
 export function isPromise(value) { return value instanceof Promise; }
 export function isNativeError(value) { return value instanceof Error; }
 export function isArrayBuffer(value) { return value instanceof ArrayBuffer; }
-export function isAnyArrayBuffer(value) { return value instanceof ArrayBuffer; }
+export function isAnyArrayBuffer(value) { return isArrayBuffer(value) || isSharedArrayBuffer(value); }
 export function isArrayBufferView(value) { return ArrayBuffer.isView(value); }
-export function isDataView(value) { return typeof DataView !== "undefined" && value instanceof DataView; }
-export function isTypedArray(value) { return ArrayBuffer.isView(value) && !isDataView(value); }
-export function isUint8Array(value) { return value instanceof Uint8Array; }
-export function isUint8ClampedArray(value) { return typeof Uint8ClampedArray !== "undefined" && value instanceof Uint8ClampedArray; }
-export function isUint16Array(value) { return value instanceof Uint16Array; }
-export function isUint32Array(value) { return value instanceof Uint32Array; }
-export function isInt8Array(value) { return value instanceof Int8Array; }
-export function isInt16Array(value) { return value instanceof Int16Array; }
-export function isInt32Array(value) { return value instanceof Int32Array; }
-export function isFloat32Array(value) { return value instanceof Float32Array; }
-export function isFloat64Array(value) { return value instanceof Float64Array; }
-export function isBigInt64Array(value) { return typeof BigInt64Array !== "undefined" && value instanceof BigInt64Array; }
-export function isBigUint64Array(value) { return typeof BigUint64Array !== "undefined" && value instanceof BigUint64Array; }
+// Typed arrays are identified by internal slot, not prototype: a plain object
+// wearing Uint8Array.prototype is not one, and a real Uint8Array whose
+// prototype was swapped out still is. %TypedArray%.prototype's toStringTag
+// getter reads the internal [[TypedArrayName]], so it is the JS-reachable
+// brand check — same trick Node's own JS fallback uses.
+const kTypedArrayTag = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag
+).get;
+function typedArrayKind(value) {
+    return value !== null && typeof value === "object"
+        ? kTypedArrayTag.call(value)
+        : undefined;
+}
+const kDataViewByteLength = Object.getOwnPropertyDescriptor(
+    DataView.prototype, "byteLength"
+).get;
+export function isDataView(value) {
+    if (value === null || typeof value !== "object") return false;
+    try { kDataViewByteLength.call(value); return true; } catch { return false; }
+}
+export function isTypedArray(value) { return typedArrayKind(value) !== undefined; }
+export function isUint8Array(value) { return typedArrayKind(value) === "Uint8Array"; }
+export function isUint8ClampedArray(value) { return typedArrayKind(value) === "Uint8ClampedArray"; }
+export function isUint16Array(value) { return typedArrayKind(value) === "Uint16Array"; }
+export function isUint32Array(value) { return typedArrayKind(value) === "Uint32Array"; }
+export function isInt8Array(value) { return typedArrayKind(value) === "Int8Array"; }
+export function isInt16Array(value) { return typedArrayKind(value) === "Int16Array"; }
+export function isInt32Array(value) { return typedArrayKind(value) === "Int32Array"; }
+export function isFloat32Array(value) { return typedArrayKind(value) === "Float32Array"; }
+export function isFloat64Array(value) { return typedArrayKind(value) === "Float64Array"; }
+export function isBigInt64Array(value) { return typedArrayKind(value) === "BigInt64Array"; }
+export function isBigUint64Array(value) { return typedArrayKind(value) === "BigUint64Array"; }
 export function isMap(value) { return typeof Map !== "undefined" && value instanceof Map; }
 export function isSet(value) { return typeof Set !== "undefined" && value instanceof Set; }
 export function isWeakMap(value) { return typeof WeakMap !== "undefined" && value instanceof WeakMap; }
@@ -792,7 +834,31 @@ export function isGeneratorObject(value) {
     return value !== null && typeof value === "object" &&
         typeof value.next === "function" && typeof value.throw === "function";
 }
-export function isProxy() { return false; }
+// Map/Set iterators share one prototype per kind in this (single-realm)
+// engine, so prototype identity is an unspoofable brand: `Symbol.toStringTag`
+// fakes sit on Object.prototype instead.
+const kMapIteratorProto = Object.getPrototypeOf((new Map())[Symbol.iterator]());
+const kSetIteratorProto = Object.getPrototypeOf((new Set())[Symbol.iterator]());
+export function isMapIterator(value) {
+    return value !== null && typeof value === "object" &&
+        Object.getPrototypeOf(value) === kMapIteratorProto;
+}
+export function isSetIterator(value) {
+    return value !== null && typeof value === "object" &&
+        Object.getPrototypeOf(value) === kSetIteratorProto;
+}
+// Proxies are script-transparent; the engine exposes its internal brand check.
+const kIsProxyNative = globalThis.__chidori_is_proxy;
+export function isProxy(value) {
+    return (typeof value === "object" || typeof value === "function") &&
+        value !== null &&
+        typeof kIsProxyNative === "function" && kIsProxyNative(value);
+}
+export function isExternal(value) {
+    // chidori has no V8 externals; the node-compat harness brands its
+    // JSStream placeholder so external-shaped values are recognizable.
+    return value !== null && typeof value === "object" && value.__chidoriExternal === true;
+}
 // Boxed primitives are identified by their internal slot, not by `instanceof`:
 // the prototype and `Symbol.toStringTag` of a wrapper are both writable, so
 // only invoking the matching `valueOf` distinguishes (say) a Boolean object
@@ -816,20 +882,28 @@ export function isBoxedPrimitive(value) {
 export function isArgumentsObject(value) {
     return Object.prototype.toString.call(value) === "[object Arguments]";
 }
-export function isSharedArrayBuffer() { return false; }
-export function isExternal() { return false; }
+export function isSharedArrayBuffer(value) {
+    return typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer;
+}
+
 export function isModuleNamespaceObject(value) {
     return Object.prototype.toString.call(value) === "[object Module]";
 }
+// chidori's crypto shim has no KeyObject/CryptoKey classes, so nothing can be
+// one; Node returns false for arbitrary values too.
+export function isKeyObject() { return false; }
+export function isCryptoKey() { return false; }
 const types = {
     isDate, isRegExp, isPromise, isNativeError, isArrayBuffer, isAnyArrayBuffer,
     isArrayBufferView, isDataView, isTypedArray, isUint8Array, isUint8ClampedArray,
     isUint16Array, isUint32Array, isInt8Array, isInt16Array, isInt32Array,
     isFloat32Array, isFloat64Array, isBigInt64Array, isBigUint64Array,
-    isMap, isSet, isWeakMap, isWeakSet, isAsyncFunction, isGeneratorFunction,
+    isMap, isSet, isMapIterator, isSetIterator, isWeakMap, isWeakSet,
+    isAsyncFunction, isGeneratorFunction,
     isGeneratorObject, isProxy, isSymbolObject, isBigIntObject, isStringObject,
     isNumberObject, isBooleanObject, isBoxedPrimitive, isArgumentsObject,
     isSharedArrayBuffer, isExternal, isModuleNamespaceObject,
+    isKeyObject, isCryptoKey,
 };
 export default types;
 "#;
@@ -1632,6 +1706,21 @@ function decodeForRead(st, chunk) {
     }
     return chunk;
 }
+// 'readable' fires deferred and deduped (Node's emitReadable): a push from
+// inside _read during a read() must not re-enter the 'readable' handler
+// synchronously. At fire time an empty non-ended buffer skips the event (its
+// data was consumed by the same handler that triggered the push).
+function scheduleReadable(stream) {
+    const st = stream._readableState;
+    if (st.readableScheduled) return;
+    st.readableScheduled = true;
+    queueMicrotask(() => {
+        st.readableScheduled = false;
+        if (st.destroyed) return;
+        if (st.buffer.length > 0 || st.ended) stream.emit("readable");
+        maybeEmitEnd(stream);
+    });
+}
 function flow(stream) {
     const st = stream._readableState;
     if (st.flowScheduled) return;
@@ -1663,6 +1752,7 @@ class Readable extends Stream {
             destroyed: false,
             reading: false,
             flowScheduled: false,
+            readableScheduled: false,
             objectMode: !!(opts.objectMode || opts.readableObjectMode),
             encoding: opts.encoding || null,
             highWaterMark: typeof opts.highWaterMark === "number" ? opts.highWaterMark : 16384,
@@ -1673,6 +1763,16 @@ class Readable extends Stream {
         const self = this;
         this.on("newListener", function (event) {
             if (event === "data") queueMicrotask(() => self.resume());
+            // A 'readable' listener kicks off the first refill (Node
+            // schedules read(0) so _read gets called without consuming).
+            if (event === "readable") {
+                queueMicrotask(() => {
+                    const state = self._readableState;
+                    if (!state.ended && !state.destroyed && state.buffer.length === 0) {
+                        self.read(0);
+                    }
+                });
+            }
         });
     }
     _read() {}
@@ -1681,7 +1781,7 @@ class Readable extends Stream {
         if (chunk === null) {
             st.ended = true;
             if (st.flowing) flow(this);
-            else { this.emit("readable"); maybeEmitEnd(this); }
+            else scheduleReadable(this);
             return false;
         }
         if (!st.objectMode && typeof chunk === "string" && encoding && encoding !== "utf8" && encoding !== "utf-8") {
@@ -1689,24 +1789,43 @@ class Readable extends Stream {
         }
         st.buffer.push(chunk);
         if (st.flowing) flow(this);
-        else this.emit("readable");
+        else scheduleReadable(this);
         return st.buffer.length < st.highWaterMark;
     }
     unshift(chunk) {
         if (chunk === null || chunk === undefined) return;
         this._readableState.buffer.unshift(chunk);
     }
-    read() {
+    read(size) {
         const st = this._readableState;
-        if (st.buffer.length === 0 && !st.ended && !st.destroyed && !st.reading) {
+        // Refill BEFORE dequeuing (Node calls _read when the buffer is under
+        // the high-water mark): a synchronous push lands in the buffer and
+        // coalesces with what was already there.
+        if (!st.ended && !st.destroyed && !st.reading) {
             st.reading = true;
             try { this._read(st.highWaterMark); } finally { st.reading = false; }
         }
+        // read(0): refill trigger only — consume nothing.
+        if (size === 0) return null;
         if (st.buffer.length === 0) {
             maybeEmitEnd(this);
             return null;
         }
-        return decodeForRead(st, st.buffer.shift());
+        let chunk;
+        if (st.objectMode || st.buffer.length === 1 || (size !== undefined && size !== null)) {
+            chunk = st.buffer.shift();
+        } else {
+            // Non-object mode, unsized read: drain the whole buffer as one
+            // chunk, joining strings (or concatenating Buffers), like Node's
+            // fromList.
+            const all = st.buffer.splice(0, st.buffer.length);
+            let allStrings = true;
+            for (const c of all) {
+                if (typeof c !== "string") { allStrings = false; break; }
+            }
+            chunk = allStrings ? all.join("") : Buffer.concat(all.map((c) => (typeof c === "string" ? Buffer.from(c) : Buffer.from(c))));
+        }
+        return decodeForRead(st, chunk);
     }
     setEncoding(encoding) { this._readableState.encoding = encoding; return this; }
     pause() { this._readableState.flowing = false; return this; }
@@ -2576,8 +2695,10 @@ export default { createTracing, getEnabledCategories };
 //     is single-threaded and cooperatively scheduled, with no interruptible
 //     evaluation.
 //
-// `measureMemory` (needs V8 heap statistics) and `SourceTextModule` (needs the
-// module-record introspection API) have no counterpart and stay fail-loud.
+// `measureMemory` (needs V8 heap statistics) has no counterpart and stays
+// fail-loud. `SourceTextModule` supports only sources without import/export
+// declarations (runtime module compilation is not exposed by the engine);
+// anything else fails loudly at evaluate().
 const VM_SHIM: &str = r#"
 // Indirect eval: `(0, eval)(src)` semantics — compiles `src` as a script in
 // the realm's global scope rather than as a direct eval in this module's.
@@ -2674,18 +2795,39 @@ function evaluateInScope(code, sandbox) {
     }
 }
 
+// In Node every context is its own realm, so a function created inside one
+// has that realm's `Function.prototype` — observably distinct from the main
+// realm's. This engine is single-realm; approximate the distinction for the
+// completion value by re-prototyping returned functions onto a per-context
+// surrogate that inherits from the real `Function.prototype` (calls still
+// work; identity checks like `getPrototypeOf(fn) !== Function.prototype`
+// behave as they would cross-realm).
+const contextFunctionProtos = new WeakMap();
+function reprototypeCompletion(result, sandbox) {
+    if (typeof result !== "function") return result;
+    if (Object.getPrototypeOf(result) !== Function.prototype) return result;
+    let surrogate = contextFunctionProtos.get(sandbox);
+    if (surrogate === undefined) {
+        surrogate = Object.create(Function.prototype);
+        contextFunctionProtos.set(sandbox, surrogate);
+    }
+    try { Object.setPrototypeOf(result, surrogate); } catch (e) { /* frozen */ }
+    return result;
+}
+
 export function runInContext(code, contextifiedObject, options) {
     checkCode(code, "code");
     const sandbox = checkSandbox(contextifiedObject, "contextifiedObject");
     if (!contexts.has(sandbox)) {
         throw typeError("ERR_INVALID_ARG_TYPE", 'The "contextifiedObject" argument must be a vm.Context');
     }
-    return evaluateInScope(code, sandbox);
+    return reprototypeCompletion(evaluateInScope(code, sandbox), sandbox);
 }
 
 export function runInNewContext(code, contextObject, options) {
     checkCode(code, "code");
-    return evaluateInScope(code, createContext(contextObject));
+    const sandbox = createContext(contextObject);
+    return reprototypeCompletion(evaluateInScope(code, sandbox), sandbox);
 }
 
 export function runInThisContext(code, options) {
@@ -2746,10 +2888,69 @@ export function measureMemory() {
     throw new Error("vm.measureMemory is not supported in the Chidori runtime (no V8 heap statistics are available)");
 }
 
+// Minimal SourceTextModule: enough of the module-record state machine
+// (unlinked → linked → evaluated) for scripts whose sources carry no
+// import/export syntax — those need runtime module compilation the engine
+// does not expose, and fail loudly at evaluate(). The namespace is shaped
+// like a real one (null prototype, `Module` tag, frozen) so
+// `util.types.isModuleNamespaceObject` recognizes it.
 export class SourceTextModule {
-    constructor() {
-        throw new Error("vm.SourceTextModule is not supported in the Chidori runtime (the module-record introspection API is not exposed by the engine)");
+    #source;
+    #namespace = null;
+    constructor(source, options) {
+        this.#source = checkCode(source, "sourceText");
+        const opts = options === undefined || options === null ? {} : options;
+        this.identifier = opts.identifier === undefined ? "vm:module(0)" : String(opts.identifier);
+        this.status = "unlinked";
+        this.error = undefined;
     }
+    async link(linker) {
+        if (typeof linker !== "function") {
+            throw typeError(
+                "ERR_INVALID_ARG_TYPE",
+                'The "linker" argument must be of type function. Received ' +
+                (linker === null ? "null" : typeof linker)
+            );
+        }
+        if (this.status !== "unlinked") {
+            const err = new Error("Module has already been linked");
+            err.code = "ERR_VM_MODULE_ALREADY_LINKED";
+            throw err;
+        }
+        this.status = "linked";
+    }
+    async evaluate() {
+        if (this.status !== "linked" && this.status !== "evaluated" && this.status !== "errored") {
+            const err = new Error("Module must be linked before it can be evaluated");
+            err.code = "ERR_VM_MODULE_STATUS";
+            throw err;
+        }
+        if (/(^|[\s;{}])(import|export)[\s({*'"]/.test(this.#source)) {
+            throw new Error("vm.SourceTextModule with import/export declarations is not supported in the Chidori runtime (runtime module compilation is not exposed by the engine)");
+        }
+        try {
+            if (this.#source.trim() !== "") indirectEval(this.#source);
+            this.status = "evaluated";
+        } catch (e) {
+            this.status = "errored";
+            this.error = e;
+            throw e;
+        }
+    }
+    get namespace() {
+        if (this.status === "unlinked") {
+            const err = new Error("Module must be linked before its namespace can be accessed");
+            err.code = "ERR_VM_MODULE_STATUS";
+            throw err;
+        }
+        if (this.#namespace === null) {
+            const ns = Object.create(null);
+            Object.defineProperty(ns, Symbol.toStringTag, { value: "Module" });
+            this.#namespace = Object.freeze(ns);
+        }
+        return this.#namespace;
+    }
+    get dependencySpecifiers() { return Object.freeze([]); }
 }
 
 export const constants = Object.freeze({

@@ -1008,6 +1008,17 @@ pub fn install(vm: &mut Vm) {
     // `Proxy` is an exotic constructor with no `prototype` property; bind it as a
     // plain global rather than via `install_ctor`.
     vm.define_value(&vm.realm.global.clone(), "Proxy", Value::Object(ctor));
+
+    // Proxies are transparent to script by design, so `util.types.isProxy`
+    // cannot be written in JS; expose the engine's brand check the way V8 does
+    // for Node. Revoked proxies still answer true, matching V8's `IsProxy`.
+    let global = vm.realm.global.clone();
+    vm.define_method(&global, "__chidori_is_proxy", 1, |vm, _t, args| {
+        Ok(Value::Bool(match args.first() {
+            Some(Value::Object(o)) => vm.is_proxy(o),
+            _ => false,
+        }))
+    });
 }
 
 fn keys_eq(a: &PropertyKey, b: &PropertyKey) -> bool {

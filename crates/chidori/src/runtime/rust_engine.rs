@@ -1130,6 +1130,28 @@ const PROCESS_EVENTS_JS: &str = r#"
     };
     proc.addListener = proc.on;
     proc.removeListener = proc.off;
+    // Node semantics: emitWarning normalizes to an Error-like (name = type,
+    // optional code) and dispatches a 'warning' event on the next tick;
+    // without listeners it degrades to console.warn, like Node's default
+    // stderr print.
+    proc.emitWarning = function (warning, type, code) {
+        let w;
+        if (warning instanceof Error) {
+            w = warning;
+        } else {
+            w = new Error(String(warning));
+            w.name = typeof type === "string" && type.length > 0 ? type : "Warning";
+        }
+        if (typeof type === "string" && !(warning instanceof Error)) w.name = type;
+        if (code !== undefined && w.code === undefined) w.code = code;
+        Promise.resolve().then(() => {
+            if (proc.listenerCount("warning") > 0) {
+                proc.emit("warning", w);
+            } else if (globalThis.console && typeof globalThis.console.warn === "function") {
+                globalThis.console.warn(w.name + ": " + w.message);
+            }
+        });
+    };
 })();
 "#;
 
@@ -1213,7 +1235,7 @@ const PROCESS_ALLOWED_FLAGS_JS: &str = r#"
 pub(crate) fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
     use crate::runtime::typescript::helpers::{
         chidori_agent_env_json, TEXT_ENCODING_POLYFILL, TIMER_DISABLED_POLYFILL,
-        TIMER_VIRTUAL_POLYFILL, WEB_CRYPTO_POLYFILL,
+        TIMER_VIRTUAL_POLYFILL, WEB_CRYPTO_POLYFILL, WEB_EVENTS_POLYFILL,
     };
     let mut out = String::new();
     out.push_str(
@@ -1293,6 +1315,8 @@ pub(crate) fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
         TimerPolicy::Disabled => out.push_str(TIMER_DISABLED_POLYFILL),
         TimerPolicy::Virtual | TimerPolicy::Host => out.push_str(TIMER_VIRTUAL_POLYFILL),
     }
+    // After timers: AbortSignal.timeout schedules on the virtual queue.
+    out.push_str(WEB_EVENTS_POLYFILL);
     out
 }
 

@@ -12,6 +12,26 @@ pub fn install(vm: &mut Vm) {
     install_symbol(vm);
     install_boolean(vm);
     install_errors(vm);
+
+    // Engine-private introspection for Node's util.inspect: the constructor
+    // name captured when an object's prototype was nulled (see
+    // `ordinary_set_prototype_of`), or undefined when none was recorded.
+    let global = vm.realm.global.clone();
+    vm.define_method(&global, "__chidori_ctor_hint", 1, |_vm, _t, args| {
+        Ok(match args.first() {
+            Some(Value::Object(o)) => o
+                .borrow()
+                .privates
+                .as_ref()
+                .and_then(|p| p.get(&CTOR_HINT_PRIVATE_ID))
+                .and_then(|el| match el {
+                    PrivateElement::Field(v) => Some(v.clone()),
+                    _ => None,
+                })
+                .unwrap_or(Value::Undefined),
+            _ => Value::Undefined,
+        })
+    });
 }
 
 fn this_object(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
@@ -1580,6 +1600,11 @@ pub(crate) fn is_array_exotic(vm: &Vm, o: &JsObject) -> Result<bool, Value> {
     }
 }
 
+/// Private-elements key for the constructor-name hint stashed when an object's
+/// prototype is nulled. `Vm::next_private_id` counts up from zero, so no script
+/// `PrivateName` can ever collide with it; the slot is engine-reachable only.
+pub(crate) const CTOR_HINT_PRIVATE_ID: u64 = u64::MAX;
+
 /// OrdinarySetPrototypeOf (spec 10.1.2): rejects (returns false) a no-op-failing
 /// change on a non-extensible object, and rejects prototype cycles. Returns true
 /// on success (and mutates `o`'s prototype).
@@ -1613,6 +1638,38 @@ fn ordinary_set_prototype_of(vm: &Vm, o: &JsObject, proto: Option<JsObject>) -> 
         }
         let next = pp.borrow().proto.clone();
         p = next;
+    }
+    // V8's hidden classes remember which constructor made an object even after
+    // its prototype is nulled — Node's util.inspect renders that as
+    // `[Foo: null prototype]`. Approximate the slot by capturing the outgoing
+    // prototype's own `constructor` name at the moment the prototype becomes
+    // null, stashed in the script-unreachable private-elements list.
+    if proto.is_none() {
+        let hint = current.as_ref().and_then(|old| {
+            let b = old.borrow();
+            match &b.own_get(&PropertyKey::str("constructor"))?.kind {
+                PropertyKind::Data {
+                    value: Value::Object(ctor),
+                    ..
+                } if ctor.borrow().is_callable() => {
+                    let cb = ctor.borrow();
+                    match &cb.own_get(&PropertyKey::str("name"))?.kind {
+                        PropertyKind::Data {
+                            value: Value::String(name),
+                            ..
+                        } if !name.as_str().is_empty() => Some(name.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+        if let Some(name) = hint {
+            o.borrow_mut()
+                .privates
+                .get_or_insert_with(Default::default)
+                .insert(CTOR_HINT_PRIVATE_ID, PrivateElement::Field(Value::String(name)));
+        }
     }
     o.borrow_mut().proto = proto;
     true

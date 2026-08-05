@@ -2159,12 +2159,7 @@ impl Compiler {
                     // `using` bindings are const-like: reassignment TypeErrors.
                     let is_const = !matches!(d.kind, VariableDeclarationKind::Let);
                     for decl in &d.declarations {
-                        if let BindingPattern::BindingIdentifier(id) = &decl.id {
-                            if self.current_scope_cell(id.name.as_str()).is_none() {
-                                let cell = self.declare_kind(id.name.as_str(), false, is_const);
-                                self.emit(Op::InitCellTdz(cell));
-                            }
-                        }
+                        self.hoist_lexical_pattern(&decl.id, is_const);
                     }
                 }
                 Statement::ClassDeclaration(c) => {
@@ -2185,12 +2180,7 @@ impl Compiler {
                     {
                         let is_const = matches!(d.kind, VariableDeclarationKind::Const);
                         for decl in &d.declarations {
-                            if let BindingPattern::BindingIdentifier(id) = &decl.id {
-                                if self.current_scope_cell(id.name.as_str()).is_none() {
-                                    let cell = self.declare_kind(id.name.as_str(), false, is_const);
-                                    self.emit(Op::InitCellTdz(cell));
-                                }
-                            }
+                            self.hoist_lexical_pattern(&decl.id, is_const);
                         }
                     }
                     Some(Declaration::ClassDeclaration(c)) => {
@@ -2204,6 +2194,41 @@ impl Compiler {
                     _ => {}
                 },
                 _ => {}
+            }
+        }
+    }
+
+    /// Pre-declare every name bound by a lexical declarator's pattern as a
+    /// TDZ cell — simple identifiers AND destructuring patterns — so function
+    /// declarations hoisted above the statement capture the real binding
+    /// instead of missing to a global lookup. The declaration statement later
+    /// initializes the same cell (`bind_pattern_kind` reuses it).
+    fn hoist_lexical_pattern(&mut self, pat: &BindingPattern, is_const: bool) {
+        match pat {
+            BindingPattern::BindingIdentifier(id) => {
+                if self.current_scope_cell(id.name.as_str()).is_none() {
+                    let cell = self.declare_kind(id.name.as_str(), false, is_const);
+                    self.emit(Op::InitCellTdz(cell));
+                }
+            }
+            BindingPattern::ObjectPattern(o) => {
+                for p in &o.properties {
+                    self.hoist_lexical_pattern(&p.value, is_const);
+                }
+                if let Some(r) = &o.rest {
+                    self.hoist_lexical_pattern(&r.argument, is_const);
+                }
+            }
+            BindingPattern::ArrayPattern(a) => {
+                for el in a.elements.iter().flatten() {
+                    self.hoist_lexical_pattern(el, is_const);
+                }
+                if let Some(r) = &a.rest {
+                    self.hoist_lexical_pattern(&r.argument, is_const);
+                }
+            }
+            BindingPattern::AssignmentPattern(a) => {
+                self.hoist_lexical_pattern(&a.left, is_const);
             }
         }
     }
@@ -2887,6 +2912,20 @@ impl Compiler {
     ) -> R {
         match pat {
             BindingPattern::BindingIdentifier(id) => {
+                // Lexical bindings may be pre-declared (as TDZ cells) by
+                // `hoist_lexical`; write THROUGH that cell (`StoreCell`) so
+                // closures hoisted above the declaration observe the
+                // initialized value — `InitCell` would mint a fresh Rc and
+                // orphan the captured cell. Mirrors the simple-identifier
+                // path in `compile_var_decl`. Fresh declarations (loop heads,
+                // params, catch bindings) keep `InitCell` for per-iteration
+                // `let` semantics.
+                if !function_scoped {
+                    if let Some(cell) = self.current_scope_cell(id.name.as_str()) {
+                        self.emit(Op::StoreCell(cell));
+                        return Ok(());
+                    }
+                }
                 let cell = self.declare_kind(id.name.as_str(), function_scoped, is_const);
                 self.emit(Op::InitCell(cell));
             }
