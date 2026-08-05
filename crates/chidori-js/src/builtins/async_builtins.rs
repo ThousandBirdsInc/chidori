@@ -40,6 +40,18 @@ fn install_promise(vm: &mut Vm) {
     );
     vm.install_ctor("Promise", &ctor, &proto);
     vm.install_species(&ctor);
+    vm.realm.promise_ctor = Some(ctor.clone());
+    vm.realm.promise_species_getter = {
+        let key = PropertyKey::Sym(vm.realm.symbol_species.clone());
+        let g = ctor.borrow().own_get(&key).and_then(|p| match &p.kind {
+            PropertyKind::Accessor {
+                get: Some(Value::Object(g)),
+                ..
+            } => Some(g.clone()),
+            _ => None,
+        });
+        g
+    };
 
     // Promise.withResolvers() — { promise, resolve, reject } (ES2024), built
     // via NewPromiseCapability(this) so subclasses construct themselves.
@@ -106,21 +118,41 @@ fn install_promise(vm: &mut Vm) {
         if same_value(&c, &default_ctor) {
             return Ok(Value::Object(vm.promise_then(&p, on_f, on_r)));
         }
-        // Species path: build the result via NewPromiseCapability(C) and forward
-        // the settlement of the native dependent promise into that capability.
+        // Species path: build the result via NewPromiseCapability(C). The
+        // handler's RAW result must reach `capability.[[Resolve]]` — chaining
+        // through an intermediate native promise would unwrap a returned
+        // thenable first, and script can observe the difference (the
+        // PromiseResolveThenableJob's `then` call on a subclass promise
+        // constructs another subclass capability).
         let (promise, resolve, reject) = new_promise_capability(vm, &c)?;
-        let native_dep = vm.promise_then(&p, on_f, on_r);
-        let res = resolve;
-        let fwd_f = vm.new_native("", 1, move |vm, _t, a| {
-            vm.call(res.clone(), Value::Undefined, &[arg(a, 0)])?;
+        let step = |vm: &mut Vm, handler: Value, v: Value, resolve: &Value, reject: &Value| {
+            let outcome = if vm.is_callable(&handler) {
+                vm.call(handler, Value::Undefined, &[v])
+            } else {
+                Ok(v)
+            };
+            match outcome {
+                Ok(r) => vm.call(resolve.clone(), Value::Undefined, &[r]),
+                Err(e) => vm.call(reject.clone(), Value::Undefined, &[e]),
+            }
+        };
+        let (rs, rj) = (resolve.clone(), reject.clone());
+        let wrap_f = vm.new_native("", 1, move |vm, _t, a| {
+            step(vm, on_f.clone(), arg(a, 0), &rs, &rj)?;
             Ok(Value::Undefined)
         });
-        let rej = reject;
-        let fwd_r = vm.new_native("", 1, move |vm, _t, a| {
-            vm.call(rej.clone(), Value::Undefined, &[arg(a, 0)])?;
+        // A MISSING onRejected must reject the capability (not fulfil it).
+        let (rs2, rj2) = (resolve, reject);
+        let wrap_r = vm.new_native("", 1, move |vm, _t, a| {
+            let v = arg(a, 0);
+            if vm.is_callable(&on_r) {
+                step(vm, on_r.clone(), v, &rs2, &rj2)?;
+            } else {
+                vm.call(rj2.clone(), Value::Undefined, &[v])?;
+            }
             Ok(Value::Undefined)
         });
-        vm.promise_then(&native_dep, Value::Object(fwd_f), Value::Object(fwd_r));
+        vm.promise_then(&p, Value::Object(wrap_f), Value::Object(wrap_r));
         Ok(promise)
     });
     vm.define_method(&proto, "catch", 1, |vm, this, args| {
@@ -529,22 +561,17 @@ fn perform_promise_any(
                 errors.borrow_mut().push(Value::Undefined);
                 let r = vm.call(promise_resolve.clone(), c.clone(), &[value]);
                 let next = close_on_err(vm, &iter, r)?;
-                let already = Rc::new(RefCell::new(false));
-                let res = resolve.clone();
-                let g_f = already.clone();
-                let on_f = vm.new_native("", 1, move |vm, _t, a| {
-                    if take_guard(&g_f) {
-                        return Ok(Value::Undefined);
-                    }
-                    vm.call(res.clone(), Value::Undefined, &[arg(a, 0)])?;
-                    Ok(Value::Undefined)
-                });
+                // Only the REJECT element function carries [[AlreadyCalled]];
+                // the fulfil handler is the capability's own resolve function,
+                // passed through unwrapped so a capability that ignores its
+                // already-resolved state is called every time (spec
+                // PerformPromiseAny step 8.j).
                 let (ec, rc, rej, idx, g) = (
                     errors.clone(),
                     remaining.clone(),
                     reject.clone(),
                     index,
-                    already,
+                    Rc::new(RefCell::new(false)),
                 );
                 let on_r = vm.new_native("", 1, move |vm, _t, a| {
                     if take_guard(&g) {
@@ -558,7 +585,7 @@ fn perform_promise_any(
                     Ok(Value::Undefined)
                 });
                 *remaining.borrow_mut() += 1;
-                let r = invoke_then(vm, &next, Value::Object(on_f), Value::Object(on_r));
+                let r = invoke_then(vm, &next, resolve.clone(), Value::Object(on_r));
                 close_on_err(vm, &iter, r)?;
                 index += 1;
             }
@@ -696,10 +723,8 @@ fn install_generator(vm: &mut Vm) {
     vm.define_method(&aproto, "throw", 1, |vm, this, args| {
         vm.async_generator_resume(&this, ResumeKind::Throw, arg(args, 0))
     });
-    // [Symbol.asyncIterator]() { return this }
-    let async_iter = vm.realm.symbol_async_iterator.clone();
-    let self_iter = vm.new_native("[Symbol.asyncIterator]", 0, |_vm, this, _a| Ok(this));
-    vm.define_value_sym(&aproto, async_iter, Value::Object(self_iter));
+    // %AsyncGeneratorPrototype% has no own `@@asyncIterator`: it inherits one
+    // from %AsyncIteratorPrototype% (installed below).
 
     // %AsyncIteratorPrototype%[@@asyncDispose] (explicit resource management):
     // GetMethod(this, "return"); absent → resolve undefined; otherwise call it
@@ -744,6 +769,7 @@ fn install_generator(vm: &mut Vm) {
     });
     let async_dispose = vm.realm.symbol_async_dispose.clone();
     let async_iter_proto = vm.realm.async_iterator_proto.clone();
+    let base_iter_proto = vm.realm.iterator_proto.clone();
     vm.define_value_sym(&async_iter_proto, async_dispose, Value::Object(dispose));
 
     // %AsyncIteratorPrototype%[@@asyncIterator]() { return this }. This lives on
@@ -752,8 +778,6 @@ fn install_generator(vm: &mut Vm) {
     let async_iter2 = vm.realm.symbol_async_iterator.clone();
     let self_iter2 = vm.new_native("[Symbol.asyncIterator]", 0, |_vm, this, _a| Ok(this));
     vm.define_value_sym(&async_iter_proto, async_iter2, Value::Object(self_iter2));
-
-    let base_iter_proto = vm.realm.iterator_proto.clone();
 
     // %IteratorPrototype%[@@dispose]: GetMethod(this, "return"); call it when
     // present; the result is discarded (return undefined).

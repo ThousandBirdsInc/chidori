@@ -42,6 +42,7 @@ pub const SECTIONS: &[(&str, fn(&mut Vm))] = &[
     ("iterator", iterator_helpers::install),
     ("date", install_date_lazy),
     ("async", async_builtins::install),
+    ("asyncfromsync", crate::iter::install),
     ("reflect", reflect::install),
     ("typedarray", install_typedarray_lazy),
     ("proxy", crate::proxy::install),
@@ -280,14 +281,18 @@ fn install_restricted_properties(vm: &mut Vm) {
 /// Compile `(<prefix>(<params>) { <body> })` — the dynamic constructor body for a
 /// generator/async function — and return the resulting function object.
 fn compile_kind_function(vm: &mut Vm, prefix: &str, args: &[Value]) -> Result<Value, Value> {
+    // CreateDynamicFunction coerces the arguments LEFT TO RIGHT: every
+    // parameter argument first (in order), then the body argument last. A
+    // `toString` that throws must abort right there, so these conversions
+    // propagate instead of swallowing the exception.
     let (params, body) = if args.is_empty() {
         (String::new(), String::new())
     } else {
-        let body = vm.to_string_lossy(&args[args.len() - 1]);
-        let parts: Vec<String> = args[..args.len() - 1]
-            .iter()
-            .map(|a| vm.to_string_lossy(a))
-            .collect();
+        let mut parts: Vec<String> = Vec::with_capacity(args.len() - 1);
+        for a in &args[..args.len() - 1] {
+            parts.push(vm.to_js_string(a)?.as_str().to_string());
+        }
+        let body = vm.to_js_string(&args[args.len() - 1])?.as_str().to_string();
         (parts.join(","), body)
     };
     let src = format!("({prefix}({params}\n) {{\n{body}\n}})");
@@ -606,11 +611,13 @@ fn install_globals(vm: &mut Vm) {
         } else {
             // ToString is observable and may throw (a body/param object with a
             // poisoned toString propagates its error, not a SyntaxError).
-            let body = vm.to_js_string(&args[args.len() - 1])?.as_str().to_string();
-            let mut parts = Vec::new();
+            // CreateDynamicFunction coerces LEFT TO RIGHT: every parameter
+            // argument in order, THEN the body argument.
+            let mut parts = Vec::with_capacity(args.len() - 1);
             for a in &args[..args.len() - 1] {
                 parts.push(vm.to_js_string(a)?.as_str().to_string());
             }
+            let body = vm.to_js_string(&args[args.len() - 1])?.as_str().to_string();
             (parts.join(","), body)
         };
         let src = format!("(function anonymous({params}\n) {{\n{body}\n}})");

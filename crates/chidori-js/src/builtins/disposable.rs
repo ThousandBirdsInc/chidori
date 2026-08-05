@@ -16,14 +16,20 @@ pub fn install(vm: &mut Vm) {
     install_one(vm, true);
 }
 
-fn state_key(vm: &Vm) -> PropertyKey {
-    PropertyKey::Sym(vm.realm.symbol_disposable_state.clone())
+/// `DisposableStack` and `AsyncDisposableStack` carry *distinct* brands, so a
+/// method lifted off one prototype rejects an instance of the other.
+fn state_key(vm: &Vm, is_async: bool) -> PropertyKey {
+    PropertyKey::Sym(if is_async {
+        vm.realm.symbol_async_disposable_state.clone()
+    } else {
+        vm.realm.symbol_disposable_state.clone()
+    })
 }
 
 /// The internal state array of a (Async)DisposableStack `this`, or a TypeError.
-fn stack_state(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
+fn stack_state(vm: &mut Vm, this: &Value, is_async: bool) -> Result<JsObject, Value> {
     if let Value::Object(o) = this {
-        let key = state_key(vm);
+        let key = state_key(vm, is_async);
         let found = o.borrow().own_get(&key).and_then(|p| match &p.kind {
             PropertyKind::Data {
                 value: Value::Object(arr),
@@ -52,10 +58,10 @@ fn push_disposer(arr: &JsObject, f: Value) {
 }
 
 /// Build a fresh stack object carrying an empty (not-disposed) state array.
-fn new_stack(vm: &mut Vm, proto: &JsObject) -> JsObject {
+fn new_stack(vm: &mut Vm, proto: &JsObject, is_async: bool) -> JsObject {
     let arr = vm.new_array(vec![Value::Bool(false)]);
     let o = vm.alloc_ordinary(Some(proto.clone()));
-    let key = state_key(vm);
+    let key = state_key(vm, is_async);
     o.borrow_mut()
         .own_insert(key, Property::builtin(Value::Object(arr)));
     o
@@ -73,13 +79,13 @@ fn install_one(vm: &mut Vm, is_async: bool) {
         name,
         0,
         move |vm, _t, _a| Err(vm.throw_type(&format!("Constructor {name} requires 'new'"))),
-        move |vm, _t, _a| Ok(Value::Object(new_stack(vm, &proto_for_ctor))),
+        move |vm, _t, _a| Ok(Value::Object(new_stack(vm, &proto_for_ctor, is_async))),
     );
     vm.install_ctor(name, &ctor, &proto);
 
     // `disposed` getter.
-    let getter = vm.new_native("get disposed", 0, |vm, this, _a| {
-        let arr = stack_state(vm, &this)?;
+    let getter = vm.new_native("get disposed", 0, move |vm, this, _a| {
+        let arr = stack_state(vm, &this, is_async)?;
         Ok(Value::Bool(is_disposed(&arr)))
     });
     vm.define_accessor(
@@ -98,7 +104,7 @@ fn install_one(vm: &mut Vm, is_async: bool) {
     {
         let dsym = dispose_sym.clone();
         vm.define_method(&proto, "use", 1, move |vm, this, args| {
-            let arr = stack_state(vm, &this)?;
+            let arr = stack_state(vm, &this, is_async)?;
             if is_disposed(&arr) {
                 return Err(vm.throw_reference("DisposableStack is already disposed"));
             }
@@ -135,8 +141,8 @@ fn install_one(vm: &mut Vm, is_async: bool) {
     }
 
     // adopt(value, onDispose): dispose by calling `onDispose(value)`.
-    vm.define_method(&proto, "adopt", 2, |vm, this, args| {
-        let arr = stack_state(vm, &this)?;
+    vm.define_method(&proto, "adopt", 2, move |vm, this, args| {
+        let arr = stack_state(vm, &this, is_async)?;
         if is_disposed(&arr) {
             return Err(vm.throw_reference("DisposableStack is already disposed"));
         }
@@ -158,8 +164,8 @@ fn install_one(vm: &mut Vm, is_async: bool) {
     });
 
     // defer(onDispose): dispose by calling `onDispose()`.
-    vm.define_method(&proto, "defer", 1, |vm, this, args| {
-        let arr = stack_state(vm, &this)?;
+    vm.define_method(&proto, "defer", 1, move |vm, this, args| {
+        let arr = stack_state(vm, &this, is_async)?;
         if is_disposed(&arr) {
             return Err(vm.throw_reference("DisposableStack is already disposed"));
         }
@@ -178,11 +184,11 @@ fn install_one(vm: &mut Vm, is_async: bool) {
     {
         let proto_m = proto.clone();
         vm.define_method(&proto, "move", 0, move |vm, this, _args| {
-            let arr = stack_state(vm, &this)?;
+            let arr = stack_state(vm, &this, is_async)?;
             if is_disposed(&arr) {
                 return Err(vm.throw_reference("DisposableStack is already disposed"));
             }
-            let new_obj = new_stack(vm, &proto_m);
+            let new_obj = new_stack(vm, &proto_m, is_async);
             // Take this stack's disposers (elements 1..) and mark it disposed.
             let moved: Vec<Value> = if let Internal::Array(a) = &mut arr.borrow_mut().internal {
                 let rest = a.split_off(1); // a == [false]
@@ -192,7 +198,7 @@ fn install_one(vm: &mut Vm, is_async: bool) {
             } else {
                 Vec::new()
             };
-            let new_arr = stack_state(vm, &Value::Object(new_obj.clone()))?;
+            let new_arr = stack_state(vm, &Value::Object(new_obj.clone()), is_async)?;
             if let Internal::Array(a) = &mut new_arr.borrow_mut().internal {
                 a.extend(moved); // new_arr == [false, ...moved]
             }
@@ -206,11 +212,20 @@ fn install_one(vm: &mut Vm, is_async: bool) {
         install_sync_dispose(vm, &proto, &dispose_sym);
     }
 
-    // @@toStringTag
+    // @@toStringTag: { [[Writable]]: false, [[Enumerable]]: false,
+    // [[Configurable]]: true } per the spec's "every other property" rule.
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto
-        .borrow_mut()
-        .own_insert(PropertyKey::Sym(tag), Property::builtin(Value::str(name)));
+    proto.borrow_mut().own_insert(
+        PropertyKey::Sym(tag),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::str(name),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
+    );
 }
 
 /// Run the disposers in reverse, chaining failures into a SuppressedError.
@@ -246,7 +261,7 @@ fn make_suppressed(vm: &mut Vm, error: Value, suppressed: Value) -> Value {
 
 fn install_sync_dispose(vm: &mut Vm, proto: &JsObject, dispose_sym: &JsSymbol) {
     let dispose = vm.new_native("dispose", 0, |vm, this, _a| {
-        let arr = stack_state(vm, &this)?;
+        let arr = stack_state(vm, &this, false)?;
         if is_disposed(&arr) {
             return Ok(Value::Undefined);
         }
@@ -286,7 +301,7 @@ fn install_async_dispose(vm: &mut Vm, proto: &JsObject, dispose_sym: &JsSymbol) 
     // @@asyncDispose holds up later disposals); errors chain through
     // SuppressedError, last error outermost.
     let dispose = vm.new_native("disposeAsync", 0, |vm, this, _a| {
-        let arr = match stack_state(vm, &this) {
+        let arr = match stack_state(vm, &this, true) {
             Ok(a) => a,
             Err(e) => return Ok(rejected(vm, e)),
         };

@@ -1840,6 +1840,8 @@ impl Vm {
             PropertyKey::Sym(sym) => {
                 *sym == self.realm.symbol_array_buffer_shared
                     || *sym == self.realm.symbol_disposable_state
+                    || *sym == self.realm.symbol_async_disposable_state
+                    || *sym == self.realm.symbol_sync_iterator_record
                     || *sym == self.realm.symbol_intl_locale
                     || *sym == self.realm.symbol_intl_plural_rules
                     || *sym == self.realm.symbol_intl_number_format

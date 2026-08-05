@@ -3249,7 +3249,14 @@ impl Vm {
                 )?;
                 let proto = match proto_val {
                     Value::Object(o) => Some(o),
-                    _ => Some(self.realm.object_proto.clone()),
+                    // GetPrototypeFromConstructor step 4: a non-object
+                    // `prototype` falls back to the intrinsic default — but
+                    // only after GetFunctionRealm(constructor), which throws
+                    // if new.target is a revoked proxy.
+                    _ => {
+                        self.get_function_realm_check(&Value::Object(nt_obj.clone()))?;
+                        Some(self.realm.object_proto.clone())
+                    }
                 };
                 let this_obj = self.alloc_ordinary(proto);
                 let this = Value::Object(this_obj.clone());

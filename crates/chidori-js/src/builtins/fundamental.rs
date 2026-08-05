@@ -18,6 +18,37 @@ fn this_object(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
     vm.to_object(this)
 }
 
+/// The name part of the `NativeFunction` form returned by
+/// `Function.prototype.toString` for a function with no [[SourceText]].
+///
+/// The grammar is `function NativeFunctionAccessor_opt IdentifierName_opt (
+/// FormalParameters ) { [ native code ] }`, so only an *IdentifierName* (or a
+/// bracketed symbol description, which engines conventionally emit for
+/// symbol-keyed built-ins) may appear, optionally behind `get `/`set `. Any
+/// other `name` — `bound f`, a private `#f`, a string with spaces — would make
+/// the output unparsable, so it is dropped.
+fn native_function_name(name: &str) -> &str {
+    fn is_identifier_name(s: &str) -> bool {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) if c == '_' || c == '$' || c.is_alphabetic() => {}
+            _ => return false,
+        }
+        chars.all(|c| c == '_' || c == '$' || c.is_alphanumeric())
+    }
+    let bare = name
+        .strip_prefix("get ")
+        .or_else(|| name.strip_prefix("set "))
+        .unwrap_or(name);
+    let ok = is_identifier_name(bare)
+        || (bare.starts_with('[') && bare.ends_with(']') && !bare[1..].contains('['));
+    if ok {
+        name
+    } else {
+        ""
+    }
+}
+
 // =========================================================================
 // Property-descriptor parsing and the OrdinaryDefineOwnProperty algorithm.
 // =========================================================================
@@ -2010,12 +2041,36 @@ fn install_function(vm: &mut Vm) {
         if !vm.is_callable(&this) {
             return Err(vm.throw_type("Function.prototype.toString called on non-callable"));
         }
+        // An ECMAScript function object returns its [[SourceText]] verbatim —
+        // the exact source range the function's syntactic production matched,
+        // comments and all. Bound functions, built-ins and callable proxies
+        // have no source text and take the NativeFunction form below.
+        if let Value::Object(o) = &this {
+            let text = {
+                let b = o.borrow();
+                match b.as_function() {
+                    Some(FunctionInner::Bytecode(bf)) => {
+                        let p = &bf.proto;
+                        p.source_text.zip(p.source_info.as_ref()).and_then(
+                            |((start, end), info)| info.slice(start, end).map(str::to_owned),
+                        )
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(t) = text {
+                return Ok(Value::str(t));
+            }
+        }
         let name = vm
             .get_prop(&this, &PropertyKey::str("name"))
             .ok()
             .map(|v| vm.to_string_lossy(&v))
             .unwrap_or_default();
-        Ok(Value::str(format!("function {name}() {{ [native code] }}")))
+        Ok(Value::str(format!(
+            "function {}() {{ [native code] }}",
+            native_function_name(&name)
+        )))
     });
     // Function.prototype itself is callable (returns undefined).
     proto.borrow_mut().internal = Internal::Function(FunctionInner::Native(NativeFunction {
@@ -2587,16 +2642,22 @@ impl Vm {
             Value::Object(o) => o,
             _ => return Err(self.throw_type("prototype is not an object")),
         };
+        // Walk the chain through [[GetPrototypeOf]] — a proxy anywhere in the
+        // chain routes through its trap (and an abrupt trap propagates).
         let mut cur = match obj {
-            Value::Object(o) => o.borrow().proto.clone(),
+            Value::Object(o) => o.clone(),
             _ => return Ok(false),
         };
-        while let Some(p) = cur {
-            if p.same(&target_proto) {
-                return Ok(true);
+        loop {
+            match self.proxy_or_ordinary_get_prototype_of(&cur)? {
+                Value::Object(p) => {
+                    if p.same(&target_proto) {
+                        return Ok(true);
+                    }
+                    cur = p;
+                }
+                _ => return Ok(false),
             }
-            cur = p.borrow().proto.clone();
         }
-        Ok(false)
     }
 }

@@ -614,7 +614,24 @@ fn select_variants(meta: &Meta, args: &Args) -> Vec<Variant> {
 /// installed on the engine before this runs (see `evaluate_rust`).
 const BOOTSTRAP_RUST: &str = r#"
 globalThis.__t262_print = [];
-globalThis.print = function (msg) { globalThis.__t262_print.push(String(msg)); };
+// The buffer is written with a captured Object.defineProperty at a private
+// counter index — never `push` or `buf[i] =`, both of which consult
+// Array.prototype. A test is allowed to install an indexed setter there (or
+// replace push), and the runner's own capture must not trip over it. Host
+// `print` is native in a real engine; this keeps the JS shim as unobservable.
+(function () {
+  var buf = globalThis.__t262_print;
+  var define = Object.defineProperty;
+  var n = 0;
+  globalThis.print = function (msg) {
+    define(buf, n++, {
+      value: String(msg),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  };
+})();
 globalThis.$262 = {
   global: globalThis,
   gc: function () {},

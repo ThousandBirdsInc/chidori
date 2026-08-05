@@ -28,9 +28,13 @@ impl Vm {
         // @@iterator — spec GetIterator with hint=async / GetMethod).
         let method = self.get_prop(v, &PropertyKey::Sym(sym))?;
         if method.is_nullish() {
-            // Fall back to the sync iterator; for-await awaits each next() result,
-            // so a sync iterator (incl. arrays of promises) works.
-            return self.get_iterator(v);
+            // No @@asyncIterator: take the SYNC iterator and wrap it in an
+            // async-from-sync iterator, which is what gives each step's
+            // `value` its Await (and closes the sync iterator when that value
+            // is a rejected promise).
+            let sync = self.get_iterator(v)?;
+            let next = self.get_prop(&sync, &crate::names::key_next())?;
+            return Ok(self.create_async_from_sync_iterator(sync, next));
         }
         if !self.is_callable(&method) {
             return Err(self.throw_type("Symbol.asyncIterator is not a function"));
@@ -120,6 +124,39 @@ impl Vm {
             let _ = self.call(ret, it.clone(), &[]);
         }
         Ok(())
+    }
+
+    /// `IteratorClose(iteratorRecord, completion)` in full: `Get(iterator,
+    /// "return")` and the call it performs are both observable, and *which*
+    /// error wins depends on `completion`.
+    ///
+    /// * `completion = Err(e)` — `e` always wins; errors from `return` (and a
+    ///   non-object result) are swallowed.
+    /// * `completion = Ok(())` — an error from `return` propagates, and a
+    ///   non-object result is a TypeError.
+    pub fn iterator_close_completion(
+        &mut self,
+        it: &Value,
+        completion: Result<(), Value>,
+    ) -> Result<(), Value> {
+        let inner = (|vm: &mut Vm| -> Result<(), Value> {
+            let ret = vm.get_prop(it, &crate::names::key_return())?;
+            if ret.is_nullish() {
+                return Ok(());
+            }
+            if !vm.is_callable(&ret) {
+                return Err(vm.throw_type("iterator return is not a function"));
+            }
+            let r = vm.call(ret, it.clone(), &[])?;
+            if !matches!(r, Value::Object(_)) {
+                return Err(vm.throw_type("iterator return result is not an object"));
+            }
+            Ok(())
+        })(self);
+        match completion {
+            Err(e) => Err(e),
+            Ok(()) => inner,
+        }
     }
 
     /// Build an iterator-result object `{ value, done }`.
@@ -570,4 +607,220 @@ impl Vm {
         }
         true
     }
+}
+
+// =========================================================================
+// %AsyncFromSyncIteratorPrototype% (ECMA-262 27.1.4)
+// =========================================================================
+//
+// `GetIterator(obj, async)` on an object that only has `@@iterator` wraps the
+// sync iterator in one of these. Every method returns a promise and every
+// step's `value` goes through `PromiseResolve(%Promise%, value)` — which is
+// what makes `for await (const x of [Promise.resolve(1)])` see `1`, and what
+// closes the sync iterator when a step's value is a rejected promise.
+
+impl Vm {
+    /// The `[[SyncIteratorRecord]]` slot: a 2-element array `[iterator, next]`.
+    fn sync_record_key(&self) -> PropertyKey {
+        PropertyKey::Sym(self.realm.symbol_sync_iterator_record.clone())
+    }
+
+    /// `CreateAsyncFromSyncIterator(syncIteratorRecord)`.
+    pub fn create_async_from_sync_iterator(&mut self, iterator: Value, next: Value) -> Value {
+        let rec = self.new_array(vec![iterator, next]);
+        let proto = self.realm.async_from_sync_iterator_proto.clone();
+        let o = self.alloc_ordinary(Some(proto));
+        let key = self.sync_record_key();
+        o.borrow_mut()
+            .own_insert(key, Property::builtin(Value::Object(rec)));
+        Value::Object(o)
+    }
+
+    /// The `(iterator, nextMethod)` of an async-from-sync wrapper `this`.
+    fn sync_iterator_record(&self, this: &Value) -> Option<(Value, Value)> {
+        let Value::Object(o) = this else {
+            return None;
+        };
+        let key = self.sync_record_key();
+        let rec = match &o.borrow().own_get(&key)?.kind {
+            PropertyKind::Data {
+                value: Value::Object(a),
+                ..
+            } => a.clone(),
+            _ => return None,
+        };
+        let b = rec.borrow();
+        match &b.internal {
+            Internal::Array(a) if a.len() == 2 => Some((a[0].clone(), a[1].clone())),
+            _ => None,
+        }
+    }
+
+    /// `AsyncFromSyncIteratorContinuation(result, capability, syncIteratorRecord,
+    /// closeOnRejection)` — unwrap the step result's `value` through a promise
+    /// and re-package it as `{ value, done }`.
+    fn async_from_sync_continuation(
+        &mut self,
+        result: Value,
+        promise: JsObject,
+        sync_iterator: Value,
+        close_on_rejection: bool,
+    ) -> Result<Value, Value> {
+        // Steps 1-4: IteratorComplete / IteratorValue, each IfAbruptRejectPromise.
+        let outcome = (|vm: &mut Vm| -> Result<(bool, Value), Value> {
+            let done = vm.get_prop(&result, &crate::names::key_done())?;
+            let done = vm.to_boolean(&done);
+            let value = vm.get_prop(&result, &crate::names::key_value())?;
+            Ok((done, value))
+        })(self);
+        let (done, value) = match outcome {
+            Ok(v) => v,
+            Err(e) => {
+                self.reject_promise(&promise, e);
+                return Ok(Value::Object(promise));
+            }
+        };
+        // Steps 5-7: PromiseResolve(%Promise%, value) is observable; when it
+        // throws mid-iteration the sync iterator is closed first.
+        let wrapper = match self.promise_resolve_intrinsic(value) {
+            Ok(w) => w,
+            Err(e) => {
+                let e = if !done && close_on_rejection {
+                    self.iterator_close_completion(&sync_iterator, Err(e))
+                        .err()
+                        .unwrap_or_else(|| self.throw_type("internal: iterator close"))
+                } else {
+                    e
+                };
+                self.reject_promise(&promise, e);
+                return Ok(Value::Object(promise));
+            }
+        };
+        // Steps 8-9: onFulfilled re-packages the awaited value.
+        let on_f = self.new_native("", 1, move |vm, _t, a| {
+            let v = a.first().cloned().unwrap_or(Value::Undefined);
+            Ok(vm.make_iter_result(v, done))
+        });
+        // Steps 11-12: mid-iteration, a rejected value closes the sync
+        // iterator before the rejection propagates.
+        let on_r = if done || !close_on_rejection {
+            Value::Undefined
+        } else {
+            let it = sync_iterator;
+            Value::Object(self.new_native("", 1, move |vm, _t, a| {
+                let e = a.first().cloned().unwrap_or(Value::Undefined);
+                Err(vm
+                    .iterator_close_completion(&it, Err(e))
+                    .err()
+                    .unwrap_or_else(|| vm.throw_type("internal: iterator close")))
+            }))
+        };
+        // Step 13-14: PerformPromiseThen(valueWrapper, …, promiseCapability).
+        self.promise_then_into(&wrapper, Value::Object(on_f), on_r, promise.clone());
+        Ok(Value::Object(promise))
+    }
+}
+
+/// Install `%AsyncFromSyncIteratorPrototype%`'s `next`/`return`/`throw`.
+pub fn install(vm: &mut Vm) {
+    let proto = vm.realm.async_from_sync_iterator_proto.clone();
+
+    vm.define_method(&proto, "next", 1, |vm, this, args| {
+        let Some((sync_iter, next)) = vm.sync_iterator_record(&this) else {
+            return Err(vm.throw_type("not an async-from-sync iterator"));
+        };
+        let cap = vm.new_promise();
+        // IteratorNext(record, value) — `value` is forwarded only when present.
+        let result = vm
+            .call(next, sync_iter.clone(), &args[..args.len().min(1)])
+            .and_then(|r| {
+                if matches!(r, Value::Object(_)) {
+                    Ok(r)
+                } else {
+                    Err(vm.throw_type("iterator result is not an object"))
+                }
+            });
+        match result {
+            Ok(r) => vm.async_from_sync_continuation(r, cap, sync_iter, true),
+            Err(e) => {
+                vm.reject_promise(&cap, e);
+                Ok(Value::Object(cap))
+            }
+        }
+    });
+
+    vm.define_method(&proto, "return", 1, |vm, this, args| {
+        let Some((sync_iter, _next)) = vm.sync_iterator_record(&this) else {
+            return Err(vm.throw_type("not an async-from-sync iterator"));
+        };
+        let cap = vm.new_promise();
+        let value = args.first().cloned().unwrap_or(Value::Undefined);
+        let outcome = (|vm: &mut Vm| -> Result<Option<Value>, Value> {
+            let ret = vm.get_prop(&sync_iter, &crate::names::key_return())?;
+            if ret.is_nullish() {
+                return Ok(None);
+            }
+            if !vm.is_callable(&ret) {
+                return Err(vm.throw_type("iterator return is not a function"));
+            }
+            let r = vm.call(ret, sync_iter.clone(), &args[..args.len().min(1)])?;
+            if !matches!(r, Value::Object(_)) {
+                return Err(vm.throw_type("iterator return result is not an object"));
+            }
+            Ok(Some(r))
+        })(vm);
+        match outcome {
+            // No `return` method: fulfil with `{ value, done: true }` — the
+            // sync iterator is simply not closed.
+            Ok(None) => {
+                let r = vm.make_iter_result(value, true);
+                vm.resolve_promise(&cap, r);
+                Ok(Value::Object(cap))
+            }
+            // closeOnRejection is FALSE here: the iterator is already closing.
+            Ok(Some(r)) => vm.async_from_sync_continuation(r, cap, sync_iter, false),
+            Err(e) => {
+                vm.reject_promise(&cap, e);
+                Ok(Value::Object(cap))
+            }
+        }
+    });
+
+    vm.define_method(&proto, "throw", 1, |vm, this, args| {
+        let Some((sync_iter, _next)) = vm.sync_iterator_record(&this) else {
+            return Err(vm.throw_type("not an async-from-sync iterator"));
+        };
+        let cap = vm.new_promise();
+        let outcome = (|vm: &mut Vm| -> Result<Option<Value>, Value> {
+            let thr = vm.get_prop(&sync_iter, &PropertyKey::str("throw"))?;
+            if thr.is_nullish() {
+                return Ok(None);
+            }
+            if !vm.is_callable(&thr) {
+                return Err(vm.throw_type("iterator throw is not a function"));
+            }
+            let r = vm.call(thr, sync_iter.clone(), &args[..args.len().min(1)])?;
+            if !matches!(r, Value::Object(_)) {
+                return Err(vm.throw_type("iterator throw result is not an object"));
+            }
+            Ok(Some(r))
+        })(vm);
+        match outcome {
+            // No `throw` method: close the sync iterator, then reject with a
+            // TypeError (an error from the close takes precedence).
+            Ok(None) => {
+                let e = match vm.iterator_close_completion(&sync_iter, Ok(())) {
+                    Ok(()) => vm.throw_type("The iterator does not provide a 'throw' method"),
+                    Err(e) => e,
+                };
+                vm.reject_promise(&cap, e);
+                Ok(Value::Object(cap))
+            }
+            Ok(Some(r)) => vm.async_from_sync_continuation(r, cap, sync_iter, true),
+            Err(e) => {
+                vm.reject_promise(&cap, e);
+                Ok(Value::Object(cap))
+            }
+        }
+    });
 }
