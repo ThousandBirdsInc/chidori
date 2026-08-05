@@ -136,7 +136,7 @@ count of the box (or CI runner) it lands on.
 The runner **skips** (does not count as failure) tests that require features the
 engine intentionally does not implement — the same way Bun/Node skip what their
 engines lack. The list lives in `UNSUPPORTED_FEATURES` in
-`crates/test262-runner/src/main.rs` (e.g. `decorators`, `iterator-helpers`,
+`crates/test262-runner/src/main.rs` (e.g. `decorators`,
 `import-attributes`, `WeakRef`/`FinalizationRegistry`), plus `intl402/`
 (skipped unless `--intl`), Temporal-tagged tests (skipped unless
 `--temporal`), and the agent (`CanBlock`, and the
