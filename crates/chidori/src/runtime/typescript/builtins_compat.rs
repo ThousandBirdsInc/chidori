@@ -21,8 +21,73 @@
 // URLSearchParams, querystring encodes spaces as %20 and supports custom
 // separators.
 const QUERYSTRING_SHIM: &str = r#"
+// Node's escape() is not encodeURIComponent: it walks UTF-16 units itself, so
+// a lone surrogate at the end of the input is an `ERR_INVALID_URI` URIError
+// (and a lone surrogate followed by any unit is folded into a 4-byte sequence,
+// exactly as Node's `encodeStr` does). The literal set is Node's `noEscape`
+// table: unreserved ASCII plus !'()*-._~.
+const hexTable = [];
+for (let i = 0; i < 256; i++) {
+    hexTable.push("%" + (i < 16 ? "0" : "") + i.toString(16).toUpperCase());
+}
+const noEscape = new Uint8Array(128);
+{
+    const literal = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!'()*-._~";
+    for (let i = 0; i < literal.length; i++) noEscape[literal.charCodeAt(i)] = 1;
+}
+function invalidURI() {
+    const err = new URIError("URI malformed");
+    err.code = "ERR_INVALID_URI";
+    return err;
+}
+function encodeStr(str) {
+    const len = str.length;
+    if (len === 0) return "";
+    let out = "";
+    let lastPos = 0;
+    for (let i = 0; i < len; i++) {
+        let c = str.charCodeAt(i);
+        if (c < 0x80) {
+            if (noEscape[c] === 1) continue;
+            if (lastPos < i) out += str.slice(lastPos, i);
+            lastPos = i + 1;
+            out += hexTable[c];
+            continue;
+        }
+        if (lastPos < i) out += str.slice(lastPos, i);
+        if (c < 0x800) {
+            lastPos = i + 1;
+            out += hexTable[0xc0 | (c >> 6)] + hexTable[0x80 | (c & 0x3f)];
+            continue;
+        }
+        if (c < 0xd800 || c >= 0xe000) {
+            lastPos = i + 1;
+            out += hexTable[0xe0 | (c >> 12)] + hexTable[0x80 | ((c >> 6) & 0x3f)] +
+                hexTable[0x80 | (c & 0x3f)];
+            continue;
+        }
+        // Surrogate: consume the next unit unconditionally (Node does the same).
+        i++;
+        if (i >= len) throw invalidURI();
+        const c2 = str.charCodeAt(i) & 0x3ff;
+        lastPos = i + 1;
+        c = 0x10000 + (((c & 0x3ff) << 10) | c2);
+        out += hexTable[0xf0 | (c >> 18)] + hexTable[0x80 | ((c >> 12) & 0x3f)] +
+            hexTable[0x80 | ((c >> 6) & 0x3f)] + hexTable[0x80 | (c & 0x3f)];
+    }
+    if (lastPos === 0) return str;
+    if (lastPos < len) return out + str.slice(lastPos);
+    return out;
+}
 function qsEscape(str) {
-    return encodeURIComponent(String(str));
+    if (typeof str !== "string") {
+        // Node coerces objects with String() (toString/valueOf may throw a
+        // TypeError, which is the intended surface) and everything else — a
+        // Symbol included — through `+ ""`.
+        if (typeof str === "object") str = String(str);
+        else str += "";
+    }
+    return encodeStr(str);
 }
 function qsUnescape(str) {
     try { return decodeURIComponent(String(str)); } catch { return String(str); }
@@ -211,8 +276,14 @@ const initialN = 128;
 const delimiter = "-";
 const baseMinusTMin = base - tMin;
 
+// Node's punycode uses these exact RangeError messages; tests match on them.
+const errorMessages = {
+    "overflow": "Overflow: input needs wider integers to process",
+    "not-basic": "Illegal input >= 0x80 (not a basic code point)",
+    "invalid-input": "Invalid input",
+};
 function error(type) {
-    throw new RangeError("punycode: " + type);
+    throw new RangeError(errorMessages[type]);
 }
 function ucs2decode(string) {
     const output = [];
@@ -235,14 +306,14 @@ function ucs2decode(string) {
     return output;
 }
 function ucs2encode(codePoints) {
+    // Astral code points go through fromCodePoint: the engine's strings are
+    // code-point based, so emitting a hand-built surrogate pair as two
+    // fromCharCode halves would yield two replacement characters instead of
+    // the character. BMP units (including a bare surrogate) stay on
+    // fromCharCode, which round-trips them the same way a source literal does.
     let out = "";
     for (const cp of codePoints) {
-        if (cp > 0xffff) {
-            const u = cp - 0x10000;
-            out += String.fromCharCode(0xd800 + (u >> 10), 0xdc00 + (u & 0x3ff));
-        } else {
-            out += String.fromCharCode(cp);
-        }
+        out += cp > 0xffff ? String.fromCodePoint(cp) : String.fromCharCode(cp);
     }
     return out;
 }
@@ -281,7 +352,10 @@ function decode(input) {
         for (let w = 1, k = base; ; k += base) {
             if (index >= inputLength) error("invalid-input");
             const digit = basicToDigit(input.charCodeAt(index++));
-            if (digit >= base || digit > Math.floor((maxInt - i) / w)) error("overflow");
+            // A non-basic (or out-of-alphabet) code point is invalid input,
+            // not an overflow — the two RangeErrors are distinguishable.
+            if (digit >= base) error("invalid-input");
+            if (digit > Math.floor((maxInt - i) / w)) error("overflow");
             i += digit * w;
             const t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
             if (digit < t) break;
@@ -356,8 +430,10 @@ function mapDomain(domain, callback) {
     return result + encoded.join(".");
 }
 function toASCII(input) {
+    // Case is significant to the encoder (RFC 3492 case flags), so the label
+    // is encoded verbatim — lowercasing here would corrupt mixed-case labels.
     return mapDomain(input, function (label) {
-        return /[^\x00-\x7e]/.test(label) ? "xn--" + encode(label.toLowerCase()) : label;
+        return /[^\0-\x7f]/.test(label) ? "xn--" + encode(label) : label;
     });
 }
 function toUnicode(input) {
@@ -647,8 +723,27 @@ export default { setTimeout, setImmediate, setInterval, scheduler };
 // accessors return fixed values — the runtime is single-threaded and
 // deterministic, so there is exactly one execution context.
 const ASYNC_HOOKS_SHIM: &str = r#"
+// Every live storage, so `snapshot()` can capture the whole set of stores that
+// are active at the moment of capture and re-enter them later — the runtime is
+// single-threaded, so the "current async context" is just the top of each
+// storage's stack.
+const liveStorages = [];
+function invalidFnArg(name, value) {
+    const received = value === null || value === undefined
+        ? String(value)
+        : "type " + typeof value + " (" + (typeof value === "string" ? JSON.stringify(value) : String(value)) + ")";
+    const err = new TypeError('The "' + name + '" argument must be of type function. Received ' + received);
+    err.code = "ERR_INVALID_ARG_TYPE";
+    // Node's coded errors stringify as `Name [CODE]: message` so a RegExp
+    // validator can match on the code; keep it off enumeration like Node does.
+    Object.defineProperty(err, "toString", {
+        value: function () { return this.name + " [" + this.code + "]: " + this.message; },
+        enumerable: false, writable: true, configurable: true,
+    });
+    return err;
+}
 class AsyncLocalStorage {
-    constructor() { this._stack = []; }
+    constructor() { this._stack = []; liveStorages.push(this); }
     getStore() {
         return this._stack.length ? this._stack[this._stack.length - 1] : undefined;
     }
@@ -670,8 +765,28 @@ class AsyncLocalStorage {
     }
     enterWith(store) { this._stack.push(store); }
     disable() { this._stack.length = 0; }
-    static bind(fn) { return fn; }
-    static snapshot() { return function (cb, ...args) { return cb(...args); }; }
+    static bind(fn) {
+        if (typeof fn !== "function") throw invalidFnArg("fn", fn);
+        const restore = AsyncLocalStorage.snapshot();
+        return function (...args) {
+            const self = this;
+            return restore(function () { return fn.apply(self, args); });
+        };
+    }
+    static snapshot() {
+        // Capture the current store of every storage; the returned runner
+        // re-enters exactly those stores for the duration of the callback.
+        const captured = [];
+        for (const storage of liveStorages) captured.push([storage, storage.getStore()]);
+        return function (cb, ...args) {
+            for (const entry of captured) entry[0]._stack.push(entry[1]);
+            try {
+                return cb(...args);
+            } finally {
+                for (let i = captured.length - 1; i >= 0; i--) captured[i][0]._stack.pop();
+            }
+        };
+    }
 }
 class AsyncResource {
     constructor(type) { this.type = String(type === undefined ? "AsyncResource" : type); }
@@ -710,12 +825,40 @@ const registry = Object.create(null);
 function invalidArg(message) {
     const err = new TypeError(message);
     err.code = "ERR_INVALID_ARG_TYPE";
+    // Node's coded errors stringify as `Name [CODE]: message`, which is what a
+    // RegExp validator passed to assert.throws matches against.
+    Object.defineProperty(err, "toString", {
+        value: function () { return this.name + " [" + this.code + "]: " + this.message; },
+        enumerable: false, writable: true, configurable: true,
+    });
     return err;
+}
+function describe(value) {
+    if (value === null || value === undefined) return String(value);
+    if (typeof value === "object") {
+        const ctor = value.constructor;
+        return "an instance of " + (ctor && ctor.name ? ctor.name : "Object");
+    }
+    if (typeof value === "string") return "type string (" + JSON.stringify(value) + ")";
+    return "type " + typeof value + " (" + String(value) + ")";
 }
 function checkChannelName(name) {
     if (typeof name !== "string" && typeof name !== "symbol") {
-        throw invalidArg('The "channel" argument must be one of type string or symbol');
+        throw invalidArg(
+            'The "channel" argument must be of type string or symbol. Received ' + describe(name)
+        );
     }
+}
+
+// Hand the error to `process`'s 'uncaughtException' listeners on a later tick
+// (Node uses process.nextTick + triggerUncaughtException). With no listener
+// registered there is nothing to swallow it, so it is rethrown asynchronously.
+function deliverUncaught(err) {
+    queueMicrotask(function () {
+        const proc = globalThis.process;
+        if (proc && typeof proc.emit === "function" && proc.emit("uncaughtException", err)) return;
+        throw err;
+    });
 }
 
 class Channel {
@@ -737,8 +880,17 @@ class Channel {
         return true;
     }
     publish(message) {
+        // A throwing subscriber must not abort the publish or reach the
+        // caller: Node routes it to the uncaught-exception path instead, so
+        // later subscribers still run.
         const subs = this._subscribers.slice();
-        for (const fn of subs) fn(message, this.name);
+        for (const fn of subs) {
+            try {
+                fn(message, this.name);
+            } catch (err) {
+                deliverUncaught(err);
+            }
+        }
     }
     bindStore() {}
     unbindStore() {}
@@ -1385,6 +1537,19 @@ class Readable extends Stream {
     }
 }
 
+function writableHighWaterMark(opts) {
+    if (typeof opts.writableHighWaterMark === "number") return opts.writableHighWaterMark;
+    if (typeof opts.highWaterMark === "number") return opts.highWaterMark;
+    return 16384;
+}
+// The buffered "length" a chunk contributes, in Node's units: one per chunk in
+// object mode, bytes otherwise.
+function chunkLength(chunk, encoding, objectMode) {
+    if (objectMode) return 1;
+    if (typeof chunk === "string") return Buffer.byteLength(chunk, encoding || "utf8");
+    if (chunk && typeof chunk.length === "number") return chunk.length;
+    return 1;
+}
 function initWritableState(stream, opts) {
     stream._writableState = {
         ended: false,
@@ -1392,6 +1557,9 @@ function initWritableState(stream, opts) {
         finishScheduled: false,
         destroyed: false,
         pending: 0,
+        length: 0,
+        needDrain: false,
+        highWaterMark: writableHighWaterMark(opts),
         objectMode: !!(opts.objectMode || opts.writableObjectMode),
     };
     stream.writable = true;
@@ -1435,13 +1603,22 @@ const writableMethods = {
             return false;
         }
         st.pending++;
+        const len = chunkLength(chunk, encoding, st.objectMode);
+        st.length += len;
         let settled = false;
         const done = function (err) {
             if (settled) return;
             settled = true;
             st.pending--;
+            st.length -= len;
             if (err) queueMicrotask(() => self.emit("error", err));
             if (callback) queueMicrotask(() => callback(err || null));
+            // Everything this stream had buffered has moved on: tell a writer
+            // that got `false` back that it may resume.
+            if (st.needDrain && st.length === 0 && !st.ended && !st.destroyed) {
+                st.needDrain = false;
+                queueMicrotask(() => self.emit("drain"));
+            }
             maybeFinish(self);
         };
         try {
@@ -1449,7 +1626,12 @@ const writableMethods = {
         } catch (err) {
             done(err);
         }
-        return true;
+        // Honest backpressure: `false` once the still-unflushed length reaches
+        // the high-water mark (a transform holding its callback keeps its
+        // chunk counted), and a 'drain' follows when that length reaches zero.
+        const ret = st.length < st.highWaterMark;
+        if (!ret) st.needDrain = true;
+        return ret;
     },
     end(chunk, encoding, callback) {
         if (typeof chunk === "function") { callback = chunk; chunk = undefined; encoding = undefined; }
@@ -1517,14 +1699,44 @@ class Transform extends Duplex {
 }
 Transform.prototype._write = function (chunk, encoding, callback) {
     const self = this;
-    try {
-        this._transform(chunk, encoding, function (err, data) {
-            if (err) return callback(err);
-            if (data !== undefined && data !== null) self.push(data);
+    const rst = this._readableState;
+    const wst = this._writableState;
+    const before = rst.buffer.length;
+    let called = false;
+    const after = function (err, data) {
+        if (called) {
+            // Node surfaces a second call to a transform callback as an
+            // ERR_MULTIPLE_CALLBACK error on the stream rather than silently
+            // ignoring it.
+            const dup = new Error("Callback called multiple times");
+            dup.code = "ERR_MULTIPLE_CALLBACK";
+            self.destroy(dup);
+            return;
+        }
+        called = true;
+        if (err) return callback(err);
+        if (data !== undefined && data !== null) self.push(data);
+        // Hold the write callback while the readable side is over its
+        // high-water mark, so the writable side reports backpressure until a
+        // reader drains it (this is what makes 'drain' meaningful).
+        if (wst.ended || before === rst.buffer.length || rst.buffer.length < rst.highWaterMark) {
             callback(null);
-        });
+        } else {
+            self._transformCallback = callback;
+        }
+    };
+    try {
+        this._transform(chunk, encoding, after);
     } catch (err) {
-        callback(err);
+        if (!called) { called = true; callback(err); }
+    }
+};
+Transform.prototype._read = function () {
+    // A reader took a chunk: release the write callback the transform parked.
+    const callback = this._transformCallback;
+    if (callback) {
+        this._transformCallback = null;
+        callback(null);
     }
 };
 Transform.prototype._final = function (callback) {
@@ -2143,88 +2355,80 @@ function base64ToBytes(b64) {
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
     return out;
 }
+// Null (rather than a throw) for anything that is not a valid codec input, so
+// each entry point can raise the Node error naming its own argument.
 function toBytes(data) {
     if (typeof data === "string") return new TextEncoder().encode(data);
     if (data instanceof Uint8Array) return data;
     if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
-    throw new TypeError("zlib: unsupported input type (expected string, Buffer, typed array, or ArrayBuffer)");
-}
-function levelOf(options) {
-    if (options && typeof options === "object" && typeof options.level === "number") {
-        return options.level;
-    }
     return null;
 }
-function codec(op, data, options) {
-    const b64 = globalThis.__chidori_zlib(op, bytesToBase64(toBytes(data)), levelOf(options));
-    return Buffer.from(base64ToBytes(b64));
+function concatBytes(chunks) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const all = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) { all.set(c, offset); offset += c.length; }
+    return all;
 }
-// node signature: fn(data[, options], callback) — result on a microtask.
-function asyncify(op) {
-    return function (data, options, callback) {
-        if (typeof options === "function") { callback = options; options = undefined; }
-        if (typeof callback !== "function") throw new TypeError("zlib: callback must be a function");
-        queueMicrotask(() => {
-            try {
-                callback(null, codec(op, data, options));
-            } catch (err) {
-                callback(err);
-            }
-        });
-    };
+
+// --- Node error shapes ---------------------------------------------------
+// Node's zlib is unusually strict about arguments, and callers branch on
+// `err.code`, so the validation surface is reproduced faithfully: the same
+// codes, the same `The "x" argument/property must be …` wording, and the same
+// `Name [CODE]: message` stringification its coded errors carry.
+function inspectValue(value) {
+    if (typeof value === "string") return "'" + value + "'";
+    if (typeof value === "bigint") return String(value) + "n";
+    if (typeof value === "symbol") return value.toString();
+    return String(value);
 }
-// Streaming form: buffer chunks, codec the concatenation at flush. Complete-
-// stream output is identical to the one-shot functions.
-function codecStream(op, options) {
-    const chunks = [];
-    return new Transform({
-        transform(chunk, encoding, callback) {
-            try { chunks.push(toBytes(chunk)); } catch (err) { return callback(err); }
-            callback(null);
-        },
-        flush(callback) {
-            try {
-                let total = 0;
-                for (const c of chunks) total += c.length;
-                const all = new Uint8Array(total);
-                let offset = 0;
-                for (const c of chunks) { all.set(c, offset); offset += c.length; }
-                callback(null, codec(op, all, options));
-            } catch (err) {
-                callback(err);
-            }
-        },
+function receivedFor(value) {
+    if (value === null || value === undefined) return " Received " + String(value);
+    if (typeof value === "function") return " Received function " + (value.name || "(anonymous)");
+    if (typeof value === "object") {
+        const ctor = value.constructor;
+        return " Received an instance of " + (ctor && ctor.name ? ctor.name : "Object");
+    }
+    return " Received type " + typeof value + " (" + inspectValue(value) + ")";
+}
+function coded(err, code) {
+    err.code = code;
+    Object.defineProperty(err, "toString", {
+        value: function () { return this.name + " [" + this.code + "]: " + this.message; },
+        enumerable: false, writable: true, configurable: true,
     });
+    return err;
 }
-export function deflateSync(data, options) { return codec("deflate", data, options); }
-export function deflateRawSync(data, options) { return codec("deflateRaw", data, options); }
-export function gzipSync(data, options) { return codec("gzip", data, options); }
-export function inflateSync(data, options) { return codec("inflate", data, options); }
-export function inflateRawSync(data, options) { return codec("inflateRaw", data, options); }
-export function gunzipSync(data, options) { return codec("gunzip", data, options); }
-export function unzipSync(data, options) { return codec("unzip", data, options); }
-export const deflate = asyncify("deflate");
-export const deflateRaw = asyncify("deflateRaw");
-export const gzip = asyncify("gzip");
-export const inflate = asyncify("inflate");
-export const inflateRaw = asyncify("inflateRaw");
-export const gunzip = asyncify("gunzip");
-export const unzip = asyncify("unzip");
-export function createDeflate(options) { return codecStream("deflate", options); }
-export function createDeflateRaw(options) { return codecStream("deflateRaw", options); }
-export function createGzip(options) { return codecStream("gzip", options); }
-export function createInflate(options) { return codecStream("inflate", options); }
-export function createInflateRaw(options) { return codecStream("inflateRaw", options); }
-export function createGunzip(options) { return codecStream("gunzip", options); }
-export function createUnzip(options) { return codecStream("unzip", options); }
-export const constants = Object.freeze({
+// Node picks "property" over "argument" when the name is dotted.
+function invalidArgType(name, expected, value) {
+    const kind = name.indexOf(".") === -1 ? "argument" : "property";
+    return coded(
+        new TypeError('The "' + name + '" ' + kind + " must be " + expected + "." + receivedFor(value)),
+        "ERR_INVALID_ARG_TYPE"
+    );
+}
+function outOfRange(name, range, value) {
+    return coded(
+        new RangeError('The value of "' + name + '" is out of range. It must be ' + range +
+            ". Received " + String(value)),
+        "ERR_OUT_OF_RANGE"
+    );
+}
+
+const constants = Object.freeze({
     Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3,
     Z_FINISH: 4, Z_BLOCK: 5,
     Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2,
     Z_NO_COMPRESSION: 0, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9,
     Z_DEFAULT_COMPRESSION: -1,
+    Z_FILTERED: 1, Z_HUFFMAN_ONLY: 2, Z_RLE: 3, Z_FIXED: 4,
     Z_DEFAULT_STRATEGY: 0,
+    Z_MIN_WINDOWBITS: 8, Z_MAX_WINDOWBITS: 15, Z_DEFAULT_WINDOWBITS: 15,
+    Z_MIN_CHUNK: 64, Z_MAX_CHUNK: Infinity, Z_DEFAULT_CHUNK: 16384,
+    Z_MIN_MEMLEVEL: 1, Z_MAX_MEMLEVEL: 9, Z_DEFAULT_MEMLEVEL: 8,
+    Z_MIN_LEVEL: -1, Z_MAX_LEVEL: 9, Z_DEFAULT_LEVEL: -1,
     BROTLI_OPERATION_PROCESS: 0, BROTLI_OPERATION_FLUSH: 1,
     BROTLI_OPERATION_FINISH: 2,
     BROTLI_PARAM_MODE: 0, BROTLI_PARAM_QUALITY: 1, BROTLI_PARAM_LGWIN: 2,
@@ -2232,7 +2436,86 @@ export const constants = Object.freeze({
     BROTLI_MODE_GENERIC: 0, BROTLI_MODE_TEXT: 1, BROTLI_MODE_FONT: 2,
     BROTLI_MIN_QUALITY: 0, BROTLI_MAX_QUALITY: 11,
     BROTLI_DEFAULT_QUALITY: 11, BROTLI_DEFAULT_WINDOW: 22,
+    BROTLI_MIN_WINDOW_BITS: 10, BROTLI_MAX_WINDOW_BITS: 24,
 });
+
+// --- Option validation ---------------------------------------------------
+function checkFiniteNumber(value, name) {
+    if (value === undefined) return false;
+    if (typeof value === "number" && isFinite(value)) return true;
+    if (typeof value !== "number") throw invalidArgType(name, "of type number", value);
+    throw outOfRange(name, "a finite number", value);
+}
+function checkRange(value, name, lower, upper, fallback) {
+    if (!checkFiniteNumber(value, name)) return fallback;
+    if (value < lower || value > upper) {
+        throw outOfRange(name, ">= " + lower + " and <= " + upper, value);
+    }
+    return value;
+}
+const DECOMPRESSORS = {
+    inflate: true, inflateRaw: true, gunzip: true, unzip: true,
+};
+function isBinary(value) {
+    return ArrayBuffer.isView(value) || value instanceof ArrayBuffer;
+}
+// The chunkSize / flush bounds every zlib and brotli stream shares.
+function validateBaseOptions(opts) {
+    if (!opts || typeof opts !== "object") return;
+    if (opts.chunkSize !== undefined && checkFiniteNumber(opts.chunkSize, "options.chunkSize") &&
+        opts.chunkSize < constants.Z_MIN_CHUNK) {
+        throw outOfRange("options.chunkSize", ">= " + constants.Z_MIN_CHUNK, opts.chunkSize);
+    }
+    checkRange(opts.flush, "options.flush", constants.Z_NO_FLUSH, constants.Z_BLOCK, constants.Z_NO_FLUSH);
+    checkRange(opts.finishFlush, "options.finishFlush", constants.Z_NO_FLUSH, constants.Z_BLOCK, constants.Z_FINISH);
+}
+function validateZlibOptions(op, opts) {
+    validateBaseOptions(opts);
+    if (!opts || typeof opts !== "object") return;
+    // windowBits 0 is legal on the decompressing side — it means "read the
+    // window size out of the stream header".
+    const unsetWindow = opts.windowBits === undefined || opts.windowBits === null || opts.windowBits === 0;
+    if (!(unsetWindow && DECOMPRESSORS[op])) {
+        checkRange(opts.windowBits, "options.windowBits",
+            constants.Z_MIN_WINDOWBITS, constants.Z_MAX_WINDOWBITS, constants.Z_DEFAULT_WINDOWBITS);
+    }
+    checkRange(opts.level, "options.level",
+        constants.Z_MIN_LEVEL, constants.Z_MAX_LEVEL, constants.Z_DEFAULT_COMPRESSION);
+    checkRange(opts.memLevel, "options.memLevel",
+        constants.Z_MIN_MEMLEVEL, constants.Z_MAX_MEMLEVEL, constants.Z_DEFAULT_MEMLEVEL);
+    checkRange(opts.strategy, "options.strategy",
+        constants.Z_DEFAULT_STRATEGY, constants.Z_FIXED, constants.Z_DEFAULT_STRATEGY);
+    if (opts.dictionary !== undefined && !isBinary(opts.dictionary)) {
+        throw invalidArgType("options.dictionary",
+            "an instance of Buffer, TypedArray, DataView, or ArrayBuffer", opts.dictionary);
+    }
+}
+function validateBrotliOptions(opts) {
+    validateBaseOptions(opts);
+    if (!opts || typeof opts !== "object" || !opts.params) return;
+    if (typeof opts.params !== "object") {
+        throw invalidArgType("options.params", "of type object", opts.params);
+    }
+    for (const key of Object.keys(opts.params)) {
+        const index = Number(key);
+        if (!isFinite(index) || index < 0 || index > constants.BROTLI_PARAM_SIZE_HINT) {
+            throw coded(new RangeError("The brotli parameter " + key + " is invalid"),
+                "ERR_BROTLI_INVALID_PARAM");
+        }
+        const value = opts.params[key];
+        if (typeof value !== "number" && typeof value !== "boolean") {
+            throw invalidArgType("options.params[key]", "of type number", value);
+        }
+    }
+}
+
+// --- Codecs --------------------------------------------------------------
+function levelOf(options) {
+    if (options && typeof options === "object" && typeof options.level === "number") {
+        return options.level;
+    }
+    return null;
+}
 // Brotli quality rides Node's option shape: options.params keyed by
 // BROTLI_PARAM_QUALITY. Other params (lgwin, mode) are accepted and ignored —
 // the codec uses its defaults for them.
@@ -2243,50 +2526,183 @@ function brotliQuality(options) {
     }
     return null;
 }
-function brotliCodec(op, data, options) {
-    const b64 = globalThis.__chidori_zlib(op, bytesToBase64(toBytes(data)), brotliQuality(options));
-    return Buffer.from(base64ToBytes(b64));
+const BROTLI_OPS = { brotliCompress: true, brotliDecompress: true };
+function runCodec(op, bytes, options) {
+    const tuning = BROTLI_OPS[op] ? brotliQuality(options) : levelOf(options);
+    return Buffer.from(base64ToBytes(globalThis.__chidori_zlib(op, bytesToBase64(bytes), tuning)));
 }
-export function brotliCompressSync(data, options) { return brotliCodec("brotliCompress", data, options); }
-export function brotliDecompressSync(data, options) { return brotliCodec("brotliDecompress", data, options); }
-function brotliAsyncify(op) {
+function inputBytes(data, options, op) {
+    const bytes = toBytes(data);
+    if (bytes === null) {
+        throw invalidArgType("buffer",
+            "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", data);
+    }
+    if (BROTLI_OPS[op]) validateBrotliOptions(options);
+    else validateZlibOptions(op, options);
+    return bytes;
+}
+// `{ info: true }` asks for the engine alongside the bytes, as Node does.
+function withInfo(buffer, options, op) {
+    if (options && typeof options === "object" && options.info) {
+        return { buffer, engine: new CLASS_FOR_OP[op](options) };
+    }
+    return buffer;
+}
+function syncCodec(op) {
+    return function (data, options) {
+        return withInfo(runCodec(op, inputBytes(data, options, op), options), options, op);
+    };
+}
+// node signature: fn(data[, options], callback) — result on a microtask.
+function asyncCodec(op) {
     return function (data, options, callback) {
         if (typeof options === "function") { callback = options; options = undefined; }
-        if (typeof callback !== "function") throw new TypeError("zlib: callback must be a function");
+        if (typeof callback !== "function") {
+            throw invalidArgType("callback", "of type function", callback);
+        }
+        const bytes = inputBytes(data, options, op);
         queueMicrotask(() => {
             try {
-                callback(null, brotliCodec(op, data, options));
+                callback(null, withInfo(runCodec(op, bytes, options), options, op));
             } catch (err) {
                 callback(err);
             }
         });
     };
 }
-export const brotliCompress = brotliAsyncify("brotliCompress");
-export const brotliDecompress = brotliAsyncify("brotliDecompress");
-function brotliStream(op, options) {
+
+// --- Streaming classes ---------------------------------------------------
+// ES5-style constructors, because Node's zlib classes work with and without
+// `new`. Each instance is a real Transform whose prototype is re-pointed at
+// the codec class, so `zlib.Deflate() instanceof zlib.Deflate` holds and the
+// full stream surface comes along. Chunks are buffered and coded at flush:
+// output for a complete stream is identical to the one-shot form.
+function codecHandlers(op, options) {
     const chunks = [];
-    return new Transform({
+    return {
         transform(chunk, encoding, callback) {
-            try { chunks.push(toBytes(chunk)); } catch (err) { return callback(err); }
+            const bytes = toBytes(chunk);
+            if (bytes === null) {
+                return callback(invalidArgType("chunk",
+                    "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", chunk));
+            }
+            chunks.push(bytes);
             callback(null);
         },
         flush(callback) {
             try {
-                let total = 0;
-                for (const c of chunks) total += c.length;
-                const all = new Uint8Array(total);
-                let offset = 0;
-                for (const c of chunks) { all.set(c, offset); offset += c.length; }
-                callback(null, brotliCodec(op, all, options));
+                callback(null, runCodec(op, concatBytes(chunks), options));
             } catch (err) {
                 callback(err);
             }
         },
-    });
+    };
 }
-export function createBrotliCompress(options) { return brotliStream("brotliCompress", options); }
-export function createBrotliDecompress(options) { return brotliStream("brotliDecompress", options); }
+function defineCodecClass(name, op) {
+    const Ctor = function (options) {
+        if (!(this instanceof Ctor)) return new Ctor(options);
+        if (BROTLI_OPS[op]) validateBrotliOptions(options);
+        else validateZlibOptions(op, options);
+        const stream = new Transform(Object.assign({}, options, codecHandlers(op, options)));
+        Object.setPrototypeOf(stream, Ctor.prototype);
+        stream._codecOp = op;
+        stream._codecOptions = options;
+        stream.bytesWritten = 0;
+        return stream;
+    };
+    Ctor.prototype = Object.create(Transform.prototype);
+    Object.defineProperty(Ctor.prototype, "constructor", {
+        value: Ctor, enumerable: false, writable: true, configurable: true,
+    });
+    Object.defineProperty(Ctor, "name", { value: name, configurable: true });
+    return Ctor;
+}
+
+const Deflate = defineCodecClass("Deflate", "deflate");
+const DeflateRaw = defineCodecClass("DeflateRaw", "deflateRaw");
+const Gzip = defineCodecClass("Gzip", "gzip");
+const Inflate = defineCodecClass("Inflate", "inflate");
+const InflateRaw = defineCodecClass("InflateRaw", "inflateRaw");
+const Gunzip = defineCodecClass("Gunzip", "gunzip");
+const Unzip = defineCodecClass("Unzip", "unzip");
+const BrotliCompress = defineCodecClass("BrotliCompress", "brotliCompress");
+const BrotliDecompress = defineCodecClass("BrotliDecompress", "brotliDecompress");
+const CLASS_FOR_OP = {
+    deflate: Deflate, deflateRaw: DeflateRaw, gzip: Gzip,
+    inflate: Inflate, inflateRaw: InflateRaw, gunzip: Gunzip, unzip: Unzip,
+    brotliCompress: BrotliCompress, brotliDecompress: BrotliDecompress,
+};
+
+// Node's private-but-widely-used synchronous entry point: code one buffer end
+// to end and hand back the result without touching the stream's event surface.
+function _processChunk(chunk, flushFlag, callback) {
+    const op = this._codecOp;
+    const bytes = toBytes(chunk);
+    if (bytes === null) {
+        throw invalidArgType("chunk",
+            "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", chunk);
+    }
+    if (typeof callback === "function") {
+        let result;
+        try { result = runCodec(op, bytes, this._codecOptions); } catch (err) { return callback(err); }
+        callback(null, result);
+        return undefined;
+    }
+    return runCodec(op, bytes, this._codecOptions);
+}
+// Only the compressing zlib classes take params(); the validation is the
+// point (Node throws before touching the handle).
+function params(level, strategy, callback) {
+    checkRange(level, "level", constants.Z_MIN_LEVEL, constants.Z_MAX_LEVEL, constants.Z_DEFAULT_COMPRESSION);
+    checkRange(strategy, "strategy", constants.Z_DEFAULT_STRATEGY, constants.Z_FIXED, constants.Z_DEFAULT_STRATEGY);
+    if (typeof level === "number") this._codecOptions = Object.assign({}, this._codecOptions, { level });
+    if (typeof callback === "function") queueMicrotask(callback);
+    return this;
+}
+for (const Ctor of [Deflate, DeflateRaw, Gzip]) {
+    Ctor.prototype.params = params;
+}
+for (const Ctor of Object.keys(CLASS_FOR_OP).map((op) => CLASS_FOR_OP[op])) {
+    Ctor.prototype._processChunk = _processChunk;
+    Ctor.prototype.reset = function reset() { return this; };
+    Ctor.prototype.close = function close(callback) {
+        if (typeof callback === "function") queueMicrotask(callback);
+        return this;
+    };
+}
+
+export const deflateSync = syncCodec("deflate");
+export const deflateRawSync = syncCodec("deflateRaw");
+export const gzipSync = syncCodec("gzip");
+export const inflateSync = syncCodec("inflate");
+export const inflateRawSync = syncCodec("inflateRaw");
+export const gunzipSync = syncCodec("gunzip");
+export const unzipSync = syncCodec("unzip");
+export const brotliCompressSync = syncCodec("brotliCompress");
+export const brotliDecompressSync = syncCodec("brotliDecompress");
+export const deflate = asyncCodec("deflate");
+export const deflateRaw = asyncCodec("deflateRaw");
+export const gzip = asyncCodec("gzip");
+export const inflate = asyncCodec("inflate");
+export const inflateRaw = asyncCodec("inflateRaw");
+export const gunzip = asyncCodec("gunzip");
+export const unzip = asyncCodec("unzip");
+export const brotliCompress = asyncCodec("brotliCompress");
+export const brotliDecompress = asyncCodec("brotliDecompress");
+export function createDeflate(options) { return new Deflate(options); }
+export function createDeflateRaw(options) { return new DeflateRaw(options); }
+export function createGzip(options) { return new Gzip(options); }
+export function createInflate(options) { return new Inflate(options); }
+export function createInflateRaw(options) { return new InflateRaw(options); }
+export function createGunzip(options) { return new Gunzip(options); }
+export function createUnzip(options) { return new Unzip(options); }
+export function createBrotliCompress(options) { return new BrotliCompress(options); }
+export function createBrotliDecompress(options) { return new BrotliDecompress(options); }
+export {
+    constants,
+    Deflate, DeflateRaw, Gzip, Inflate, InflateRaw, Gunzip, Unzip,
+    BrotliCompress, BrotliDecompress,
+};
 export default {
     deflate, deflateSync, deflateRaw, deflateRawSync,
     inflate, inflateSync, inflateRaw, inflateRawSync,
@@ -2295,6 +2711,8 @@ export default {
     createDeflate, createDeflateRaw, createInflate, createInflateRaw,
     createGzip, createGunzip, createUnzip,
     createBrotliCompress, createBrotliDecompress,
+    Deflate, DeflateRaw, Gzip, Inflate, InflateRaw, Gunzip, Unzip,
+    BrotliCompress, BrotliDecompress,
     constants,
 };
 "#;
