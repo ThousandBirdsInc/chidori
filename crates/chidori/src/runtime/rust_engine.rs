@@ -1059,6 +1059,152 @@ pub(crate) fn build_sync_native_dispatch(
     )
 }
 
+/// `process`'s EventEmitter surface. Node code registers 'uncaughtException',
+/// 'unhandledRejection', 'beforeExit' and friends on `process`, and callers
+/// that emit into it (diagnostics_channel's subscriber-error path, for one)
+/// need those listeners to actually run. The registry is a plain in-heap map
+/// of arrays — no host state, no scheduling of its own, so it stays as
+/// deterministic as the rest of the prelude. Emitting is synchronous and
+/// ordered, matching Node; there is no 'newListener' meta-event and no
+/// max-listeners warning, which `process` never relies on.
+const PROCESS_EVENTS_JS: &str = r#"
+(function () {
+    const proc = globalThis.process;
+    const events = Object.create(null);
+    const listOf = function (name) {
+        const key = String(name);
+        return events[key] || (events[key] = []);
+    };
+    proc.on = function (name, fn) {
+        if (typeof fn !== "function") throw new TypeError("process listener must be a function");
+        listOf(name).push(fn);
+        return this;
+    };
+    proc.once = function (name, fn) {
+        if (typeof fn !== "function") throw new TypeError("process listener must be a function");
+        const self = this;
+        const wrapper = function (...args) {
+            self.off(name, wrapper);
+            return fn.apply(self, args);
+        };
+        wrapper.listener = fn;
+        return this.on(name, wrapper);
+    };
+    proc.off = function (name, fn) {
+        const list = events[String(name)];
+        if (list) {
+            for (let i = 0; i < list.length; i++) {
+                if (list[i] === fn || list[i].listener === fn) { list.splice(i, 1); break; }
+            }
+        }
+        return this;
+    };
+    proc.removeAllListeners = function (name) {
+        if (name === undefined) {
+            for (const key of Object.keys(events)) delete events[key];
+        } else {
+            delete events[String(name)];
+        }
+        return this;
+    };
+    proc.prependListener = function (name, fn) {
+        if (typeof fn !== "function") throw new TypeError("process listener must be a function");
+        listOf(name).unshift(fn);
+        return this;
+    };
+    proc.listeners = function (name) {
+        const list = events[String(name)];
+        return list ? list.slice() : [];
+    };
+    proc.rawListeners = proc.listeners;
+    proc.listenerCount = function (name) {
+        const list = events[String(name)];
+        return list ? list.length : 0;
+    };
+    proc.eventNames = function () { return Object.keys(events); };
+    proc.emit = function (name, ...args) {
+        const list = events[String(name)];
+        if (!list || list.length === 0) return false;
+        for (const fn of list.slice()) fn.apply(this, args);
+        return true;
+    };
+    proc.addListener = proc.on;
+    proc.removeListener = proc.off;
+})();
+"#;
+
+/// `process.allowedNodeEnvironmentFlags`: the frozen, Set-shaped view of the
+/// flags Node accepts in `NODE_OPTIONS`. The list is a fixed constant (chidori
+/// parses no command line), and the lookup rules are Node's: underscores fold
+/// to dashes, a leading dash means "match the canonical spelling with any
+/// `=value` suffix stripped", and a bare word matches the dash-stripped name.
+/// The object is a real `Set` so `Set.prototype.add.call(…)` does not throw on
+/// it, but every observable method is an own property reading the fixed list —
+/// so mutating through the `Set` prototype can never surface a flag.
+const PROCESS_ALLOWED_FLAGS_JS: &str = r#"
+(function () {
+    const flags = [
+        "--abort-on-uncaught-exception", "--conditions", "--diagnostic-dir",
+        "--disable-proto", "--dns-result-order", "--enable-source-maps",
+        "--experimental-import-meta-resolve", "--experimental-json-modules",
+        "--experimental-loader", "--experimental-modules",
+        "--experimental-vm-modules", "--experimental-wasm-modules",
+        "--force-context-aware", "--force-fips", "--frozen-intrinsics",
+        "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal",
+        "--icu-data-dir", "--import", "--input-type", "--insecure-http-parser",
+        "--max-http-header-size", "--napi-modules", "--no-deprecation",
+        "--no-warnings", "--openssl-config", "--openssl-legacy-provider",
+        "--pending-deprecation", "--perf-basic-prof",
+        "--perf-basic-prof-only-functions", "--perf-prof",
+        "--perf-prof-unwinding-info", "--preserve-symlinks",
+        "--preserve-symlinks-main", "--prof-process", "--redirect-warnings",
+        "--report-compact", "--report-dir", "--report-directory",
+        "--report-filename", "--report-on-fatalerror", "--report-on-signal",
+        "--report-signal", "--report-uncaught-exception", "--require",
+        "--secure-heap", "--secure-heap-min", "--snapshot-blob",
+        "--stack-trace-limit", "--test-only", "--throw-deprecation", "--title",
+        "--tls-cipher-list", "--tls-keylog", "--tls-max-v1.2", "--tls-max-v1.3",
+        "--tls-min-v1.0", "--tls-min-v1.1", "--tls-min-v1.2", "--tls-min-v1.3",
+        "--trace-atomics-wait", "--trace-deprecation", "--trace-event-categories",
+        "--trace-event-file-pattern", "--trace-events-enabled", "--trace-exit",
+        "--trace-sigint", "--trace-sync-io", "--trace-tls", "--trace-uncaught",
+        "--trace-warnings", "--track-heap-objects", "--unhandled-rejections",
+        "--use-bundled-ca", "--use-largepages", "--use-openssl-ca",
+        "--v8-pool-size", "--zero-fill-buffers", "-r",
+    ];
+    const bare = flags.map(function (flag) { return flag.replace(/^--?/, ""); });
+    const iterable = new Set(flags);
+    const values = function values() { return iterable.values(); };
+    const set = new Set();
+    Object.defineProperties(set, {
+        has: {
+            value: function has(key) {
+                if (typeof key !== "string") return false;
+                const folded = key.replace(/_/g, "-");
+                if (/^--?/.test(folded)) {
+                    return flags.indexOf(folded.replace(/=.*$/, "")) !== -1;
+                }
+                return bare.indexOf(folded) !== -1;
+            },
+        },
+        add: { value: function add() { return this; } },
+        delete: { value: function () { return false; } },
+        clear: { value: function clear() {} },
+        forEach: {
+            value: function forEach(callback, thisArg) {
+                for (const flag of flags) callback.call(thisArg, flag, flag, this);
+            },
+        },
+        size: { get: function () { return flags.length; } },
+        values: { value: values },
+        keys: { value: values },
+        entries: { value: function entries() { return iterable.entries(); } },
+        [Symbol.iterator]: { value: values },
+    });
+    globalThis.process.allowedNodeEnvironmentFlags = Object.freeze(set);
+})();
+"#;
+
 /// The determinism prelude installed on the rust engine before an agent runs:
 /// the logical clock, `process.env`, UTF-8/base64 text primitives, the Web
 /// Crypto subset, and the virtual timer queue. Date and `Math.random`
@@ -1128,20 +1274,9 @@ pub(crate) fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
     }},
     abort: function () {{ throw new Error("process.abort is not supported in the Chidori runtime"); }},
     kill: function () {{ throw new Error("process.kill is not supported in the Chidori runtime (no host processes are visible)"); }},
-    on: function () {{ return this; }},
-    once: function () {{ return this; }},
-    off: function () {{ return this; }},
-    addListener: function () {{ return this; }},
-    removeListener: function () {{ return this; }},
-    removeAllListeners: function () {{ return this; }},
-    prependListener: function () {{ return this; }},
-    listeners: function () {{ return []; }},
-    listenerCount: function () {{ return 0; }},
-    emit: function () {{ return false; }},
     stdout: {{ isTTY: false, write: function (s) {{ if (globalThis.console) globalThis.console.log(String(s).replace(/\n$/, "")); return true; }} }},
     stderr: {{ isTTY: false, write: function (s) {{ if (globalThis.console) globalThis.console.error(String(s).replace(/\n$/, "")); return true; }} }},
     stdin: null,
-    allowedNodeEnvironmentFlags: Object.freeze([]),
     features: Object.freeze({{}}),
     release: Object.freeze({{ name: "chidori" }}),
     getuid: function () {{ return -1; }},
@@ -1150,6 +1285,8 @@ pub(crate) fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
 }};
 "#
     ));
+    out.push_str(PROCESS_EVENTS_JS);
+    out.push_str(PROCESS_ALLOWED_FLAGS_JS);
     out.push_str(TEXT_ENCODING_POLYFILL);
     out.push_str(WEB_CRYPTO_POLYFILL);
     match policy.timers {
