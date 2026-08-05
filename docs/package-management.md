@@ -143,7 +143,7 @@ three cliffs, concretely:
      error at first use — never a silent no-op.
 
    Unprovided *subpaths* of a builtin (and post-suite builtins like
-   `node:test`) still fail at resolve time with an error naming the
+   `node:sqlite`) still fail at resolve time with an error naming the
    importing file. (Networking is `fetch` plus the `node:http`/`node:https`
    client shims, all captured for replay.)
 

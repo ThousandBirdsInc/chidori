@@ -73,6 +73,7 @@ pub const NODE_BUILTIN_ALLOWLIST: &[&str] = &[
     "url",
     "assert",
     "assert/strict",
+    "test",
     "os",
     "async_hooks",
     "console",

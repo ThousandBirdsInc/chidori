@@ -3518,6 +3518,91 @@ mod tests {
         );
     }
 
+    /// The legacy (`url.parse`/`format`/`resolve`) half of node:url, plus the
+    /// file-URL conversions — the surface Node's own `test-url-*` suite pins.
+    #[test]
+    fn run_agent_node_url_legacy_and_file_surface() {
+        let out = run_compute_agent(
+            "node-url-legacy",
+            // `r##` delimiters: the body contains `"#` (a fragment reference).
+            r##"
+            import url from "node:url";
+            export async function agent() {
+                const parsed = url.parse("HTTP://User:PW@www.ExAmPlE.com:8080/a/b?c=d#e");
+                const withQuery = url.parse("http://x.com/p?a=1&a=2&b=3", true);
+                let scheme = null;
+                try { url.fileURLToPath("https://a/b"); } catch (err) { scheme = err.code; }
+                let fileHost = null;
+                try { url.fileURLToPath("file://nas/a"); } catch (err) { fileHost = err.code; }
+                let encodedSlash = null;
+                try { url.fileURLToPath("file:///a%2F/"); } catch (err) { encodedSlash = err.code; }
+                let badFormat = null;
+                try { url.format(0); } catch (err) { badFormat = err.code; }
+                return {
+                    protocol: parsed.protocol,
+                    auth: parsed.auth,
+                    host: parsed.host,
+                    hostname: parsed.hostname,
+                    port: parsed.port,
+                    path: parsed.path,
+                    query: parsed.query,
+                    href: parsed.href,
+                    parsedQuery: withQuery.query,
+                    format: url.format(parsed),
+                    resolveDots: url.resolve("http://a/b/c/d;p?q", "../../g"),
+                    resolveProto: url.resolve("http://example.com/a/b", "//other.com/c"),
+                    resolveHash: url.resolve("http://a/b/c/d;p?q", "#s"),
+                    toPath: url.fileURLToPath("file:///f%C3%B3%C3%B3/a%20b"),
+                    toURL: url.pathToFileURL("/dir/a b#c%d").href,
+                    trailing: url.pathToFileURL("/dir/").href,
+                    scheme, fileHost, encodedSlash, badFormat,
+                };
+            }
+            "##,
+        );
+        assert_eq!(out["protocol"], serde_json::json!("http:"));
+        assert_eq!(out["auth"], serde_json::json!("User:PW"));
+        assert_eq!(out["host"], serde_json::json!("www.example.com:8080"));
+        assert_eq!(out["hostname"], serde_json::json!("www.example.com"));
+        assert_eq!(out["port"], serde_json::json!("8080"));
+        assert_eq!(out["path"], serde_json::json!("/a/b?c=d"));
+        assert_eq!(out["query"], serde_json::json!("c=d"));
+        assert_eq!(
+            out["href"],
+            serde_json::json!("http://User:PW@www.example.com:8080/a/b?c=d#e")
+        );
+        assert_eq!(
+            out["parsedQuery"],
+            serde_json::json!({ "a": ["1", "2"], "b": "3" })
+        );
+        assert_eq!(
+            out["format"],
+            serde_json::json!("http://User:PW@www.example.com:8080/a/b?c=d#e")
+        );
+        assert_eq!(out["resolveDots"], serde_json::json!("http://a/g"));
+        assert_eq!(out["resolveProto"], serde_json::json!("http://other.com/c"));
+        assert_eq!(
+            out["resolveHash"],
+            serde_json::json!("http://a/b/c/d;p?q#s")
+        );
+        assert_eq!(out["toPath"], serde_json::json!("/fóó/a b"));
+        assert_eq!(
+            out["toURL"],
+            serde_json::json!("file:///dir/a%20b%23c%25d")
+        );
+        assert_eq!(out["trailing"], serde_json::json!("file:///dir/"));
+        assert_eq!(out["scheme"], serde_json::json!("ERR_INVALID_URL_SCHEME"));
+        assert_eq!(
+            out["fileHost"],
+            serde_json::json!("ERR_INVALID_FILE_URL_HOST")
+        );
+        assert_eq!(
+            out["encodedSlash"],
+            serde_json::json!("ERR_INVALID_FILE_URL_PATH")
+        );
+        assert_eq!(out["badFormat"], serde_json::json!("ERR_INVALID_ARG_TYPE"));
+    }
+
     #[test]
     fn run_agent_node_assert_surface() {
         let out = run_compute_agent(
