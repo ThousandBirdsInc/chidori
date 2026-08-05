@@ -2343,11 +2343,228 @@ export default Module;
     )
 });
 
+// node:test shim. Node's runner registers tests, schedules them, and reports
+// through a TAP/stream reporter; chidori has no test-process lifecycle to hang
+// that on, so tests run *eagerly* at the call site and a failure propagates to
+// the caller — synchronously for a synchronous body, as a rejected promise for
+// an asynchronous one. That keeps `node:test` usable as the grouping wrapper
+// Node's own core tests use it as (a failing assertion still fails the run)
+// without pretending to schedule or report.
+const TEST_SHIM: &str = r#"
+import assert from "node:assert";
+
+const ASSERT_METHODS = [
+    "ok", "fail", "equal", "notEqual", "strictEqual", "notStrictEqual",
+    "deepEqual", "notDeepEqual", "deepStrictEqual", "notDeepStrictEqual",
+    "throws", "doesNotThrow", "rejects", "doesNotReject", "match",
+    "doesNotMatch", "ifError",
+];
+
+// Hook frames pushed by `describe`; `beforeEach`/`afterEach` declared in a
+// suite body apply to the tests declared after them in that body.
+const suiteStack = [];
+
+function unsupported(name) {
+    return function () {
+        throw new Error(
+            "node:test " + name + " is not supported in the Chidori runtime " +
+            "(tests run eagerly at the call site; there is no scheduler to hook)"
+        );
+    };
+}
+
+function parseTestArgs(args) {
+    let name;
+    let options;
+    let fn;
+    let index = 0;
+    const first = args[0];
+    if (typeof first === "string") { name = first; index = 1; }
+    else if (typeof first === "function") { fn = first; index = 1; }
+    else if (first !== null && typeof first === "object") { options = first; index = 1; }
+    if (fn === undefined && index < args.length) {
+        const second = args[index];
+        if (typeof second === "function") { fn = second; index += 1; }
+        else if (second !== null && typeof second === "object") { options = second; index += 1; }
+    }
+    if (fn === undefined && typeof args[index] === "function") fn = args[index];
+    if (name === undefined) name = (fn && fn.name) || "<anonymous>";
+    return { name, options: options || {}, fn };
+}
+
+function makeContext(name, options) {
+    const context = {
+        name,
+        fullName: name,
+        filePath: undefined,
+        signal: undefined,
+        assert: {},
+        diagnostic() {},
+        runOnly() {},
+        skip() { context.__skipped = true; },
+        todo() { context.__todo = true; },
+        plan(count) { context.__plan = count; },
+        before(fn) { return runHook(fn, context); },
+        after(fn) { return runHook(fn, context); },
+        beforeEach() {},
+        afterEach() {},
+        test(...args) { context.__assertions += 1; return runTest(args); },
+        get mock() { return unsupported("t.mock")(); },
+    };
+    context.__assertions = 0;
+    context.__plan = options.plan;
+    for (const key of ASSERT_METHODS) {
+        context.assert[key] = function (...args) {
+            context.__assertions += 1;
+            return assert[key](...args);
+        };
+    }
+    context.assert.snapshot = unsupported("t.assert.snapshot");
+    context.it = context.test;
+    return context;
+}
+
+function runHook(fn, context) {
+    if (typeof fn !== "function") return undefined;
+    return fn(context);
+}
+
+function settled(value) {
+    // A thenable rather than a plain Promise so an unawaited failure still
+    // surfaces: nothing here is deferred, so there is nothing to lose.
+    return { then(onFulfilled) { return Promise.resolve().then(() => onFulfilled && onFulfilled(value)); },
+             catch() { return this; },
+             finally(onFinally) { if (onFinally) onFinally(); return this; } };
+}
+
+function verifyPlan(context) {
+    if (context.__plan === undefined) return;
+    if (context.__assertions !== context.__plan) {
+        throw new Error(
+            "plan: expected " + context.__plan + " assertion(s), got " + context.__assertions
+        );
+    }
+}
+
+function runTest(args) {
+    const parsed = parseTestArgs(args);
+    const options = parsed.options;
+    if (parsed.fn === undefined || options.skip || options.todo) return settled(undefined);
+
+    const context = makeContext(parsed.name, options);
+    const frame = suiteStack[suiteStack.length - 1];
+    if (frame) for (const hook of frame.beforeEach) runHook(hook, context);
+
+    const finish = () => {
+        if (frame) for (const hook of frame.afterEach) runHook(hook, context);
+    };
+
+    let result;
+    try {
+        result = parsed.fn.length > 1
+            ? new Promise((resolve, reject) => {
+                const done = (err) => (err ? reject(err) : resolve());
+                Promise.resolve(parsed.fn(context, done)).catch(reject);
+            })
+            : parsed.fn(context);
+    } catch (err) {
+        finish();
+        throw err;
+    }
+
+    if (result !== null && typeof result === "object" && typeof result.then === "function") {
+        return Promise.resolve(result).then(
+            (value) => { finish(); verifyPlan(context); return value; },
+            (err) => { finish(); throw err; }
+        );
+    }
+    finish();
+    verifyPlan(context);
+    return settled(result);
+}
+
+function test(...args) { return runTest(args); }
+
+function describe(...args) {
+    const parsed = parseTestArgs(args);
+    if (parsed.fn === undefined || parsed.options.skip || parsed.options.todo) return settled(undefined);
+    const frame = { beforeEach: [], afterEach: [], before: [], after: [] };
+    suiteStack.push(frame);
+    try {
+        const result = parsed.fn.call(undefined);
+        if (result !== null && typeof result === "object" && typeof result.then === "function") {
+            return Promise.resolve(result).then(
+                (value) => { suiteStack.pop(); return value; },
+                (err) => { suiteStack.pop(); throw err; }
+            );
+        }
+    } catch (err) {
+        suiteStack.pop();
+        throw err;
+    }
+    suiteStack.pop();
+    return settled(undefined);
+}
+
+function before(fn) { return runHook(fn, undefined); }
+function after(fn) { return runHook(fn, undefined); }
+function beforeEach(fn) {
+    const frame = suiteStack[suiteStack.length - 1];
+    if (frame) frame.beforeEach.push(fn);
+}
+function afterEach(fn) {
+    const frame = suiteStack[suiteStack.length - 1];
+    if (frame) frame.afterEach.push(fn);
+}
+
+const it = test;
+const suite = describe;
+function skip() { return settled(undefined); }
+function todo() { return settled(undefined); }
+function only(...args) { return runTest(args); }
+
+const mock = {
+    fn: unsupported("mock.fn"),
+    method: unsupported("mock.method"),
+    getter: unsupported("mock.getter"),
+    setter: unsupported("mock.setter"),
+    module: unsupported("mock.module"),
+    timers: { enable: unsupported("mock.timers.enable"), reset() {} },
+    reset() {},
+    restoreAll() {},
+};
+const run = unsupported("run");
+const snapshot = {
+    setResolveSnapshotPath: unsupported("snapshot.setResolveSnapshotPath"),
+    setDefaultSnapshotSerializers: unsupported("snapshot.setDefaultSnapshotSerializers"),
+};
+
+test.test = test;
+test.it = it;
+test.describe = describe;
+test.suite = suite;
+test.before = before;
+test.after = after;
+test.beforeEach = beforeEach;
+test.afterEach = afterEach;
+test.skip = skip;
+test.todo = todo;
+test.only = only;
+test.mock = mock;
+test.run = run;
+test.snapshot = snapshot;
+test.assert = { register: unsupported("assert.register") };
+
+export { test, it, describe, suite, before, after, beforeEach, afterEach, skip, todo, only, mock, run, snapshot };
+export default test;
+"#;
+
 /// Shim source for the compat suite; consulted by `builtins::shim_source`
 /// after its own table.
 pub fn compat_shim_source(name: &str) -> Option<&'static str> {
     match name {
         "querystring" => Some(QUERYSTRING_SHIM),
+        "test" => Some(TEST_SHIM),
         "string_decoder" => Some(STRING_DECODER_SHIM),
         "punycode" => Some(PUNYCODE_SHIM),
         "console" => Some(CONSOLE_SHIM),
