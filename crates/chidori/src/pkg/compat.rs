@@ -1,8 +1,9 @@
 //! Post-install compatibility scan for `chidori add`.
 //!
 //! Chidori's embedded engine is not Node: CommonJS `require()` only works for
-//! leaf modules, `node:` builtins are a small allowlisted set of shims, and
-//! native addons can never load. None of that is visible at install time —
+//! leaf modules, `node:` builtins are served from an allowlisted shim suite
+//! (every builtin base module, though not every subpath), and native addons
+//! can never load. None of that is visible at install time —
 //! `chidori add somepkg` succeeds as pure data movement and the failure only
 //! surfaces when the agent imports the package. This module closes that gap:
 //! after materializing `node_modules`, the freshly added root packages are
@@ -337,21 +338,40 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_builtin_imports_warn() {
+    fn full_builtin_suite_yields_no_warnings() {
+        // Every builtin base is shimmed now — the imports that used to trip
+        // the scan (net, stream, worker_threads, …) resolve like node:path.
         let dir = temp_pkg(
             "builtins",
             r#"{"name":"netpkg","version":"1.0.0","type":"module","main":"index.js"}"#,
         );
         std::fs::write(
             dir.join("index.js"),
-            "import net from 'node:net';\nimport { Readable } from \"stream\";\nimport path from 'node:path';\nexport {};\n",
+            "import net from 'node:net';\nimport { Readable } from \"stream\";\nimport { Worker } from 'worker_threads';\nimport path from 'node:path';\nexport {};\n",
         )
         .unwrap();
         let warnings = check_package_compat("netpkg", &dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unsupported_builtin_subpath_imports_warn() {
+        // The scan still fires for builtin *subpaths* the runtime does not
+        // provide (the base name is a builtin, the full specifier is not
+        // allowlisted).
+        let dir = temp_pkg(
+            "builtin-subpath",
+            r#"{"name":"subpkg","version":"1.0.0","type":"module","main":"index.js"}"#,
+        );
+        std::fs::write(
+            dir.join("index.js"),
+            "import x from 'node:stream/internal';\nimport path from 'node:path';\nexport {};\n",
+        )
+        .unwrap();
+        let warnings = check_package_compat("subpkg", &dir);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("net"), "{warnings:?}");
-        assert!(warnings[0].contains("stream"), "{warnings:?}");
-        // path IS allowlisted — it must not be flagged.
+        assert!(warnings[0].contains("stream/internal"), "{warnings:?}");
         assert!(!warnings[0].contains("(path"), "{warnings:?}");
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -15,7 +15,9 @@
 use std::path::Path;
 
 /// Allowlisted builtin names. Kept in sync with `NODE_BUILTIN_ALLOWLIST` in
-/// `transpile.rs`.
+/// `transpile.rs`. The first block is served from this file; the rest come
+/// from `builtins_compat.rs`, which completes coverage of the Node builtin
+/// module suite.
 #[allow(dead_code)] // Reference copy of the allowlist; transpile.rs owns the enforced one.
 pub const BUILTIN_NAMES: &[&str] = &[
     "process",
@@ -33,6 +35,47 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "assert",
     "assert/strict",
     "os",
+    // Served from builtins_compat.rs (functional implementations).
+    "async_hooks",
+    "console",
+    "constants",
+    "diagnostics_channel",
+    "domain",
+    "module",
+    "net",
+    "path/win32",
+    "perf_hooks",
+    "punycode",
+    "querystring",
+    "stream",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "sys",
+    "timers",
+    "timers/promises",
+    "tty",
+    "util/types",
+    "v8",
+    "worker_threads",
+    // Served from builtins_compat.rs (fail-loud capability stubs).
+    "child_process",
+    "cluster",
+    "dgram",
+    "dns",
+    "dns/promises",
+    "http2",
+    "inspector",
+    "inspector/promises",
+    "readline",
+    "readline/promises",
+    "repl",
+    "tls",
+    "trace_events",
+    "vm",
+    "wasi",
+    "zlib",
 ];
 
 const PROCESS_SHIM: &str = r#"
@@ -42,10 +85,20 @@ const PROCESS_SHIM: &str = r#"
 // both work without diverging from the global.
 const process = globalThis.process;
 const env = process.env;
-const argv = [];
-const platform = "chidori";
-const versions = Object.freeze({ node: "0.0.0-chidori" });
-export { process as default, env, argv, platform, versions };
+const argv = process.argv || [];
+const platform = process.platform || "chidori";
+const version = process.version || "v0.0.0-chidori";
+const versions = process.versions || Object.freeze({ node: "0.0.0-chidori" });
+const nextTick = process.nextTick
+    ? process.nextTick.bind(process)
+    : function (cb, ...args) { Promise.resolve().then(() => cb(...args)); };
+const cwd = process.cwd ? process.cwd.bind(process) : function () { return "/"; };
+const hrtime = process.hrtime;
+const pid = process.pid;
+const title = process.title;
+const stdout = process.stdout;
+const stderr = process.stderr;
+export { process as default, env, argv, platform, version, versions, nextTick, cwd, hrtime, pid, title, stdout, stderr };
 "#;
 
 const BUFFER_SHIM: &str = r#"
@@ -126,27 +179,137 @@ export default { Buffer };
 "#;
 
 const UTIL_SHIM: &str = r#"
-// node:util shim. We expose `inspect` (delegates to JSON.stringify with a
-// fallback for circular structures), `promisify` (identity for already-async
-// callbacks; throws otherwise), and `inherits` (prototype chain wire-up).
+// node:util shim. `inspect` delegates to JSON.stringify with a fallback for
+// circular structures; `promisify` supports the custom-symbol override;
+// `format` covers the printf-ish specifiers packages actually use. The type
+// predicates live in node:util/types and are re-exported as `types`.
+import types from "node:util/types";
+
 function inspect(value) {
+    if (typeof value === "string") return value;
     try { return JSON.stringify(value); } catch { return String(value); }
 }
+function format(f, ...args) {
+    if (typeof f !== "string") {
+        const all = [f, ...args];
+        const parts = [];
+        for (const a of all) parts.push(inspect(a));
+        return parts.join(" ");
+    }
+    let i = 0;
+    let out = f.replace(/%[sdijfoOc%]/g, (spec) => {
+        if (spec === "%%") return "%";
+        if (i >= args.length) return spec;
+        const a = args[i++];
+        switch (spec) {
+            case "%s": return typeof a === "string" ? a : inspect(a);
+            case "%d": return String(Number(a));
+            case "%i": return String(parseInt(a, 10));
+            case "%f": return String(parseFloat(a));
+            case "%j":
+                try { return JSON.stringify(a); } catch { return "[Circular]"; }
+            case "%o":
+            case "%O": return inspect(a);
+            case "%c": return "";
+            default: return spec;
+        }
+    });
+    for (; i < args.length; i++) out += " " + inspect(args[i]);
+    return out;
+}
 function promisify(fn) {
+    if (typeof fn !== "function") throw new TypeError("promisify expects a function");
+    const custom = fn[promisify.custom];
+    if (typeof custom === "function") return custom;
     return function (...args) {
         return new Promise((resolve, reject) => {
             try {
-                fn(...args, (err, value) => err ? reject(err) : resolve(value));
+                fn.call(this, ...args, (err, value) => err ? reject(err) : resolve(value));
             } catch (e) { reject(e); }
         });
+    };
+}
+promisify.custom = Symbol.for("nodejs.util.promisify.custom");
+function callbackify(fn) {
+    if (typeof fn !== "function") throw new TypeError("callbackify expects a function");
+    return function (...args) {
+        const cb = args.pop();
+        Promise.resolve(fn.apply(this, args)).then(
+            (value) => queueMicrotask(() => cb(null, value)),
+            (err) => queueMicrotask(() => cb(err || new Error("rejected with falsy value")))
+        );
+    };
+}
+function deprecate(fn, message) {
+    let warned = false;
+    return function (...args) {
+        if (!warned) {
+            warned = true;
+            if (globalThis.console && typeof globalThis.console.warn === "function") {
+                globalThis.console.warn("DeprecationWarning: " + message);
+            }
+        }
+        return fn.apply(this, args);
     };
 }
 function inherits(ctor, superCtor) {
     ctor.super_ = superCtor;
     Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
 }
-export { inspect, promisify, inherits };
-export default { inspect, promisify, inherits };
+function isDeepStrictEqual(a, b) {
+    if (Object.is(a, b)) return true;
+    if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
+        return false;
+    }
+    if (a instanceof Date || b instanceof Date) {
+        return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
+    }
+    if (a instanceof RegExp || b instanceof RegExp) {
+        return a instanceof RegExp && b instanceof RegExp && a.source === b.source && a.flags === b.flags;
+    }
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    const ka = Object.keys(a);
+    const kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    for (const k of ka) {
+        if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+        if (!isDeepStrictEqual(a[k], b[k])) return false;
+    }
+    return true;
+}
+// Legacy predicates, still imported by older packages.
+const isArray = Array.isArray;
+function isBoolean(v) { return typeof v === "boolean"; }
+function isNull(v) { return v === null; }
+function isNullOrUndefined(v) { return v === null || v === undefined; }
+function isNumber(v) { return typeof v === "number"; }
+function isString(v) { return typeof v === "string"; }
+function isSymbol(v) { return typeof v === "symbol"; }
+function isUndefined(v) { return v === undefined; }
+function isObject(v) { return v !== null && typeof v === "object"; }
+function isFunction(v) { return typeof v === "function"; }
+function isPrimitive(v) { return v === null || (typeof v !== "object" && typeof v !== "function"); }
+function isRegExp(v) { return v instanceof RegExp; }
+function isDate(v) { return v instanceof Date; }
+function isError(v) { return v instanceof Error; }
+function isBuffer(v) { return v instanceof Uint8Array; }
+const TextEncoder = globalThis.TextEncoder;
+const TextDecoder = globalThis.TextDecoder;
+function debuglog() { return function () {}; }
+export {
+    inspect, format, promisify, callbackify, deprecate, inherits, types,
+    isDeepStrictEqual, debuglog, TextEncoder, TextDecoder,
+    isArray, isBoolean, isNull, isNullOrUndefined, isNumber, isString,
+    isSymbol, isUndefined, isObject, isFunction, isPrimitive, isRegExp,
+    isDate, isError, isBuffer,
+};
+export default {
+    inspect, format, promisify, callbackify, deprecate, inherits, types,
+    isDeepStrictEqual, debuglog, TextEncoder, TextDecoder,
+    isArray, isBoolean, isNull, isNullOrUndefined, isNumber, isString,
+    isSymbol, isUndefined, isObject, isFunction, isPrimitive, isRegExp,
+    isDate, isError, isBuffer,
+};
 "#;
 
 // node:fs shim backed by the captured, snapshot-resident virtual filesystem.
@@ -1490,7 +1653,8 @@ pub fn shim_source(name: &str) -> Option<&'static str> {
         "assert" => Some(ASSERT_SHIM),
         "assert/strict" => Some(ASSERT_STRICT_SHIM),
         "os" => Some(OS_SHIM),
-        _ => None,
+        // Everything else in the Node builtin suite lives in builtins_compat.
+        other => crate::runtime::typescript::builtins_compat::compat_shim_source(other),
     }
 }
 
@@ -1677,5 +1841,44 @@ mod tests {
         let path = PathBuf::from("/some/workspace/src/index.ts");
         assert_eq!(builtin_name_from_path(&path), None);
         assert_eq!(source_for(&path), None);
+    }
+
+    #[test]
+    fn compat_suite_shims_are_registered() {
+        // Functional implementations route through the expected machinery…
+        assert!(shim_source("stream").unwrap().contains("class Readable"));
+        assert!(shim_source("stream/promises")
+            .unwrap()
+            .contains("from \"node:stream\""));
+        assert!(shim_source("querystring").unwrap().contains("function parse"));
+        assert!(shim_source("string_decoder")
+            .unwrap()
+            .contains("class StringDecoder"));
+        assert!(shim_source("punycode").unwrap().contains("xn--"));
+        assert!(shim_source("timers/promises")
+            .unwrap()
+            .contains("globalThis.setTimeout"));
+        assert!(shim_source("async_hooks")
+            .unwrap()
+            .contains("class AsyncLocalStorage"));
+        assert!(shim_source("module").unwrap().contains("builtinModules"));
+        // …the module shim's builtin list is spliced from the live allowlist…
+        assert!(shim_source("module").unwrap().contains("\"stream\""));
+        // …and capability stubs fail loud, not silent.
+        for name in ["child_process", "zlib", "vm", "tls", "wasi", "dgram"] {
+            assert!(
+                shim_source(name)
+                    .unwrap()
+                    .contains("not supported in the Chidori runtime"),
+                "stub for {name} must throw a clear unsupported error"
+            );
+        }
+        // The by-path lookup works for compat shims too (snapshot bundler).
+        let path = PathBuf::from("/ws/__node_builtins__/stream/promises.js");
+        assert_eq!(
+            builtin_name_from_path(&path).as_deref(),
+            Some("stream/promises")
+        );
+        assert!(source_for(&path).is_some());
     }
 }

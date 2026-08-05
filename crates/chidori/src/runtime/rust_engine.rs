@@ -747,8 +747,8 @@ pub(crate) fn run_module(
             let src = crate::runtime::typescript::builtins::shim_source(name).ok_or_else(|| {
                 format!(
                     "unsupported node: builtin '{specifier}' (imported from {importer_key}); \
-                     the runtime shims only a small allowlist of node builtins — \
-                     see docs/package-management.md#compatibility"
+                     the runtime shims the Node builtin module suite and this name is not \
+                     part of it — see docs/package-management.md#compatibility"
                 )
             })?;
             return Ok((format!("node:{name}"), src.to_string()));
@@ -1062,9 +1062,82 @@ pub(crate) fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
     out.push_str(
         "if (typeof globalThis.__chidori_now !== \"number\") globalThis.__chidori_now = 0;\n",
     );
+    // `process` carries the standard Node surface packages probe for. Every
+    // value is a fixed virtualized constant (mirroring the node:os shim) or a
+    // pure in-heap operation, so nothing here leaks host state into a run.
+    // `env` stays frozen; the object itself is mutable so Node idioms like
+    // `process.exitCode = 1` don't throw in strict-mode ESM.
     let env_json = chidori_agent_env_json();
     out.push_str(&format!(
-        "globalThis.process = Object.freeze({{ env: Object.freeze({env_json}) }});\n"
+        r#"globalThis.process = {{
+    env: Object.freeze({env_json}),
+    argv: [], argv0: "chidori", execArgv: [], execPath: "/chidori",
+    platform: "chidori", arch: "wasm32",
+    version: "v0.0.0-chidori",
+    versions: Object.freeze({{ node: "0.0.0-chidori", chidori: "1" }}),
+    pid: 1, ppid: 0, title: "chidori",
+    exitCode: undefined,
+    nextTick: function (cb, ...args) {{
+        if (typeof cb !== "function") throw new TypeError("process.nextTick callback must be a function");
+        Promise.resolve().then(() => cb(...args));
+    }},
+    cwd: function () {{ return "/"; }},
+    chdir: function () {{ throw new Error("process.chdir is not supported in the Chidori runtime (the VFS root is fixed)"); }},
+    hrtime: Object.assign(
+        function (prev) {{
+            const ms = typeof globalThis.__chidori_now === "number" ? globalThis.__chidori_now : 0;
+            let sec = Math.floor(ms / 1000);
+            let nsec = Math.round((ms % 1000) * 1e6);
+            if (prev) {{
+                sec -= prev[0];
+                nsec -= prev[1];
+                if (nsec < 0) {{ sec -= 1; nsec += 1e9; }}
+            }}
+            return [sec, nsec];
+        }},
+        {{ bigint: function () {{
+            const ms = typeof globalThis.__chidori_now === "number" ? globalThis.__chidori_now : 0;
+            return typeof BigInt === "function" ? BigInt(Math.round(ms * 1e6)) : Math.round(ms * 1e6);
+        }} }}
+    ),
+    uptime: function () {{
+        return (typeof globalThis.__chidori_now === "number" ? globalThis.__chidori_now : 0) / 1000;
+    }},
+    memoryUsage: Object.assign(
+        function () {{ return {{ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }}; }},
+        {{ rss: function () {{ return 0; }} }}
+    ),
+    emitWarning: function (warning) {{
+        if (globalThis.console && typeof globalThis.console.warn === "function") {{
+            globalThis.console.warn("Warning: " + (warning && warning.message ? warning.message : warning));
+        }}
+    }},
+    exit: function (code) {{
+        throw new Error("process.exit(" + (code === undefined ? "" : code) + ") is not supported in the Chidori runtime; return from the agent function instead");
+    }},
+    abort: function () {{ throw new Error("process.abort is not supported in the Chidori runtime"); }},
+    kill: function () {{ throw new Error("process.kill is not supported in the Chidori runtime (no host processes are visible)"); }},
+    on: function () {{ return this; }},
+    once: function () {{ return this; }},
+    off: function () {{ return this; }},
+    addListener: function () {{ return this; }},
+    removeListener: function () {{ return this; }},
+    removeAllListeners: function () {{ return this; }},
+    prependListener: function () {{ return this; }},
+    listeners: function () {{ return []; }},
+    listenerCount: function () {{ return 0; }},
+    emit: function () {{ return false; }},
+    stdout: {{ isTTY: false, write: function (s) {{ if (globalThis.console) globalThis.console.log(String(s).replace(/\n$/, "")); return true; }} }},
+    stderr: {{ isTTY: false, write: function (s) {{ if (globalThis.console) globalThis.console.error(String(s).replace(/\n$/, "")); return true; }} }},
+    stdin: null,
+    allowedNodeEnvironmentFlags: Object.freeze([]),
+    features: Object.freeze({{}}),
+    release: Object.freeze({{ name: "chidori" }}),
+    getuid: function () {{ return -1; }},
+    getgid: function () {{ return -1; }},
+    umask: function () {{ return 0; }},
+}};
+"#
     ));
     out.push_str(TEXT_ENCODING_POLYFILL);
     out.push_str(WEB_CRYPTO_POLYFILL);
@@ -2771,9 +2844,8 @@ mod tests {
     #[test]
     fn run_agent_node_path_posix_surface() {
         // Covers the default + named import forms and the `path.posix`
-        // self-alias. (Only the `node:`-prefixed specifier is accepted; bare
-        // builtin specifiers are not — the resolver treats a bare `path` as a
-        // package lookup, matching the other shims.)
+        // self-alias. (Bare builtin specifiers — `import path from "path"` —
+        // resolve to the same shim; see run_agent_bare_builtin_specifiers.)
         let out = run_compute_agent(
             "node-path",
             r#"
@@ -2867,6 +2939,318 @@ mod tests {
         assert_eq!(out["countAfter"], serde_json::json!(0));
         assert_eq!(out["names"], serde_json::json!(["other"]));
         assert_eq!(out["readyArgs"], serde_json::json!(["go"]));
+    }
+
+    #[test]
+    fn run_agent_bare_builtin_specifiers() {
+        // Node resolves unprefixed builtin names (`path`, `events`) to core
+        // modules ahead of node_modules; the chidori resolver mirrors that,
+        // serving the same shim (same module instance) as the node: form.
+        let out = run_compute_agent(
+            "bare-builtins",
+            r#"
+            import path from "path";
+            import prefixed from "node:path";
+            import { EventEmitter } from "events";
+            import { StringDecoder } from "string_decoder";
+            export async function agent() {
+                const ee = new EventEmitter();
+                let got = null;
+                ee.on("x", (v) => { got = v; });
+                ee.emit("x", 7);
+                return {
+                    joined: path.join("a", "b"),
+                    sameModule: path === prefixed,
+                    got,
+                    decoded: new StringDecoder("utf8").write(new TextEncoder().encode("hi")),
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["joined"], serde_json::json!("a/b"));
+        assert_eq!(out["sameModule"], serde_json::json!(true));
+        assert_eq!(out["got"], serde_json::json!(7));
+        assert_eq!(out["decoded"], serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn run_agent_node_querystring_and_string_decoder() {
+        let out = run_compute_agent(
+            "node-querystring",
+            r#"
+            import qs from "node:querystring";
+            import { StringDecoder } from "node:string_decoder";
+            export async function agent() {
+                const parsed = qs.parse("a=1&b=two&b=three&c");
+                const roundtrip = qs.stringify({ x: "hello world", tags: ["p", "q"] });
+                // Multi-byte char split across writes must not corrupt: é is
+                // 0xC3 0xA9 in UTF-8.
+                const dec = new StringDecoder("utf8");
+                const part1 = dec.write(new Uint8Array([0x63, 0x61, 0x66, 0xc3]));
+                const part2 = dec.write(new Uint8Array([0xa9]));
+                const tail = dec.end();
+                return {
+                    a: parsed.a, b: parsed.b, c: parsed.c,
+                    roundtrip,
+                    split: part1 + part2 + tail,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["a"], serde_json::json!("1"));
+        assert_eq!(out["b"], serde_json::json!(["two", "three"]));
+        assert_eq!(out["c"], serde_json::json!(""));
+        assert_eq!(
+            out["roundtrip"],
+            serde_json::json!("x=hello%20world&tags=p&tags=q")
+        );
+        assert_eq!(out["split"], serde_json::json!("café"));
+    }
+
+    #[test]
+    fn run_agent_node_punycode_surface() {
+        let out = run_compute_agent(
+            "node-punycode",
+            r#"
+            import punycode from "node:punycode";
+            export async function agent() {
+                return {
+                    ascii: punycode.toASCII("mañana.com"),
+                    unicode: punycode.toUnicode("xn--maana-pta.com"),
+                    encoded: punycode.encode("münchen"),
+                    decoded: punycode.decode("mnchen-3ya"),
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["ascii"], serde_json::json!("xn--maana-pta.com"));
+        assert_eq!(out["unicode"], serde_json::json!("mañana.com"));
+        assert_eq!(out["encoded"], serde_json::json!("mnchen-3ya"));
+        assert_eq!(out["decoded"], serde_json::json!("münchen"));
+    }
+
+    #[test]
+    fn run_agent_node_stream_pipeline_and_iteration() {
+        let out = run_compute_agent(
+            "node-stream",
+            r#"
+            import { Readable, Writable, Transform, PassThrough } from "node:stream";
+            import { pipeline } from "node:stream/promises";
+            import { text } from "node:stream/consumers";
+            export async function agent() {
+                // pipeline: source -> transform -> sink.
+                const upper = new Transform({
+                    transform(chunk, encoding, callback) {
+                        callback(null, String(chunk).toUpperCase());
+                    },
+                });
+                const collected = [];
+                const sink = new Writable({
+                    write(chunk, encoding, callback) {
+                        collected.push(String(chunk));
+                        callback(null);
+                    },
+                });
+                await pipeline(Readable.from(["ab", "cd"]), upper, sink);
+
+                // Async iteration over a Readable.
+                const iterated = [];
+                for await (const chunk of Readable.from([1, 2, 3])) iterated.push(chunk);
+
+                // Consumers over a PassThrough fed by write/end.
+                const pass = new PassThrough();
+                const textPromise = text(pass);
+                pass.write("hello ");
+                pass.end("world");
+
+                // Event order: finish fires after end() completes writes.
+                const events = [];
+                const w = new Writable({
+                    write(chunk, encoding, callback) { events.push("w:" + chunk); callback(null); },
+                    final(callback) { events.push("final"); callback(null); },
+                });
+                w.on("finish", () => events.push("finish"));
+                w.write("x");
+                w.end();
+                await new Promise((resolve) => w.on("close", resolve));
+
+                return {
+                    collected,
+                    iterated,
+                    text: await textPromise,
+                    events,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["collected"], serde_json::json!(["AB", "CD"]));
+        assert_eq!(out["iterated"], serde_json::json!([1, 2, 3]));
+        assert_eq!(out["text"], serde_json::json!("hello world"));
+        assert_eq!(
+            out["events"],
+            serde_json::json!(["w:x", "final", "finish"])
+        );
+    }
+
+    #[test]
+    fn run_agent_node_timers_promises_virtual_clock() {
+        let out = run_compute_agent(
+            "node-timers",
+            r#"
+            import { setTimeout as sleep, scheduler } from "node:timers/promises";
+            import timers from "node:timers";
+            export async function agent() {
+                const before = globalThis.__chidori_now;
+                await sleep(250, undefined);
+                const after = globalThis.__chidori_now;
+                await scheduler.wait(50);
+                const value = await sleep(10, "done");
+                // node:timers handles support unref() and clear by handle.
+                let fired = false;
+                const handle = timers.setTimeout(() => { fired = true; }, 5);
+                handle.unref();
+                timers.clearTimeout(handle);
+                await sleep(20, undefined);
+                return { advanced: after - before, value, fired };
+            }
+            "#,
+        );
+        assert_eq!(out["advanced"], serde_json::json!(250));
+        assert_eq!(out["value"], serde_json::json!("done"));
+        assert_eq!(out["fired"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn run_agent_node_async_hooks_and_diagnostics() {
+        let out = run_compute_agent(
+            "node-async-hooks",
+            r#"
+            import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
+            import dc from "node:diagnostics_channel";
+            export async function agent() {
+                const als = new AsyncLocalStorage();
+                const inside = als.run({ user: "ada" }, () => {
+                    const store = als.getStore();
+                    return store ? store.user : null;
+                });
+                const outside = als.getStore() === undefined;
+                const resource = new AsyncResource("test");
+                const bound = resource.bind(function () { return "bound"; });
+
+                const seen = [];
+                const ch = dc.channel("app:events");
+                const onMessage = (message, name) => seen.push(name + ":" + message.n);
+                dc.subscribe("app:events", onMessage);
+                ch.publish({ n: 1 });
+                const hadSubs = ch.hasSubscribers;
+                dc.unsubscribe("app:events", onMessage);
+                ch.publish({ n: 2 });
+                return { inside, outside, bound: bound(), seen, hadSubs };
+            }
+            "#,
+        );
+        assert_eq!(out["inside"], serde_json::json!("ada"));
+        assert_eq!(out["outside"], serde_json::json!(true));
+        assert_eq!(out["bound"], serde_json::json!("bound"));
+        assert_eq!(out["seen"], serde_json::json!(["app:events:1"]));
+        assert_eq!(out["hadSubs"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn run_agent_node_module_net_util_surface() {
+        let out = run_compute_agent(
+            "node-module-net",
+            r#"
+            import { builtinModules, isBuiltin } from "node:module";
+            import net from "node:net";
+            import util, { format } from "node:util";
+            import { isDate } from "node:util/types";
+            import os from "node:os";
+            import process from "node:process";
+            export async function agent() {
+                return {
+                    hasStream: builtinModules.indexOf("stream") !== -1,
+                    isBuiltinPrefixed: isBuiltin("node:zlib"),
+                    isBuiltinBare: isBuiltin("querystring"),
+                    notBuiltin: isBuiltin("lodash"),
+                    ip4: net.isIP("127.0.0.1"),
+                    ip6: net.isIP("::ffff:10.0.0.1"),
+                    ipNone: net.isIP("999.1.1.1"),
+                    formatted: format("%s has %d items (%j)", "cart", 3, { ok: true }),
+                    dateCheck: isDate(new Date(0)),
+                    typesWired: util.types.isPromise(Promise.resolve()),
+                    platform: process.platform,
+                    tick: await new Promise((resolve) => process.nextTick(resolve, "ticked")),
+                    osPlatform: os.platform(),
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["hasStream"], serde_json::json!(true));
+        assert_eq!(out["isBuiltinPrefixed"], serde_json::json!(true));
+        assert_eq!(out["isBuiltinBare"], serde_json::json!(true));
+        assert_eq!(out["notBuiltin"], serde_json::json!(false));
+        assert_eq!(out["ip4"], serde_json::json!(4));
+        assert_eq!(out["ip6"], serde_json::json!(6));
+        assert_eq!(out["ipNone"], serde_json::json!(0));
+        assert_eq!(
+            out["formatted"],
+            serde_json::json!("cart has 3 items ({\"ok\":true})")
+        );
+        assert_eq!(out["dateCheck"], serde_json::json!(true));
+        assert_eq!(out["typesWired"], serde_json::json!(true));
+        assert_eq!(out["platform"], serde_json::json!("chidori"));
+        assert_eq!(out["tick"], serde_json::json!("ticked"));
+        assert_eq!(out["osPlatform"], serde_json::json!("chidori"));
+    }
+
+    #[test]
+    fn run_agent_unsupported_builtins_link_but_fail_loud() {
+        // The capability stubs must import cleanly (packages import these at
+        // module scope) and throw a clear error only at first use.
+        let out = run_compute_agent(
+            "node-stubs",
+            r#"
+            import { spawn } from "node:child_process";
+            import zlib from "node:zlib";
+            import { Worker, MessageChannel } from "node:worker_threads";
+            import cluster from "node:cluster";
+            import { lookup } from "node:dns";
+            export async function agent() {
+                const errors = {};
+                try { spawn("ls"); } catch (e) { errors.spawn = e.message; }
+                try { zlib.gzipSync("data"); } catch (e) { errors.gzip = e.message; }
+                try { new Worker("./w.js"); } catch (e) { errors.worker = e.message; }
+                const dnsError = await new Promise((resolve) => {
+                    lookup("example.com", (err) => resolve(err ? err.code : null));
+                });
+                // MessageChannel is real plumbing, not a stub.
+                const { port1, port2 } = new MessageChannel();
+                const delivered = new Promise((resolve) => port2.on("message", resolve));
+                port1.postMessage({ hello: true });
+                return {
+                    spawn: errors.spawn,
+                    gzip: errors.gzip,
+                    worker: errors.worker,
+                    dnsError,
+                    isPrimary: cluster.isPrimary,
+                    message: await delivered,
+                };
+            }
+            "#,
+        );
+        let spawn_msg = out["spawn"].as_str().unwrap();
+        assert!(
+            spawn_msg.contains("not supported in the Chidori runtime"),
+            "{spawn_msg}"
+        );
+        let gzip_msg = out["gzip"].as_str().unwrap();
+        assert!(gzip_msg.contains("no compression capability"), "{gzip_msg}");
+        let worker_msg = out["worker"].as_str().unwrap();
+        assert!(worker_msg.contains("single-threaded"), "{worker_msg}");
+        assert_eq!(out["dnsError"], serde_json::json!("ENOTSUP"));
+        assert_eq!(out["isPrimary"], serde_json::json!(true));
+        assert_eq!(out["message"], serde_json::json!({ "hello": true }));
     }
 
     #[test]

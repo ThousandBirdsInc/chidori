@@ -136,6 +136,15 @@ impl Resolver {
             );
         }
 
+        // Bare builtin specifiers (`fs`, `path`, `stream/promises`) resolve to
+        // the same shims as their `node:`-prefixed forms. Node gives core
+        // modules priority over node_modules for unprefixed names, so packages
+        // that import builtins without the prefix — most of npm — link
+        // identically here.
+        if self.builtin_allowlist.iter().any(|b| b == specifier) {
+            return self.resolve_node_builtin(specifier);
+        }
+
         self.resolve_bare(specifier, parent)
     }
 
@@ -750,6 +759,46 @@ mod tests {
             ResolutionKind::NodeBuiltin { ref name } if name == "process"
         ));
         assert!(res.resolved_path.ends_with("__node_builtins__/process.js"));
+    }
+
+    #[test]
+    fn resolves_bare_builtin_specifier_ahead_of_node_modules() {
+        // Node gives core modules priority over node_modules for unprefixed
+        // names; a bare `process` must reach the shim even when a package of
+        // the same name is installed.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("node_modules/process/package.json"),
+            r#"{"name":"process","main":"./index.js"}"#,
+        );
+        write(&root.join("node_modules/process/index.js"), "");
+        let resolver = make_resolver(root);
+        let res = resolver
+            .resolve("process", &root.join("agent.ts"))
+            .unwrap();
+        assert!(matches!(
+            res.kind,
+            ResolutionKind::NodeBuiltin { ref name } if name == "process"
+        ));
+        assert!(res.resolved_path.ends_with("__node_builtins__/process.js"));
+    }
+
+    #[test]
+    fn bare_non_builtin_still_resolves_as_package() {
+        // A name outside the allowlist keeps the node_modules lookup path.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("node_modules/leftpad/package.json"),
+            r#"{"name":"leftpad","main":"./index.js"}"#,
+        );
+        write(&root.join("node_modules/leftpad/index.js"), "");
+        let resolver = make_resolver(root);
+        let res = resolver
+            .resolve("leftpad", &root.join("agent.ts"))
+            .unwrap();
+        assert!(matches!(res.kind, ResolutionKind::Package { .. }));
     }
 
     #[test]

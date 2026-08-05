@@ -116,14 +116,35 @@ three cliffs, concretely:
    only if it never calls `require()` at runtime (the wrapper turns its
    `module.exports` into the default export). Any runtime `require()` throws —
    at *import time*, not install time.
-2. **Node builtins are a small allowlist.** The runtime shims exactly:
-   `process`, `buffer`, `util`, `fs`, `fs/promises`, `crypto`, `http`,
-   `https`, `path`, `path/posix`, `events`, `url`, `assert`,
-   `assert/strict`, `os`. Anything else — `net`, `stream`, `child_process`,
-   `worker_threads`, `zlib`, `tls`, `vm`, … — is not provided, and importing
-   it fails with an allowlist error naming the importing file. (Networking is
-   `fetch` plus the `node:http`/`node:https` client shims, all captured for
-   replay.)
+2. **Node builtins are shimmed — resolving is not the same as working.** The
+   runtime ships a shim for *every* Node builtin base module, and both
+   spellings resolve (`node:path` and bare `path` — core modules win over
+   node_modules, as in Node). What a shim does at runtime falls into two
+   tiers:
+   - **Functional:** `process`, `buffer`, `util` (+ `util/types`), `fs`
+     (+ `fs/promises`, VFS-backed), `crypto`, `http`/`https` (client only,
+     captured), `path` (+ `path/posix`, `path/win32` — posix-flavored),
+     `events`, `url`, `assert` (+ `assert/strict`), `os` (virtualized),
+     `stream` (+ `stream/promises`, `stream/consumers`), `querystring`,
+     `string_decoder`, `punycode`, `timers` (+ `timers/promises`, virtual
+     clock), `console`, `constants`, `module` (introspection),
+     `async_hooks` (AsyncLocalStorage, synchronous scope),
+     `diagnostics_channel`, `domain`, `perf_hooks` (virtual clock), `net`
+     (`isIP` helpers only), `worker_threads` (main-thread surface +
+     MessageChannel), `sys`, `v8` (introspection stubs), `tty`
+     (`isatty` → false).
+   - **Fail-loud:** capabilities the runtime deliberately does not grant —
+     `child_process`, `cluster`, `dgram`, `dns` (+ `dns/promises`), `http2`,
+     `inspector`, `readline`, `repl`, `tls`, `trace_events`, `vm`, `wasi`,
+     `zlib`, plus server/socket surfaces of `net` and `http`. These import
+     and link cleanly (packages import them at module scope), but every
+     entry point throws a clear "not supported in the Chidori runtime"
+     error at first use — never a silent no-op.
+
+   Unprovided *subpaths* of a builtin (and post-suite builtins like
+   `node:test`) still fail at resolve time with an error naming the
+   importing file. (Networking is `fetch` plus the `node:http`/`node:https`
+   client shims, all captured for replay.)
 3. **No native addons.** There is no node-gyp build step (lifecycle scripts
    never run) and no way to load a `.node` binary. Packages that depend on
    `node-gyp-build`, `prebuild-install`, `bindings`, etc. cannot work, even

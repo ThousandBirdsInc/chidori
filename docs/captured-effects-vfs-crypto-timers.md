@@ -94,15 +94,18 @@ Today the Chidori snapshot runtime makes nondeterministic and host-reaching
 JavaScript surfaces *unavailable*. `snapshot_policy_prelude` (`src/runtime/snapshot.rs`)
 hard-disables `WeakRef`, `FinalizationRegistry`, `SharedArrayBuffer`, and
 `Atomics`; freezes `Date` to epoch 0; seeds or disables `Math.random`; and the
-`node:` resolver (`src/runtime/typescript/{resolver,builtins}.rs`) allowlists a
-fixed set of builtins — at the time of writing `process`, `buffer`, `util`,
-`fs`, `fs/promises`, `crypto`, `http`, `https`, plus the pure-logic /
-virtualized modules `path` (and `path/posix`), `events`, `url`, `assert` (and
-`assert/strict`), and `os`. The pure modules (`path`/`events`/`url`/`assert`)
-are deterministic by construction; `os` returns fixed virtualized constants in
-the same spirit as `process.platform`. Anything outside the allowlist throws at
-first use. The authoritative list is `NODE_BUILTIN_ALLOWLIST` (`transpile.rs`),
-kept in sync with `BUILTIN_NAMES` (`builtins.rs`).
+`node:` resolver (`src/runtime/typescript/{resolver,builtins,builtins_compat}.rs`)
+allowlists a fixed set of builtins — the full Node builtin module suite. The
+core captured/virtualized modules are `process`, `buffer`, `util`, `fs`,
+`fs/promises`, `crypto`, `http`, `https`; the pure-logic / virtualized modules
+(`path`, `events`, `url`, `assert`, `os`, `querystring`, `string_decoder`,
+`punycode`, `stream`, `timers`, `perf_hooks`, …) are deterministic by
+construction — `os`, like `process.platform`, returns fixed virtualized
+constants and `timers`/`perf_hooks` read the virtual clock; and the modules
+whose capabilities the runtime does not grant (`child_process`, `tls`, `vm`,
+`zlib`, …) link but throw a clear unsupported error at first use. The
+authoritative list is `NODE_BUILTIN_ALLOWLIST` (`transpile.rs`), kept in sync
+with `BUILTIN_NAMES` (`builtins.rs`).
 
 This document specifies the inverse policy for a specific class of surfaces:
 **filesystem, crypto, and timers**. Rather than rejecting them, the runtime

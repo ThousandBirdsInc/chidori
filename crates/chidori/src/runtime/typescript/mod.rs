@@ -2,6 +2,7 @@
 // dispatcher (see `rust_engine::run_module`).
 pub mod bindings;
 pub mod builtins;
+pub mod builtins_compat;
 pub mod check;
 pub mod helpers;
 pub mod loader;

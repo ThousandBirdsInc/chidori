@@ -167,9 +167,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(pkg.join("index.js"), "export * from \"./impl.js\";\n").unwrap();
+        // `node:test` is a real Node builtin the runtime does not provide (the
+        // shim suite covers the module-loading builtins, not the test runner).
         std::fs::write(
             pkg.join("impl.js"),
-            "import { createRequire } from \"node:module\";\nexport const x = 1;\n",
+            "import { test } from \"node:test\";\nexport const x = 1;\n",
         )
         .unwrap();
         std::fs::write(
