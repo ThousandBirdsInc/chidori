@@ -95,103 +95,260 @@ export default querystring;
 
 // node:string_decoder — a StringDecoder that buffers incomplete multi-byte
 // sequences across write() calls, matching Node's streaming semantics for the
-// encodings Buffer supports here.
+// encodings Buffer supports here. The state machine mirrors Node's own
+// (`lastChar`/`lastNeed`/`lastTotal`, undocumented but asserted on by Node's
+// tests): partial characters are held in `lastChar` and completed by the next
+// write, `end()` flushes whatever is left (a replacement character for utf8,
+// the buffered half of a surrogate for utf16le, padded base64) and resets the
+// state so the decoder is reusable afterwards. Written as a function + prototype
+// rather than a class so `StringDecoder.call(obj)` works, like Node.
 const STRING_DECODER_SHIM: &str = r#"
 import { Buffer } from "node:buffer";
 
-function normEnc(encoding) {
-    if (!encoding) return "utf8";
-    const e = String(encoding).toLowerCase();
-    if (e === "utf-8") return "utf8";
-    if (e === "utf-16le" || e === "ucs2" || e === "ucs-2") return "utf16le";
-    if (e === "binary") return "latin1";
-    return e;
+const kState = Symbol("kStringDecoderState");
+
+function normalizeEncoding(encoding) {
+    if (encoding === undefined || encoding === null) return "utf8";
+    if (typeof encoding === "string") {
+        const e = encoding.toLowerCase();
+        if (e === "utf8" || e === "utf-8") return "utf8";
+        if (e === "utf16le" || e === "utf-16le" || e === "ucs2" || e === "ucs-2") return "utf16le";
+        if (e === "latin1" || e === "binary") return "latin1";
+        if (e === "ascii") return "ascii";
+        if (e === "base64") return "base64";
+        if (e === "base64url") return "base64url";
+        if (e === "hex") return "hex";
+    }
+    const err = new TypeError("Unknown encoding: " + String(encoding));
+    err.code = "ERR_UNKNOWN_ENCODING";
+    throw err;
 }
-function toBytes(buf) {
-    if (buf instanceof Uint8Array) return buf;
-    if (typeof buf === "string") return new TextEncoder().encode(buf);
-    if (ArrayBuffer.isView(buf)) return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-    if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
-    throw new TypeError("StringDecoder.write expects a Buffer or typed array");
-}
-// How many trailing bytes belong to an unfinished UTF-8 sequence (0 if the
-// buffer ends on a complete boundary).
-function utf8IncompleteTail(bytes) {
-    const len = bytes.length;
-    for (let back = 1; back <= 3 && back <= len; back++) {
-        const b = bytes[len - back];
-        if ((b & 0x80) === 0) return 0;
-        if ((b & 0xc0) === 0xc0) {
-            const need = (b & 0xe0) === 0xc0 ? 2 : (b & 0xf0) === 0xe0 ? 3 : 4;
-            return back < need ? back : 0;
+function receivedHelper(input) {
+    if (input === null) return " Received null";
+    if (input === undefined) return " Received undefined";
+    const t = typeof input;
+    if (t === "function") return " Received function " + (input.name || "(anonymous)");
+    if (t === "object") {
+        const ctor = input.constructor;
+        if (ctor && typeof ctor.name === "string" && ctor.name.length !== 0) {
+            return " Received an instance of " + ctor.name;
         }
-        // Continuation byte: keep scanning backwards for the lead.
+        return " Received [Object: null prototype] {}";
+    }
+    let inspected = t === "string" ? "'" + input + "'"
+        : t === "bigint" ? String(input) + "n"
+        : t === "symbol" ? input.toString()
+        : String(input);
+    if (inspected.length > 25) inspected = inspected.slice(0, 25) + "...";
+    return " Received type " + t + " (" + inspected + ")";
+}
+function checkThis(self) {
+    if (self === undefined || self === null || !self[kState]) {
+        const err = new TypeError('Value of "this" must be of type StringDecoder');
+        err.code = "ERR_INVALID_THIS";
+        throw err;
+    }
+}
+// StringDecoder works in bytes; anything ArrayBufferView-shaped is reinterpreted
+// as a Buffer over the same memory so the encoding helpers below can use
+// Buffer.prototype.toString.
+function asBuffer(view) {
+    if (Buffer.isBuffer(view)) return view;
+    return Buffer.from(view.buffer, view.byteOffset, view.byteLength);
+}
+function copyInto(src, dst, dstStart, srcStart, srcEnd) {
+    dst.set(src.subarray(srcStart, srcEnd), dstStart);
+}
+
+// Total width and the legal range of the *second* byte for a UTF-8 lead byte,
+// or null when the byte cannot start a sequence (a stray continuation byte, or
+// one of C0/C1/F5..FF which UTF-8 never uses). The second-byte range is what
+// rules out overlong encodings, surrogate code points and anything above
+// U+10FFFF, so partial sequences are rejected as early as Buffer.toString does.
+function utf8Lead(b) {
+    if (b >= 0xc2 && b <= 0xdf) return [2, 0x80, 0xbf];
+    if (b >= 0xe0 && b <= 0xef) return [3, b === 0xe0 ? 0xa0 : 0x80, b === 0xed ? 0x9f : 0xbf];
+    if (b >= 0xf0 && b <= 0xf4) return [4, b === 0xf0 ? 0x90 : 0x80, b === 0xf4 ? 0x8f : 0xbf];
+    return null;
+}
+// How many trailing bytes of `buf` form a sequence that is still valid but not
+// yet complete, and so must wait for the next chunk. Anything already known to
+// be malformed stays in place for the decoder to turn into U+FFFD.
+function utf8IncompleteTail(buf, i) {
+    const len = buf.length;
+    for (let back = 1; back <= 3 && len - back >= i; back++) {
+        const p = len - back;
+        const lead = utf8Lead(buf[p]);
+        if (lead === null) {
+            // A continuation byte may still belong to a lead further back.
+            if (buf[p] >= 0x80 && buf[p] <= 0xbf) continue;
+            return 0;
+        }
+        if (lead[0] <= back) return 0;
+        for (let k = 1; k < back; k++) {
+            const b = buf[p + k];
+            const lo = k === 1 ? lead[1] : 0x80;
+            const hi = k === 1 ? lead[2] : 0xbf;
+            if (b < lo || b > hi) return 0;
+        }
+        return back;
     }
     return 0;
 }
-function bytesToBase64(bytes) {
-    let s = "";
-    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return btoa(s);
+function utf8Text(self, buf, i) {
+    const keep = utf8IncompleteTail(buf, i);
+    if (keep === 0) {
+        self.lastNeed = 0;
+        self.lastTotal = 0;
+        return buf.toString("utf8", i);
+    }
+    const start = buf.length - keep;
+    self.lastTotal = utf8Lead(buf[start])[0];
+    self.lastNeed = self.lastTotal - keep;
+    copyInto(buf, self.lastChar, 0, start, buf.length);
+    return buf.toString("utf8", i, start);
+}
+// UTF-8 carries the held-back bytes forward by prepending them to the next
+// chunk: they produced no output on their own, so re-decoding them is free of
+// side effects and keeps invalid-sequence handling identical to a single write.
+function utf8Write(self, buf) {
+    if (self.lastTotal !== 0) {
+        const seen = self.lastTotal - self.lastNeed;
+        const merged = Buffer.allocUnsafe(seen + buf.length);
+        copyInto(self.lastChar, merged, 0, 0, seen);
+        copyInto(buf, merged, seen, 0, buf.length);
+        self.lastNeed = 0;
+        self.lastTotal = 0;
+        buf = merged;
+    }
+    return utf8Text(self, buf, 0);
+}
+// UTF-16LE needs byte pairs, and a trailing high surrogate must wait for its
+// low half before it can be emitted.
+function utf16Text(self, buf, i) {
+    const n = buf.length;
+    if ((n - i) % 2 === 0) {
+        // Inspect the trailing code unit as bytes rather than as the last
+        // character of the decoded string: an unpaired surrogate cannot
+        // survive a round trip through this engine's UTF-8 strings.
+        if (n - i >= 2) {
+            const c = buf[n - 2] | (buf[n - 1] << 8);
+            if (c >= 0xd800 && c <= 0xdbff) {
+                self.lastNeed = 2;
+                self.lastTotal = 4;
+                self.lastChar[0] = buf[n - 2];
+                self.lastChar[1] = buf[n - 1];
+                return buf.toString("utf16le", i, n - 2);
+            }
+        }
+        return buf.toString("utf16le", i);
+    }
+    self.lastNeed = 1;
+    self.lastTotal = 2;
+    self.lastChar[0] = buf[buf.length - 1];
+    return buf.toString("utf16le", i, buf.length - 1);
+}
+// base64 emits four characters per three bytes, so hold back the remainder.
+function base64Text(self, buf, i) {
+    const n = (buf.length - i) % 3;
+    if (n === 0) return buf.toString(self.encoding, i);
+    self.lastNeed = 3 - n;
+    self.lastTotal = 3;
+    if (n === 1) {
+        self.lastChar[0] = buf[buf.length - 1];
+    } else {
+        self.lastChar[0] = buf[buf.length - 2];
+        self.lastChar[1] = buf[buf.length - 1];
+    }
+    return buf.toString(self.encoding, i, buf.length - n);
+}
+function fillLast(self, buf) {
+    if (self.lastNeed <= buf.length) {
+        copyInto(buf, self.lastChar, self.lastTotal - self.lastNeed, 0, self.lastNeed);
+        return self.lastChar.toString(self.encoding, 0, self.lastTotal);
+    }
+    copyInto(buf, self.lastChar, self.lastTotal - self.lastNeed, 0, buf.length);
+    self.lastNeed -= buf.length;
+    return undefined;
 }
 
-class StringDecoder {
-    constructor(encoding) {
-        this.encoding = normEnc(encoding);
-        this._carry = null;
-    }
-    write(buf) {
-        let bytes = toBytes(buf);
-        if (this._carry && this._carry.length) {
-            const merged = new Uint8Array(this._carry.length + bytes.length);
-            merged.set(this._carry, 0);
-            merged.set(bytes, this._carry.length);
-            bytes = merged;
-            this._carry = null;
-        }
-        let keep = 0;
-        if (this.encoding === "utf8") keep = utf8IncompleteTail(bytes);
-        else if (this.encoding === "utf16le") keep = bytes.length % 2;
-        else if (this.encoding === "base64" || this.encoding === "base64url") keep = bytes.length % 3;
-        const complete = keep === 0 ? bytes : bytes.subarray(0, bytes.length - keep);
-        if (keep !== 0) this._carry = bytes.slice(bytes.length - keep);
-        return this._decode(complete);
-    }
-    _decode(bytes) {
-        if (bytes.length === 0) return "";
-        if (this.encoding === "utf8") return new TextDecoder().decode(bytes);
-        if (this.encoding === "utf16le") {
-            let out = "";
-            for (let i = 0; i + 1 < bytes.length; i += 2) {
-                out += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8));
-            }
-            return out;
-        }
-        if (this.encoding === "base64") return bytesToBase64(bytes);
-        if (this.encoding === "base64url") {
-            return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-        }
-        if (this.encoding === "hex") {
-            let out = "";
-            for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, "0");
-            return out;
-        }
-        // latin1 / ascii.
-        let out = "";
-        for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i] & 0xff);
-        return out;
-    }
-    end(buf) {
-        let out = buf === undefined || buf === null ? "" : this.write(buf);
-        if (this._carry && this._carry.length) {
-            const rest = this._carry;
-            this._carry = null;
-            if (this.encoding === "utf8") out += "�";
-            else out += this._decode(rest);
-        }
-        return out;
-    }
+function StringDecoder(encoding) {
+    this.encoding = normalizeEncoding(encoding);
+    this.lastNeed = 0;
+    this.lastTotal = 0;
+    // 4 bytes covers the widest utf8 sequence and a utf16le surrogate pair;
+    // base64 only ever holds back two of a three-byte group.
+    this.lastChar = Buffer.alloc(
+        this.encoding === "base64" || this.encoding === "base64url" ? 3 : 4
+    );
+    this[kState] = true;
 }
+
+// Returns only the complete characters in `buf` from index `i`, buffering any
+// trailing partial character. Undocumented in Node but part of its surface.
+StringDecoder.prototype.text = function text(buf, i) {
+    checkThis(this);
+    const bytes = asBuffer(buf);
+    if (this.encoding === "utf8") return utf8Text(this, bytes, i);
+    if (this.encoding === "utf16le") return utf16Text(this, bytes, i);
+    if (this.encoding === "base64" || this.encoding === "base64url") {
+        return base64Text(this, bytes, i);
+    }
+    return bytes.toString(this.encoding, i);
+};
+
+StringDecoder.prototype.write = function write(buf) {
+    if (typeof buf === "string") return buf;
+    if (!ArrayBuffer.isView(buf)) {
+        const err = new TypeError(
+            'The "buf" argument must be an instance of Buffer, TypedArray, or DataView.' +
+            receivedHelper(buf)
+        );
+        err.code = "ERR_INVALID_ARG_TYPE";
+        throw err;
+    }
+    checkThis(this);
+    const bytes = asBuffer(buf);
+    if (bytes.length === 0) return "";
+    if (this.encoding === "utf8") return utf8Write(this, bytes);
+    let r;
+    let i;
+    if (this.lastNeed) {
+        r = fillLast(this, bytes);
+        if (r === undefined) return "";
+        i = this.lastNeed;
+        this.lastNeed = 0;
+    } else {
+        i = 0;
+    }
+    if (i < bytes.length) {
+        const rest = this.text(bytes, i);
+        return r ? r + rest : rest;
+    }
+    return r || "";
+};
+
+StringDecoder.prototype.end = function end(buf) {
+    checkThis(this);
+    let r = buf === undefined || buf === null ? "" : this.write(buf);
+    if (this.lastNeed) {
+        const enc = this.encoding;
+        if (enc === "utf8") {
+            // One replacement character for the truncated sequence, however
+            // many of its bytes had already arrived.
+            r += "�";
+        } else if (enc === "utf16le") {
+            r += this.lastChar.toString("utf16le", 0, this.lastTotal - this.lastNeed);
+        } else if (enc === "base64" || enc === "base64url") {
+            r += this.lastChar.toString(enc, 0, 3 - this.lastNeed);
+        }
+        // Flushing resets the decoder: a write() after end() starts clean.
+        this.lastNeed = 0;
+        this.lastTotal = 0;
+    }
+    return r;
+};
+
 export { StringDecoder };
 export default { StringDecoder };
 "#;
