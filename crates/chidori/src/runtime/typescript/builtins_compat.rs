@@ -21,6 +21,7 @@
 // URLSearchParams, querystring encodes spaces as %20 and supports custom
 // separators.
 const QUERYSTRING_SHIM: &str = r#"
+import { Buffer } from "node:buffer";
 // Node's escape() is not encodeURIComponent: it walks UTF-16 units itself, so
 // a lone surrogate at the end of the input is an `ERR_INVALID_URI` URIError
 // (and a lone surrogate followed by any unit is folded into a 4-byte sequence,
@@ -89,12 +90,62 @@ function qsEscape(str) {
     }
     return encodeStr(str);
 }
-function qsUnescape(str) {
-    try { return decodeURIComponent(String(str)); } catch { return String(str); }
+// Node's `querystring.unescapeBuffer` — a byte-level percent-decoder that
+// never throws: an unterminated or non-hex escape is emitted verbatim (and
+// re-scanned, so `%%2a` decodes to `%*`), which is why `unescape()` can fall
+// back to it when `decodeURIComponent` rejects the input. Mirrors
+// lib/querystring.js's state machine, `hasHex` short-circuit included.
+function unhexDigit(code) {
+    if (code >= 0x30 && code <= 0x39) return code - 0x30;
+    if (code >= 0x41 && code <= 0x46) return code - 0x41 + 10;
+    if (code >= 0x61 && code <= 0x66) return code - 0x61 + 10;
+    return -1;
+}
+function unescapeBuffer(s, decodeSpaces) {
+    s = String(s);
+    const out = Buffer.allocUnsafe(s.length);
+    let index = 0;
+    let outIndex = 0;
+    const maxLength = s.length - 2;
+    let hasHex = false;
+    while (index < s.length) {
+        let currentChar = s.charCodeAt(index);
+        if (currentChar === 43 && decodeSpaces) {
+            out[outIndex++] = 32;
+            index++;
+            continue;
+        }
+        if (currentChar === 37 && index < maxLength) {
+            currentChar = s.charCodeAt(++index);
+            const hexHigh = unhexDigit(currentChar);
+            if (hexHigh < 0) {
+                out[outIndex++] = 37;
+                continue;
+            } else {
+                const nextChar = s.charCodeAt(++index);
+                const hexLow = unhexDigit(nextChar);
+                if (hexLow < 0) {
+                    out[outIndex++] = 37;
+                    index--;
+                } else {
+                    hasHex = true;
+                    currentChar = hexHigh * 16 + hexLow;
+                }
+            }
+        }
+        out[outIndex++] = currentChar;
+        index++;
+    }
+    return hasHex ? out.slice(0, outIndex) : out;
+}
+function qsUnescape(str, decodeSpaces) {
+    const s = String(str);
+    try { return decodeURIComponent(s); } catch { return unescapeBuffer(s, decodeSpaces).toString(); }
 }
 function stringifyPrimitive(v) {
     if (typeof v === "string") return v;
     if (typeof v === "number" && isFinite(v)) return String(v);
+    if (typeof v === "bigint") return String(v);
     if (typeof v === "boolean") return String(v);
     return "";
 }
@@ -105,9 +156,29 @@ function parse(qs, sep, eq, options) {
     if (typeof qs !== "string" || qs.length === 0) return obj;
     let maxKeys = 1000;
     if (options && typeof options.maxKeys === "number") maxKeys = options.maxKeys;
-    const decode = options && typeof options.decodeURIComponent === "function"
-        ? options.decodeURIComponent
-        : qsUnescape;
+    // Node reads the decoder off the module object, so replacing
+    // `querystring.unescape` re-points `parse` too — and counts as a *custom*
+    // decoder, which changes the gating below.
+    let decode = querystring.unescape;
+    if (options && typeof options.decodeURIComponent === "function") {
+        decode = options.decodeURIComponent;
+    }
+    const customDecode = decode !== qsUnescape;
+    // Node only reaches for the decoder when the slice actually *looks*
+    // encoded — a `%` followed by two hex digits (its `encodeCheck` state
+    // machine). That gate is observable: `parse('%Ā=%ā')` keeps its
+    // keys verbatim precisely because the decoder is never called. A custom
+    // decoder is always called (Node seeds `keyEncoded = customDecode`), and
+    // it sees `+` as `%20` rather than a literal space.
+    const plusChar = customDecode ? "%20" : " ";
+    const looksEncoded = /%[0-9A-Fa-f]{2}/;
+    function decodeSlice(s) {
+        if (s.length === 0) return s;
+        if (!customDecode && !looksEncoded.test(s)) return s;
+        // A throwing decoder is not fatal: Node retries through its own
+        // never-throwing `unescape` (with `+` → space enabled).
+        try { return decode(s); } catch { return qsUnescape(s, true); }
+    }
     const parts = qs.split(sep);
     const limit = maxKeys > 0 ? Math.min(parts.length, maxKeys) : parts.length;
     for (let i = 0; i < limit; i++) {
@@ -116,11 +187,11 @@ function parse(qs, sep, eq, options) {
         const idx = part.indexOf(eq);
         let key, value;
         if (idx === -1) {
-            key = decode(part.replace(/\+/g, " "));
+            key = decodeSlice(part.split("+").join(plusChar));
             value = "";
         } else {
-            key = decode(part.slice(0, idx).replace(/\+/g, " "));
-            value = decode(part.slice(idx + eq.length).replace(/\+/g, " "));
+            key = decodeSlice(part.slice(0, idx).split("+").join(plusChar));
+            value = decodeSlice(part.slice(idx + eq.length).split("+").join(plusChar));
         }
         if (Object.prototype.hasOwnProperty.call(obj, key)) {
             if (Array.isArray(obj[key])) obj[key].push(value);
@@ -152,9 +223,9 @@ function stringify(obj, sep, eq, options) {
 }
 const querystring = {
     parse, stringify, decode: parse, encode: stringify,
-    escape: qsEscape, unescape: qsUnescape,
+    escape: qsEscape, unescape: qsUnescape, unescapeBuffer,
 };
-export { parse, stringify, parse as decode, stringify as encode, qsEscape as escape, qsUnescape as unescape };
+export { parse, stringify, parse as decode, stringify as encode, qsEscape as escape, qsUnescape as unescape, unescapeBuffer };
 export default querystring;
 "#;
 
@@ -2482,30 +2553,214 @@ export function getEnabledCategories() { return undefined; }
 export default { createTracing, getEnabledCategories };
 "#;
 
-// node:vm — arbitrary secondary evaluation contexts would bypass the
-// determinism prelude and capability policy, so the whole surface throws.
+// node:vm — functional, SAME-REALM. Evaluation goes through the engine's own
+// `eval`/`Function` intrinsics, so contextified code runs in the one existing
+// realm: same determinism prelude, same captured host ops, same capability
+// policy as every other line of agent code. A `vm` "context" here is a scope
+// object pushed with `with`, not a fresh global — no capability is granted
+// that a plain `eval` did not already grant, which is why this is a shim and
+// not a stub.
+//
+// The honest divergences, all consequences of there being exactly one realm:
+//
+//   * Contexts share the realm's intrinsics. `vm.runInNewContext('[]')
+//     instanceof Array` is `true` here and `false` in Node, and there is no
+//     "different Array from a different context" to test against — the
+//     cross-realm-identity half of Node's `vm` is not meaningful in chidori.
+//   * `this` inside contextified code is the realm's `globalThis`, not the
+//     contextified sandbox.
+//   * A leading `"use strict"` directive loses its directive position (the
+//     source is spliced inside a `with` block, where strict mode is a syntax
+//     error), so such code runs sloppy.
+//   * Timeouts (`options.timeout`, `breakOnSigint`) are ignored: the runtime
+//     is single-threaded and cooperatively scheduled, with no interruptible
+//     evaluation.
+//
+// `measureMemory` (needs V8 heap statistics) and `SourceTextModule` (needs the
+// module-record introspection API) have no counterpart and stay fail-loud.
 const VM_SHIM: &str = r#"
-function unsupported(name) {
-    return function () {
-        throw new Error("vm." + name + " is not supported in the Chidori runtime (secondary evaluation contexts would bypass the determinism prelude and capability policy)");
-    };
+// Indirect eval: `(0, eval)(src)` semantics — compiles `src` as a script in
+// the realm's global scope rather than as a direct eval in this module's.
+const indirectEval = eval;
+
+// Contexts are tracked out-of-band so `isContext` cannot be spoofed and a
+// sandbox never grows a visible marker property (Node uses an internal
+// pointer on the object; a WeakSet is the closest JS-visible equivalent).
+const contexts = new WeakSet();
+
+// The slot the `with` head reads the sandbox out of. Namespaced so contextified
+// code that enumerates `globalThis` sees nothing surprising after a run — the
+// slot is restored to its prior state in the `finally` below.
+const kSlot = "__chidori_vm_sandbox__";
+
+function typeError(code, message) {
+    const err = new TypeError(message);
+    err.code = code;
+    return err;
 }
+
+function checkCode(code, name) {
+    if (typeof code !== "string") {
+        throw typeError(
+            "ERR_INVALID_ARG_TYPE",
+            'The "' + name + '" argument must be of type string. Received ' +
+            (code === null ? "null" : typeof code)
+        );
+    }
+    return code;
+}
+
+function checkSandbox(sandbox, name) {
+    if (sandbox === undefined) return {};
+    if (sandbox === null || (typeof sandbox !== "object" && typeof sandbox !== "function")) {
+        throw typeError(
+            "ERR_INVALID_ARG_TYPE",
+            'The "' + name + '" argument must be of type object. Received ' +
+            (sandbox === null ? "null" : typeof sandbox)
+        );
+    }
+    return sandbox;
+}
+
+export function isContext(sandbox) {
+    if (sandbox === null || (typeof sandbox !== "object" && typeof sandbox !== "function")) {
+        throw typeError(
+            "ERR_INVALID_ARG_TYPE",
+            'The "object" argument must be of type object. Received ' +
+            (sandbox === null ? "null" : typeof sandbox)
+        );
+    }
+    return contexts.has(sandbox);
+}
+
+export function createContext(contextObject, options) {
+    const sandbox = contextObject === undefined ? {} : checkSandbox(contextObject, "contextObject");
+    contexts.add(sandbox);
+    return sandbox;
+}
+
+// Evaluate `code` with `sandbox`'s properties in scope.
+//
+// Reads and writes of properties the sandbox already has resolve through the
+// `with` object record. The two remaining cases — an implicit global
+// assignment (`x = 1` where `x` is not yet on the sandbox) and a hoisted
+// `var`/function declaration — land on the realm's global object instead,
+// because a `with` object record is never the variable environment. Both are
+// reclaimed afterwards by diffing the global's own keys against a snapshot
+// taken before the run and moving whatever appeared onto the sandbox. A key
+// the `with` write already delivered to the sandbox wins (a `var x = 1`
+// hoists `x` onto the global as `undefined` and then assigns the *sandbox*
+// binding through the `with`), so the move never clobbers a live value.
+function evaluateInScope(code, sandbox) {
+    const hadSlot = Object.prototype.hasOwnProperty.call(globalThis, kSlot);
+    const prevSlot = hadSlot ? Object.getOwnPropertyDescriptor(globalThis, kSlot) : undefined;
+    const before = new Set(Object.getOwnPropertyNames(globalThis));
+    Object.defineProperty(globalThis, kSlot, {
+        value: sandbox, writable: true, enumerable: false, configurable: true,
+    });
+    try {
+        return indirectEval("with (globalThis." + kSlot + ") {\n" + code + "\n}");
+    } finally {
+        for (const key of Object.getOwnPropertyNames(globalThis)) {
+            if (key === kSlot || before.has(key)) continue;
+            const desc = Object.getOwnPropertyDescriptor(globalThis, key);
+            try { delete globalThis[key]; } catch (e) { /* non-configurable */ }
+            if (desc !== undefined && !Object.prototype.hasOwnProperty.call(sandbox, key)) {
+                try { Object.defineProperty(sandbox, key, desc); } catch (e) { /* frozen sandbox */ }
+            }
+        }
+        if (hadSlot) Object.defineProperty(globalThis, kSlot, prevSlot);
+        else delete globalThis[kSlot];
+    }
+}
+
+export function runInContext(code, contextifiedObject, options) {
+    checkCode(code, "code");
+    const sandbox = checkSandbox(contextifiedObject, "contextifiedObject");
+    if (!contexts.has(sandbox)) {
+        throw typeError("ERR_INVALID_ARG_TYPE", 'The "contextifiedObject" argument must be a vm.Context');
+    }
+    return evaluateInScope(code, sandbox);
+}
+
+export function runInNewContext(code, contextObject, options) {
+    checkCode(code, "code");
+    return evaluateInScope(code, createContext(contextObject));
+}
+
+export function runInThisContext(code, options) {
+    checkCode(code, "code");
+    return indirectEval(code);
+}
+
+export function compileFunction(code, params, options) {
+    checkCode(code, "code");
+    const args = params === undefined ? [] : params;
+    if (!Array.isArray(args)) {
+        throw typeError("ERR_INVALID_ARG_TYPE", 'The "params" argument must be an instance of Array');
+    }
+    const opts = options === undefined || options === null ? {} : options;
+    const names = args.map(String);
+    // `parsingContext` binds the compiled body to a contextified sandbox the
+    // same way `runInContext` does; the extra `with` head is invisible to the
+    // returned function's signature.
+    const ctx = opts.parsingContext;
+    if (ctx !== undefined && ctx !== null) {
+        if (!contexts.has(ctx)) {
+            throw typeError("ERR_INVALID_ARG_TYPE", 'The "options.parsingContext" argument must be a vm.Context');
+        }
+        const inner = new Function(kSlot, ...names, "with (" + kSlot + ") {\n" + code + "\n}");
+        return function (...callArgs) { return inner.call(this, ctx, ...callArgs); };
+    }
+    return new Function(...names, code);
+}
+
 export class Script {
-    constructor() { unsupported("Script")(); }
+    constructor(code, options) {
+        this.code = checkCode(code, "code");
+        const opts = options === undefined || options === null ? {} : options;
+        this.filename = opts.filename === undefined ? "evalmachine.<anonymous>" : String(opts.filename);
+        // Node compiles eagerly, so a syntax error surfaces from `new
+        // vm.Script(...)` rather than from the first run. `new Function` is the
+        // only compile-without-running primitive available here; it accepts a
+        // superset of script syntax (top-level `return`), so a script that only
+        // *runs* differently still constructs — the syntax errors this catches
+        // are the ones a real parse would have caught too.
+        new Function(this.code);
+    }
+    runInContext(contextifiedObject, options) {
+        return runInContext(this.code, contextifiedObject, options);
+    }
+    runInNewContext(contextObject, options) {
+        return runInNewContext(this.code, contextObject, options);
+    }
+    runInThisContext(options) {
+        return runInThisContext(this.code, options);
+    }
+    createCachedData() {
+        throw new Error("vm.Script.createCachedData is not supported in the Chidori runtime (there is no V8 code cache to serialize)");
+    }
 }
-export const createContext = unsupported("createContext");
-export const isContext = unsupported("isContext");
-export const runInContext = unsupported("runInContext");
-export const runInNewContext = unsupported("runInNewContext");
-export const runInThisContext = unsupported("runInThisContext");
-export const compileFunction = unsupported("compileFunction");
-export const measureMemory = unsupported("measureMemory");
+
+export function measureMemory() {
+    throw new Error("vm.measureMemory is not supported in the Chidori runtime (no V8 heap statistics are available)");
+}
+
 export class SourceTextModule {
-    constructor() { unsupported("SourceTextModule")(); }
+    constructor() {
+        throw new Error("vm.SourceTextModule is not supported in the Chidori runtime (the module-record introspection API is not exposed by the engine)");
+    }
 }
+
+export const constants = Object.freeze({
+    USE_MAIN_CONTEXT_DEFAULT_LOADER: Symbol("vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER"),
+    DONT_CONTEXTIFY: Symbol("vm.constants.DONT_CONTEXTIFY"),
+});
+
 export default {
     Script, createContext, isContext, runInContext, runInNewContext,
     runInThisContext, compileFunction, measureMemory, SourceTextModule,
+    constants,
 };
 "#;
 

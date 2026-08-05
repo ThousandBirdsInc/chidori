@@ -133,10 +133,13 @@ three cliffs, concretely:
      (`isIP` helpers only), `worker_threads` (main-thread surface +
      MessageChannel), `sys`, `v8` (introspection stubs), `tty`
      (`isatty` → false), `zlib` (deflate/gzip and Brotli families — sync,
-     callback, and streaming — via a pure-Rust compression native).
+     callback, and streaming — via a pure-Rust compression native), `vm`
+     (same-realm: contextified code runs through the engine's own `eval`, so
+     contexts share the realm's intrinsics and grant no capability a plain
+     `eval` did not — `measureMemory`/`SourceTextModule` still fail loud).
    - **Fail-loud:** capabilities the runtime deliberately does not grant —
      `child_process`, `cluster`, `dgram`, `dns` (+ `dns/promises`), `http2`,
-     `inspector`, `readline`, `repl`, `tls`, `trace_events`, `vm`, `wasi`,
+     `inspector`, `readline`, `repl`, `tls`, `trace_events`, `wasi`,
      plus server/socket surfaces of `net` and `http`. These import
      and link cleanly (packages import them at module scope), but every
      entry point throws a clear "not supported in the Chidori runtime"

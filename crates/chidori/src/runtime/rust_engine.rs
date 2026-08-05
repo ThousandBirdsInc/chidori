@@ -3414,14 +3414,14 @@ mod tests {
             "node-stubs",
             r#"
             import { spawn } from "node:child_process";
-            import vm from "node:vm";
+            import dgram from "node:dgram";
             import { Worker, MessageChannel } from "node:worker_threads";
             import cluster from "node:cluster";
             import { lookup } from "node:dns";
             export async function agent() {
                 const errors = {};
                 try { spawn("ls"); } catch (e) { errors.spawn = e.message; }
-                try { vm.runInNewContext("1 + 1", {}); } catch (e) { errors.vm = e.message; }
+                try { dgram.createSocket("udp4"); } catch (e) { errors.dgram = e.message; }
                 try { new Worker("./w.js"); } catch (e) { errors.worker = e.message; }
                 const dnsError = await new Promise((resolve) => {
                     lookup("example.com", (err) => resolve(err ? err.code : null));
@@ -3432,7 +3432,7 @@ mod tests {
                 port1.postMessage({ hello: true });
                 return {
                     spawn: errors.spawn,
-                    vm: errors.vm,
+                    dgram: errors.dgram,
                     worker: errors.worker,
                     dnsError,
                     isPrimary: cluster.isPrimary,
@@ -3446,16 +3446,88 @@ mod tests {
             spawn_msg.contains("not supported in the Chidori runtime"),
             "{spawn_msg}"
         );
-        let vm_msg = out["vm"].as_str().unwrap();
+        let dgram_msg = out["dgram"].as_str().unwrap();
         assert!(
-            vm_msg.contains("not supported in the Chidori runtime"),
-            "{vm_msg}"
+            dgram_msg.contains("not supported in the Chidori runtime"),
+            "{dgram_msg}"
         );
         let worker_msg = out["worker"].as_str().unwrap();
         assert!(worker_msg.contains("single-threaded"), "{worker_msg}");
         assert_eq!(out["dnsError"], serde_json::json!("ENOTSUP"));
         assert_eq!(out["isPrimary"], serde_json::json!(true));
         assert_eq!(out["message"], serde_json::json!({ "hello": true }));
+    }
+
+    #[test]
+    fn run_agent_node_vm_same_realm_contexts() {
+        // node:vm is a *functional* same-realm shim: contextified code runs
+        // through the engine's own `eval`, in the one existing realm, under the
+        // same determinism prelude and capability policy as the agent body. The
+        // load-bearing behaviours are (a) the sandbox object is the scope —
+        // reads see its properties, and writes (including bare assignments and
+        // `var`/function declarations, which are not `with`-bindable) land back
+        // on it rather than leaking to the realm global — and (b) a `Script`
+        // compiles once and can be re-run against several contexts.
+        let out = run_compute_agent(
+            "node-vm",
+            r#"
+            import vm from "node:vm";
+            export async function agent() {
+                const sandbox = { seed: 2 };
+                const ctx = vm.createContext(sandbox);
+
+                // Bare assignment + `var` + function declaration all land on
+                // the sandbox, and reads see what the sandbox already holds.
+                vm.runInContext("x = [1, 2, 3]; var doubled = seed * 2; function tag() { return 'ok'; }", ctx);
+
+                // A fresh sandbox object is contextified in place.
+                const fresh = { checkString: "test" };
+                const boxed = vm.runInNewContext("new String(checkString)", fresh);
+
+                // One compiled Script, two contexts, plus this-context eval.
+                const script = new vm.Script("seed + 1");
+                const other = vm.createContext({ seed: 40 });
+
+                return {
+                    x: sandbox.x,
+                    doubled: sandbox.doubled,
+                    tagged: sandbox.tag(),
+                    isContext: vm.isContext(ctx),
+                    isNotContext: vm.isContext({}),
+                    createdContext: vm.isContext(fresh),
+                    boxed: String(boxed),
+                    scriptA: script.runInContext(ctx),
+                    scriptB: script.runInContext(other),
+                    scriptFresh: script.runInNewContext({ seed: 100 }),
+                    thisContext: vm.runInThisContext("1 + 1"),
+                    compiled: vm.compileFunction("return a + b;", ["a", "b"])(3, 4),
+                    // Nothing leaked to the realm global.
+                    leakedX: typeof globalThis.x,
+                    leakedDoubled: typeof globalThis.doubled,
+                    leakedTag: typeof globalThis.tag,
+                    // Contexts share the realm's intrinsics — the one honest
+                    // divergence from Node, where this would be false.
+                    sameRealmIntrinsics: vm.runInNewContext("[]") instanceof Array,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["x"], serde_json::json!([1, 2, 3]));
+        assert_eq!(out["doubled"], serde_json::json!(4));
+        assert_eq!(out["tagged"], serde_json::json!("ok"));
+        assert_eq!(out["isContext"], serde_json::json!(true));
+        assert_eq!(out["isNotContext"], serde_json::json!(false));
+        assert_eq!(out["createdContext"], serde_json::json!(true));
+        assert_eq!(out["boxed"], serde_json::json!("test"));
+        assert_eq!(out["scriptA"], serde_json::json!(3));
+        assert_eq!(out["scriptB"], serde_json::json!(41));
+        assert_eq!(out["scriptFresh"], serde_json::json!(101));
+        assert_eq!(out["thisContext"], serde_json::json!(2));
+        assert_eq!(out["compiled"], serde_json::json!(7));
+        assert_eq!(out["leakedX"], serde_json::json!("undefined"));
+        assert_eq!(out["leakedDoubled"], serde_json::json!("undefined"));
+        assert_eq!(out["leakedTag"], serde_json::json!("undefined"));
+        assert_eq!(out["sameRealmIntrinsics"], serde_json::json!(true));
     }
 
     #[test]
