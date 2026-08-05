@@ -4457,10 +4457,14 @@ impl Vm {
                     t.borrow_mut().own_insert(k, Property::data(val));
                 }
             } else if let Value::String(st) = src {
-                for (i, c) in st.as_str().chars().enumerate() {
+                // A string's index properties are its UTF-16 CODE UNITS (an
+                // astral char spreads as two one-unit strings; a lone
+                // surrogate is preserved, not replaced).
+                let units = st.to_utf16_vec();
+                for (i, u) in units.iter().enumerate() {
                     t.borrow_mut().own_insert(
                         PropertyKey::from_index(i as u32),
-                        Property::data(Value::str(c.to_string())),
+                        Property::data(Value::String(JsString::from_code_units(&[*u]))),
                     );
                 }
             }
@@ -4486,14 +4490,18 @@ impl Vm {
                     t.borrow_mut().own_insert(k, Property::data(val));
                 }
             } else if let Value::String(st) = src {
-                // A primitive-string source contributes its index keys.
-                for (i, c) in st.as_str().chars().enumerate() {
+                // A primitive-string source contributes its index keys — one
+                // per UTF-16 code unit (see object_spread above).
+                let units = st.to_utf16_vec();
+                for (i, u) in units.iter().enumerate() {
                     let k = PropertyKey::from_index(i as u32);
                     if excluded.contains(&k) {
                         continue;
                     }
-                    t.borrow_mut()
-                        .own_insert(k, Property::data(Value::str(c.to_string())));
+                    t.borrow_mut().own_insert(
+                        k,
+                        Property::data(Value::String(JsString::from_code_units(&[*u]))),
+                    );
                 }
             }
         }

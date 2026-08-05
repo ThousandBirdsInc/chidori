@@ -301,6 +301,9 @@ impl<'a> Parser<'a> {
     fn peek(&self) -> Option<char> {
         self.src.get(self.pos).copied()
     }
+    fn peek_at(&self, n: usize) -> Option<char> {
+        self.src.get(self.pos + n).copied()
+    }
     fn next(&mut self) -> Option<char> {
         let c = self.src.get(self.pos).copied();
         if c.is_some() {
@@ -636,15 +639,49 @@ impl<'a> Parser<'a> {
                 None => return Err("Unterminated group name".to_string()),
                 Some('>') => break,
                 Some(c) => {
-                    let ok = if name.is_empty() {
-                        is_id_start(c)
+                    // RegExpIdentifierName admits `\uXXXX` / `\u{...}` escapes
+                    // (a lead+trail escape pair composes an astral code point,
+                    // u-flag or not) alongside literal identifier characters.
+                    let ch = if c == '\\' {
+                        if self.next() != Some('u') {
+                            return Err("Invalid character '\\' in group name".to_string());
+                        }
+                        let cp = self
+                            .parse_unicode_escape()
+                            .ok_or_else(|| "Invalid unicode escape in group name".to_string())?;
+                        let cp = if (0xD800..=0xDBFF).contains(&cp) {
+                            // Combine an escaped surrogate pair regardless of
+                            // the u flag (RegExpIdentifierCodePoint).
+                            let save = self.pos;
+                            let mut combined = cp;
+                            if self.eat('\\') && self.eat('u') {
+                                if let Some(lo) = self.parse_unicode_escape() {
+                                    if (0xDC00..=0xDFFF).contains(&lo) {
+                                        combined = 0x1_0000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                    }
+                                }
+                            }
+                            if combined == cp {
+                                self.pos = save;
+                            }
+                            combined
+                        } else {
+                            cp
+                        };
+                        char::from_u32(cp)
+                            .ok_or_else(|| "Invalid code point in group name".to_string())?
                     } else {
-                        is_id_continue(c)
+                        c
+                    };
+                    let ok = if name.is_empty() {
+                        is_id_start(ch)
+                    } else {
+                        is_id_continue(ch)
                     };
                     if !ok {
-                        return Err(format!("Invalid character '{c}' in group name"));
+                        return Err(format!("Invalid character '{ch}' in group name"));
                     }
-                    name.push(c);
+                    name.push(ch);
                 }
             }
         }
@@ -821,13 +858,17 @@ impl<'a> Parser<'a> {
                     ClassAtom::Char('\u{0008}' as u32) // \b is backspace inside a class
                 }
                 'c' => {
-                    // \cX control escape; if not a valid control letter, treat
-                    // the backslash literally (Annex B leniency).
+                    // \cX control escape; if not a valid control letter, the
+                    // lone `\c` is an Annex B identity-ish escape — but a
+                    // SyntaxError in unicode mode.
                     self.pos += 1;
                     match self.peek() {
                         Some(ch) if ch.is_ascii_alphabetic() => {
                             self.pos += 1;
                             ClassAtom::Char(((ch as u8) & 0x1f) as u32)
+                        }
+                        _ if self.unicode => {
+                            return Err("Invalid class escape '\\c' in unicode mode".to_string())
                         }
                         _ => ClassAtom::Char('\\' as u32),
                     }
@@ -836,6 +877,9 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     match self.parse_hex(2) {
                         Some(ch) => ClassAtom::Char(ch),
+                        None if self.unicode => {
+                            return Err("Invalid class escape '\\x' in unicode mode".to_string())
+                        }
                         None => ClassAtom::Char('x' as u32),
                     }
                 }
@@ -843,16 +887,36 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     match self.parse_unicode_escape() {
                         Some(ch) => ClassAtom::Char(self.combine_surrogate(ch)),
+                        None if self.unicode => {
+                            return Err("Invalid class escape '\\u' in unicode mode".to_string())
+                        }
                         None => ClassAtom::Char('u' as u32),
                     }
                 }
                 '0'..='7' => {
-                    // Octal escape inside a class (Annex B). `\0` not followed by
-                    // a digit is NUL.
-                    ClassAtom::Char(self.parse_octal_escape())
+                    // Octal escape inside a class (Annex B); in unicode mode
+                    // only `\0` NOT followed by a digit (NUL) is legal.
+                    if self.unicode {
+                        let is_lone_zero =
+                            c == '0' && !matches!(self.peek_at(1), Some(d) if d.is_ascii_digit());
+                        if !is_lone_zero {
+                            return Err("Invalid octal class escape in unicode mode".to_string());
+                        }
+                        self.pos += 1; // consume the '0'
+                        ClassAtom::Char(0)
+                    } else {
+                        ClassAtom::Char(self.parse_octal_escape())
+                    }
                 }
                 _ => {
                     let other = self.next().unwrap();
+                    // In unicode mode only SyntaxCharacters, `/`, `-`, and `b`
+                    // (handled above) may be identity-escaped in a class.
+                    if self.unicode && !is_syntax_char(other) && other != '/' && other != '-' {
+                        return Err(format!(
+                            "Invalid identity escape '\\{other}' in unicode-mode class"
+                        ));
+                    }
                     ClassAtom::Char(other as u32)
                 }
             }),
@@ -1554,29 +1618,13 @@ impl<'a> MatchCtx<'a> {
             let stop = |p: usize, _c: &mut Caps| Some(p);
             self.match_node(node, pos, caps, &stop).is_some()
         } else {
-            // Lookbehind: succeed iff the sub-pattern matches some span that ends
-            // exactly at `pos`. Try every candidate start `j` in `0..=pos`,
-            // longest span first for deterministic capture behaviour.
-            let mut hit = false;
-            let mut j = pos + 1;
-            while j > 0 {
-                j -= 1;
-                if self.exhausted.get() {
-                    break;
-                }
-                let stop = move |p: usize, _c: &mut Caps| {
-                    if p == pos {
-                        Some(p)
-                    } else {
-                        None
-                    }
-                };
-                if self.match_node(node, j, caps, &stop).is_some() {
-                    hit = true;
-                    break;
-                }
-            }
-            hit
+            // Lookbehind: match the sub-pattern RIGHT-TO-LEFT ending exactly
+            // at `pos` (the spec's direction-back matcher). Any resulting
+            // start position succeeds; choice ordering (alternatives,
+            // greediness) is made while walking backwards, which is what the
+            // lookbehind capture/alternation semantics require.
+            let stop = |p: usize, _c: &mut Caps| Some(p);
+            self.match_node_back(node, pos, caps, &stop).is_some()
         };
 
         if negative {
@@ -1615,6 +1663,239 @@ impl<'a> MatchCtx<'a> {
         }
         let rest_k = move |p: usize, caps: &mut Caps| self.match_seq(items, i + 1, p, caps, k);
         self.match_node(&items[i], pos, caps, &rest_k)
+    }
+
+    // -----------------------------------------------------------------------
+    // Backwards matching (lookbehind bodies)
+    // -----------------------------------------------------------------------
+
+    /// The code point ENDING at code-unit `pos` (i.e. starting at `pos - w`)
+    /// and its width — the mirror of [`MatchCtx::code_point_at`].
+    #[inline]
+    fn code_point_before(&self, pos: usize) -> Option<(u32, usize)> {
+        if pos == 0 {
+            return None;
+        }
+        let u = self.input[pos - 1];
+        if self.flags.unicode && (0xDC00..=0xDFFF).contains(&u) && pos >= 2 {
+            let hi = self.input[pos - 2];
+            if (0xD800..=0xDBFF).contains(&hi) {
+                let cp = 0x1_0000 + (((hi as u32 - 0xD800) << 10) | (u as u32 - 0xDC00));
+                return Some((cp, 2));
+            }
+        }
+        Some((u as u32, 1))
+    }
+
+    /// Match `node` RIGHT-TO-LEFT so that its span ENDS at `pos`; the
+    /// continuation receives the span's START. This is the spec's
+    /// direction-back matcher: sequence elements run in reverse order while
+    /// alternative order and quantifier greediness keep their left-to-right
+    /// preference — which is exactly what candidate-start scanning cannot
+    /// reproduce and what the lookbehind capture/alternation tests pin.
+    fn match_node_back(
+        &self,
+        node: &Node,
+        pos: usize,
+        caps: &mut Caps,
+        k: &Cont<'_>,
+    ) -> Option<usize> {
+        let s = self.steps.get();
+        let here = &s as *const _ as usize;
+        if s >= REGEX_STEP_LIMIT
+            || self.stack_base.saturating_sub(here) >= REGEX_STACK_LIMIT_BYTES
+            || self.exhausted.get()
+        {
+            self.exhausted.set(true);
+            return None;
+        }
+        self.steps.set(s + 1);
+        match node {
+            Node::Empty => k(pos, caps),
+            Node::Char(c) => {
+                if let Some((cp, w)) = self.code_point_before(pos) {
+                    if self.char_eq(cp, *c) {
+                        return k(pos - w, caps);
+                    }
+                }
+                None
+            }
+            Node::AnyChar => {
+                if let Some((cp, w)) = self.code_point_before(pos) {
+                    if self.flags.dot_all || !is_line_terminator(cp) {
+                        return k(pos - w, caps);
+                    }
+                }
+                None
+            }
+            Node::Class { negated, items } => {
+                if let Some((cp, w)) = self.code_point_before(pos) {
+                    let matched =
+                        class_matches(items, cp, self.flags.ignore_case, self.flags.unicode);
+                    if matched != *negated {
+                        return k(pos - w, caps);
+                    }
+                }
+                None
+            }
+            // Position assertions are direction-independent.
+            Node::Start | Node::End | Node::WordBoundary(_) => {
+                let stop = |p: usize, caps: &mut Caps| k(p, caps);
+                self.match_node_inner(node, pos, caps, &stop)
+            }
+            Node::Group { idx, node } => match idx {
+                None => self.match_node_back(node, pos, caps, k),
+                Some(i) => {
+                    let i = *i;
+                    let saved = caps[i];
+                    let end = pos;
+                    let inner_k = move |start: usize, caps: &mut Caps| {
+                        let prev = caps[i];
+                        caps[i] = Some((start, end));
+                        match k(start, caps) {
+                            Some(r) => Some(r),
+                            None => {
+                                caps[i] = prev;
+                                None
+                            }
+                        }
+                    };
+                    match self.match_node_back(node, pos, caps, &inner_k) {
+                        Some(r) => Some(r),
+                        None => {
+                            caps[i] = saved;
+                            None
+                        }
+                    }
+                }
+            },
+            Node::Look { .. } => {
+                // A nested lookaround inside a lookbehind evaluates at the
+                // current position and consumes nothing in either direction.
+                let stop = |p: usize, caps: &mut Caps| k(p, caps);
+                self.match_node_inner(node, pos, caps, &stop)
+            }
+            Node::Alt(branches) => {
+                for b in branches {
+                    if let Some(r) = self.match_node_back(b, pos, caps, k) {
+                        return Some(r);
+                    }
+                }
+                None
+            }
+            Node::Concat(items) => self.match_seq_back(items, items.len(), pos, caps, k),
+            Node::Repeat {
+                node,
+                min,
+                max,
+                greedy,
+            } => self.match_repeat_back(node, *min, *max, *greedy, 0, pos, caps, k),
+            Node::Backref(i) => {
+                let span = if *i < caps.len() { caps[*i] } else { None };
+                match span {
+                    None => k(pos, caps),
+                    Some((s, e)) => {
+                        let len = e - s;
+                        if len > pos {
+                            return None;
+                        }
+                        for j in 0..len {
+                            if !self
+                                .char_eq(self.input[pos - len + j] as u32, self.input[s + j] as u32)
+                            {
+                                return None;
+                            }
+                        }
+                        k(pos - len, caps)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Match `items[..i]` right-to-left ending at `pos` (the backwards mirror
+    /// of [`MatchCtx::match_seq`]).
+    fn match_seq_back(
+        &self,
+        items: &[Node],
+        i: usize,
+        pos: usize,
+        caps: &mut Caps,
+        k: &Cont<'_>,
+    ) -> Option<usize> {
+        if i == 0 {
+            return k(pos, caps);
+        }
+        let rest_k = move |p: usize, caps: &mut Caps| self.match_seq_back(items, i - 1, p, caps, k);
+        self.match_node_back(&items[i - 1], pos, caps, &rest_k)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// The backwards mirror of [`MatchCtx::match_repeat`] (no iterative fast
+    /// path; lookbehind bodies are short). RepeatMatcher's capture-clearing
+    /// applies here too.
+    fn match_repeat_back(
+        &self,
+        node: &Node,
+        min: usize,
+        max: Option<usize>,
+        greedy: bool,
+        done: usize,
+        pos: usize,
+        caps: &mut Caps,
+        k: &Cont<'_>,
+    ) -> Option<usize> {
+        let contained = contained_captures(node);
+        if done < min {
+            let more = move |p: usize, caps: &mut Caps| {
+                if p == pos && done >= 1 {
+                    return None;
+                }
+                self.match_repeat_back(node, min, max, greedy, done + 1, p, caps, k)
+            };
+            let saved = clear_captures(caps, &contained);
+            let r = self.match_node_back(node, pos, caps, &more);
+            if r.is_none() {
+                restore_captures(caps, saved);
+            }
+            return r;
+        }
+        let at_max = matches!(max, Some(m) if done >= m);
+        if greedy {
+            if !at_max {
+                let more = move |p: usize, caps: &mut Caps| {
+                    if p == pos {
+                        return None;
+                    }
+                    self.match_repeat_back(node, min, max, greedy, done + 1, p, caps, k)
+                };
+                let saved = clear_captures(caps, &contained);
+                if let Some(r) = self.match_node_back(node, pos, caps, &more) {
+                    return Some(r);
+                }
+                restore_captures(caps, saved);
+            }
+            k(pos, caps)
+        } else {
+            if let Some(r) = k(pos, caps) {
+                return Some(r);
+            }
+            if !at_max {
+                let more = move |p: usize, caps: &mut Caps| {
+                    if p == pos {
+                        return None;
+                    }
+                    self.match_repeat_back(node, min, max, greedy, done + 1, p, caps, k)
+                };
+                let saved = clear_captures(caps, &contained);
+                let r = self.match_node_back(node, pos, caps, &more);
+                if r.is_none() {
+                    restore_captures(caps, saved);
+                }
+                return r;
+            }
+            None
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1715,6 +1996,12 @@ impl<'a> MatchCtx<'a> {
                 }
             }
         }
+        // Spec RepeatMatcher: every repetition ATTEMPT starts with the
+        // captures inside the Atom cleared (`/(z)((a+)?(b+)?(c))*/` must
+        // report group 4 undefined when the final iteration matched "ac").
+        // Cleared state is restored if the attempt fails so completed
+        // iterations keep their captures.
+        let contained = contained_captures(node);
         // Still obligated to match more.
         if done < min {
             let more = move |p: usize, caps: &mut Caps| {
@@ -1724,7 +2011,12 @@ impl<'a> MatchCtx<'a> {
                 }
                 self.match_repeat(node, min, max, greedy, done + 1, p, caps, k)
             };
-            return self.match_node(node, pos, caps, &more);
+            let saved = clear_captures(caps, &contained);
+            let r = self.match_node(node, pos, caps, &more);
+            if r.is_none() {
+                restore_captures(caps, saved);
+            }
+            return r;
         }
         let at_max = matches!(max, Some(m) if done >= m);
 
@@ -1737,9 +2029,11 @@ impl<'a> MatchCtx<'a> {
                     }
                     self.match_repeat(node, min, max, greedy, done + 1, p, caps, k)
                 };
+                let saved = clear_captures(caps, &contained);
                 if let Some(r) = self.match_node(node, pos, caps, &more) {
                     return Some(r);
                 }
+                restore_captures(caps, saved);
             }
             k(pos, caps)
         } else {
@@ -1754,10 +2048,58 @@ impl<'a> MatchCtx<'a> {
                     }
                     self.match_repeat(node, min, max, greedy, done + 1, p, caps, k)
                 };
-                return self.match_node(node, pos, caps, &more);
+                let saved = clear_captures(caps, &contained);
+                let r = self.match_node(node, pos, caps, &more);
+                if r.is_none() {
+                    restore_captures(caps, saved);
+                }
+                return r;
             }
             None
         }
+    }
+}
+
+/// The capture indices of every capturing group inside `node` (the Atom of a
+/// quantifier), for RepeatMatcher's clear-before-each-attempt rule.
+fn contained_captures(node: &Node) -> Vec<usize> {
+    fn walk(node: &Node, out: &mut Vec<usize>) {
+        match node {
+            Node::Group { idx, node } => {
+                if let Some(i) = idx {
+                    out.push(*i);
+                }
+                walk(node, out);
+            }
+            Node::Look { node, .. } | Node::Repeat { node, .. } => walk(node, out),
+            Node::Alt(items) | Node::Concat(items) => {
+                for n in items {
+                    walk(n, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, &mut out);
+    out
+}
+
+/// Clear the given capture slots, returning what they held.
+#[allow(clippy::type_complexity)]
+fn clear_captures(caps: &mut Caps, idxs: &[usize]) -> Vec<(usize, Option<(usize, usize)>)> {
+    let mut saved = Vec::with_capacity(idxs.len());
+    for &i in idxs {
+        if i < caps.len() {
+            saved.push((i, caps[i].take()));
+        }
+    }
+    saved
+}
+
+fn restore_captures(caps: &mut Caps, saved: Vec<(usize, Option<(usize, usize)>)>) {
+    for (i, v) in saved {
+        caps[i] = v;
     }
 }
 
@@ -1869,13 +2211,10 @@ fn fold(c: u32, unicode: bool) -> u32 {
         return c;
     };
     if unicode {
-        // Unicode mode: simple case fold (approximated by lowercase). Operates
-        // on whole code points, so astral case pairs fold correctly.
-        let mut it = ch.to_lowercase();
-        match (it.next(), it.next()) {
-            (Some(x), None) => x as u32,
-            _ => c,
-        }
+        // Unicode mode: the spec's Canonicalize is scf() — Unicode simple
+        // case folding, exactly (`ΐ` folds to `ΐ`; lowercase alone
+        // misses the already-lowercase folds).
+        crate::unicode_tables::simple_case_fold(c)
     } else {
         // Legacy mode: uppercase, single code unit only, with the guard that a
         // non-ASCII character must not fold *to* ASCII (so e.g. `K` Kelvin
@@ -1936,12 +2275,23 @@ fn is_line_terminator(c: u32) -> bool {
 }
 
 fn is_regex_space(c: u32) -> bool {
-    // \s per spec: WhiteSpace + LineTerminator. All members are BMP, so a code
-    // unit is sufficient; widen to `char` for the general White_Space test.
+    // \s per spec: WhiteSpace + LineTerminator — the enumerated members plus
+    // the Zs (space-separator) category, exactly. NOT Rust's White_Space,
+    // which also contains U+0085 NEL (a Cc the spec excludes).
     matches!(
         c,
-        0x20 | 0x09 | 0x0B | 0x0C | 0xA0 | 0xFEFF | 0x0A | 0x0D | 0x2028 | 0x2029
-    ) || char::from_u32(c).is_some_and(|ch| ch.is_whitespace())
+        0x09..=0x0D
+            | 0x20
+            | 0xA0
+            | 0x1680
+            | 0x2000..=0x200A
+            | 0x2028
+            | 0x2029
+            | 0x202F
+            | 0x205F
+            | 0x3000
+            | 0xFEFF
+    )
 }
 
 // =========================================================================

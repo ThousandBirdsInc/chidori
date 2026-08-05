@@ -20,6 +20,7 @@ pub fn install(vm: &mut Vm) {
     install_kind_ctors(vm, &ta_ctor);
     install_data_view(vm);
     install_atomics(vm);
+    install_base64_hex(vm);
 }
 
 // =========================================================================
@@ -3085,4 +3086,440 @@ fn is_iterable(vm: &mut Vm, v: &Value) -> Result<bool, Value> {
         return Err(vm.throw_type("Symbol.iterator is not a function"));
     }
     Ok(true)
+}
+
+// =========================================================================
+// Uint8Array base64 / hex (the `uint8array-base64` proposal, ES2026)
+// =========================================================================
+
+/// Install `Uint8Array.fromBase64/fromHex` and
+/// `Uint8Array.prototype.toBase64/toHex/setFromBase64/setFromHex`.
+fn install_base64_hex(vm: &mut Vm) {
+    let global = vm.realm.global.clone();
+    let ctor = match vm
+        .get_prop(&Value::Object(global), &PropertyKey::str("Uint8Array"))
+        .ok()
+    {
+        Some(Value::Object(o)) => o,
+        _ => return,
+    };
+    let proto = match vm
+        .get_prop(&Value::Object(ctor.clone()), &PropertyKey::str("prototype"))
+        .ok()
+    {
+        Some(Value::Object(o)) => o,
+        _ => return,
+    };
+
+    vm.define_method(&ctor, "fromBase64", 1, |vm, _t, args| {
+        let s = match arg(args, 0) {
+            Value::String(s) => s,
+            _ => return Err(vm.throw_type("Uint8Array.fromBase64 requires a string")),
+        };
+        let (url, lch) = base64_options(vm, &arg(args, 1), true)?;
+        let (_read, bytes, error) = from_base64(&s, url, lch, usize::MAX);
+        if error {
+            return Err(vm.throw_syntax("invalid base64 string"));
+        }
+        Ok(new_u8_array(vm, bytes))
+    });
+    vm.define_method(&ctor, "fromHex", 1, |vm, _t, args| {
+        let s = match arg(args, 0) {
+            Value::String(s) => s,
+            _ => return Err(vm.throw_type("Uint8Array.fromHex requires a string")),
+        };
+        let (_read, bytes, error) = from_hex(&s, usize::MAX);
+        if error {
+            return Err(vm.throw_syntax("invalid hex string"));
+        }
+        Ok(new_u8_array(vm, bytes))
+    });
+
+    vm.define_method(&proto, "toBase64", 0, |vm, this, args| {
+        let ta = validate_uint8(vm, &this)?;
+        let (url, _lch) = base64_options(vm, &arg(args, 0), false)?;
+        let omit = {
+            let opts = arg(args, 0);
+            if opts.is_undefined() {
+                false
+            } else {
+                let v = vm.get_prop(&opts, &PropertyKey::str("omitPadding"))?;
+                vm.to_boolean(&v)
+            }
+        };
+        let bytes = uint8_contents(vm, &ta)?;
+        Ok(Value::str(to_base64(&bytes, url, omit)))
+    });
+    vm.define_method(&proto, "toHex", 0, |vm, this, _args| {
+        let ta = validate_uint8(vm, &this)?;
+        let bytes = uint8_contents(vm, &ta)?;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+            out.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+        }
+        Ok(Value::str(out))
+    });
+
+    vm.define_method(&proto, "setFromBase64", 1, |vm, this, args| {
+        let ta = validate_uint8(vm, &this)?;
+        let s = match arg(args, 0) {
+            Value::String(s) => s,
+            _ => return Err(vm.throw_type("setFromBase64 requires a string")),
+        };
+        let (url, lch) = base64_options(vm, &arg(args, 1), true)?;
+        let cap = uint8_writable_len(vm, &ta)?;
+        let (read, bytes, error) = from_base64(&s, url, lch, cap);
+        let written = bytes.len();
+        write_uint8(&ta, &bytes);
+        if error {
+            return Err(vm.throw_syntax("invalid base64 string"));
+        }
+        Ok(read_written_result(vm, read, written))
+    });
+    vm.define_method(&proto, "setFromHex", 1, |vm, this, args| {
+        let ta = validate_uint8(vm, &this)?;
+        let s = match arg(args, 0) {
+            Value::String(s) => s,
+            _ => return Err(vm.throw_type("setFromHex requires a string")),
+        };
+        let cap = uint8_writable_len(vm, &ta)?;
+        let (read, bytes, error) = from_hex(&s, cap);
+        let written = bytes.len();
+        write_uint8(&ta, &bytes);
+        if error {
+            return Err(vm.throw_syntax("invalid hex string"));
+        }
+        Ok(read_written_result(vm, read, written))
+    });
+}
+
+/// How a trailing partial base64 chunk is treated.
+#[derive(Clone, Copy, PartialEq)]
+enum LastChunk {
+    Loose,
+    Strict,
+    StopBeforePartial,
+}
+
+/// GetOptionsObject + the `alphabet` (and, when `want_lch`, the
+/// `lastChunkHandling`) options: values must be exactly the spec strings —
+/// no ToString coercion.
+fn base64_options(vm: &mut Vm, opts: &Value, want_lch: bool) -> Result<(bool, LastChunk), Value> {
+    if opts.is_undefined() {
+        return Ok((false, LastChunk::Loose));
+    }
+    if !matches!(opts, Value::Object(_)) {
+        return Err(vm.throw_type("options must be an object or undefined"));
+    }
+    let a = vm.get_prop(opts, &PropertyKey::str("alphabet"))?;
+    let url = match &a {
+        Value::Undefined => false,
+        Value::String(s) => match s.as_str() {
+            "base64" => false,
+            "base64url" => true,
+            _ => return Err(vm.throw_type("alphabet must be \"base64\" or \"base64url\"")),
+        },
+        _ => return Err(vm.throw_type("alphabet must be a string")),
+    };
+    let mut lch = LastChunk::Loose;
+    if want_lch {
+        let l = vm.get_prop(opts, &PropertyKey::str("lastChunkHandling"))?;
+        lch = match &l {
+            Value::Undefined => LastChunk::Loose,
+            Value::String(s) => match s.as_str() {
+                "loose" => LastChunk::Loose,
+                "strict" => LastChunk::Strict,
+                "stop-before-partial" => LastChunk::StopBeforePartial,
+                _ => return Err(vm.throw_type(
+                    "lastChunkHandling must be \"loose\", \"strict\", or \"stop-before-partial\"",
+                )),
+            },
+            _ => return Err(vm.throw_type("lastChunkHandling must be a string")),
+        };
+    }
+    Ok((url, lch))
+}
+
+/// ValidateUint8Array: the receiver must be a `Uint8Array` (not clamped, not
+/// another kind).
+fn validate_uint8(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
+    if let Value::Object(o) = this {
+        if let Internal::TypedArray(t) = &o.borrow().internal {
+            if matches!(t.kind, TAKind::U8) {
+                return Ok(o.clone());
+            }
+        }
+    }
+    Err(vm.throw_type("receiver must be a Uint8Array"))
+}
+
+/// The view's current bytes (empty when detached/out of bounds is an error:
+/// spec re-validates the buffer witness after option getters ran).
+fn uint8_contents(vm: &mut Vm, o: &JsObject) -> Result<Vec<u8>, Value> {
+    let b = o.borrow();
+    if let Internal::TypedArray(t) = &b.internal {
+        if crate::typed_array::ta_out_of_bounds(t) {
+            return Err(vm.throw_type("typed array is detached or out of bounds"));
+        }
+        let len = crate::typed_array::ta_eff_length(t);
+        let buf = t.buffer.borrow();
+        if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
+            return Ok(bytes[t.byte_offset..t.byte_offset + len].to_vec());
+        }
+    }
+    Err(vm.throw_type("typed array is detached or out of bounds"))
+}
+
+/// The view's writable length, re-validated after option getters ran.
+fn uint8_writable_len(vm: &mut Vm, o: &JsObject) -> Result<usize, Value> {
+    let b = o.borrow();
+    if let Internal::TypedArray(t) = &b.internal {
+        if crate::typed_array::ta_out_of_bounds(t) {
+            return Err(vm.throw_type("typed array is detached or out of bounds"));
+        }
+        return Ok(crate::typed_array::ta_eff_length(t));
+    }
+    Err(vm.throw_type("receiver must be a Uint8Array"))
+}
+
+/// SetUint8ArrayBytes: write `bytes` at the view's start.
+fn write_uint8(o: &JsObject, bytes: &[u8]) {
+    let b = o.borrow();
+    if let Internal::TypedArray(t) = &b.internal {
+        let mut buf = t.buffer.borrow_mut();
+        if let Internal::ArrayBuffer(Some(dst)) = &mut buf.internal {
+            let start = t.byte_offset;
+            dst[start..start + bytes.len()].copy_from_slice(bytes);
+        }
+    }
+}
+
+/// A fresh `Uint8Array` over its own buffer holding `bytes`.
+fn new_u8_array(vm: &mut Vm, bytes: Vec<u8>) -> Value {
+    let len = bytes.len();
+    let buf = vm.alloc(ObjectData::new(
+        Some(vm.realm.array_buffer_proto.clone()),
+        Internal::ArrayBuffer(Some(bytes)),
+    ));
+    let proto = match vm.get_prop(
+        &Value::Object(vm.realm.global.clone()),
+        &PropertyKey::str("Uint8Array"),
+    ) {
+        Ok(Value::Object(c)) => {
+            match vm.get_prop(&Value::Object(c), &PropertyKey::str("prototype")) {
+                Ok(Value::Object(p)) => p,
+                _ => vm.realm.typed_array_proto.clone(),
+            }
+        }
+        _ => vm.realm.typed_array_proto.clone(),
+    };
+    Value::Object(vm.new_typed_array(TAKind::U8, buf, 0, len, proto))
+}
+
+/// `{ read, written }` result object for the set-from methods.
+fn read_written_result(vm: &mut Vm, read: usize, written: usize) -> Value {
+    let o = vm.new_object();
+    o.borrow_mut().own_insert(
+        PropertyKey::str("read"),
+        Property::data(Value::Number(read as f64)),
+    );
+    o.borrow_mut().own_insert(
+        PropertyKey::str("written"),
+        Property::data(Value::Number(written as f64)),
+    );
+    Value::Object(o)
+}
+
+fn is_b64_ws(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+}
+
+fn b64_char_value(b: u8, url: bool) -> Option<u8> {
+    match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' if !url => Some(62),
+        b'/' if !url => Some(63),
+        b'-' if url => Some(62),
+        b'_' if url => Some(63),
+        _ => None,
+    }
+}
+
+/// The spec's FromBase64: returns (code units read, decoded bytes, error).
+/// On error the bytes decoded BEFORE the error are still returned — the
+/// set-from methods write them before throwing. `max_len` bounds the output
+/// (the target's capacity); hitting it stops cleanly with `read` at the end
+/// of the last complete chunk consumed.
+fn from_base64(
+    s: &crate::value::JsString,
+    url: bool,
+    lch: LastChunk,
+    max_len: usize,
+) -> (usize, Vec<u8>, bool) {
+    // Any non-ASCII code unit is an illegal character, so byte-wise iteration
+    // over the WTF-8 view is exact: multi-byte sequences hit the error arm,
+    // and for the all-ASCII success path bytes == code units.
+    let input = s.wtf8_bytes();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4];
+    let mut chunk_len = 0usize;
+    let mut read = 0usize;
+    let mut i = 0usize;
+    if max_len == 0 {
+        return (0, bytes, false);
+    }
+    loop {
+        while i < input.len() && is_b64_ws(input[i]) {
+            i += 1;
+        }
+        if i == input.len() {
+            if chunk_len > 0 {
+                if lch == LastChunk::StopBeforePartial {
+                    return (read, bytes, false);
+                }
+                if lch == LastChunk::Loose {
+                    if chunk_len == 1 {
+                        return (read, bytes, true);
+                    }
+                    decode_chunk(&chunk[..chunk_len], &mut bytes);
+                } else {
+                    return (read, bytes, true);
+                }
+            }
+            return (input.len(), bytes, false);
+        }
+        let c = input[i];
+        i += 1;
+        if c == b'=' {
+            if chunk_len < 2 {
+                return (read, bytes, true);
+            }
+            while i < input.len() && is_b64_ws(input[i]) {
+                i += 1;
+            }
+            if chunk_len == 2 {
+                if i == input.len() {
+                    if lch == LastChunk::StopBeforePartial {
+                        return (read, bytes, false);
+                    }
+                    return (read, bytes, true);
+                }
+                let c2 = input[i];
+                i += 1;
+                if c2 != b'=' {
+                    return (read, bytes, true);
+                }
+                while i < input.len() && is_b64_ws(input[i]) {
+                    i += 1;
+                }
+            }
+            if i < input.len() {
+                return (read, bytes, true);
+            }
+            if lch == LastChunk::Strict && has_extra_bits(&chunk[..chunk_len]) {
+                return (read, bytes, true);
+            }
+            decode_chunk(&chunk[..chunk_len], &mut bytes);
+            return (input.len(), bytes, false);
+        }
+        let v = match b64_char_value(c, url) {
+            Some(v) => v,
+            None => return (read, bytes, true),
+        };
+        // Stop before a partial chunk would overflow the capacity.
+        let remaining = max_len - bytes.len();
+        if (remaining == 1 && chunk_len == 2) || (remaining == 2 && chunk_len == 3) {
+            return (read, bytes, false);
+        }
+        chunk[chunk_len] = v;
+        chunk_len += 1;
+        if chunk_len == 4 {
+            decode_chunk(&chunk, &mut bytes);
+            chunk_len = 0;
+            read = i;
+            if bytes.len() == max_len {
+                return (read, bytes, false);
+            }
+        }
+    }
+}
+
+/// Decode a 2/3/4-value chunk into 1/2/3 bytes.
+fn decode_chunk(vals: &[u8], out: &mut Vec<u8>) {
+    match vals.len() {
+        2 => out.push((vals[0] << 2) | (vals[1] >> 4)),
+        3 => {
+            out.push((vals[0] << 2) | (vals[1] >> 4));
+            out.push((vals[1] << 4) | (vals[2] >> 2));
+        }
+        4 => {
+            out.push((vals[0] << 2) | (vals[1] >> 4));
+            out.push((vals[1] << 4) | (vals[2] >> 2));
+            out.push((vals[2] << 6) | vals[3]);
+        }
+        _ => {}
+    }
+}
+
+/// In strict mode a padded final chunk must have zero unused bits.
+fn has_extra_bits(vals: &[u8]) -> bool {
+    match vals.len() {
+        2 => vals[1] & 0xf != 0,
+        3 => vals[2] & 0x3 != 0,
+        _ => false,
+    }
+}
+
+/// The spec's FromHex: (code units read, bytes, error), partial bytes kept.
+fn from_hex(s: &crate::value::JsString, max_len: usize) -> (usize, Vec<u8>, bool) {
+    let input = s.wtf8_bytes();
+    let mut bytes = Vec::new();
+    if !input.len().is_multiple_of(2) {
+        // Odd length is an immediate syntax error, but bytes decoded before
+        // a (hypothetical) earlier bad digit still matter — the spec checks
+        // length first, before reading any digit.
+        return (0, bytes, true);
+    }
+    let mut i = 0;
+    while i < input.len() && bytes.len() < max_len {
+        let hi = (input[i] as char).to_digit(16);
+        let lo = input.get(i + 1).and_then(|&b| (b as char).to_digit(16));
+        // Uppercase and lowercase hex both decode.
+        match (hi, lo) {
+            (Some(h), Some(l)) => bytes.push(((h << 4) | l) as u8),
+            _ => return (i, bytes, true),
+        }
+        i += 2;
+    }
+    (i, bytes, false)
+}
+
+/// Encode to base64 (standard or url alphabet, padded unless omitted).
+fn to_base64(bytes: &[u8], url: bool, omit_padding: bool) -> String {
+    const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let table = if url { URL } else { STD };
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let b0 = c[0] as u32;
+        let b1 = c.get(1).copied().unwrap_or(0) as u32;
+        let b2 = c.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(table[(n >> 18) as usize & 63] as char);
+        out.push(table[(n >> 12) as usize & 63] as char);
+        if c.len() > 1 {
+            out.push(table[(n >> 6) as usize & 63] as char);
+        } else if !omit_padding {
+            out.push('=');
+        }
+        if c.len() > 2 {
+            out.push(table[n as usize & 63] as char);
+        } else if !omit_padding {
+            out.push('=');
+        }
+    }
+    out
 }

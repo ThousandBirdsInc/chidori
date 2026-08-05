@@ -26,12 +26,36 @@ pub fn install(vm: &mut Vm) {
     let proto = vm.realm.regexp_proto.clone();
 
     // RegExp(pattern, flags?) / RegExp(regexpObj[, flags]).
+    // The call form has the spec's identity short-circuit (22.2.4.1 step 2):
+    // `RegExp(x)` with no flags returns `x` unchanged when x is regexp-like
+    // and `x.constructor` is %RegExp% itself. The cell is filled with the
+    // constructor object right after creation.
+    let ctor_cell: std::rc::Rc<std::cell::OnceCell<JsObject>> =
+        std::rc::Rc::new(std::cell::OnceCell::new());
+    let cc = ctor_cell.clone();
     let ctor = vm.new_native_ctor(
         "RegExp",
         2,
-        |vm, _t, args| construct_regexp(vm, args),
-        |vm, _t, args| construct_regexp(vm, args),
+        move |vm, _t, args| {
+            let pat = arg(args, 0);
+            let pattern_is_regexp = spec_is_regexp(vm, &pat)?;
+            if pattern_is_regexp && arg(args, 1).is_undefined() {
+                let c = vm.get_prop(&pat, &PropertyKey::str("constructor"))?;
+                if let (Value::Object(co), Some(me)) = (&c, cc.get()) {
+                    if co.ptr_eq(me) {
+                        return Ok(pat);
+                    }
+                }
+            }
+            construct_regexp(vm, args, pattern_is_regexp)
+        },
+        |vm, _t, args| {
+            let pat = arg(args, 0);
+            let pattern_is_regexp = spec_is_regexp(vm, &pat)?;
+            construct_regexp(vm, args, pattern_is_regexp)
+        },
     );
+    let _ = ctor_cell.set(ctor.clone());
     vm.install_ctor("RegExp", &ctor, &proto);
     vm.install_species(&ctor);
 
@@ -42,7 +66,10 @@ pub fn install(vm: &mut Vm) {
         if !matches!(v, Value::String(_)) {
             return Err(vm.throw_type("RegExp.escape requires a string argument"));
         }
-        let s = vm.to_string_lossy(&v);
+        let s = match &v {
+            Value::String(s) => s.clone(),
+            _ => unreachable!("checked above"),
+        };
         Ok(Value::str(regexp_escape(&s)))
     });
 
@@ -81,7 +108,9 @@ pub fn install(vm: &mut Vm) {
     // When the receiver is `RegExp.prototype` itself (the bare intrinsic, which
     // is not a real RegExp), the spec mandates: `source` -> "(?:)",
     // `flags` -> "", and every boolean flag getter -> `undefined` (NOT false).
-    define_string_getter(vm, &proto, "source", |_vm, src, _fl| Value::str(src));
+    define_string_getter(vm, &proto, "source", |_vm, src, _fl| {
+        Value::str(escape_regexp_pattern(&src))
+    });
     // `flags` is a generic getter: it reads the individual flag properties off
     // the receiver (any object) and assembles the string in canonical order.
     let flags_getter = vm.new_native("get flags", 0, |vm, this, _a| {
@@ -262,40 +291,76 @@ fn validate_flags(flags: &str) -> Result<(), String> {
 /// source (and its flags, unless an explicit `flags` argument overrides them).
 /// Flags are validated (duplicate or unknown -> SyntaxError) and `lastIndex` is
 /// installed as a writable data property initialized to 0 (by `make_regexp`).
-fn construct_regexp(vm: &mut Vm, args: &[Value]) -> Result<Value, Value> {
+fn construct_regexp(vm: &mut Vm, args: &[Value], pattern_is_regexp: bool) -> Result<Value, Value> {
     let pat_arg = arg(args, 0);
     let flags_arg = arg(args, 1);
 
-    // RegExp(regexp) / RegExp(regexp, flags): copy source, override flags.
-    if is_regexp(&pat_arg) {
-        if let Value::Object(o) = &pat_arg {
-            let (source, existing_flags) = regexp_source_flags(o);
-            let flags = if flags_arg.is_undefined() {
-                existing_flags
+    let (pattern, flags) = if is_regexp(&pat_arg) {
+        // A real RegExp (has the matcher slots): copy source; flags come from
+        // the slots unless overridden (an override goes through ToString and
+        // may throw).
+        let (source, existing_flags) = match &pat_arg {
+            Value::Object(o) => regexp_source_flags(o),
+            _ => unreachable!("is_regexp implies object"),
+        };
+        let flags = if flags_arg.is_undefined() {
+            existing_flags
+        } else {
+            vm.to_js_string(&flags_arg)?.as_str().to_string()
+        };
+        (source, flags)
+    } else if pattern_is_regexp {
+        // RegExp-like (branded via @@match): read source/flags as ordinary
+        // properties.
+        let pv = vm.get_prop(&pat_arg, &PropertyKey::str("source"))?;
+        let pattern = if pv.is_undefined() {
+            String::new()
+        } else {
+            vm.to_js_string(&pv)?.as_str().to_string()
+        };
+        let flags = if flags_arg.is_undefined() {
+            let fv = vm.get_prop(&pat_arg, &PropertyKey::str("flags"))?;
+            if fv.is_undefined() {
+                String::new()
             } else {
-                vm.to_string_lossy(&flags_arg)
-            };
-            if let Err(msg) = validate_flags(&flags) {
-                return Err(vm.throw_syntax(&msg));
+                vm.to_js_string(&fv)?.as_str().to_string()
             }
-            return vm.make_regexp(&source, &flags);
-        }
-    }
-
-    let pattern = if pat_arg.is_undefined() {
-        String::new()
+        } else {
+            vm.to_js_string(&flags_arg)?.as_str().to_string()
+        };
+        (pattern, flags)
     } else {
-        vm.to_string_lossy(&pat_arg)
-    };
-    let flags = if flags_arg.is_undefined() {
-        String::new()
-    } else {
-        vm.to_string_lossy(&flags_arg)
+        let pattern = if pat_arg.is_undefined() {
+            String::new()
+        } else {
+            vm.to_js_string(&pat_arg)?.as_str().to_string()
+        };
+        let flags = if flags_arg.is_undefined() {
+            String::new()
+        } else {
+            vm.to_js_string(&flags_arg)?.as_str().to_string()
+        };
+        (pattern, flags)
     };
     if let Err(msg) = validate_flags(&flags) {
         return Err(vm.throw_syntax(&msg));
     }
     vm.make_regexp(&pattern, &flags)
+}
+
+/// Spec `IsRegExp` (7.2.6), observable: reads `@@match` once; a defined,
+/// truthy value brands any object as a regexp; otherwise fall back to the
+/// internal matcher slot.
+fn spec_is_regexp(vm: &mut Vm, v: &Value) -> Result<bool, Value> {
+    if !matches!(v, Value::Object(_)) {
+        return Ok(false);
+    }
+    let sym = PropertyKey::Sym(vm.realm.symbol_match.clone());
+    let m = vm.get_prop(v, &sym)?;
+    if !m.is_undefined() {
+        return Ok(vm.to_boolean(&m));
+    }
+    Ok(is_regexp(v))
 }
 
 /// Require `this` to be an Object (for the generic `@@match`/`@@replace`/etc.),
@@ -314,15 +379,36 @@ fn require_object(vm: &mut Vm, this: &Value, method: &str) -> Result<(), Value> 
 /// `RegExp.escape(S)` per ES2025: escape every code point of `s` so the result
 /// matches `s` literally in a RegExp. A leading ASCII alphanumeric is hex-escaped
 /// so the output can't merge with preceding text.
-fn regexp_escape(s: &str) -> String {
+fn regexp_escape(s: &JsString) -> String {
+    let units = s.to_utf16_vec();
     let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i == 0 && c.is_ascii_alphanumeric() {
-            // Always ≤ 0x7F here, so a 2-digit \xHH suffices.
-            out.push_str(&format!("\\x{:02x}", c as u32));
+    let mut i = 0;
+    let mut first = true;
+    while i < units.len() {
+        let u = units[i];
+        // Decode one code point, pairing surrogates; a lone surrogate stays a
+        // code point of its own and gets a \uXXXX escape below.
+        let (cp, adv) = if (0xD800..=0xDBFF).contains(&u)
+            && i + 1 < units.len()
+            && (0xDC00..=0xDFFF).contains(&units[i + 1])
+        {
+            (
+                0x10000 + (((u as u32 - 0xD800) << 10) | (units[i + 1] as u32 - 0xDC00)),
+                2,
+            )
         } else {
+            (u as u32, 1)
+        };
+        if first && cp < 0x80 && (cp as u8).is_ascii_alphanumeric() {
+            // Always ≤ 0x7F here, so a 2-digit \xHH suffices.
+            out.push_str(&format!("\\x{cp:02x}"));
+        } else if (0xD800..=0xDFFF).contains(&cp) {
+            out.push_str(&format!("\\u{cp:04x}"));
+        } else if let Some(c) = char::from_u32(cp) {
             out.push_str(&encode_for_regexp_escape(c));
         }
+        first = false;
+        i += adv;
     }
     out
 }
@@ -489,13 +575,15 @@ fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
 /// Generic `RegExp.prototype[@@match]` (spec 22.2.6.8): operates on any receiver
 /// via `RegExpExec` and the `global`/`unicode`/`lastIndex` properties.
 pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value, Value> {
-    let g = vm.get_prop(rx, &PropertyKey::str("global"))?;
-    let global = vm.to_boolean(&g);
+    // Spec (22.2.6.8): global/unicode come from ToString(? Get(rx, "flags")),
+    // not from the individual boolean properties.
+    let flags_v = vm.get_prop(rx, &PropertyKey::str("flags"))?;
+    let flags = vm.to_js_string(&flags_v)?;
+    let global = flags.as_str().contains('g');
     if !global {
         return regexp_exec_abstract(vm, rx, s);
     }
-    let u = vm.get_prop(rx, &PropertyKey::str("unicode"))?;
-    let unicode = vm.to_boolean(&u);
+    let unicode = flags.as_str().contains('u') || flags.as_str().contains('v');
     let units = s.to_utf16_vec();
     vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
     let mut out: Vec<Value> = Vec::new();
@@ -667,13 +755,14 @@ pub fn sym_replace_generic(
     } else {
         vm.to_js_string(repl)?.to_utf16_vec()
     };
-    let g = vm.get_prop(rx, &PropertyKey::str("global"))?;
-    let global = vm.to_boolean(&g);
+    // Spec (22.2.6.11): global/unicode come from ToString(? Get(rx, "flags")),
+    // not from the individual boolean properties.
+    let flags_v = vm.get_prop(rx, &PropertyKey::str("flags"))?;
+    let flags = vm.to_js_string(&flags_v)?;
+    let global = flags.as_str().contains('g');
     let unicode = if global {
-        let u = vm.get_prop(rx, &PropertyKey::str("unicode"))?;
-        let unicode = vm.to_boolean(&u);
         vm.set_prop_strict(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
-        unicode
+        flags.as_str().contains('u') || flags.as_str().contains('v')
     } else {
         false
     };
@@ -963,6 +1052,54 @@ pub fn build_match_array(
 /// Install a string-valued accessor getter (`source`, `flags`) on the
 /// prototype. On the bare `RegExp.prototype` receiver the canonical empty
 /// values are reported.
+/// EscapeRegExpPattern: escape `/` and line terminators so that
+/// `"/" + source + "/" + flags` re-parses as an equivalent literal. A `/`
+/// inside a character class needs no escape; an already-escaped `/` is left
+/// alone; a line terminator becomes its escape sequence (turning e.g. a
+/// literal `\<LF>` continuation into `\n`, which matches identically).
+fn escape_regexp_pattern(src: &str) -> String {
+    if src.is_empty() {
+        return "(?:)".to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut in_class = false;
+    let mut escaped = false;
+    for c in src.chars() {
+        if escaped {
+            match c {
+                '\n' => out.push('n'),
+                '\r' => out.push('r'),
+                '\u{2028}' => out.push_str("u2028"),
+                '\u{2029}' => out.push_str("u2029"),
+                _ => out.push(c),
+            }
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => {
+                out.push('\\');
+                escaped = true;
+            }
+            '/' if !in_class => out.push_str("\\/"),
+            '[' => {
+                in_class = true;
+                out.push('[');
+            }
+            ']' => {
+                in_class = false;
+                out.push(']');
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn define_string_getter(
     vm: &mut Vm,
     proto: &JsObject,
