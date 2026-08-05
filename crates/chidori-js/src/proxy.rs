@@ -57,6 +57,35 @@ impl Vm {
         }
     }
 
+    /// `GetFunctionRealm(obj)` reduced to its only script-observable effect in
+    /// a single-realm engine: it unwraps bound functions and proxies down to
+    /// the underlying function, and throws a **TypeError** when it reaches a
+    /// REVOKED proxy. `GetPrototypeFromConstructor` calls it whenever
+    /// `constructor.prototype` is not an object, which is how
+    /// `new revokedProxyOfAFunction()` becomes a TypeError rather than an
+    /// object with the default prototype.
+    pub fn get_function_realm_check(&mut self, v: &Value) -> Result<(), Value> {
+        let mut cur = match v {
+            Value::Object(o) => o.clone(),
+            _ => return Ok(()),
+        };
+        // Bound/proxy chains are finite (each link wraps an already-existing
+        // object, so they cannot be cyclic), but cap the walk anyway.
+        for _ in 0..1000 {
+            let next = match &cur.borrow().internal {
+                Internal::Proxy(p) if p.revoked => None,
+                Internal::Proxy(p) => Some(p.target.clone()),
+                Internal::Function(FunctionInner::Bound(b)) => Some(b.target.clone()),
+                _ => return Ok(()),
+            };
+            match next {
+                None => return Err(self.throw_type("Cannot perform operation on a revoked proxy")),
+                Some(t) => cur = t,
+            }
+        }
+        Ok(())
+    }
+
     /// Look up a trap on the handler: `None` if absent/undefined/null, `Some(fn)`
     /// if callable, else a TypeError.
     fn proxy_trap(&mut self, handler: &JsObject, name: &str) -> Result<Option<Value>, Value> {
@@ -546,6 +575,10 @@ impl Vm {
                 if matches!(target.borrow().internal, Internal::Proxy(_)) {
                     return self.proxy_get_own_descriptor(&target, key);
                 }
+                // A trapless proxy over the global forwards to the target's
+                // [[GetOwnProperty]] — same transparency rule as the direct
+                // reflection paths.
+                crate::builtins::materialize_lazy_for_key(self, &target, key);
                 Ok(match own_property_descriptor(&target, key) {
                     Some(p) => descriptor_to_object(self, &p),
                     None => Value::Undefined,

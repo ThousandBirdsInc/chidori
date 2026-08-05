@@ -173,8 +173,12 @@ impl Vm {
                     match kind {
                         ResumeKind::Throw => self.reject_promise(&result, value),
                         ResumeKind::Return => {
-                            let r = self.make_iter_result(value, true);
-                            self.resolve_promise(&result, r);
+                            // AsyncGeneratorAwaitReturn: the returned value is
+                            // AWAITED even on an already-completed generator,
+                            // so a thenable unwraps and a rejection (or a
+                            // poisoned `constructor`) rejects this request.
+                            self.agen_await_return(gobj, value, &result);
+                            return;
                         }
                         ResumeKind::Next => {
                             let r = self.make_iter_result(Value::Undefined, true);
@@ -193,33 +197,26 @@ impl Vm {
                             // `{value, done:true}`; a rejected value rejects
                             // the result.
                             self.set_gen_state(gobj, GeneratorState::Completed);
-                            let target = self.promise_resolve(value);
-                            let gen_f = gobj.clone();
-                            let res_f = result.clone();
-                            let on_f = self.new_native("", 1, move |vm, _t, args| {
-                                let v = args.first().cloned().unwrap_or(Value::Undefined);
-                                let r = vm.make_iter_result(v, true);
-                                vm.resolve_promise(&res_f, r);
-                                vm.agen_complete_step(&gen_f);
-                                Ok(Value::Undefined)
-                            });
-                            let gen_r = gobj.clone();
-                            let res_r = result.clone();
-                            let on_r = self.new_native("", 1, move |vm, _t, args| {
-                                let e = args.first().cloned().unwrap_or(Value::Undefined);
-                                vm.reject_promise(&res_r, e);
-                                vm.agen_complete_step(&gen_r);
-                                Ok(Value::Undefined)
-                            });
-                            self.promise_then(&target, Value::Object(on_f), Value::Object(on_r));
+                            self.agen_await_return(gobj, value, &result);
                             return; // completion is async; on_f/on_r re-drain
                         }
                         // Suspended at a yield: AsyncGeneratorUnwrapYieldResumption
                         // — Await the return value, then resume the frame with a
                         // Return completion so enclosing `finally` blocks run and
                         // a `yield*` delegates to the inner iterator's `return`.
-                        // A rejected awaited value resumes with a Throw instead.
-                        let target = self.promise_resolve(value);
+                        // A rejected awaited value resumes with a Throw instead
+                        // — including a `PromiseResolve` that threw outright
+                        // (a poisoned `constructor` getter on the value).
+                        let target = match self.promise_resolve_intrinsic(value) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let token = frame.trace_token;
+                                self.trace_resume(token);
+                                let flow = self.resume_frame_throw(frame, e);
+                                self.agen_drive(gobj, flow, &result, token);
+                                return;
+                            }
+                        };
                         let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(frame)));
                         let gen_f = gobj.clone();
                         let res_f = result.clone();
@@ -264,6 +261,41 @@ impl Vm {
         }
     }
 
+    /// `AsyncGeneratorAwaitReturn`: await the value of a `return()` request
+    /// against a generator that is not running a body (suspendedStart or
+    /// completed), then settle the request with `{value, done: true}`. A
+    /// rejected value — or a `PromiseResolve` that throws outright, e.g. a
+    /// poisoned `constructor` getter — rejects the request instead.
+    fn agen_await_return(&mut self, gobj: &JsObject, value: Value, result: &JsObject) {
+        let target = match self.promise_resolve_intrinsic(value) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_gen_state(gobj, GeneratorState::Completed);
+                self.reject_promise(result, e);
+                self.agen_complete_step(gobj);
+                return;
+            }
+        };
+        let gen_f = gobj.clone();
+        let res_f = result.clone();
+        let on_f = self.new_native("", 1, move |vm, _t, args| {
+            let v = args.first().cloned().unwrap_or(Value::Undefined);
+            let r = vm.make_iter_result(v, true);
+            vm.resolve_promise(&res_f, r);
+            vm.agen_complete_step(&gen_f);
+            Ok(Value::Undefined)
+        });
+        let gen_r = gobj.clone();
+        let res_r = result.clone();
+        let on_r = self.new_native("", 1, move |vm, _t, args| {
+            let e = args.first().cloned().unwrap_or(Value::Undefined);
+            vm.reject_promise(&res_r, e);
+            vm.agen_complete_step(&gen_r);
+            Ok(Value::Undefined)
+        });
+        self.promise_then(&target, Value::Object(on_f), Value::Object(on_r));
+    }
+
     /// Remove the just-settled front request, then drive the next queued one.
     /// Called when a step finishes (a yield surfaces, or the generator
     /// returns/throws) — the point where the current request's promise settles.
@@ -305,8 +337,17 @@ impl Vm {
                     // value; one that rejects is thrown back into the generator
                     // at the yield point (so `yield Promise.reject(e)` with no
                     // local handler rejects this `next()` and closes the gen).
-                    let target = self.promise_resolve(y);
-                    let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(s.frame)));
+                    let mut frame = s.frame;
+                    let target = match self.promise_resolve_intrinsic(y) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            frame.skip_delegation_throw = true;
+                            let flow = self.resume_frame_throw(frame, e);
+                            self.agen_drive(gobj, flow, result, token);
+                            return;
+                        }
+                    };
+                    let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(frame)));
                     let gen_f = gobj.clone();
                     let res_f = result.clone();
                     let cell_f = cell.clone();
@@ -344,8 +385,17 @@ impl Vm {
                     // Internal await: resume the frame when `awaited` settles,
                     // then keep driving the SAME result promise. The trace token
                     // rides `s.frame`, so each resume re-reads it.
-                    let target = self.promise_resolve(awaited);
-                    let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(s.frame)));
+                    let frame = s.frame;
+                    let target = match self.promise_resolve_intrinsic(awaited) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let token = frame.trace_token;
+                            let flow = self.resume_frame_throw(frame, e);
+                            self.agen_drive(gobj, flow, result, token);
+                            return;
+                        }
+                    };
+                    let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(frame)));
                     let gen_f = gobj.clone();
                     let res_f = result.clone();
                     let cell_f = cell.clone();

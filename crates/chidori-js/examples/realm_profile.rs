@@ -5,6 +5,13 @@
 //! This is the measurement behind the realm numbers in
 //! `docs/resume-performance.md` — rerun it before acting on them.
 //!
+//! Two caveats. The `date`/`typedarray`/`intl`/`temporal` rows time only the
+//! lazy accessor stubs those sections now install (see
+//! `builtins::install_lazy_globals`) — the deferred real installs run on
+//! first use, not here. And all numbers are warm (min-of-N in one process);
+//! for the cold first-realm cost a fresh process pays, use the
+//! `startup_cold` example instead.
+//!
 //! Run: `cargo run -q --release --example realm_profile -p chidori-js`
 
 use std::time::Instant;

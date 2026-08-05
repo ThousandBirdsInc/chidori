@@ -750,6 +750,8 @@ struct FnCtx {
     /// (toplevel scripts/modules, eval bodies, `%fieldinit`, …), which then
     /// render in stack traces without a position.
     source_start: Option<u32>,
+    /// `[[SourceText]]` byte range — see [`crate::bytecode::FuncProto::source_text`].
+    source_text: Option<(u32, u32)>,
 }
 
 impl FnCtx {
@@ -794,6 +796,7 @@ impl FnCtx {
             home_super: false,
             eval_scopes: Vec::new(),
             source_start: None,
+            source_text: None,
         }
     }
     fn alloc_cell(&mut self) -> u32 {
@@ -884,6 +887,13 @@ struct Compiler {
     /// object-literal concise method/accessor): the closure is a
     /// non-constructor with no `prototype` property.
     pending_method: bool,
+    /// One-shot: the `[[SourceText]]` byte range the next `emit_function_core`
+    /// should record. Set by the callers whose function's source text is WIDER
+    /// than the function node itself — a `MethodDefinition` (which starts at
+    /// the property key) and a class constructor (whose source text is the
+    /// whole class). Unset, `compile_function`/`compile_arrow` fall back to the
+    /// function/arrow node's own span.
+    pending_source_span: Option<(u32, u32)>,
     /// Lexically inside a `class` body (heritage, keys, methods,
     /// initializers): ALL class code is strict-mode code.
     in_class_body: bool,
@@ -931,6 +941,7 @@ impl Compiler {
             source_label: None,
             eval_var_names: Vec::new(),
             pending_method: false,
+            pending_source_span: None,
             in_class_body: false,
             in_field_initializer: false,
             fuse: true,
@@ -950,6 +961,53 @@ impl Compiler {
     /// characters, not bytes.
     fn line_col_of(&self, offset: u32) -> (u32, u32) {
         self.source_info().line_col_of(offset)
+    }
+
+    /// `[[SourceText]]` range of a class `MethodDefinition`. The production
+    /// does NOT include the `static` modifier (nor the trivia after it), so a
+    /// static element's text starts at its first real token — `async`, `*`,
+    /// `get`, `set`, or the property key.
+    fn method_source_span(&self, span: oxc::span::Span, is_static: bool) -> (u32, u32) {
+        if !is_static {
+            return (span.start, span.end);
+        }
+        let start = self.skip_trivia(span.start + "static".len() as u32, span.end);
+        (start, span.end)
+    }
+
+    /// Advance past whitespace, line terminators and comments starting at
+    /// `from` (bounded by `end`).
+    fn skip_trivia(&self, from: u32, end: u32) -> u32 {
+        let bytes = self.source.as_bytes();
+        let mut i = from as usize;
+        let end = (end as usize).min(bytes.len());
+        while i < end {
+            match bytes[i] {
+                b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => i += 1,
+                b'/' if i + 1 < end && bytes[i + 1] == b'/' => {
+                    while i < end && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < end && bytes[i + 1] == b'*' => {
+                    match self.source[i + 2..end].find("*/") {
+                        Some(off) => i = i + 2 + off + 2,
+                        None => return end as u32,
+                    }
+                }
+                // Non-ASCII whitespace (NBSP, U+2028/9, …): step one char.
+                b if b >= 0x80 => {
+                    let ch = self.source[i..].chars().next().unwrap_or(' ');
+                    if ch.is_whitespace() {
+                        i += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        i as u32
     }
 
     /// Whether the source region `[start, end)` mentions `arguments` (the word).
@@ -2033,6 +2091,7 @@ impl Compiler {
             upvalues: fc.upvalues,
             kind: fc.kind,
             source_start: fc.source_start.unwrap_or(0),
+            source_text: fc.source_text.filter(|_| !self.source.is_empty()),
             source_line,
             source_col,
             source_label: self.source_label.clone(),
@@ -4123,6 +4182,10 @@ impl Compiler {
                     if is_method {
                         self.pending_home_super = true;
                         self.pending_method = true;
+                        // A concise method's [[SourceText]] is the whole
+                        // MethodDefinition — key (or `get`/`set`/`async`/`*`)
+                        // through the closing brace — not just its body.
+                        self.pending_source_span = Some((p.span.start, p.span.end));
                     }
                     // value
                     if !p.computed {
@@ -4149,6 +4212,7 @@ impl Compiler {
                     }
                     self.pending_home_super = false;
                     self.pending_method = false;
+                    self.pending_source_span = None;
                     if is_method {
                         // [obj, key, value] — stamp value.[[HomeObject]] = obj.
                         self.emit(Op::SetHomeObject);
@@ -5916,6 +5980,9 @@ impl Compiler {
             (false, false, false) => FuncKind::Normal,
         };
         let body = f.body.as_deref();
+        if self.pending_source_span.is_none() {
+            self.pending_source_span = Some((f.span.start, f.span.end));
+        }
         self.emit_function_core(&f.params, body, false, None, kind, name, None)
     }
 
@@ -5933,6 +6000,9 @@ impl Compiler {
         } else {
             None
         };
+        if self.pending_source_span.is_none() {
+            self.pending_source_span = Some((a.span.start, a.span.end));
+        }
         self.emit_function_core(&a.params, Some(&*a.body), true, ret_expr, kind, name, None)
     }
 
@@ -5953,6 +6023,9 @@ impl Compiler {
         // ops emitted before the first body statement anchor there too.
         fc.source_start = Some(params.span.start);
         fc.cur_pos = params.span.start;
+        // `[[SourceText]]` — the enclosing production's span when a caller
+        // supplied one (method / class constructor), else the function node's.
+        fc.source_text = self.pending_source_span.take();
         // A function defined inside a `with` block (directly or transitively)
         // resolves free identifiers against the captured with-scope chain.
         fc.enclosed_in_with = self
@@ -6471,7 +6544,11 @@ impl Compiler {
 
         // Build the constructor closure, then stash it in a temp cell so the rest
         // of class building can address it cleanly.
+        // A class constructor's [[SourceText]] is the WHOLE class definition
+        // (ClassDeclaration/ClassExpression), explicit ctor or not.
+        let class_span = Some((class.span.start, class.span.end));
         if let Some(m) = ctor_method {
+            self.pending_source_span = class_span;
             self.emit_function_core(
                 &m.value.params,
                 m.value.body.as_deref(),
@@ -6486,6 +6563,7 @@ impl Compiler {
                 Some(&instance_fields),
             )?;
         } else {
+            self.pending_source_span = class_span;
             self.synthesize_constructor(name, has_super, &instance_fields)?;
         }
         let ctor_cell = self.temp();
@@ -6674,6 +6752,7 @@ impl Compiler {
             if let Some(m) = method {
                 self.pending_home_super = true;
                 self.pending_method = true;
+                self.pending_source_span = Some(self.method_source_span(m.span, is_static));
                 self.compile_function(&m.value, Some(&format!("#{name}")))?;
                 self.pending_home_super = false;
                 self.emit(Op::SetHomeObjectAt(1)); // [ctor, fn]
@@ -6683,6 +6762,7 @@ impl Compiler {
                     Some(g) => {
                         self.pending_home_super = true;
                         self.pending_method = true;
+                        self.pending_source_span = Some(self.method_source_span(g.span, is_static));
                         self.compile_function(&g.value, Some(&format!("get #{name}")))?;
                         self.pending_home_super = false;
                         self.emit(Op::SetHomeObjectAt(1));
@@ -6695,6 +6775,8 @@ impl Compiler {
                     Some(st) => {
                         self.pending_home_super = true;
                         self.pending_method = true;
+                        self.pending_source_span =
+                            Some(self.method_source_span(st.span, is_static));
                         self.compile_function(&st.value, Some(&format!("set #{name}")))?;
                         self.pending_home_super = false;
                         self.emit(Op::SetHomeObjectAt(2));
@@ -6715,6 +6797,7 @@ impl Compiler {
             self.emit(Op::GetProp(proto_k)); // [proto]
             if let Some(m) = method {
                 self.pending_method = true;
+                self.pending_source_span = Some(self.method_source_span(m.span, is_static));
                 self.compile_function(&m.value, Some(&format!("#{name}")))?;
                 self.emit(Op::SetHomeObjectAt(1)); // [proto, fn]
                 self.store_priv_cell(&format!("%privm#{name}"));
@@ -6722,6 +6805,7 @@ impl Compiler {
                 match getter {
                     Some(g) => {
                         self.pending_method = true;
+                        self.pending_source_span = Some(self.method_source_span(g.span, is_static));
                         self.compile_function(&g.value, Some(&format!("get #{name}")))?;
                         self.emit(Op::SetHomeObjectAt(1));
                     }
@@ -6733,6 +6817,8 @@ impl Compiler {
                 match setter {
                     Some(st) => {
                         self.pending_method = true;
+                        self.pending_source_span =
+                            Some(self.method_source_span(st.span, is_static));
                         self.compile_function(&st.value, Some(&format!("set #{name}")))?;
                         self.emit(Op::SetHomeObjectAt(1));
                     }
@@ -6795,6 +6881,7 @@ impl Compiler {
             FuncKind::ClassCtor
         };
         let mut fc = FnCtx::new(name.unwrap_or(""), kind);
+        fc.source_text = self.pending_source_span.take();
         fc.enclosed_in_with = self
             .fns
             .last()
@@ -6825,9 +6912,10 @@ impl Compiler {
             self.emit_field_init_closure(fields)?;
             self.emit(Op::InitCell(fi));
             self.load_binding("%superclass");
-            self.emit(Op::LoadRestArgs(0));
             self.load_binding("%newtarget");
-            self.emit(Op::ConstructSuperSpread);
+            // The argument list is forwarded directly — the default derived
+            // constructor performs no observable array spread.
+            self.emit(Op::ConstructSuperForward);
             self.emit_super_bind_and_init();
             self.emit(Op::Return); // super() evaluates to the bound `this`
         } else {
@@ -6994,6 +7082,7 @@ impl Compiler {
             self.pending_home_super = true;
         }
         self.pending_method = true;
+        self.pending_source_span = Some(self.method_source_span(m.span, m.r#static));
         self.compile_function(&m.value, Some(&fname))?;
         // Computed-key method/accessor: the compile-time name above is just
         // "[computed]" — SetFunctionName with the runtime key.

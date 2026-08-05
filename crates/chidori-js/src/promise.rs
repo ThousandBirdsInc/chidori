@@ -40,6 +40,11 @@ impl Vm {
 
     /// `PromiseResolve`: return `v` if it is a native promise, else a new promise
     /// resolved with `v`.
+    ///
+    /// NOTE: this is the *non-observable* shortcut. Use
+    /// [`Vm::promise_resolve_intrinsic`] anywhere the spec says
+    /// `PromiseResolve(%Promise%, x)` on a script-supplied value — that step
+    /// reads `x.constructor`, which a getter can poison.
     pub fn promise_resolve(&mut self, v: Value) -> JsObject {
         if let Value::Object(o) = &v {
             if matches!(o.borrow().internal, Internal::Promise(_)) {
@@ -49,6 +54,72 @@ impl Vm {
         let p = self.new_promise();
         self.resolve_promise(&p, v);
         p
+    }
+
+    /// Whether `Get(o, "constructor")` provably yields the intrinsic
+    /// `%Promise%` with no observable side effect: no own `constructor` on the
+    /// promise, its `[[Prototype]]` is still `%Promise.prototype%`, and that
+    /// prototype's own `constructor` is still the intrinsic data property.
+    fn promise_ctor_is_intrinsic(&self, o: &JsObject) -> bool {
+        let Some(ctor) = &self.realm.promise_ctor else {
+            return false;
+        };
+        {
+            let b = o.borrow();
+            if b.own_get(&StrKeyRef("constructor")).is_some() {
+                return false;
+            }
+            match &b.proto {
+                Some(p) if p.same(&self.realm.promise_proto) => {}
+                _ => return false,
+            }
+        }
+        matches!(
+            self.realm.promise_proto.borrow().own_get(&StrKeyRef("constructor")),
+            Some(p) if matches!(&p.kind, PropertyKind::Data { value: Value::Object(c), .. } if c.same(ctor))
+        )
+    }
+
+    /// Whether `%Promise%[@@species]` is still the intrinsic getter (so
+    /// `SpeciesConstructor(x, %Promise%)` is `%Promise%` for any `x` whose
+    /// `constructor` is `%Promise%`).
+    fn promise_species_is_intrinsic(&self) -> bool {
+        let (Some(ctor), Some(getter)) =
+            (&self.realm.promise_ctor, &self.realm.promise_species_getter)
+        else {
+            return false;
+        };
+        let key = PropertyKey::Sym(self.realm.symbol_species.clone());
+        matches!(
+            ctor.borrow().own_get(&key),
+            Some(p) if matches!(&p.kind, PropertyKind::Accessor { get: Some(Value::Object(g)), .. } if g.same(getter))
+        )
+    }
+
+    /// `PromiseResolve(%Promise%, v)` with its observable steps: a native
+    /// promise whose `constructor` is `%Promise%` passes through unchanged;
+    /// anything else is wrapped. Reading `constructor` can throw, which is why
+    /// this returns a `Result` (the `Await` of a "broken promise" rejects
+    /// rather than silently succeeding).
+    pub fn promise_resolve_intrinsic(&mut self, v: Value) -> Result<JsObject, Value> {
+        if let Value::Object(o) = &v {
+            if matches!(o.borrow().internal, Internal::Promise(_)) {
+                if self.promise_ctor_is_intrinsic(o) {
+                    return Ok(o.clone());
+                }
+                let c = self.get_prop(&v, &PropertyKey::str("constructor"))?;
+                let is_intrinsic = matches!(
+                    (&c, &self.realm.promise_ctor),
+                    (Value::Object(a), Some(b)) if a.same(b)
+                );
+                if is_intrinsic {
+                    return Ok(o.clone());
+                }
+            }
+        }
+        let p = self.new_promise();
+        self.resolve_promise(&p, v);
+        Ok(p)
     }
 
     /// The resolve function of a promise: handles thenables/self-resolution.
@@ -86,7 +157,14 @@ impl Vm {
                 (&then, &builtin_then),
                 (Value::Object(a), Some(Value::Object(b))) if a.same(b)
             );
-            if is_intrinsic_then && matches!(o.borrow().internal, Internal::Promise(_)) {
+            // …and only when `SpeciesConstructor(value, %Promise%)` is still
+            // `%Promise%`: for a SUBCLASS promise the job's `then` call
+            // constructs a subclass capability, which script can count.
+            if is_intrinsic_then
+                && matches!(o.borrow().internal, Internal::Promise(_))
+                && self.promise_ctor_is_intrinsic(o)
+                && self.promise_species_is_intrinsic()
+            {
                 let target = promise.clone();
                 let t2 = promise.clone();
                 self.promise_then_internal(
@@ -121,25 +199,40 @@ impl Vm {
     }
 
     fn run_thenable_job(&mut self, promise: &JsObject, thenable: Value, then: Value) {
+        // CreateResolvingFunctions: resolve and reject share ONE
+        // [[AlreadyResolved]] record, so the first call wins and later ones —
+        // including the job's own "then threw" fallback — are no-ops. That is
+        // what keeps `then(resolve) { resolve(); throw e; }` from rejecting an
+        // already-resolved promise.
+        let already = Rc::new(RefCell::new(false));
         let p1 = promise.clone();
-        let p2 = promise.clone();
+        let a1 = already.clone();
         let resolve = self.new_native("", 1, move |vm, _this, args| {
+            if std::mem::replace(&mut *a1.borrow_mut(), true) {
+                return Ok(Value::Undefined);
+            }
             let v = args.first().cloned().unwrap_or(Value::Undefined);
             vm.resolve_promise(&p1, v);
             Ok(Value::Undefined)
         });
+        let p2 = promise.clone();
+        let a2 = already.clone();
         let reject = self.new_native("", 1, move |vm, _this, args| {
+            if std::mem::replace(&mut *a2.borrow_mut(), true) {
+                return Ok(Value::Undefined);
+            }
             let v = args.first().cloned().unwrap_or(Value::Undefined);
             vm.reject_promise(&p2, v);
             Ok(Value::Undefined)
         });
+        let reject_fn = Value::Object(reject.clone());
         let r = self.call(
             then,
             thenable,
             &[Value::Object(resolve), Value::Object(reject)],
         );
         if let Err(e) = r {
-            self.reject_promise(promise, e);
+            let _ = self.call(reject_fn, Value::Undefined, &[e]);
         }
     }
 
@@ -219,6 +312,21 @@ impl Vm {
     /// promise.
     pub fn promise_then(&mut self, promise: &JsObject, on_f: Value, on_r: Value) -> JsObject {
         let result = self.new_promise();
+        self.promise_then_into(promise, on_f, on_r, result.clone());
+        result
+    }
+
+    /// `PerformPromiseThen(promise, onFulfilled, onRejected, resultCapability)`
+    /// with an EXISTING result promise — used where a capability was created
+    /// up front so the algorithm's earlier `IfAbruptRejectPromise` steps had
+    /// something to reject.
+    pub fn promise_then_into(
+        &mut self,
+        promise: &JsObject,
+        on_f: Value,
+        on_r: Value,
+        result: JsObject,
+    ) {
         let on_fulfill = Reaction::Then {
             handler: if self.is_callable(&on_f) {
                 Some(on_f)
@@ -234,11 +342,10 @@ impl Vm {
             } else {
                 None
             },
-            result_capability: result.clone(),
+            result_capability: result,
             is_reject: true,
         };
         self.promise_then_internal(promise, on_fulfill, on_reject);
-        result
     }
 
     /// A new already-rejected promise.
@@ -276,19 +383,29 @@ impl Vm {
             Flow::Suspend(s) => match s.kind {
                 SuspendKind::Await(awaited) => {
                     self.trace_suspend(token);
-                    let target = self.promise_resolve(awaited);
-                    let cell = Rc::new(RefCell::new(Some(s.frame)));
-                    let on_f = Reaction::AsyncResume {
-                        frame: cell.clone(),
-                        own_promise: own_promise.clone(),
-                        is_reject: false,
-                    };
-                    let on_r = Reaction::AsyncResume {
-                        frame: cell,
-                        own_promise,
-                        is_reject: true,
-                    };
-                    self.promise_then_internal(&target, on_f, on_r);
+                    // Await's `PromiseResolve(%Promise%, v)` is observable: a
+                    // poisoned `constructor` getter throws *at the await*, so
+                    // the error resumes the frame as a throw.
+                    match self.promise_resolve_intrinsic(awaited) {
+                        Ok(target) => {
+                            let cell = Rc::new(RefCell::new(Some(s.frame)));
+                            let on_f = Reaction::AsyncResume {
+                                frame: cell.clone(),
+                                own_promise: own_promise.clone(),
+                                is_reject: false,
+                            };
+                            let on_r = Reaction::AsyncResume {
+                                frame: cell,
+                                own_promise,
+                                is_reject: true,
+                            };
+                            self.promise_then_internal(&target, on_f, on_r);
+                        }
+                        Err(e) => {
+                            let flow = self.resume_frame_throw(s.frame, e);
+                            self.dispatch_async_flow(flow, own_promise, token);
+                        }
+                    }
                 }
                 SuspendKind::Yield(_) | SuspendKind::YieldStar(_) | SuspendKind::GeneratorStart => {
                     // async generators are deferred; treat as immediate resolve.

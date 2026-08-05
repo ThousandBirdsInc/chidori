@@ -18,6 +18,37 @@ fn this_object(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
     vm.to_object(this)
 }
 
+/// The name part of the `NativeFunction` form returned by
+/// `Function.prototype.toString` for a function with no [[SourceText]].
+///
+/// The grammar is `function NativeFunctionAccessor_opt IdentifierName_opt (
+/// FormalParameters ) { [ native code ] }`, so only an *IdentifierName* (or a
+/// bracketed symbol description, which engines conventionally emit for
+/// symbol-keyed built-ins) may appear, optionally behind `get `/`set `. Any
+/// other `name` — `bound f`, a private `#f`, a string with spaces — would make
+/// the output unparsable, so it is dropped.
+fn native_function_name(name: &str) -> &str {
+    fn is_identifier_name(s: &str) -> bool {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) if c == '_' || c == '$' || c.is_alphabetic() => {}
+            _ => return false,
+        }
+        chars.all(|c| c == '_' || c == '$' || c.is_alphanumeric())
+    }
+    let bare = name
+        .strip_prefix("get ")
+        .or_else(|| name.strip_prefix("set "))
+        .unwrap_or(name);
+    let ok = is_identifier_name(bare)
+        || (bare.starts_with('[') && bare.ends_with(']') && !bare[1..].contains('['));
+    if ok {
+        name
+    } else {
+        ""
+    }
+}
+
 // =========================================================================
 // Property-descriptor parsing and the OrdinaryDefineOwnProperty algorithm.
 // =========================================================================
@@ -37,6 +68,14 @@ pub(crate) struct PropDesc {
 }
 
 impl PropDesc {
+    /// The `{ [[Value]]: v }` partial descriptor an `OrdinarySet` hands to
+    /// `[[DefineOwnProperty]]`.
+    pub(crate) fn value_only(v: Value) -> PropDesc {
+        PropDesc {
+            value: Some(v),
+            ..Default::default()
+        }
+    }
     fn is_accessor(&self) -> bool {
         self.has_get || self.has_set
     }
@@ -133,7 +172,7 @@ fn array_exotic_current(b: &ObjectData, key: &PropertyKey) -> Option<Property> {
         if let Some("length") = key.as_str() {
             return Some(Property {
                 kind: PropertyKind::Data {
-                    value: Value::Number(arr.len() as f64),
+                    value: Value::Number(b.array_length() as f64),
                     // length is writable unless the props map records otherwise.
                     writable: b
                         .own_get(key)
@@ -172,6 +211,11 @@ pub(crate) fn define_own_property(
     d: &PropDesc,
     throw_on_fail: bool,
 ) -> Result<bool, Value> {
+    // [[DefineOwnProperty]] validates against the CURRENT descriptor, so a
+    // lazy section stub must give way to its real binding first — both for
+    // correct validation and so a later sibling-name materialization can
+    // never clobber what was defined here.
+    super::materialize_lazy_for_key(vm, obj, key);
     let args_index = if matches!(obj.borrow().internal, Internal::Arguments(_)) {
         key.array_index()
     } else {
@@ -299,11 +343,8 @@ fn define_own_property_inner(
         if let Some(idx) = key.array_index() {
             let blocked = {
                 let b = obj.borrow();
-                let len = match &b.internal {
-                    Internal::Array(a) => a.len(),
-                    _ => 0,
-                };
-                (idx as usize) >= len
+                let len = b.array_length();
+                idx >= len
                     && matches!(
                         b.own_get(&PropertyKey::str("length")),
                         Some(Property {
@@ -418,23 +459,19 @@ fn define_own_property_inner(
     if is_array && key.as_str() == Some("length") {
         if let Some(v) = &d.value {
             let n = vm.to_number(v)?;
-            let new_len = n as usize;
+            let new_len = n as u32;
             if (new_len as f64) != n || n < 0.0 {
                 return Err(vm.throw_range("Invalid array length"));
             }
             let block = {
                 let b = obj.borrow();
-                let cur_len = match &b.internal {
-                    Internal::Array(arr) => arr.len(),
-                    _ => 0,
-                };
-                let mut block: Option<usize> = None;
+                let cur_len = b.array_length();
+                let mut block: Option<u32> = None;
                 if new_len < cur_len {
                     for (k, p) in b.own_iter() {
                         if let Some(idx) = k.array_index() {
-                            let idx = idx as usize;
                             if idx >= new_len && idx < cur_len && !p.configurable {
-                                block = Some(block.map_or(idx, |b| b.max(idx)));
+                                block = Some(block.map_or(idx, |b: u32| b.max(idx)));
                             }
                         }
                     }
@@ -443,33 +480,11 @@ fn define_own_property_inner(
             };
             if let Some(k) = block {
                 let mut b = obj.borrow_mut();
-                if let Internal::Array(arr) = &mut b.internal {
-                    arr.resize(k + 1, Value::Hole);
-                }
-                let drop_keys: Vec<PropertyKey> = b
-                    .own_keys_iter()
-                    .filter(|kk| kk.array_index().is_some_and(|i| (i as usize) > k))
-                    .cloned()
-                    .collect();
-                for kk in drop_keys {
-                    b.own_remove(&kk);
-                }
-                // A deferred `writable: false` still applies — with the length
-                // where deletion stopped — even though the define FAILS
-                // (ArraySetLength steps 19.d.i-ii).
-                if d.writable == Some(false) {
-                    b.own_insert(
-                        PropertyKey::str("length"),
-                        Property {
-                            kind: PropertyKind::Data {
-                                value: Value::Number((k + 1) as f64),
-                                writable: false,
-                            },
-                            enumerable: false,
-                            configurable: false,
-                        },
-                    );
-                }
+                // Shrink only down to the highest non-configurable index + 1,
+                // keeping `length` writable unless the define also asked to
+                // clear it (ArraySetLength steps 19.d.i-ii: a deferred
+                // `writable: false` still applies even though the define FAILS).
+                b.array_set_length(k + 1, d.writable != Some(false));
                 drop(b);
                 return fail(vm);
             }
@@ -681,56 +696,33 @@ fn store_property(
         if let Some("length") = key.as_str() {
             if let PropertyKind::Data { value, writable } = &prop.kind {
                 let n = vm.to_number(value)?;
-                let len = n as usize;
-                {
-                    let mut b = obj.borrow_mut();
-                    if let Internal::Array(arr) = &mut b.internal {
-                        if (len as f64) != n || n < 0.0 {
-                            return Err(vm.throw_range("Invalid array length"));
-                        }
-                        if len > crate::value::MAX_DENSE_ARRAY {
-                            return Err(vm.throw_range("Array allocation exceeds engine limit"));
-                        }
-                        // Growing length introduces holes, not undefined slots.
-                        arr.resize(len, Value::Hole);
-                    }
+                let len = n as u32;
+                if (len as f64) != n || n < 0.0 {
+                    return Err(vm.throw_range("Invalid array length"));
                 }
-                // Record non-writable length as a marker property so that
-                // freeze/isFrozen and the writable invariant are observable.
-                if !*writable {
-                    obj.borrow_mut().own_insert(
-                        key.clone(),
-                        Property {
-                            kind: PropertyKind::Data {
-                                value: Value::Number(len as f64),
-                                writable: false,
-                            },
-                            enumerable: false,
-                            configurable: false,
-                        },
-                    );
-                } else {
-                    obj.borrow_mut().own_remove(key);
-                }
+                // Resize the dense store, drop the index properties at or past
+                // the new length, and record the length/writable state (a
+                // length past the dense ceiling keeps a sparse tail).
+                obj.borrow_mut().array_set_length(len, *writable);
                 return Ok(());
             }
         }
         // Array index with a plain default data descriptor -> dense store. A
         // non-default attribute set falls through to be reified into `props`
         // below; vm.rs get/set/delete consult that entry, shadowing the dense slot.
-        if let Some(idx) = key.array_index() {
+        if let Some(index) = key.array_index() {
             if let PropertyKind::Data { value, writable } = &prop.kind {
-                if *writable && prop.enumerable && prop.configurable {
-                    let idx = idx as usize;
+                if *writable
+                    && prop.enumerable
+                    && prop.configurable
+                    && (index as usize) < crate::value::MAX_DENSE_ARRAY
+                {
+                    let idx = index as usize;
                     let mut b = obj.borrow_mut();
                     let is_arr = matches!(b.internal, Internal::Array(_));
                     if is_arr {
                         if let Internal::Array(arr) = &mut b.internal {
                             if idx >= arr.len() {
-                                if idx >= crate::value::MAX_DENSE_ARRAY {
-                                    drop(b);
-                                    return Err(vm.throw_range("Array index exceeds engine limit"));
-                                }
                                 // Growing past length introduces HOLES at the
                                 // intermediate indices (absent, not undefined).
                                 arr.resize(idx + 1, Value::Hole);
@@ -738,6 +730,7 @@ fn store_property(
                             arr[idx] = value.clone();
                         }
                         b.own_remove(key);
+                        b.array_grow_length(index + 1);
                         return Ok(());
                     }
                 }
@@ -745,22 +738,24 @@ fn store_property(
         }
     }
     // Array exotic [[DefineOwnProperty]]: defining an own index property at or
-    // past `length` must update `length` to index+1. Grow the dense backing with
-    // holes so the (length == arr.len()) invariant holds; the `props` entry we
-    // insert below shadows that hole at this index.
+    // past `length` must update `length` to index+1. Below the dense ceiling
+    // the backing vec grows with holes so `length == arr.len()` still holds;
+    // past it the property IS the element (the sparse tail) and only `length`
+    // moves. Either way the `props` entry inserted below wins at this index.
     if is_array {
-        if let Some(idx) = key.array_index() {
-            let idx = idx as usize;
+        if let Some(index) = key.array_index() {
+            let idx = index as usize;
             let mut b = obj.borrow_mut();
-            if let Internal::Array(arr) = &mut b.internal {
-                if idx >= arr.len() {
-                    if idx >= crate::value::MAX_DENSE_ARRAY {
-                        drop(b);
-                        return Err(vm.throw_range("Array index exceeds engine limit"));
+            if idx < crate::value::MAX_DENSE_ARRAY {
+                if let Internal::Array(arr) = &mut b.internal {
+                    if idx >= arr.len() {
+                        arr.resize(idx + 1, Value::Hole);
                     }
-                    arr.resize(idx + 1, Value::Hole);
                 }
             }
+            b.own_insert(key.clone(), prop);
+            b.array_grow_length(index.saturating_add(1));
+            return Ok(());
         }
     }
     obj.borrow_mut().own_insert(key.clone(), prop);
@@ -1172,6 +1167,7 @@ fn install_object(vm: &mut Vm) {
         if vm.is_proxy(&o) {
             return vm.proxy_get_own_descriptor(&o, &key);
         }
+        super::materialize_lazy_for_key(vm, &o, &key);
         let prop = own_property_descriptor(&o, &key);
         match prop {
             None => Ok(Value::Undefined),
@@ -1233,6 +1229,7 @@ fn install_object_extra(vm: &mut Vm) {
     };
     vm.define_method(&ctor, "getOwnPropertyDescriptors", 1, |vm, _t, args| {
         let o = vm.to_object(&arg(args, 0))?;
+        super::materialize_all_lazy(vm, &o);
         let result = vm.new_object();
         for key in vm.own_keys(&o) {
             let prop = own_property_descriptor(&o, &key);
@@ -1278,6 +1275,9 @@ fn install_object_extra(vm: &mut Vm) {
 /// per own key, in [[OwnPropertyKeys]] order: `{configurable: false}` for
 /// sealing, plus `{writable: false}` for frozen DATA keys.
 pub(crate) fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Result<(), Value> {
+    // Freezing/sealing the global must lock the REAL bindings, not the lazy
+    // stubs (which could otherwise never self-replace afterwards).
+    super::materialize_all_lazy(vm, o);
     let ok = if vm.is_proxy(o) {
         vm.proxy_prevent_extensions(o)?
     } else {
@@ -1355,8 +1355,8 @@ pub(crate) fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Re
     // non-configurable, matching `length`'s appearance in [[OwnPropertyKeys]].
     if !is_proxy {
         let mut b = o.borrow_mut();
-        if let Internal::Array(arr) = &b.internal {
-            let len = arr.len() as f64;
+        if b.is_array() {
+            let len = b.array_length() as f64;
             let cur_writable = b
                 .own_get(&PropertyKey::str("length"))
                 .map(|p| matches!(&p.kind, PropertyKind::Data { writable, .. } if *writable))
@@ -1381,6 +1381,7 @@ pub(crate) fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Re
 /// own key must be non-configurable (and, for `frozen`, data keys
 /// non-writable).
 fn test_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Result<bool, Value> {
+    super::materialize_all_lazy(vm, o);
     let extensible = if vm.is_proxy(o) {
         vm.proxy_is_extensible(o)?
     } else {
@@ -1437,6 +1438,9 @@ fn lookup_accessor(
     key: &PropertyKey,
     want_get: bool,
 ) -> Result<Value, Value> {
+    // `globalThis.__lookupGetter__("Date")` must answer `undefined` (a data
+    // property), never a lazy section stub's internal getter.
+    super::materialize_lazy_for_key(vm, o, key);
     let mut cur = Some(o.clone());
     while let Some(obj) = cur {
         // For a Proxy, [[GetOwnProperty]] and [[GetPrototypeOf]] dispatch to the
@@ -1713,7 +1717,7 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
             if let Some("length") = key.as_str() {
                 return Some(Property {
                     kind: PropertyKind::Data {
-                        value: Value::Number(arr.len() as f64),
+                        value: Value::Number(b.array_length() as f64),
                         writable: true,
                     },
                     enumerable: false,
@@ -1996,12 +2000,36 @@ fn install_function(vm: &mut Vm) {
         if !vm.is_callable(&this) {
             return Err(vm.throw_type("Function.prototype.toString called on non-callable"));
         }
+        // An ECMAScript function object returns its [[SourceText]] verbatim —
+        // the exact source range the function's syntactic production matched,
+        // comments and all. Bound functions, built-ins and callable proxies
+        // have no source text and take the NativeFunction form below.
+        if let Value::Object(o) = &this {
+            let text = {
+                let b = o.borrow();
+                match b.as_function() {
+                    Some(FunctionInner::Bytecode(bf)) => {
+                        let p = &bf.proto;
+                        p.source_text.zip(p.source_info.as_ref()).and_then(
+                            |((start, end), info)| info.slice(start, end).map(str::to_owned),
+                        )
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(t) = text {
+                return Ok(Value::str(t));
+            }
+        }
         let name = vm
             .get_prop(&this, &PropertyKey::str("name"))
             .ok()
             .map(|v| vm.to_string_lossy(&v))
             .unwrap_or_default();
-        Ok(Value::str(format!("function {name}() {{ [native code] }}")))
+        Ok(Value::str(format!(
+            "function {}() {{ [native code] }}",
+            native_function_name(&name)
+        )))
     });
     // Function.prototype itself is callable (returns undefined).
     proto.borrow_mut().internal = Internal::Function(FunctionInner::Native(NativeFunction {
@@ -2573,16 +2601,22 @@ impl Vm {
             Value::Object(o) => o,
             _ => return Err(self.throw_type("prototype is not an object")),
         };
+        // Walk the chain through [[GetPrototypeOf]] — a proxy anywhere in the
+        // chain routes through its trap (and an abrupt trap propagates).
         let mut cur = match obj {
-            Value::Object(o) => o.borrow().proto.clone(),
+            Value::Object(o) => o.clone(),
             _ => return Ok(false),
         };
-        while let Some(p) = cur {
-            if p.same(&target_proto) {
-                return Ok(true);
+        loop {
+            match self.proxy_or_ordinary_get_prototype_of(&cur)? {
+                Value::Object(p) => {
+                    if p.same(&target_proto) {
+                        return Ok(true);
+                    }
+                    cur = p;
+                }
+                _ => return Ok(false),
             }
-            cur = p.borrow().proto.clone();
         }
-        Ok(false)
     }
 }

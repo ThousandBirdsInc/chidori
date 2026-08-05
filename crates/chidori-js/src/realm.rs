@@ -8,6 +8,15 @@ use std::rc::Rc;
 use crate::value::*;
 use crate::vm::Vm;
 
+/// One lazily-installed builtin section (see `builtins::install_lazy_globals`):
+/// the global names its stubs occupy, the real installer, and the shared
+/// once-flag (the same `Rc` the stub accessors carry).
+pub struct LazySection {
+    pub names: &'static [&'static str],
+    pub install: fn(&mut Vm),
+    pub done: Rc<std::cell::Cell<bool>>,
+}
+
 pub struct Realm {
     pub global: JsObject,
     /// The %eval% intrinsic function object — `Op::DirectEval` compares the
@@ -33,6 +42,11 @@ pub struct Realm {
     pub array_push: Option<JsObject>,
     /// As `array_push`, for `Array.prototype.pop` (`KOp::ArrayPop`).
     pub array_pop: Option<JsObject>,
+    /// The canonical `Array.prototype.values` (= `Array.prototype[@@iterator]`),
+    /// pinned at install. The dense array-iteration fast paths identity-check
+    /// the live `@@iterator` against it: a replaced `@@iterator` (or a replaced
+    /// `%ArrayIteratorPrototype%.next`) must take the observable generic path.
+    pub array_values: Option<JsObject>,
     /// The canonical `String.prototype.charCodeAt`, pinned at install for
     /// the kernel `CharCodeAt` entry guard (and bail-shape reconstruction).
     pub string_char_code_at: Option<JsObject>,
@@ -62,11 +76,39 @@ pub struct Realm {
     pub uri_error_proto: JsObject,
 
     pub promise_proto: JsObject,
+    /// `%Promise%` itself. `PromiseResolve(%Promise%, x)` — which every `Await`
+    /// and the async-from-sync iterator run through — compares `x.constructor`
+    /// against it, so the identity has to be reachable, not re-derived from
+    /// `Promise.prototype.constructor` (which script can overwrite).
+    pub promise_ctor: Option<JsObject>,
+    /// The original `%Promise%[@@species]` getter. Used only to prove that
+    /// `SpeciesConstructor(nativePromise, %Promise%)` is still `%Promise%`, so
+    /// resolving a promise WITH a promise may take the non-observable shortcut
+    /// instead of the PromiseResolveThenableJob.
+    pub promise_species_getter: Option<JsObject>,
     pub iterator_proto: JsObject,
+    /// %AsyncIteratorPrototype% — a SEPARATE object from %IteratorPrototype%
+    /// (they share nothing but `Object.prototype`). Keeping them distinct is
+    /// what makes `obj[Symbol.asyncIterator]` a real capability test: a sync
+    /// iterator (generator object, array iterator, …) must NOT answer it, or
+    /// every sync iterable would masquerade as async-iterable and
+    /// `Array.fromAsync` / `for await` would skip the value-awaiting path.
+    pub async_iterator_proto: JsObject,
+    /// `%AsyncFromSyncIteratorPrototype%` — the prototype of the wrapper
+    /// `GetIterator(obj, async)` builds when `obj` has only `@@iterator`. Not
+    /// reachable from script (the spec gives it no global path); the wrapper
+    /// objects themselves are held only by `for await` / `yield*`.
+    pub async_from_sync_iterator_proto: JsObject,
     pub array_iterator_proto: JsObject,
     pub string_iterator_proto: JsObject,
     pub map_iterator_proto: JsObject,
     pub set_iterator_proto: JsObject,
+    /// %IteratorHelperPrototype% — the prototype of `map`/`filter`/`take`/
+    /// `drop`/`flatMap` helper objects.
+    pub iterator_helper_proto: JsObject,
+    /// %WrapForValidIteratorPrototype% — the prototype of `Iterator.from`
+    /// wrappers around foreign iterators.
+    pub wrap_valid_iterator_proto: JsObject,
     pub generator_proto: JsObject,
     pub async_generator_proto: JsObject,
     /// `%GeneratorFunction.prototype%` etc. — the `[[Prototype]]` of generator /
@@ -113,6 +155,15 @@ pub struct Realm {
     /// array `[disposedBool, ...disposerFns]`). A symbol so it stays out of
     /// `getOwnPropertyNames` — fresh stacks must have no own string keys.
     pub symbol_disposable_state: JsSymbol,
+    /// Engine-private key for an `AsyncDisposableStack`'s `[[AsyncDisposableState]]`.
+    /// Distinct from [`Self::symbol_disposable_state`] so the two stack classes
+    /// have *separate* brands: `DisposableStack.prototype.use.call(asyncStack)`
+    /// must throw a TypeError (and vice versa).
+    pub symbol_async_disposable_state: JsSymbol,
+    /// Engine-private key holding an async-from-sync wrapper's
+    /// `[[SyncIteratorRecord]]` as a 2-element array `[iterator, nextMethod]`.
+    /// Filtered from `own_keys` like the other internal slots.
+    pub symbol_sync_iterator_record: JsSymbol,
     /// Engine-private brand marking a buffer object as a SharedArrayBuffer
     /// (`IsSharedArrayBuffer`). A symbol — script-unreachable — so it cannot be
     /// observed; `own_keys` also filters it from `getOwnPropertySymbols`.
@@ -127,6 +178,13 @@ pub struct Realm {
     /// (locale/style/digit/grouping options). The brand for the receiver checks.
     pub symbol_intl_number_format: JsSymbol,
 
+    /// Builtin sections installed lazily (see
+    /// `builtins::install_lazy_globals`): their global names sit behind
+    /// self-replacing accessor stubs until first use. Reflection entry points
+    /// (descriptor reads, defineProperty, freeze/seal) consult this registry
+    /// to materialize a pending section before answering, so a stub is never
+    /// observable through them.
+    pub lazy_sections: Vec<LazySection>,
     /// Registry for `Symbol.for`.
     pub symbol_registry: indexmap::IndexMap<String, JsSymbol>,
     /// The empty root of this realm's shape transition tree (see
@@ -161,10 +219,14 @@ impl Realm {
             self.uri_error_proto.clone(),
             self.promise_proto.clone(),
             self.iterator_proto.clone(),
+            self.async_iterator_proto.clone(),
+            self.async_from_sync_iterator_proto.clone(),
             self.array_iterator_proto.clone(),
             self.string_iterator_proto.clone(),
             self.map_iterator_proto.clone(),
             self.set_iterator_proto.clone(),
+            self.iterator_helper_proto.clone(),
+            self.wrap_valid_iterator_proto.clone(),
             self.generator_proto.clone(),
             self.async_generator_proto.clone(),
             self.generator_function_proto.clone(),
@@ -207,6 +269,7 @@ impl Realm {
             array_push: None,
             string_char_code_at: None,
             array_pop: None,
+            array_values: None,
             builtin_iter_next: Vec::new(),
             object_proto: bare(),
             function_proto: bare(),
@@ -223,11 +286,17 @@ impl Realm {
             syntax_error_proto: bare(),
             uri_error_proto: bare(),
             promise_proto: bare(),
+            promise_ctor: None,
+            promise_species_getter: None,
             iterator_proto: bare(),
+            async_iterator_proto: bare(),
+            async_from_sync_iterator_proto: bare(),
             array_iterator_proto: bare(),
             string_iterator_proto: bare(),
             map_iterator_proto: bare(),
             set_iterator_proto: bare(),
+            iterator_helper_proto: bare(),
+            wrap_valid_iterator_proto: bare(),
             generator_proto: bare(),
             async_generator_proto: bare(),
             generator_function_proto: bare(),
@@ -264,6 +333,9 @@ impl Realm {
             symbol_intl_locale: bare_symbol(18, "[[InitializedLocale]]"),
             symbol_intl_plural_rules: bare_symbol(19, "[[InitializedPluralRules]]"),
             symbol_intl_number_format: bare_symbol(20, "[[InitializedNumberFormat]]"),
+            symbol_async_disposable_state: bare_symbol(21, "[[AsyncDisposableState]]"),
+            symbol_sync_iterator_record: bare_symbol(22, "[[SyncIteratorRecord]]"),
+            lazy_sections: Vec::new(),
             symbol_registry: indexmap::IndexMap::new(),
             shape_root: crate::shape::Shape::new_root(),
         }
@@ -290,6 +362,7 @@ pub fn init_realm(vm: &mut Vm) {
         &vm.realm.error_proto,
         &vm.realm.promise_proto,
         &vm.realm.iterator_proto,
+        &vm.realm.async_iterator_proto,
         &vm.realm.map_proto,
         &vm.realm.set_proto,
         &vm.realm.weak_map_proto,
@@ -314,7 +387,9 @@ pub fn init_realm(vm: &mut Vm) {
     ] {
         set_proto(p, &ep);
     }
-    // Iterator-derived prototypes chain to the shared iterator prototype.
+    // Sync-iterator-derived prototypes chain to %IteratorPrototype%; the async
+    // generator prototype chains to %AsyncIteratorPrototype% instead, so a
+    // sync iterator never inherits `[Symbol.asyncIterator]` (and vice versa).
     let ip = vm.realm.iterator_proto.clone();
     for p in [
         &vm.realm.array_iterator_proto,
@@ -322,9 +397,18 @@ pub fn init_realm(vm: &mut Vm) {
         &vm.realm.map_iterator_proto,
         &vm.realm.set_iterator_proto,
         &vm.realm.generator_proto,
-        &vm.realm.async_generator_proto,
+        &vm.realm.iterator_helper_proto,
+        &vm.realm.wrap_valid_iterator_proto,
     ] {
         set_proto(p, &ip);
+    }
+    // The ASYNC iterator prototypes chain to %AsyncIteratorPrototype% instead.
+    let aip = vm.realm.async_iterator_proto.clone();
+    for p in [
+        &vm.realm.async_generator_proto,
+        &vm.realm.async_from_sync_iterator_proto,
+    ] {
+        set_proto(p, &aip);
     }
     // The generator/async function-kind prototypes chain to %Function.prototype%.
     let fp = vm.realm.function_proto.clone();

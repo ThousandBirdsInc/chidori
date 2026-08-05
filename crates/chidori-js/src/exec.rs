@@ -3164,7 +3164,12 @@ impl Vm {
                 Err(self.throw_type(&format!("{n} is not a constructor")))
             }
             Disp::Native(c) => {
-                let r = c(self, Value::Undefined, args)?;
+                // Stash new.target for hooks that need it (the abstract
+                // `Iterator` constructor); overwritten per native construct.
+                self.native_new_target = Some(new_target.clone());
+                let r = c(self, Value::Undefined, args);
+                self.native_new_target = None;
+                let r = r?;
                 // GetPrototypeFromConstructor: when constructed via a different
                 // new.target (a subclass `super()` or Reflect.construct), the
                 // fresh instance's [[Prototype]] comes from new_target.prototype
@@ -3244,7 +3249,14 @@ impl Vm {
                 )?;
                 let proto = match proto_val {
                     Value::Object(o) => Some(o),
-                    _ => Some(self.realm.object_proto.clone()),
+                    // GetPrototypeFromConstructor step 4: a non-object
+                    // `prototype` falls back to the intrinsic default — but
+                    // only after GetFunctionRealm(constructor), which throws
+                    // if new.target is a revoked proxy.
+                    _ => {
+                        self.get_function_realm_check(&Value::Object(nt_obj.clone()))?;
+                        Some(self.realm.object_proto.clone())
+                    }
                 };
                 let this_obj = self.alloc_ordinary(proto);
                 let this = Value::Object(this_obj.clone());
@@ -4452,10 +4464,14 @@ impl Vm {
                     t.borrow_mut().own_insert(k, Property::data(val));
                 }
             } else if let Value::String(st) = src {
-                for (i, c) in st.as_str().chars().enumerate() {
+                // A string's index properties are its UTF-16 CODE UNITS (an
+                // astral char spreads as two one-unit strings; a lone
+                // surrogate is preserved, not replaced).
+                let units = st.to_utf16_vec();
+                for (i, u) in units.iter().enumerate() {
                     t.borrow_mut().own_insert(
                         PropertyKey::from_index(i as u32),
-                        Property::data(Value::str(c.to_string())),
+                        Property::data(Value::String(JsString::from_code_units(&[*u]))),
                     );
                 }
             }
@@ -4481,14 +4497,18 @@ impl Vm {
                     t.borrow_mut().own_insert(k, Property::data(val));
                 }
             } else if let Value::String(st) = src {
-                // A primitive-string source contributes its index keys.
-                for (i, c) in st.as_str().chars().enumerate() {
+                // A primitive-string source contributes its index keys — one
+                // per UTF-16 code unit (see object_spread above).
+                let units = st.to_utf16_vec();
+                for (i, u) in units.iter().enumerate() {
                     let k = PropertyKey::from_index(i as u32);
                     if excluded.contains(&k) {
                         continue;
                     }
-                    t.borrow_mut()
-                        .own_insert(k, Property::data(Value::str(c.to_string())));
+                    t.borrow_mut().own_insert(
+                        k,
+                        Property::data(Value::String(JsString::from_code_units(&[*u]))),
+                    );
                 }
             }
         }
@@ -6946,6 +6966,13 @@ impl Vm {
                 let args_arr = pop!();
                 let sup = pop!();
                 let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.construct(&sup, &args, &nt)?;
+                push!(r);
+            }
+            Op::ConstructSuperForward => {
+                let nt = pop!();
+                let sup = pop!();
+                let args = frame.args.clone();
                 let r = self.construct(&sup, &args, &nt)?;
                 push!(r);
             }

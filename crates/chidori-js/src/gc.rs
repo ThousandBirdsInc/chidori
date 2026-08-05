@@ -55,7 +55,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use crate::value::{FunctionInner, Internal, JsObject, ObjectData, Property, PropertyKind, Value};
+use crate::value::{
+    FunctionInner, HelperKind, Internal, JsObject, ObjectData, Property, PropertyKind, Value,
+};
 use crate::vm::{Completion, Frame, GeneratorState, PromiseState, Reaction, Vm};
 
 /// Minimum allocations between automatic collections. The auto threshold is
@@ -492,6 +494,21 @@ fn trace_object(
         Internal::Iterator(it) => {
             if let Some(t) = &it.target {
                 f(t);
+            }
+        }
+        Internal::IteratorHelper(h) => {
+            trace_value(&h.iter, f);
+            trace_value(&h.next, f);
+            match &h.kind {
+                HelperKind::Map(v) | HelperKind::Filter(v) => trace_value(v, f),
+                HelperKind::FlatMap { mapper, inner } => {
+                    trace_value(mapper, f);
+                    if let Some((i, n)) = inner {
+                        trace_value(i, f);
+                        trace_value(n, f);
+                    }
+                }
+                HelperKind::Take(_) | HelperKind::Drop(_) | HelperKind::Wrap => {}
             }
         }
         Internal::ModuleNamespace(ns) => {

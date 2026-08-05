@@ -68,6 +68,12 @@ impl SourceInfo {
             + 1;
         (line as u32, col)
     }
+
+    /// The source text in `[start, end)`, or `None` when the range is not a
+    /// char boundary / out of bounds.
+    pub fn slice(&self, start: u32, end: u32) -> Option<&str> {
+        self.text.get(start as usize..end as usize)
+    }
 }
 
 /// How a free variable referenced by a nested function is captured at closure
@@ -178,6 +184,15 @@ pub struct FuncProto {
     pub kind: FuncKind,
     /// Source span for stack traces (start byte offset).
     pub source_start: u32,
+    /// `[[SourceText]]`: the `[start, end)` byte range of the *whole* syntactic
+    /// production this function came from — `FunctionDeclaration`,
+    /// `ArrowFunction`, `MethodDefinition` (key included, `static` excluded),
+    /// or, for a class constructor, the entire `ClassDeclaration`/
+    /// `ClassExpression`. Resolved against [`Self::source_info`] by
+    /// `Function.prototype.toString`. `None` for synthetic protos and
+    /// compilations carrying no source text, which fall back to the
+    /// `{ [native code] }` form.
+    pub source_text: Option<(u32, u32)>,
     /// 1-based line/column of the function's definition site in its source.
     /// `0` = unknown (synthetic protos, sources compiled without position
     /// tracking). Stack frames prefer the per-op position (`pos` at the
@@ -334,6 +349,7 @@ impl FuncProto {
             upvalues: Vec::new(),
             kind,
             source_start: 0,
+            source_text: None,
             source_line: 0,
             source_col: 0,
             pos: Box::new([]),
@@ -704,6 +720,12 @@ pub enum Op {
     ConstructSuper(u32),
     /// `[super, argsArray, newTarget] -> [instance]`: spread form.
     ConstructSuperSpread,
+    /// `[super, newTarget] -> [instance]`: the SYNTHESIZED default derived
+    /// constructor's super call. The spec (ClassDefinitionEvaluation) forwards
+    /// the constructor's argument list straight to `Construct` — there is no
+    /// rest array and no iteration, so a patched `Array.prototype[@@iterator]`
+    /// must not be observable here (unlike a source-level `super(...args)`).
+    ConstructSuperForward,
     /// `[instance] -> [instance]`: BindThisValue — initialize the derived
     /// constructor's `%this` cell (index payload) IN PLACE so closures that
     /// captured it before `super()` observe the value. Throws a

@@ -53,21 +53,26 @@ pub fn install(vm: &mut Vm) {
     vm.install_ctor("String", &ctor, &proto);
 
     vm.define_method(&ctor, "fromCharCode", 1, |vm, _t, args| {
-        // Each argument is truncated to a UTF-16 code unit (ToUint16). NOTE: lone
-        // surrogates are currently replaced with U+FFFD rather than preserved.
-        // Producing real lone surrogates here is deferred to the RegExp stage,
-        // where the regex-source / eval-source pipeline (`eval("/"+cu+"/").source`)
-        // is made surrogate-aware in lockstep — otherwise those round-trip tests
-        // regress against the UTF-8 (oxc) front end.
-        let mut s = String::new();
+        // Each argument is truncated to a UTF-16 code unit (ToUint16). Lone
+        // surrogates are preserved exactly (`JsString::from_code_units` takes
+        // the WTF-8 arm when needed) — the property-escape sweeps build their
+        // surrogate test strings through here.
+        //
+        // Known residual gap: source text handed to `eval` flows through the
+        // UTF-8 oxc front end, which cannot carry a lone surrogate, so
+        // `eval("/" + String.fromCharCode(0xD800) + "/").source` yields
+        // U+FFFD and no longer round-trips (the four
+        // `language/literals/regexp/S7.8.5_*_T2` tests, which previously
+        // "passed" only because BOTH sides were lossy). Fixing that means a
+        // WTF-8-aware source pipeline, tracked as out of scope here.
+        let mut units: Vec<u16> = Vec::with_capacity(args.len());
         for a in args {
-            let n = vm.to_uint32(a)? as u16;
-            s.push(char::from_u32(n as u32).unwrap_or('\u{fffd}'));
+            units.push(vm.to_uint32(a)? as u16);
         }
-        Ok(Value::str(s))
+        Ok(Value::String(JsString::from_code_units(&units)))
     });
     vm.define_method(&ctor, "fromCodePoint", 1, |vm, _t, args| {
-        let mut s = String::new();
+        let mut units: Vec<u16> = Vec::with_capacity(args.len());
         for a in args {
             let num = vm.to_number(a)?;
             // CodePoint must be an integer in [0, 0x10FFFF].
@@ -77,9 +82,17 @@ pub fn install(vm: &mut Vm) {
                     crate::vm::number_to_string(num)
                 )));
             }
-            s.push(char::from_u32(num as u32).unwrap_or('\u{fffd}'));
+            let cp = num as u32;
+            if cp <= 0xFFFF {
+                // BMP code points — including lone surrogates — are one unit.
+                units.push(cp as u16);
+            } else {
+                let v = cp - 0x10000;
+                units.push((0xD800 + (v >> 10)) as u16);
+                units.push((0xDC00 + (v & 0x3FF)) as u16);
+            }
         }
-        Ok(Value::str(s))
+        Ok(Value::String(JsString::from_code_units(&units)))
     });
 
     // String.raw(template, ...substitutions)
@@ -155,6 +168,24 @@ fn is_regexp_spec(vm: &mut Vm, v: &Value) -> Result<bool, Value> {
         return Ok(vm.to_boolean(&m));
     }
     Ok(crate::regexp::is_regexp(v))
+}
+
+/// `str_this` preserving the exact code units (no lossy `&str` round-trip):
+/// for consumers that must keep lone surrogates intact (the String iterator).
+fn str_this_preserving(vm: &mut Vm, this: &Value) -> Result<JsString, Value> {
+    if this.is_nullish() {
+        return Err(vm.throw_type("String.prototype method called on null or undefined"));
+    }
+    match this {
+        Value::String(s) => Ok(s.clone()),
+        Value::Object(o) => {
+            if let Internal::StringObj(s) = &o.borrow().internal {
+                return Ok(s.clone());
+            }
+            vm.to_js_string(this)
+        }
+        _ => vm.to_js_string(this),
+    }
 }
 
 fn str_this(vm: &mut Vm, this: &Value) -> Result<String, Value> {
@@ -802,14 +833,16 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         invoke_regexp_sym(vm, &regexp, "g", sym, s)
     });
 
-    // [Symbol.iterator]
+    // [Symbol.iterator]. The receiver string is carried as a `JsString` (not
+    // through the lossy `&str` view) so iterating a string with lone
+    // surrogates yields the surrogate code points, not U+FFFD.
     let sym = vm.realm.symbol_iterator.clone();
     vm.define_method(proto, "[Symbol.iterator]", 0, |vm, this, _a| {
-        let s = str_this(vm, &this)?;
+        let s = str_this_preserving(vm, &this)?;
         Ok(vm.make_iterator(
             &vm.realm.string_iterator_proto.clone(),
             None,
-            Some(JsString::new(s)),
+            Some(s),
             IterKind::StringChars,
         ))
     });
