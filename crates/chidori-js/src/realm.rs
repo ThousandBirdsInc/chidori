@@ -72,6 +72,13 @@ pub struct Realm {
 
     pub promise_proto: JsObject,
     pub iterator_proto: JsObject,
+    /// %AsyncIteratorPrototype% — a SEPARATE object from %IteratorPrototype%
+    /// (they share nothing but `Object.prototype`). Keeping them distinct is
+    /// what makes `obj[Symbol.asyncIterator]` a real capability test: a sync
+    /// iterator (generator object, array iterator, …) must NOT answer it, or
+    /// every sync iterable would masquerade as async-iterable and
+    /// `Array.fromAsync` / `for await` would skip the value-awaiting path.
+    pub async_iterator_proto: JsObject,
     pub array_iterator_proto: JsObject,
     pub string_iterator_proto: JsObject,
     pub map_iterator_proto: JsObject,
@@ -183,6 +190,7 @@ impl Realm {
             self.uri_error_proto.clone(),
             self.promise_proto.clone(),
             self.iterator_proto.clone(),
+            self.async_iterator_proto.clone(),
             self.array_iterator_proto.clone(),
             self.string_iterator_proto.clone(),
             self.map_iterator_proto.clone(),
@@ -248,6 +256,7 @@ impl Realm {
             uri_error_proto: bare(),
             promise_proto: bare(),
             iterator_proto: bare(),
+            async_iterator_proto: bare(),
             array_iterator_proto: bare(),
             string_iterator_proto: bare(),
             map_iterator_proto: bare(),
@@ -317,6 +326,7 @@ pub fn init_realm(vm: &mut Vm) {
         &vm.realm.error_proto,
         &vm.realm.promise_proto,
         &vm.realm.iterator_proto,
+        &vm.realm.async_iterator_proto,
         &vm.realm.map_proto,
         &vm.realm.set_proto,
         &vm.realm.weak_map_proto,
@@ -341,7 +351,9 @@ pub fn init_realm(vm: &mut Vm) {
     ] {
         set_proto(p, &ep);
     }
-    // Iterator-derived prototypes chain to the shared iterator prototype.
+    // Sync-iterator-derived prototypes chain to %IteratorPrototype%; the async
+    // generator prototype chains to %AsyncIteratorPrototype% instead, so a
+    // sync iterator never inherits `[Symbol.asyncIterator]` (and vice versa).
     let ip = vm.realm.iterator_proto.clone();
     for p in [
         &vm.realm.array_iterator_proto,
@@ -349,12 +361,15 @@ pub fn init_realm(vm: &mut Vm) {
         &vm.realm.map_iterator_proto,
         &vm.realm.set_iterator_proto,
         &vm.realm.generator_proto,
-        &vm.realm.async_generator_proto,
         &vm.realm.iterator_helper_proto,
         &vm.realm.wrap_valid_iterator_proto,
     ] {
         set_proto(p, &ip);
     }
+    set_proto(
+        &vm.realm.async_generator_proto,
+        &vm.realm.async_iterator_proto,
+    );
     // The generator/async function-kind prototypes chain to %Function.prototype%.
     let fp = vm.realm.function_proto.clone();
     for p in [

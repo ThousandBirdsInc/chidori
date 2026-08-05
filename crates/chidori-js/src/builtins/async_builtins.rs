@@ -703,8 +703,7 @@ fn install_generator(vm: &mut Vm) {
 
     // %AsyncIteratorPrototype%[@@asyncDispose] (explicit resource management):
     // GetMethod(this, "return"); absent → resolve undefined; otherwise call it
-    // and resolve undefined (or reject) once its result settles. The shared
-    // iterator prototype doubles as %AsyncIteratorPrototype% in this realm.
+    // and resolve undefined (or reject) once its result settles.
     let dispose = vm.new_native("[Symbol.asyncDispose]", 0, |vm, this, _a| {
         let promise = vm.new_promise();
         let (resolve, reject) = make_resolving_functions(vm, &promise);
@@ -744,13 +743,17 @@ fn install_generator(vm: &mut Vm) {
         Ok(Value::Object(promise))
     });
     let async_dispose = vm.realm.symbol_async_dispose.clone();
-    let base_iter_proto = vm.realm.iterator_proto.clone();
-    vm.define_value_sym(&base_iter_proto, async_dispose, Value::Object(dispose));
+    let async_iter_proto = vm.realm.async_iterator_proto.clone();
+    vm.define_value_sym(&async_iter_proto, async_dispose, Value::Object(dispose));
 
-    // %AsyncIteratorPrototype%[@@asyncIterator]() { return this }.
+    // %AsyncIteratorPrototype%[@@asyncIterator]() { return this }. This lives on
+    // the async prototype ONLY — a sync iterator inheriting it would make every
+    // sync iterable answer the async-iterable capability test.
     let async_iter2 = vm.realm.symbol_async_iterator.clone();
     let self_iter2 = vm.new_native("[Symbol.asyncIterator]", 0, |_vm, this, _a| Ok(this));
-    vm.define_value_sym(&base_iter_proto, async_iter2, Value::Object(self_iter2));
+    vm.define_value_sym(&async_iter_proto, async_iter2, Value::Object(self_iter2));
+
+    let base_iter_proto = vm.realm.iterator_proto.clone();
 
     // %IteratorPrototype%[@@dispose]: GetMethod(this, "return"); call it when
     // present; the result is discarded (return undefined).

@@ -10,6 +10,7 @@ mod collections;
 mod disposable;
 
 mod date;
+mod from_async;
 pub(crate) mod fundamental;
 mod intl;
 mod iterator_helpers;
@@ -48,6 +49,9 @@ pub const SECTIONS: &[(&str, fn(&mut Vm))] = &[
     ("intl", install_intl_lazy),
     ("temporal", install_temporal_lazy),
     ("globals", install_globals),
+    // Last: its body is a compiled script, which needs the globals section's
+    // `globalThis` binding in place before it can be evaluated.
+    ("array.fromAsync", from_async::install),
 ];
 
 pub fn install(vm: &mut Vm) {

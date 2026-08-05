@@ -117,7 +117,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "decorators",
     "tail-call-optimization",
     "IsHTMLDDA",
-    "Array.fromAsync",
     "import-assertions",
     "import-attributes",
     "regexp-modifiers",
