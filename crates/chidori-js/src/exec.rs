@@ -6969,6 +6969,13 @@ impl Vm {
                 let r = self.construct(&sup, &args, &nt)?;
                 push!(r);
             }
+            Op::ConstructSuperForward => {
+                let nt = pop!();
+                let sup = pop!();
+                let args = frame.args.clone();
+                let r = self.construct(&sup, &args, &nt)?;
+                push!(r);
+            }
             Op::BindThisCell(i) => {
                 let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                 let mut slot = frame.cells[*i as usize].borrow_mut();

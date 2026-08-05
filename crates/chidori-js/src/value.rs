@@ -1553,6 +1553,117 @@ impl ObjectData {
     pub fn is_array(&self) -> bool {
         matches!(self.internal, Internal::Array(_))
     }
+
+    /// An Array exotic object's `length`.
+    ///
+    /// `length` is normally DERIVED from the dense backing store, but it is
+    /// reified into `props` whenever it can no longer be: a non-writable
+    /// `length` (freeze/`defineProperty`) records its attributes there, and a
+    /// `length` past the dense-storage ceiling records the SPARSE TAIL — the
+    /// indices in `[dense.len(), length)`, which live in `props` (or nowhere,
+    /// as holes) rather than in the vec. The reified entry always wins.
+    pub fn array_length(&self) -> u32 {
+        let dense = match &self.internal {
+            Internal::Array(arr) => arr.len() as u32,
+            _ => return 0,
+        };
+        // No props at all (the overwhelmingly common array) => derived. This
+        // early-out keeps the generic index-write path free of a key
+        // allocation + map probe.
+        if self.own_is_empty() {
+            return dense;
+        }
+        if let Some(p) = self.own_get(&PropertyKey::str("length")) {
+            if let Some(Value::Number(n)) = p.value() {
+                return *n as u32;
+            }
+        }
+        dense
+    }
+
+    /// True when the array's whole `[0, length)` range is held in the dense
+    /// backing store — i.e. there is no sparse tail. Every dense fast path
+    /// that treats `arr.len()` as `length` requires this.
+    pub fn array_is_dense(&self) -> bool {
+        match &self.internal {
+            Internal::Array(arr) => {
+                self.own_is_empty() || self.array_length() as usize == arr.len()
+            }
+            _ => false,
+        }
+    }
+
+    /// Reify (or clear) the `length` entry so it reports `len` with `writable`.
+    /// Clearing is only possible when `len` is exactly the dense count and
+    /// `length` stays writable — otherwise the entry is what carries the value.
+    fn array_reify_length(&mut self, len: u32, writable: bool) {
+        let dense = match &self.internal {
+            Internal::Array(arr) => arr.len(),
+            _ => 0,
+        };
+        if writable && len as usize == dense {
+            // Derived again: drop any reified entry (nothing to drop when the
+            // map is empty — the common `arr.length = n` shrink).
+            if !self.own_is_empty() {
+                self.own_remove(&PropertyKey::str("length"));
+            }
+        } else {
+            self.own_insert(
+                PropertyKey::str("length"),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Number(len as f64),
+                        writable,
+                    },
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+    }
+
+    /// The storage half of `ArraySetLength`: resize the dense store, delete the
+    /// index properties at or past `new_len` (the spec's "every property whose
+    /// name is an array index not smaller than the new length is deleted"),
+    /// and record the resulting `length`/`writable` state.
+    pub fn array_set_length(&mut self, new_len: u32, writable: bool) {
+        let n = new_len as usize;
+        if let Internal::Array(arr) = &mut self.internal {
+            if n < arr.len() {
+                arr.truncate(n);
+            } else if n <= MAX_DENSE_ARRAY {
+                // Growing introduces HOLES, not undefined slots.
+                arr.resize(n, Value::Hole);
+            }
+            // n > MAX_DENSE_ARRAY: the tail past `arr.len()` stays sparse.
+        }
+        if !self.own_is_empty() {
+            let dropped: Vec<PropertyKey> = self
+                .own_keys_iter()
+                .filter(|k| k.array_index().is_some_and(|i| i >= new_len))
+                .cloned()
+                .collect();
+            for k in dropped {
+                self.own_remove(&k);
+            }
+        }
+        self.array_reify_length(new_len, writable);
+    }
+
+    /// Grow an array's `length` to cover a newly created index, keeping the
+    /// current `writable` state. No-op when `length` already covers it.
+    pub fn array_grow_length(&mut self, needed: u32) {
+        // With no props, `length` IS the dense count and the caller has
+        // already grown the backing store to cover the index.
+        if self.own_is_empty() || needed <= self.array_length() {
+            return;
+        }
+        let writable = self
+            .own_get(&PropertyKey::str("length"))
+            .map(|p| matches!(&p.kind, PropertyKind::Data { writable, .. } if *writable))
+            .unwrap_or(true);
+        self.array_reify_length(needed, writable);
+    }
     pub fn class_name(&self) -> &'static str {
         match &self.internal {
             Internal::Ordinary => "Object",

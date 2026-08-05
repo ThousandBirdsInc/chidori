@@ -170,13 +170,10 @@ fn array_call(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value>
             if (len as f64) != n {
                 return Err(vm.throw_range("Invalid array length"));
             }
-            // Dense storage: refuse to eagerly allocate pathologically large
-            // arrays (a conformance gap vs. sparse arrays, but bounds memory).
-            if len as usize > crate::value::MAX_DENSE_ARRAY {
-                return Err(vm.throw_range("Array allocation exceeds engine limit"));
-            }
-            // `new Array(n)` / `Array(n)` yields n holes, not n undefineds.
-            return Ok(Value::Object(vm.new_array(vec![Value::Hole; len as usize])));
+            // `new Array(n)` / `Array(n)` yields n holes, not n undefineds —
+            // and past the dense ceiling those holes are never materialized
+            // (the array carries the length with an empty backing store).
+            return Ok(Value::Object(vm.new_array_of_length(len)));
         }
     }
     Ok(Value::Object(vm.new_array(args.to_vec())))
@@ -680,6 +677,13 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
+            // The accumulator obeys the engine's string ceiling: a huge
+            // `length` (a sparse array, or any array-like claiming one) must
+            // not grow it without bound. UTF-8 bytes >= UTF-16 units, so this
+            // is a conservative over-approximation of the unit count.
+            if r.len() > crate::value::MAX_STRING_LEN {
+                return Err(vm.throw_range("Invalid string length"));
+            }
             if k > 0.0 {
                 r.push_str(&sep);
             }
@@ -715,6 +719,10 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
+            // Bounded like `join`'s accumulator.
+            if out.len() > crate::value::MAX_STRING_LEN {
+                return Err(vm.throw_range("Invalid string length"));
+            }
             if k > 0.0 {
                 out.push(',');
             }
@@ -1159,7 +1167,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // path below) and no reified index accessors.
         let dense_ok = {
             let b = o.borrow();
-            matches!(b.internal, Internal::Array(_))
+            b.array_is_dense()
                 && !b.own_keys_iter().any(|k| k.array_index().is_some())
                 && matches!(&b.internal, Internal::Array(a) if !a.iter().any(|v| matches!(v, Value::Hole)))
         };
@@ -1433,6 +1441,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     let values = vm
         .get_prop(&Value::Object(proto.clone()), &PropertyKey::str("values"))
         .unwrap();
+    // Pin the canonical `values` so the dense-iteration fast paths can
+    // identity-check that `Array.prototype[@@iterator]` is still it.
+    if let Value::Object(o) = &values {
+        vm.realm.array_values = Some(o.clone());
+    }
     let sym = vm.realm.symbol_iterator.clone();
     vm.define_value_sym(proto, sym, values);
 }

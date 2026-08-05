@@ -42,6 +42,11 @@ pub struct Realm {
     pub array_push: Option<JsObject>,
     /// As `array_push`, for `Array.prototype.pop` (`KOp::ArrayPop`).
     pub array_pop: Option<JsObject>,
+    /// The canonical `Array.prototype.values` (= `Array.prototype[@@iterator]`),
+    /// pinned at install. The dense array-iteration fast paths identity-check
+    /// the live `@@iterator` against it: a replaced `@@iterator` (or a replaced
+    /// `%ArrayIteratorPrototype%.next`) must take the observable generic path.
+    pub array_values: Option<JsObject>,
     /// The canonical `String.prototype.charCodeAt`, pinned at install for
     /// the kernel `CharCodeAt` entry guard (and bail-shape reconstruction).
     pub string_char_code_at: Option<JsObject>,
@@ -264,6 +269,7 @@ impl Realm {
             array_push: None,
             string_char_code_at: None,
             array_pop: None,
+            array_values: None,
             builtin_iter_next: Vec::new(),
             object_proto: bare(),
             function_proto: bare(),

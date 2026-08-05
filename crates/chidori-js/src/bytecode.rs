@@ -720,6 +720,12 @@ pub enum Op {
     ConstructSuper(u32),
     /// `[super, argsArray, newTarget] -> [instance]`: spread form.
     ConstructSuperSpread,
+    /// `[super, newTarget] -> [instance]`: the SYNTHESIZED default derived
+    /// constructor's super call. The spec (ClassDefinitionEvaluation) forwards
+    /// the constructor's argument list straight to `Construct` — there is no
+    /// rest array and no iteration, so a patched `Array.prototype[@@iterator]`
+    /// must not be observable here (unlike a source-level `super(...args)`).
+    ConstructSuperForward,
     /// `[instance] -> [instance]`: BindThisValue — initialize the derived
     /// constructor's `%this` cell (index payload) IN PLACE so closures that
     /// captured it before `super()` observe the value. Throws a

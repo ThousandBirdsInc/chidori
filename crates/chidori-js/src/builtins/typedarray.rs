@@ -1021,26 +1021,52 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
     });
 
     // subarray(begin?, end?) — a new view sharing the same buffer.
+    //
+    // Only `RequireInternalSlot(O, [[TypedArrayName]])` guards this method: a
+    // detached / out-of-bounds source is NOT an error here, it simply yields
+    // srcLength = 0 (any TypeError comes later, out of the constructor call).
     vm.define_method(proto, "subarray", 2, |vm, this, args| {
-        let o = ta_this(vm, &this)?;
-        let (buffer, byte_offset, length, kind) =
-            ta_fields(&o).ok_or_else(|| vm.throw_type("subarray on non-typed-array"))?;
-        let len = length as isize;
-        let start = rel_index(vm, &arg(args, 0), len, 0)?;
-        let end = rel_index(vm, &arg(args, 1), len, len)?;
-        let new_len = (end - start).max(0) as usize;
-        let new_byte_offset = byte_offset + (start as usize) * kind.bytes();
-        // subarray builds the view via TypedArraySpeciesCreate(O, [buffer,
-        // byteOffset, length]).
-        let result = ta_species_create(
-            vm,
-            &o,
-            &[
+        let fields = match &this {
+            Value::Object(o) => match &o.borrow().internal {
+                Internal::TypedArray(t) => {
+                    Some((t.buffer.clone(), t.byte_offset, t.kind, t.length_tracking))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let (o, (buffer, byte_offset, kind, tracking)) = match (&this, fields) {
+            (Value::Object(o), Some(f)) => (o.clone(), f),
+            _ => {
+                return Err(vm.throw_type(
+                    "Method %TypedArray%.prototype.subarray called on incompatible receiver",
+                ))
+            }
+        };
+        let src_len = if ta_out_of_bounds(&o) {
+            0isize
+        } else {
+            vm.ta_length(&o).unwrap_or(0) as isize
+        };
+        let start = rel_index(vm, &arg(args, 0), src_len, 0)?;
+        let begin_byte_offset = byte_offset + (start as usize) * kind.bytes();
+        // A length-tracking source with no explicit `end` propagates its
+        // auto-length: the species constructor is called with two arguments.
+        let ctor_args = if tracking && arg(args, 1).is_undefined() {
+            vec![
                 Value::Object(buffer),
-                Value::Number(new_byte_offset as f64),
+                Value::Number(begin_byte_offset as f64),
+            ]
+        } else {
+            let end = rel_index(vm, &arg(args, 1), src_len, src_len)?;
+            let new_len = (end - start).max(0) as usize;
+            vec![
+                Value::Object(buffer),
+                Value::Number(begin_byte_offset as f64),
                 Value::Number(new_len as f64),
-            ],
-        )?;
+            ]
+        };
+        let result = ta_species_create(vm, &o, &ctor_args)?;
         Ok(Value::Object(result))
     });
 
@@ -1534,7 +1560,10 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         if is_bigint != matches!(value, Value::BigInt(_)) {
             return Err(vm.throw_type("Cannot mix BigInt and other types"));
         }
-        if actual < 0.0 || actual >= len as f64 {
+        // IsValidIntegerIndex(O, actualIndex) is checked AFTER the coercions,
+        // against the CURRENT view: a `valueOf` that resized the backing
+        // buffer can have made an out-of-bounds index valid (or vice versa).
+        if !vm.ta_valid_index(&o, actual) {
             return Err(vm.throw_range("Invalid typed array index"));
         }
         let actual = actual as usize;
@@ -1658,8 +1687,13 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
                 out.push(',');
             }
             // R = ToString(? Invoke(element, "toLocaleString")) — observable per
-            // element, with abrupt completions propagated.
+            // element, with abrupt completions propagated. An element that is
+            // undefined (the index fell out of bounds because a user
+            // `toLocaleString` shrank the buffer) contributes the empty string.
             let v = vm.ta_get(&o, i);
+            if v.is_nullish() {
+                continue;
+            }
             let f = vm.get_prop(&v, &PropertyKey::str("toLocaleString"))?;
             let r = vm.call(f, v, &[])?;
             let s = vm.to_js_string(&r)?;
@@ -2679,7 +2713,10 @@ fn to_integer_or_infinity(vm: &mut Vm, v: &Value) -> Result<f64, Value> {
     if n.is_infinite() {
         return Ok(n);
     }
-    Ok(n.trunc())
+    // The result is a mathematical value, so -0 is 0 (`+ 0.0` normalizes the
+    // sign): callers such as `with` feed it straight to IsValidIntegerIndex,
+    // which rejects -0𝔽.
+    Ok(n.trunc() + 0.0)
 }
 
 /// Resolve a relative start/end index argument against `len`, clamped to

@@ -248,13 +248,20 @@ fn reflect_get(
     loop {
         let found = {
             let b = cur.borrow();
+            // A reified `props` entry (a non-writable `length`, a sparse-tail
+            // element, an index accessor) shadows the exotic slot, so it is
+            // consulted by the ordinary walk below instead.
             if let Internal::Array(arr) = &b.internal {
-                if let Some("length") = key.as_str() {
-                    return Ok(Value::Number(arr.len() as f64));
-                }
-                if let Some(idx) = key.array_index() {
-                    if let Some(v) = arr.get(idx as usize) {
-                        return Ok(v.clone());
+                if !b.own_contains_key(key) {
+                    if let Some("length") = key.as_str() {
+                        return Ok(Value::Number(b.array_length() as f64));
+                    }
+                    if let Some(idx) = key.array_index() {
+                        if let Some(v) = arr.get(idx as usize) {
+                            if !matches!(v, Value::Hole) {
+                                return Ok(v.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -463,9 +470,10 @@ fn set_ordinary(
         // Primitives are not writable targets.
         _ => return Ok(false),
     };
-    // Delegate the array/exotic and writability handling to the engine.
-    vm.set_prop(&Value::Object(obj), key, value)?;
-    Ok(true)
+    // Delegate the array/exotic and writability handling to the engine, which
+    // reports whether [[Set]] succeeded (Reflect.set returns that boolean
+    // rather than throwing).
+    vm.set_prop_report(&Value::Object(obj), key, value)
 }
 
 // --- Descriptor helpers (replicated from builtins/fundamental.rs; no shared

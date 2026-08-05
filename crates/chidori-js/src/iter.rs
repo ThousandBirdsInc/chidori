@@ -68,7 +68,10 @@ impl Vm {
         if let Value::Object(o) = v {
             let is_plain_array = {
                 let b = o.borrow();
-                matches!(b.internal, Internal::Array(_))
+                // `own_is_empty` excludes a reified index entry (which shadows
+                // the dense slot) and a reified `length` (a sparse tail, whose
+                // elements are not in the vec at all).
+                b.array_is_dense() && b.own_is_empty()
             };
             if is_plain_array && self.has_default_array_iterator(o) {
                 if let Internal::Array(arr) = &o.borrow().internal {
@@ -103,19 +106,49 @@ impl Vm {
     }
 
     fn has_default_array_iterator(&self, o: &JsObject) -> bool {
-        // If the object's own + proto chain Symbol.iterator is the built-in
-        // Array.prototype[Symbol.iterator], the fast path is safe. We approximate
-        // by checking the prototype is the realm array_proto and no own override.
+        // The fast path replaces the whole iteration protocol, so it is only
+        // safe while every observable step of it is still the intrinsic one:
+        // no own `@@iterator` on the array, the prototype is the realm's
+        // `Array.prototype`, its `@@iterator` is still the canonical `values`,
+        // and `%ArrayIteratorPrototype%.next` is still the canonical `next`.
         let sym = self.realm.symbol_iterator.clone();
         let key = PropertyKey::Sym(sym);
-        let b = o.borrow();
-        if b.own_contains_key(&key) {
-            return false;
+        {
+            let b = o.borrow();
+            if b.own_contains_key(&key) {
+                return false;
+            }
+            match &b.proto {
+                Some(p) if p.same(&self.realm.array_proto) => {}
+                _ => return false,
+            }
         }
-        match &b.proto {
-            Some(p) => p.same(&self.realm.array_proto),
-            None => false,
+        let canonical_values = match &self.realm.array_values {
+            Some(f) => f.clone(),
+            None => return false,
+        };
+        match self
+            .realm
+            .array_proto
+            .borrow()
+            .own_get(&key)
+            .and_then(|p| p.value().cloned())
+        {
+            Some(Value::Object(f)) if f.same(&canonical_values) => {}
+            _ => return false,
         }
+        let canonical_next = match self.realm.builtin_iter_next.first() {
+            Some(f) => f.clone(),
+            None => return false,
+        };
+        matches!(
+            self.realm
+                .array_iterator_proto
+                .borrow()
+                .own_get(&PropertyKey::str("next"))
+                .and_then(|p| p.value().cloned()),
+            Some(Value::Object(f)) if f.same(&canonical_next)
+        )
     }
 
     pub fn iterator_close(&mut self, it: &Value) -> Result<(), Value> {
@@ -311,16 +344,33 @@ impl Vm {
                                     (len, Some(val))
                                 } else {
                                     let tb = t.borrow();
-                                    if let Internal::Array(a) = &tb.internal {
-                                        // Holes iterate as undefined.
-                                        let v = a.get(idx).map(|v| {
-                                            if matches!(v, Value::Hole) {
-                                                Value::Undefined
-                                            } else {
-                                                v.clone()
-                                            }
-                                        });
-                                        (a.len(), v)
+                                    if tb.is_array() {
+                                        // `length` may exceed the dense store
+                                        // (a sparse tail); a reified `props`
+                                        // entry shadows the dense slot.
+                                        let len = tb.array_length() as usize;
+                                        let shadow = if tb.own_is_empty() {
+                                            None
+                                        } else {
+                                            tb.own_get(&PropertyKey::from_index(idx as u32))
+                                                .and_then(|p| p.value().cloned())
+                                        };
+                                        let v = if idx >= len {
+                                            None
+                                        } else if let Some(v) = shadow {
+                                            Some(v)
+                                        } else {
+                                            // Holes (and absent sparse slots)
+                                            // iterate as undefined.
+                                            Some(match &tb.internal {
+                                                Internal::Array(a) => match a.get(idx) {
+                                                    Some(Value::Hole) | None => Value::Undefined,
+                                                    Some(v) => v.clone(),
+                                                },
+                                                _ => Value::Undefined,
+                                            })
+                                        };
+                                        (len, v)
                                     } else {
                                         (0, None)
                                     }

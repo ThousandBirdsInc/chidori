@@ -37,8 +37,16 @@ fn realistic_large_allocations_succeed() {
         "2000000"
     );
     assert_eq!(run("'x'.repeat(20_000_000).length"), "20000000");
-    // The caps still exist for hostile sizes — and throw catchably.
-    let out = run("try { new Array(2**31) } catch (e) { e instanceof RangeError }");
+    // A `length` beyond the dense-storage cap is a SPARSE array: honoured
+    // (the spec allows up to 2^32-1) and backed by no allocation at all.
+    assert_eq!(run("new Array(2**31).length"), "2147483648");
+    assert_eq!(run("const b = []; b[2**31] = 'x'; b.length"), "2147483649");
+    // The caps still exist for hostile sizes — and throw catchably: past the
+    // spec's own 2^32-1 bound, and for anything that would MATERIALIZE more
+    // than the cap allows.
+    let out = run("try { new Array(2**32) } catch (e) { e instanceof RangeError }");
+    assert_eq!(out, "true");
+    let out = run("try { Array.from({length: 2**31}) } catch (e) { e instanceof RangeError }");
     assert_eq!(out, "true");
 }
 

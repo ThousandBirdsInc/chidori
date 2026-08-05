@@ -6912,9 +6912,10 @@ impl Compiler {
             self.emit_field_init_closure(fields)?;
             self.emit(Op::InitCell(fi));
             self.load_binding("%superclass");
-            self.emit(Op::LoadRestArgs(0));
             self.load_binding("%newtarget");
-            self.emit(Op::ConstructSuperSpread);
+            // The argument list is forwarded directly — the default derived
+            // constructor performs no observable array spread.
+            self.emit(Op::ConstructSuperForward);
             self.emit_super_bind_and_init();
             self.emit(Op::Return); // super() evaluates to the bound `this`
         } else {

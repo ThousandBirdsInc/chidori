@@ -573,6 +573,18 @@ impl Vm {
         ))
     }
 
+    /// `ArrayCreate(len)`: an array of `len` HOLES. Past the dense-storage
+    /// ceiling the holes are not materialized — the array records `length`
+    /// alone and its (entirely absent) elements form the sparse tail.
+    pub fn new_array_of_length(&self, len: u32) -> JsObject {
+        if len as usize <= crate::value::MAX_DENSE_ARRAY {
+            return self.new_array(vec![Value::Hole; len as usize]);
+        }
+        let o = self.new_array(Vec::new());
+        o.borrow_mut().array_set_length(len, true);
+        o
+    }
+
     pub fn new_string_object(&self, s: JsString) -> JsObject {
         let len = s.len_utf16();
         let o = self.alloc(ObjectData::new(
@@ -1309,7 +1321,7 @@ impl Vm {
     /// `[[Set]]` with sloppy-mode semantics: a failed write (non-writable,
     /// setter-less accessor, primitive base, non-extensible add) silently no-ops.
     pub fn set_prop(&mut self, base: &Value, key: &PropertyKey, value: Value) -> Result<(), Value> {
-        self.set_prop_mode(base, key, value, false)
+        self.set_prop_mode(base, key, value, false).map(|_| ())
     }
 
     /// `PutValue` with Throw=true (strict-mode assignment): the same failures
@@ -1320,16 +1332,29 @@ impl Vm {
         key: &PropertyKey,
         value: Value,
     ) -> Result<(), Value> {
-        self.set_prop_mode(base, key, value, true)
+        self.set_prop_mode(base, key, value, true).map(|_| ())
     }
 
+    /// `[[Set]]` reporting its boolean result instead of throwing or silently
+    /// no-op'ing (`Reflect.set`, whose caller decides what a `false` means).
+    pub fn set_prop_report(
+        &mut self,
+        base: &Value,
+        key: &PropertyKey,
+        value: Value,
+    ) -> Result<bool, Value> {
+        self.set_prop_mode(base, key, value, false)
+    }
+
+    /// `[[Set]]`. Returns whether the write succeeded; when `strict`, a failure
+    /// is raised as a `TypeError` instead of being reported.
     fn set_prop_mode(
         &mut self,
         base: &Value,
         key: &PropertyKey,
         value: Value,
         strict: bool,
-    ) -> Result<(), Value> {
+    ) -> Result<bool, Value> {
         let obj = match base {
             Value::Object(o) => o.clone(),
             Value::Undefined | Value::Null => {
@@ -1351,7 +1376,7 @@ impl Vm {
                         ts
                     )));
                 }
-                return Ok(());
+                return Ok(false);
             }
         };
         // TypedArray exotic: integer-index writes coerce per the element kind
@@ -1365,7 +1390,7 @@ impl Vm {
             if let Some(kind) = ta_kind {
                 if let Some(idx) = key.array_index() {
                     self.ta_write(&obj, idx as usize, &value)?;
-                    return Ok(());
+                    return Ok(true);
                 }
                 if let Some(s) = key.as_str() {
                     if s != "length" && crate::vm::is_canonical_numeric(s) {
@@ -1376,7 +1401,7 @@ impl Vm {
                         } else {
                             let _ = self.to_number(&value)?;
                         }
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
             }
@@ -1399,7 +1424,7 @@ impl Vm {
                         key_display(key)
                     )));
                 }
-                return Ok(());
+                return Ok(false);
             }
         }
         // Walk proto chain to find a setter / writable check.
@@ -1415,7 +1440,7 @@ impl Vm {
                         key_display(key)
                     )));
                 }
-                return Ok(());
+                return Ok(ok);
             }
             // Module Namespace exotic [[Set]]: always returns false (a strict
             // write throws, sloppy is a silent no-op), for any key.
@@ -1426,7 +1451,7 @@ impl Vm {
                         key_display(key)
                     )));
                 }
-                return Ok(());
+                return Ok(false);
             }
             // TypedArray exotic [[Set]] reached via the proto chain (receiver is
             // an ordinary object): a canonical numeric key that is NOT a valid
@@ -1449,7 +1474,7 @@ impl Vm {
                     if self.ta_valid_index(&cur, n) {
                         break;
                     }
-                    return Ok(());
+                    return Ok(true);
                 }
             }
             let accessor = {
@@ -1473,7 +1498,7 @@ impl Vm {
                                     key_display(key)
                                 )));
                             } else {
-                                return Ok(()); // non-writable: ignore (non-strict)
+                                return Ok(false); // non-writable: ignore (non-strict)
                             }
                         } else {
                             // inherited data property: shadow on receiver if writable
@@ -1485,7 +1510,7 @@ impl Vm {
                                     key_display(key)
                                 )));
                             } else {
-                                return Ok(());
+                                return Ok(false);
                             }
                         }
                     }
@@ -1526,7 +1551,7 @@ impl Vm {
             match accessor {
                 Some(Some(setter)) => {
                     self.call(setter, base.clone(), &[value])?;
-                    return Ok(());
+                    return Ok(true);
                 }
                 Some(None) => {
                     // accessor with no setter: throws in strict, ignored otherwise
@@ -1536,7 +1561,7 @@ impl Vm {
                             key_display(key)
                         )));
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
                 None => break, // own writable data property
             }
@@ -1551,7 +1576,41 @@ impl Vm {
         key: &PropertyKey,
         value: Value,
         strict: bool,
-    ) -> Result<(), Value> {
+    ) -> Result<bool, Value> {
+        // Array `length` is never a plain data slot: an assignment to it runs
+        // the full `ArraySetLength` (ToUint32 + ToNumber coercions, the
+        // element-deleting truncation, the writable check that a coercion side
+        // effect may itself have installed). Route it through the array exotic
+        // [[DefineOwnProperty]] rather than the ordinary props path below.
+        if key.as_str() == Some("length") && obj.borrow().is_array() {
+            // Fast path for the overwhelmingly common `arr.length = <number>`:
+            // an empty `props` means `length` is derived (so writable) and no
+            // index is reified (so none can be non-configurable and block the
+            // truncation), and a Number needs no observable coercion — the
+            // whole of ArraySetLength collapses to the storage update.
+            if let Value::Number(n) = &value {
+                let n = *n;
+                let mut b = obj.borrow_mut();
+                if b.own_is_empty() {
+                    let len = n as u32;
+                    if (len as f64) != n || n < 0.0 {
+                        drop(b);
+                        return Err(self.throw_range("Invalid array length"));
+                    }
+                    b.array_set_length(len, true);
+                    return Ok(true);
+                }
+            }
+            let desc = crate::builtins::fundamental::PropDesc::value_only(value);
+            let ok =
+                crate::builtins::fundamental::define_own_property(self, obj, key, &desc, false)?;
+            if !ok && strict {
+                return Err(
+                    self.throw_type("Cannot assign to read only property 'length' of object")
+                );
+            }
+            return Ok(ok);
+        }
         let mut b = obj.borrow_mut();
         // Mapped arguments: a [[Set]] on an aliased index writes the parameter
         // CELL too (the ordinary props entry below stays in sync).
@@ -1580,65 +1639,65 @@ impl Vm {
                 ..
             })
         );
+        let array_length = if b.is_array() { b.array_length() } else { 0 };
         if !has_props_entry {
-            if let Internal::Array(arr) = &mut b.internal {
-                if let Some("length") = key.as_str() {
-                    drop(b);
-                    let n = self.to_number(&value)?;
-                    let len = n as usize;
-                    let mut b = obj.borrow_mut();
-                    if let Internal::Array(arr) = &mut b.internal {
-                        if (len as f64) != n || n < 0.0 {
-                            return Err(self.throw_range("Invalid array length"));
-                        }
-                        if len > crate::value::MAX_DENSE_ARRAY {
-                            return Err(self.throw_range("Array allocation exceeds engine limit"));
-                        }
-                        // Growing `length` creates holes, not undefined slots.
-                        arr.resize(len, Value::Hole);
+            if let Some(index) = key.array_index().filter(|_| b.is_array()) {
+                let idx = index as usize;
+                let dense_len = match &b.internal {
+                    Internal::Array(arr) => arr.len(),
+                    _ => 0,
+                };
+                // An append OR an in-bounds hole fill CREATES a property
+                // (a hole is absent), so a non-extensible receiver rejects
+                // it (OrdinarySet → CreateDataProperty → [[DefineOwnProperty]]
+                // step 2.b): silently in sloppy mode, TypeError in strict.
+                // Object.seal/preventExtensions on a dense array land here.
+                let creates = match &b.internal {
+                    Internal::Array(arr) => idx >= dense_len || matches!(arr[idx], Value::Hole),
+                    _ => true,
+                };
+                if creates && !extensible {
+                    if strict {
+                        drop(b);
+                        return Err(self.throw_type(&format!(
+                            "Cannot add property {}, object is not extensible",
+                            key_display(key)
+                        )));
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
-                if let Some(idx) = key.array_index() {
-                    let idx = idx as usize;
-                    // An append OR an in-bounds hole fill CREATES a property
-                    // (a hole is absent), so a non-extensible receiver rejects
-                    // it (OrdinarySet → CreateDataProperty → [[DefineOwnProperty]]
-                    // step 2.b): silently in sloppy mode, TypeError in strict.
-                    // Object.seal/preventExtensions on a dense array land here.
-                    let creates = idx >= arr.len() || matches!(arr[idx], Value::Hole);
-                    if creates && !extensible {
-                        if strict {
-                            drop(b);
-                            return Err(self.throw_type(&format!(
-                                "Cannot add property {}, object is not extensible",
-                                key_display(key)
-                            )));
-                        }
-                        return Ok(());
+                if index >= array_length && len_not_writable {
+                    // Growing past a non-writable `length` is rejected
+                    // (silently in sloppy mode, TypeError in strict).
+                    if strict {
+                        return Err(
+                            self.throw_type("Cannot add property, array length is not writable")
+                        );
                     }
-                    if idx >= arr.len() {
-                        if len_not_writable {
-                            // Growing past a non-writable `length` is rejected
-                            // (silently in sloppy mode, TypeError in strict).
-                            if strict {
-                                return Err(self.throw_type(
-                                    "Cannot add property, array length is not writable",
-                                ));
-                            }
-                            return Ok(());
-                        }
-                        if idx >= crate::value::MAX_DENSE_ARRAY {
-                            return Err(self.throw_range("Array index exceeds engine limit"));
-                        }
-                        // Writing past the end leaves holes in the gap.
+                    return Ok(false);
+                }
+                if idx >= crate::value::MAX_DENSE_ARRAY {
+                    // Past the dense-storage ceiling: the element becomes an
+                    // ordinary own data property (the sparse tail) and `length`
+                    // grows to cover it.
+                    b.own_insert(key.clone(), Property::data(value));
+                    b.array_grow_length(index.saturating_add(1));
+                    return Ok(true);
+                }
+                if idx >= dense_len {
+                    // Writing past the end leaves holes in the gap.
+                    if let Internal::Array(arr) = &mut b.internal {
                         arr.resize(idx + 1, Value::Hole);
                     }
-                    arr[idx] = value;
-                    return Ok(());
+                    b.array_grow_length(index + 1);
                 }
+                if let Internal::Array(arr) = &mut b.internal {
+                    arr[idx] = value;
+                }
+                return Ok(true);
             }
         }
+        let mut ok = true;
         match b.own_get_mut(key) {
             Some(p) => match &mut p.kind {
                 PropertyKind::Data {
@@ -1647,10 +1706,13 @@ impl Vm {
                 } => {
                     if *writable {
                         *slot = value;
+                    } else {
+                        ok = false;
                     }
                 }
                 PropertyKind::Accessor { .. } => {
                     // shouldn't get here (handled above), ignore
+                    ok = false;
                 }
             },
             None => {
@@ -1662,12 +1724,19 @@ impl Vm {
                             key_display(key)
                         )));
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
                 b.own_insert(key.clone(), Property::data(value));
+                // A newly created own index property on an array grows `length`
+                // to cover it (array exotic [[DefineOwnProperty]] step 3.g).
+                if b.is_array() {
+                    if let Some(i) = key.array_index() {
+                        b.array_grow_length(i.saturating_add(1));
+                    }
+                }
             }
         }
-        Ok(())
+        Ok(ok)
     }
 
     /// [[Delete]].

@@ -6,6 +6,11 @@
 //! units) so a future change to either constant is a deliberate, test-visible
 //! decision — the previous bump (1M -> 2^25, 2^24 -> 2^28) landed with no test
 //! pinning either boundary.
+//!
+//! `MAX_DENSE_ARRAY` bounds the DENSE backing store, not the array `length`:
+//! a `length` past the cap is honoured with a sparse tail that allocates
+//! nothing, so the ceiling holds without the (non-conformant) RangeError the
+//! cap used to raise.
 
 use chidori_js::value::{Value, MAX_DENSE_ARRAY, MAX_STRING_LEN};
 use chidori_js::Engine;
@@ -20,31 +25,43 @@ fn eval_str(e: &mut Engine, src: &str) -> String {
 #[test]
 fn dense_array_cap_is_a_catchable_range_error() {
     let mut e = Engine::new();
-    // The constructor guard fires before allocating, so probing one past the
-    // cap is cheap. The error must be a catchable RangeError.
+    // A `length` past the cap is NOT an error: the array simply keeps no dense
+    // backing for the tail (the spec's sparse array), so nothing is allocated
+    // and the ceiling still holds. `new Array(n)` and `a.length = n` both do
+    // this, up to the spec's own 2^32-1 bound.
+    let src = format!("new Array({over}).length", over = MAX_DENSE_ARRAY + 1);
+    let v = e.eval(&src).unwrap();
+    assert!(matches!(v, Value::Number(n) if n == (MAX_DENSE_ARRAY + 1) as f64));
+
     let src = format!(
-        r#"
-        (function () {{
-          try {{
-            new Array({over});
-            return "allocated";
-          }} catch (err) {{
-            return err instanceof RangeError ? "range-error" : "wrong-error: " + err;
-          }}
-        }})();
-        "#,
+        "(function () {{ const a = []; a.length = {over}; return a.length; }})();",
         over = MAX_DENSE_ARRAY + 1
     );
-    assert_eq!(eval_str(&mut e, &src), "range-error");
+    let v = e.eval(&src).unwrap();
+    assert!(matches!(v, Value::Number(n) if n == (MAX_DENSE_ARRAY + 1) as f64));
 
-    // Setting `.length` past the cap is guarded the same way.
+    // Past 2^32-1 the spec bound applies, as a catchable RangeError.
+    let src = r#"
+        (function () {
+          try {
+            new Array(4294967296);
+            return "allocated";
+          } catch (err) {
+            return err instanceof RangeError ? "range-error" : "wrong-error: " + err;
+          }
+        })();
+    "#;
+    assert_eq!(eval_str(&mut e, src), "range-error");
+
+    // What the cap still guards is EAGER DENSE materialization: a builtin
+    // asked to build a real backing store past the cap refuses before
+    // allocating, with a catchable RangeError.
     let src = format!(
         r#"
         (function () {{
-          const a = [];
           try {{
-            a.length = {over};
-            return "grew";
+            Array.from({{ length: {over} }});
+            return "allocated";
           }} catch (err) {{
             return err instanceof RangeError ? "range-error" : "wrong-error: " + err;
           }}
