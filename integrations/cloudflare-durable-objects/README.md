@@ -46,3 +46,13 @@ The Worker speaks the `HttpRunStore` REST protocol defined in
 `crates/chidori/src/runtime/store.rs` (records + blobs per run, a run index,
 and the detached-agent registry). Any server implementing that protocol works
 as a mirror — the Durable Object deployment is the reference implementation.
+
+## Self-hosted alternative
+
+`chidori cell-store` serves the same protocol on your own infrastructure,
+implementing the core of Deno's [celld](https://github.com/denoland/celld)
+design: one SQLite database per run, replicated to an S3-compatible bucket,
+with object-storage compare-and-swap ensuring exactly one node owns a run at
+a time — the Durable Object shape (per-run isolation, serialized writers)
+without depending on Cloudflare. See "Self-hosted cell store" in
+`docs/durable-storage.md`.

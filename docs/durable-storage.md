@@ -82,12 +82,58 @@ Selected by `CHIDORI_RUN_STORE`:
 | unset / `fs` | Filesystem only (the default — exactly the pre-existing behavior) |
 | `sqlite` | Mirror to a shared SQLite database (`CHIDORI_RUN_DB`, default `<run_base>/runs.sqlite3`). One row per record — not the session store's blob-per-session shortcut. |
 | `s3://bucket[/prefix]` | Mirror to any **S3-compatible object store** — AWS S3, Cloudflare R2, GCS interop, Backblaze, MinIO, LocalStack. No server-side code to deploy: point `CHIDORI_RUN_STORE_ENDPOINT` at the store (default `https://s3.<region>.amazonaws.com`), supply the standard `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (or `CHIDORI_RUN_STORE_*` overrides), and requests are SigV4-signed in-process (no AWS SDK). Each journal append is one object PUT (`runs/<id>/records/<seq>.json`); safepoint checkpoints compact the tail objects. Bucket versioning gives point-in-time recovery for free. **This is the recommended default mirror.** |
-| `http(s)://…` | Mirror to a remote relay speaking the run-store REST protocol. The reference deployment is one **Cloudflare Durable Object per run** (`integrations/cloudflare-durable-objects/`), which gives every acknowledged write cross-datacenter replication, 30-day point-in-time recovery, and a **serialized writer per run** (the platform enforces a single instance per id — the strongest lease story). `CHIDORI_RUN_STORE_TOKEN` adds bearer auth. |
+| `http(s)://…` | Mirror to a remote relay speaking the run-store REST protocol. Two reference deployments: one **Cloudflare Durable Object per run** (`integrations/cloudflare-durable-objects/`), which gives every acknowledged write cross-datacenter replication, 30-day point-in-time recovery, and a **serialized writer per run** (the platform enforces a single instance per id — the strongest lease story); or the **self-hosted cell store** (`chidori cell-store`, below), which delivers the same one-database-per-run, single-writer model on your own machines. `CHIDORI_RUN_STORE_TOKEN` adds bearer auth to both. |
 
 Choosing between the remote backends: reach for `s3://` when you want durability
 with zero deployment surface (most users); reach for the Durable Object relay
 when you want platform-enforced single writers and the lowest write
-confirmation latency, or as the beachhead for future multi-node routing.
+confirmation latency, or as the beachhead for future multi-node routing; reach
+for the self-hosted cell store when you want the Durable Object shape —
+serialized writers, per-run isolation — without depending on Cloudflare.
+
+## Self-hosted cell store: `chidori cell-store`
+
+An alternative to the Durable Object relay that runs on your own
+infrastructure, implementing the core of the design behind Deno's
+[celld](https://github.com/denoland/celld) ("self-hosted, distributed Durable
+Objects"). It serves the exact run-store REST protocol, so it is a drop-in
+`CHIDORI_RUN_STORE` target:
+
+```bash
+# One node, replicating to any S3-compatible bucket (S3, R2, MinIO, …):
+chidori cell-store --bucket s3://chidori-cells --listen 0.0.0.0:9700
+
+# Point Chidori at it, exactly like the Durable Object worker:
+export CHIDORI_RUN_STORE="http://storehost:9700"
+export CHIDORI_RUN_STORE_TOKEN="…"   # same knob, enforced by the node
+chidori serve agent.ts
+```
+
+The celld model, applied to runs:
+
+* **Every run is its own SQLite database** (a *cell*) on node-local disk —
+  runs shard by construction, one run's failure can't corrupt another's.
+* **The bucket is the fleet's source of truth.** Cells replicate to it as
+  immutable snapshots on the `--sync-secs` cadence (and at hibernate and
+  shutdown); ownership records live next to them. Nodes are replaceable.
+* **Object-storage compare-and-swap owns cells.** Exactly one node owns a
+  cell at a time with no membership protocol, failure detector, or consensus
+  service: ownership epoch *N* is a create-only PUT (`If-None-Match: *`) of
+  the cell's `meta/N.json` — atomic create means exactly one winner per
+  epoch. Leases expire; takeover is winning the next epoch and restoring the
+  database from the current snapshot. A fenced ex-owner (its epoch
+  superseded) drops its copy and answers 409 with the live owner's identity.
+* **Idle cells hibernate to nearly nothing** (`--idle-secs`): a final
+  replication, published unowned *without resetting the epoch*, database
+  closed, memory dropped. The next request — on any node sharing the bucket —
+  claims the next epoch immediately and restores it.
+
+Durability shape: local disk stays the fast primary (a node restart reclaims
+its own cells losslessly, unpublished writes included); the bucket is the
+copy that survives losing the machine, fresh to within one sync window. Run
+several nodes against one bucket for failover; note that a client talks to
+one node — a cell owned by another live node is refused, not proxied
+(routing, like celld's V8 application runtime, is out of scope here).
 
 ## Write-error policy: `CHIDORI_DURABILITY`
 

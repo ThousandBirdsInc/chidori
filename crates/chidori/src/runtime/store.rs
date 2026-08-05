@@ -14,7 +14,10 @@
 //!   * [`HttpRunStore`] — records + blobs relayed to a remote store speaking
 //!     the small REST protocol in `integrations/cloudflare-durable-objects/`
 //!     (`CHIDORI_RUN_STORE=https://...`). One Durable Object per run gives the
-//!     journal cross-datacenter replication and point-in-time recovery.
+//!     journal cross-datacenter replication and point-in-time recovery. The
+//!     self-hosted equivalent is `chidori cell-store` (`crate::cellstore`):
+//!     one SQLite cell per run on your own nodes, bucket-replicated, with
+//!     compare-and-swap single ownership — the celld model.
 //!   * [`TeeRunStore`] — the composition the runtime actually uses when a
 //!     durable backend is configured: the filesystem layout stays the primary
 //!     (every existing read path keeps working), the durable backend receives
