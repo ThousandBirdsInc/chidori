@@ -104,7 +104,7 @@ serde_yaml = "0.9"
 # dependency graph, so dev builds can drop it with `--no-default-features`
 # (runtime/otel.rs is swapped for a no-op stub; everything else compiles
 # unchanged).
-opentelemetry = { version = "0.27", optional = true }
+opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
 
