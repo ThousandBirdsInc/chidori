@@ -53,8 +53,11 @@ impl From<&ResolutionKind> for ResolutionKindTag {
 }
 
 /// Allowlist of `node:` builtins the resolver will accept under the `Node`
-/// policy. The corresponding shim sources are registered by
-/// `runtime::typescript::snapshot` when bundling.
+/// policy. Covers the full Node builtin module suite: shim sources live in
+/// `runtime::typescript::builtins` (the original core set) and
+/// `runtime::typescript::builtins_compat` (the rest — functional pure-JS
+/// implementations plus fail-loud stubs for capabilities the runtime does not
+/// grant).
 pub const NODE_BUILTIN_ALLOWLIST: &[&str] = &[
     "process",
     "buffer",
@@ -71,7 +74,52 @@ pub const NODE_BUILTIN_ALLOWLIST: &[&str] = &[
     "assert",
     "assert/strict",
     "os",
+    "async_hooks",
+    "console",
+    "constants",
+    "diagnostics_channel",
+    "domain",
+    "module",
+    "net",
+    "path/win32",
+    "perf_hooks",
+    "punycode",
+    "querystring",
+    "stream",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "sys",
+    "test",
+    "timers",
+    "timers/promises",
+    "tty",
+    "util/types",
+    "v8",
+    "worker_threads",
+    "child_process",
+    "cluster",
+    "dgram",
+    "dns",
+    "dns/promises",
+    "http2",
+    "inspector",
+    "inspector/promises",
+    "readline",
+    "readline/promises",
+    "repl",
+    "tls",
+    "trace_events",
+    "vm",
+    "wasi",
+    "zlib",
 ];
+
+/// Builtins Node only accepts with the `node:` prefix: they are excluded from
+/// `module.builtinModules`, `isBuiltin("test")` is false, and a bare `test`
+/// specifier resolves through node_modules, not to the shim.
+pub const NODE_PREFIX_ONLY_BUILTINS: &[&str] = &["test"];
 
 /// Walk up from `start` looking for a `package.json` and return the directory
 /// that contains it. Falls back to `start`'s parent (or the cwd) if none

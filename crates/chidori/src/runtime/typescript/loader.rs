@@ -21,15 +21,18 @@ use std::path::Path;
 
 use crate::runtime::snapshot::TypeScriptImportPolicy;
 
-use super::resolver::{Resolver, DEFAULT_CONDITIONS};
+use super::resolver::{ResolutionKind, Resolver, DEFAULT_CONDITIONS};
 use super::transpile::{
     find_workspace_root, resolve_relative_import, transpile_module, TranspileOptions,
     NODE_BUILTIN_ALLOWLIST,
 };
 
 /// Resolve `specifier` from `importer_key`, read the module, and produce ES
-/// module source. `node:` builtins and vendored packages must be handled by
-/// the caller before this.
+/// module source. `node:`-prefixed builtins and vendored packages must be
+/// handled by the caller before this; *bare* builtin specifiers (`fs`,
+/// `path`) come out of the resolver as `NodeBuiltin` resolutions and are
+/// served from the shim registry here under the same `node:<name>` key, so
+/// both spellings share one module instance.
 pub fn load_module_source(
     specifier: &str,
     importer_key: &str,
@@ -49,10 +52,15 @@ pub fn load_module_source(
             DEFAULT_CONDITIONS.iter().copied(),
             NODE_BUILTIN_ALLOWLIST.iter().copied(),
         );
-        resolver
+        let resolution = resolver
             .resolve(specifier, importer)
-            .map_err(|e| e.to_string())?
-            .resolved_path
+            .map_err(|e| e.to_string())?;
+        if let ResolutionKind::NodeBuiltin { name } = &resolution.kind {
+            let src = super::builtins::shim_source(name)
+                .ok_or_else(|| format!("no shim registered for node builtin `{name}`"))?;
+            return Ok((format!("node:{name}"), src.to_string()));
+        }
+        resolution.resolved_path
     } else {
         // Agent-code relative import: keep the historical strict behavior
         // (rooted at the importer's directory, no escaping).
@@ -179,6 +187,25 @@ mod tests {
         )
         .unwrap();
         assert!(key.ends_with("node_modules/pkg/util.js"));
+    }
+
+    #[test]
+    fn bare_builtin_specifier_serves_shim_under_node_key() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("package.json"), r#"{"name":"proj"}"#);
+        write(&root.join("agent.ts"), "");
+        let (key, src) =
+            load_module_source("path", root.join("agent.ts").to_str().unwrap()).unwrap();
+        // Same module key as the node:-prefixed spelling, so both share one
+        // instance in the module graph.
+        assert_eq!(key, "node:path");
+        assert!(src.contains("posix"));
+
+        let (key2, src2) =
+            load_module_source("stream", root.join("agent.ts").to_str().unwrap()).unwrap();
+        assert_eq!(key2, "node:stream");
+        assert!(src2.contains("class Readable"));
     }
 
     #[test]

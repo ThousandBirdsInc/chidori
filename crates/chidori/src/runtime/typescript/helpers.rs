@@ -1204,6 +1204,37 @@ pub(crate) const TIMER_VIRTUAL_POLYFILL: &str = r#"
         }
         return best;
     }
+    // Immediates carry Node's round semantics: an immediate queued while the
+    // current round's immediates are being processed waits for the NEXT round
+    // (Node runs `setImmediate` callbacks once per event-loop turn), and due
+    // timers fire at round boundaries. `round` is the round currently being
+    // drained; an immediate scheduled mid-drain is stamped `round + 1`.
+    let round = 0;
+    function earliestDueTimerIndex() {
+        let best = -1;
+        for (let i = 0; i < tasks.length; i++) {
+            if (tasks[i].immediate) continue;
+            if (tasks[i].deadline > globalThis.__chidori_now) continue;
+            if (best === -1 ||
+                tasks[i].deadline < tasks[best].deadline ||
+                (tasks[i].deadline === tasks[best].deadline && tasks[i].id < tasks[best].id)) {
+                best = i;
+            }
+        }
+        return best;
+    }
+    function eligibleImmediateIndex() {
+        let best = -1;
+        for (let i = 0; i < tasks.length; i++) {
+            if (!tasks[i].immediate || tasks[i].round > round) continue;
+            if (best === -1 || tasks[i].id < tasks[best].id) best = i;
+        }
+        return best;
+    }
+    function hasImmediates() {
+        for (let i = 0; i < tasks.length; i++) if (tasks[i].immediate) return true;
+        return false;
+    }
     function pump() {
         if (tasks.length === 0) { pumping = false; return; }
         if (fired++ > MAX_FIRES) {
@@ -1211,7 +1242,24 @@ pub(crate) const TIMER_VIRTUAL_POLYFILL: &str = r#"
             tasks.length = 0;
             throw new Error("Chidori timer pump exceeded " + MAX_FIRES + " firings (runaway setInterval?)");
         }
-        const idx = earliestIndex();
+        // 1. Drain THIS round's immediates first, FIFO — once a turn's check
+        //    phase begins, Node runs every immediate queued before it, and
+        //    timers wait for the next turn's timers phase.
+        let idx = eligibleImmediateIndex();
+        if (idx === -1) {
+            // 2. Round exhausted: the next turn begins with its timers phase —
+            //    fire any timer whose virtual deadline has already passed.
+            idx = earliestDueTimerIndex();
+            if (idx === -1 && hasImmediates()) {
+                // 3. No due timer, immediates queued for the next turn.
+                round += 1;
+                idx = eligibleImmediateIndex();
+            }
+            if (idx === -1) {
+                // 4. Nothing but future timers: jump the clock to the next one.
+                idx = earliestIndex();
+            }
+        }
         const task = tasks[idx];
         if (task.deadline > globalThis.__chidori_now) {
             globalThis.__chidori_now = task.deadline;
@@ -1232,8 +1280,27 @@ pub(crate) const TIMER_VIRTUAL_POLYFILL: &str = r#"
         return schedule(cb, delay, args, true);
     };
     globalThis.setImmediate = function setImmediate(cb, ...args) {
-        return schedule(cb, 0, args, false);
+        const id = schedule(cb, 0, args, false);
+        const task = tasks[tasks.length - 1];
+        if (task && task.id === id) {
+            task.immediate = true;
+            // Queued while its own round is draining -> next turn.
+            task.round = pumping ? round + 1 : round;
+        }
+        return id;
     };
+    // Deterministic clock reads: the engine's native Date is fixed at epoch 0
+    // (no host clock). Bridge Date.now to the virtual timer clock, advancing
+    // it a small fixed step per read so spin-waits on elapsed time terminate
+    // deterministically (same call sequence -> same readings) instead of
+    // looping forever against a frozen value.
+    const NativeDate = globalThis.Date;
+    if (NativeDate && typeof NativeDate.now === "function") {
+        NativeDate.now = function now() {
+            globalThis.__chidori_now += 0.05;
+            return Math.floor(globalThis.__chidori_now);
+        };
+    }
     function clear(id) {
         for (let i = 0; i < tasks.length; i++) {
             if (tasks[i].id === id) { tasks.splice(i, 1); return; }
@@ -1251,6 +1318,148 @@ pub(crate) const TIMER_VIRTUAL_POLYFILL: &str = r#"
             Promise.resolve().then(cb);
         };
     }
+})();
+"#;
+
+/// WHATWG events subset: `Event`/`EventTarget`/`AbortController`/`AbortSignal`
+/// as globals. Pure deterministic JS — listener bookkeeping in memory, no host
+/// reach. `AbortSignal.timeout` schedules on the virtual timer queue, so
+/// install this after the timer polyfill. Listener lists live under the
+/// well-known `Symbol.for("chidori.kEvents")` (exposed as
+/// `globalThis.__chidori_kEvents` for the node-compat harness's
+/// `internal/event_target`).
+pub(crate) const WEB_EVENTS_POLYFILL: &str = r#"
+(function () {
+    if (typeof globalThis.EventTarget === "function") return;
+    const kEvents = Symbol.for("chidori.kEvents");
+    globalThis.__chidori_kEvents = kEvents;
+
+    class Event {
+        constructor(type, options) {
+            if (arguments.length === 0) {
+                const err = new TypeError("The type argument must be specified");
+                err.code = "ERR_MISSING_ARGS";
+                throw err;
+            }
+            this.type = String(type);
+            this.bubbles = !!(options && options.bubbles);
+            this.cancelable = !!(options && options.cancelable);
+            this.composed = !!(options && options.composed);
+            this.defaultPrevented = false;
+            this.target = null;
+            this.currentTarget = null;
+            this.isTrusted = false;
+            this.timeStamp = 0;
+            this.__stopImmediate = false;
+        }
+        preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+        stopPropagation() {}
+        stopImmediatePropagation() { this.__stopImmediate = true; }
+        composedPath() { return this.target ? [this.target] : []; }
+    }
+
+    class EventTarget {
+        constructor() {
+            this[kEvents] = new Map();
+        }
+        addEventListener(type, listener, options) {
+            if (listener === null || listener === undefined) return;
+            type = String(type);
+            const opts = typeof options === "boolean" ? { capture: options } : (options || {});
+            let list = this[kEvents].get(type);
+            if (!list) { list = []; this[kEvents].set(type, list); }
+            for (const entry of list) {
+                if (entry.listener === listener && entry.capture === !!opts.capture) return;
+            }
+            list.push({
+                listener,
+                once: !!opts.once,
+                capture: !!opts.capture,
+                // Internal (events.once): survive stopImmediatePropagation,
+                // like Node's kResistStopPropagation abort watchers.
+                resist: !!opts.__chidoriResistStopPropagation,
+            });
+        }
+        removeEventListener(type, listener, options) {
+            type = String(type);
+            const capture = typeof options === "boolean" ? options : !!(options && options.capture);
+            const list = this[kEvents].get(type);
+            if (!list) return;
+            for (let i = 0; i < list.length; i++) {
+                if (list[i].listener === listener && list[i].capture === capture) {
+                    list.splice(i, 1);
+                    break;
+                }
+            }
+            if (list.length === 0) this[kEvents].delete(type);
+        }
+        dispatchEvent(event) {
+            const list = this[kEvents].get(event.type);
+            event.target = this;
+            event.currentTarget = this;
+            if (list) {
+                for (const entry of list.slice()) {
+                    if (event.__stopImmediate && !entry.resist) continue;
+                    if (entry.once) this.removeEventListener(event.type, entry.listener, entry.capture);
+                    if (typeof entry.listener === "function") entry.listener.call(this, event);
+                    else if (entry.listener && typeof entry.listener.handleEvent === "function") {
+                        entry.listener.handleEvent(event);
+                    }
+                }
+            }
+            return !event.defaultPrevented;
+        }
+    }
+
+    function makeAbortError(message) {
+        const err = new Error(message || "This operation was aborted");
+        err.name = "AbortError";
+        err.code = 20;
+        return err;
+    }
+    function doAbort(signal, reason) {
+        if (signal.aborted) return;
+        signal.aborted = true;
+        signal.reason = reason;
+        const event = new Event("abort");
+        if (typeof signal.onabort === "function") signal.onabort.call(signal, event);
+        signal.dispatchEvent(event);
+    }
+
+    class AbortSignal extends EventTarget {
+        constructor() {
+            super();
+            this.aborted = false;
+            this.reason = undefined;
+            this.onabort = null;
+        }
+        throwIfAborted() { if (this.aborted) throw this.reason; }
+        static abort(reason) {
+            const signal = new AbortSignal();
+            signal.aborted = true;
+            signal.reason = reason === undefined ? makeAbortError() : reason;
+            return signal;
+        }
+        static timeout(ms) {
+            const signal = new AbortSignal();
+            setTimeout(() => {
+                const err = new Error("The operation was aborted due to timeout");
+                err.name = "TimeoutError";
+                doAbort(signal, err);
+            }, ms);
+            return signal;
+        }
+    }
+
+    class AbortController {
+        constructor() { this.signal = new AbortSignal(); }
+        abort(reason) { doAbort(this.signal, reason === undefined ? makeAbortError() : reason); }
+    }
+
+    if (typeof globalThis.Event !== "function") globalThis.Event = Event;
+    globalThis.EventTarget = EventTarget;
+    if (typeof globalThis.AbortSignal !== "function") globalThis.AbortSignal = AbortSignal;
+    if (typeof globalThis.AbortController !== "function") globalThis.AbortController = AbortController;
 })();
 "#;
 

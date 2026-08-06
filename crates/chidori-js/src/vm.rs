@@ -790,13 +790,38 @@ impl Vm {
     pub(crate) fn record_unwind_frame(
         &self,
         err: &Value,
-        proto: &crate::bytecode::FuncProto,
+        proto: &std::rc::Rc<crate::bytecode::FuncProto>,
         pos: Option<u32>,
     ) {
         const MAX_UNWIND_FRAMES: usize = 32;
         let Value::Object(o) = err else { return };
         let mut b = o.borrow_mut();
         if !matches!(b.internal, Internal::Error) {
+            return;
+        }
+        // `Error.captureStackTrace(err, fn)` asked for every frame at or inside
+        // `fn` to be hidden. Frames arrive innermost-first on the unwind path,
+        // so "hidden" is simply "record nothing until we leave `fn` itself" —
+        // the marker is consumed by `fn`'s own activation and outer frames are
+        // recorded normally.
+        let marker_key = PropertyKey::Sym(self.realm.symbol_stack_start.clone());
+        let marker = b.own_get(&marker_key).and_then(|p| p.value().cloned());
+        if let Some(marker) = marker {
+            let reached = match &marker {
+                Value::Object(f) => match &f.borrow().internal {
+                    Internal::Function(crate::value::FunctionInner::Bytecode(bf)) => {
+                        std::rc::Rc::ptr_eq(&bf.proto, proto)
+                    }
+                    // A native `stackStartFn` never appears as a bytecode frame;
+                    // treat the marker as satisfied rather than swallowing the
+                    // whole trace.
+                    _ => true,
+                },
+                _ => true,
+            };
+            if reached {
+                b.own_remove(&marker_key);
+            }
             return;
         }
         let Some(prop) = b.own_get_mut(&crate::value::StrKeyRef("stack")) else {
@@ -1914,6 +1939,7 @@ impl Vm {
                     || *sym == self.realm.symbol_intl_locale
                     || *sym == self.realm.symbol_intl_plural_rules
                     || *sym == self.realm.symbol_intl_number_format
+                    || *sym == self.realm.symbol_stack_start
             }
         }
     }

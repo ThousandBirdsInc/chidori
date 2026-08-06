@@ -747,8 +747,8 @@ pub(crate) fn run_module(
             let src = crate::runtime::typescript::builtins::shim_source(name).ok_or_else(|| {
                 format!(
                     "unsupported node: builtin '{specifier}' (imported from {importer_key}); \
-                     the runtime shims only a small allowlist of node builtins — \
-                     see docs/package-management.md#compatibility"
+                     the runtime shims the Node builtin module suite and this name is not \
+                     part of it — see docs/package-management.md#compatibility"
                 )
             })?;
             return Ok((format!("node:{name}"), src.to_string()));
@@ -828,6 +828,7 @@ const SYNC_NATIVE_NAMES: &[(&str, u32)] = &[
     ("__chidori_fs_rm", 3),
     ("__chidori_fs_rename", 2),
     ("__chidori_fs_stat", 1),
+    ("__chidori_zlib", 3),
     ("__chidori_note_capability", 1),
 ];
 
@@ -1033,6 +1034,16 @@ pub(crate) fn build_sync_native_dispatch(
                     fs_policy_guard(&policy)?;
                     ctx.vfs_stat(&str_arg(0)?)
                 }
+                "__chidori_zlib" => {
+                    // Pure inline computation (like hashing): output is a
+                    // function of (input, level) alone, so nothing is captured
+                    // and no policy gates it.
+                    let op = str_arg(0)?;
+                    let data = b64_decode(&str_arg(1)?)?;
+                    let level = args.get(2).and_then(|v| v.as_i64());
+                    let out = crate::runtime::compress::zlib_op(&op, &data, level)?;
+                    Ok(Value::String(b64_encode(&out)))
+                }
                 "__chidori_note_capability" => {
                     let cap = match str_arg(0)?.as_str() {
                         "timer" => Capability::Timer,
@@ -1048,6 +1059,174 @@ pub(crate) fn build_sync_native_dispatch(
     )
 }
 
+/// `process`'s EventEmitter surface. Node code registers 'uncaughtException',
+/// 'unhandledRejection', 'beforeExit' and friends on `process`, and callers
+/// that emit into it (diagnostics_channel's subscriber-error path, for one)
+/// need those listeners to actually run. The registry is a plain in-heap map
+/// of arrays — no host state, no scheduling of its own, so it stays as
+/// deterministic as the rest of the prelude. Emitting is synchronous and
+/// ordered, matching Node; there is no 'newListener' meta-event and no
+/// max-listeners warning, which `process` never relies on.
+const PROCESS_EVENTS_JS: &str = r#"
+(function () {
+    const proc = globalThis.process;
+    const events = Object.create(null);
+    const listOf = function (name) {
+        const key = String(name);
+        return events[key] || (events[key] = []);
+    };
+    proc.on = function (name, fn) {
+        if (typeof fn !== "function") throw new TypeError("process listener must be a function");
+        listOf(name).push(fn);
+        return this;
+    };
+    proc.once = function (name, fn) {
+        if (typeof fn !== "function") throw new TypeError("process listener must be a function");
+        const self = this;
+        const wrapper = function (...args) {
+            self.off(name, wrapper);
+            return fn.apply(self, args);
+        };
+        wrapper.listener = fn;
+        return this.on(name, wrapper);
+    };
+    proc.off = function (name, fn) {
+        const list = events[String(name)];
+        if (list) {
+            for (let i = 0; i < list.length; i++) {
+                if (list[i] === fn || list[i].listener === fn) { list.splice(i, 1); break; }
+            }
+        }
+        return this;
+    };
+    proc.removeAllListeners = function (name) {
+        if (name === undefined) {
+            for (const key of Object.keys(events)) delete events[key];
+        } else {
+            delete events[String(name)];
+        }
+        return this;
+    };
+    proc.prependListener = function (name, fn) {
+        if (typeof fn !== "function") throw new TypeError("process listener must be a function");
+        listOf(name).unshift(fn);
+        return this;
+    };
+    proc.listeners = function (name) {
+        const list = events[String(name)];
+        return list ? list.slice() : [];
+    };
+    proc.rawListeners = proc.listeners;
+    proc.listenerCount = function (name) {
+        const list = events[String(name)];
+        return list ? list.length : 0;
+    };
+    proc.eventNames = function () { return Object.keys(events); };
+    proc.emit = function (name, ...args) {
+        const list = events[String(name)];
+        if (!list || list.length === 0) return false;
+        for (const fn of list.slice()) fn.apply(this, args);
+        return true;
+    };
+    proc.addListener = proc.on;
+    proc.removeListener = proc.off;
+    // Node semantics: emitWarning normalizes to an Error-like (name = type,
+    // optional code) and dispatches a 'warning' event on the next tick;
+    // without listeners it degrades to console.warn, like Node's default
+    // stderr print.
+    proc.emitWarning = function (warning, type, code) {
+        let w;
+        if (warning instanceof Error) {
+            w = warning;
+        } else {
+            w = new Error(String(warning));
+            w.name = typeof type === "string" && type.length > 0 ? type : "Warning";
+        }
+        if (typeof type === "string" && !(warning instanceof Error)) w.name = type;
+        if (code !== undefined && w.code === undefined) w.code = code;
+        Promise.resolve().then(() => {
+            if (proc.listenerCount("warning") > 0) {
+                proc.emit("warning", w);
+            } else if (globalThis.console && typeof globalThis.console.warn === "function") {
+                globalThis.console.warn(w.name + ": " + w.message);
+            }
+        });
+    };
+})();
+"#;
+
+/// `process.allowedNodeEnvironmentFlags`: the frozen, Set-shaped view of the
+/// flags Node accepts in `NODE_OPTIONS`. The list is a fixed constant (chidori
+/// parses no command line), and the lookup rules are Node's: underscores fold
+/// to dashes, a leading dash means "match the canonical spelling with any
+/// `=value` suffix stripped", and a bare word matches the dash-stripped name.
+/// The object is a real `Set` so `Set.prototype.add.call(…)` does not throw on
+/// it, but every observable method is an own property reading the fixed list —
+/// so mutating through the `Set` prototype can never surface a flag.
+const PROCESS_ALLOWED_FLAGS_JS: &str = r#"
+(function () {
+    const flags = [
+        "--abort-on-uncaught-exception", "--conditions", "--diagnostic-dir",
+        "--disable-proto", "--dns-result-order", "--enable-source-maps",
+        "--experimental-import-meta-resolve", "--experimental-json-modules",
+        "--experimental-loader", "--experimental-modules",
+        "--experimental-vm-modules", "--experimental-wasm-modules",
+        "--force-context-aware", "--force-fips", "--frozen-intrinsics",
+        "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal",
+        "--icu-data-dir", "--import", "--input-type", "--insecure-http-parser",
+        "--max-http-header-size", "--napi-modules", "--no-deprecation",
+        "--no-warnings", "--openssl-config", "--openssl-legacy-provider",
+        "--pending-deprecation", "--perf-basic-prof",
+        "--perf-basic-prof-only-functions", "--perf-prof",
+        "--perf-prof-unwinding-info", "--preserve-symlinks",
+        "--preserve-symlinks-main", "--prof-process", "--redirect-warnings",
+        "--report-compact", "--report-dir", "--report-directory",
+        "--report-filename", "--report-on-fatalerror", "--report-on-signal",
+        "--report-signal", "--report-uncaught-exception", "--require",
+        "--secure-heap", "--secure-heap-min", "--snapshot-blob",
+        "--stack-trace-limit", "--test-only", "--throw-deprecation", "--title",
+        "--tls-cipher-list", "--tls-keylog", "--tls-max-v1.2", "--tls-max-v1.3",
+        "--tls-min-v1.0", "--tls-min-v1.1", "--tls-min-v1.2", "--tls-min-v1.3",
+        "--trace-atomics-wait", "--trace-deprecation", "--trace-event-categories",
+        "--trace-event-file-pattern", "--trace-events-enabled", "--trace-exit",
+        "--trace-sigint", "--trace-sync-io", "--trace-tls", "--trace-uncaught",
+        "--trace-warnings", "--track-heap-objects", "--unhandled-rejections",
+        "--use-bundled-ca", "--use-largepages", "--use-openssl-ca",
+        "--v8-pool-size", "--zero-fill-buffers", "-r",
+    ];
+    const bare = flags.map(function (flag) { return flag.replace(/^--?/, ""); });
+    const iterable = new Set(flags);
+    const values = function values() { return iterable.values(); };
+    const set = new Set();
+    Object.defineProperties(set, {
+        has: {
+            value: function has(key) {
+                if (typeof key !== "string") return false;
+                const folded = key.replace(/_/g, "-");
+                if (/^--?/.test(folded)) {
+                    return flags.indexOf(folded.replace(/=.*$/, "")) !== -1;
+                }
+                return bare.indexOf(folded) !== -1;
+            },
+        },
+        add: { value: function add() { return this; } },
+        delete: { value: function () { return false; } },
+        clear: { value: function clear() {} },
+        forEach: {
+            value: function forEach(callback, thisArg) {
+                for (const flag of flags) callback.call(thisArg, flag, flag, this);
+            },
+        },
+        size: { get: function () { return flags.length; } },
+        values: { value: values },
+        keys: { value: values },
+        entries: { value: function entries() { return iterable.entries(); } },
+        [Symbol.iterator]: { value: values },
+    });
+    globalThis.process.allowedNodeEnvironmentFlags = Object.freeze(set);
+})();
+"#;
+
 /// The determinism prelude installed on the rust engine before an agent runs:
 /// the logical clock, `process.env`, UTF-8/base64 text primitives, the Web
 /// Crypto subset, and the virtual timer queue. Date and `Math.random`
@@ -1056,22 +1235,88 @@ pub(crate) fn build_sync_native_dispatch(
 pub(crate) fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
     use crate::runtime::typescript::helpers::{
         chidori_agent_env_json, TEXT_ENCODING_POLYFILL, TIMER_DISABLED_POLYFILL,
-        TIMER_VIRTUAL_POLYFILL, WEB_CRYPTO_POLYFILL,
+        TIMER_VIRTUAL_POLYFILL, WEB_CRYPTO_POLYFILL, WEB_EVENTS_POLYFILL,
     };
     let mut out = String::new();
     out.push_str(
         "if (typeof globalThis.__chidori_now !== \"number\") globalThis.__chidori_now = 0;\n",
     );
+    // `process` carries the standard Node surface packages probe for. Every
+    // value is a fixed virtualized constant (mirroring the node:os shim) or a
+    // pure in-heap operation, so nothing here leaks host state into a run.
+    // `env` stays frozen; the object itself is mutable so Node idioms like
+    // `process.exitCode = 1` don't throw in strict-mode ESM.
     let env_json = chidori_agent_env_json();
     out.push_str(&format!(
-        "globalThis.process = Object.freeze({{ env: Object.freeze({env_json}) }});\n"
+        r#"globalThis.process = {{
+    env: Object.freeze({env_json}),
+    argv: [], argv0: "chidori", execArgv: [], execPath: "/chidori",
+    platform: "chidori", arch: "wasm32",
+    version: "v0.0.0-chidori",
+    versions: Object.freeze({{ node: "0.0.0-chidori", chidori: "1" }}),
+    pid: 1, ppid: 0, title: "chidori",
+    exitCode: undefined,
+    nextTick: function (cb, ...args) {{
+        if (typeof cb !== "function") throw new TypeError("process.nextTick callback must be a function");
+        Promise.resolve().then(() => cb(...args));
+    }},
+    cwd: function () {{ return "/"; }},
+    chdir: function () {{ throw new Error("process.chdir is not supported in the Chidori runtime (the VFS root is fixed)"); }},
+    hrtime: Object.assign(
+        function (prev) {{
+            const ms = typeof globalThis.__chidori_now === "number" ? globalThis.__chidori_now : 0;
+            let sec = Math.floor(ms / 1000);
+            let nsec = Math.round((ms % 1000) * 1e6);
+            if (prev) {{
+                sec -= prev[0];
+                nsec -= prev[1];
+                if (nsec < 0) {{ sec -= 1; nsec += 1e9; }}
+            }}
+            return [sec, nsec];
+        }},
+        {{ bigint: function () {{
+            const ms = typeof globalThis.__chidori_now === "number" ? globalThis.__chidori_now : 0;
+            return typeof BigInt === "function" ? BigInt(Math.round(ms * 1e6)) : Math.round(ms * 1e6);
+        }} }}
+    ),
+    uptime: function () {{
+        return (typeof globalThis.__chidori_now === "number" ? globalThis.__chidori_now : 0) / 1000;
+    }},
+    memoryUsage: Object.assign(
+        function () {{ return {{ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }}; }},
+        {{ rss: function () {{ return 0; }} }}
+    ),
+    emitWarning: function (warning) {{
+        if (globalThis.console && typeof globalThis.console.warn === "function") {{
+            globalThis.console.warn("Warning: " + (warning && warning.message ? warning.message : warning));
+        }}
+    }},
+    exit: function (code) {{
+        throw new Error("process.exit(" + (code === undefined ? "" : code) + ") is not supported in the Chidori runtime; return from the agent function instead");
+    }},
+    abort: function () {{ throw new Error("process.abort is not supported in the Chidori runtime"); }},
+    kill: function () {{ throw new Error("process.kill is not supported in the Chidori runtime (no host processes are visible)"); }},
+    stdout: {{ isTTY: false, write: function (s) {{ if (globalThis.console) globalThis.console.log(String(s).replace(/\n$/, "")); return true; }} }},
+    stderr: {{ isTTY: false, write: function (s) {{ if (globalThis.console) globalThis.console.error(String(s).replace(/\n$/, "")); return true; }} }},
+    stdin: null,
+    features: Object.freeze({{}}),
+    release: Object.freeze({{ name: "chidori" }}),
+    getuid: function () {{ return -1; }},
+    getgid: function () {{ return -1; }},
+    umask: function () {{ return 0; }},
+}};
+"#
     ));
+    out.push_str(PROCESS_EVENTS_JS);
+    out.push_str(PROCESS_ALLOWED_FLAGS_JS);
     out.push_str(TEXT_ENCODING_POLYFILL);
     out.push_str(WEB_CRYPTO_POLYFILL);
     match policy.timers {
         TimerPolicy::Disabled => out.push_str(TIMER_DISABLED_POLYFILL),
         TimerPolicy::Virtual | TimerPolicy::Host => out.push_str(TIMER_VIRTUAL_POLYFILL),
     }
+    // After timers: AbortSignal.timeout schedules on the virtual queue.
+    out.push_str(WEB_EVENTS_POLYFILL);
     out
 }
 
@@ -2771,9 +3016,8 @@ mod tests {
     #[test]
     fn run_agent_node_path_posix_surface() {
         // Covers the default + named import forms and the `path.posix`
-        // self-alias. (Only the `node:`-prefixed specifier is accepted; bare
-        // builtin specifiers are not — the resolver treats a bare `path` as a
-        // package lookup, matching the other shims.)
+        // self-alias. (Bare builtin specifiers — `import path from "path"` —
+        // resolve to the same shim; see run_agent_bare_builtin_specifiers.)
         let out = run_compute_agent(
             "node-path",
             r#"
@@ -2837,6 +3081,60 @@ mod tests {
     }
 
     #[test]
+    fn run_agent_node_path_win32_table_is_real() {
+        // `path.win32` is a real win32 implementation, not an alias of posix:
+        // backslash separator, `;` delimiter, drive letters, drive-relative
+        // paths and UNC roots. The module default stays posix (the chidori VFS
+        // is posix), and `node:path/win32` serves the same object.
+        let out = run_compute_agent(
+            "node-path-win32",
+            r#"
+            import path from "node:path";
+            import win32, { join as win32Join } from "node:path/win32";
+            export async function agent() {
+                return {
+                    sep: path.win32.sep,
+                    delimiter: path.win32.delimiter,
+                    defaultSep: path.sep,
+                    join: path.win32.join("C:\\foo", "..", "bar\\baz.txt"),
+                    unc: path.win32.join("//server", "share"),
+                    driveRelative: path.win32.normalize("C:..\\abc"),
+                    resolve: path.win32.resolve("c:/blah\\blah", "d:/games", "c:../a"),
+                    isAbsolute: path.win32.isAbsolute("C:\\x"),
+                    driveNotAbsolute: path.win32.isAbsolute("C:x"),
+                    parsedRoot: path.win32.parse("\\\\server\\share\\file").root,
+                    namespaced: path.win32.toNamespacedPath("C:\\foo"),
+                    relative: path.win32.relative("c:/AaAa/bbbb", "c:/aaaa/cccc"),
+                    posixUntouched: path.join("/a", "b\\c"),
+                    subpathSame: win32 === path.win32,
+                    subpathJoin: win32Join("C:\\a", "b"),
+                    selfAlias: path.win32.win32 === path.win32,
+                    crossAlias: path.win32.posix === path.posix,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["sep"], serde_json::json!("\\"));
+        assert_eq!(out["delimiter"], serde_json::json!(";"));
+        assert_eq!(out["defaultSep"], serde_json::json!("/"));
+        assert_eq!(out["join"], serde_json::json!("C:\\bar\\baz.txt"));
+        assert_eq!(out["unc"], serde_json::json!("\\\\server\\share\\"));
+        assert_eq!(out["driveRelative"], serde_json::json!("C:..\\abc"));
+        assert_eq!(out["resolve"], serde_json::json!("c:\\blah\\a"));
+        assert_eq!(out["isAbsolute"], serde_json::json!(true));
+        assert_eq!(out["driveNotAbsolute"], serde_json::json!(false));
+        assert_eq!(out["parsedRoot"], serde_json::json!("\\\\server\\share\\"));
+        assert_eq!(out["namespaced"], serde_json::json!("\\\\?\\C:\\foo"));
+        assert_eq!(out["relative"], serde_json::json!("..\\cccc"));
+        // The posix table keeps treating a backslash as an ordinary character.
+        assert_eq!(out["posixUntouched"], serde_json::json!("/a/b\\c"));
+        assert_eq!(out["subpathSame"], serde_json::json!(true));
+        assert_eq!(out["subpathJoin"], serde_json::json!("C:\\a\\b"));
+        assert_eq!(out["selfAlias"], serde_json::json!(true));
+        assert_eq!(out["crossAlias"], serde_json::json!(true));
+    }
+
+    #[test]
     fn run_agent_node_events_emitter_surface() {
         let out = run_compute_agent(
             "node-events",
@@ -2867,6 +3165,510 @@ mod tests {
         assert_eq!(out["countAfter"], serde_json::json!(0));
         assert_eq!(out["names"], serde_json::json!(["other"]));
         assert_eq!(out["readyArgs"], serde_json::json!(["go"]));
+    }
+
+    #[test]
+    fn run_agent_bare_builtin_specifiers() {
+        // Node resolves unprefixed builtin names (`path`, `events`) to core
+        // modules ahead of node_modules; the chidori resolver mirrors that,
+        // serving the same shim (same module instance) as the node: form.
+        let out = run_compute_agent(
+            "bare-builtins",
+            r#"
+            import path from "path";
+            import prefixed from "node:path";
+            import { EventEmitter } from "events";
+            import { StringDecoder } from "string_decoder";
+            export async function agent() {
+                const ee = new EventEmitter();
+                let got = null;
+                ee.on("x", (v) => { got = v; });
+                ee.emit("x", 7);
+                return {
+                    joined: path.join("a", "b"),
+                    sameModule: path === prefixed,
+                    got,
+                    decoded: new StringDecoder("utf8").write(new TextEncoder().encode("hi")),
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["joined"], serde_json::json!("a/b"));
+        assert_eq!(out["sameModule"], serde_json::json!(true));
+        assert_eq!(out["got"], serde_json::json!(7));
+        assert_eq!(out["decoded"], serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn run_agent_node_querystring_and_string_decoder() {
+        let out = run_compute_agent(
+            "node-querystring",
+            r#"
+            import qs from "node:querystring";
+            import { StringDecoder } from "node:string_decoder";
+            export async function agent() {
+                const parsed = qs.parse("a=1&b=two&b=three&c");
+                const roundtrip = qs.stringify({ x: "hello world", tags: ["p", "q"] });
+                // Multi-byte char split across writes must not corrupt: é is
+                // 0xC3 0xA9 in UTF-8.
+                const dec = new StringDecoder("utf8");
+                const part1 = dec.write(new Uint8Array([0x63, 0x61, 0x66, 0xc3]));
+                const part2 = dec.write(new Uint8Array([0xa9]));
+                const tail = dec.end();
+                return {
+                    a: parsed.a, b: parsed.b, c: parsed.c,
+                    roundtrip,
+                    split: part1 + part2 + tail,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["a"], serde_json::json!("1"));
+        assert_eq!(out["b"], serde_json::json!(["two", "three"]));
+        assert_eq!(out["c"], serde_json::json!(""));
+        assert_eq!(
+            out["roundtrip"],
+            serde_json::json!("x=hello%20world&tags=p&tags=q")
+        );
+        assert_eq!(out["split"], serde_json::json!("café"));
+    }
+
+    #[test]
+    fn run_agent_node_punycode_surface() {
+        let out = run_compute_agent(
+            "node-punycode",
+            r#"
+            import punycode from "node:punycode";
+            export async function agent() {
+                return {
+                    ascii: punycode.toASCII("mañana.com"),
+                    unicode: punycode.toUnicode("xn--maana-pta.com"),
+                    encoded: punycode.encode("münchen"),
+                    decoded: punycode.decode("mnchen-3ya"),
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["ascii"], serde_json::json!("xn--maana-pta.com"));
+        assert_eq!(out["unicode"], serde_json::json!("mañana.com"));
+        assert_eq!(out["encoded"], serde_json::json!("mnchen-3ya"));
+        assert_eq!(out["decoded"], serde_json::json!("münchen"));
+    }
+
+    #[test]
+    fn run_agent_node_stream_pipeline_and_iteration() {
+        let out = run_compute_agent(
+            "node-stream",
+            r#"
+            import { Readable, Writable, Transform, PassThrough } from "node:stream";
+            import { pipeline } from "node:stream/promises";
+            import { text } from "node:stream/consumers";
+            export async function agent() {
+                // pipeline: source -> transform -> sink.
+                const upper = new Transform({
+                    transform(chunk, encoding, callback) {
+                        callback(null, String(chunk).toUpperCase());
+                    },
+                });
+                const collected = [];
+                const sink = new Writable({
+                    write(chunk, encoding, callback) {
+                        collected.push(String(chunk));
+                        callback(null);
+                    },
+                });
+                await pipeline(Readable.from(["ab", "cd"]), upper, sink);
+
+                // Async iteration over a Readable.
+                const iterated = [];
+                for await (const chunk of Readable.from([1, 2, 3])) iterated.push(chunk);
+
+                // Consumers over a PassThrough fed by write/end.
+                const pass = new PassThrough();
+                const textPromise = text(pass);
+                pass.write("hello ");
+                pass.end("world");
+
+                // Event order: finish fires after end() completes writes.
+                const events = [];
+                const w = new Writable({
+                    write(chunk, encoding, callback) { events.push("w:" + chunk); callback(null); },
+                    final(callback) { events.push("final"); callback(null); },
+                });
+                w.on("finish", () => events.push("finish"));
+                w.write("x");
+                w.end();
+                await new Promise((resolve) => w.on("close", resolve));
+
+                return {
+                    collected,
+                    iterated,
+                    text: await textPromise,
+                    events,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["collected"], serde_json::json!(["AB", "CD"]));
+        assert_eq!(out["iterated"], serde_json::json!([1, 2, 3]));
+        assert_eq!(out["text"], serde_json::json!("hello world"));
+        assert_eq!(
+            out["events"],
+            serde_json::json!(["w:x", "final", "finish"])
+        );
+    }
+
+    #[test]
+    fn run_agent_node_timers_promises_virtual_clock() {
+        let out = run_compute_agent(
+            "node-timers",
+            r#"
+            import { setTimeout as sleep, scheduler } from "node:timers/promises";
+            import timers from "node:timers";
+            export async function agent() {
+                const before = globalThis.__chidori_now;
+                await sleep(250, undefined);
+                const after = globalThis.__chidori_now;
+                await scheduler.wait(50);
+                const value = await sleep(10, "done");
+                // node:timers handles support unref() and clear by handle.
+                let fired = false;
+                const handle = timers.setTimeout(() => { fired = true; }, 5);
+                handle.unref();
+                timers.clearTimeout(handle);
+                await sleep(20, undefined);
+                return { advanced: after - before, value, fired };
+            }
+            "#,
+        );
+        assert_eq!(out["advanced"], serde_json::json!(250));
+        assert_eq!(out["value"], serde_json::json!("done"));
+        assert_eq!(out["fired"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn run_agent_node_async_hooks_and_diagnostics() {
+        let out = run_compute_agent(
+            "node-async-hooks",
+            r#"
+            import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
+            import dc from "node:diagnostics_channel";
+            export async function agent() {
+                const als = new AsyncLocalStorage();
+                const inside = als.run({ user: "ada" }, () => {
+                    const store = als.getStore();
+                    return store ? store.user : null;
+                });
+                const outside = als.getStore() === undefined;
+                const resource = new AsyncResource("test");
+                const bound = resource.bind(function () { return "bound"; });
+
+                const seen = [];
+                const ch = dc.channel("app:events");
+                const onMessage = (message, name) => seen.push(name + ":" + message.n);
+                dc.subscribe("app:events", onMessage);
+                ch.publish({ n: 1 });
+                const hadSubs = ch.hasSubscribers;
+                dc.unsubscribe("app:events", onMessage);
+                ch.publish({ n: 2 });
+                return { inside, outside, bound: bound(), seen, hadSubs };
+            }
+            "#,
+        );
+        assert_eq!(out["inside"], serde_json::json!("ada"));
+        assert_eq!(out["outside"], serde_json::json!(true));
+        assert_eq!(out["bound"], serde_json::json!("bound"));
+        assert_eq!(out["seen"], serde_json::json!(["app:events:1"]));
+        assert_eq!(out["hadSubs"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn run_agent_node_module_net_util_surface() {
+        let out = run_compute_agent(
+            "node-module-net",
+            r#"
+            import { builtinModules, isBuiltin } from "node:module";
+            import net from "node:net";
+            import util, { format } from "node:util";
+            import { isDate } from "node:util/types";
+            import os from "node:os";
+            import process from "node:process";
+            export async function agent() {
+                return {
+                    hasStream: builtinModules.indexOf("stream") !== -1,
+                    isBuiltinPrefixed: isBuiltin("node:zlib"),
+                    isBuiltinBare: isBuiltin("querystring"),
+                    notBuiltin: isBuiltin("lodash"),
+                    ip4: net.isIP("127.0.0.1"),
+                    ip6: net.isIP("::ffff:10.0.0.1"),
+                    ipNone: net.isIP("999.1.1.1"),
+                    formatted: format("%s has %d items (%j)", "cart", 3, { ok: true }),
+                    dateCheck: isDate(new Date(0)),
+                    typesWired: util.types.isPromise(Promise.resolve()),
+                    platform: process.platform,
+                    tick: await new Promise((resolve) => process.nextTick(resolve, "ticked")),
+                    osPlatform: os.platform(),
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["hasStream"], serde_json::json!(true));
+        assert_eq!(out["isBuiltinPrefixed"], serde_json::json!(true));
+        assert_eq!(out["isBuiltinBare"], serde_json::json!(true));
+        assert_eq!(out["notBuiltin"], serde_json::json!(false));
+        assert_eq!(out["ip4"], serde_json::json!(4));
+        assert_eq!(out["ip6"], serde_json::json!(6));
+        assert_eq!(out["ipNone"], serde_json::json!(0));
+        assert_eq!(
+            out["formatted"],
+            serde_json::json!("cart has 3 items ({\"ok\":true})")
+        );
+        assert_eq!(out["dateCheck"], serde_json::json!(true));
+        assert_eq!(out["typesWired"], serde_json::json!(true));
+        assert_eq!(out["platform"], serde_json::json!("chidori"));
+        assert_eq!(out["tick"], serde_json::json!("ticked"));
+        assert_eq!(out["osPlatform"], serde_json::json!("chidori"));
+    }
+
+    #[test]
+    fn run_agent_unsupported_builtins_link_but_fail_loud() {
+        // The capability stubs must import cleanly (packages import these at
+        // module scope) and throw a clear error only at first use.
+        let out = run_compute_agent(
+            "node-stubs",
+            r#"
+            import { spawn } from "node:child_process";
+            import dgram from "node:dgram";
+            import { Worker, MessageChannel } from "node:worker_threads";
+            import cluster from "node:cluster";
+            import { lookup } from "node:dns";
+            export async function agent() {
+                const errors = {};
+                try { spawn("ls"); } catch (e) { errors.spawn = e.message; }
+                try { dgram.createSocket("udp4"); } catch (e) { errors.dgram = e.message; }
+                try { new Worker("./w.js"); } catch (e) { errors.worker = e.message; }
+                const dnsError = await new Promise((resolve) => {
+                    lookup("example.com", (err) => resolve(err ? err.code : null));
+                });
+                // MessageChannel is real plumbing, not a stub.
+                const { port1, port2 } = new MessageChannel();
+                const delivered = new Promise((resolve) => port2.on("message", resolve));
+                port1.postMessage({ hello: true });
+                return {
+                    spawn: errors.spawn,
+                    dgram: errors.dgram,
+                    worker: errors.worker,
+                    dnsError,
+                    isPrimary: cluster.isPrimary,
+                    message: await delivered,
+                };
+            }
+            "#,
+        );
+        let spawn_msg = out["spawn"].as_str().unwrap();
+        assert!(
+            spawn_msg.contains("not supported in the Chidori runtime"),
+            "{spawn_msg}"
+        );
+        let dgram_msg = out["dgram"].as_str().unwrap();
+        assert!(
+            dgram_msg.contains("not supported in the Chidori runtime"),
+            "{dgram_msg}"
+        );
+        let worker_msg = out["worker"].as_str().unwrap();
+        assert!(worker_msg.contains("single-threaded"), "{worker_msg}");
+        assert_eq!(out["dnsError"], serde_json::json!("ENOTSUP"));
+        assert_eq!(out["isPrimary"], serde_json::json!(true));
+        assert_eq!(out["message"], serde_json::json!({ "hello": true }));
+    }
+
+    #[test]
+    fn run_agent_node_vm_same_realm_contexts() {
+        // node:vm is a *functional* same-realm shim: contextified code runs
+        // through the engine's own `eval`, in the one existing realm, under the
+        // same determinism prelude and capability policy as the agent body. The
+        // load-bearing behaviours are (a) the sandbox object is the scope —
+        // reads see its properties, and writes (including bare assignments and
+        // `var`/function declarations, which are not `with`-bindable) land back
+        // on it rather than leaking to the realm global — and (b) a `Script`
+        // compiles once and can be re-run against several contexts.
+        let out = run_compute_agent(
+            "node-vm",
+            r#"
+            import vm from "node:vm";
+            export async function agent() {
+                const sandbox = { seed: 2 };
+                const ctx = vm.createContext(sandbox);
+
+                // Bare assignment + `var` + function declaration all land on
+                // the sandbox, and reads see what the sandbox already holds.
+                vm.runInContext("x = [1, 2, 3]; var doubled = seed * 2; function tag() { return 'ok'; }", ctx);
+
+                // A fresh sandbox object is contextified in place.
+                const fresh = { checkString: "test" };
+                const boxed = vm.runInNewContext("new String(checkString)", fresh);
+
+                // One compiled Script, two contexts, plus this-context eval.
+                const script = new vm.Script("seed + 1");
+                const other = vm.createContext({ seed: 40 });
+
+                return {
+                    x: sandbox.x,
+                    doubled: sandbox.doubled,
+                    tagged: sandbox.tag(),
+                    isContext: vm.isContext(ctx),
+                    isNotContext: vm.isContext({}),
+                    createdContext: vm.isContext(fresh),
+                    boxed: String(boxed),
+                    scriptA: script.runInContext(ctx),
+                    scriptB: script.runInContext(other),
+                    scriptFresh: script.runInNewContext({ seed: 100 }),
+                    thisContext: vm.runInThisContext("1 + 1"),
+                    compiled: vm.compileFunction("return a + b;", ["a", "b"])(3, 4),
+                    // Nothing leaked to the realm global.
+                    leakedX: typeof globalThis.x,
+                    leakedDoubled: typeof globalThis.doubled,
+                    leakedTag: typeof globalThis.tag,
+                    // Contexts share the realm's intrinsics — the one honest
+                    // divergence from Node, where this would be false.
+                    sameRealmIntrinsics: vm.runInNewContext("[]") instanceof Array,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["x"], serde_json::json!([1, 2, 3]));
+        assert_eq!(out["doubled"], serde_json::json!(4));
+        assert_eq!(out["tagged"], serde_json::json!("ok"));
+        assert_eq!(out["isContext"], serde_json::json!(true));
+        assert_eq!(out["isNotContext"], serde_json::json!(false));
+        assert_eq!(out["createdContext"], serde_json::json!(true));
+        assert_eq!(out["boxed"], serde_json::json!("test"));
+        assert_eq!(out["scriptA"], serde_json::json!(3));
+        assert_eq!(out["scriptB"], serde_json::json!(41));
+        assert_eq!(out["scriptFresh"], serde_json::json!(101));
+        assert_eq!(out["thisContext"], serde_json::json!(2));
+        assert_eq!(out["compiled"], serde_json::json!(7));
+        assert_eq!(out["leakedX"], serde_json::json!("undefined"));
+        assert_eq!(out["leakedDoubled"], serde_json::json!("undefined"));
+        assert_eq!(out["leakedTag"], serde_json::json!("undefined"));
+        assert_eq!(out["sameRealmIntrinsics"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn run_agent_node_zlib_round_trips() {
+        let out = run_compute_agent(
+            "node-zlib",
+            r#"
+            import zlib from "node:zlib";
+            import { pipeline } from "node:stream/promises";
+            import { Readable, Writable } from "node:stream";
+            import { Buffer } from "node:buffer";
+            export async function agent() {
+                const input = "the quick brown fox jumps over the lazy dog ".repeat(20);
+
+                // Sync round trips across the codec families.
+                const gz = zlib.gzipSync(input);
+                const roundGzip = zlib.gunzipSync(gz).toString("utf8");
+                const fl = zlib.deflateSync(input, { level: 9 });
+                const roundDeflate = zlib.inflateSync(fl).toString("utf8");
+                const raw = zlib.deflateRawSync(input);
+                const roundRaw = zlib.inflateRawSync(raw).toString("utf8");
+                // unzip auto-detects gzip vs zlib framing.
+                const roundUnzip = zlib.unzipSync(gz).toString("utf8");
+
+                // Callback form.
+                const asyncRound = await new Promise((resolve, reject) => {
+                    zlib.gzip(input, (err, compressed) => {
+                        if (err) return reject(err);
+                        zlib.gunzip(compressed, (err2, restored) => {
+                            if (err2) return reject(err2);
+                            resolve(restored.toString("utf8"));
+                        });
+                    });
+                });
+
+                // Streaming form: compress then decompress through pipelines.
+                const compressedChunks = [];
+                await pipeline(
+                    Readable.from([input.slice(0, 100), input.slice(100)]),
+                    zlib.createGzip(),
+                    new Writable({
+                        write(chunk, encoding, callback) { compressedChunks.push(chunk); callback(null); },
+                    })
+                );
+                const restoredChunks = [];
+                await pipeline(
+                    Readable.from(compressedChunks),
+                    zlib.createGunzip(),
+                    new Writable({
+                        write(chunk, encoding, callback) { restoredChunks.push(chunk); callback(null); },
+                    })
+                );
+                let streamed = "";
+                for (const c of restoredChunks) streamed += Buffer.from(c).toString("utf8");
+
+                // Brotli family: sync round trip, Node's params-keyed quality
+                // option, and the callback form.
+                const br = zlib.brotliCompressSync(input);
+                const roundBrotli = zlib.brotliDecompressSync(br).toString("utf8");
+                const brFast = zlib.brotliCompressSync(input, {
+                    params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 1 },
+                });
+                const roundBrotliFast = zlib.brotliDecompressSync(brFast).toString("utf8");
+                const asyncBrotli = await new Promise((resolve, reject) => {
+                    zlib.brotliCompress(input, (err, compressed) => {
+                        if (err) return reject(err);
+                        zlib.brotliDecompress(compressed, (err2, restored) => {
+                            if (err2) return reject(err2);
+                            resolve(restored.toString("utf8"));
+                        });
+                    });
+                });
+
+                // Corrupt input errors cleanly; determinism holds.
+                let corruptError = null;
+                try { zlib.gunzipSync("definitely not gzip"); } catch (e) { corruptError = e.message; }
+                const deterministic = zlib.gzipSync(input).toString("hex") === gz.toString("hex");
+
+                return {
+                    smaller: gz.length < input.length,
+                    roundGzip: roundGzip === input,
+                    roundDeflate: roundDeflate === input,
+                    roundRaw: roundRaw === input,
+                    roundUnzip: roundUnzip === input,
+                    asyncRound: asyncRound === input,
+                    streamed: streamed === input,
+                    brotliSmaller: br.length < input.length,
+                    roundBrotli: roundBrotli === input,
+                    roundBrotliFast: roundBrotliFast === input,
+                    asyncBrotli: asyncBrotli === input,
+                    corruptError,
+                    deterministic,
+                    hasConstants: zlib.constants.Z_BEST_COMPRESSION,
+                    brotliDefaultQuality: zlib.constants.BROTLI_DEFAULT_QUALITY,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["smaller"], serde_json::json!(true));
+        assert_eq!(out["roundGzip"], serde_json::json!(true));
+        assert_eq!(out["roundDeflate"], serde_json::json!(true));
+        assert_eq!(out["roundRaw"], serde_json::json!(true));
+        assert_eq!(out["roundUnzip"], serde_json::json!(true));
+        assert_eq!(out["asyncRound"], serde_json::json!(true));
+        assert_eq!(out["streamed"], serde_json::json!(true));
+        assert_eq!(out["brotliSmaller"], serde_json::json!(true));
+        assert_eq!(out["roundBrotli"], serde_json::json!(true));
+        assert_eq!(out["roundBrotliFast"], serde_json::json!(true));
+        assert_eq!(out["asyncBrotli"], serde_json::json!(true));
+        assert!(
+            out["corruptError"].as_str().unwrap().contains("gunzip"),
+            "{:?}",
+            out["corruptError"]
+        );
+        assert_eq!(out["deterministic"], serde_json::json!(true));
+        assert_eq!(out["hasConstants"], serde_json::json!(9));
+        assert_eq!(out["brotliDefaultQuality"], serde_json::json!(11));
     }
 
     #[test]
@@ -3001,6 +3803,91 @@ mod tests {
             out["spToString"],
             serde_json::json!("k=1&k=2&j=hello+world")
         );
+    }
+
+    /// The legacy (`url.parse`/`format`/`resolve`) half of node:url, plus the
+    /// file-URL conversions — the surface Node's own `test-url-*` suite pins.
+    #[test]
+    fn run_agent_node_url_legacy_and_file_surface() {
+        let out = run_compute_agent(
+            "node-url-legacy",
+            // `r##` delimiters: the body contains `"#` (a fragment reference).
+            r##"
+            import url from "node:url";
+            export async function agent() {
+                const parsed = url.parse("HTTP://User:PW@www.ExAmPlE.com:8080/a/b?c=d#e");
+                const withQuery = url.parse("http://x.com/p?a=1&a=2&b=3", true);
+                let scheme = null;
+                try { url.fileURLToPath("https://a/b"); } catch (err) { scheme = err.code; }
+                let fileHost = null;
+                try { url.fileURLToPath("file://nas/a"); } catch (err) { fileHost = err.code; }
+                let encodedSlash = null;
+                try { url.fileURLToPath("file:///a%2F/"); } catch (err) { encodedSlash = err.code; }
+                let badFormat = null;
+                try { url.format(0); } catch (err) { badFormat = err.code; }
+                return {
+                    protocol: parsed.protocol,
+                    auth: parsed.auth,
+                    host: parsed.host,
+                    hostname: parsed.hostname,
+                    port: parsed.port,
+                    path: parsed.path,
+                    query: parsed.query,
+                    href: parsed.href,
+                    parsedQuery: withQuery.query,
+                    format: url.format(parsed),
+                    resolveDots: url.resolve("http://a/b/c/d;p?q", "../../g"),
+                    resolveProto: url.resolve("http://example.com/a/b", "//other.com/c"),
+                    resolveHash: url.resolve("http://a/b/c/d;p?q", "#s"),
+                    toPath: url.fileURLToPath("file:///f%C3%B3%C3%B3/a%20b"),
+                    toURL: url.pathToFileURL("/dir/a b#c%d").href,
+                    trailing: url.pathToFileURL("/dir/").href,
+                    scheme, fileHost, encodedSlash, badFormat,
+                };
+            }
+            "##,
+        );
+        assert_eq!(out["protocol"], serde_json::json!("http:"));
+        assert_eq!(out["auth"], serde_json::json!("User:PW"));
+        assert_eq!(out["host"], serde_json::json!("www.example.com:8080"));
+        assert_eq!(out["hostname"], serde_json::json!("www.example.com"));
+        assert_eq!(out["port"], serde_json::json!("8080"));
+        assert_eq!(out["path"], serde_json::json!("/a/b?c=d"));
+        assert_eq!(out["query"], serde_json::json!("c=d"));
+        assert_eq!(
+            out["href"],
+            serde_json::json!("http://User:PW@www.example.com:8080/a/b?c=d#e")
+        );
+        assert_eq!(
+            out["parsedQuery"],
+            serde_json::json!({ "a": ["1", "2"], "b": "3" })
+        );
+        assert_eq!(
+            out["format"],
+            serde_json::json!("http://User:PW@www.example.com:8080/a/b?c=d#e")
+        );
+        assert_eq!(out["resolveDots"], serde_json::json!("http://a/g"));
+        assert_eq!(out["resolveProto"], serde_json::json!("http://other.com/c"));
+        assert_eq!(
+            out["resolveHash"],
+            serde_json::json!("http://a/b/c/d;p?q#s")
+        );
+        assert_eq!(out["toPath"], serde_json::json!("/fóó/a b"));
+        assert_eq!(
+            out["toURL"],
+            serde_json::json!("file:///dir/a%20b%23c%25d")
+        );
+        assert_eq!(out["trailing"], serde_json::json!("file:///dir/"));
+        assert_eq!(out["scheme"], serde_json::json!("ERR_INVALID_URL_SCHEME"));
+        assert_eq!(
+            out["fileHost"],
+            serde_json::json!("ERR_INVALID_FILE_URL_HOST")
+        );
+        assert_eq!(
+            out["encodedSlash"],
+            serde_json::json!("ERR_INVALID_FILE_URL_PATH")
+        );
+        assert_eq!(out["badFormat"], serde_json::json!("ERR_INVALID_ARG_TYPE"));
     }
 
     #[test]

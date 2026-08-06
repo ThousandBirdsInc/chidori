@@ -177,6 +177,13 @@ pub struct Realm {
     /// Engine-private key holding an `Intl.NumberFormat`'s internal record object
     /// (locale/style/digit/grouping options). The brand for the receiver checks.
     pub symbol_intl_number_format: JsSymbol,
+    /// Engine-private key holding the pending `Error.captureStackTrace(err, fn)`
+    /// cut point: the function object whose activation (and everything it
+    /// called) must be omitted from `err.stack`. `Vm::record_unwind_frame`
+    /// consumes it as the throw unwinds past that function. Filtered from
+    /// `own_keys`, so an error carrying one is indistinguishable from one that
+    /// is not.
+    pub symbol_stack_start: JsSymbol,
 
     /// Builtin sections installed lazily (see
     /// `builtins::install_lazy_globals`): their global names sit behind
@@ -335,6 +342,7 @@ impl Realm {
             symbol_intl_number_format: bare_symbol(20, "[[InitializedNumberFormat]]"),
             symbol_async_disposable_state: bare_symbol(21, "[[AsyncDisposableState]]"),
             symbol_sync_iterator_record: bare_symbol(22, "[[SyncIteratorRecord]]"),
+            symbol_stack_start: bare_symbol(23, "[[StackStartFn]]"),
             lazy_sections: Vec::new(),
             symbol_registry: indexmap::IndexMap::new(),
             shape_root: crate::shape::Shape::new_root(),

@@ -13,6 +13,12 @@ same parent/child structure the call log records. Any OTLP backend works
 observability CLI, because the two products share a design goal: **a tael trace
 and a Chidori run are two views of the same object.**
 
+> **Build note:** OTLP export is compiled in by default via the `otel` cargo
+> feature. Building chidori with `--no-default-features` swaps in a no-op
+> exporter and drops the OTLP/gRPC dependency tree (tonic, prost, hyper) —
+> useful for faster local builds when you don't need tracing. Everything in
+> this guide requires a default (feature-on) build.
+
 ## One env var
 
 ```bash

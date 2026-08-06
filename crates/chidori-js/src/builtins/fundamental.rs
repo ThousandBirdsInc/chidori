@@ -12,6 +12,26 @@ pub fn install(vm: &mut Vm) {
     install_symbol(vm);
     install_boolean(vm);
     install_errors(vm);
+
+    // Engine-private introspection for Node's util.inspect: the constructor
+    // name captured when an object's prototype was nulled (see
+    // `ordinary_set_prototype_of`), or undefined when none was recorded.
+    let global = vm.realm.global.clone();
+    vm.define_method(&global, "__chidori_ctor_hint", 1, |_vm, _t, args| {
+        Ok(match args.first() {
+            Some(Value::Object(o)) => o
+                .borrow()
+                .privates
+                .as_ref()
+                .and_then(|p| p.get(&CTOR_HINT_PRIVATE_ID))
+                .and_then(|el| match el {
+                    PrivateElement::Field(v) => Some(v.clone()),
+                    _ => None,
+                })
+                .unwrap_or(Value::Undefined),
+            _ => Value::Undefined,
+        })
+    });
 }
 
 fn this_object(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
@@ -1580,6 +1600,11 @@ pub(crate) fn is_array_exotic(vm: &Vm, o: &JsObject) -> Result<bool, Value> {
     }
 }
 
+/// Private-elements key for the constructor-name hint stashed when an object's
+/// prototype is nulled. `Vm::next_private_id` counts up from zero, so no script
+/// `PrivateName` can ever collide with it; the slot is engine-reachable only.
+pub(crate) const CTOR_HINT_PRIVATE_ID: u64 = u64::MAX;
+
 /// OrdinarySetPrototypeOf (spec 10.1.2): rejects (returns false) a no-op-failing
 /// change on a non-extensible object, and rejects prototype cycles. Returns true
 /// on success (and mutates `o`'s prototype).
@@ -1613,6 +1638,38 @@ fn ordinary_set_prototype_of(vm: &Vm, o: &JsObject, proto: Option<JsObject>) -> 
         }
         let next = pp.borrow().proto.clone();
         p = next;
+    }
+    // V8's hidden classes remember which constructor made an object even after
+    // its prototype is nulled — Node's util.inspect renders that as
+    // `[Foo: null prototype]`. Approximate the slot by capturing the outgoing
+    // prototype's own `constructor` name at the moment the prototype becomes
+    // null, stashed in the script-unreachable private-elements list.
+    if proto.is_none() {
+        let hint = current.as_ref().and_then(|old| {
+            let b = old.borrow();
+            match &b.own_get(&PropertyKey::str("constructor"))?.kind {
+                PropertyKind::Data {
+                    value: Value::Object(ctor),
+                    ..
+                } if ctor.borrow().is_callable() => {
+                    let cb = ctor.borrow();
+                    match &cb.own_get(&PropertyKey::str("name"))?.kind {
+                        PropertyKind::Data {
+                            value: Value::String(name),
+                            ..
+                        } if !name.as_str().is_empty() => Some(name.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+        if let Some(name) = hint {
+            o.borrow_mut()
+                .privates
+                .get_or_insert_with(Default::default)
+                .insert(CTOR_HINT_PRIVATE_ID, PrivateElement::Field(Value::String(name)));
+        }
     }
     o.borrow_mut().proto = proto;
     true
@@ -2347,6 +2404,55 @@ fn install_errors(vm: &mut Vm) {
             );
             Ok(Value::Bool(is))
         });
+    }
+
+    // Error.captureStackTrace(target [, constructorOpt]) — V8's API, which
+    // Node's own `assert`/`errors` internals (and a great many npm packages)
+    // call unconditionally. It resets `target.stack` to the creation-time head
+    // and, when `constructorOpt` is given, arranges for `constructorOpt`'s own
+    // activation and everything it called to be *absent* from the trace.
+    //
+    // chidori builds stack traces on the unwind path (see
+    // `Vm::record_unwind_frame`), innermost frame first, so the cut is
+    // recorded as an engine-private marker on the error and consumed when the
+    // throw leaves `constructorOpt`. That is a strictly lazier model than
+    // V8's snapshot-at-call — an error that is never thrown carries only the
+    // head, which is also what V8 produces once `stackTraceLimit` is 0 — but
+    // the frames a *thrown* error ends up showing are the same set.
+    //
+    // The one shape that differs: if the error is thrown from somewhere that
+    // never unwinds through `constructorOpt`, the cut is never reached and the
+    // trace stays empty. That is the conservative direction (fewer frames, not
+    // wrong ones), and it does not arise in the pattern the API exists for —
+    // capture inside a helper, throw from that same helper.
+    if let Some(ec) = &error_ctor {
+        vm.define_method(ec, "captureStackTrace", 2, |vm, _t, args| {
+            let Value::Object(target) = arg(args, 0) else {
+                return Err(vm.throw_type(
+                    "Error.captureStackTrace requires that the first argument be an object",
+                ));
+            };
+            install_error_stack(vm, &target);
+            let marker_key = PropertyKey::Sym(vm.realm.symbol_stack_start.clone());
+            match arg(args, 1) {
+                Value::Object(f) if f.borrow().is_callable() => {
+                    target
+                        .borrow_mut()
+                        .own_insert(marker_key, Property::builtin(Value::Object(f)));
+                }
+                _ => {
+                    target.borrow_mut().own_remove(&marker_key);
+                }
+            }
+            Ok(Value::Undefined)
+        });
+        // V8 exposes this as a plain writable data property; code that saves,
+        // zeroes and restores it (Node's assert does exactly that) must not
+        // trip over a missing property.
+        ec.borrow_mut().own_insert(
+            PropertyKey::str("stackTraceLimit"),
+            Property::builtin(Value::Number(10.0)),
+        );
     }
 
     // AggregateError(errors, message): collects an iterable of errors.
