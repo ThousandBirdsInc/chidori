@@ -105,7 +105,7 @@ serde_yaml = "0.9"
 # (runtime/otel.rs is swapped for a no-op stub; everything else compiles
 # unchanged).
 opentelemetry = { version = "0.27", optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
 
 # Checkpoint export: `chidori checkpoint export <run_id>` archives a run dir
@@ -141,7 +141,7 @@ landlock = "0.4"
 tempfile = "3"
 # In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
 # with the runtime `opentelemetry_sdk` features for test builds.
-opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 criterion = "0.5"
 
 # Runtime-layer perf coverage (journal replay lookup, session/run stores,
