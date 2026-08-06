@@ -106,7 +106,7 @@ serde_yaml = "0.9"
 # unchanged).
 opentelemetry = { version = "0.27", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"], optional = true }
 
 # Checkpoint export: `chidori checkpoint export <run_id>` archives a run dir
 # as a .tar.gz so a golden eval case's fixture can be committed to git or
