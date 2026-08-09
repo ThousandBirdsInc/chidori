@@ -47,6 +47,13 @@ The Worker speaks the `HttpRunStore` REST protocol defined in
 and the detached-agent registry). Any server implementing that protocol works
 as a mirror — the Durable Object deployment is the reference implementation.
 
+Blob writes additionally honor `If-None-Match: *` and `If-Match: "<sha256>"`,
+answering `412` when the precondition fails. That is what makes Chidori's run
+lease a real compare-and-swap here rather than advisory: the check and the
+write both happen inside the Durable Object, of which the platform runs
+exactly one per run id. A server implementing the protocol without the
+conditional headers still works, but its leases are last-writer-wins.
+
 ## Self-hosted alternative
 
 `chidori cell-store` serves the same protocol on your own infrastructure,

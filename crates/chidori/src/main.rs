@@ -1816,13 +1816,16 @@ fn cmd_chat(
                 chrono::Duration::minutes(10),
             ) {
                 Ok(Ok(_)) => {}
+                // As in `resume`: a dead holder's lease lapses on its own, and
+                // with a mirror configured it isn't a local file to delete.
                 Ok(Err(holder)) => anyhow::bail!(
                     "chat session {session_id} is already being driven by another process \
                      (lease holder `{}`, expires {}). Two concurrent drivers would corrupt \
-                     the journal — close the other chat, or delete {} if the holder is dead.",
+                     the journal — close the other chat, or retry after {} if the holder \
+                     is dead.",
                     holder.owner,
                     holder.expires_at,
-                    run_dir.join("lease.json").display()
+                    holder.expires_at
                 ),
                 Err(err) => {
                     eprintln!("warning: could not take the session lease: {err}");
@@ -2304,13 +2307,17 @@ fn cmd_resume(
         chrono::Duration::minutes(10),
     ) {
         Ok(Ok(_)) => {}
+        // A dead holder stops renewing, so the lease lapses at `expires` and
+        // the next attempt takes it over — hence "wait", not "delete a file":
+        // with a durable mirror configured the lease is fleet state living in
+        // the mirror, not `<run_dir>/lease.json`.
         Ok(Err(holder)) => anyhow::bail!(
             "run {run_id} is already being driven by another process (lease holder \
              `{}`, expires {}). Two concurrent drivers would corrupt the journal — \
-             wait for it to finish, or delete {} if the holder is dead.",
+             wait for it to finish, or retry after {} if the holder is dead.",
             holder.owner,
             holder.expires_at,
-            run_dir.join("lease.json").display()
+            holder.expires_at
         ),
         Err(err) => {
             eprintln!("warning: could not take the run lease: {err}");

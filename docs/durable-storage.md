@@ -217,12 +217,38 @@ paused run wants plain `resume` — and is mutually exclusive with
 which process owns a run, with a TTL. The detached-agent supervisor
 (`docs/detached-agents.md`) takes a run's lease before executing and releases
 it on hibernate/settle; a second process sharing the same mirror stands down,
-and an expired lease (a dead node) transfers on the next wake. Note the
-check-and-set is last-writer-wins on the plain filesystem backend **and on
-S3-compatible object stores** (no compare-and-swap is used) — deployments
-that need enforced single writers should use the SQLite backend (one
-connection serializes writers) or the Durable Object relay (the platform
-guarantees one instance per run).
+and an expired lease (a dead node) transfers on the next wake.
+
+**The lease is fleet state, so it lives in the shared backend.** When a
+durable mirror is configured, lease reads and writes address the mirror
+directly rather than the filesystem tee. Reading the local primary first
+would give every machine its own private `lease.json` and defeat the whole
+mechanism: node A would keep seeing its own stale local lease while node B
+owned the run in the mirror. `RunStore::coordination_target` is what routes
+around that — with no mirror, the filesystem store is itself the
+coordination target, so single-machine behavior is unchanged.
+
+**Acquisition is a compare-and-swap, not a read-then-write.**
+`acquire_lease` reads the current lease bytes, decides (free / mine / expired
+/ held), then swaps *against exactly the bytes it read*
+(`RunStore::compare_and_swap_blob`). A lost swap means someone else wrote
+first: the caller re-reads and re-decides instead of clobbering the winner.
+How atomic that swap really is depends on the backend:
+
+| Backend | Lease guarantee |
+|---|---|
+| `fs` | **Advisory.** The default read-compare-write has no atomic primitive behind it; two processes can interleave. Fine for one machine, one process. |
+| `sqlite` | **Enforced.** The swap runs in one `BEGIN IMMEDIATE` transaction, so concurrent writers serialize — including writers in other processes sharing the file. |
+| `s3://` | **Advisory.** Object stores are last-writer-wins on overwrite; the create-only conditional PUT the cell store uses for *cell ownership* does not generalize to overwriting an existing lease across every S3-compatible implementation. |
+| `chidori cell-store` | **Enforced.** The swap rides HTTP conditional headers (`If-Match` / `If-None-Match`) that the node evaluates inside the cell's own lock — one serialization point per run. |
+| Durable Object relay | **Enforced.** Same conditional headers, evaluated inside the run's Durable Object, of which the platform runs exactly one. |
+
+A fenced node — one whose cell another node has taken over — gets a `409`
+from the store naming the live owner. `acquire_lease` turns that into the
+ordinary "held by someone else" outcome, so every existing standdown path
+(the detached-agent supervisor's wait-for-expiry loop, `chidori resume`'s
+refusal, `chidori chat`'s error) fires unchanged rather than the run being
+poisoned by a mirror-write failure.
 
 ## What this layer deliberately does not do
 
@@ -236,3 +262,39 @@ guarantees one instance per run).
 * **Branch stores mirror through the parent run's handle** (scoped keys), but
   out-of-band branch *reads* (`chidori branches`) stay filesystem-local —
   hydrate the run first on a fresh machine.
+
+## Known limits and follow-on work
+
+Tracked here so the guarantees above aren't read as stronger than they are:
+
+* **`s3://` leases stay advisory.** The blob CAS needs a conditional
+  *overwrite*, and while `If-Match` on an ETag is supported by AWS S3 and
+  some compatible stores, it is not universal and the ETag of a multipart or
+  server-side-encrypted object is not a plain content hash. Closing this
+  means tracking ETags through `BlobRunStore` and degrading cleanly where the
+  store rejects the precondition — worth doing, not yet done. Until then,
+  `s3://` deployments should stop the old instance before starting the new.
+* **Fencing is only observed at lease boundaries.** A node that loses a cell
+  mid-run learns about it at its next lease renewal (per supervisor
+  iteration) and stands down then. Its in-flight journal appends between
+  those points still surface as generic mirror-write failures — logged under
+  `besteffort`, run-poisoning under `strict`. Threading the typed fenced
+  error all the way through the append path (so a fenced node stops driving
+  immediately, and never poisons a run it simply no longer owns) is the next
+  increment.
+* **The cell store does not route.** A cell owned by another live node is
+  refused with a `409` naming the owner, not proxied. Single ownership is
+  solved at the storage layer; picking *which* node should serve a given run
+  is still the operator's job (one `chidori serve` per agent, as
+  `docs/deployment.md` describes).
+* **Cell-store bucket freshness is the sync cadence.** An acknowledged write
+  is durable on the owning node's disk (`synchronous=FULL`) but reaches the
+  bucket on the `--sync-secs` tick, at hibernate, and at graceful shutdown.
+  Losing a store node's disk outright can therefore lose up to one sync
+  window. Continuous WAL shipping instead of periodic whole-database
+  snapshots would shrink that window and cut replication cost for large
+  cells; the current design favors simplicity.
+* **Snapshot GC is best-effort.** A publish retires the superseded snapshot
+  and pre-takeover epoch metas after swinging the pointer. An interrupted GC
+  leaves orphaned objects (never a dangling pointer) — a bucket lifecycle
+  rule on the `state/` prefix is the pragmatic backstop.

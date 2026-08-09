@@ -85,6 +85,47 @@ pub trait RunStore: Send + Sync + std::fmt::Debug {
     /// Keys of every stored blob (relative paths). Used by hydration.
     fn list_blobs(&self) -> Result<Vec<String>>;
 
+    /// Compare-and-swap one blob: apply `new` (`None` = delete) only when the
+    /// stored value is byte-identical to `expected` (`None` = the key must be
+    /// absent). `Ok(false)` means the precondition failed — another writer got
+    /// there first — and is a normal outcome, not an error.
+    ///
+    /// Callers must pass bytes they actually read from this store rather than
+    /// a re-serialization, so the comparison never turns on formatting.
+    ///
+    /// The default implementation is a read-compare-write and is **not**
+    /// atomic: two callers can observe the same prior value and both write.
+    /// That is the historical advisory behavior, correct for backends with no
+    /// serialization point (`fs`, object stores). Backends that have one
+    /// override this: [`SqliteRunStore`] wraps it in a transaction,
+    /// [`HttpRunStore`] hands the precondition to the server as HTTP
+    /// conditional headers. See `docs/durable-storage.md` §Leases.
+    fn compare_and_swap_blob(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<bool> {
+        if self.get_blob(key)?.as_deref() != expected {
+            return Ok(false);
+        }
+        match new {
+            Some(bytes) => self.put_blob(key, bytes)?,
+            None => self.delete_blob(key)?,
+        }
+        Ok(true)
+    }
+
+    /// The store that coordination state (the run lease) must address.
+    ///
+    /// `None` — the default — means "this store". [`TeeRunStore`] overrides it
+    /// with its durable secondary: a lease is *fleet* state, and the tee's
+    /// local-primary-first reads would otherwise give every machine its own
+    /// private lease, which is no lease at all.
+    fn coordination_target(&self) -> Option<&dyn RunStore> {
+        None
+    }
+
     /// Durability barrier: every prior write on this handle is durable when
     /// this returns Ok. The runtime calls it before a run settles or pauses —
     /// the output-gate point — so backends may buffer between flushes.
@@ -516,6 +557,47 @@ impl RunStore for SqliteRunStore {
         Ok(out)
     }
 
+    /// Atomic: the read and the conditional write share one `IMMEDIATE`
+    /// transaction, which takes the database's write lock up front — so two
+    /// processes sharing the file serialize here instead of interleaving a
+    /// read-compare-write. (A deferred transaction would let both read before
+    /// either wrote, and the loser would fail on upgrade rather than cleanly
+    /// reporting a lost swap.)
+    fn compare_and_swap_blob(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<bool> {
+        let mut conn = self.shared.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut stmt =
+                tx.prepare_cached("SELECT data FROM run_blobs WHERE run_id = ?1 AND key = ?2")?;
+            let mut rows = stmt.query(rusqlite::params![self.run_id, key])?;
+            let current: Option<Vec<u8>> = match rows.next()? {
+                Some(row) => Some(row.get(0)?),
+                None => None,
+            };
+            if current.as_deref() != expected {
+                return Ok(false);
+            }
+        }
+        match new {
+            Some(bytes) => tx.execute(
+                "INSERT INTO run_blobs (run_id, key, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(run_id, key) DO UPDATE SET data = excluded.data",
+                rusqlite::params![self.run_id, key, bytes],
+            )?,
+            None => tx.execute(
+                "DELETE FROM run_blobs WHERE run_id = ?1 AND key = ?2",
+                rusqlite::params![self.run_id, key],
+            )?,
+        };
+        tx.commit()?;
+        Ok(true)
+    }
+
     fn flush(&self) -> Result<()> {
         Ok(())
     }
@@ -570,6 +652,69 @@ impl HttpRunStore {
             urlencode_path(key)
         )
     }
+}
+
+/// The store refused an operation because this node no longer owns the run —
+/// another node took its cell over (`chidori cell-store` reports this as HTTP
+/// 409 naming the live owner). Distinct from an ordinary write failure: the
+/// correct response is to stand down, not to retry or to poison the run.
+/// Recognize it with [`fenced_owner`].
+#[derive(Debug, Clone)]
+pub struct FencedError {
+    pub owner: String,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl std::fmt::Display for FencedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run is owned by `{}`", self.owner)?;
+        if let Some(expires) = self.lease_expires_at {
+            write!(f, " (lease expires {expires})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FencedError {}
+
+/// The fenced-store error anywhere in `err`'s cause chain, if any.
+pub fn fenced_owner(err: &anyhow::Error) -> Option<&FencedError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<FencedError>())
+}
+
+/// Build the error for a non-success relay status. A 409 always becomes a
+/// [`FencedError`] — even when the body doesn't parse, since standing down
+/// must not depend on being able to name the new owner.
+fn relay_error(what: &str, status: u16, body: &[u8]) -> anyhow::Error {
+    if status == 409 {
+        let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+        return anyhow::Error::new(FencedError {
+            owner: parsed
+                .as_ref()
+                .and_then(|v| v.get("owner"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            lease_expires_at: parsed
+                .as_ref()
+                .and_then(|v| v.get("lease_expires_at"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok()),
+        });
+    }
+    anyhow::anyhow!(
+        "run store relay {what} failed: HTTP {status} {}",
+        String::from_utf8_lossy(body)
+    )
+}
+
+/// The entity tag a conditional request compares against: the SHA-256 of the
+/// blob's bytes, quoted per HTTP. Content-derived rather than server-assigned
+/// so any implementation of the protocol computes the same value.
+fn blob_etag(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("\"{}\"", hex::encode(sha2::Sha256::digest(bytes)))
 }
 
 /// Percent-encode a blob key for use as a single path segment, keeping `/`
@@ -846,10 +991,7 @@ impl HttpRelay {
         if (200..300).contains(&status) {
             Ok(())
         } else {
-            anyhow::bail!(
-                "run store relay {method} {url} failed: HTTP {status} {}",
-                String::from_utf8_lossy(&bytes)
-            )
+            Err(relay_error(&format!("{method} {url}"), status, &bytes))
         }
     }
 
@@ -926,10 +1068,7 @@ impl RunStore for HttpRunStore {
         if (200..300).contains(&status) {
             Ok(())
         } else {
-            anyhow::bail!(
-                "run store relay PUT blob {key} failed: HTTP {status} {}",
-                String::from_utf8_lossy(&body)
-            )
+            Err(relay_error(&format!("PUT blob {key}"), status, &body))
         }
     }
 
@@ -938,7 +1077,7 @@ impl RunStore for HttpRunStore {
         match status {
             404 => Ok(None),
             s if (200..300).contains(&s) => Ok(Some(bytes)),
-            s => anyhow::bail!("run store relay GET blob {key} failed: HTTP {s}"),
+            s => Err(relay_error(&format!("GET blob {key}"), s, &bytes)),
         }
     }
 
@@ -970,7 +1109,47 @@ impl RunStore for HttpRunStore {
         match status {
             404 => Ok(Vec::new()),
             s if (200..300).contains(&s) => Ok(serde_json::from_slice(&bytes)?),
-            s => anyhow::bail!("run store relay GET blobs failed: HTTP {s}"),
+            s => Err(relay_error("GET blobs", s, &bytes)),
+        }
+    }
+
+    /// Atomic when the server is: the precondition rides as an HTTP
+    /// conditional header and is evaluated server-side, inside whatever lock
+    /// serializes that run (`chidori cell-store`: the cell's slot mutex; the
+    /// Durable Object relay: the single instance per run id). A 412 is the
+    /// precondition failing — a lost swap, not an error.
+    ///
+    /// Always synchronous, even in pipelined (besteffort) mode: the caller
+    /// needs the verdict. The relay is a single FIFO thread, so appends
+    /// enqueued earlier still reach the server first.
+    fn compare_and_swap_blob(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<bool> {
+        let precondition = match expected {
+            Some(bytes) => ("if-match".to_string(), blob_etag(bytes)),
+            None => ("if-none-match".to_string(), "*".to_string()),
+        };
+        let (method, body, content_type) = match new {
+            Some(bytes) => ("PUT", Some(bytes.to_vec()), "application/octet-stream"),
+            None => ("DELETE", None, "application/json"),
+        };
+        let (status, response) = self.relay.request_full(
+            method,
+            self.blob_url(key),
+            body,
+            content_type,
+            vec![precondition],
+        )?;
+        match status {
+            412 => Ok(false),
+            // Deleting a key we required to be absent: already in the
+            // requested state.
+            404 if new.is_none() => Ok(true),
+            s if (200..300).contains(&s) => Ok(true),
+            s => Err(relay_error(&format!("CAS blob {key}"), s, &response)),
         }
     }
 
@@ -1052,6 +1231,30 @@ impl RunStore for TeeRunStore {
         Ok(keys)
     }
 
+    /// The secondary is the authority — it is the copy every machine shares —
+    /// so the swap is decided there and the primary is updated to match only
+    /// once it succeeds. Deciding on the primary would make each machine's
+    /// local file the arbiter of a fleet-wide question.
+    fn compare_and_swap_blob(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<bool> {
+        if !self.secondary.compare_and_swap_blob(key, expected, new)? {
+            return Ok(false);
+        }
+        match new {
+            Some(bytes) => self.primary.put_blob(key, bytes)?,
+            None => self.primary.delete_blob(key)?,
+        }
+        Ok(true)
+    }
+
+    fn coordination_target(&self) -> Option<&dyn RunStore> {
+        Some(self.secondary.as_ref())
+    }
+
     fn flush(&self) -> Result<()> {
         self.primary.flush()?;
         self.secondary.flush()
@@ -1131,6 +1334,16 @@ impl RunStore for ScopedRunStore {
             .into_iter()
             .filter_map(|key| key.strip_prefix(&self.prefix).map(str::to_string))
             .collect())
+    }
+
+    fn compare_and_swap_blob(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<bool> {
+        self.inner
+            .compare_and_swap_blob(&self.key(key), expected, new)
     }
 
     fn flush(&self) -> Result<()> {
@@ -1514,42 +1727,107 @@ pub struct RunLease {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// How many times [`acquire_lease`] re-reads and re-decides after losing a
+/// compare-and-swap. Each loss means a concurrent writer won, so this bounds
+/// livelock under contention rather than expressing a retry-on-failure policy.
+const LEASE_CAS_ATTEMPTS: usize = 8;
+
 /// Try to acquire (or renew) the run's lease for `owner`. Succeeds when the
 /// run has no lease, the lease is already `owner`'s, or the previous lease
 /// expired — in which case ownership transfers (the takeover path). Returns
 /// the granted lease, or the live holder's lease as the error.
 ///
-/// The check-and-set runs through the store's blob interface: last-writer-wins
-/// races are possible between two *processes* sharing only the filesystem
-/// backend; the SQLite and HTTP backends serialize writers (single connection
-/// / single Durable Object), which is where multi-writer deployments live.
+/// **Compare-and-swap, not read-then-write.** The decision is made against the
+/// exact bytes read, and the write is conditional on those bytes still being
+/// current ([`RunStore::compare_and_swap_blob`]); a lost swap re-reads and
+/// re-decides instead of clobbering the winner. How atomic that is depends on
+/// the backend — enforced on SQLite (one `IMMEDIATE` transaction) and on the
+/// relay backends (server-side preconditions), advisory on the filesystem and
+/// on object stores. `docs/durable-storage.md` §Leases has the table.
+///
+/// **Fleet state, so it addresses the shared store**
+/// ([`RunStore::coordination_target`]): a tee's local-primary-first reads
+/// would give every machine its own private lease.
+///
+/// A [`FencedError`] — this node's run was taken over — is reported as the
+/// ordinary "held by someone else" outcome, so callers' existing standdown
+/// paths handle it instead of it surfacing as a write failure.
 pub fn acquire_lease(
     store: &dyn RunStore,
     owner: &str,
     ttl: chrono::Duration,
 ) -> Result<std::result::Result<RunLease, RunLease>> {
-    let now = chrono::Utc::now();
-    if let Some(bytes) = store.get_blob(LEASE_FILE)? {
-        if let Ok(existing) = serde_json::from_slice::<RunLease>(&bytes) {
-            if existing.owner != owner && existing.expires_at > now {
-                return Ok(Err(existing));
+    let store = store.coordination_target().unwrap_or(store);
+
+    // A fenced store means someone else owns the run; report them as the
+    // holder. When the store couldn't name them, park the waiter for one TTL
+    // rather than reporting an already-expired lease, which would spin.
+    let standdown = |err: anyhow::Error| -> Result<std::result::Result<RunLease, RunLease>> {
+        match fenced_owner(&err) {
+            Some(fenced) => Ok(Err(RunLease {
+                owner: fenced.owner.clone(),
+                expires_at: fenced
+                    .lease_expires_at
+                    .unwrap_or_else(|| chrono::Utc::now() + ttl),
+            })),
+            None => Err(err),
+        }
+    };
+
+    for _ in 0..LEASE_CAS_ATTEMPTS {
+        let current = match store.get_blob(LEASE_FILE) {
+            Ok(current) => current,
+            Err(err) => return standdown(err),
+        };
+        let now = chrono::Utc::now();
+        if let Some(bytes) = &current {
+            if let Ok(existing) = serde_json::from_slice::<RunLease>(bytes) {
+                if existing.owner != owner && existing.expires_at > now {
+                    return Ok(Err(existing));
+                }
             }
         }
+        let lease = RunLease {
+            owner: owner.to_string(),
+            expires_at: now + ttl,
+        };
+        let bytes = serde_json::to_vec_pretty(&lease)?;
+        match store.compare_and_swap_blob(LEASE_FILE, current.as_deref(), Some(&bytes)) {
+            Ok(true) => return Ok(Ok(lease)),
+            // Someone wrote between the read and the swap: re-read and
+            // re-decide — they may now be a live holder we must yield to.
+            Ok(false) => continue,
+            Err(err) => return standdown(err),
+        }
     }
-    let lease = RunLease {
-        owner: owner.to_string(),
-        expires_at: now + ttl,
-    };
-    store.put_blob(LEASE_FILE, &serde_json::to_vec_pretty(&lease)?)?;
-    Ok(Ok(lease))
+    anyhow::bail!(
+        "lease for this run is being contended: lost {LEASE_CAS_ATTEMPTS} \
+         compare-and-swaps in a row"
+    )
 }
 
 /// Release the run's lease if `owner` holds it.
+///
+/// The delete is itself conditional on the exact bytes read, so a lease that
+/// was taken over between the read and the delete is left alone instead of
+/// being deleted out from under its new owner.
 pub fn release_lease(store: &dyn RunStore, owner: &str) -> Result<()> {
-    if let Some(bytes) = store.get_blob(LEASE_FILE)? {
+    let store = store.coordination_target().unwrap_or(store);
+    let current = match store.get_blob(LEASE_FILE) {
+        Ok(current) => current,
+        // Already fenced: this node owns nothing here, so there is nothing to
+        // release and nothing to report.
+        Err(err) if fenced_owner(&err).is_some() => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if let Some(bytes) = current {
         if let Ok(existing) = serde_json::from_slice::<RunLease>(&bytes) {
             if existing.owner == owner {
-                store.delete_blob(LEASE_FILE)?;
+                match store.compare_and_swap_blob(LEASE_FILE, Some(&bytes), None) {
+                    Ok(_) => {}
+                    Err(err) if fenced_owner(&err).is_some() => {}
+                    Err(err) => return Err(err),
+                }
             }
         }
     }
@@ -1881,6 +2159,168 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(relay.list_runs().unwrap().contains(&"run-http".to_string()));
+    }
+
+    /// The compare-and-swap contract every backend must satisfy, whether or
+    /// not its implementation is atomic.
+    fn cas_conformance(store: &dyn RunStore) {
+        // Create-if-absent: the first wins, a second attempt sees the key.
+        assert!(store
+            .compare_and_swap_blob("cas.json", None, Some(b"one"))
+            .unwrap());
+        assert!(!store
+            .compare_and_swap_blob("cas.json", None, Some(b"two"))
+            .unwrap());
+        assert_eq!(store.get_blob("cas.json").unwrap().unwrap(), b"one");
+
+        // Swap against the current bytes succeeds; against stale bytes fails.
+        assert!(store
+            .compare_and_swap_blob("cas.json", Some(b"one"), Some(b"three"))
+            .unwrap());
+        assert!(!store
+            .compare_and_swap_blob("cas.json", Some(b"one"), Some(b"four"))
+            .unwrap());
+        assert_eq!(store.get_blob("cas.json").unwrap().unwrap(), b"three");
+
+        // Conditional delete: stale expectation refuses, current succeeds.
+        assert!(!store
+            .compare_and_swap_blob("cas.json", Some(b"one"), None)
+            .unwrap());
+        assert!(store
+            .compare_and_swap_blob("cas.json", Some(b"three"), None)
+            .unwrap());
+        assert!(store.get_blob("cas.json").unwrap().is_none());
+    }
+
+    #[test]
+    fn cas_conformance_across_backends() {
+        let dir = std::env::temp_dir().join(format!("chidori-store-cas-{}", uuid::Uuid::new_v4()));
+        cas_conformance(&FsRunStore::new(&dir));
+        let shared = SqliteRunStoreShared::open(&dir.join("runs.sqlite3")).unwrap();
+        cas_conformance(&SqliteRunStore::new(shared.clone(), "run-cas"));
+        cas_conformance(&TeeRunStore::new(
+            FsRunStore::new(dir.join("tee")),
+            Arc::new(SqliteRunStore::new(shared, "run-tee")),
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression: the lease is fleet state, so it must be read from the
+    /// shared backend. A tee reads its local primary first, so before
+    /// `coordination_target` routed around it each machine saw its own
+    /// private `lease.json` — and two machines would each believe they owned
+    /// the run.
+    #[test]
+    fn lease_is_fleet_state_not_per_machine() {
+        let base = std::env::temp_dir().join(format!("chidori-store-fleet-{}", uuid::Uuid::new_v4()));
+        let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
+        // Two machines: their own run directories, one shared mirror.
+        let machine = |name: &str| {
+            TeeRunStore::new(
+                FsRunStore::new(base.join(name).join("run-1")),
+                Arc::new(SqliteRunStore::new(shared.clone(), "run-1")),
+            )
+        };
+        let (a, b) = (machine("a"), machine("b"));
+        let ttl = chrono::Duration::seconds(60);
+
+        assert!(acquire_lease(&a, "node-a", ttl).unwrap().is_ok());
+        // B sees A's lease through the shared mirror and stands down.
+        assert_eq!(
+            acquire_lease(&b, "node-b", ttl).unwrap().unwrap_err().owner,
+            "node-a"
+        );
+
+        // A's lease expires and B takes over. A's *local* copy still names A
+        // with a live expiry — the stale view that used to fool it.
+        let expired = RunLease {
+            owner: "node-a".to_string(),
+            expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+        };
+        SqliteRunStore::new(shared.clone(), "run-1")
+            .put_blob(LEASE_FILE, &serde_json::to_vec_pretty(&expired).unwrap())
+            .unwrap();
+        assert!(acquire_lease(&b, "node-b", ttl).unwrap().is_ok());
+        assert_eq!(
+            acquire_lease(&a, "node-a", ttl).unwrap().unwrap_err().owner,
+            "node-b"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A store that reports every read as fenced — what a node sees after
+    /// another node takes its cell over.
+    #[derive(Debug)]
+    struct FencedStore;
+
+    impl RunStore for FencedStore {
+        fn append_record(&self, _: &CallRecord) -> Result<()> {
+            Err(anyhow::Error::new(FencedError {
+                owner: "node-live".to_string(),
+                lease_expires_at: None,
+            }))
+        }
+        fn write_call_log(&self, _: &[CallRecord]) -> Result<()> {
+            unimplemented!()
+        }
+        fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
+            unimplemented!()
+        }
+        fn put_blob(&self, _: &str, _: &[u8]) -> Result<()> {
+            unimplemented!()
+        }
+        fn get_blob(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            // Wrapped in context to prove the chain walk finds it.
+            Err(anyhow::Error::new(FencedError {
+                owner: "node-live".to_string(),
+                lease_expires_at: None,
+            })
+            .context("reading blob lease.json"))
+        }
+        fn delete_blob(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        fn list_blobs(&self) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A fenced store means someone else owns the run: that must surface as
+    /// the ordinary "held by another" outcome (which callers already stand
+    /// down for), not as a write error that would poison the run under
+    /// `CHIDORI_DURABILITY=strict`.
+    #[test]
+    fn fenced_store_reports_a_holder_instead_of_failing() {
+        let ttl = chrono::Duration::seconds(60);
+        let holder = acquire_lease(&FencedStore, "node-dead", ttl)
+            .expect("a fenced store is a standdown, not an error")
+            .expect_err("must not report ownership");
+        assert_eq!(holder.owner, "node-live");
+        // Unknown expiry parks the waiter for a TTL rather than reporting an
+        // already-expired lease, which would spin.
+        assert!(holder.expires_at > chrono::Utc::now());
+        // Releasing a lease we no longer own is a no-op, not an error.
+        release_lease(&FencedStore, "node-dead").unwrap();
+        // The marker survives `.context()` wrapping.
+        assert!(fenced_owner(&FencedStore.append_record(&record(1, "x")).unwrap_err()).is_some());
+    }
+
+    #[test]
+    fn relay_409_becomes_a_fenced_error() {
+        let body = br#"{"error":"cell owned elsewhere","owner":"node-b","lease_expires_at":"2030-01-01T00:00:00Z"}"#;
+        let err = relay_error("PUT blob lease.json", 409, body);
+        let fenced = fenced_owner(&err).expect("409 must be fenced");
+        assert_eq!(fenced.owner, "node-b");
+        assert!(fenced.lease_expires_at.is_some());
+        // Still fenced when the body says nothing useful — standing down must
+        // not depend on being able to name the winner.
+        let err = relay_error("PUT blob lease.json", 409, b"nope");
+        assert_eq!(fenced_owner(&err).unwrap().owner, "unknown");
+        // Other failures stay ordinary errors.
+        assert!(fenced_owner(&relay_error("PUT", 500, b"boom")).is_none());
     }
 
     #[test]

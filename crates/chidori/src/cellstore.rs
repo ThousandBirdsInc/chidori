@@ -31,6 +31,13 @@
 //!     dropped. The next request — on any node — wins the next epoch and
 //!     restores the database from the bucket.
 //!
+//! Beyond the plain protocol, blob writes honor `If-None-Match: *` and
+//! `If-Match: "<sha256>"` and are evaluated inside the owning cell's lock —
+//! one serialization point per run, since a cell has exactly one owning node.
+//! That is what upgrades Chidori's run lease from advisory to enforced
+//! (`crate::runtime::store::acquire_lease`, `docs/durable-storage.md`
+//! §Leases): two processes racing for the same run cannot both win.
+//!
 //! What this deliberately does not implement from celld: the V8/Wrangler
 //! application runtime (Chidori has its own engine; cells here hold run
 //! journals, not application code) and inter-node request routing (a client
@@ -277,6 +284,23 @@ impl Cell {
         Ok(())
     }
 
+    /// Evaluate a conditional write's precondition against the stored blob.
+    /// Called with the cell's slot mutex held, which is what makes the
+    /// check-then-write atomic for the whole fleet: a cell has exactly one
+    /// owning node, and within that node exactly one holder of this lock. This
+    /// is what turns Chidori's run lease from advisory into enforced
+    /// (`crate::runtime::store::acquire_lease`).
+    fn precondition_holds(&self, key: &str, condition: &Precondition) -> Result<bool> {
+        let current = self.blob_get(key)?;
+        Ok(match condition {
+            Precondition::None => true,
+            Precondition::Absent => current.is_none(),
+            Precondition::Matches(etag) => {
+                current.is_some_and(|bytes| blob_etag(&bytes) == *etag)
+            }
+        })
+    }
+
     fn blob_list(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -288,6 +312,42 @@ impl Cell {
         }
         Ok(keys)
     }
+}
+
+/// The precondition a conditional blob write carries, parsed from the request's
+/// `If-None-Match` / `If-Match` headers.
+#[derive(Debug, PartialEq, Eq)]
+enum Precondition {
+    /// Unconditional — an ordinary write.
+    None,
+    /// `If-None-Match: *` — the key must not exist.
+    Absent,
+    /// `If-Match: "<etag>"` — the key must exist with exactly this entity tag.
+    Matches(String),
+}
+
+impl Precondition {
+    fn from_headers(headers: &axum::http::HeaderMap) -> Self {
+        if headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim() == "*")
+        {
+            return Precondition::Absent;
+        }
+        match headers.get("if-match").and_then(|v| v.to_str().ok()) {
+            Some(etag) => Precondition::Matches(etag.trim().to_string()),
+            None => Precondition::None,
+        }
+    }
+}
+
+/// The entity tag of a blob: quoted SHA-256 of its bytes. Content-derived, so
+/// client and server compute it independently and never need to exchange
+/// server-assigned tags (matches `runtime::store::blob_etag`).
+fn blob_etag(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("\"{}\"", hex::encode(sha2::Sha256::digest(bytes)))
 }
 
 /// A cell's slot in the node's map: `None` while hibernated or never opened.
@@ -303,7 +363,12 @@ fn open_cell_db(path: &Path) -> Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(path)
         .with_context(|| format!("opening cell database {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").ok();
-    conn.pragma_update(None, "synchronous", "NORMAL").ok();
+    // FULL, not NORMAL: this node is somebody's durability tier. Under
+    // CHIDORI_DURABILITY=strict the client treats our acknowledgement as "the
+    // effect is recorded", and WAL+NORMAL acknowledges commits that a power
+    // loss can still take back. The fsync costs microseconds against the tens
+    // of milliseconds an S3 round-trip would have cost instead.
+    conn.pragma_update(None, "synchronous", "FULL").ok();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS records (
              seq INTEGER PRIMARY KEY,
@@ -1204,6 +1269,7 @@ async fn http_blob_get(
 async fn http_blob_put(
     State(state): State<AppState>,
     AxPath((id, key)): AxPath<(String, String)>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     blocking(move || {
@@ -1213,8 +1279,16 @@ async fn http_blob_put(
         if let Err(err) = state.node.run_register(&id) {
             return error_response(err.into());
         }
-        match state.node.with_cell(&id, |cell| cell.blob_put(&key, &body)) {
-            Ok(()) => "ok".into_response(),
+        let condition = Precondition::from_headers(&headers);
+        match state.node.with_cell(&id, |cell| {
+            if !cell.precondition_holds(&key, &condition)? {
+                return Ok(false);
+            }
+            cell.blob_put(&key, &body)?;
+            Ok(true)
+        }) {
+            Ok(true) => "ok".into_response(),
+            Ok(false) => precondition_failed(),
             Err(err) => error_response(err),
         }
     })
@@ -1224,19 +1298,41 @@ async fn http_blob_put(
 async fn http_blob_delete(
     State(state): State<AppState>,
     AxPath((id, key)): AxPath<(String, String)>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     blocking(move || {
         if let Some(response) = check_component(&id, "run id") {
             return response;
         }
+        let condition = Precondition::from_headers(&headers);
+        // If no cell exists anywhere, every key in it is absent — so an
+        // `If-Match` can never be satisfied, while an unconditional or
+        // `If-None-Match: *` delete is already in its requested state.
+        let satisfied_by_absence = !matches!(condition, Precondition::Matches(_));
         // Deleting from a cell that exists nowhere is Ok without conjuring
         // one (mirrors the RunStore delete-absent contract).
-        match state.node.with_cell_opt(&id, |cell| cell.blob_delete(&key)) {
-            Ok(_) => "ok".into_response(),
+        match state.node.with_cell_opt(&id, |cell| {
+            if !cell.precondition_holds(&key, &condition)? {
+                return Ok(false);
+            }
+            cell.blob_delete(&key)?;
+            Ok(true)
+        }) {
+            Ok(Some(true)) => "ok".into_response(),
+            Ok(Some(false)) => precondition_failed(),
+            Ok(None) if satisfied_by_absence => "ok".into_response(),
+            Ok(None) => precondition_failed(),
             Err(err) => error_response(err),
         }
     })
     .await
+}
+
+/// A conditional write whose precondition did not hold. 412 is the protocol's
+/// "you lost the compare-and-swap" — a normal outcome the client retries after
+/// re-reading, distinct from 409 (this node no longer owns the cell at all).
+fn precondition_failed() -> Response {
+    (StatusCode::PRECONDITION_FAILED, "precondition failed").into_response()
 }
 
 async fn http_registry_list(State(state): State<AppState>) -> Response {
@@ -1846,6 +1942,161 @@ mod tests {
         let dir_b = tempfile::tempdir().unwrap();
         let node_b = test_node(dir_b.path(), "node-b", Some(bucket), 60_000, LONG_IDLE);
         assert_eq!(node_b.runs_list().unwrap(), vec!["run-1".to_string()]);
+    }
+
+    /// Conditional blob writes are evaluated by the server, so the client's
+    /// `compare_and_swap_blob` is atomic rather than a read-compare-write.
+    #[test]
+    fn conditional_writes_are_evaluated_server_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(dir.path(), "node-a", None, 60_000, LONG_IDLE);
+        let base = spawn_axum(router(AppState { node, token: None }));
+        let store = HttpRunStore::new(HttpRelay::new(base.clone(), None), "run-cas");
+
+        assert!(store
+            .compare_and_swap_blob("lease.json", None, Some(b"one"))
+            .unwrap());
+        // The key now exists, so an absent-precondition write is refused…
+        assert!(!store
+            .compare_and_swap_blob("lease.json", None, Some(b"two"))
+            .unwrap());
+        // …a swap against stale bytes is refused…
+        assert!(!store
+            .compare_and_swap_blob("lease.json", Some(b"stale"), Some(b"two"))
+            .unwrap());
+        // …and one against the current bytes succeeds.
+        assert!(store
+            .compare_and_swap_blob("lease.json", Some(b"one"), Some(b"three"))
+            .unwrap());
+        assert_eq!(store.get_blob("lease.json").unwrap().unwrap(), b"three");
+
+        assert!(!store
+            .compare_and_swap_blob("lease.json", Some(b"one"), None)
+            .unwrap());
+        assert!(store
+            .compare_and_swap_blob("lease.json", Some(b"three"), None)
+            .unwrap());
+        assert!(store.get_blob("lease.json").unwrap().is_none());
+
+        // A run with no cell at all: absence satisfies an absent-precondition
+        // delete, but never an `If-Match` for specific bytes.
+        let absent = HttpRunStore::new(HttpRelay::new(base, None), "run-never-existed");
+        assert!(absent.compare_and_swap_blob("k", None, None).unwrap());
+        assert!(!absent
+            .compare_and_swap_blob("k", Some(b"ghost"), None)
+            .unwrap());
+    }
+
+    /// The headline claim: a run lease taken through the cell store is
+    /// *enforced*, not advisory. Eight processes race for the same run with no
+    /// coordination between them; exactly one may win, and every loser must be
+    /// told who did. Each gets its own relay so the requests genuinely
+    /// interleave at the server rather than serializing on one FIFO thread.
+    #[test]
+    fn lease_is_enforced_against_concurrent_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(dir.path(), "node-a", None, 60_000, LONG_IDLE);
+        let base = spawn_axum(router(AppState { node, token: None }));
+        let ttl = chrono::Duration::seconds(60);
+
+        let winners: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let base = base.clone();
+                    scope.spawn(move || {
+                        let store =
+                            HttpRunStore::new(HttpRelay::new(base, None), "run-contended");
+                        let owner = format!("proc-{i}");
+                        match crate::runtime::store::acquire_lease(&store, &owner, ttl).unwrap() {
+                            Ok(lease) => Ok(lease.owner),
+                            Err(holder) => Err(holder.owner),
+                        }
+                    })
+                })
+                .collect();
+            let (won, lost): (Vec<_>, Vec<_>) = handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .partition(|r| r.is_ok());
+            let winners: Vec<String> = won.into_iter().map(Result::unwrap).collect();
+            // Every loser names the winner rather than erroring out.
+            for holder in lost.into_iter().map(Result::unwrap_err) {
+                assert_eq!(Some(&holder), winners.first(), "loser named a non-winner");
+            }
+            winners
+        });
+        assert_eq!(winners.len(), 1, "exactly one process may hold the lease");
+
+        // The holder renews; a different process is still refused; a release
+        // hands ownership over cleanly.
+        let store = HttpRunStore::new(HttpRelay::new(base.clone(), None), "run-contended");
+        let winner = winners.into_iter().next().unwrap();
+        assert!(crate::runtime::store::acquire_lease(&store, &winner, ttl)
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            crate::runtime::store::acquire_lease(&store, "outsider", ttl)
+                .unwrap()
+                .unwrap_err()
+                .owner,
+            winner
+        );
+        crate::runtime::store::release_lease(&store, &winner).unwrap();
+        assert!(crate::runtime::store::acquire_lease(&store, "outsider", ttl)
+            .unwrap()
+            .is_ok());
+    }
+
+    /// A node fenced by a takeover answers 409, and the client turns that into
+    /// an ordinary standdown — the run is someone else's, not broken.
+    #[test]
+    fn fenced_node_makes_the_client_stand_down() {
+        let endpoint = spawn_mock_bucket();
+        let bucket = S3BlobStore::for_tests(&endpoint, "cells", "");
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let node_a = test_node(dir_a.path(), "node-a", Some(bucket.clone()), 400, LONG_IDLE);
+        let node_b = test_node(dir_b.path(), "node-b", Some(bucket), 60_000, LONG_IDLE);
+        let base = spawn_axum(router(AppState {
+            node: node_a.clone(),
+            token: None,
+        }));
+        let store = HttpRunStore::new(HttpRelay::new(base, None), "run-fenced");
+
+        append(&node_a, "run-fenced", 1, "prompt").unwrap();
+        node_a.tick(); // replicate so B can restore
+        assert!(store.get_blob("anything").unwrap().is_none());
+
+        // A's lease lapses and B takes the cell; A is now fenced.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert_eq!(record_seqs(&node_b, "run-fenced"), vec![1]);
+
+        // Synchronous requests through A are recognized as fencing.
+        let err = store
+            .get_blob("manifest.json")
+            .expect_err("a fenced node must refuse the read");
+        assert_eq!(
+            crate::runtime::store::fenced_owner(&err)
+                .expect("409 must be recognized as fencing")
+                .owner,
+            "node-b"
+        );
+
+        // Pipelined writes (the besteffort default) are enqueued without
+        // waiting, so a fenced write is not refused inline — it lands at the
+        // relay barrier, which is exactly why fencing is observed at lease
+        // boundaries rather than per effect (docs/durable-storage.md §Known
+        // limits). Assert the real behavior so the gap stays visible.
+        store.put_blob("manifest.json", b"{}").unwrap();
+        assert!(store.flush().is_ok(), "besteffort logs and continues");
+        let holder = crate::runtime::store::acquire_lease(
+            &store,
+            "proc-a",
+            chrono::Duration::seconds(60),
+        )
+        .expect("fencing is a standdown, not an error")
+        .expect_err("a fenced node must not believe it holds the lease");
+        assert_eq!(holder.owner, "node-b");
     }
 
     #[test]
