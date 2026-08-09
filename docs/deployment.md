@@ -36,7 +36,7 @@ flowchart LR
         state[(".chidori/<br/>journals · checkpoints ·<br/>detached-agent registry")]
     end
 
-    mirror[("CHIDORI_RUN_STORE mirror<br/>sqlite · s3://bucket · DO relay")]
+    mirror[("CHIDORI_RUN_STORE mirror<br/>sqlite · s3://bucket ·<br/>chidori cell-store · DO relay")]
 
     u1 --> proxy
     u2 --> proxy
@@ -122,13 +122,76 @@ Each tier survives strictly more:
 | `CHIDORI_RUN_STORE` | Survives | Depends on |
 |---|---|---|
 | unset / `fs` | crash, restart, redeploy | nothing |
-| `sqlite` | + single-file backup; serialized writers | nothing |
+| `sqlite` | + single-file backup; enforced single writer (one host) | nothing |
 | `s3://bucket/prefix` | **+ machine loss** (hydration) | any S3 API: AWS, R2, GCS, Backblaze, self-hosted MinIO |
-| `https://…` relay | + cross-DC replication, 30-day PITR, platform-enforced single writer | [Cloudflare Durable Objects](../integrations/cloudflare-durable-objects/) |
+| `https://…` → `chidori cell-store` | + machine loss, **enforced single writer across hosts**, per-run isolation | an S3 bucket + a store node you run |
+| `https://…` → Durable Object relay | + cross-DC replication, 30-day PITR, enforced single writer | [Cloudflare Durable Objects](../integrations/cloudflare-durable-objects/) |
 
 Rule of thumb: `sqlite` on a durable disk you back up; `s3://` when the
-machine is ephemeral (containers, managed hosts); the Durable Object relay
-when you want the strongest failover guarantees.
+machine is ephemeral (containers, managed hosts); `chidori cell-store` when
+you want enforced single writers on your own infrastructure; the Durable
+Object relay when you want the strongest failover guarantees and don't mind
+depending on Cloudflare.
+
+Only the bottom three rows survive machine loss, and only the bottom three
+**enforce** the run lease rather than leaving it advisory — see
+[leases](./durable-storage.md#leases-single-writer-ownership), which is what
+makes the deploy-overlap hazard below go away.
+
+### Self-hosting the strongest tier: `chidori cell-store`
+
+`chidori cell-store` serves the same REST protocol as the Durable Object
+relay, so it is a drop-in `CHIDORI_RUN_STORE` target — but it runs on your
+machines. It splits a deployment into a **stateless agent tier** and a
+**stateful store tier**, which is what removes the sharpest edges from rules
+2 and 3 above.
+
+```bash
+# Store tier — the only stateful thing you operate.
+chidori cell-store --bucket s3://acme-chidori-cells \
+  --listen 0.0.0.0:9700 --lease-secs 30 --sync-secs 2
+
+# Agent tier — every shard points at the store instead of at a bucket.
+export CHIDORI_RUN_STORE="http://store.internal:9700"
+export CHIDORI_RUN_STORE_TOKEN="<long random>"
+export CHIDORI_DURABILITY=strict
+chidori serve support.ts
+```
+
+Every run becomes its own SQLite database ("cell") on the store node,
+replicated to the bucket; object-storage compare-and-swap guarantees exactly
+one node owns a cell at a time, with no consensus service. See
+[durable storage](./durable-storage.md#self-hosted-cell-store-chidori-cell-store)
+for the protocol.
+
+What it buys a production deployment:
+
+- **Enforced single writers without Cloudflare.** The strongest durability
+  tier stops requiring a Worker deployment — reachable on-prem, in a private
+  VPC, or air-gapped apart from the bucket.
+- **Deploy overlap fails loud instead of silent.** A stale instance writing
+  to a run the new one owns is fenced with a 409 naming the live owner, and
+  stands down at its next lease renewal (see [when things fail](#when-things-fail)).
+- **Much lower write latency and S3 cost under `strict`.** Strict makes every
+  journal append synchronous; against `s3://` that is an S3 PUT round-trip
+  *per host effect*, while the cell store acknowledges on a local commit and
+  batches bucket traffic onto the `--sync-secs` cadence.
+- **One place to operate.** Sharded agent servers share one store endpoint;
+  cells shard by construction on run id, and `GET /status` reports which
+  cells a node holds, at which epoch, and whether they are replicated.
+
+The trade to make deliberately: with `s3://`, an acknowledged effect is *in
+the bucket*. With the cell store it is committed on the store node's disk and
+reaches the bucket within `--sync-secs` — a bounded loss window if that node's
+disk is destroyed, in exchange for the latency and cost win. Keep
+`--sync-secs` low, and treat the store node's disk as real infrastructure
+(the cell databases commit with `synchronous=FULL`, so process crashes and
+power loss are both safe, but the disk itself is not redundant).
+
+Two further notes for the store tier: run it behind the same TLS/firewall
+posture as the agent tier (it speaks plain HTTP and holds every journal), and
+give `CHIDORI_RUN_STORE_TOKEN` the same rotation treatment as
+`CHIDORI_API_KEY`.
 
 ## Decision 2: where the process runs
 
@@ -334,7 +397,9 @@ flowchart TB
 Durability is unchanged by sharding: every shard keeps
 `CHIDORI_DURABILITY=strict` and its own mirror prefix, so losing any one
 host loses no acknowledged work — its replacement hydrates that agent's
-runs from the mirror while the other shards keep serving.
+runs from the mirror while the other shards keep serving. (With a
+`chidori cell-store` endpoint the per-shard prefixes collapse into one
+store: cells are keyed by run id, so shards can't collide by construction.)
 
 What scaling out must **never** look like is replicas of the same agent
 behind a load balancer:
@@ -403,13 +468,18 @@ sequenceDiagram
 - **Machine loss** → replacement machine (same env) hydrates runs from the
   mirror on demand. Nothing to restore by hand — but do one drill.
 - **Deploy overlap** (old and new instance briefly both alive) → run leases
-  make the loser stand down. They are *enforced* on `sqlite` and the Durable
-  Object relay, but *advisory* (last-writer-wins) on `fs` and `s3://` — so on
-  those backends configure deploys to stop the old instance first
-  (`Recreate`, not rolling).
+  make the loser stand down. The lease is a genuine compare-and-swap on
+  `sqlite`, `chidori cell-store`, and the Durable Object relay, but
+  *advisory* (last-writer-wins) on `fs` and `s3://` — so on those two
+  backends configure deploys to stop the old instance first (`Recreate`, not
+  rolling). On the enforcing backends the loser is refused rather than
+  racing: the stale instance's next lease renewal returns the live owner and
+  it stands down on its own.
 - **Faster manual failover** → keep a second instance configured against the
-  same mirror but *stopped*; promoting it is starting it. Active–active is
-  not a supported mode — nothing routes requests to a run's owner (a
+  same mirror but *stopped*; promoting it is starting it. On an enforcing
+  backend the promoted instance simply takes the lease once the dead one's
+  expires (immediately, if the old node shut down gracefully). Active–active
+  is still not a supported mode — nothing routes requests to a run's owner (a
   documented non-goal in [durable storage](./durable-storage.md)).
 
 ## Production checklist
@@ -422,7 +492,13 @@ sequenceDiagram
 - [ ] `CHIDORI_HTTP_ALLOW_HOSTS` limited to the internal hosts agents truly
       need (never `*` in production)
 - [ ] `CHIDORI_DB_PATH` left at (or set to) a durable path — never `:memory:` in production
-- [ ] `CHIDORI_RUN_STORE` chosen; `s3://` if the machine is ephemeral
+- [ ] `CHIDORI_RUN_STORE` chosen; `s3://` if the machine is ephemeral, or a
+      `chidori cell-store` endpoint for enforced single writers on your own
+      infrastructure
+- [ ] If deploys are rolling rather than stop-first, the store backend is one
+      that enforces the lease (`sqlite`, cell store, DO relay)
+- [ ] Cell store (if used): `CHIDORI_RUN_STORE_TOKEN` set, port firewalled,
+      bucket credentials scoped to its prefix
 - [ ] `CHIDORI_DURABILITY=strict`
 - [ ] `.chidori/` backed up, or a hydration drill done against the mirror
 - [ ] Auto-restart on (`Restart=always` / platform restarts / liveness probe)

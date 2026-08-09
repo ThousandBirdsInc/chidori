@@ -1,4 +1,5 @@
 mod acp;
+mod cellstore;
 mod deploy;
 mod export;
 mod init;
@@ -499,6 +500,58 @@ enum Commands {
         no_isolate: bool,
     },
 
+    /// Serve a self-hosted durable run store — the celld model
+    /// (github.com/denoland/celld) applied to runs, as an alternative to the
+    /// Cloudflare Durable Object relay. Every run is its own SQLite database
+    /// (a "cell") on local disk, replicated to an S3-compatible bucket;
+    /// object-storage compare-and-swap ensures exactly one node owns a cell
+    /// at a time, with no membership protocol or consensus service. Idle
+    /// cells hibernate; any node sharing the bucket can restore and resume
+    /// them. Speaks the same REST protocol as the Durable Object worker, so
+    /// point CHIDORI_RUN_STORE=http://host:9700 at it and nothing else
+    /// changes. CHIDORI_RUN_STORE_TOKEN (when set) enforces bearer auth;
+    /// bucket credentials come from the same environment as
+    /// CHIDORI_RUN_STORE=s3://… (endpoint, region, AWS keys).
+    #[command(name = "cell-store")]
+    CellStore {
+        /// Address to listen on. Defaults to loopback; expose it deliberately
+        /// and put TLS in front for anything non-local.
+        #[arg(long, default_value = "127.0.0.1:9700")]
+        listen: String,
+
+        /// s3://bucket[/prefix] shared by the fleet — the source of truth for
+        /// cell state and ownership. Omit to run a single-node store with no
+        /// replication (cells live on local disk only).
+        #[arg(long)]
+        bucket: Option<String>,
+
+        /// Directory for cell databases and the node's index.
+        #[arg(long, default_value = ".chidori/cellstore")]
+        data_dir: PathBuf,
+
+        /// Stable node identity used in ownership records. Defaults to an id
+        /// generated once and persisted in the data directory, so restarts
+        /// reclaim their own cells instead of waiting out the lease.
+        #[arg(long)]
+        node_id: Option<String>,
+
+        /// Cell ownership lease TTL in seconds. Takeover of a dead node's
+        /// cells waits this long; node clocks must be sane within a fraction
+        /// of it.
+        #[arg(long, default_value_t = 30)]
+        lease_secs: u64,
+
+        /// Replication cadence in seconds: how often dirty cells snapshot to
+        /// the bucket (also the bound on what a lost machine can lose).
+        #[arg(long, default_value_t = 2)]
+        sync_secs: u64,
+
+        /// Hibernate cells idle longer than this many seconds: final
+        /// replication, published unowned, memory dropped.
+        #[arg(long, default_value_t = 300)]
+        idle_secs: u64,
+    },
+
     /// Deploy an agent to a Chidori Deploy server (like Val Town's `vt`): a
     /// local directory kept in sync with the cloud. With no subcommand, pushes
     /// the current directory as a new live version.
@@ -853,6 +906,26 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                 false,
             )
         }
+        Commands::CellStore {
+            listen,
+            bucket,
+            data_dir,
+            node_id,
+            lease_secs,
+            sync_secs,
+            idle_secs,
+        } => (
+            crate::cellstore::cmd_cell_store(
+                &listen,
+                bucket.as_deref(),
+                &data_dir,
+                node_id,
+                lease_secs,
+                sync_secs,
+                idle_secs,
+            ),
+            false,
+        ),
         Commands::Deploy(args) => (deploy::run(args), false),
     }
 }
@@ -1743,13 +1816,16 @@ fn cmd_chat(
                 chrono::Duration::minutes(10),
             ) {
                 Ok(Ok(_)) => {}
+                // As in `resume`: a dead holder's lease lapses on its own, and
+                // with a mirror configured it isn't a local file to delete.
                 Ok(Err(holder)) => anyhow::bail!(
                     "chat session {session_id} is already being driven by another process \
                      (lease holder `{}`, expires {}). Two concurrent drivers would corrupt \
-                     the journal — close the other chat, or delete {} if the holder is dead.",
+                     the journal — close the other chat, or retry after {} if the holder \
+                     is dead.",
                     holder.owner,
                     holder.expires_at,
-                    run_dir.join("lease.json").display()
+                    holder.expires_at
                 ),
                 Err(err) => {
                     eprintln!("warning: could not take the session lease: {err}");
@@ -2231,13 +2307,17 @@ fn cmd_resume(
         chrono::Duration::minutes(10),
     ) {
         Ok(Ok(_)) => {}
+        // A dead holder stops renewing, so the lease lapses at `expires` and
+        // the next attempt takes it over — hence "wait", not "delete a file":
+        // with a durable mirror configured the lease is fleet state living in
+        // the mirror, not `<run_dir>/lease.json`.
         Ok(Err(holder)) => anyhow::bail!(
             "run {run_id} is already being driven by another process (lease holder \
              `{}`, expires {}). Two concurrent drivers would corrupt the journal — \
-             wait for it to finish, or delete {} if the holder is dead.",
+             wait for it to finish, or retry after {} if the holder is dead.",
             holder.owner,
             holder.expires_at,
-            run_dir.join("lease.json").display()
+            holder.expires_at
         ),
         Err(err) => {
             eprintln!("warning: could not take the run lease: {err}");

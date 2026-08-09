@@ -18,6 +18,16 @@
  *   GET    /runs/:id/blobs/:key           → blob bytes          (404 if none)
  *   PUT    /runs/:id/blobs/:key           → store blob bytes
  *   DELETE /runs/:id/blobs/:key           → remove blob
+ *
+ * Blob PUT/DELETE honor two conditional headers, which is what makes the run
+ * lease enforced rather than advisory (see docs/durable-storage.md §Leases):
+ *
+ *   If-None-Match: *          → apply only if the key does not exist
+ *   If-Match: "<sha256 hex>"  → apply only if the stored bytes hash to this
+ *
+ * A failed precondition is 412. Evaluation happens inside the Durable Object,
+ * of which the platform runs exactly one per run id, so the check and the
+ * write cannot interleave with another writer's.
  *   GET    /registry                      → [entry, ...]        (agent names)
  *   GET    /registry/:name                → entry               (404 if none)
  *   PUT    /registry/:name                → store entry (body: entry JSON)
@@ -36,6 +46,19 @@ export interface Env {
 }
 
 const JSON_HEADERS = { "content-type": "application/json" };
+
+/**
+ * A blob's entity tag: quoted SHA-256 of its bytes. Content-derived, so the
+ * client computes the same value without the server ever handing one out
+ * (matches `blob_etag` in crates/chidori/src/runtime/store.rs).
+ */
+async function etag(bytes: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `"${hex}"`;
+}
 
 export class ChidoriRun {
   private storage: DurableObjectStorage;
@@ -138,7 +161,14 @@ export class ChidoriRun {
       }
       return new Response(rows[0].data as ArrayBuffer);
     }
-    if (request.method === "PUT") {
+    if (request.method === "PUT" || request.method === "DELETE") {
+      if (!(await this.preconditionHolds(request, key))) {
+        return new Response("precondition failed", { status: 412 });
+      }
+      if (request.method === "DELETE") {
+        sql.exec("DELETE FROM blobs WHERE key = ?", key);
+        return new Response("ok");
+      }
       const data = await request.arrayBuffer();
       sql.exec(
         `INSERT INTO blobs (key, data) VALUES (?, ?)
@@ -148,11 +178,33 @@ export class ChidoriRun {
       );
       return new Response("ok");
     }
-    if (request.method === "DELETE") {
-      sql.exec("DELETE FROM blobs WHERE key = ?", key);
-      return new Response("ok");
-    }
     return new Response("method not allowed", { status: 405 });
+  }
+
+  /**
+   * Evaluate a conditional write's precondition. Runs inside the object, so
+   * the check and the write that follows it are atomic against every other
+   * writer for this run — the compare-and-swap Chidori's lease relies on.
+   */
+  private async preconditionHolds(request: Request, key: string): Promise<boolean> {
+    const ifNoneMatch = request.headers.get("if-none-match")?.trim();
+    const ifMatch = request.headers.get("if-match")?.trim();
+    if (!ifNoneMatch && !ifMatch) {
+      return true;
+    }
+    const rows = this.storage.sql
+      .exec("SELECT data FROM blobs WHERE key = ?", key)
+      .toArray();
+    if (ifNoneMatch === "*") {
+      return rows.length === 0;
+    }
+    if (!ifMatch) {
+      return true;
+    }
+    if (rows.length === 0) {
+      return false;
+    }
+    return (await etag(rows[0].data as ArrayBuffer)) === ifMatch;
   }
 
   /** The singleton index object: run listing + detached-agent registry. */

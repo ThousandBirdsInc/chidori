@@ -186,6 +186,29 @@ impl S3BlobStore {
         }
     }
 
+    /// Create-only PUT (`If-None-Match: *`): `Ok(true)` when this call created
+    /// the object, `Ok(false)` when it already existed — 412 from S3-compatible
+    /// stores, 409 from AWS S3 while a concurrent create of the same key is in
+    /// flight. This is the object-storage compare-and-swap primitive the cell
+    /// store's ownership protocol builds on (`crate::cellstore`): exactly one
+    /// caller wins the creation of a given key. The header rides unsigned,
+    /// which SigV4 permits for non-`x-amz-*` headers.
+    pub fn put_object_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        let (url, mut headers, content_type) = self.build_signed("PUT", key, &[], Some(bytes))?;
+        headers.push(("if-none-match".to_string(), "*".to_string()));
+        let (status, body) =
+            self.relay
+                .request_full("PUT", url, Some(bytes.to_vec()), content_type, headers)?;
+        match status {
+            s if (200..300).contains(&s) => Ok(true),
+            412 | 409 => Ok(false),
+            s => anyhow::bail!(
+                "s3 conditional PUT {key} failed: HTTP {s} {}",
+                String::from_utf8_lossy(&body)
+            ),
+        }
+    }
+
     pub fn delete_object(&self, key: &str) -> Result<()> {
         let (status, body) = self.signed("DELETE", key, &[], None)?;
         // 404 tolerated: deleting an absent object is Ok, matching RunStore.
@@ -245,9 +268,8 @@ impl S3BlobStore {
         Ok((keys, common))
     }
 
-    /// The configured key prefix (empty or `…/`-terminated), so the factory
-    /// can address `runs/…` / `agents/…` keyspaces.
-    #[allow(dead_code)] // Not yet wired into a call path; staged API.
+    /// The configured key prefix (empty or `…/`-terminated), so callers (the
+    /// factory, the cell store) can address keyspaces inside the bucket.
     pub fn key_prefix(&self) -> &str {
         &self.prefix
     }
