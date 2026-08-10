@@ -743,14 +743,23 @@ fn resolve_name(name: Option<String>) -> Result<String> {
 
 /// Reject absolute paths and parent traversal in a server-provided path before
 /// writing it to disk (pull/clone).
+///
+/// Splitting on `/` alone is not enough. On Windows a backslash is also a path
+/// separator, so `..\..\evil` survives as one "segment" that neither equals
+/// `..` nor contains `/` — and `PathBuf::push` then expands it right back into
+/// traversal, letting a hostile (or compromised) deploy server write outside
+/// the output directory. Backslashes never appear in a legitimate entry (the
+/// packer normalizes them to `/` in [`walk`]), so treat them as separators here
+/// too and let the `..` check see them. Drive-relative and UNC prefixes
+/// (`C:foo`, `\\host\share`) are rejected for the same reason.
 fn sanitize_rel(rel: &str) -> Result<PathBuf> {
     let rel = rel.trim_start_matches("./");
-    if rel.is_empty() || rel.starts_with('/') {
+    if rel.is_empty() || rel.starts_with('/') || rel.starts_with('\\') {
         bail!("absolute or empty path");
     }
     let mut out = PathBuf::new();
-    for seg in rel.split('/') {
-        if seg == ".." || seg == "." || seg.is_empty() {
+    for seg in rel.split(['/', '\\']) {
+        if seg == ".." || seg == "." || seg.is_empty() || seg.contains(':') {
             bail!("path traversal");
         }
         out.push(seg);
@@ -905,10 +914,20 @@ fn http_page(msg: &str, ok: bool) -> String {
 
 /// Persist `deploy_url` + `deploy_api_key` into `~/.chidori/credentials.json`,
 /// preserving any other keys (e.g. the OpenRouter model-login token).
+///
+/// The file holds a live API key, so it is written owner-only — the directory
+/// too, since `credentials.json` is not the only secret that lands in it. This
+/// used to be a plain `fs::write`, which creates at 0666 & ~umask: the key was
+/// left world-readable for good, not merely for a window.
 fn save_credentials(server: &str, key: &str) -> Result<()> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     let dir = Path::new(&home).join(".chidori");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let path = dir.join("credentials.json");
     let mut obj = std::fs::read_to_string(&path)
         .ok()
@@ -916,8 +935,11 @@ fn save_credentials(server: &str, key: &str) -> Result<()> {
         .unwrap_or_default();
     obj.insert("deploy_url".into(), Value::String(server.to_string()));
     obj.insert("deploy_api_key".into(), Value::String(key.to_string()));
-    std::fs::write(&path, serde_json::to_string_pretty(&Value::Object(obj))?)
-        .with_context(|| format!("writing {}", path.display()))?;
+    crate::providers::openrouter::write_private(
+        &path,
+        serde_json::to_string_pretty(&Value::Object(obj))?.as_bytes(),
+    )
+    .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -951,17 +973,25 @@ fn hostname() -> String {
         .unwrap_or_else(|| "cli".to_string())
 }
 
-/// A high-entropy state token for CSRF on the loopback callback. `RandomState`
-/// is seeded by the OS, so two fresh hashers give 128 unpredictable bits.
+/// The CSRF state binding this login to its callback — drawn from the OS
+/// CSPRNG.
+///
+/// It used to be two `RandomState::new().build_hasher().finish()` values, which
+/// is not a random-number generator: that is SipHash of the empty input under
+/// the thread's hash keys, and the standard library derives each successive
+/// `RandomState` in a thread from the previous one by incrementing a counter.
+/// So the two halves were near-identical rather than independent, and the whole
+/// value rested on an implementation detail the standard library never promised
+/// and can change in any release. This token is the only thing stopping a local
+/// page from feeding `accept_callback` someone else's API key, so it gets a
+/// real CSPRNG — the same one `providers::openrouter` uses for PKCE.
 fn random_state() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let a = std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish();
-    let b = std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish();
-    format!("{a:016x}{b:016x}")
+    use base64::Engine as _;
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn urlencode(s: &str) -> String {
@@ -1343,5 +1373,43 @@ fn short_time(ts: &str) -> String {
         ts[..16].replace('T', " ")
     } else {
         ts.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_rel_keeps_ordinary_relative_paths() {
+        assert_eq!(sanitize_rel("agent.ts").unwrap(), PathBuf::from("agent.ts"));
+        assert_eq!(
+            sanitize_rel("./src/lib/agent.ts").unwrap(),
+            PathBuf::from("src/lib/agent.ts")
+        );
+    }
+
+    /// A pulled file's path comes from the deploy server, so it is untrusted
+    /// input to a local write. Every spelling of "escape the output directory"
+    /// must be refused — including the backslash forms that only bite on
+    /// Windows, where `PathBuf::push` expands them back into traversal.
+    #[test]
+    fn sanitize_rel_refuses_every_spelling_of_traversal() {
+        for hostile in [
+            "../evil.ts",
+            "src/../../evil.ts",
+            "/etc/passwd",
+            "..\\..\\evil.ts",
+            "src\\..\\..\\evil.ts",
+            "\\\\host\\share\\evil.ts",
+            "C:\\Windows\\evil.ts",
+            "C:evil.ts",
+            "",
+        ] {
+            assert!(
+                sanitize_rel(hostile).is_err(),
+                "`{hostile}` should be refused"
+            );
+        }
     }
 }

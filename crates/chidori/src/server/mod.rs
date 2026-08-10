@@ -63,7 +63,7 @@ use sessions::{
 #[cfg(test)]
 use events::{is_probe_noise_path, noise_short_circuit};
 #[cfg(test)]
-use hardening::bearer_token_matches;
+use hardening::{bearer_token_matches, carries_configured_key};
 #[cfg(test)]
 use sessions::resume::{ApproveRequest, ResumeRequest, SignalRequest};
 #[cfg(test)]

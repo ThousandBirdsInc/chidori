@@ -77,6 +77,44 @@ pub(super) fn bearer_token_matches(header_value: &str, raw_keys: &str) -> bool {
     ok
 }
 
+/// Placeholder substituted for a header value that carries the server's own
+/// API key.
+pub(super) const REDACTED_CREDENTIAL: &str = "[redacted by chidori]";
+
+/// Should this header value be withheld from agent code, because it carries a
+/// credential the *server* authenticates with?
+///
+/// The event handler hands the agent the whole request — method, path, headers,
+/// query, body — which is what makes webhook-shaped agents possible. But the
+/// request that reaches an agent has, by definition, just cleared
+/// [`auth_middleware`], so its `Authorization` header holds `CHIDORI_API_KEY`
+/// itself: the credential for every other endpoint on this server, including
+/// `/sessions`. Passing it through would hand each of those keys to agent code
+/// (which under a session policy profile may be untrusted), and an agent that
+/// merely logs its own input writes the key into the durable call log — where
+/// `GET /sessions/:id` then serves it back.
+///
+/// Scoped to values that actually contain a configured key, so a webhook's own
+/// shared secret in `Authorization` — a different value, which the agent
+/// legitimately needs to verify the sender — still arrives intact.
+pub(super) fn is_server_credential(value: &str) -> bool {
+    match std::env::var("CHIDORI_API_KEY") {
+        Ok(raw_keys) => carries_configured_key(value, &raw_keys),
+        Err(_) => false,
+    }
+}
+
+/// Whether `value` embeds any key from a comma-separated `CHIDORI_API_KEY`
+/// list. Split from the env read so both branches are unit-testable without
+/// mutating process-global environment state (same shape as
+/// `events::noise_short_circuit`).
+pub(super) fn carries_configured_key(value: &str, raw_keys: &str) -> bool {
+    raw_keys
+        .split(',')
+        .map(str::trim)
+        .any(|key| !key.is_empty() && value.contains(key))
+}
+
 /// A bind host counts as loopback when it is the literal name `localhost` or
 /// parses to a loopback IP (`127.0.0.0/8`, `::1`). Anything else — including
 /// unresolvable hostnames — is treated as network-reachable, so the

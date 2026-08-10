@@ -17,6 +17,17 @@
 //! clean base to tighten from. `fork`/`clone` are intentionally *not* denied —
 //! the engine's watchdog thread needs them and a fork that cannot `exec` gains no
 //! new code — so the `exec*` denial is what actually forecloses code execution.
+//!
+//! **A denylist has to cover the aliases, not just the obvious spelling.** A
+//! syscall filter only constrains what actually crosses the syscall boundary,
+//! and several capabilities have a second entry point that a naive list misses:
+//! `io_uring` performs socket and file operations as ring submissions rather
+//! than as `connect`/`openat` syscalls, `pidfd_getfd` imports an already-open
+//! descriptor from another process instead of creating one, the `fsopen` family
+//! is `mount` under a newer name, and `open_by_handle_at` opens a file without
+//! the path lookup Landlock reasons about. Each of those is denied alongside
+//! the spelling it aliases; adding a syscall here without its aliases buys
+//! nothing.
 
 /// What each best-effort confinement layer achieved for a worker. Layers that
 /// could not be applied (older kernel, rootless container, …) leave their flag
@@ -197,6 +208,17 @@ pub fn install_seccomp() -> Result<(), String> {
 #[allow(clippy::unnecessary_cast)]
 fn denied_syscalls() -> Vec<i64> {
     let denied: &[libc::c_long] = &[
+        // io_uring first: a ring submits *operations* (connect, sendmsg, openat,
+        // read, write) through `io_uring_enter` rather than as their own
+        // syscalls, so every other entry in this table is bypassable while a
+        // ring can be created. Denying `io_uring_setup` is what makes the rest
+        // of the denylist meaningful; `enter`/`register` are denied too so a
+        // ring inherited across a `fork` is equally useless. The worker is a
+        // blocking stdin/stdout program with no async I/O of its own, so
+        // nothing healthy ever reaches these.
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
         // Network: the worker never legitimately touches a socket — `http` is a
         // brokered effect performed by the parent.
         libc::SYS_socket,
@@ -220,17 +242,36 @@ fn denied_syscalls() -> Vec<i64> {
         // New-program execution (what actually denies "run arbitrary code").
         libc::SYS_execve,
         libc::SYS_execveat,
-        // Debugging / cross-process memory.
+        // Debugging / cross-process memory. `pidfd_getfd` belongs here: it
+        // lifts an open file descriptor straight out of another process of the
+        // same user — including the parent's already-connected sockets, which
+        // would hand the worker network egress the socket denials above are
+        // meant to foreclose.
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
-        // Namespace / mount manipulation (sandbox-escape surface).
+        libc::SYS_pidfd_open,
+        libc::SYS_pidfd_getfd,
+        // Namespace / mount manipulation (sandbox-escape surface). The `fs*` /
+        // `*_mount` / `open_tree` set is the modern mount API — it does
+        // everything `mount` does, so denying only `mount` would leave the
+        // newer spelling of the same capability open.
         libc::SYS_unshare,
         libc::SYS_setns,
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
         libc::SYS_chroot,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
+        // File handles: `open_by_handle_at` opens a file from an opaque handle
+        // with no path lookup, which is precisely the step Landlock's
+        // path-based ruleset reasons about.
+        libc::SYS_name_to_handle_at,
+        libc::SYS_open_by_handle_at,
         // Privilege changes.
         libc::SYS_setuid,
         libc::SYS_setgid,
@@ -241,13 +282,17 @@ fn denied_syscalls() -> Vec<i64> {
         libc::SYS_setfsuid,
         libc::SYS_setfsgid,
         libc::SYS_setgroups,
-        // Kernel surface / modules / power.
+        // Kernel surface / modules / power. `userfaultfd` is here because it
+        // hands userspace control over the timing of the kernel's page faults,
+        // the lever that turns a kernel memory bug into a reliable exploit.
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
+        libc::SYS_userfaultfd,
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,
         libc::SYS_kexec_load,
+        libc::SYS_kexec_file_load,
         libc::SYS_reboot,
         // Keyrings.
         libc::SYS_keyctl,
@@ -355,5 +400,37 @@ mod tests {
         .expect("filter builds");
         let program: BpfProgram = filter.try_into().expect("filter compiles");
         assert!(!program.is_empty());
+    }
+
+    /// Every denial that has a second entry point must deny that entry point
+    /// too, or the first one is decorative: a ring reaches the network without
+    /// `socket`, `pidfd_getfd` reaches it without any syscall of its own, the
+    /// `fsopen` family mounts without `mount`, and `open_by_handle_at` opens
+    /// without a path for Landlock to judge.
+    #[test]
+    // Same reason as `denied_syscalls`: `c_long as i64` is a no-op on the
+    // 64-bit targets we ship but load-bearing where `c_long` is 32-bit.
+    #[allow(clippy::unnecessary_cast)]
+    fn denylist_covers_the_aliases_of_what_it_denies() {
+        let denied = denied_syscalls();
+        for (sysno, name, aliased) in [
+            (libc::SYS_io_uring_setup, "io_uring_setup", "socket/openat"),
+            (libc::SYS_io_uring_enter, "io_uring_enter", "socket/openat"),
+            (
+                libc::SYS_io_uring_register,
+                "io_uring_register",
+                "socket/openat",
+            ),
+            (libc::SYS_pidfd_getfd, "pidfd_getfd", "socket"),
+            (libc::SYS_fsopen, "fsopen", "mount"),
+            (libc::SYS_fsmount, "fsmount", "mount"),
+            (libc::SYS_move_mount, "move_mount", "mount"),
+            (libc::SYS_open_by_handle_at, "open_by_handle_at", "openat"),
+        ] {
+            assert!(
+                denied.contains(&(sysno as i64)),
+                "`{name}` is not denied, so the `{aliased}` denial can be bypassed through it"
+            );
+        }
     }
 }

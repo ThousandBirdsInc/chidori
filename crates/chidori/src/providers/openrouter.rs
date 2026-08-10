@@ -16,7 +16,7 @@
 //! OpenRouter slugs (`anthropic/claude-sonnet-4.6`) on the way out.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
@@ -186,13 +186,37 @@ pub fn save_api_key(key: &str) -> Result<PathBuf> {
         .unwrap_or_default();
     creds.openrouter_api_key = Some(key.to_string());
     let body = serde_json::to_string_pretty(&creds)?;
-    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    write_private(&path, body.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// Write `bytes` to `path` with owner-only permissions **from the moment the
+/// file exists**.
+///
+/// `std::fs::write` creates at 0666 & ~umask — 0644 on a stock account — and a
+/// follow-up `set_permissions` closes that only after the fact. The file holds
+/// an API key, so between those two calls every local account can read it, and
+/// on a shared or multi-tenant box that window is all an attacker needs. Asking
+/// `open(2)` for 0600 up front removes the window instead of shrinking it, and
+/// truncating an *existing* file keeps its current mode, so the mode is
+/// re-asserted afterwards for a file written before this function existed.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    Ok(path)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +249,21 @@ pub async fn oauth_login() -> Result<String> {
         .await
         .context("binding a local callback listener for OAuth")?;
     let port = listener.local_addr()?.port();
-    let callback = format!("http://localhost:{port}/callback");
+    // The callback path carries a one-time secret, and only a request to that
+    // exact path is accepted as the authorization response (RFC 6749 §10.12 /
+    // RFC 8252 §8.9 — the role `state` plays in a browser redirect flow).
+    //
+    // Without it this listener takes a `code` from *anyone* who can reach
+    // loopback for the five minutes it is open. That is not a high bar: any
+    // page open in the user's browser can sweep all ~16k ephemeral ports with
+    // background fetches in seconds, and a hit means we exchange the
+    // *attacker's* authorization code and save the resulting key as the user's.
+    // Every prompt and document the agent handles from then on flows through an
+    // OpenRouter account the attacker owns and can read. PKCE does not cover
+    // this: the verifier proves nobody intercepted *our* code, not that the
+    // code we received is one we asked for.
+    let state = callback_state();
+    let callback = format!("http://localhost:{port}/callback/{state}");
 
     let auth_url = format!(
         "{OPENROUTER_AUTH_URL}?callback_url={}&code_challenge={}&code_challenge_method=S256",
@@ -255,6 +293,20 @@ pub async fn oauth_login() -> Result<String> {
                 // Not an HTTP request we understand — keep waiting.
                 continue;
             };
+            if !callback_path_matches(path, &state) {
+                // Anything that does not carry this run's one-time secret is
+                // not our redirect — a stray browser probe at best, a port
+                // sweep trying to inject someone else's `code` at worst.
+                // Answer 404 and keep waiting for the real one.
+                let body = callback_html("Sign-in failed. Return to your terminal and try again.");
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+                continue;
+            }
             let code = query_param(path, "code");
             let error = query_param(path, "error");
 
@@ -325,6 +377,35 @@ async fn exchange_code_for_key(code: &str, verifier: &str) -> Result<String> {
         bail!("OpenRouter returned an empty API key");
     }
     Ok(parsed.key)
+}
+
+/// A one-time, unguessable path segment for this login's callback URL — the
+/// CSRF token of the redirect flow, carried in the path rather than a `state`
+/// query parameter so it survives the provider appending `?code=…` to whatever
+/// `callback_url` we hand it.
+fn callback_state() -> String {
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Does this request target the callback path minted for this login? Compared
+/// in constant time: the secret is what stands between a port sweep and an
+/// injected authorization code, so it gets the same treatment as any other
+/// bearer secret in the tree.
+fn callback_path_matches(target: &str, state: &str) -> bool {
+    use subtle::ConstantTimeEq as _;
+
+    let path = target.split_once('?').map(|(p, _)| p).unwrap_or(target);
+    let Some(presented) = path.strip_prefix("/callback/") else {
+        return false;
+    };
+    // Trailing slashes are the one shape a browser or provider may normalize
+    // into the path; anything else must match the secret exactly.
+    let presented = presented.trim_end_matches('/');
+    presented.as_bytes().ct_eq(state.as_bytes()).into()
 }
 
 /// Generate a PKCE `(code_verifier, code_challenge)` pair. The verifier is
@@ -527,6 +608,43 @@ mod tests {
         // Unpadded URL-safe base64 has no '=', '+', or '/'.
         assert!(!challenge.contains(['=', '+', '/']));
         assert!(!verifier.contains(['=', '+', '/']));
+    }
+
+    #[test]
+    fn callback_path_accepts_only_this_logins_secret() {
+        let state = callback_state();
+        assert!(callback_path_matches(
+            &format!("/callback/{state}?code=abc123"),
+            &state
+        ));
+        assert!(callback_path_matches(
+            &format!("/callback/{state}/"),
+            &state
+        ));
+
+        // The shapes a port-sweeping page would try: the bare path it can guess
+        // from the docs, a wrong secret, a prefix of the right one, and the
+        // secret pushed into the query string where it never appears.
+        assert!(!callback_path_matches("/callback?code=attacker", &state));
+        assert!(!callback_path_matches(
+            "/callback/wrong?code=attacker",
+            &state
+        ));
+        assert!(!callback_path_matches(
+            &format!("/callback/{}?code=attacker", &state[..8]),
+            &state
+        ));
+        assert!(!callback_path_matches(
+            &format!("/callback?state={state}&code=attacker"),
+            &state
+        ));
+        assert!(!callback_path_matches("/", &state));
+    }
+
+    #[test]
+    fn callback_state_is_fresh_per_login() {
+        assert_ne!(callback_state(), callback_state());
+        assert!(callback_state().len() >= 32);
     }
 
     #[test]

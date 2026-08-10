@@ -252,11 +252,32 @@ export class ChidoriRun {
   }
 }
 
+/**
+ * Compare two strings without leaking where they first differ.
+ *
+ * `===` on strings short-circuits at the first differing byte, which turns a
+ * token check into an oracle an attacker can walk one byte at a time. The Rust
+ * side of this same protocol uses `subtle::ConstantTimeEq` for exactly this
+ * reason (see `bearer_token_matches` in crates/chidori/src/server/hardening.rs);
+ * this is that check in the Worker. Every byte of the longer string is examined
+ * regardless of the outcome — a length difference is all that leaks.
+ */
+function constantTimeEqual(a: string, b: string): boolean {
+  const encoder = new TextEncoder();
+  const left = encoder.encode(a);
+  const right = encoder.encode(b);
+  let diff = left.length ^ right.length;
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    diff |= (left[i] ?? 0) ^ (right[i] ?? 0);
+  }
+  return diff === 0;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (env.CHIDORI_RUN_STORE_TOKEN) {
       const auth = request.headers.get("authorization") ?? "";
-      if (auth !== `Bearer ${env.CHIDORI_RUN_STORE_TOKEN}`) {
+      if (!constantTimeEqual(auth, `Bearer ${env.CHIDORI_RUN_STORE_TOKEN}`)) {
         return new Response("unauthorized", { status: 401 });
       }
     }

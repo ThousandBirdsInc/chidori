@@ -314,14 +314,28 @@ remain legal:
   access while leaving reads for the C runtime, closing the `openat`-write
   surface seccomp leaves open and sparing inherited fds like a redirected stderr.
 - **seccomp-bpf denylist** (via `seccompiler`, safe Rust) — `NO_NEW_PRIVS` +
-  `KILL_PROCESS` on a curated denylist: the whole socket family, `exec*`,
-  `ptrace`/`process_vm_*`, namespace/mount, privilege-change,
-  kernel-module/`bpf`/`perf_event_open`, and keyring syscalls. `fork`/`clone` are
-  *not* denied (the watchdog thread needs them, and a fork that cannot `exec`
-  gains no code) — the `exec*` denial is what forecloses code execution. It is a
-  **denylist, not an allowlist**, deliberately: it cannot false-positive-kill the
-  engine and ships real confinement today; the near-empty allowlist remains the
-  end goal.
+  `KILL_PROCESS` on a curated denylist: `io_uring_*`, the whole socket family,
+  `exec*`, `ptrace`/`process_vm_*`/`pidfd_getfd`, namespace/mount (including the
+  `fsopen`/`fsmount`/`move_mount`/`open_tree` modern mount API),
+  `name_to_handle_at`/`open_by_handle_at`, privilege-change,
+  kernel-module/`bpf`/`perf_event_open`/`userfaultfd`, and keyring syscalls.
+  `fork`/`clone` are *not* denied (the watchdog thread needs them, and a fork
+  that cannot `exec` gains no code) — the `exec*` denial is what forecloses code
+  execution. It is a **denylist, not an allowlist**, deliberately: it cannot
+  false-positive-kill the engine and ships real confinement today; the
+  near-empty allowlist remains the end goal.
+
+  A denylist only holds if it covers each capability's *aliases*, not just its
+  obvious spelling — the reason several of the entries above look redundant.
+  `io_uring` is the sharpest case: a ring performs connects, sends, and file
+  opens as submission-queue entries rather than as syscalls, so a filter that
+  denies `socket` and `connect` while permitting `io_uring_setup` denies
+  nothing. `pidfd_getfd` reaches the network without any socket syscall at all,
+  by lifting an already-connected descriptor out of the parent; the `fsopen`
+  family is `mount` renamed; and `open_by_handle_at` opens a file with no path
+  lookup for Landlock's path-based ruleset to judge. Adding a syscall here
+  without its aliases buys nothing —
+  `sandbox::tests::denylist_covers_the_aliases_of_what_it_denies` pins the pairs.
 
 **macOS** (`apply_macos`):
 

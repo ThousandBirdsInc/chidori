@@ -10,6 +10,13 @@
 //! host matches the secret's allowlist. A token sent to a non-allowlisted host
 //! fails the request rather than leaking the value.
 //!
+//! That allowlist is checked once, against the host of the URL the guest named,
+//! so a request that ends up carrying a real secret does not follow redirects
+//! (`host_core::http_client_no_redirect`) — otherwise the value would travel to
+//! whatever host the first hop points at, which no allowlist ever authorized.
+//! The guest receives the 3xx and may re-issue against the new location, which
+//! puts that host through the same check.
+//!
 //! `CHIDORI_SECRET_ENV` shape:
 //! `{ "<token>": { "key": "OPENAI_API_KEY", "value": "sk-...",
 //!                 "allowedHosts": ["api.openai.com", "*.openai.com"],
