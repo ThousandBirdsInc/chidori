@@ -1179,6 +1179,7 @@ fn cmd_demo() -> Result<()> {
         println!("or set one of:");
         println!("  export ANTHROPIC_API_KEY=sk-ant-...");
         println!("  export OPENAI_API_KEY=sk-...");
+        println!("  export ORCAROUTER_API_KEY=sk-orca-...   # OrcaRouter routing gateway");
         println!("  # any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, LiteLLM...):");
         println!("  export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com");
         println!("  export CHIDORI_OPENAI_COMPAT_KEY=sk-...");
@@ -1266,6 +1267,7 @@ fn confirm_start_server(port: u16) -> Result<bool> {
 fn has_llm_provider() -> bool {
     std::env::var_os("ANTHROPIC_API_KEY").is_some()
         || std::env::var_os("OPENAI_API_KEY").is_some()
+        || std::env::var_os("ORCAROUTER_API_KEY").is_some()
         || std::env::var_os("CHIDORI_OPENAI_COMPAT_URL").is_some()
         || std::env::var_os("LITELLM_API_URL").is_some()
         || providers::openrouter::saved_api_key().is_some()
@@ -1313,7 +1315,7 @@ fn ensure_llm_provider_interactive() -> bool {
     println!();
     println!(
         "No LLM provider key found (ANTHROPIC_API_KEY / OPENAI_API_KEY / \
-         CHIDORI_OPENAI_COMPAT_URL)."
+         ORCAROUTER_API_KEY / CHIDORI_OPENAI_COMPAT_URL)."
     );
     println!("You can sign in with OpenRouter to try this out — no API key setup needed.");
     if !providers::openrouter::confirm_login() {

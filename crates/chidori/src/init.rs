@@ -52,9 +52,9 @@ Or call it with a fixed list of messages:
     chidori run agent.ts --input '{"messages": ["Hi, who are you?"]}'
 
 Every turn is a durable host call, so replaying the whole conversation costs
-zero tokens. Set a provider key first (e.g. `ANTHROPIC_API_KEY` or
-`OPENAI_API_KEY`) — or just run `chidori model-login` to sign in with OpenRouter and
-skip the env var entirely.
+zero tokens. Set a provider key first (e.g. `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, or `ORCAROUTER_API_KEY`) — or just run `chidori model-login`
+to sign in with OpenRouter and skip the env var entirely.
 "#;
 
 const WORKER_README: &str = r#"# Chidori worker agent
@@ -75,9 +75,9 @@ terminal (the ask-by-default policy for running unfamiliar code). Add
 where gated effects fail closed.
 
 Add your own tools with more `defineTool({...})` handles and register them in
-the agent's `toolbox` map. Set a provider key first (e.g. `ANTHROPIC_API_KEY`
-or `OPENAI_API_KEY`) — or just run `chidori model-login` to sign in with
-OpenRouter and skip the env var entirely.
+the agent's `toolbox` map. Set a provider key first (e.g. `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, or `ORCAROUTER_API_KEY`) — or just run `chidori model-login`
+to sign in with OpenRouter and skip the env var entirely.
 "#;
 
 /// The docs-chat agent: an offline-friendly RAG-lite assistant that answers
@@ -149,6 +149,7 @@ Sign in once with OpenRouter (opens your browser — no API key to manage):
 …or set a provider key instead:
 
     export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY=...
+    # export ORCAROUTER_API_KEY=sk-orca-...  # or the OrcaRouter routing gateway
 
 Then chat:
 

@@ -109,7 +109,8 @@ pub fn to_openrouter_slug(model: &str) -> String {
 
 /// Rewrite a trailing `-<digits>-<digits>` version segment with a dot:
 /// `claude-sonnet-4-6` → `claude-sonnet-4.6`. Leaves anything else unchanged.
-fn hyphen_version_to_dot(s: &str) -> String {
+/// Shared with [`super::orcarouter`], whose catalog uses the same dot format.
+pub(crate) fn hyphen_version_to_dot(s: &str) -> String {
     let segs: Vec<&str> = s.split('-').collect();
     let n = segs.len();
     if n >= 2

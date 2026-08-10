@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod openai;
 pub mod openrouter;
+pub mod orcarouter;
 pub mod rate_limit;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -368,6 +369,23 @@ impl ProviderRegistry {
             registry.register(Box::new(p));
         }
 
+        // OrcaRouter is a named OpenAI-compatible routing gateway
+        // (<https://www.orcarouter.ai>) — one endpoint in front of Anthropic,
+        // OpenAI, Google, DeepSeek, and more, plus smart routing. An explicit
+        // `ORCAROUTER_API_KEY` registers it ahead of the OpenRouter fallback
+        // (so it wins whenever both are configured); like OpenRouter it
+        // matches every model and only handles requests no explicit provider
+        // above claimed. See [`orcarouter`] for the model-id translation.
+        if let Ok(api_key) = std::env::var(orcarouter::ORCAROUTER_API_KEY_ENV) {
+            if !api_key.trim().is_empty() {
+                let mut p = orcarouter::OrcaRouterProvider::new(api_key);
+                if let Some(rpm) = rpm_env("CHIDORI_ORCAROUTER_RPM") {
+                    p = p.with_rate_limit(rpm);
+                }
+                registry.register(Box::new(p));
+            }
+        }
+
         // OpenRouter is the zero-config fallback: an `OPENROUTER_API_KEY`, or a
         // key saved by a prior `chidori model-login` / demo OAuth sign-in. Registered
         // last and matching every model, so it only handles requests no
@@ -391,7 +409,7 @@ impl ProviderRegistry {
             }
         }
         bail!(
-            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, point CHIDORI_OPENAI_COMPAT_URL + CHIDORI_OPENAI_COMPAT_KEY at any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, ...), or run `chidori model-login` to sign in with OpenRouter.",
+            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, point CHIDORI_OPENAI_COMPAT_URL + CHIDORI_OPENAI_COMPAT_KEY at any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, ...), set ORCAROUTER_API_KEY for OrcaRouter, or run `chidori model-login` to sign in with OpenRouter.",
             request.model
         );
     }
@@ -409,7 +427,7 @@ impl ProviderRegistry {
             }
         }
         bail!(
-            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, point CHIDORI_OPENAI_COMPAT_URL + CHIDORI_OPENAI_COMPAT_KEY at any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, ...), or run `chidori model-login` to sign in with OpenRouter.",
+            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, point CHIDORI_OPENAI_COMPAT_URL + CHIDORI_OPENAI_COMPAT_KEY at any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, ...), set ORCAROUTER_API_KEY for OrcaRouter, or run `chidori model-login` to sign in with OpenRouter.",
             request.model
         );
     }
