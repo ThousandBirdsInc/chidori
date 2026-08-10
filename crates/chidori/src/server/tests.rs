@@ -98,6 +98,30 @@ fn bearer_token_matches_rotating_key_list() {
     assert!(!bearer_token_matches("Bearer ", ","));
 }
 
+/// A request that reaches the event handler has already presented
+/// `CHIDORI_API_KEY` to the auth middleware, so its `Authorization` header holds
+/// the credential for every other endpoint on this server. That value must not
+/// be handed to agent code (which a session policy profile may treat as
+/// untrusted) or journaled where `GET /sessions/:id` serves it back.
+#[test]
+fn event_headers_withhold_the_servers_own_api_key() {
+    assert!(carries_configured_key("Bearer sekrit", "sekrit"));
+    assert!(carries_configured_key("sekrit", "sekrit"));
+    // Any header carrying it, not just Authorization.
+    assert!(carries_configured_key("token=sekrit", "sekrit"));
+    // During key rotation both the new and the retired key are still live
+    // credentials, so both are withheld.
+    assert!(carries_configured_key("Bearer old-key", "new-key,old-key"));
+
+    // A webhook's own shared secret is a different value and must reach the
+    // agent intact — verifying the sender is what it is for.
+    assert!(!carries_configured_key("Bearer github-hmac", "sekrit"));
+    assert!(!carries_configured_key("application/json", "sekrit"));
+    // An empty or whitespace-only configured key never matches everything.
+    assert!(!carries_configured_key("Bearer anything", ""));
+    assert!(!carries_configured_key("Bearer anything", " , "));
+}
+
 #[test]
 fn loopback_host_classification() {
     assert!(is_loopback_host("127.0.0.1"));

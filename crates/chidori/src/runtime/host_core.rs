@@ -1452,6 +1452,40 @@ fn http_client() -> Result<reqwest::Client> {
     Ok(CLIENT.get_or_init(|| built).clone())
 }
 
+/// The client used for a request that carries a **real secret value**
+/// substituted by the broker: identical to [`http_client`] except that it does
+/// not follow redirects.
+///
+/// `secret_env` locks each secret to an allowlist of hosts, and
+/// `execute_http_with_secrets` enforces that against the host of the URL the
+/// guest named — "a token sent to a non-allowlisted host fails the request
+/// rather than leaking the value". Following a redirect silently voids that
+/// promise: the audience was checked once, against the first hop, and the
+/// request then travels to a host nobody authorized. reqwest strips
+/// `Authorization` and `Cookie` across origins, but a secret substituted into
+/// any other header — `x-api-key`, the spelling Anthropic and most vendor APIs
+/// use — rides along to wherever the first host points, so one open redirect on
+/// an allowlisted host is enough to hand the credential away.
+///
+/// Not following redirects keeps the check and the destination the same thing.
+/// The guest still receives the 3xx (status, headers, body) and can re-issue the
+/// request against the new location, which re-runs the audience check for that
+/// host — the outcome the allowlist is there to decide.
+fn http_client_no_redirect() -> Result<reqwest::Client> {
+    use std::sync::OnceLock;
+
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let built = reqwest::Client::builder()
+        .gzip(true)
+        .dns_resolver(crate::runtime::ssrf::dns_resolver())
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    Ok(CLIENT.get_or_init(|| built).clone())
+}
+
 /// Rewrite `url` to the per-agent Mock Gateway when its host is listed in the
 /// `CHIDORI_INTEGRATION_BASE_URLS` env map (`{host: "http://127.0.0.1:port/__mock/<id>"}`),
 /// preserving path and query. Returns `None` (no rewrite) when the env var is
@@ -1668,6 +1702,12 @@ fn execute_http_with_secrets(
     // token form — and only for hosts the secret's allowlist permits. The
     // substitution happens on the local copies above, so recorded args,
     // traces, and anything the guest can observe keep the token form.
+    //
+    // `carries_secret` records whether substitution actually put a real value on
+    // this request. It selects the no-redirect client below, so the host the
+    // audience was checked against stays the host the secret is sent to — see
+    // `http_client_no_redirect`.
+    let mut carries_secret = false;
     if !secrets.is_empty() {
         let host = url::Url::parse(&url)
             .ok()
@@ -1675,6 +1715,7 @@ fn execute_http_with_secrets(
         match host {
             Some(host) => {
                 let deny = |err: String| anyhow::anyhow!("http secret substitution: {err}");
+                let before = (url.clone(), headers.clone(), params.clone(), body.clone());
                 url = secrets.substitute_str(&url, &host).map_err(deny)?;
                 if let Some(map) = headers.as_mut() {
                     for (_, value) in map.iter_mut() {
@@ -1689,6 +1730,8 @@ fn execute_http_with_secrets(
                 if let Some(value) = body.as_mut() {
                     secrets.substitute_value(value, &host).map_err(deny)?;
                 }
+                carries_secret =
+                    before != (url.clone(), headers.clone(), params.clone(), body.clone());
             }
             None => {
                 // Unparseable URL: only an error if the request references a
@@ -1718,7 +1761,11 @@ fn execute_http_with_secrets(
         .is_some_and(|map| map.keys().any(|key| key.eq_ignore_ascii_case("user-agent")));
 
     tokio_rt.block_on(async move {
-        let client = http_client()?;
+        let client = if carries_secret {
+            http_client_no_redirect()?
+        } else {
+            http_client()?
+        };
         let request_method =
             reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         let mut req = client.request(request_method, &url);

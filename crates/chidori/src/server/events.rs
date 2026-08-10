@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use crate::storage::{SessionStatus, StoredSession};
 
 use super::engine::build_engine;
-use super::hardening::acquire_run_slot;
+use super::hardening::{acquire_run_slot, is_server_credential, REDACTED_CREDENTIAL};
 use super::sessions::{agent_error_string, apply_run_outcome, arm_signal_timeout};
 use super::{session_view, store_or_500, AppState};
 
@@ -79,9 +79,17 @@ pub(super) async fn handle_event(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    // Headers go to the agent verbatim — except any that carry the server's own
+    // API key, which this request necessarily presented to get past the auth
+    // middleware. See `hardening::is_server_credential`.
     let mut header_map = serde_json::Map::new();
     for (key, value) in headers.iter() {
         if let Ok(v) = value.to_str() {
+            let v = if is_server_credential(v) {
+                REDACTED_CREDENTIAL
+            } else {
+                v
+            };
             header_map.insert(key.as_str().to_string(), Value::String(v.to_string()));
         }
     }
