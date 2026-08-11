@@ -34,7 +34,7 @@ import {
 } from './brain';
 import { makeTools } from './tools';
 import { ToolCard, FormResponseBubble } from './cards';
-import { formResponseMessage, pairFormResponses, type FormValues } from './form-dsl';
+import { formResponseMessage, pairFormResponses, type FormData } from './form-schema';
 import {
   type BranchStore,
   countTurns,
@@ -491,7 +491,7 @@ export function PlaygroundClient() {
    * the runtime never knows a form was involved.
    */
   const submitForm = useCallback(
-    (id: string, values: FormValues) => {
+    (id: string, values: FormData) => {
       send(formResponseMessage(id, values));
     },
     [send],
@@ -1140,9 +1140,9 @@ export function PlaygroundClient() {
             model&apos;s context, and exposed as the <code>search_docs</code> tool.
           </li>
           <li>
-            Inline forms are pure host-side generative UI: the <code>form</code> tool takes a tiny
-            line-based DSL, its parsed result is journaled (so replays repaint the form), and
-            submitting sends <code>/form &lt;id&gt; {'{…}'}</code> through the same{' '}
+            Inline forms are pure host-side generative UI: the <code>form</code> tool takes a JSON
+            Schema, the journaled result is rendered by react-jsonschema-form (so replays repaint
+            the form), and submitting sends <code>/form &lt;id&gt; {'{…}'}</code> through the same{' '}
             <code>chidori.input()</code> as any message — the runtime itself knows nothing about
             forms, and rewinding past a submission makes the form fillable again.
           </li>

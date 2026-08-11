@@ -5,9 +5,17 @@
  * card driven by the (journaled) tool args + result, so replays repaint the
  * exact same UI with zero live calls.
  */
-import { type FormEvent, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
+import dynamic from 'next/dynamic';
 import type { DocHit, Json } from './brain';
-import { asFormSpec, type FormField, type FormSpec, type FormValues } from './form-dsl';
+import { asFormSpec, formRows, formTitle, type FormData, type FormSpec } from './form-schema';
+
+// react-jsonschema-form + ajv are a heavy chunk; load them only when a chat
+// actually renders a form card.
+const SchemaForm = dynamic(() => import('./schema-form').then((m) => m.SchemaForm), {
+  ssr: false,
+  loading: () => <p className="mt-2 text-xs text-fd-muted-foreground">Loading form…</p>,
+});
 
 const BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
 
@@ -20,10 +28,10 @@ const asObj = (v: Json | undefined): Record<string, Json> =>
 /** How a live FormCard talks back to the page hosting the chat. */
 export interface FormCardHooks {
   /** The journaled submission that answered this form, if any. */
-  answered: FormValues | null;
+  answered: FormData | null;
   disabled: boolean;
   /** Sends the values through the ordinary chat-input path. */
-  respond: (id: string, values: FormValues) => void;
+  respond: (id: string, values: FormData) => void;
 }
 
 export function ToolCard({
@@ -304,52 +312,32 @@ function SourceUpdateCard({
   );
 }
 
-function initialFormValues(spec: FormSpec): FormValues {
-  const values: FormValues = {};
-  for (const f of spec.fields) {
-    if (f.kind === 'check') values[f.name] = f.default === true;
-    else if (f.default !== undefined) values[f.name] = f.default as string | number;
-    else if (f.kind === 'range') values[f.name] = f.min ?? 0;
-    else values[f.name] = '';
-  }
-  return values;
-}
-
-function displayFormValue(f: FormField, v: FormValues[string] | undefined): string {
-  if (v === undefined || v === '') return '—';
-  if (f.kind === 'check') return v === true ? 'yes' : 'no';
-  return String(v);
-}
-
-const formInput =
-  'w-full rounded-lg border border-fd-border bg-fd-background px-2.5 py-1.5 text-sm outline-none focus:ring-2 focus:ring-fd-primary/40 disabled:opacity-50';
-
 /**
- * A live form in the feed, rendered from the journaled `form` tool result.
+ * A live form in the feed, rendered by react-jsonschema-form from the
+ * journaled `form` tool result (a JSON Schema + optional uiSchema).
  * Submitting sends `/form <id> {...}` through the normal chat-input path, so
  * the answers reach the agent as one journaled `chidori.input()`. Once a
  * later feed event answers this form (hooks.answered), the card collapses to
  * a read-only summary — which is also what replays and restores show.
  */
 function FormCard({ spec, hooks }: { spec: FormSpec; hooks?: FormCardHooks }) {
-  const [values, setValues] = useState<FormValues>(() => initialFormValues(spec));
   const [sent, setSent] = useState(false);
-  const [problem, setProblem] = useState<string | null>(null);
   const answered = hooks?.answered ?? null;
   // A rewind can un-answer a form; make it fillable again.
   useEffect(() => {
     if (!answered) setSent(false);
   }, [answered]);
+  const title = formTitle(spec) ?? spec.id;
 
   if (answered) {
     return (
       <div className={card}>
-        <CardTitle name="form" extra={`${spec.title ?? spec.id} · answered`} />
+        <CardTitle name="form" extra={`${title} · answered`} />
         <dl className="mt-2 space-y-1 text-sm">
-          {spec.fields.map((f) => (
-            <div key={f.name} className="flex justify-between gap-3">
-              <dt className="text-fd-muted-foreground">{f.label}</dt>
-              <dd className="text-right font-medium">{displayFormValue(f, answered[f.name])}</dd>
+          {formRows(spec, answered).map(([label, value]) => (
+            <div key={label} className="flex justify-between gap-3">
+              <dt className="text-fd-muted-foreground">{label}</dt>
+              <dd className="text-right font-medium">{value}</dd>
             </div>
           ))}
         </dl>
@@ -358,206 +346,22 @@ function FormCard({ spec, hooks }: { spec: FormSpec; hooks?: FormCardHooks }) {
   }
 
   const locked = sent || !hooks || hooks.disabled;
-  const set = (name: string, v: string | number | boolean) =>
-    setValues((prev) => ({ ...prev, [name]: v }));
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
-    if (locked) return;
-    const missing = spec.fields.filter(
-      (f) => f.required && (values[f.name] === '' || values[f.name] === false),
-    );
-    if (missing.length) {
-      setProblem(`Required: ${missing.map((f) => f.label).join(', ')}`);
-      return;
-    }
-    const out: FormValues = {};
-    for (const f of spec.fields) {
-      const v = values[f.name];
-      if (v === '' || v === undefined) continue;
-      if (f.kind === 'number' || f.kind === 'range') {
-        const num = Number(v);
-        if (Number.isFinite(num)) out[f.name] = num;
-      } else out[f.name] = v;
-    }
-    setProblem(null);
-    setSent(true);
-    hooks?.respond(spec.id, out);
-  };
-
   return (
-    <form className={card} onSubmit={submit}>
-      <CardTitle name="form" extra={spec.title ?? spec.id} />
-      <div className="mt-2.5 space-y-2.5">
-        {spec.fields.map((f) => (
-          <FormFieldControl
-            key={f.name}
-            f={f}
-            id={`form-${spec.id}-${f.name}`}
-            value={values[f.name]}
-            locked={locked}
-            set={set}
-          />
-        ))}
-      </div>
-      {problem && <p className="mt-2 text-xs text-red-600 dark:text-red-400">{problem}</p>}
-      <div className="mt-3 flex items-center gap-2.5">
-        <button
-          type="submit"
-          disabled={locked}
-          className="h-8 rounded-lg bg-fd-primary px-3.5 text-xs font-medium text-fd-primary-foreground transition-opacity hover:opacity-85 disabled:pointer-events-none disabled:opacity-40"
-        >
-          {spec.submit}
-        </button>
-        <span className="text-[11px] text-fd-muted-foreground">
-          {sent ? 'sending…' : 'answers go back to the agent as one journaled input'}
-        </span>
-      </div>
-    </form>
+    <div className={card}>
+      <CardTitle name="form" extra={title} />
+      <SchemaForm
+        spec={spec}
+        disabled={locked}
+        onSubmit={(values) => {
+          setSent(true);
+          hooks?.respond(spec.id, values);
+        }}
+      />
+      <p className="mt-2 text-[11px] text-fd-muted-foreground">
+        {sent ? 'sending…' : 'answers go back to the agent as one journaled input'}
+      </p>
+    </div>
   );
-}
-
-function FormFieldControl({
-  f,
-  id,
-  value,
-  locked,
-  set,
-}: {
-  f: FormField;
-  id: string;
-  value: FormValues[string] | undefined;
-  locked: boolean;
-  set: (name: string, v: string | number | boolean) => void;
-}) {
-  const label = (
-    <label htmlFor={id} className="mb-1 block text-xs font-medium">
-      {f.label}
-      {f.required && <span className="text-fd-muted-foreground"> *</span>}
-    </label>
-  );
-  switch (f.kind) {
-    case 'check':
-      return (
-        <label className="flex cursor-pointer items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={value === true}
-            disabled={locked}
-            onChange={(e) => set(f.name, e.target.checked)}
-            className="size-4 accent-(--color-fd-primary)"
-          />
-          {f.label}
-          {f.required && <span className="text-fd-muted-foreground"> *</span>}
-        </label>
-      );
-    case 'textarea':
-      return (
-        <div>
-          {label}
-          <textarea
-            id={id}
-            rows={3}
-            value={String(value ?? '')}
-            placeholder={f.placeholder}
-            disabled={locked}
-            onChange={(e) => set(f.name, e.target.value)}
-            className={formInput}
-          />
-        </div>
-      );
-    case 'select':
-      return (
-        <div>
-          {label}
-          <select
-            id={id}
-            value={String(value ?? '')}
-            disabled={locked}
-            onChange={(e) => set(f.name, e.target.value)}
-            className={formInput}
-          >
-            {value === '' && <option value="">choose…</option>}
-            {(f.options ?? []).map((o) => (
-              <option key={o} value={o}>
-                {o}
-              </option>
-            ))}
-          </select>
-        </div>
-      );
-    case 'radio':
-      return (
-        <fieldset>
-          <legend className="mb-1 text-xs font-medium">
-            {f.label}
-            {f.required && <span className="text-fd-muted-foreground"> *</span>}
-          </legend>
-          <div className="flex flex-wrap gap-1.5">
-            {(f.options ?? []).map((o) => (
-              <label
-                key={o}
-                className={`cursor-pointer rounded-lg border px-2.5 py-1 text-xs transition-colors ${
-                  value === o
-                    ? 'border-fd-primary bg-fd-primary/10 font-medium'
-                    : 'border-fd-border hover:bg-fd-accent'
-                }`}
-              >
-                <input
-                  type="radio"
-                  name={id}
-                  value={o}
-                  checked={value === o}
-                  disabled={locked}
-                  onChange={() => set(f.name, o)}
-                  className="sr-only"
-                />
-                {o}
-              </label>
-            ))}
-          </div>
-        </fieldset>
-      );
-    case 'range':
-      return (
-        <div>
-          {label}
-          <div className="flex items-center gap-2.5">
-            <input
-              id={id}
-              type="range"
-              min={f.min}
-              max={f.max}
-              step={f.step}
-              value={Number(value ?? f.min ?? 0)}
-              disabled={locked}
-              onChange={(e) => set(f.name, Number(e.target.value))}
-              className="min-w-0 flex-1 accent-(--color-fd-primary)"
-            />
-            <span className="w-8 text-right font-mono text-xs tabular-nums">
-              {String(value ?? f.min ?? 0)}
-            </span>
-          </div>
-        </div>
-      );
-    default:
-      return (
-        <div>
-          {label}
-          <input
-            id={id}
-            type={f.kind === 'number' ? 'number' : f.kind === 'date' ? 'date' : 'text'}
-            value={String(value ?? '')}
-            placeholder={f.placeholder}
-            min={f.min}
-            max={f.max}
-            step={f.step}
-            disabled={locked}
-            onChange={(e) => set(f.name, e.target.value)}
-            className={formInput}
-          />
-        </div>
-      );
-  }
 }
 
 /**
@@ -570,23 +374,18 @@ export function FormResponseBubble({
   values,
 }: {
   spec: FormSpec | null;
-  values: FormValues;
+  values: FormData;
 }) {
-  const rows: [string, string][] = spec
-    ? spec.fields
-        .filter((f) => f.name in values)
-        .map((f) => [f.label, displayFormValue(f, values[f.name])])
-    : Object.entries(values).map(([k, v]) => [k, String(v)]);
   return (
     <div className="max-w-[85%] rounded-2xl rounded-br-md bg-fd-primary px-3.5 py-2.5 text-sm text-fd-primary-foreground">
       <p className="text-[11px] font-medium uppercase tracking-wider opacity-80">
-        📋 {spec?.title ?? spec?.id ?? 'form answers'}
+        📋 {(spec && formTitle(spec)) ?? spec?.id ?? 'form answers'}
       </p>
       <dl className="mt-1 space-y-0.5">
-        {rows.map(([k, v]) => (
-          <div key={k} className="flex justify-between gap-4">
-            <dt className="opacity-80">{k}</dt>
-            <dd className="text-right font-medium">{v}</dd>
+        {formRows(spec, values).map(([label, value]) => (
+          <div key={label} className="flex justify-between gap-4">
+            <dt className="opacity-80">{label}</dt>
+            <dd className="text-right font-medium">{value}</dd>
           </div>
         ))}
       </dl>
