@@ -23,6 +23,137 @@
 }
 
 /*
+ * Inline form cards: react-jsonschema-form emits bootstrap-flavored markup
+ * (form-group / control-label / form-control / btn); these rules restyle it
+ * with the site's tokens, scoped to the chat's form cards.
+ */
+.playground-form .form-group {
+  margin-bottom: 0.625rem;
+}
+.playground-form fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+/* The card's own title row shows the schema title; hide RJSF's copy. */
+.playground-form legend#root__title {
+  display: none;
+}
+.playground-form legend,
+.playground-form label,
+.playground-form .control-label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  margin-bottom: 0.25rem;
+  padding: 0;
+}
+.playground-form .required {
+  color: var(--color-fd-muted-foreground);
+  margin-left: 0.125rem;
+}
+.playground-form .form-control,
+.playground-form select,
+.playground-form textarea {
+  width: 100%;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.5rem;
+  background: var(--color-fd-background);
+  color: var(--color-fd-foreground);
+  padding: 0.375rem 0.625rem;
+  font-size: 0.875rem;
+  outline: none;
+}
+.playground-form .form-control:focus,
+.playground-form select:focus,
+.playground-form textarea:focus {
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--color-fd-primary) 40%, transparent);
+}
+.playground-form .form-control:disabled,
+.playground-form select:disabled,
+.playground-form textarea:disabled {
+  opacity: 0.5;
+}
+.playground-form input[type='checkbox'],
+.playground-form input[type='radio'] {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--color-fd-primary);
+}
+.playground-form .checkbox label,
+.playground-form .radio label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 400;
+  margin: 0;
+  cursor: pointer;
+}
+.playground-form .checkbox span,
+.playground-form .radio span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.playground-form .field-radio-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem 0.875rem;
+}
+.playground-form .field-range-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+}
+.playground-form input[type='range'] {
+  min-width: 0;
+  flex: 1;
+  accent-color: var(--color-fd-primary);
+}
+.playground-form .range-view {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+.playground-form .field-description,
+.playground-form .help-block {
+  font-size: 0.6875rem;
+  color: var(--color-fd-muted-foreground);
+  margin: 0.125rem 0 0.25rem;
+}
+.playground-form .error-detail {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+}
+.playground-form .text-danger {
+  font-size: 0.6875rem;
+  color: oklch(0.577 0.245 27.3);
+}
+.dark .playground-form .text-danger {
+  color: oklch(0.704 0.191 22.2);
+}
+.playground-form button[type='submit'] {
+  height: 2rem;
+  border-radius: 0.5rem;
+  background: var(--color-fd-primary);
+  color: var(--color-fd-primary-foreground);
+  padding: 0 0.875rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  transition: opacity 0.15s;
+}
+.playground-form button[type='submit']:hover {
+  opacity: 0.85;
+}
+.playground-form button[type='submit']:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/*
  * Per-turn controls (rewind/branch) are always visible so touch devices can
  * reach them; devices with a real hover pointer get the quieter hover-reveal.
  */

@@ -5,7 +5,17 @@
  * card driven by the (journaled) tool args + result, so replays repaint the
  * exact same UI with zero live calls.
  */
+import { useEffect, useState } from 'react';
+import dynamic from 'next/dynamic';
 import type { DocHit, Json } from './brain';
+import { asFormSpec, formRows, formTitle, type FormData, type FormSpec } from './form-schema';
+
+// react-jsonschema-form + ajv are a heavy chunk; load them only when a chat
+// actually renders a form card.
+const SchemaForm = dynamic(() => import('./schema-form').then((m) => m.SchemaForm), {
+  ssr: false,
+  loading: () => <p className="mt-2 text-xs text-fd-muted-foreground">Loading form…</p>,
+});
 
 const BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
 
@@ -15,7 +25,26 @@ const card =
 const asObj = (v: Json | undefined): Record<string, Json> =>
   v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, Json>) : {};
 
-export function ToolCard({ name, args, result }: { name: string; args?: Json; result?: Json }) {
+/** How a live FormCard talks back to the page hosting the chat. */
+export interface FormCardHooks {
+  /** The journaled submission that answered this form, if any. */
+  answered: FormData | null;
+  disabled: boolean;
+  /** Sends the values through the ordinary chat-input path. */
+  respond: (id: string, values: FormData) => void;
+}
+
+export function ToolCard({
+  name,
+  args,
+  result,
+  formHooks,
+}: {
+  name: string;
+  args?: Json;
+  result?: Json;
+  formHooks?: FormCardHooks;
+}) {
   const r = asObj(result);
   if ('error' in r) {
     return (
@@ -24,6 +53,12 @@ export function ToolCard({ name, args, result }: { name: string; args?: Json; re
         <p className="mt-1 text-sm text-fd-muted-foreground">{String(r.error)}</p>
       </div>
     );
+  }
+  if (name === 'form') {
+    const spec = asFormSpec(result);
+    // Keying by form id resets the draft state if a rewind re-purposes this
+    // feed slot for a different form.
+    if (spec) return <FormCard key={spec.id} spec={spec} hooks={formHooks} />;
   }
   switch (name) {
     case 'weather':
@@ -273,6 +308,87 @@ function SourceUpdateCard({
           </p>
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * A live form in the feed, rendered by react-jsonschema-form from the
+ * journaled `form` tool result (a JSON Schema + optional uiSchema).
+ * Submitting sends `/form <id> {...}` through the normal chat-input path, so
+ * the answers reach the agent as one journaled `chidori.input()`. Once a
+ * later feed event answers this form (hooks.answered), the card collapses to
+ * a read-only summary — which is also what replays and restores show.
+ */
+function FormCard({ spec, hooks }: { spec: FormSpec; hooks?: FormCardHooks }) {
+  const [sent, setSent] = useState(false);
+  const answered = hooks?.answered ?? null;
+  // A rewind can un-answer a form; make it fillable again.
+  useEffect(() => {
+    if (!answered) setSent(false);
+  }, [answered]);
+  const title = formTitle(spec) ?? spec.id;
+
+  if (answered) {
+    return (
+      <div className={card}>
+        <CardTitle name="form" extra={`${title} · answered`} />
+        <dl className="mt-2 space-y-1 text-sm">
+          {formRows(spec, answered).map(([label, value]) => (
+            <div key={label} className="flex justify-between gap-3">
+              <dt className="text-fd-muted-foreground">{label}</dt>
+              <dd className="text-right font-medium">{value}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+    );
+  }
+
+  const locked = sent || !hooks || hooks.disabled;
+  return (
+    <div className={card}>
+      <CardTitle name="form" extra={title} />
+      <SchemaForm
+        spec={spec}
+        disabled={locked}
+        onSubmit={(values) => {
+          setSent(true);
+          hooks?.respond(spec.id, values);
+        }}
+      />
+      <p className="mt-2 text-[11px] text-fd-muted-foreground">
+        {sent ? 'sending…' : 'answers go back to the agent as one journaled input'}
+      </p>
+    </div>
+  );
+}
+
+/**
+ * A submitted form response in the feed: the raw message is
+ * `/form <id> {...}` (that's what the agent, both brains, and the journal
+ * see), but the user's bubble renders it as labeled answers.
+ */
+export function FormResponseBubble({
+  spec,
+  values,
+}: {
+  spec: FormSpec | null;
+  values: FormData;
+}) {
+  return (
+    <div className="max-w-[85%] rounded-2xl rounded-br-md bg-fd-primary px-3.5 py-2.5 text-sm text-fd-primary-foreground">
+      <p className="text-[11px] font-medium uppercase tracking-wider opacity-80">
+        📋 {(spec && formTitle(spec)) ?? spec?.id ?? 'form answers'}
+      </p>
+      <dl className="mt-1 space-y-0.5">
+        {formRows(spec, values).map(([label, value]) => (
+          <div key={label} className="flex justify-between gap-4">
+            <dt className="opacity-80">{label}</dt>
+            <dd className="text-right font-medium">{value}</dd>
+          </div>
+        ))}
+      </dl>
     </div>
   );
 }

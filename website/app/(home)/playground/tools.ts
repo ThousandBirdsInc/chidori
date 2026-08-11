@@ -4,6 +4,7 @@
  * live exactly once and replay offline forever after.
  */
 import { type DocsIndex, type Json, hashString, paletteFor, searchDocs } from './brain';
+import { prepareFormSpec } from './form-schema';
 
 // WMO weather interpretation codes → something a card can render.
 const WMO: [number, string, string][] = [
@@ -295,6 +296,18 @@ export function makeTools(
         ok: true,
         lines: self.defaultSource.split('\n').length,
         note: 'original source staged — hot-swaps in when this turn ends',
+      };
+    },
+
+    form: async (kwargs) => {
+      // The journaled result is the validated {schema, uiSchema} spec itself —
+      // exactly what the card hands react-jsonschema-form, so replays repaint
+      // the identical form with zero live calls. Schema problems throw here,
+      // inside the tool call, where the model can read them and retry.
+      const spec = await prepareFormSpec(kwargs);
+      return {
+        ...(spec as unknown as Record<string, Json>),
+        note: `rendered inline — the answers arrive as your next input, formatted /form ${spec.id} {"name":value,...}`,
       };
     },
 

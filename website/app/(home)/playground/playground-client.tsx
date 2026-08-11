@@ -33,7 +33,8 @@ import {
   prepareDocsIndex,
 } from './brain';
 import { makeTools } from './tools';
-import { ToolCard } from './cards';
+import { ToolCard, FormResponseBubble } from './cards';
+import { formResponseMessage, pairFormResponses, type FormData } from './form-schema';
 import {
   type BranchStore,
   countTurns,
@@ -68,6 +69,7 @@ const SUGGESTIONS = [
   'Show me your own source code',
   'Rewrite your code: add a ⚡ to every reply',
   'Weather in Tokyo',
+  'Make a form to plan a trip',
   'Chart the first 10 fibonacci numbers',
   'Roll 3d6',
   'A color palette for a storm at dusk',
@@ -483,6 +485,18 @@ export function PlaygroundClient() {
     [ready, ensureAgent],
   );
 
+  /**
+   * A form card's submit: the answers travel the exact same path as a typed
+   * message, so the agent receives them as one journaled `chidori.input()` —
+   * the runtime never knows a form was involved.
+   */
+  const submitForm = useCallback(
+    (id: string, values: FormData) => {
+      send(formResponseMessage(id, values));
+    },
+    [send],
+  );
+
   const replay = useCallback(async () => {
     const loaded = loadedRef.current;
     const saved = localStorage.getItem(SAVE_KEY);
@@ -802,6 +816,11 @@ export function PlaygroundClient() {
   let userTurns = 0;
   const turnOf = feed.map((e) => (e.kind === 'user' ? userTurns++ : -1));
 
+  // Pair `form` tool events with the `/form <id> {...}` input that answered
+  // them — derived from the feed alone, so live chats, restores, replays, and
+  // rewinds all agree on which forms are still fillable.
+  const forms = pairFormResponses(feed);
+
   const action =
     'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-fd-border px-2.5 text-xs font-medium transition-colors hover:bg-fd-accent disabled:pointer-events-none disabled:opacity-40';
   const segment = (active: boolean) =>
@@ -971,11 +990,16 @@ export function PlaygroundClient() {
               {feed.map((event, i) => {
                 if (event.kind === 'user') {
                   const turn = turnOf[i];
+                  const formResponse = forms.responses.get(i);
                   return (
                     <div key={i} className="group flex flex-col items-end">
-                      <p className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-fd-primary px-3.5 py-2 text-sm text-fd-primary-foreground">
-                        {event.text}
-                      </p>
+                      {formResponse ? (
+                        <FormResponseBubble spec={formResponse.spec} values={formResponse.values} />
+                      ) : (
+                        <p className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-fd-primary px-3.5 py-2 text-sm text-fd-primary-foreground">
+                          {event.text}
+                        </p>
+                      )}
                       <span className="turn-controls mt-1 flex gap-1.5 text-[11px] text-fd-muted-foreground">
                         <button
                           id={`rewind-${turn}`}
@@ -1009,7 +1033,16 @@ export function PlaygroundClient() {
                 if (event.kind === 'tool') {
                   return (
                     <div key={i} className="flex">
-                      <ToolCard name={event.name} args={event.args} result={event.result} />
+                      <ToolCard
+                        name={event.name}
+                        args={event.args}
+                        result={event.result}
+                        formHooks={{
+                          answered: forms.answers.get(i) ?? null,
+                          disabled: !ready,
+                          respond: submitForm,
+                        }}
+                      />
                     </div>
                   );
                 }
@@ -1105,6 +1138,13 @@ export function PlaygroundClient() {
           <li>
             Docs answers are grounded: these docs are indexed at build time, retrieved into the
             model&apos;s context, and exposed as the <code>search_docs</code> tool.
+          </li>
+          <li>
+            Inline forms are pure host-side generative UI: the <code>form</code> tool takes a JSON
+            Schema, the journaled result is rendered by react-jsonschema-form (so replays repaint
+            the form), and submitting sends <code>/form &lt;id&gt; {'{…}'}</code> through the same{' '}
+            <code>chidori.input()</code> as any message — the runtime itself knows nothing about
+            forms, and rewinding past a submission makes the form fillable again.
           </li>
         </ul>
         <p className="mt-3 text-xs text-fd-muted-foreground" id="source-label">
