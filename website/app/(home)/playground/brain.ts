@@ -8,6 +8,8 @@
  *    and replays byte-identically.
  */
 
+import { parseFormResponse } from './form-dsl';
+
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 export interface ChatMessage {
@@ -160,6 +162,12 @@ const TOOL_SPEC = `Tools you can call (one per decision):
 - chart {title?: string, kind?: "bar" | "line", series: [{label: string, value: number}, ...]} — renders a chart card in the chat. Provide the data yourself.
 - color_palette {mood: string, colors: [{hex: string, name: string} x5]} — renders five swatches. Pick the hex values yourself.
 - roll_dice {count?: number, sides?: number} — fair dice, rolled by the host.
+- form {spec: string} — render an inline form the user fills in; the answers arrive as your next user message, formatted /form <id> {"name":value,...}. spec is a line-based DSL, one field per line:
+    directives (each optional): id: <slug> · title: <heading> · submit: <button label>
+    field lines: <kind> <name> "Label" [option|option] min=0 max=10 step=1 default=x placeholder="hint" required
+    kinds: text, textarea, number, range, select, radio, check, date — [options] only for select/radio.
+  Example: form {"spec": "title: RSVP\\ntext name \\"Your name\\" required\\nradio coming \\"Coming?\\" [yes|no]"}
+  When you need several pieces of structured input, send one form instead of asking questions one at a time.
 - read_source {} — your own source code: the chidori agent program currently running this conversation.
 - update_source {find: string, replace: string} or {source: string} — rewrite your own implementation. The find text must occur exactly once in the current source (call read_source first and copy it verbatim). The edit is validated by replaying this conversation's journal against the new code, then hot-swapped in when the turn ends.
 - reset_source {} — go back to the original playground source.`;
@@ -277,8 +285,36 @@ export function mockDecide(transcript: ChatMessage[], index: DocsIndex | null): 
  */
 const EMIT_REPLY_LINE = "emit({ kind: 'assistant', text: reply });";
 
+/** The offline brain's canned form — themed to match the suggestion chip. */
+const DEMO_FORM_DSL = `id: trip
+title: Plan a weekend trip
+submit: Plan it
+text destination "Where to?" required
+date depart "Leaving on"
+number days "How many days?" min=1 max=14 default=2
+select budget "Budget" [shoestring|comfortable|splurge]
+radio pace "Pace" [chill|balanced|packed]
+check flexible "My dates are flexible"
+textarea notes "Anything else?" placeholder="food, must-sees, dealbreakers…"`;
+
 function route(text: string, index: DocsIndex | null): Decision {
   const t = text.toLowerCase();
+
+  // A submitted form comes back as `/form <id> {...}` — checked first, the
+  // prefix is unambiguous. The values arrived through one journaled
+  // chidori.input(), same as any typed message.
+  const formResponse = parseFormResponse(text);
+  if (formResponse) {
+    const pairs = Object.entries(formResponse.values)
+      .map(([k, v]) => `${k} = ${String(v)}`)
+      .join(' · ');
+    return {
+      reply:
+        `Got your answers${pairs ? `: ${pairs}` : ''}. They reached me as one journaled ` +
+        'chidori.input() — a real agent would use them as plain variables now, and an offline ' +
+        'replay re-reads them from the journal instead of asking you again.',
+    };
+  }
 
   // Self-modification: the agent reading, patching, and resetting its own
   // program. Checked first — "code" and "source" say exactly what is meant.
@@ -299,6 +335,10 @@ function route(text: string, index: DocsIndex | null): Decision {
       };
     }
     return { tool: 'read_source', args: {} };
+  }
+
+  if (/\b(form|survey|questionnaire|rsvp|intake|sign.?up)\b/.test(t)) {
+    return { tool: 'form', args: { spec: DEMO_FORM_DSL } };
   }
 
   const dice = /(\d+)\s*d\s*(\d+)/.exec(t);
@@ -375,6 +415,7 @@ function route(text: string, index: DocsIndex | null): Decision {
       '• "Weather in Tokyo"\n' +
       '• "Chart the first 10 fibonacci numbers"\n' +
       '• "What is 2^16 / 3?"  • "Roll 3d6"  • "A palette for a storm at dusk"\n' +
+      '• "Make a form to plan a trip" (an inline form — answers come back as journaled input)\n' +
       '• "Show me your own source code"  • "Rewrite your code: add a ⚡ to every reply"',
   };
 }
@@ -415,6 +456,15 @@ function composeReply(toolMsg: { name?: string; result?: Json }): Decision {
     }
     case 'color_palette':
       return { reply: `Five swatches for “${String(r.mood)}” — rendered above.` };
+    case 'form': {
+      const count = Array.isArray(r.fields) ? r.fields.length : 0;
+      return {
+        reply:
+          `I put a ${count}-field form in the chat — fill it in and hit “${String(r.submit ?? 'Submit')}”. ` +
+          'Your answers come back to me as a single journaled input, so even this UI round-trip ' +
+          'suspends, resumes, and replays offline.',
+      };
+    }
     case 'read_source':
       return {
         reply:
