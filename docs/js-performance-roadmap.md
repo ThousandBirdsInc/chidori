@@ -1782,6 +1782,74 @@ the reg budget sweep runs over the new corpus entries (and caught the
 first cost-model cut); full suites green; benchmark cross-checks green on
 all four runtimes; clippy and rustfmt clean.
 
+## 6.17 React render latency (2026-08-13): the browser-use-case measurement
+and the index-key probe fast path
+
+Question under test: is React on chidori-js fast enough for a *browser* use
+case — the LiveView-style loop where every user event triggers a full
+`renderToStaticMarkup` pass on the engine (natively behind a host, or as
+wasm via `crates/chidori-wasm` + `sdk/browser`)? A new example,
+`examples/react_perf.rs`, measures it directly: the vendored React 18 +
+react-dom/server bundles, a js-framework-benchmark-shaped table app
+(N rows × 4 cells, one selected row, every 10th label mutated per tick),
+one full re-render per event, no memoization. Markup is byte-identical to
+Node 22 on the same bundles.
+
+**Profile finding (callgrind, load + 10 ticks at 100 rows):** ~31% of ALL
+instructions were one guard — `protos_allow_any_index_create`, the
+per-kernel-activation check that no prototype on a store-target's chain
+carries a reified index key. It probes every own key of
+`Array.prototype`/`Object.prototype` (Dict-mode intrinsics, ~45 keys per
+chain) through `PropertyKey::array_index()`, which materialized a
+UTF-8-validated `&str` per key — 5.57 M `from_utf8` calls (629 M
+instructions, 22.3%) plus 247 M (8.8%) in the walk itself, re-run per
+activation because React's element/children building kernelizes with
+`stores_elems` on fresh arrays constantly.
+
+**Fix (landed):** `array_index()` rejects named keys on the raw
+`wtf8_bytes()` view — a canonical index must start with an ASCII digit —
+before building the validated `&str`. Equivalent by case analysis
+(non-digit-leading keys already returned `None` through
+`canonical_index`; WTF-8 lossy views agree on a leading ASCII digit), so
+no semantic surface at all.
+
+| metric (100-row app) | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| instructions, load + 10 renders | 2.823 G | 2.086 G | **−26%** |
+| instructions per render | ~280 M | ~206 M | −26% |
+| wall per render (warm avg) | ~37 ms | ~31 ms | −16% |
+
+Gates: full chidori-js suite green (219 tests, incl. record→replay
+byte-identity and the kernels/reg differential corpora), clippy clean,
+React markup byte-identical to Node before/after; Test262 gate result
+recorded below.
+
+**Where React render latency stands (idle container, warm avg/min):**
+
+| rows | markup | chidori-js | node 22 (V8) | gap |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 2.9 KB | 3.8 / 3.3 ms | 0.15 / 0.04 ms | ~25× |
+| 100 | 25 KB | 31 / 29 ms | 0.50 / 0.34 ms | ~60× |
+| 500 | 125 KB | 157 / 150 ms | 2.9 / 2.3 ms | ~55× |
+| 1000 | 250 KB | 315 / 297 ms | 6.3 / 4.9 ms | ~50× |
+
+One-time costs are small: engine ~0.6 ms + React bundles ~15 ms eval.
+Remaining profile is the known structural tax, now with no single cliff:
+register/stack dispatch ~27%, boxed `Value` clone/drop ~17%, the residual
+index-key walk ~7% (a per-shape/per-object cached verdict is the next
+lever if it matters), IC + property probes ~6%.
+
+**Reading for the browser use case:** ~30 ms per full re-render at 100
+rows (≈50–90 ms as wasm, at wasm's typical 1.5–3× interpreter penalty)
+sits inside the ~100 ms perceived-instant budget — form/dashboard-class
+agent UIs re-rendered per click are fine natively and workable in-browser;
+500+ row tables or per-keystroke re-render are not, and 60 fps was never
+the target (`docs/dom-runtime-prototype.md`). The honest levers, in order:
+render less (memoized subtrees render fine today — this benchmark
+deliberately re-renders everything), the §6.12.2 structural work (smaller
+`Value`, reg-tier superinstructions, ObjectData arena), and only then
+JIT-class throughput (§4).
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —
