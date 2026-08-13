@@ -16,12 +16,16 @@
 //!   identical by construction. The translation changes only WHERE operands
 //!   live (indexed registers instead of a stack), never what runs.
 //! - **Whole-function eligibility.** Translation is all-or-nothing per
-//!   function: any op outside the translated subset (try/finally handlers,
-//!   `with`/direct-`eval` scope machinery, class `super`/private elements,
-//!   suspension ops, `Op::LoopKernel`, …) declines the function and it keeps
-//!   the stack interpreter. Loop-kernelized functions keep the stack tier so
-//!   their unboxed kernels — far faster than boxed register ops — stay in
-//!   charge.
+//!   function: any op outside the translated subset (`with`/direct-`eval`
+//!   scope machinery, class `super`/private elements, suspension ops, …)
+//!   declines the function and it keeps the stack interpreter.
+//! - **Loop kernels EMBED** (docs §6.10.2/§6.18): `Op::LoopKernel` becomes
+//!   [`ROp::LoopKernel`] followed by its translated fallback twin, so a
+//!   kernel-carrying glue function no longer forfeits the register tier.
+//!   The unboxed kernel stays in charge of its loop when its guard passes;
+//!   exits and bails materialize into canonical registers (on top of the
+//!   header's base depth) and resume at mapped register pcs
+//!   ([`RegProto::kernel_resume`]).
 //! - **Registers are `frame.locals`.** Register `0..num_locals` ARE the
 //!   localized bindings (same slots, same TDZ marker); `num_locals..` are the
 //!   canonical homes of the stack machine's operand-stack depths. A frame
@@ -112,6 +116,14 @@ pub struct RegProto {
     /// same statement/call-site position as the stack tier. Empty when the
     /// input carried no position table.
     pub pos: Box<[u32]>,
+    /// Kernel resume map for embedded loop kernels ([`ROp::LoopKernel`]):
+    /// `(stack ip, register pc)` pairs, sorted by stack ip, for every
+    /// `KOp::Exit` target of every kernel in the function. Each such ip is
+    /// forced to be a LABEL during translation, so its register pc receives
+    /// exactly the canonical state the kernel's exit materialization writes
+    /// (operand shape into `canon(d)` registers). Empty for kernel-free
+    /// functions.
+    pub kernel_resume: Box<[(u32, u32)]>,
 }
 
 /// Unary value ops sharing one register shape (`dst = op(src)`).
@@ -148,6 +160,22 @@ pub enum DefKind {
 #[derive(Clone, Debug)]
 pub enum ROp {
     // ---- moves / constants / frame values ----
+    /// Embedded loop kernel (§6.10.2): attempt the unboxed kernel at
+    /// `FuncProto::kernels[kernel]`. Guard declined (or an op budget is
+    /// installed — kernels stay off under a budget, matching the stack
+    /// tier) → fall through to the translated FALLBACK twin emitted
+    /// immediately after this op. A kernel exit/bail materializes locals +
+    /// the operand shape into canonical registers and jumps to the mapped
+    /// pc ([`RegProto::kernel_resume`]). Budget-pure: its stack op's unit
+    /// is carried by the fallback twin.
+    LoopKernel {
+        kernel: u32,
+        /// Operand depth at the loop header (an enclosing construct — e.g. a
+        /// for-of iterator — may hold live operands below the loop). Exit
+        /// shapes materialize ON TOP of this base: the runtime writes shape
+        /// slot `d` to `canon(base + d)`.
+        base: u16,
+    },
     /// Pure budget landing: runs nothing; exists so stranded pure stack-op
     /// units on a fall-through edge into a label are charged on that path
     /// (jump-in paths charged theirs at their control op). Its units live
@@ -890,6 +918,7 @@ fn rop_budget_pure(op: &ROp) -> bool {
     matches!(
         op,
         ROp::Charge
+            | ROp::LoopKernel { .. }
             | ROp::Mov { .. }
             | ROp::Const { .. }
             | ROp::Undef { .. }
@@ -913,19 +942,37 @@ pub fn regify(
     num_locals: u32,
     consts: &[crate::bytecode::Const],
     pos: &[u32],
+    kernels: &[crate::bytecode::Kernel],
 ) -> Option<RegProto> {
     if code.is_empty() || num_locals > u16::MAX as u32 / 2 {
         return None;
     }
+    // Embedded loop kernels: for the whole ANALYSIS (effect/flow/TDZ), an
+    // `Op::LoopKernel` behaves exactly like its preserved FALLBACK header op
+    // — that is what the stack tier executes whenever the kernel does not
+    // (guard decline, budget, and every generic iteration after a bail).
+    // The kernel path itself only ever leaves via `KOp::Exit`, whose resume
+    // ips are forced to be labels below so a resume lands on canonical
+    // state.
+    fn real_op<'a>(op: &'a Op, kernels: &'a [crate::bytecode::Kernel]) -> &'a Op {
+        if let Op::LoopKernel(i) = op {
+            &kernels[*i as usize].fallback
+        } else {
+            op
+        }
+    }
+    let real = |op| real_op(op, kernels);
     // Phase 1: eligibility + label collection.
     let mut labels: Vec<u32> = Vec::new();
+    let mut kernel_resume_ips: Vec<u32> = Vec::new();
     for op in code {
-        effect(op)?;
-        match flow_of(op) {
+        let rop = real(op);
+        effect(rop)?;
+        match flow_of(rop) {
             FlowKind::Jump(t) | FlowKind::Branch(t) | FlowKind::PeekBranch(t) => labels.push(t),
             _ => {}
         }
-        match op {
+        match rop {
             Op::PushTryHandler { catch, finally } => {
                 if *catch != u32::MAX {
                     labels.push(*catch);
@@ -937,7 +984,17 @@ pub fn regify(
             Op::CompletionJump { target, .. } => labels.push(*target),
             _ => {}
         }
+        if let Op::LoopKernel(i) = op {
+            for kop in kernels[*i as usize].code.iter() {
+                if let crate::bytecode::KOp::Exit { resume_ip, .. } = kop {
+                    labels.push(*resume_ip);
+                    kernel_resume_ips.push(*resume_ip);
+                }
+            }
+        }
     }
+    kernel_resume_ips.sort_unstable();
+    kernel_resume_ips.dedup();
     labels.sort_unstable();
     labels.dedup();
     let is_label = |ip: u32| labels.binary_search(&ip).is_ok();
@@ -1008,7 +1065,7 @@ pub fn regify(
                     continue;
                 };
                 visited[ip as usize] = true;
-                let op = &code[ip as usize];
+                let op = real(&code[ip as usize]);
                 let (pops, pushes) = effect(op).unwrap();
                 if depth < pops {
                     return None; // malformed: operand-stack underflow
@@ -1090,6 +1147,29 @@ pub fn regify(
     let endfin_linear = |ip: u32| normal_visited[ip as usize];
     let (label_states, _) = dataflow(true, &endfin_linear)?;
 
+    // Embedded-kernel validation: every kernel exit must land on a SEEDED
+    // label whose operand depth equals the exit shape's length — that is
+    // the contract that lets the runtime write the shape into canonical
+    // registers and resume. A mismatch (or an unreached resume label)
+    // declines the whole function; the stack tier keeps it.
+    for (ip, op) in code.iter().enumerate() {
+        if let Op::LoopKernel(i) = op {
+            let k = &kernels[*i as usize];
+            // The header is a back-edge target, so it is a label; its depth
+            // is the BASE every exit shape sits on top of (an enclosing
+            // for-of's iterator lives below the loop on the operand stack).
+            let base = label_states.get(&(ip as u32)).map(|st| st.depth)?;
+            for kop in k.code.iter() {
+                if let crate::bytecode::KOp::Exit { resume_ip, shape } = kop {
+                    let st = label_states.get(resume_ip)?;
+                    if st.depth != base + k.shapes[*shape as usize].len() as u32 {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
     // CompletionJump targets are reached only through the PARKED completion
     // (phase 2 draws no edge): collect the ones no normal edge seeded, so a
     // reachable jump to one declines the function (its code was skipped and
@@ -1161,11 +1241,28 @@ pub fn regify(
             continue;
         }
         let emit_start = e.code.len();
-        let (fallthrough, consumed) = e.emit_op(code, ip, &is_label)?;
+        let (fallthrough, consumed) = if let Op::LoopKernel(kidx) = &code[ip as usize] {
+            // Embedded kernel: the header is a back-edge target (a label),
+            // so state here is already canonical. Emit the probe, then the
+            // translated FALLBACK twin it falls through to on decline. The
+            // fallback is translated as a 1-op slice: its branch target (a
+            // stack ip) remaps through `rpc_at` at the end like any other,
+            // and no fusion window can form across the substitution.
+            e.push_op(ROp::LoopKernel {
+                kernel: *kidx,
+                base: e.entries.len() as u16,
+            });
+            let fb = &kernels[*kidx as usize].fallback;
+            let (ft, c) = e.emit_op(std::slice::from_ref(fb), 0, &|_| false)?;
+            debug_assert_eq!(c, 1);
+            (ft, 1)
+        } else {
+            e.emit_op(code, ip, &is_label)?
+        };
         e.assign_cost(emit_start, consumed);
         live = fallthrough;
         for k in 0..consumed {
-            tdz_transfer(&code[(ip + k) as usize], &mut e.tdz);
+            tdz_transfer(real(&code[(ip + k) as usize]), &mut e.tdz);
             if k > 0 {
                 rpc_at[(ip + k) as usize] = e.code.len() as u32;
             }
@@ -1233,12 +1330,17 @@ pub fn regify(
         .collect();
     debug_assert_eq!(e.code.len(), e.costs.len());
     debug_assert!(rpos.is_empty() || rpos.len() == e.code.len());
+    let kernel_resume: Vec<(u32, u32)> = kernel_resume_ips
+        .iter()
+        .map(|&sip| (sip, rpc_at[sip as usize]))
+        .collect();
     Some(RegProto {
         code: e.code,
         costs: e.costs.into_boxed_slice(),
         num_regs: num_regs as u16,
         ic,
         pos: rpos.into_boxed_slice(),
+        kernel_resume: kernel_resume.into_boxed_slice(),
     })
 }
 

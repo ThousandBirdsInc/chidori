@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Chidori × React — durable client-side agents</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #131824; --panel-2: #0f141f;
+    --ink: #e8ecf4; --dim: #8b94a7; --line: #232b3b;
+    --accent: #6ea8ff; --accent-2: #9d7bff;
+    --agent: #1a2233; --user: #234a86; --replay: #17251c;
+    --ok: #56d364; --warn: #e3b341; --err: #ff7b72;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  }
+  header {
+    padding: 1.1rem 1.6rem; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: .9rem;
+  }
+  header h1 { font-size: 1.05rem; margin: 0; letter-spacing: .02em; }
+  header h1 b { background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  header span { color: var(--dim); font-size: .85rem; }
+  main {
+    display: grid; grid-template-columns: 1fr 310px; gap: 1.1rem;
+    max-width: 62rem; margin: 1.2rem auto; padding: 0 1.2rem;
+  }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  #chat { display: flex; flex-direction: column; min-height: 540px; }
+  #msgs { flex: 1; padding: 1rem 1.1rem; overflow-y: auto; display: flex;
+          flex-direction: column; gap: .55rem; }
+  .msg { max-width: 82%; padding: .5rem .8rem; border-radius: 10px;
+         white-space: pre-wrap; animation: pop .18s ease-out; }
+  @keyframes pop { from { opacity: 0; transform: translateY(4px); } }
+  .agent  { background: var(--agent); align-self: flex-start; border-top-left-radius: 3px; }
+  .user   { background: var(--user);  align-self: flex-end;   border-top-right-radius: 3px; }
+  .replay { background: var(--replay); align-self: flex-start; color: #9fd8ab;
+            font-family: ui-monospace, monospace; font-size: .82rem; }
+  .sys    { align-self: center; color: var(--dim); font-size: .8rem; }
+  form { display: flex; gap: .6rem; padding: .9rem 1.1rem; border-top: 1px solid var(--line); }
+  input[type=text] {
+    flex: 1; background: var(--panel-2); color: var(--ink); font-size: .95rem;
+    border: 1px solid var(--line); border-radius: 8px; padding: .55rem .8rem; outline: none;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+  button {
+    background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: .5rem .9rem; font-size: .88rem; cursor: pointer;
+  }
+  button.primary { background: var(--user); border-color: #2e5ca6; }
+  button:disabled { opacity: .35; cursor: default; }
+  aside .card { padding: 1rem 1.1rem; margin-bottom: 1.1rem; }
+  aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .1em;
+             color: var(--dim); margin: 0 0 .7rem; }
+  .row { display: flex; justify-content: space-between; margin: .35rem 0;
+         font-size: .88rem; color: var(--dim); }
+  .row b { color: var(--ink); font-weight: 600; font-family: ui-monospace, monospace; }
+  .badge { display: inline-block; padding: .12rem .55rem; border-radius: 99px;
+           font-size: .78rem; font-weight: 600; }
+  .b-idle { background: #222a3a; color: var(--dim); }
+  .b-running { background: #2b2410; color: var(--warn); }
+  .b-awaiting-input { background: #10263a; color: var(--accent); }
+  .b-suspended { background: #33202b; color: #ff9bc0; }
+  .b-completed { background: #12291a; color: var(--ok); }
+  .b-error { background: #331b1b; color: var(--err); }
+  .stack { display: flex; flex-direction: column; gap: .5rem; margin-top: .8rem; }
+  .note { font-size: .8rem; color: var(--dim); margin-top: .8rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1><b>Chidori × React</b></h1>
+  <span>React renders native in the page · the agent runs on the wasm engine · every effect journaled</span>
+</header>
+<main id="root"></main>
+
+<script src="./vendor/react.production.min.js"></script>
+<script src="./vendor/react-dom.production.min.js"></script>
+<script type="importmap">{ "imports": { "react": "./vendor/react-shim.js" } }</script>
+<script type="module">
+import init, * as wasm from './pkg/chidori_wasm.js';
+import { useChidoriAgent } from './pkg/sdk/react.js';
+import { saveRun, loadRun } from './pkg/sdk/index.js';
+
+const h = React.createElement;
+const BLOB_KEY = 'chidori-react-demo-blob';
+const CHAT_KEY = 'chidori-react-demo-chat';
+
+// The agent — plain TypeScript on the wasm engine. Every await below is a
+// journaled host effect: replayable, resumable, byte-identical.
+const SOURCE = `
+async function main(): Promise<void> {
+  await chidori.log('Hi! I plan city trips — two quick questions.');
+  const city = await chidori.input('Where are you headed?');
+  await chidori.log('Nice — ' + city + ' it is. Checking the season…');
+  await chidori.sleep(500);
+  const days = await chidori.input('How many days do you have?');
+  await chidori.log('Sketching ' + days + ' days on the ground…');
+  const plan = await chidori.prompt('Plan ' + days + ' days in ' + city);
+  await chidori.log(plan);
+  const extra = await chidori.input('Anything to add before I finalize?');
+  await chidori.sleep(300);
+  await chidori.log('Noted: ' + extra + '.');
+  console.log('ITINERARY // ' + city + ' · ' + days + ' days · note: ' + extra);
+  await chidori.log('Itinerary saved — bon voyage!');
+}
+main();
+`;
+
+// A deterministic stand-in LLM (offline demo). The journal records its
+// result like any host effect, so replays never call it again.
+const plannerLlm = async ({ text }) => {
+  await new Promise((r) => setTimeout(r, 650));
+  const m = text.match(/Plan (.+) days in (.+)/);
+  const [days, city] = m ? [m[1], m[2]] : ['?', '?'];
+  return 'Here’s the shape of ' + days + ' days in ' + city + ':\n' +
+    '· Day 1 — old town on foot, market lunch, golden-hour viewpoint\n' +
+    '· Day 2 — one big museum, long dinner in the local quarter\n' +
+    '· Last day — slow morning, one neighborhood you’d move to';
+};
+
+function App() {
+  const [msgs, setMsgs] = React.useState([]);
+  const [draft, setDraft] = React.useState('');
+  const [blobBytes, setBlobBytes] = React.useState(null);
+  const [lastMs, setLastMs] = React.useState(null);
+  const [hasSaved, setHasSaved] = React.useState(() => loadRun(BLOB_KEY) !== null);
+  const tSend = React.useRef(0);
+  const asked = React.useRef(null);
+  const inputRef = React.useRef(null);
+
+  const add = (role, text) => setMsgs((m) => [...m, { role, text }]);
+  const msgsRef = React.useRef(null);
+  React.useEffect(() => {
+    msgsRef.current?.scrollTo({ top: msgsRef.current.scrollHeight, behavior: 'smooth' });
+  }, [msgs]);
+
+  const [agent, controls] = useChidoriAgent(wasm, {
+    source: SOURCE,
+    filename: 'trip-planner.ts',
+    llm: plannerLlm,
+    onLog: ({ message }) => add('agent', message),
+  });
+
+  // Surface each new question as a chat bubble, and measure the
+  // answer → next-question roundtrip through the engine.
+  React.useEffect(() => {
+    if (agent.pendingInput && asked.current !== agent.pendingInput.prompt) {
+      asked.current = agent.pendingInput.prompt;
+      if (tSend.current) { setLastMs(performance.now() - tSend.current); tSend.current = 0; }
+      add('agent', agent.pendingInput.prompt);
+      setTimeout(() => inputRef.current?.focus(), 0);
+    }
+    if (agent.status === 'completed' && tSend.current) {
+      setLastMs(performance.now() - tSend.current); tSend.current = 0;
+    }
+  }, [agent.pendingInput, agent.status]);
+
+  // A finished run is a durable artifact too — keep it for offline replay.
+  React.useEffect(() => {
+    if (agent.status === 'completed') {
+      const b = controls.blob();
+      if (b) { saveRun(BLOB_KEY, b); setBlobBytes(b.length); setHasSaved(true); }
+    }
+  }, [agent.status]);
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!draft.trim()) return;
+    add('user', draft);
+    tSend.current = performance.now();
+    controls.answer(draft);
+    setDraft('');
+  };
+
+  const suspendAndSave = () => {
+    controls.suspend();
+    // The pump resolves asynchronously; save once the blob reflects it.
+    setTimeout(() => {
+      const b = controls.blob();
+      if (b) {
+        saveRun(BLOB_KEY, b);
+        localStorage.setItem(CHAT_KEY, JSON.stringify(msgs));
+        setBlobBytes(b.length); setHasSaved(true);
+        add('sys', 'run suspended — saved to localStorage (' + b.length + ' bytes). Reload the page: it survives.');
+      }
+    }, 50);
+  };
+
+  const restoreSaved = () => {
+    const b = loadRun(BLOB_KEY);
+    if (!b) return;
+    const chat = JSON.parse(localStorage.getItem(CHAT_KEY) ?? '[]');
+    asked.current = null;
+    setMsgs([...chat, { role: 'sys', text: 'restored from blob — answered effects replay from the journal, no re-asking' }]);
+    controls.restore(b);
+  };
+
+  const replayOffline = () => {
+    const b = loadRun(BLOB_KEY);
+    if (!b) return;
+    asked.current = null;
+    add('sys', 'replaying the finished run offline — zero live host calls');
+    controls.restore(b);
+  };
+
+  // After an offline replay the console re-generates (JS re-runs; effects
+  // come from the journal) — show it as proof of byte-identical output.
+  React.useEffect(() => {
+    if (agent.status === 'completed' && agent.liveCalls === 0 && agent.console.length) {
+      agent.console.forEach((l) => add('replay', l));
+    }
+  }, [agent.status, agent.liveCalls]);
+
+  const started = agent.status !== 'idle';
+  return h(React.Fragment, null,
+    h('section', { className: 'card', id: 'chat' },
+      h('div', { id: 'msgs', ref: msgsRef },
+        msgs.length === 0 && h('div', { className: 'sys' },
+          'a TypeScript agent, running client-side on the pure-Rust engine compiled to wasm'),
+        msgs.map((m, i) => h('div', { key: i, className: 'msg ' + m.role }, m.text))),
+      h('form', { onSubmit: submit },
+        started
+          ? h(React.Fragment, null,
+              h('input', {
+                ref: inputRef, type: 'text', value: draft, id: 'reply',
+                placeholder: agent.status === 'awaiting-input' ? 'type your answer…' : '…',
+                disabled: agent.status !== 'awaiting-input',
+                onChange: (e) => setDraft(e.target.value),
+              }),
+              h('button', { className: 'primary', disabled: agent.status !== 'awaiting-input' }, 'Send'))
+          : h('button', {
+              className: 'primary', type: 'button', id: 'start',
+              onClick: () => { setMsgs([]); controls.start(); },
+            }, 'Start the agent'))),
+    h('aside', null,
+      h('div', { className: 'card' },
+        h('h2', null, 'Durable run'),
+        h('div', { className: 'row' }, 'status',
+          h('span', { className: 'badge b-' + agent.status, id: 'status' }, agent.status)),
+        h('div', { className: 'row' }, 'live host effects', h('b', null, String(agent.liveCalls))),
+        h('div', { className: 'row' }, 'answer → next step',
+          h('b', null, lastMs === null ? '—' : lastMs.toFixed(1) + ' ms')),
+        h('div', { className: 'row' }, 'saved blob',
+          h('b', null, blobBytes === null ? (hasSaved ? 'in localStorage' : '—') : blobBytes + ' B')),
+        h('div', { className: 'stack' },
+          h('button', {
+            id: 'suspend', onClick: suspendAndSave,
+            disabled: agent.status !== 'awaiting-input',
+          }, 'Suspend & save'),
+          h('button', { id: 'restore', onClick: restoreSaved, disabled: !hasSaved }, 'Restore saved run'),
+          h('button', {
+            id: 'replay', onClick: replayOffline,
+            disabled: !hasSaved,
+          }, 'Replay offline'))),
+      h('div', { className: 'card' },
+        h('h2', null, 'What this shows'),
+        h('div', { className: 'note' },
+          'The UI is plain React on the browser’s native engine. The agent is TypeScript on ',
+          'chidori’s wasm runtime behind ', h('code', null, 'useChidoriAgent'), '. Every LLM call, ',
+          'input, sleep, and log is a journaled host effect — so a run can suspend to a few KB, ',
+          'survive a reload, resume at the same question, and replay offline byte-identically.'))));
+}
+
+await init();
+ReactDOM.createRoot(document.getElementById('root')).render(h(App));
+</script>
+</body>
+</html>

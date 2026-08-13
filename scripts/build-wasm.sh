@@ -20,9 +20,12 @@ wasm-bindgen --target web \
   --out-dir crates/chidori-wasm/www/pkg \
   target/wasm32-unknown-unknown/release/chidori_wasm.wasm
 
-# The browser SDK ships from sdk/browser; the demo page imports it alongside
-# the wasm bindings, so mirror it into the (gitignored) pkg/ output.
+# The browser SDK ships from sdk/browser; the demo pages import it alongside
+# the wasm bindings, so mirror it into the (gitignored) pkg/ output — flat for
+# index.html, and as a directory (relative imports intact) for react.html.
 cp sdk/browser/index.js crates/chidori-wasm/www/pkg/chidori-browser.js
+mkdir -p crates/chidori-wasm/www/pkg/sdk
+cp sdk/browser/index.js sdk/browser/react.js crates/chidori-wasm/www/pkg/sdk/
 
 # Mirror the runtime assets into the docs website's public dir (also
 # gitignored) so the /playground page can load them. The docs deploy workflow

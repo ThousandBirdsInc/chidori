@@ -53,6 +53,48 @@ Agents may be written in TypeScript — sources are stripped by the wasm
 module's oxc transpiler (`filename: 'agent.tsx'` enables JSX). The bundle
 executes top-level with the `chidori` global in scope.
 
+## React binding
+
+`@1kbirds/chidori-browser/react` binds an agent to React state: React renders
+in the page on the browser's native engine (real DOM, real reconciler), the
+agent runs behind it on the wasm runtime, and journaled effects surface as
+state transitions. The interpreter only ever executes agent logic — measured
+end-to-end in Chromium, an `answer()` → next-question re-render roundtrip
+(input resolve + one `chidori.prompt` + one `chidori.log`, all journaled) is
+**under 1 ms**, so UI latency is React's, not the engine's.
+
+```jsx
+import { useChidoriAgent } from './chidori-browser/react.js';
+
+function AgentChat({ wasm, source }) {
+  const [agent, controls] = useChidoriAgent(wasm, { source, llm: mockLlm() });
+  const [draft, setDraft] = useState('');
+
+  if (agent.status === 'idle') return <button onClick={() => controls.start()}>Run</button>;
+  return (
+    <div>
+      <ul>{agent.logs.map((l, i) => <li key={i}>{l.message}</li>)}</ul>
+      {agent.pendingInput && (
+        <form onSubmit={(e) => { e.preventDefault(); controls.answer(draft); setDraft(''); }}>
+          <label>{agent.pendingInput.prompt}</label>
+          <input value={draft} onChange={(e) => setDraft(e.target.value)} />
+        </form>
+      )}
+      {agent.status === 'completed' && <p>done — {agent.liveCalls} live effects</p>}
+    </div>
+  );
+}
+```
+
+`agent` is `{ status, logs, console, pendingInput, liveCalls, error }` with
+`status` one of `idle | running | awaiting-input | suspended | completed |
+error`. While the run awaits `chidori.input()` it stays live in the page and
+`controls.answer(text)` continues it; `controls.suspend()` instead parks the
+run so `controls.blob()` can be persisted (e.g. `saveRun`) and
+`controls.restore(blob)` — in this tab or a fresh one, days later — picks it
+back up at the same question, with already-answered effects replayed from the
+journal instead of re-asked.
+
 ## API surface
 
 `chidori.prompt(text, opts)`, `chidori.input(message, opts)`,
