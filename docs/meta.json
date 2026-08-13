@@ -12,6 +12,7 @@
     "running-modes",
     "signals",
     "branching-execution",
+    "source-history",
     "actors",
     "detached-agents",
     "context-management",

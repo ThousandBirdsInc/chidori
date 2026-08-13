@@ -1,9 +1,9 @@
 pub mod app_data;
 pub mod call_log;
 pub mod capability;
+pub mod compress;
 pub mod context;
 pub mod cost;
-pub mod compress;
 pub mod crypto;
 pub mod engine;
 /// Typed error taxonomy: the pause interrupt and run-failure classification.
@@ -33,6 +33,7 @@ pub mod prompt_cache;
 pub mod rust_engine;
 pub mod secret_env;
 pub mod snapshot;
+pub mod source_history;
 /// SSRF guard for the guest-facing `http`/`fetch` host effect.
 pub mod ssrf;
 /// Pluggable persistence for the durable run artifact (journal + blobs).

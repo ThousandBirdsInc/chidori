@@ -429,6 +429,41 @@ enum Commands {
         dir: Option<PathBuf>,
     },
 
+    /// Show a run's implementation history: the git-like chain of agent
+    /// source versions (entry + imported modules, full text) recorded
+    /// alongside the execution journal — the version the run started with,
+    /// every edit accepted through edit-and-resume, and each branch's own
+    /// source chain (fork, edit-and-rerun). Each commit is anchored to the
+    /// journal frontier where its code took over, so the listing shows which
+    /// recorded calls executed under which version.
+    History {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+
+        /// Print the stored source of a commit (all files, or one with
+        /// --path). Accepts a full commit id or a unique hex prefix (>= 4
+        /// chars).
+        #[arg(long, value_name = "COMMIT", conflicts_with = "diff")]
+        show: Option<String>,
+
+        /// Unified diff between two recorded versions: `<a>..<b>`, or a
+        /// single commit to diff against its parent.
+        #[arg(long, value_name = "COMMIT[..COMMIT]")]
+        diff: Option<String>,
+
+        /// Restrict --show / --diff to one file path within the commit tree.
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Emit machine-readable JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Aggregate run history: total runs, tokens, est. cost, per-model breakdown.
     /// Reads `.chidori/runs/<id>/checkpoint.json` in the given directory.
     Stats {
@@ -875,6 +910,24 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
         ),
         Commands::Trace { run_id, dir } => (cmd_trace(&run_id, dir.as_deref()), false),
         Commands::Snapshot { run_id, dir } => (cmd_snapshot(&run_id, dir.as_deref()), false),
+        Commands::History {
+            run_id,
+            dir,
+            show,
+            diff,
+            path,
+            json,
+        } => (
+            cmd_history(
+                &run_id,
+                dir.as_deref(),
+                show.as_deref(),
+                diff.as_deref(),
+                path.as_deref(),
+                json,
+            ),
+            false,
+        ),
         Commands::Serve {
             file,
             port,
@@ -3204,6 +3257,400 @@ fn cmd_snapshot(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     let manifest = store.load_manifest()?;
 
     println!("{}", serde_json::to_string_pretty(&manifest)?);
+    Ok(())
+}
+
+/// One history store contributing to `chidori history`: the run's own trunk,
+/// or one branch sub-run's chain.
+struct HistoryScope {
+    /// `None` for the run trunk; the branch id for a branch store.
+    branch_id: Option<String>,
+    /// Branch label + status from `branch.json`, when readable.
+    branch_label: Option<String>,
+    branch_status: Option<String>,
+    dir: PathBuf,
+    commits: Vec<crate::runtime::source_history::SourceCommit>,
+}
+
+/// `chidori history` — the implementation side of a run's history. The
+/// execution journal (`chidori trace`) says what the run did; this command
+/// says what the run *was* at each point: the git-like chain of source
+/// versions recorded at run start, on every accepted edit-and-resume, and in
+/// each branch store (fork / resume / edit-and-rerun), each anchored to the
+/// journal frontier where that code took over.
+fn cmd_history(
+    run_id: &str,
+    dir: Option<&std::path::Path>,
+    show: Option<&str>,
+    diff: Option<&str>,
+    path_filter: Option<&std::path::Path>,
+    json: bool,
+) -> Result<()> {
+    use crate::runtime::source_history::{self as sh, short_id, SourceCommit, TreeChange};
+    use crate::runtime::store::{FsRunStore, RunStore as _};
+
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
+    if !run_dir.is_dir() {
+        anyhow::bail!("no run directory at {}", run_dir.display());
+    }
+
+    // Collect every history store under the run: the trunk plus one scope per
+    // branch sub-run (out-of-band branch reads stay filesystem-local, like
+    // `chidori branches`).
+    let mut scopes: Vec<HistoryScope> = vec![HistoryScope {
+        branch_id: None,
+        branch_label: None,
+        branch_status: None,
+        dir: run_dir.clone(),
+        commits: sh::load_commits(&FsRunStore::new(&run_dir))?,
+    }];
+    let branches_root = run_dir.join("branches");
+    if branches_root.is_dir() {
+        let mut op_dirs: Vec<PathBuf> = std::fs::read_dir(&branches_root)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect();
+        op_dirs.sort();
+        for op_dir in op_dirs {
+            let mut branch_dirs: Vec<PathBuf> = std::fs::read_dir(&op_dir)?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.is_dir())
+                .collect();
+            branch_dirs.sort();
+            for branch_dir in branch_dirs {
+                let commits = sh::load_commits(&FsRunStore::new(&branch_dir))?;
+                if commits.is_empty() {
+                    continue;
+                }
+                let meta: Option<Value> = std::fs::read(branch_dir.join("branch.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                let meta_str = |key: &str| -> Option<String> {
+                    meta.as_ref()
+                        .and_then(|meta| meta.get(key))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                };
+                let branch_id = meta_str("branch_id")
+                    .or_else(|| commits.first().and_then(|c| c.branch_id.clone()))
+                    .unwrap_or_else(|| branch_dir.display().to_string());
+                scopes.push(HistoryScope {
+                    branch_id: Some(branch_id),
+                    branch_label: meta_str("label"),
+                    branch_status: meta_str("status"),
+                    dir: branch_dir,
+                    commits,
+                });
+            }
+        }
+    }
+
+    if scopes.iter().all(|scope| scope.commits.is_empty()) {
+        anyhow::bail!(
+            "no implementation history recorded for run {run_id} — runs persisted before \
+             source history existed have none (a new resume or branch operation will start one)"
+        );
+    }
+
+    // Commit id → (scope index, commit), for parent resolution and prefix
+    // lookups across the whole DAG.
+    let mut by_id: Vec<(usize, &SourceCommit)> = Vec::new();
+    for (scope_index, scope) in scopes.iter().enumerate() {
+        for commit in &scope.commits {
+            by_id.push((scope_index, commit));
+        }
+    }
+    let resolve = |reference: &str| -> Result<(usize, &SourceCommit)> {
+        let matches: Vec<&(usize, &SourceCommit)> = by_id
+            .iter()
+            .filter(|(_, commit)| sh::id_matches(&commit.id, reference))
+            .collect();
+        match matches.as_slice() {
+            [] => anyhow::bail!(
+                "no commit matching `{reference}` in run {run_id}'s history (prefixes need \
+                 at least 4 hex chars; list ids with `chidori history {run_id}`)"
+            ),
+            [one] => Ok(**one),
+            many => anyhow::bail!(
+                "commit reference `{reference}` is ambiguous: matches {}",
+                many.iter()
+                    .map(|(_, commit)| short_id(&commit.id).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    };
+    // Objects live in the store whose chain recorded them; a fork commit's
+    // parent lives in the run trunk — so lookups try the commit's own scope
+    // first, then every other store.
+    let load_object = |scope_index: usize, object: &str| -> Result<String> {
+        let mut order: Vec<usize> = (0..scopes.len()).collect();
+        order.retain(|index| *index != scope_index);
+        order.insert(0, scope_index);
+        for index in order {
+            if let Some(text) = sh::load_object(&FsRunStore::new(&scopes[index].dir), object)? {
+                return Ok(text);
+            }
+        }
+        anyhow::bail!("source object {object} not found in any of the run's history stores")
+    };
+    let parent_of = |commit: &SourceCommit| -> Option<(usize, &SourceCommit)> {
+        commit.parents.first().and_then(|parent| {
+            by_id
+                .iter()
+                .find(|(_, candidate)| candidate.id == *parent)
+                .copied()
+        })
+    };
+
+    if let Some(reference) = show {
+        let (scope_index, commit) = resolve(reference)?;
+        let entries: Vec<_> = commit
+            .tree
+            .iter()
+            .filter(|entry| path_filter.is_none_or(|path| entry.path == path))
+            .collect();
+        if entries.is_empty() {
+            anyhow::bail!(
+                "commit {} has no file matching --path (tree: {})",
+                short_id(&commit.id),
+                commit
+                    .tree
+                    .iter()
+                    .map(|entry| entry.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if json {
+            let mut files = serde_json::Map::new();
+            for entry in entries {
+                files.insert(
+                    entry.path.display().to_string(),
+                    Value::String(load_object(scope_index, &entry.object)?),
+                );
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "commit": commit,
+                    "files": files,
+                }))?
+            );
+        } else {
+            for entry in entries {
+                println!(
+                    "// {} @ {} ({})",
+                    entry.path.display(),
+                    short_id(&commit.id),
+                    commit.event
+                );
+                println!("{}", load_object(scope_index, &entry.object)?);
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(spec) = diff {
+        let (old, new) = match spec.split_once("..") {
+            Some((a, b)) => (resolve(a.trim())?, resolve(b.trim())?),
+            None => {
+                let new = resolve(spec.trim())?;
+                let old = parent_of(new.1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "commit {} has no recorded parent to diff against; use \
+                         `--diff <a>..<b>`",
+                        short_id(&new.1.id)
+                    )
+                })?;
+                (old, new)
+            }
+        };
+        let mut paths: Vec<&std::path::Path> = old
+            .1
+            .tree
+            .iter()
+            .chain(new.1.tree.iter())
+            .map(|entry| entry.path.as_path())
+            .filter(|path| path_filter.is_none_or(|filter| *path == filter))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            anyhow::bail!("--path matches no file in either commit's tree");
+        }
+        let mut printed = false;
+        for path in paths {
+            let old_text = match old.1.tree_object(path) {
+                Some(object) => load_object(old.0, object)?,
+                None => String::new(),
+            };
+            let new_text = match new.1.tree_object(path) {
+                Some(object) => load_object(new.0, object)?,
+                None => String::new(),
+            };
+            let rendered = sh::unified_diff(
+                &old_text,
+                &new_text,
+                &format!("a/{} @{}", path.display(), short_id(&old.1.id)),
+                &format!("b/{} @{}", path.display(), short_id(&new.1.id)),
+            );
+            if !rendered.is_empty() {
+                print!("{rendered}");
+                printed = true;
+            }
+        }
+        if !printed {
+            eprintln!(
+                "no differences between {} and {}",
+                short_id(&old.1.id),
+                short_id(&new.1.id)
+            );
+        }
+        return Ok(());
+    }
+
+    if json {
+        let branches: Vec<Value> = scopes
+            .iter()
+            .skip(1)
+            .map(|scope| {
+                serde_json::json!({
+                    "branchId": scope.branch_id,
+                    "label": scope.branch_label,
+                    "status": scope.branch_status,
+                    "commits": scope.commits,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "runId": run_id,
+                "run": scopes[0].commits,
+                "branches": branches,
+            }))?
+        );
+        return Ok(());
+    }
+
+    // Human listing: the trunk with execution spans, then each branch chain.
+    let total_records = FsRunStore::new(&run_dir)
+        .load_call_log()
+        .ok()
+        .flatten()
+        .map(|records| records.len() as u64);
+    let describe_changes = |commit: &SourceCommit| -> String {
+        // A fork's parent is the run trunk's head — a different module set,
+        // not an edit of it — so diffing against it would misread ("- agent.ts
+        // + strategy.ts"). List the fork's own files instead.
+        let parent =
+            if commit.event == crate::runtime::source_history::SourceCommitEvent::BranchFork {
+                None
+            } else {
+                parent_of(commit).map(|(_, parent)| parent)
+            };
+        if parent.is_none() {
+            return format!(
+                "{} file(s): {}",
+                commit.tree.len(),
+                commit
+                    .tree
+                    .iter()
+                    .map(|entry| entry.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let changes = sh::tree_changes(parent, commit);
+        if changes.is_empty() {
+            return "no file changes".to_string();
+        }
+        changes
+            .iter()
+            .map(|(path, change)| {
+                let marker = match change {
+                    TreeChange::Added => "+",
+                    TreeChange::Modified => "~",
+                    TreeChange::Removed => "-",
+                };
+                format!("{marker} {}", path.display())
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    println!("Implementation history for run {run_id}");
+    println!(
+        "(the code side of the run's history; `chidori trace {run_id}` shows the execution side)\n"
+    );
+    println!("run:");
+    if scopes[0].commits.is_empty() {
+        println!("  (no trunk history — recorded before source history existed)");
+    }
+    for (index, commit) in scopes[0].commits.iter().enumerate() {
+        println!(
+            "  * {} {:<21} {}  {}",
+            short_id(&commit.id),
+            commit.event.to_string(),
+            commit.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            describe_changes(commit),
+        );
+        // The execution records this version was live for: from its frontier
+        // to the next commit's (or the journal's end).
+        let start = commit.journal_frontier;
+        let end = scopes[0]
+            .commits
+            .get(index + 1)
+            .map(|next| next.journal_frontier)
+            .or(total_records);
+        match end {
+            Some(end) if end > start => {
+                println!(
+                    "  |     journal records {}..{} executed under this version",
+                    start + 1,
+                    end
+                );
+            }
+            _ => {
+                println!("  |     active from journal frontier {start}");
+            }
+        }
+    }
+    for scope in scopes.iter().skip(1) {
+        let branch_id = scope.branch_id.as_deref().unwrap_or("?");
+        let mut headline = format!("\nbranch {branch_id}");
+        if let Some(label) = &scope.branch_label {
+            headline.push_str(&format!(" [label \"{label}\"]"));
+        }
+        if let Some(status) = &scope.branch_status {
+            headline.push_str(&format!(" ({status})"));
+        }
+        let fork = scope.commits.first();
+        if let Some(fork) = fork {
+            headline.push_str(&format!(", forked at parent seq {}", fork.journal_frontier));
+            if let Some(parent) = fork.parents.first() {
+                headline.push_str(&format!(" from {}", short_id(parent)));
+            }
+        }
+        println!("{headline}:");
+        for commit in &scope.commits {
+            println!(
+                "  * {} {:<21} {}  {}",
+                short_id(&commit.id),
+                commit.event.to_string(),
+                commit.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                describe_changes(commit),
+            );
+        }
+    }
+    println!(
+        "\nInspect a version with `chidori history {run_id} --show <commit>`, compare with \
+         `--diff <a>..<b>` (or `--diff <commit>` against its parent)."
+    );
     Ok(())
 }
 

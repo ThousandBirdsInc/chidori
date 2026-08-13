@@ -56,6 +56,8 @@ use crate::runtime::snapshot::{
     CallLogSequenceRange, HostOperationId, ParallelBranchManifest, BRANCHES_DIR,
     DEFAULT_BRANCH_SEQUENCE_RANGE_WIDTH,
 };
+use crate::runtime::source_history::{self, CommitInput, SourceCommitEvent};
+use crate::runtime::store::FsRunStore;
 use crate::runtime::typescript::bindings::HostBindingBackend;
 use crate::runtime::vfs::Vfs;
 
@@ -520,7 +522,14 @@ pub(crate) fn resume_branch(
         error: None,
     });
 
-    run_persisted_branch(backend, &op_dir, &branch_dir, meta, replay_log)
+    run_persisted_branch(
+        backend,
+        &op_dir,
+        &branch_dir,
+        meta,
+        replay_log,
+        SourceCommitEvent::BranchResume,
+    )
 }
 
 /// Re-run a persisted branch **fresh from its parent anchor** with whatever
@@ -535,7 +544,14 @@ pub(crate) fn rerun_branch(
     branch_id: &str,
 ) -> std::result::Result<Value, String> {
     let (op_dir, branch_dir, meta) = find_branch(run_dir, branch_id)?;
-    run_persisted_branch(backend, &op_dir, &branch_dir, meta, Vec::new())
+    run_persisted_branch(
+        backend,
+        &op_dir,
+        &branch_dir,
+        meta,
+        Vec::new(),
+        SourceCommitEvent::BranchRerun,
+    )
 }
 
 /// Shared core of [`resume_branch`] / [`rerun_branch`]: rebuild the branch
@@ -547,8 +563,37 @@ fn run_persisted_branch(
     branch_dir: &Path,
     mut meta: BranchMeta,
     replay_log: Vec<CallRecord>,
+    history_event: SourceCommitEvent,
 ) -> std::result::Result<Value, String> {
     let anchor = load_anchor(op_dir)?;
+
+    // Whatever `source.ts` now contains is the implementation about to run:
+    // chain it into the branch's source history before executing. The
+    // head-tree dedupe makes this a no-op when the code is unchanged (the
+    // plain resume case), so only real edits grow the chain. Best-effort.
+    match std::fs::read_to_string(branch_dir.join(BRANCH_SOURCE_FILE)) {
+        Ok(source_text) => {
+            let entry = PathBuf::from(&meta.original_source);
+            let files = vec![(entry.clone(), source_text)];
+            if let Err(err) = source_history::record_commit(
+                &FsRunStore::new(branch_dir),
+                CommitInput {
+                    event: history_event,
+                    run_id: &meta.parent_run_id,
+                    branch_id: Some(&meta.branch_id),
+                    entry_path: &entry,
+                    files: &files,
+                    journal_frontier: replay_log.len() as u64,
+                    extra_parent: None,
+                },
+            ) {
+                tracing::warn!(error = %err, branch = %meta.branch_id, "failed to record branch source history");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, branch = %meta.branch_id, "failed to read branch source for history");
+        }
+    }
     let branch_ctx = RuntimeContext::for_branch_resume(
         replay_log,
         anchor.vfs,
@@ -610,6 +655,19 @@ fn persist_anchor_and_sources(
     let bytes = serde_json::to_vec_pretty(anchor).map_err(|err| err.to_string())?;
     std::fs::write(&anchor_path, bytes)
         .map_err(|err| format!("writing {}: {err}", anchor_path.display()))?;
+    // The fork is a code-history event too: each branch's history opens with
+    // a `branch_fork` commit of the variant's own source, parented on the
+    // parent run's head commit — the git-like fork point tying the branch's
+    // implementation chain back to the trunk's.
+    let fork_parent = op_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|run_dir| {
+            source_history::head_commit(&FsRunStore::new(run_dir))
+                .ok()
+                .flatten()
+        })
+        .map(|head| head.id);
     for (index, variant) in variants.iter().enumerate() {
         let dir = branch_dir(op_dir, index as u32);
         std::fs::create_dir_all(&dir)
@@ -617,6 +675,25 @@ fn persist_anchor_and_sources(
         let source_path = dir.join(BRANCH_SOURCE_FILE);
         std::fs::write(&source_path, &variant.source_text)
             .map_err(|err| format!("writing {}: {err}", source_path.display()))?;
+        let branch_id = format!(
+            "{}-op{}-branch-{}",
+            anchor.parent_run_id, anchor.branch_seq, index
+        );
+        let files = vec![(PathBuf::from(&variant.source), variant.source_text.clone())];
+        if let Err(err) = source_history::record_commit(
+            &FsRunStore::new(&dir),
+            CommitInput {
+                event: SourceCommitEvent::BranchFork,
+                run_id: &anchor.parent_run_id,
+                branch_id: Some(&branch_id),
+                entry_path: Path::new(&variant.source),
+                files: &files,
+                journal_frontier: anchor.branch_seq,
+                extra_parent: fork_parent.clone(),
+            },
+        ) {
+            tracing::warn!(error = %err, branch = %branch_id, "failed to record branch fork source history");
+        }
     }
     Ok(())
 }
@@ -1207,6 +1284,33 @@ mod tests {
             meta.output,
             Some(json!({ "version": "v2-edited", "note": "from-parent", "suffix": "s1" }))
         );
+
+        // The branch's implementation history is git-like: the fork commit
+        // holds the original strategy, the rerun commit chains the edit onto
+        // it, and both full texts are recoverable from the branch store.
+        use crate::runtime::source_history::{self, SourceCommitEvent};
+        let history_store = crate::runtime::store::FsRunStore::new(&branch_dir);
+        let commits = source_history::load_commits(&history_store).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].event, SourceCommitEvent::BranchFork);
+        assert_eq!(commits[0].branch_id.as_deref(), Some(branch_id.as_str()));
+        assert_eq!(commits[1].event, SourceCommitEvent::BranchRerun);
+        assert_eq!(commits[1].parents, vec![commits[0].id.clone()]);
+        let strategy_path = std::path::PathBuf::from(&meta.original_source);
+        let forked = source_history::load_object(
+            &history_store,
+            commits[0].tree_object(&strategy_path).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let rerun_text = source_history::load_object(
+            &history_store,
+            commits[1].tree_object(&strategy_path).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(forked.contains("\"v1\""));
+        assert!(rerun_text.contains("\"v2-edited\""));
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(base);

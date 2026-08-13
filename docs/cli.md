@@ -37,6 +37,7 @@ its job and the doc that covers it in depth.
 | `chidori trace <run_id>` | Print a run's call log — every prompt, tool call, and effect, with token counts and cost (including prompt-cache read/write totals). |
 | `chidori stats` | Usage and cost totals, including prompt-cache read/write tokens. |
 | `chidori snapshot <run_id>` | Print `runtime.snapshot.json` metadata (never raw VM snapshot bytes). |
+| `chidori history <run_id>` | The code side of the run's history: the git-like chain of source versions (run start, accepted edits, branch forks/reruns), each anchored to the journal records that executed under it. `--show <commit>` prints a stored version, `--diff <a>..<b>` (or `--diff <commit>` vs its parent) compares two, `--json` for machines ([source history](./source-history.md)). |
 
 Run journals live under `.chidori/runs/<run_id>/` next to the agent file;
 pass `--dir <path>` when tracing from elsewhere.

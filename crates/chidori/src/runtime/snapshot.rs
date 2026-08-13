@@ -1070,6 +1070,24 @@ pub fn validate_manifest_for_resume(
                  because the caller opted in (allow_source_change) — replay will fail loudly \
                  if the edit diverges from already-journaled calls: {err}"
             );
+            // The accepted edit is history: chain it into the run's git-like
+            // source history before replay begins, so both the version that
+            // produced the journaled prefix and the version taking over stay
+            // recoverable (`chidori history <run-id>`). Best-effort — a
+            // recording failure warns, it never blocks the resume.
+            if let Err(record_err) = record_accepted_source_change(
+                &run_base.join(run_id),
+                run_id,
+                &manifest,
+                agent_path,
+                &entry_source,
+                &current_modules,
+            ) {
+                tracing::warn!(
+                    "failed to record edit-and-resume source history for run {run_id}: \
+                     {record_err}"
+                );
+            }
             Ok(())
         }
         Err(err) => Err(err.context(
@@ -1078,6 +1096,72 @@ pub fn validate_manifest_for_resume(
              (server) to replay the recorded calls against the edited code",
         )),
     }
+}
+
+/// Record an accepted edit-and-resume into the run's source history
+/// (`runtime::source_history`): the edited entry + modules chain onto the
+/// history head as a `resume_source_change` commit, anchored at the
+/// manifest's durable journal frontier. For runs recorded before source
+/// history existed the original entry text still lives in the persisted
+/// `DurableBlob.bundle`, so a `run_start` commit is synthesized from it first
+/// (only when its hash matches the manifest's entry fingerprint — never
+/// fabricate) and "what changed since the recording" stays diffable even for
+/// old runs.
+fn record_accepted_source_change(
+    run_dir: &Path,
+    run_id: &str,
+    manifest: &SnapshotManifest,
+    agent_path: &Path,
+    entry_source: &str,
+    current_modules: &[SourceFingerprint],
+) -> Result<()> {
+    use crate::runtime::source_history::{self, CommitInput, SourceCommitEvent};
+    use crate::runtime::store::RunStore as _;
+
+    let store = crate::runtime::store::FsRunStore::new(run_dir);
+
+    if source_history::head_commit(&store)?.is_none() {
+        if let Some(bytes) = store.get_blob(&manifest.snapshot_file)? {
+            if let Ok(blob) = serde_json::from_slice::<chidori_js::replay::DurableBlob>(&bytes) {
+                let recorded = SourceFingerprint::from_source(&manifest.entry.path, &blob.bundle);
+                if recorded == manifest.entry {
+                    let files = vec![(manifest.entry.path.clone(), blob.bundle)];
+                    source_history::record_commit(
+                        &store,
+                        CommitInput {
+                            event: SourceCommitEvent::RunStart,
+                            run_id,
+                            branch_id: None,
+                            entry_path: &manifest.entry.path,
+                            files: &files,
+                            journal_frontier: 0,
+                            extra_parent: None,
+                        },
+                    )?;
+                }
+            }
+        }
+    }
+
+    let module_paths: Vec<PathBuf> = current_modules
+        .iter()
+        .map(|module| module.path.clone())
+        .collect();
+    let mut files = vec![(agent_path.to_path_buf(), entry_source.to_string())];
+    files.extend(source_history::read_source_files(&module_paths)?);
+    source_history::record_commit(
+        &store,
+        CommitInput {
+            event: SourceCommitEvent::ResumeSourceChange,
+            run_id,
+            branch_id: None,
+            entry_path: agent_path,
+            files: &files,
+            journal_frontier: manifest.call_log_len as u64,
+            extra_parent: None,
+        },
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1679,6 +1763,92 @@ mod completed_args_match_tests {
             &json!({"text": "hi"}),
             &json!({"text": "CHANGED"}),
         ));
+    }
+}
+
+#[cfg(test)]
+mod source_change_history_tests {
+    use super::*;
+    use crate::runtime::source_history::{self, unified_diff, SourceCommitEvent};
+    use crate::runtime::store::FsRunStore;
+
+    /// Edit-and-resume records the accepted change into the run's git-like
+    /// source history — and for runs recorded before source history existed,
+    /// first synthesizes the original version from the persisted
+    /// `DurableBlob.bundle`, so the pre-edit implementation stays recoverable
+    /// and diffable. A refused resume records nothing; a repeated identical
+    /// edit dedupes.
+    #[test]
+    fn allow_source_change_resume_records_history() {
+        let base =
+            std::env::temp_dir().join(format!("chidori-resume-history-{}", uuid::Uuid::new_v4()));
+        let run_id = "run-1";
+        let run_dir = base.join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let proj = base.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let agent_path = proj.join("agent.ts");
+
+        let original = "export async function agent() { return { v: \"original\" }; }\n";
+        let edited = "export async function agent() { return { v: \"edited\" }; }\n";
+        std::fs::write(&agent_path, edited).unwrap();
+
+        // A legacy-shaped run: manifest carrying the ORIGINAL fingerprint,
+        // blob carrying the original bundle, and no history/ at all.
+        let policy = RuntimePolicy::from_env_for_durable_run(run_id).unwrap();
+        let manifest = SnapshotManifest::new(
+            run_id,
+            SnapshotAbi::current("chidori-quickjs"),
+            policy,
+            SourceFingerprint::from_source(&agent_path, original),
+            Vec::new(),
+            None,
+            5,
+        );
+        let blob = chidori_js::replay::DurableBlob {
+            bundle: original.to_string(),
+            effects: Vec::new(),
+            journal: Vec::new(),
+        };
+        SnapshotStore::new(&run_dir)
+            .save(&manifest, &serde_json::to_vec(&blob).unwrap(), &[])
+            .unwrap();
+
+        // Without the opt-in the resume refuses — and records nothing.
+        assert!(validate_manifest_for_resume(&base, Some(run_id), &agent_path, false).is_err());
+        let fs_store = FsRunStore::new(&run_dir);
+        assert!(source_history::load_commits(&fs_store).unwrap().is_empty());
+
+        // With the opt-in: synthesized run_start (the original) + the edit,
+        // chained, with the edit anchored at the manifest's journal frontier.
+        validate_manifest_for_resume(&base, Some(run_id), &agent_path, true).unwrap();
+        let commits = source_history::load_commits(&fs_store).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].event, SourceCommitEvent::RunStart);
+        assert_eq!(commits[0].journal_frontier, 0);
+        assert_eq!(commits[1].event, SourceCommitEvent::ResumeSourceChange);
+        assert_eq!(commits[1].journal_frontier, 5);
+        assert_eq!(commits[1].parents, vec![commits[0].id.clone()]);
+
+        let old =
+            source_history::load_object(&fs_store, commits[0].tree_object(&agent_path).unwrap())
+                .unwrap()
+                .unwrap();
+        let new =
+            source_history::load_object(&fs_store, commits[1].tree_object(&agent_path).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(old, original);
+        assert_eq!(new, edited);
+        let diff = unified_diff(&old, &new, "a/agent.ts", "b/agent.ts");
+        assert!(diff.contains("-export async function agent() { return { v: \"original\" }; }"));
+        assert!(diff.contains("+export async function agent() { return { v: \"edited\" }; }"));
+
+        // A second validated resume with the same edit appends nothing.
+        validate_manifest_for_resume(&base, Some(run_id), &agent_path, true).unwrap();
+        assert_eq!(source_history::load_commits(&fs_store).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }
 
