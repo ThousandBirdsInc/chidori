@@ -29,7 +29,11 @@ Replay is guarded, not best-effort:
   The divergence checks below still guard the journaled prefix — an edit that
   changes an already-recorded call fails loudly, an edit past the pause point
   resumes cleanly. ABI/policy mismatches are environment drift, not edits,
-  and always refuse.
+  and always refuse. Every accepted edit is also recorded as a commit in the
+  run's git-like source history, so the version that produced the journaled
+  prefix and the version taking over both stay recoverable — inspect and
+  diff them with `chidori history <run-id>`
+  ([`docs/source-history.md`](./source-history.md)).
 - **Divergence checks compare arguments, not just names:** a replayed call
   must match the recorded call's function *and* arguments (the derived
   `request_digest` field is ignored). A completed async host operation whose

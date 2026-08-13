@@ -291,6 +291,10 @@ pub struct FuncProto {
 /// evaluated values.
 pub struct ObjTemplate {
     pub map: crate::fxhash::FxIndexMap<crate::value::PropertyKey, crate::value::Property>,
+    /// Precomputed at template build: does any key parse as an array index?
+    /// Instantiation hands it straight to `ObjectData::new_shaped_with`, so
+    /// the per-object `has_idx_keys` bit costs nothing per literal.
+    pub has_idx_keys: bool,
     /// Memoized (realm root, leaf) shape pair for this literal site: after
     /// the first instantiation in a realm, building the object is ONE slot
     /// vec allocation + N value writes under the cached leaf shape — no
@@ -1633,6 +1637,16 @@ pub struct Kernel {
     pub uses_char_code: bool,
     /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
     pub shapes: Box<[Box<[KShapeSlot]>]>,
+    /// Futility latch — a pure performance side effect (never serialized,
+    /// never observable; the fallback path is byte-identical). A BAIL exit
+    /// (non-empty shape: mid-expression operands to reconstruct) bumps it, a
+    /// clean exit (empty shape: a statement-boundary loop exit) decays it;
+    /// at [`crate::exec::KERNEL_FUTILITY_LATCH`] the guard stops trying and
+    /// the loop runs generically — the pattern of a region whose element
+    /// types never match the kernel's speculation (an object-array loop in
+    /// glue code bails on EVERY iteration; the guard+enter+bail cycle would
+    /// otherwise be paid per iteration forever).
+    pub futile: std::cell::Cell<u8>,
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
     /// entry-resolved to raw slot indices. See [`KProp`].
     pub props_used: Box<[KProp]>,

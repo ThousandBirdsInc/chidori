@@ -2041,13 +2041,15 @@ impl Compiler {
         };
         // Register bytecode (reg.rs, docs/js-performance-roadmap.md §3.5):
         // translate the whole body into a register program when every op is
-        // in the translated subset. Runs LAST so it sees the final stream;
-        // functions carrying loop kernels decline inside `regify` (the
-        // unboxed kernels are faster than boxed register ops and own their
-        // functions), as does anything with try/finally handlers, `with`/
-        // direct-eval machinery, suspension, or super/private class wiring.
+        // in the translated subset. Runs LAST so it sees the final stream.
+        // Loop kernels EMBED (§6.10.2): `Op::LoopKernel` translates to
+        // `ROp::LoopKernel` + its fallback twin, with kernel exits resuming
+        // at mapped register pcs — so glue functions whose loops kernelized
+        // no longer forfeit the register tier. Declines remain for `with`/
+        // direct-eval machinery, suspension, and super/private class wiring.
         let reg = if self.regify {
-            crate::reg::regify(&code, loc.num_locals, &fc.consts, &pos).map(std::rc::Rc::new)
+            crate::reg::regify(&code, loc.num_locals, &fc.consts, &pos, &kernels)
+                .map(std::rc::Rc::new)
         } else {
             None
         };
@@ -4143,6 +4145,7 @@ impl Compiler {
         let fc = self.fns.last_mut().expect("fn ctx");
         fc.obj_tpls
             .push(std::rc::Rc::new(crate::bytecode::ObjTemplate {
+                has_idx_keys: map.keys().any(|k| k.array_index().is_some()),
                 map,
                 shape_cache: Default::default(),
             }));

@@ -590,6 +590,26 @@ const CORPUS: &[&str] = &[
     "let s = \"ok\"; let h = 0; for (let r = 0; r < 2; r++) { for (let i = 0; i < s.length; i++) h += s.charCodeAt(i); s = \"next\"; } console.log(h);",
     // charCodeAt result feeding arithmetic, compares, and a stored boolean.
     "const s = \"mixed13chars\"; let digits = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); const isd = c >= 48 && c <= 57; if (isd) digits++; } console.log(digits);",
+    // ---- Register-tier kernel embedding (docs §6.10.2 / §6.18) ----
+    // A kernelized numeric loop NESTED inside a for-of: the enclosing
+    // iterator lives BELOW the loop on the operand stack, so kernel exits
+    // resume at a non-zero base depth in the register program.
+    "let t = 0; for (const r of [[1, 2, 3], [4], [5, 6]]) { let s = 0; for (let i = 0; i < r.length; i++) { s += r[i]; } t += s * 10; } console.log(t);",
+    // Same shape, but the inner loop BAILS mid-run: a row switches to
+    // object elements, so the access op resumes generically at base depth.
+    "let t = ''; for (const r of [[1, 2], [{ v: 3 }, 4], [5]]) { let s = 0; for (let i = 0; i < r.length; i++) { s += r[i].v ?? r[i]; } t += s + '|'; } console.log(t);",
+    // Bail-heavy glue: object elements make the kernel bail EVERY iteration
+    // (and, past the futility latch, stop being attempted) — results must
+    // stay identical throughout, including well past the latch threshold.
+    "const items = []; for (let i = 0; i < 40; i++) items.push({ id: i, w: i % 7 }); let acc = 0; for (let round = 0; round < 30; round++) { for (let i = 0; i < items.length; i++) { acc += items[i].w; } } console.log(acc);",
+    // Futility latch must not disturb a HEALTHY kernel compiled from the
+    // same program: the object loop latches, the numeric loop keeps
+    // kernelling; both answers are exact.
+    "const objs = [{ n: 1 }, { n: 2 }]; let a = 0, b = 0; for (let round = 0; round < 25; round++) { for (let i = 0; i < objs.length; i++) a += objs[i].n; let s = 0; for (let i = 0; i < 100; i++) s += i; b = s; } console.log(a, b);",
+    // Latched-past-warming: the guard declines for the first 20 activations
+    // (string-typed local) and the latch keeps the loop generic even after
+    // it would qualify; output must be identical either way.
+    "let out = 0; for (let round = 0; round < 24; round++) { let x = round < 20 ? 'p' : 0; let s = 0; for (let i = 0; i < 5; i++) { s = x === 'p' ? s + 1 : s + i; } out += s; } console.log(out);",
 ];
 
 #[test]

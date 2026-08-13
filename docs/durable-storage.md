@@ -27,7 +27,9 @@ guarantees each backend gives, and how a run survives losing the machine.
 
 Everything a run persists — the journal, the snapshot manifest and blob, the
 pending host operation, the host-promise table, the signal inbox, branch
-stores — flows through one `RunStore` handle
+stores, the source history (`history/`, the git-like record of the agent's
+implementation alongside the journal — `docs/source-history.md`) — flows
+through one `RunStore` handle
 (`crates/chidori/src/runtime/store.rs`). The filesystem layout is always the
 primary and is byte-identical to what the framework has always written, so
 every existing consumer (the viewer, `chidori trace`, external tooling) keeps

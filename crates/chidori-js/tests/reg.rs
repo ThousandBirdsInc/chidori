@@ -524,8 +524,67 @@ fn structural_translation_pins() {
         });
         assert!(found, "{name}: `{needle}` must carry a register program:\n{src}");
     }
+    // Loop-KERNELIZED functions now translate too (§6.10.2 embedding): the
+    // register program carries `ROp::LoopKernel` + its fallback twin, and
+    // kernel exits resume at mapped register pcs. Bail-capable kernels
+    // (element access) must also publish a resume map.
+    for (name, needle, src, want_resumes) in [
+        (
+            "numeric kernel",
+            "k",
+            "function k(n) { let s = 0; for (let i = 0; i < n; i++) s += i * 2; return s; } k(3);",
+            false,
+        ),
+        (
+            "array kernel",
+            "ka",
+            "function ka(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; return s; } ka([1, 2, 3]);",
+            true,
+        ),
+        (
+            "kernel nested in for-of",
+            "kf",
+            "function kf(rows) { let t = 0; for (const r of rows) { let s = 0; for (let i = 0; i < r.length; i++) s += r[i]; t += s; } return t; } kf([[1, 2], [3]]);",
+            true,
+        ),
+    ] {
+        let proto = compile_script(src).expect("compiles");
+        let mut ok = false;
+        walk_protos(&proto, &mut |p| {
+            if p.name == needle {
+                assert!(
+                    !p.kernels.is_empty(),
+                    "{name}: `{needle}` should have kernelized:
+{src}"
+                );
+                let Some(reg) = &p.reg else {
+                    panic!("{name}: `{needle}` must carry a register program:
+{src}");
+                };
+                let probes = reg
+                    .code
+                    .iter()
+                    .filter(|o| matches!(o, chidori_js::reg::ROp::LoopKernel { .. }))
+                    .count();
+                assert_eq!(
+                    probes,
+                    p.kernels.len(),
+                    "{name}: every kernel embeds exactly one ROp::LoopKernel"
+                );
+                if want_resumes {
+                    assert!(
+                        !reg.kernel_resume.is_empty(),
+                        "{name}: bail-capable kernel must publish a resume map"
+                    );
+                }
+                ok = true;
+            }
+        });
+        assert!(ok, "{name}: `{needle}` not found:
+{src}");
+    }
     // Must NOT translate: with, direct eval, generators, suspending async
-    // bodies, `using` declarations, and loop-kernelized functions.
+    // bodies, `using` declarations, and super class wiring.
     for (name, needle, src) in [
         (
             "with",
@@ -542,11 +601,6 @@ fn structural_translation_pins() {
             "await",
             "aw",
             "async function aw() { return await 1; } aw();",
-        ),
-        (
-            "kernel loop",
-            "k",
-            "function k(n) { let s = 0; for (let i = 0; i < n; i++) s += i * 2; return s; } k(3);",
         ),
         (
             "extends",

@@ -1782,6 +1782,154 @@ the reg budget sweep runs over the new corpus entries (and caught the
 first cost-model cut); full suites green; benchmark cross-checks green on
 all four runtimes; clippy and rustfmt clean.
 
+## 6.17 React render latency (2026-08-13): the browser-use-case measurement
+and the index-key probe fast path
+
+Question under test: is React on chidori-js fast enough for a *browser* use
+case — the LiveView-style loop where every user event triggers a full
+`renderToStaticMarkup` pass on the engine (natively behind a host, or as
+wasm via `crates/chidori-wasm` + `sdk/browser`)? A new example,
+`examples/react_perf.rs`, measures it directly: the vendored React 18 +
+react-dom/server bundles, a js-framework-benchmark-shaped table app
+(N rows × 4 cells, one selected row, every 10th label mutated per tick),
+one full re-render per event, no memoization. Markup is byte-identical to
+Node 22 on the same bundles.
+
+**Profile finding (callgrind, load + 10 ticks at 100 rows):** ~31% of ALL
+instructions were one guard — `protos_allow_any_index_create`, the
+per-kernel-activation check that no prototype on a store-target's chain
+carries a reified index key. It probes every own key of
+`Array.prototype`/`Object.prototype` (Dict-mode intrinsics, ~45 keys per
+chain) through `PropertyKey::array_index()`, which materialized a
+UTF-8-validated `&str` per key — 5.57 M `from_utf8` calls (629 M
+instructions, 22.3%) plus 247 M (8.8%) in the walk itself, re-run per
+activation because React's element/children building kernelizes with
+`stores_elems` on fresh arrays constantly.
+
+**Fix (landed):** `array_index()` rejects named keys on the raw
+`wtf8_bytes()` view — a canonical index must start with an ASCII digit —
+before building the validated `&str`. Equivalent by case analysis
+(non-digit-leading keys already returned `None` through
+`canonical_index`; WTF-8 lossy views agree on a leading ASCII digit), so
+no semantic surface at all.
+
+| metric (100-row app) | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| instructions, load + 10 renders | 2.823 G | 2.086 G | **−26%** |
+| instructions per render | ~280 M | ~206 M | −26% |
+| wall per render (warm avg) | ~37 ms | ~31 ms | −16% |
+
+Gates: full chidori-js suite green (219 tests, incl. record→replay
+byte-identity and the kernels/reg differential corpora), Test262 gate
+green (0 regressions, 99.49%), clippy clean, React markup byte-identical
+to Node before/after.
+
+**Where React render latency stands (idle container, warm avg/min):**
+
+| rows | markup | chidori-js | node 22 (V8) | gap |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 2.9 KB | 3.8 / 3.3 ms | 0.15 / 0.04 ms | ~25× |
+| 100 | 25 KB | 31 / 29 ms | 0.50 / 0.34 ms | ~60× |
+| 500 | 125 KB | 157 / 150 ms | 2.9 / 2.3 ms | ~55× |
+| 1000 | 250 KB | 315 / 297 ms | 6.3 / 4.9 ms | ~50× |
+
+One-time costs are small: engine ~0.6 ms + React bundles ~15 ms eval.
+Remaining profile is the known structural tax, now with no single cliff:
+register/stack dispatch ~27%, boxed `Value` clone/drop ~17%, the residual
+index-key walk ~7% (a per-shape/per-object cached verdict is the next
+lever if it matters), IC + property probes ~6%.
+
+**Measured in the browser** (chidori-wasm `evalScript` in headless
+Chromium on the same container, per-render isolated by a 2-tick/12-tick
+diff so per-call engine + bundle compile costs cancel): 10 rows ~12 ms,
+100 rows ~40 ms (1.3× native), 500 rows ~214 ms (1.4×) — the wasm
+penalty at realistic sizes is ~1.3–1.5×, not the 2–3× folklore figure.
+The wasm artifact is 7.8 MB (2.2 MB gzipped), a page-load cost, not a
+latency one.
+
+**Reading for the browser use case:** ~30 ms native / ~40 ms in-browser
+per full re-render at 100 rows sits inside the ~100 ms perceived-instant
+budget — form/dashboard-class agent UIs re-rendered per click are fine
+natively and workable in-browser; 500+ row tables or per-keystroke
+re-render are not, and 60 fps was never the target
+(`docs/dom-runtime-prototype.md`). The honest levers, in order:
+render less (memoized subtrees render fine today — this benchmark
+deliberately re-renders everything), the §6.12.2 structural work (smaller
+`Value`, reg-tier superinstructions, ObjectData arena), and only then
+JIT-class throughput (§4).
+
+## 6.18 The LiveView round (2026-08-13): O(1) index-key guard + register-tier
+kernel embedding + the futility latch
+
+Follow-up to §6.17, driven by the product goal of making the LiveView-style
+loop (a full React re-render per user event) effective. Three changes, all
+safe Rust, zero new dependencies, gated by both differential corpora,
+record→replay byte-identity, and the Test262 gate (0 regressions, 99.49%).
+
+1. **`ObjectData::has_idx_keys` — the O(1) chain guard.** §6.17 left
+   `protos_allow_any_index_create` at ~7% of the React profile: every
+   `stores_elems` kernel activation probed every own key of
+   `Array.prototype` + `Object.prototype` (~45 keys/chain, Dict-mode
+   intrinsics). The bit is maintained EXACTLY at the (audited, private-
+   storage) mutation surface — insert sets it, a delete under the flag
+   recounts, bulk installs scan, object templates precompute — so both
+   guards now answer per level with one flag read. Drift is impossible
+   toward unsound `false`; a hypothetical stale `true` merely declines a
+   fast path. React: 2.086 G → 1.918 G (−8.1%); property_access −3.9%,
+   arith_loop −3.1% against a same-toolchain HEAD~1 baseline.
+
+2. **Register-tier loop-kernel embedding (§6.10.2, landed).** The tier-
+   policy experiment (kernels compiled out: −10%; reg compiled out: +27%)
+   showed React's glue functions were pinned to the STACK tier by kernels
+   that never fire — their loops iterate object arrays, so the guard
+   declined 8,834 times per render with ZERO entries. `Op::LoopKernel` now
+   translates: `ROp::LoopKernel` + the translated fallback twin, with all
+   analysis treating the op as its fallback header. Kernel `KOp::Exit`
+   targets are forced to be labels; exit/bail shapes materialize into
+   canonical registers ON TOP of the header's base depth (an enclosing
+   for-of holds its iterator below the loop — the one-line contract the
+   whole React bundle hinged on) and resume at mapped register pcs
+   (`RegProto::kernel_resume`). Kernels stay off under an op budget
+   (fall-through to the twin, exact drain), and a declined/bailed
+   activation continues in REGISTER mode — no stack-tier involvement.
+
+3. **Kernel futility latch** (`Kernel::futile`, latch 16). A kernel whose
+   speculation never matches the live types pays guard+enter+bail (or a
+   full guard walk) per back-edge forever. Guard declines and bail exits
+   (non-empty shape) bump a per-kernel counter, clean exits decay it, and
+   at 16 the guard short-circuits to one Cell read. Budget declines are
+   excluded (a budgeted fleet must not poison shared protos). Warm-up
+   declines (`let x;` → number) decay away; a healthy kernel pins at 0.
+   Same pure-side-effect class as the ICs and the JIT cache: never
+   serialized, tier choice is semantically invisible, and the differential
+   corpora run programs well past the latch point.
+
+Measured on the React workload (callgrind, load + 10 × 100-row renders):
+1.918 G → 1.768 G (−7.8% for 2+3 combined; −2.3% from the kernels-
+compiled-out ceiling). Cumulative §6.17→§6.18: **2.823 G → 1.768 G
+(−37%)**; per-render ~280 M → ~174 M instructions. Kernel-owned workloads
+against the exact HEAD~1 baseline: sort +0.009% (noise), closures −0.3%,
+array_sum −1.6%, mixed_helpers −0.2% — the embedding costs nothing where
+kernels are healthy.
+
+**Where the LiveView loop stands** (idle container; browser = chidori-wasm
+in headless Chromium, 2/12-tick diff):
+
+| rows | native warm avg/min | in-browser (wasm) |
+| ---: | ---: | ---: |
+| 10 | 3.2 / 2.9 ms | 3.0 ms |
+| 100 | 26.5 / 24.9 ms | 35.6 ms |
+| 500 | 135 / 129 ms | 179 ms |
+| 1000 | 262 / 255 ms | — |
+
+A 100-row full re-render per click is now ~26 ms native / ~36 ms in the
+browser — comfortably inside the ~100 ms perceived-instant budget with
+zero memoization; 10-row (form/dialog-class) UIs re-render at effectively
+input-rate cost. The remaining profile is the known structural tax with no
+cliffs: register dispatch ~16%, boxed `Value` clone/drop ~18%, call
+ceremony ~8% — the §6.12.2 levers (smaller `Value`, reg superinstructions,
+ObjectData arena) are the next altitude.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

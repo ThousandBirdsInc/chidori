@@ -559,6 +559,7 @@ impl Vm {
             Some(self.realm.object_proto.clone()),
             shape,
             slots,
+            tpl.has_idx_keys,
         ))
     }
 

@@ -26,6 +26,7 @@ can log it, cache it, replay it, pause on it, and resume from it:
 | Runs checkpoint at every host safepoint | **Crash recovery** — kill the process mid-run, resume in a new one ([Durable Storage](./durable-storage.md)) |
 | A pause is just a host call with no answer yet | **Humans in the loop without a live process** — suspend to disk, resume days later ([Signals](./signals.md)) |
 | A recording fully specifies behavior | **Checkpoints as CI tests** — `chidori verify` asserts zero drift for $0 ([Value Checkpoints](./value-checkpoints.md)) |
+| Code changes are events too | **Implementation history** — a git-like chain of every source version that ran, diffable, anchored to the journal ([Source History](./source-history.md)) |
 
 ## Where to start
 

@@ -134,6 +134,10 @@ is persisted under it:
     checkpoint.json        the branch's call log (same shape as a run's)
     branch.json            metadata: label, id, status, pending input,
                            reserved sequence range, input, output/error
+    history/               the branch's git-like source history: a
+                           `branch_fork` commit of the variant's source
+                           (parented on the parent run's head commit), plus
+                           one commit per accepted edit (`docs/source-history.md`)
 ```
 
 The anchor and the per-branch source copies are written **before** the fan-out
@@ -174,7 +178,13 @@ posture flags as `chidori run`.
   state, not a source identity check.
 
 A resumed or re-run branch updates only its own store; the parent's recorded
-`branch` outcome is immutable history (compare, don't merge).
+`branch` outcome is immutable history (compare, don't merge). The branch's
+**code** history is kept too: each edit that actually runs (`branch-rerun`,
+or a resume whose `source.ts` changed) chains a commit onto the branch's
+`history/` store, so every strategy version that ever ran from the anchor
+stays recoverable and diffable — `chidori history <run-id>` shows the chains
+and `--diff` compares any two versions (see
+[`docs/source-history.md`](./source-history.md)).
 
 ## Correctness and determinism
 
