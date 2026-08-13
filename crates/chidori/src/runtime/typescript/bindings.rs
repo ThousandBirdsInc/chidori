@@ -909,6 +909,37 @@ impl HostBindingBackend {
         }
     }
 
+    /// Clone this runtime backend with the tool registry narrowed to `names`
+    /// (intersection with what this backend already holds) — the tool view a
+    /// `chidori.actors.spawn` intercept hands a child. `None` for the
+    /// recorder backend.
+    pub(crate) fn with_tools_restricted(&self, names: &[String]) -> Option<Self> {
+        match self {
+            HostBindingBackend::Runtime {
+                runtime_ctx,
+                providers,
+                template_engine,
+                tokio_rt,
+                policy,
+                policy_cache,
+                runtime_policy,
+                tools,
+                mcp,
+            } => Some(HostBindingBackend::Runtime {
+                runtime_ctx: runtime_ctx.clone(),
+                providers: providers.clone(),
+                template_engine: template_engine.clone(),
+                tokio_rt: tokio_rt.clone(),
+                policy: policy.clone(),
+                policy_cache: policy_cache.clone(),
+                runtime_policy: runtime_policy.clone(),
+                tools: Arc::new(tools.restricted_to(names)),
+                mcp: mcp.clone(),
+            }),
+            HostBindingBackend::Recorder(_) => None,
+        }
+    }
+
     /// As [`with_runtime_ctx`](Self::with_runtime_ctx), but also swapping the
     /// durable runtime policy — for sub-runs that are their OWN durable runs
     /// (detached agents), whose policy is derived from their own run id so a

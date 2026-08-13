@@ -405,6 +405,11 @@ const worker = await chidori.actors.spawn("workers/researcher.ts", { topic }, {
   restart: "resume",       // "never" (default) | "clean" | "resume"
   maxRestarts: 3,
   backoffMs: 500,          // doubles per attempt
+  intercept: {             // narrow the child's context — never widen:
+    model: "cheap-model",  //   default model for the child's prompts
+    tools: ["search"],     //   registry tools, intersected with the spawner's
+    workspace: "research", //   relative `..`-free subpath of the spawner's root
+  },
 });
 
 // Message passing (never blocks). String-addressed sends take a pid, a

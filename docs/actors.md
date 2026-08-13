@@ -83,6 +83,11 @@ const worker = await chidori.actors.spawn(source, input?, {
   maxRestarts?: number,   // default 3
   backoffMs?: number,     // base restart delay, doubles per attempt; default 0
   idleTimeoutMs?: number, // empty-mailbox park cap; default 300000
+  intercept?: {           // narrow the child's context (never widen)
+    model?: string,       // default model for the child's prompts
+    tools?: string[],     // registry tools the child may call (intersection)
+    workspace?: string,   // relative subpath the child's workspace narrows to
+  },
 });
 ```
 
@@ -94,6 +99,37 @@ trees](#supervision-trees) — but joining and stopping are **owner-only**: an
 actor is settled by whoever spawned it (its records fold into the spawner's
 log). `actors.spawn` inside a `chidori.branch` sub-run is rejected for the same
 range-confinement reason as nested branches.
+
+### intercept: handing a child a narrower context
+
+`intercept` scopes what the child sees, and every field can only **narrow**
+what the spawner itself holds — a child never widens:
+
+- `model` re-points the child's default model (a routing choice, not a
+  capability): an orchestrator on a strong model fans work out to cheap
+  workers without each worker hard-coding one.
+- `tools` intersects with the spawner's tool registry — a name the spawner
+  doesn't hold simply doesn't exist for the child. Registry tools only
+  (MCP / native); in-VM `defineTool` functions are plain code in the child's
+  own module.
+- `workspace` must be a relative, `..`-free subpath; the child's workspace
+  root becomes the spawner's root joined with it, so its reads and writes are
+  confined to that subtree.
+
+The intercept travels in the durable spawn args, so restarts and replay
+re-create the child under the identical narrowed view. Children that spawn
+their own actors narrow from their already-narrowed context — the tree only
+ever gets tighter toward the leaves.
+
+```ts
+const researcher = await chidori.actors.spawn("workers/research.ts", input, {
+  intercept: {
+    model: "claude-haiku-4-5",
+    tools: ["search"],
+    workspace: "research",
+  },
+});
+```
 
 ### handles and actors.send
 

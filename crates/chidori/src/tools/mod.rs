@@ -122,6 +122,29 @@ impl ToolRegistry {
         });
     }
 
+    /// A copy of this registry containing only the named tools — the
+    /// narrow-only view a `chidori.actors.spawn` intercept hands a child.
+    /// Intersection semantics: names this registry doesn't hold are simply
+    /// absent from the copy, so a child can never widen its parent's view.
+    pub fn restricted_to(&self, names: &[String]) -> ToolRegistry {
+        let allowed: std::collections::HashSet<&str> =
+            names.iter().map(String::as_str).collect();
+        ToolRegistry {
+            tools: self
+                .tools
+                .iter()
+                .filter(|(name, _)| allowed.contains(name.as_str()))
+                .map(|(name, def)| (name.clone(), def.clone()))
+                .collect(),
+            native_handlers: self
+                .native_handlers
+                .iter()
+                .filter(|(name, _)| allowed.contains(name.as_str()))
+                .map(|(name, handler)| (name.clone(), handler.clone()))
+                .collect(),
+        }
+    }
+
     pub fn dispatch_native(&self, name: &str, args: Value) -> Result<Value> {
         let Some(tool) = self.tools.get(name) else {
             anyhow::bail!("{}", self.describe_miss(name));

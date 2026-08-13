@@ -460,6 +460,26 @@ export interface RetryOptions {
  */
 export type ActorRestartStrategy = "never" | "clean" | "resume";
 
+/**
+ * The narrowed context view a spawn hands its child (`docs/actors.md`).
+ * Every field can only NARROW what the spawner itself holds — a child never
+ * widens: `tools` intersects with the spawner's registry, `workspace` is a
+ * relative `..`-free subpath under the spawner's workspace root, `model`
+ * re-points the child's default model (a routing choice, not a capability).
+ */
+export interface SpawnIntercept {
+  /** Default model for the child's prompts (e.g. a cheaper model for a fan-out worker). */
+  model?: string;
+  /**
+   * Registry tool names (MCP / native) the child may call — intersected with
+   * the spawner's own registry. In-VM `defineTool` functions are plain code
+   * in the child's module and are not governed by this list.
+   */
+  tools?: string[];
+  /** Relative subpath (no `..`) the child's workspace root narrows to. */
+  workspace?: string | { root: string };
+}
+
 export interface SpawnActorOptions {
   /** Register the actor under a name for `actors.lookup`/`actors.send` addressing. */
   name?: string;
@@ -475,6 +495,8 @@ export interface SpawnActorOptions {
    * (default 300 000 ms).
    */
   idleTimeoutMs?: number;
+  /** Narrow the child's context: default model, registry tools, workspace subtree. */
+  intercept?: SpawnIntercept;
 }
 
 /** How an actor's supervision loop settled. */
