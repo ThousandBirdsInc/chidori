@@ -161,7 +161,8 @@ chidori chat agent.ts
 
 `chidori model-login` opens your browser, signs you in with OpenRouter, and saves a
 key to `~/.chidori/credentials.json` — the zero-setup way to try things out.
-Prefer your own provider key? Set `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`)
+Prefer your own provider key? Set `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`,
+or `ORCAROUTER_API_KEY` for the OrcaRouter routing gateway)
 instead; explicit keys always take precedence over the OpenRouter fallback.
 
 Then ask it things like *"What is a host call?"* or *"How do I write a tool?"*.
@@ -215,8 +216,20 @@ the per-file directive). See the
 ```bash
 # The OpenRouter sign-in from step 1 is all you need. Prefer your own key?
 # export ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY=...
+# export ORCAROUTER_API_KEY=sk-orca-...      # or use the OrcaRouter routing gateway
 
 chidori run summarizer.ts \
+  --input document="Rust is a systems programming language..."
+```
+
+**OrcaRouter is a named multi-provider routing gateway** — one endpoint in
+front of Anthropic, OpenAI, Google, DeepSeek, and more, plus smart routing
+(`orcarouter/auto`). Set `ORCAROUTER_API_KEY` and pick the model with `--model`
+(or `CHIDORI_MODEL`):
+
+```bash
+export ORCAROUTER_API_KEY=sk-orca-...
+chidori run summarizer.ts --model orcarouter/auto \
   --input document="Rust is a systems programming language..."
 ```
 

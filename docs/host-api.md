@@ -579,6 +579,7 @@ route by model name, first match wins):
 | `ANTHROPIC_API_KEY` | Anthropic (`claude-*` models). |
 | `OPENAI_API_KEY` | OpenAI; `OPENAI_BASE_URL` redirects it at any OpenAI-compatible endpoint and widens it to match all model names. |
 | `CHIDORI_OPENAI_COMPAT_URL` + `CHIDORI_OPENAI_COMPAT_KEY` | Any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, LiteLLM…), matching all model names. `/v1` and bare hosts both work. |
+| `ORCAROUTER_API_KEY` | OrcaRouter — a named multi-provider routing gateway ([orcarouter.ai](https://www.orcarouter.ai)) that fronts Anthropic, OpenAI, Google, DeepSeek, and more behind one OpenAI-compatible endpoint (plus `orcarouter/auto` smart routing), matching all model names. |
 | `chidori model-login` | Zero-setup OpenRouter fallback. |
 
 The default model for prompts that don't set `model` in code is

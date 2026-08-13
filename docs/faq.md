@@ -26,8 +26,11 @@ verification ([Package Management](./package-management.md)).
 ### Which model providers work?
 
 Anthropic (`ANTHROPIC_API_KEY`), OpenAI (`OPENAI_API_KEY`, redirectable
-via `OPENAI_BASE_URL`), any OpenAI-compatible endpoint — DeepSeek, Groq,
-Ollama, vLLM, LiteLLM — via `CHIDORI_OPENAI_COMPAT_URL`, and a zero-setup
+via `OPENAI_BASE_URL`), OrcaRouter (`ORCAROUTER_API_KEY` — a named
+multi-provider routing gateway that fronts Anthropic, OpenAI, Google,
+DeepSeek, and more behind one OpenAI-compatible endpoint), any
+OpenAI-compatible endpoint — DeepSeek, Groq, Ollama, vLLM, LiteLLM — via
+`CHIDORI_OPENAI_COMPAT_URL`, and a zero-setup
 OpenRouter fallback via `chidori model-login`. All can coexist; requests
 route by model name. Details:
 [Providers & model selection](./host-api.md#providers--model-selection).

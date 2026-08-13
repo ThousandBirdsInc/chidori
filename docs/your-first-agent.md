@@ -15,10 +15,10 @@ You need the `chidori` binary ([install](./getting-started.md)) and,
 ideally, a provider key exported in your shell:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...   # or another provider — see below
+export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY / ORCAROUTER_API_KEY — see below
 ```
 
-Any Anthropic, OpenAI, or OpenAI-compatible key works
+Any Anthropic, OpenAI, OrcaRouter, or OpenAI-compatible key works
 ([provider setup](./host-api.md#providers--model-selection)), and
 `chidori model-login` gives you a zero-setup OpenRouter fallback.
 
