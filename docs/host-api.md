@@ -56,6 +56,31 @@ Rules:
 - Local TypeScript imports are governed by runtime policy. Dynamic imports
   are rejected.
 
+Try the validation live — this example runs in your browser, and the input is
+editable: delete `topic` (or set it to a number, or add an extra key) and the
+run refuses with the full issue list before the handler executes:
+
+```ts
+import { chidori, run } from "chidori:agent";
+
+run(
+  async (input: { topic: string }) => {
+    await chidori.log("handler entered — input passed the schema", {
+      topic: input.topic,
+    });
+    return { topic: input.topic };
+  },
+  {
+    inputSchema: {
+      type: "object",
+      properties: { topic: { type: "string", minLength: 1 } },
+      required: ["topic"],
+      additionalProperties: false,
+    },
+  },
+);
+```
+
 ## LLM calls
 
 ### `chidori.prompt(text, options?)`
@@ -519,6 +544,23 @@ side effects, and re-firing them is an operator decision.
 The `agent` path resolves like `callAgent` (relative to the project root) and
 must exist at registration — a compensation that can't resolve is useless
 exactly when it's needed.
+
+Watch the ledger arm itself — this example registers two compensations and
+then fails; the runner reports the armed inverse actions **newest-first**,
+exactly the plan `chidori rollback <run_id>` would execute (delete the
+`throw` and the registrations become void history instead):
+
+```ts
+import { chidori, run } from "chidori:agent";
+
+run(async () => {
+  await chidori.compensation.register("deprovision", "comp/deprovision.ts", {
+    serverId: "srv-7",
+  });
+  await chidori.compensation.register("notify-oncall", "comp/notify.ts");
+  throw new Error("provisioning failed halfway");
+});
+```
 
 ### `chidori.log(msg, data?)` / `chidori.mark(label, data?)`
 

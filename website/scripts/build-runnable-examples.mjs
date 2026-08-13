@@ -39,7 +39,7 @@ const EXCLUDE = new Set(['README.md', 'posts/harness-engineering-thread.md']);
 // The chidori.* surface the browser harness implements (harness.ts).
 const SUPPORTED_API = new Set([
   'prompt', 'input', 'tool', 'log', 'step', 'sleep', 'now', 'random', 'fetch',
-  'signal', 'pollSignal', 'alarm', 'receive', 'mark',
+  'signal', 'pollSignal', 'alarm', 'receive', 'mark', 'compensation',
   'memory', 'workspace', 'appData', 'util', 'template',
   'context', 'conversation',
   'actors', 'agents', 'branch', 'callAgent', 'renderDOM',
