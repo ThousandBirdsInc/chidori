@@ -1119,6 +1119,7 @@ fn record_accepted_source_change(
     use crate::runtime::store::RunStore as _;
 
     let store = crate::runtime::store::FsRunStore::new(run_dir);
+    let cache = run_dir.parent().and_then(source_history::cross_run_cache);
 
     if source_history::head_commit(&store)?.is_none() {
         if let Some(bytes) = store.get_blob(&manifest.snapshot_file)? {
@@ -1136,6 +1137,8 @@ fn record_accepted_source_change(
                             files: &files,
                             journal_frontier: 0,
                             extra_parent: None,
+                            share_from: &[],
+                            backfill_cache: cache.as_deref(),
                         },
                     )?;
                 }
@@ -1159,6 +1162,8 @@ fn record_accepted_source_change(
             files: &files,
             journal_frontier: manifest.call_log_len as u64,
             extra_parent: None,
+            share_from: &[],
+            backfill_cache: cache.as_deref(),
         },
     )?;
     Ok(())

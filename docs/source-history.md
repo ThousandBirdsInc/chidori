@@ -29,7 +29,9 @@ Each run (and each `chidori.branch` sub-run) carries its own store:
   objects/<sha256 hex>     content-addressed source blobs — the full text of
                            one file version, stored once per unique content
   commits.jsonl            append-only commit log, one JSON commit per line
+  HEAD.json                head-commit cache (the log stays authoritative)
 <run dir>/branches/op-*/branch-*/history/    the same shape, per branch
+.chidori/history-objects/<sha256 hex>        cross-run object cache (see below)
 ```
 
 A commit snapshots the module **tree** — `(path, sha256 of content)` for the
@@ -104,6 +106,45 @@ chidori history <run-id> --json
 `--show` and `--diff` resolve commits across the whole DAG (trunk and every
 branch store), so diffing a branch's edit against the trunk version it forked
 from works directly.
+
+## Performance, copy-on-write, and deduplication
+
+Recording follows the journal's own append+cache discipline, so history never
+becomes a per-run tax:
+
+- **O(1) recording.** The hot path reads one small blob (`HEAD.json`, the
+  head-commit cache) instead of parsing the log, checks object existence with
+  a `stat` (`RunStore::has_blob`), and lands the commit as a single O(1) line
+  append (`RunStore::append_blob_line`) — the same must-not-rewrite contract
+  as `records.jsonl`. Nothing is ever O(#commits) on the write path. The log
+  stays authoritative: a missing or stale HEAD (e.g. a crash between the
+  append and the cache rewrite) falls back to the log and heals on the next
+  recording; the worst crash outcome is one redundant "no file changes"
+  commit, never lost history.
+- **Recording happens per *event*, not per host call.** A run records once at
+  its first safepoint (guarded by a per-run flag), and thereafter only when
+  code actually changes — the head-tree dedupe makes every other invocation a
+  no-op.
+- **Object-level dedupe, per machine.** Objects are immutable and
+  content-addressed, so identical content is **hardlinked** rather than
+  rewritten — across sibling branches (two variants forking the same strategy
+  file store it once), between a branch and its parent run, and **across
+  runs**: under the standard `.chidori/runs` layout, the first run back-fills
+  a sibling `.chidori/history-objects/` cache and every later run of the same
+  agent links its whole unchanged tree from it. Each run directory still
+  *contains* its full history (hardlinks are real directory entries), so runs
+  stay self-contained for copying/archiving while the disk stores one copy.
+- **Copy-on-write for the mutable copy.** A branch's editable `source.ts` is
+  materialized as a clone of the immutable object it forked from —
+  `std::fs::copy`, which reflinks (shares blocks copy-on-write) on
+  filesystems that support it (btrfs/XFS via `copy_file_range`, APFS via
+  `clonefile`) and degrades to a plain copy elsewhere. It is deliberately
+  *never* hardlinked: an edit must not write through into the shared object.
+- **Mirror-safe.** Hardlink/clone sharing only engages when the store is a
+  plain local directory. A run teed to a durable mirror
+  ([`docs/durable-storage.md`](./durable-storage.md)) takes the `put_blob`
+  path for objects so the mirror always receives the bytes — dedupe never
+  trades away durability.
 
 ## Relationship to the rest of the system
 

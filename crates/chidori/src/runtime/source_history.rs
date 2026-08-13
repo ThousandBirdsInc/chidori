@@ -68,7 +68,19 @@ use crate::runtime::store::RunStore;
 pub const SOURCE_COMMITS_FILE: &str = "history/commits.jsonl";
 /// Run-dir-relative key prefix of the content-addressed source blobs.
 pub const SOURCE_OBJECTS_PREFIX: &str = "history/objects/";
+/// Head-commit cache (`history/HEAD.json`): the newest commit, duplicated so
+/// the recording hot path reads one small blob instead of parsing the whole
+/// log. The log stays authoritative — every reader of the *chain*
+/// ([`load_commits`]) ignores HEAD, and [`head_commit`] falls back to the
+/// log when HEAD is missing or unreadable. A crash between the log append
+/// and the HEAD rewrite leaves HEAD one commit stale; the worst consequence
+/// is one redundant (identical-to-parent-tree, "no file changes") commit on
+/// the next recording — never lost history.
+pub const SOURCE_HEAD_FILE: &str = "history/HEAD.json";
 const SOURCE_COMMIT_VERSION: u32 = 1;
+/// The cross-run object cache's directory name, a sibling of the standard
+/// `runs/` base (i.e. `.chidori/history-objects/`). See [`cross_run_cache`].
+pub const CROSS_RUN_OBJECT_CACHE_DIR: &str = "history-objects";
 
 /// Why a source version was recorded — the git-log "subject" of the commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,7 +176,13 @@ pub fn id_matches(id: &str, reference: &str) -> bool {
 
 /// Content-address a source text: `sha256:<hex>` over its bytes.
 pub fn object_id(text: &str) -> String {
-    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+    format!("sha256:{}", object_hex(text))
+}
+
+/// The bare hex of a text's content address — its file name inside an
+/// objects directory (`history/objects/<hex>`, or the cross-run cache).
+pub fn object_hex(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 fn object_key(id: &str) -> Result<String> {
@@ -189,6 +207,68 @@ pub struct CommitInput<'a> {
     /// An extra parent from *outside* this store's chain — the parent run's
     /// head commit id for a `branch_fork`.
     pub extra_parent: Option<String>,
+    /// Content-addressed directories (flat `<sha256 hex>` files) that may
+    /// already hold this version's objects — the parent run's
+    /// `history/objects/`, sibling branches', the cross-run cache. A hit is
+    /// hardlinked (falling back to a copy-on-write clone) into this store
+    /// instead of rewritten, so shared content is stored once per machine.
+    /// Only applies when the store is a local directory
+    /// ([`RunStore::blob_os_path`]); harmless otherwise.
+    pub share_from: &'a [PathBuf],
+    /// The machine-local cross-run cache ([`cross_run_cache`]): newly
+    /// recorded objects are also linked (or written) into it, best-effort,
+    /// so the *next* run of the same agent dedupes its whole tree against
+    /// one shared copy instead of storing another.
+    pub backfill_cache: Option<&'a Path>,
+}
+
+/// The cross-run object cache for a run base directory: `history-objects/`
+/// as a **sibling** of the standard `runs/` base — `.chidori/history-objects`
+/// next to `.chidori/runs` — so run-id enumeration over the base never sees
+/// it. `None` for a non-standard base (embedders, tests pointing at
+/// arbitrary directories), which keeps the cache from being planted in
+/// arbitrary parent directories.
+pub fn cross_run_cache(run_base: &Path) -> Option<PathBuf> {
+    if run_base.file_name() == Some(std::ffi::OsStr::new("runs")) {
+        run_base
+            .parent()
+            .map(|parent| parent.join(CROSS_RUN_OBJECT_CACHE_DIR))
+    } else {
+        None
+    }
+}
+
+/// Materialize `dst` with the same content as the existing file `src`,
+/// sharing storage where the platform allows: hardlink first (true
+/// deduplication on any filesystem — safe here because history objects are
+/// content-addressed and never mutated in place), then [`std::fs::copy`],
+/// which clones copy-on-write on filesystems that support it (btrfs/XFS via
+/// `copy_file_range`, APFS via `clonefile`) and degrades to a plain copy
+/// elsewhere. Fails if `dst` already exists (callers check first).
+fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => std::fs::copy(src, dst).map(|_| ()),
+    }
+}
+
+/// Copy-on-write clone for **mutable** destinations (a branch's editable
+/// `source.ts`): never hardlinks — an edit through a hardlink would rewrite
+/// the shared immutable object — but `std::fs::copy` shares blocks (reflink)
+/// on CoW filesystems until the file is edited, and is an ordinary copy
+/// elsewhere.
+pub(crate) fn cow_clone(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+fn write_file_creating_dirs(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)
 }
 
 /// Record a source version into the store's history: write any new
@@ -196,6 +276,11 @@ pub struct CommitInput<'a> {
 /// without writing anything when the tree is identical to the store's head
 /// commit — recording is idempotent, so callers invoke it unconditionally at
 /// their integration point and let the dedupe decide.
+///
+/// Cost model: the head check reads the small `HEAD.json` cache (not the
+/// log), the commit lands as one O(1) line append, and each object is one
+/// existence stat plus — only when new — a hardlink/CoW-clone from
+/// `share_from`/the cache, or a write.
 pub fn record_commit(store: &dyn RunStore, input: CommitInput<'_>) -> Result<Option<SourceCommit>> {
     // Sorted, deduped-by-path tree: deterministic identity regardless of the
     // caller's file ordering.
@@ -216,8 +301,8 @@ pub fn record_commit(store: &dyn RunStore, input: CommitInput<'_>) -> Result<Opt
         })
         .collect();
 
-    let commits = load_commits(store)?;
-    let head = commits.last();
+    let head = head_commit(store)?;
+    let head = head.as_ref();
     if let Some(head) = head {
         if head.tree == tree {
             return Ok(None);
@@ -270,19 +355,64 @@ pub fn record_commit(store: &dyn RunStore, input: CommitInput<'_>) -> Result<Opt
     // pointing at missing text.
     for (path, text) in input.files {
         let entry_object = object_id(text);
+        let hex = entry_object
+            .strip_prefix("sha256:")
+            .expect("object_id always returns a sha256: id");
         let key = object_key(&entry_object)?;
-        if store.get_blob(&key)?.is_none() {
+        if store.has_blob(&key)? {
+            continue;
+        }
+        // Dedupe before write: an identical object anywhere in the shared
+        // set (parent run, sibling branch, cross-run cache) is hardlinked or
+        // CoW-cloned in — one stored copy per machine for unchanged content.
+        let dst = store.blob_os_path(&key);
+        let mut materialized = false;
+        if let Some(dst) = &dst {
+            for source_dir in input
+                .share_from
+                .iter()
+                .map(PathBuf::as_path)
+                .chain(input.backfill_cache)
+            {
+                let candidate = source_dir.join(hex);
+                if candidate.is_file() && link_or_copy(&candidate, dst).is_ok() {
+                    materialized = true;
+                    break;
+                }
+            }
+        }
+        if !materialized {
             store
                 .put_blob(&key, text.as_bytes())
                 .with_context(|| format!("writing source object for {}", path.display()))?;
         }
+        // Back-fill the cross-run cache so the next run links instead of
+        // writing. Best-effort: cache misses never fail a recording.
+        if let Some(cache) = input.backfill_cache {
+            let cache_path = cache.join(hex);
+            if !cache_path.is_file() {
+                let cached = match &dst {
+                    Some(dst) => link_or_copy(dst, &cache_path)
+                        .or_else(|_| write_file_creating_dirs(&cache_path, text.as_bytes())),
+                    None => write_file_creating_dirs(&cache_path, text.as_bytes()),
+                };
+                if let Err(err) = cached {
+                    tracing::debug!(
+                        "source history: could not back-fill object cache {}: {err}",
+                        cache_path.display()
+                    );
+                }
+            }
+        }
     }
-    let mut log = store.get_blob(SOURCE_COMMITS_FILE)?.unwrap_or_default();
-    log.extend(serde_json::to_vec(&commit)?);
-    log.push(b'\n');
+    // O(1) append, then refresh the head cache (log first: the log is
+    // authoritative, HEAD is a rebuildable cache of its last line).
     store
-        .put_blob(SOURCE_COMMITS_FILE, &log)
+        .append_blob_line(SOURCE_COMMITS_FILE, &serde_json::to_vec(&commit)?)
         .with_context(|| format!("appending {SOURCE_COMMITS_FILE}"))?;
+    store
+        .put_blob(SOURCE_HEAD_FILE, &serde_json::to_vec_pretty(&commit)?)
+        .with_context(|| format!("writing {SOURCE_HEAD_FILE}"))?;
     Ok(Some(commit))
 }
 
@@ -308,8 +438,16 @@ pub fn load_commits(store: &dyn RunStore) -> Result<Vec<SourceCommit>> {
     Ok(commits)
 }
 
-/// The store's newest commit, if any.
+/// The store's newest commit, if any: one read of the small `HEAD.json`
+/// cache, falling back to scanning the authoritative log when HEAD is
+/// missing (histories recorded before HEAD existed) or unreadable.
 pub fn head_commit(store: &dyn RunStore) -> Result<Option<SourceCommit>> {
+    if let Some(bytes) = store.get_blob(SOURCE_HEAD_FILE)? {
+        if let Ok(commit) = serde_json::from_slice::<SourceCommit>(&bytes) {
+            return Ok(Some(commit));
+        }
+        tracing::warn!("unreadable {SOURCE_HEAD_FILE}; rebuilding from the commit log");
+    }
     Ok(load_commits(store)?.pop())
 }
 
@@ -564,6 +702,8 @@ mod tests {
                 files,
                 journal_frontier: frontier,
                 extra_parent,
+                share_from: &[],
+                backfill_cache: None,
             },
         )
         .unwrap()
@@ -672,6 +812,120 @@ mod tests {
         assert!(diff.contains("+C!\n"));
         assert!(diff.contains("+h\n"));
         assert_eq!(unified_diff("same\n", "same\n", "a", "b"), "");
+    }
+
+    /// The recording hot path reads `HEAD.json`, not the whole log — and the
+    /// log stays authoritative: a deleted/stale HEAD falls back to the log
+    /// and is rebuilt by the next recording.
+    #[test]
+    fn head_cache_serves_recording_and_heals() {
+        let (dir, store) = temp_store();
+        let v1 = vec![(PathBuf::from("agent.ts"), "v1\n".to_string())];
+        let v2 = vec![(PathBuf::from("agent.ts"), "v2\n".to_string())];
+        let first = commit_files(&store, SourceCommitEvent::RunStart, &v1, 0, None).unwrap();
+        let second =
+            commit_files(&store, SourceCommitEvent::ResumeSourceChange, &v2, 3, None).unwrap();
+
+        // HEAD is the newest commit, byte-parseable on its own.
+        let head: SourceCommit =
+            serde_json::from_slice(&store.get_blob(SOURCE_HEAD_FILE).unwrap().unwrap()).unwrap();
+        assert_eq!(head.id, second.id);
+
+        // Losing HEAD loses nothing: head_commit rebuilds from the log, and
+        // the next recording chains onto the true head and rewrites HEAD.
+        store.delete_blob(SOURCE_HEAD_FILE).unwrap();
+        assert_eq!(head_commit(&store).unwrap().unwrap().id, second.id);
+        let v3 = vec![(PathBuf::from("agent.ts"), "v3\n".to_string())];
+        let third =
+            commit_files(&store, SourceCommitEvent::ResumeSourceChange, &v3, 9, None).unwrap();
+        assert_eq!(third.parents, vec![second.id.clone()]);
+        let head: SourceCommit =
+            serde_json::from_slice(&store.get_blob(SOURCE_HEAD_FILE).unwrap().unwrap()).unwrap();
+        assert_eq!(head.id, third.id);
+        assert_eq!(load_commits(&store).unwrap().len(), 3);
+        let _ = (first, std::fs::remove_dir_all(dir));
+    }
+
+    /// Identical content shared between stores is hardlinked, not rewritten:
+    /// one stored copy per machine (inode-verified), whether it comes from a
+    /// sibling store (`share_from`) or the cross-run cache (`backfill_cache`).
+    #[cfg(unix)]
+    #[test]
+    fn objects_dedupe_by_hardlink_across_stores_and_cache() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (dir_a, store_a) = temp_store();
+        let (dir_b, store_b) = temp_store();
+        let cache =
+            std::env::temp_dir().join(format!("chidori-obj-cache-{}", uuid::Uuid::new_v4()));
+        let files = vec![(PathBuf::from("agent.ts"), "shared content\n".to_string())];
+        let hex = object_hex("shared content\n");
+
+        // A records with back-fill: object lands in A and in the cache,
+        // hardlinked (same inode).
+        record_commit(
+            &store_a,
+            CommitInput {
+                event: SourceCommitEvent::RunStart,
+                run_id: "run-a",
+                branch_id: None,
+                entry_path: &files[0].0,
+                files: &files,
+                journal_frontier: 0,
+                extra_parent: None,
+                share_from: &[],
+                backfill_cache: Some(&cache),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let a_object = dir_a.join(SOURCE_OBJECTS_PREFIX).join(&hex);
+        let cache_object = cache.join(&hex);
+        assert!(a_object.is_file() && cache_object.is_file());
+        let a_ino = a_object.metadata().unwrap().ino();
+        assert_eq!(cache_object.metadata().unwrap().ino(), a_ino);
+
+        // B records the same content sharing from A: linked, not rewritten.
+        record_commit(
+            &store_b,
+            CommitInput {
+                event: SourceCommitEvent::RunStart,
+                run_id: "run-b",
+                branch_id: None,
+                entry_path: &files[0].0,
+                files: &files,
+                journal_frontier: 0,
+                extra_parent: None,
+                share_from: &[dir_a.join(SOURCE_OBJECTS_PREFIX)],
+                backfill_cache: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let b_object = dir_b.join(SOURCE_OBJECTS_PREFIX).join(&hex);
+        assert_eq!(b_object.metadata().unwrap().ino(), a_ino);
+        assert_eq!(
+            load_object(&store_b, &format!("sha256:{hex}"))
+                .unwrap()
+                .unwrap(),
+            "shared content\n"
+        );
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+        let _ = std::fs::remove_dir_all(cache);
+    }
+
+    /// The cross-run cache lives beside the standard `runs/` base — and only
+    /// there, so arbitrary embedder/test bases never get a cache planted in
+    /// their parent directory.
+    #[test]
+    fn cross_run_cache_requires_standard_layout() {
+        assert_eq!(
+            cross_run_cache(Path::new("/proj/.chidori/runs")),
+            Some(PathBuf::from("/proj/.chidori/history-objects"))
+        );
+        assert_eq!(cross_run_cache(Path::new("/tmp/some-arbitrary-base")), None);
     }
 
     #[test]

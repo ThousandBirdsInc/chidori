@@ -340,6 +340,10 @@ impl ScaffoldPersister {
             Some(_) => SourceCommitEvent::ResumeSourceChange,
             None => SourceCommitEvent::RunStart,
         };
+        // Cross-run dedupe: under the standard `.chidori/runs` layout, the
+        // same agent tree recorded by many runs is stored once in the sibling
+        // `history-objects/` cache and hardlinked into each run's store.
+        let cache = source_history::cross_run_cache(&self.base);
         source_history::record_commit(
             store,
             CommitInput {
@@ -350,6 +354,8 @@ impl ScaffoldPersister {
                 files: &files,
                 journal_frontier: ctx.call_log_len() as u64,
                 extra_parent: None,
+                share_from: &[],
+                backfill_cache: cache.as_deref(),
             },
         )?;
         Ok(())
@@ -1241,6 +1247,52 @@ mod tests {
         assert_eq!(commits[1].parents, vec![commits[0].id.clone()]);
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Under the standard `.chidori/runs` layout, identical trees recorded
+    /// by different runs share one stored object: the first run back-fills
+    /// the sibling `history-objects/` cache and every later run hardlinks
+    /// from it (inode-verified) — cross-run dedupe.
+    #[cfg(unix)]
+    #[test]
+    fn scaffold_history_dedupes_across_runs_via_cache() {
+        use crate::runtime::source_history;
+        use std::os::unix::fs::MetadataExt;
+
+        let root =
+            std::env::temp_dir().join(format!("chidori-cross-run-dedupe-{}", uuid::Uuid::new_v4()));
+        let base = root.join(".chidori").join("runs");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("agent.ts");
+        let src = "export async function agent() { return { same: true }; }\n";
+        std::fs::write(&path, src).unwrap();
+        let ctx = RuntimeContext::new();
+        for run_id in ["run-a", "run-b"] {
+            let policy = RuntimePolicy::durable_default(run_id);
+            ScaffoldPersister::new(&base, run_id, &path, src, &policy)
+                .persist(&ctx, CheckpointWrite::Compact)
+                .unwrap();
+        }
+
+        let hex = source_history::object_hex(src);
+        let cache_object = root
+            .join(".chidori")
+            .join(source_history::CROSS_RUN_OBJECT_CACHE_DIR)
+            .join(&hex);
+        let run_a_object = base
+            .join("run-a")
+            .join(source_history::SOURCE_OBJECTS_PREFIX)
+            .join(&hex);
+        let run_b_object = base
+            .join("run-b")
+            .join(source_history::SOURCE_OBJECTS_PREFIX)
+            .join(&hex);
+        let cache_ino = cache_object.metadata().unwrap().ino();
+        assert_eq!(run_a_object.metadata().unwrap().ino(), cache_ino);
+        assert_eq!(run_b_object.metadata().unwrap().ino(), cache_ino);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     struct FixedTestProvider {
