@@ -21,11 +21,13 @@ export default function PlaygroundPage() {
         hand it a tool, or ask it to rewrite its own code. Every effect is
         journaled: reload mid-conversation and it resumes, rewind any turn,
         branch into an alternate timeline — or hot-swap the agent&apos;s
-        implementation and replay the same history against the new code.
+        implementation and replay the same history against the new code. Every
+        version that runs is recorded as a git-like <em>implementation
+        history</em> alongside the journal: diff any two, restore any one.
       </p>
       <p className="mt-1.5 text-sm text-fd-muted-foreground sm:hidden">
-        A live agent in this tab — journaled, rewindable, branchable, and able
-        to rewrite its own code.
+        A live agent in this tab — journaled, rewindable, branchable, able to
+        rewrite its own code, with every version kept as history.
       </p>
       <PlaygroundClient />
     </div>

@@ -306,6 +306,11 @@ human-in-the-loop pause/resume loop — see
   [signals](./docs/signals.md) until a human or another agent delivers a payload.
 - **Branching exploration** — fork a run into per-strategy sub-runs and compare
   every outcome ([branching execution](./docs/branching-execution.md)).
+- **Implementation history** — every source version a run or branch ever
+  executed is recorded as a git-like commit chain alongside the journal:
+  `chidori history` shows which code produced which recorded calls, prints any
+  stored version, and diffs any two
+  ([source history](./docs/source-history.md)).
 - **Supervised multi-agent processes** — spawn agent modules as concurrent,
   addressable [actors](./docs/actors.md) with durable mailboxes, message
   passing, supervision trees, and runtime-owned restart policies — including
@@ -438,6 +443,7 @@ cd website && npm install && npm run dev
 | [Actors & supervision](./docs/actors.md) | Spawned agent processes, message passing, supervision trees, restart strategies |
 | [Detached agents](./docs/detached-agents.md) | Durable, addressable, hibernating agent processes; `chidori.alarm`; the `/agents/detached` HTTP surface |
 | [Durable storage](./docs/durable-storage.md) | The run store: append-only journal, SQLite / Durable Object mirrors, hydration, strict durability, leases, `--until-seq` |
+| [Source history](./docs/source-history.md) | The git-like record of the agent's implementation kept alongside the execution journal: commits and fork points, `chidori history` log/show/diff, hardlink dedupe and copy-on-write clones |
 | [Deployment](./docs/deployment.md) | Running in production: config, durability tiers, recipes for a plain VM / Fly.io / Kubernetes, failure & recovery |
 | [Rust style guide](./docs/rust-style-guide.md) | Conventions for contributing Rust: error handling, panics, tracing, async, `unsafe` policy, testing |
 | [Observing runs with Tael](./docs/observing-with-tael.md) | OTLP export, run↔trace correlation, checkpoint-backed golden cases, the self-harness loop |
