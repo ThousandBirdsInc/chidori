@@ -26,8 +26,26 @@ use crate::bytecode::FuncProto;
 /// `Rc<str>` model: cheap clone, `as_str()` borrows directly, zero overhead.
 /// Only strings that actually contain an unpaired surrogate pay for the `Wtf8`
 /// arm. See [`crate::wtf8`].
-#[derive(Clone)]
 pub struct JsString(Repr);
+
+/// Hand-written so it carries an inline hint: every arm is a small copy or
+/// an `Rc` bump, and string clones are hot enough (register reads, property
+/// values) that the out-of-line derived clone showed up as its own profile
+/// rank. Semantically identical to the derive.
+impl Clone for JsString {
+    #[inline]
+    fn clone(&self) -> JsString {
+        JsString(match &self.0 {
+            Repr::Inline { meta, buf } => Repr::Inline {
+                meta: *meta,
+                buf: *buf,
+            },
+            Repr::Utf8(s, units) => Repr::Utf8(s.clone(), units.clone()),
+            Repr::Wtf8(b) => Repr::Wtf8(b.clone()),
+            Repr::Rope(r) => Repr::Rope(r.clone()),
+        })
+    }
+}
 
 #[derive(Clone)]
 enum Repr {
@@ -588,7 +606,6 @@ impl fmt::Debug for JsObject {
 }
 
 /// A JS value. `Clone` is cheap for all variants (scalars or `Rc` bumps).
-#[derive(Clone)]
 pub enum Value {
     Undefined,
     Null,
@@ -627,7 +644,68 @@ impl fmt::Debug for Value {
     }
 }
 
+/// Hand-written so it carries an inline hint: the derived clone compiled
+/// out of line, so every hot register/stack read paid a full call + dynamic
+/// match even for a `Number` (measured ~7% of the React render profile).
+/// Every arm here is a scalar copy or an `Rc` bump (strings via the inlined
+/// [`JsString::clone`] above). Semantically identical to the derive.
+impl Clone for Value {
+    #[inline(always)]
+    fn clone(&self) -> Value {
+        match self {
+            Value::Undefined => Value::Undefined,
+            Value::Null => Value::Null,
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Number(n) => Value::Number(*n),
+            Value::Uninitialized => Value::Uninitialized,
+            Value::Hole => Value::Hole,
+            Value::Object(o) => Value::Object(o.clone()),
+            Value::String(s) => Value::String(s.clone()),
+            Value::Symbol(s) => Value::Symbol(s.clone()),
+            Value::BigInt(b) => Value::BigInt(b.clone()),
+        }
+    }
+}
+
 impl Value {
+    /// Fully-inlined clone for the interpreter's register/stack read paths:
+    /// identical to `Clone::clone`, but `always`-inlined so a hot read is a
+    /// handful of straight-line instructions (scalar copy, `Rc` bump, or
+    /// the string's small representation match) instead of an out-of-line
+    /// call + dynamic match. Kept separate from the `Clone` impl so the
+    /// bloat is confined to the interpreter loops that measurably need it.
+    #[inline(always)]
+    pub(crate) fn clone_fast(&self) -> Value {
+        match self {
+            Value::Undefined => Value::Undefined,
+            Value::Null => Value::Null,
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Number(n) => Value::Number(*n),
+            Value::Uninitialized => Value::Uninitialized,
+            Value::Hole => Value::Hole,
+            Value::Object(o) => Value::Object(o.clone()),
+            Value::String(s) => Value::String(s.clone()),
+            Value::Symbol(s) => Value::Symbol(s.clone()),
+            Value::BigInt(b) => Value::BigInt(b.clone()),
+        }
+    }
+
+    /// True when dropping this value is a no-op (no heap ownership): the
+    /// register-file write path skips the dynamic drop-glue call for these
+    /// (measured ~19 instructions per call, ~8% of the React profile).
+    #[inline(always)]
+    pub(crate) fn drop_is_noop(&self) -> bool {
+        matches!(
+            self,
+            Value::Undefined
+                | Value::Null
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::Uninitialized
+                | Value::Hole
+        )
+    }
+
     pub fn str(s: impl AsRef<str>) -> Value {
         Value::String(JsString::new(s))
     }

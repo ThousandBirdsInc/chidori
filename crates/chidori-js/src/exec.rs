@@ -4864,13 +4864,23 @@ impl Vm {
             crate::opstats::record_rop(op);
             macro_rules! rd {
                 ($i:expr) => {
-                    frame.locals[$i as usize].clone()
+                    frame.locals[$i as usize].clone_fast()
                 };
             }
+            // Register writes skip the dynamic drop-glue call when the old
+            // value owns nothing (the `forget` makes the moved-out copy
+            // dead, so the optimizer deletes it); a heap-owning old value
+            // takes the ordinary in-place assignment drop.
             macro_rules! wr {
-                ($i:expr, $v:expr) => {
-                    frame.locals[$i as usize] = $v
-                };
+                ($i:expr, $v:expr) => {{
+                    let v = $v;
+                    let slot = &mut frame.locals[$i as usize];
+                    if slot.drop_is_noop() {
+                        std::mem::forget(std::mem::replace(slot, v));
+                    } else {
+                        *slot = v;
+                    }
+                }};
             }
             // Frame exit with the module-linker snapshot (mirror of the
             // stack loop's `Ctl::Return` arm).
@@ -4988,12 +4998,9 @@ impl Vm {
                                 *budget -= cost;
                             }
                         }
-                        let b = self.const_val(&frame, arm.konst);
-                        let r = tryv!(self.cmp_values(
-                            CmpOp::StrictEq,
-                            &frame.locals[arm.a as usize],
-                            &b
-                        ));
+                        // Strict equality is total: compare against the
+                        // constant IN PLACE (no clone, no drop, no throw).
+                        let r = self.strict_eq_konst(&frame, &frame.locals[arm.a as usize], arm.konst);
                         if r == arm.br_on_eq {
                             pc = arm.target as usize;
                             break;
@@ -8061,6 +8068,27 @@ impl Vm {
         match (a, b) {
             (Value::Number(x), Value::Number(y)) => x == y,
             _ => strict_equals_nonnumeric(a, b),
+        }
+    }
+
+    /// `a === consts[konst]` without materializing the constant. Strict
+    /// equality is total (no user code, no throw) and structural on every
+    /// constant kind, so this is exactly
+    /// `strict_equals(a, &const_val(konst))` minus the clone + drop.
+    /// `Const::Func` loads as `undefined` through `const_val`, mirrored
+    /// here; `Const::BigInt` builds its value per load, so it keeps the
+    /// materializing path.
+    pub(crate) fn strict_eq_konst(&self, frame: &Frame, a: &Value, konst: u32) -> bool {
+        match &frame.func.proto.consts[konst as usize] {
+            Const::Undefined | Const::Func(_) => matches!(a, Value::Undefined),
+            Const::Null => matches!(a, Value::Null),
+            Const::Bool(b) => matches!(a, Value::Bool(x) if x == b),
+            Const::Number(n) => matches!(a, Value::Number(m) if m == n),
+            Const::String(s) => matches!(a, Value::String(x) if x == s),
+            Const::BigInt(_) => {
+                let b = self.const_val(frame, konst);
+                self.strict_equals(a, &b)
+            }
         }
     }
 
