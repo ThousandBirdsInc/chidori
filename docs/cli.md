@@ -26,6 +26,7 @@ its job and the doc that covers it in depth.
 | `chidori chat [agent.ts]` | Interactive multi-turn REPL backed by `conversation()`. With no file, chats with the model directly (`--system`, `--model`); with a conversational agent file, chats through it. Each turn is a durable host call; prior turns replay for free, so only the newest message reaches the provider. `--resume <session_id>` reprints the transcript for $0 and continues the same session. |
 | `chidori serve <agent.ts> --port 8080` | HTTP session server: sessions, pause/resume, signals, SSE streaming ([Running Modes](./running-modes.md)). In production, set `CHIDORI_API_KEY` for bearer auth and see the [Deployment](./deployment.md) checklist. |
 | `chidori serve --port 8080` | Fleet-only server (no agent file): hosts detached agents; sessions must name an agent. |
+| `chidori serve --app chidori.app.yml` | Boot from an application manifest: a declared detached-agent fleet (`keep_alive`), cron schedules, and webhook routes that deliver into agent mailboxes as signals ([Running Modes](./running-modes.md)). Picked up automatically when `chidori.app.yml` sits next to the agent file. |
 
 ## Replay, resume, and testing
 

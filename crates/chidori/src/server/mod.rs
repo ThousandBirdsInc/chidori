@@ -32,6 +32,7 @@ use crate::scheduler::{self, SchedulerDeps};
 use crate::storage::{build_session_store, SessionStatus, SessionStore, StoredSession};
 use crate::tools::{ToolDef, ToolRegistry};
 
+mod app_routes;
 mod detached;
 mod engine;
 mod events;
@@ -574,6 +575,66 @@ fn resolve_persisted_pending_host_operation(
     .map(|_| ())
 }
 
+/// Spawn the application manifest's `keep_alive` agents that aren't already
+/// live in the registry. Best-effort per agent: one bad entry logs and skips
+/// rather than taking the whole boot down (the manifest itself was validated
+/// at load).
+fn boot_manifest_fleet(manifest: &crate::app_manifest::AppManifest) {
+    let hub = crate::runtime::host_agent::hub();
+    let parts = match hub.installed_parts() {
+        Ok(parts) => parts,
+        Err(err) => {
+            tracing::warn!("app manifest fleet: {err}");
+            return;
+        }
+    };
+    let factory = crate::runtime::store::RunStoreFactory::shared(&parts.run_base);
+    for agent in manifest.fleet() {
+        let live = factory
+            .registry_get(&agent.name)
+            .ok()
+            .flatten()
+            .and_then(|entry| {
+                entry
+                    .get("descriptor")
+                    .and_then(|d| d.get("status"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|status| matches!(status.as_str(), "running" | "hibernating"));
+        if live {
+            continue;
+        }
+        let options = crate::runtime::host_agent::SpawnOptions {
+            name: Some(agent.name.clone()),
+            restart: agent.restart.clone().unwrap_or_else(|| "resume".to_string()),
+            max_restarts: agent.max_restarts.unwrap_or(3),
+            backoff_ms: agent.backoff_ms.unwrap_or(0),
+            model: agent.model.clone(),
+        };
+        let source = manifest
+            .resolve_agent_path(agent)
+            .to_string_lossy()
+            .into_owned();
+        let input = if agent.input.is_null() {
+            json!({})
+        } else {
+            agent.input.clone()
+        };
+        match hub.spawn(&parts, &source, input, &options, "app-manifest".to_string()) {
+            Ok(receipt) => eprintln!(
+                "  App fleet: spawned `{}` (run {})",
+                agent.name,
+                receipt
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>")
+            ),
+            Err(err) => tracing::warn!("app manifest fleet: spawning `{}`: {err}", agent.name),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server entry point
 // ---------------------------------------------------------------------------
@@ -586,6 +647,7 @@ pub async fn serve(
     port: u16,
     policy: Arc<PolicyConfig>,
     policy_posture: String,
+    app_manifest: Option<crate::app_manifest::AppManifest>,
 ) -> anyhow::Result<()> {
     // No agent file → a fleet-only server: it re-arms and drives the
     // detached-agent fleet under the current directory, and every session
@@ -628,10 +690,15 @@ pub async fn serve(
     let run_base = base_dir.join(".chidori").join("runs");
 
     let recipe_dir = std::env::var("CHIDORI_RECIPE_DIR").ok().map(PathBuf::from);
-    let recipes = recipe_dir
+    let mut recipes = recipe_dir
         .as_ref()
         .map(|d| Recipe::load_dir(d).unwrap_or_default())
         .unwrap_or_default();
+    // Manifest schedules join the recipe set: same cron loop, same
+    // `GET /recipes` listing, same manual `POST /recipes/{name}/run`.
+    if let Some(manifest) = &app_manifest {
+        recipes.extend(manifest.to_recipes());
+    }
     let recipes_arc = Arc::new(recipes.clone());
 
     // Spawn cron loops for every recipe with a schedule.
@@ -705,6 +772,14 @@ pub async fn serve(
         }
     }
 
+    // Boot the manifest's keep_alive fleet: spawn every declared agent whose
+    // name is not already live in the registry (live ones were just re-armed
+    // above; settled ones are replaced by a fresh spawn, mailbox migration
+    // included, exactly like a `chidori.agents.spawn` reusing the name).
+    if let Some(manifest) = &app_manifest {
+        boot_manifest_fleet(manifest);
+    }
+
     let auth_required = std::env::var("CHIDORI_API_KEY").is_ok();
     let loopback = is_loopback_host(&host);
     // Fail closed on the dangerous combination: a network-reachable bind with
@@ -769,7 +844,26 @@ pub async fn serve(
         .route("/recipes/{name}/run", post(run_recipe))
         .with_state(state.clone())
         // ACP endpoints (separate sub-router so it carries its own state).
-        .merge(acp::router(acp_state))
+        .merge(acp::router(acp_state));
+
+    // Manifest webhook routes: each path delivers into a detached agent's
+    // mailbox as a named signal. Registered before the fallback/auth layers
+    // so they are real routes under the same bearer auth as everything else.
+    let mut app = app;
+    if let Some(manifest) = &app_manifest {
+        for route in &manifest.routes {
+            let target = Arc::new(app_routes::AppRouteTarget {
+                path: route.path.clone(),
+                agent: route.agent.clone(),
+                signal: route.signal.clone(),
+            });
+            app = app.route(
+                &route.path,
+                post(app_routes::deliver_app_route).with_state(target),
+            );
+        }
+    }
+    let app = app
         // Event-driven fallback
         .fallback(any(handle_event).with_state(state.clone()))
         .layer(middleware::from_fn(auth_middleware))

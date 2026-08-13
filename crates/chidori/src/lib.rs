@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod app_manifest;
 pub mod mcp;
 pub mod mem_guard;
 pub mod node_compat;

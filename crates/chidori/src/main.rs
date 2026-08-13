@@ -1,4 +1,5 @@
 mod acp;
+mod app_manifest;
 mod cellstore;
 mod deploy;
 mod export;
@@ -529,6 +530,14 @@ enum Commands {
         /// Equivalent to CHIDORI_ISOLATE=off.
         #[arg(long)]
         no_isolate: bool,
+
+        /// Application manifest to boot the server from (detached-agent
+        /// fleet, schedules, webhook routes). Defaults to
+        /// `chidori.app.yml`/`.yaml`/`.json` next to the agent file (or in
+        /// the current directory for a fleet-only server) when one exists;
+        /// CHIDORI_APP_MANIFEST also names one.
+        #[arg(long, value_name = "MANIFEST")]
+        app: Option<PathBuf>,
     },
 
     /// Serve a self-hosted durable run store — the celld model
@@ -930,6 +939,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             trusted,
             isolate,
             no_isolate,
+            app,
         } => {
             if isolate {
                 crate::runtime::isolate::enable();
@@ -947,6 +957,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                     verbose,
                     untrusted,
                     trusted,
+                    app.as_deref(),
                 ),
                 false,
             )
@@ -1257,7 +1268,7 @@ fn cmd_demo() -> Result<()> {
             // The demo serves the developer's own example agent on their own
             // machine — the trusted posture, like `chidori run`, on the
             // default loopback bind.
-            cmd_serve(Some(&PathBuf::from(file)), None, *port, false, false, true)
+            cmd_serve(Some(&PathBuf::from(file)), None, *port, false, false, true, None)
         }
     }
 }
@@ -3750,6 +3761,7 @@ fn cmd_serve(
     verbose: bool,
     untrusted: bool,
     trusted: bool,
+    app: Option<&Path>,
 ) -> Result<()> {
     if verbose {
         // Isolate worker children read this to decide whether to print
@@ -3789,6 +3801,28 @@ fn cmd_serve(
              sessions must name an agent via the `agent` field)"
         ),
     }
+
+    // Application manifest: an explicit `--app` (or CHIDORI_APP_MANIFEST) must
+    // load or the server refuses to start; the probed default is optional.
+    let app_manifest = match app
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var("CHIDORI_APP_MANIFEST").ok().map(PathBuf::from))
+    {
+        Some(path) => Some(crate::app_manifest::AppManifest::load(&path)?),
+        None => crate::app_manifest::AppManifest::find_in(&base_dir)
+            .map(|path| crate::app_manifest::AppManifest::load(&path))
+            .transpose()?,
+    };
+    if let Some(manifest) = &app_manifest {
+        eprintln!(
+            "App manifest: {} — {} agent(s) ({} kept alive, {} scheduled), {} route(s)",
+            manifest.name.as_deref().unwrap_or("(unnamed)"),
+            manifest.agents.len(),
+            manifest.fleet().count(),
+            manifest.agents.iter().filter(|a| a.schedule.is_some()).count(),
+            manifest.routes.len(),
+        );
+    }
     eprintln!("Isolation: {}", crate::runtime::isolate::describe());
     // The server is deny-by-default unless explicitly trusted; if it is confining
     // callers by policy but not by process, point at --isolate.
@@ -3812,6 +3846,7 @@ fn cmd_serve(
         port,
         policy,
         policy_posture,
+        app_manifest,
     ))?;
 
     Ok(())
