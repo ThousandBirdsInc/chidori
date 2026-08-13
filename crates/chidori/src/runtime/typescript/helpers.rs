@@ -833,9 +833,6 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
 })()
 "#;
 
-/// APIs, but `node:buffer` and `node:fs` shims (and lots of real packages) need
-/// `TextEncoder`/`TextDecoder`/`atob`/`btoa`. Pure-JS, deterministic, no host
-/// access — safe to install unconditionally like `URLSearchParams`.
 /// Input-schema validation for the `run(handler, { inputSchema })` form.
 ///
 /// Wraps the native `run` registrar (so it MUST be evaluated after
@@ -852,7 +849,7 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
 /// Validation is pure and deterministic (a function of the input alone), so
 /// it happens before any host call and replays identically. A failure throws
 /// an `InputValidationError` listing every issue — the server maps it to a
-/// 400 instead of storing a failed session.
+/// 400 carrying the issue list (the failed session is still stored).
 pub(crate) const INPUT_SCHEMA_SCRIPT: &str = r#"
 (() => {
   const nativeRun = globalThis.run;
@@ -928,9 +925,10 @@ pub(crate) const INPUT_SCHEMA_SCRIPT: &str = r#"
             checkJsonSchema(schema.properties[key], value[key], path ? `${path}.${key}` : key, issues);
         }
       }
-      if (schema.additionalProperties === false && schema.properties) {
+      if (schema.additionalProperties === false) {
+        const props = schema.properties || {};
         for (const key of Object.keys(value)) {
-          if (!(key in schema.properties)) issues.push(`${where}.${key}: unexpected property`);
+          if (!(key in props)) issues.push(`${where}.${key}: unexpected property`);
         }
       }
     }
@@ -979,6 +977,9 @@ pub(crate) const INPUT_SCHEMA_SCRIPT: &str = r#"
 })();
 "#;
 
+/// APIs, but `node:buffer` and `node:fs` shims (and lots of real packages) need
+/// `TextEncoder`/`TextDecoder`/`atob`/`btoa`. Pure-JS, deterministic, no host
+/// access — safe to install unconditionally like `URLSearchParams`.
 pub(crate) const TEXT_ENCODING_POLYFILL: &str = r#"
 (function () {
     const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

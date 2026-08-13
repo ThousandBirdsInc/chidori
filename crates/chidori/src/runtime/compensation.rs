@@ -100,6 +100,14 @@ pub fn rollback_run(
     let mut pending = pending_compensations(&records);
     pending.reverse();
 
+    // Nothing registered: report empty WITHOUT writing rollback.json — a
+    // rollback that did nothing must not block a later legitimate one (e.g.
+    // after a `resume --retry-failed` that registers compensations and fails
+    // again).
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut outcomes = Vec::with_capacity(pending.len());
     for compensation in &pending {
         let resolved = resolve_agent(base_dir, &compensation.agent);
@@ -227,6 +235,35 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{err:#}").contains("already rolled back"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_rollback_writes_no_marker_so_a_later_rollback_still_runs() {
+        let dir =
+            std::env::temp_dir().join(format!("chidori-rollback-empty-{}", uuid::Uuid::new_v4()));
+        let store = FsRunStore::new(dir.join("run-1"));
+        store.write_call_log(&[other_record(1, "prompt")]).unwrap();
+
+        // No compensations registered: empty outcome, no rollback.json.
+        let outcomes =
+            rollback_run(&store, Path::new("/p"), &mut |_, _| Ok("r".to_string())).unwrap();
+        assert!(outcomes.is_empty());
+        assert!(store.get_blob(ROLLBACK_FILE).unwrap().is_none());
+
+        // The run later registers a compensation (e.g. a retry that got
+        // further) — rollback still runs it.
+        store
+            .write_call_log(&[
+                other_record(1, "prompt"),
+                compensation_record(2, "undo", "comp/undo.ts", Value::Null),
+            ])
+            .unwrap();
+        let outcomes =
+            rollback_run(&store, Path::new("/p"), &mut |_, _| Ok("r2".to_string())).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(store.get_blob(ROLLBACK_FILE).unwrap().is_some());
 
         let _ = std::fs::remove_dir_all(dir);
     }

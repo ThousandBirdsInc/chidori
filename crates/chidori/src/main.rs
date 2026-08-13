@@ -1753,6 +1753,11 @@ fn cmd_dev(
     // ---- Initial recording run -------------------------------------------
     eprintln!("[dev] recording initial run of {}…", file.display());
     let started = std::time::SystemTime::now();
+    // Baseline the entry file BEFORE the initial (longest, all-live) run, so
+    // an edit saved while it executes still triggers the first re-run. The
+    // imported-module set isn't known until the run's manifest exists; those
+    // paths fold into the baseline afterwards.
+    let pre_run_signatures = watch_signatures(&[file.to_path_buf()]);
     let mut last_output: Option<Value> = None;
     let mut run_id: Option<String> = match run_engine(&build_engine(), file, &input_value) {
         Ok(result) => {
@@ -1776,6 +1781,9 @@ fn cmd_dev(
     // ---- Watch loop -------------------------------------------------------
     eprintln!("[dev] watching for changes (Ctrl-C to exit)…");
     let mut signatures = watch_signatures(&watch_set(&run_base, run_id.as_deref(), file));
+    // The entry keeps its pre-run signature: if it changed during the
+    // initial run, the first loop tick sees the difference and re-runs.
+    signatures.extend(pre_run_signatures);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let watched = watch_set(&run_base, run_id.as_deref(), file);
@@ -2867,6 +2875,14 @@ fn cmd_holdings(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
 
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
     let _ = factory.hydrate(run_id);
+    // A holdings report for a run that doesn't exist would read as "holds
+    // nothing" — a typo'd id must error, like `trace` and `rollback` do.
+    if !run_dir.is_dir() {
+        anyhow::bail!(
+            "no run {run_id} under {} — check the id with `chidori stats` (or pass --dir)",
+            run_base.display()
+        );
+    }
     let store = factory.store_for(run_id);
     let registry_factory = factory.clone();
     let lookup = move |name: &str| registry_factory.registry_get(name).ok().flatten();

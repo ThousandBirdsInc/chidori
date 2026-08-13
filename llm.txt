@@ -37,7 +37,8 @@ Rules:
   structurally: type/properties/required/items/enum/const/bounds/pattern).
   Validation is deterministic and runs before any host call; a failure throws
   `InputValidationError` listing every issue, and `chidori serve` answers 400
-  instead of storing a failed session.
+  with the issue list (the failed session is still stored and echoed in the
+  response).
 - Type the input with an inline object type or a `type` alias, never an
   `interface` — interfaces have no implicit index signature, so they fail the
   handler's `AgentJson` constraint with a confusing type error.
@@ -60,6 +61,9 @@ chidori run agents/my_agent.ts --input '{"document": "text"}'
 chidori run agents/my_agent.ts --model deepseek-chat   # default model for prompts (or CHIDORI_MODEL)
 chidori run agents/my_agent.ts --stream
 chidori run agents/my_agent.ts --trace
+chidori dev agents/my_agent.ts --input key=value  # edit-and-replay loop: records one run, re-runs on every
+                                            # save with recorded calls replayed free; a divergent edit is
+                                            # reported with its seq and re-records live from there
 chidori chat --system "You are a concise assistant." --model claude-sonnet
 chidori chat agents/chat.ts                 # chat through a conversational agent file
 chidori serve agents/webhook.ts --port 8080 --trusted
@@ -75,6 +79,12 @@ chidori verify agents/my_agent.ts <run_id>  # checkpoint-as-test: replay with NO
                                             # "N workspace re-materialization(s)") — same bytes, fresh mtime.
 chidori trace <run_id>
 chidori snapshot <run_id>
+chidori holdings <run_id>                   # what the run holds right now: pending operation, queued
+                                            # signals, unsettled actors, detached agents, branches,
+                                            # armed compensations
+chidori rollback <run_id>                   # saga rollback: run registered compensations newest-first
+chidori serve agents/app.ts --app chidori.app.yml  # boot from an application manifest: keep_alive
+                                            # detached-agent fleet, cron schedules, webhook routes
 ```
 
 `chidori init [dir] --template docs|chat|worker` scaffolds a starter project

@@ -658,6 +658,25 @@ pub async fn serve(
     let has_default_agent = agent_path.is_some();
     let agent_path =
         agent_path.unwrap_or_else(|| PathBuf::from(".").join("__no_default_agent__.ts"));
+    // Fail closed on the dangerous combination FIRST — before MCP servers
+    // start, cron loops spawn, or the manifest fleet boots: a server that is
+    // going to refuse its bind must not execute agent code on the way down.
+    // A network-reachable bind with no authentication means anyone who can
+    // route to the port can execute agent code. The default bind is
+    // loopback, so this only trips when the operator explicitly asked for a
+    // wider bind without setting a key.
+    let auth_required = std::env::var("CHIDORI_API_KEY").is_ok();
+    let loopback = is_loopback_host(&host);
+    if !loopback && !auth_required && !allow_unauthenticated_from_env() {
+        anyhow::bail!(
+            "refusing to bind {host}:{port} without authentication: a non-loopback bind \
+             exposes this server — which executes agent code — to the network with no \
+             access control. Either set CHIDORI_API_KEY to require bearer auth, keep the \
+             default loopback bind (drop --host / CHIDORI_HOST), or set \
+             CHIDORI_ALLOW_UNAUTHENTICATED=1 if a reverse proxy or firewall in front of \
+             this server already controls access."
+        );
+    }
     // Configurable concurrency cap. Default 8 is low enough to keep one
     // LLM provider from being flooded and high enough that a small agent
     // fleet can saturate. Expose as env var so ops can tune without a
@@ -696,9 +715,22 @@ pub async fn serve(
         .map(|d| Recipe::load_dir(d).unwrap_or_default())
         .unwrap_or_default();
     // Manifest schedules join the recipe set: same cron loop, same
-    // `GET /recipes` listing, same manual `POST /recipes/{name}/run`.
+    // `GET /recipes` listing, same manual `POST /recipes/{name}/run`. On a
+    // name collision the manifest entry replaces the recipe-dir one —
+    // declarative config wins, and two cron loops for one name would run the
+    // job twice per tick.
     if let Some(manifest) = &app_manifest {
-        recipes.extend(manifest.to_recipes());
+        for recipe in manifest.to_recipes() {
+            if let Some(existing) = recipes.iter().position(|r| r.name == recipe.name) {
+                tracing::warn!(
+                    "app manifest schedule `{}` overrides the recipe of the same name from \
+                     CHIDORI_RECIPE_DIR",
+                    recipe.name
+                );
+                recipes.remove(existing);
+            }
+            recipes.push(recipe);
+        }
     }
     let recipes_arc = Arc::new(recipes.clone());
 
@@ -781,22 +813,6 @@ pub async fn serve(
         boot_manifest_fleet(manifest);
     }
 
-    let auth_required = std::env::var("CHIDORI_API_KEY").is_ok();
-    let loopback = is_loopback_host(&host);
-    // Fail closed on the dangerous combination: a network-reachable bind with
-    // no authentication means anyone who can route to the port can execute
-    // agent code. The default bind is loopback, so this only trips when the
-    // operator explicitly asked for a wider bind without setting a key.
-    if !loopback && !auth_required && !allow_unauthenticated_from_env() {
-        anyhow::bail!(
-            "refusing to bind {host}:{port} without authentication: a non-loopback bind \
-             exposes this server — which executes agent code — to the network with no \
-             access control. Either set CHIDORI_API_KEY to require bearer auth, keep the \
-             default loopback bind (drop --host / CHIDORI_HOST), or set \
-             CHIDORI_ALLOW_UNAUTHENTICATED=1 if a reverse proxy or firewall in front of \
-             this server already controls access."
-        );
-    }
     let cors_layer = build_cors_layer();
 
     // ACP router owns its own state so session lookups go through the same

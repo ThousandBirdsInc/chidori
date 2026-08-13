@@ -2047,6 +2047,40 @@ mod tests {
     }
 
     #[test]
+    fn run_input_schema_additional_properties_false_works_without_properties() {
+        // `additionalProperties: false` must reject unexpected keys even when
+        // the schema declares no `properties` map (a common strict-input
+        // pattern) — JSON Schema semantics, not a silent accept-all.
+        let dir = std::env::temp_dir()
+            .join(format!("chidori-rust-addprops-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            import { run } from "chidori:agent";
+            run(async (input) => ({ ok: true }), {
+                inputSchema: { type: "object", required: ["id"], additionalProperties: false },
+            });
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let backend = test_backend(RuntimeContext::new(), Arc::new(ToolRegistry::new()));
+        let err = run_agent(
+            &path,
+            src,
+            &serde_json::json!({ "id": 1, "admin": true }),
+            &backend,
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("admin: unexpected property"),
+            "expected the unexpected-property issue, got: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn run_input_schema_standard_schema_validates_and_replaces_input() {
         // A Standard Schema validator (`~standard.validate`): its issues
         // refuse the run, and its validated value — defaults applied —

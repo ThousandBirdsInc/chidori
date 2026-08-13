@@ -50,6 +50,11 @@ use crate::recipes::Recipe;
 /// no explicit path is given.
 pub const MANIFEST_FILE_NAMES: &[&str] = &["chidori.app.yml", "chidori.app.yaml", "chidori.app.json"];
 
+/// Top-level path segments the server's built-in routes own; a manifest route
+/// under one of these would make the router panic at assembly. `acp` is the
+/// ACP sub-router's root.
+const RESERVED_ROUTE_ROOTS: &[&str] = &["health", "sessions", "agents", "recipes", "acp"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppManifest {
     #[serde(default)]
@@ -70,7 +75,9 @@ pub struct ManifestAgent {
     pub name: String,
     /// Agent entry file, relative to the manifest's directory.
     pub agent: PathBuf,
-    #[serde(default)]
+    /// Spawn input (detached agents) / run inputs (schedules). `inputs` is
+    /// accepted as an alias so recipe files translate 1:1.
+    #[serde(default, alias = "inputs")]
     pub input: Value,
     /// Spawn as a detached agent at server boot and keep it re-armed.
     #[serde(default)]
@@ -188,6 +195,7 @@ impl AppManifest {
                 })?;
             }
         }
+        let mut seen_paths = std::collections::HashSet::new();
         for route in &self.routes {
             if !route.path.starts_with('/') {
                 anyhow::bail!(
@@ -199,6 +207,27 @@ impl AppManifest {
                 anyhow::bail!(
                     "app manifest: route `{}` needs both `agent` and `signal`",
                     route.path
+                );
+            }
+            // The router panics (mid-boot, after the fleet is already
+            // spawned) on an overlapping route — so duplicates and paths
+            // under the server's built-in roots must fail validation here,
+            // where a manifest error stops the server before it does
+            // anything.
+            if !seen_paths.insert(route.path.clone()) {
+                anyhow::bail!("app manifest: duplicate route path `{}`", route.path);
+            }
+            let root = route.path.split('/').nth(1).unwrap_or("");
+            if RESERVED_ROUTE_ROOTS.contains(&root) {
+                anyhow::bail!(
+                    "app manifest: route path `{}` collides with the server's built-in \
+                     `/{root}` routes — pick a path outside {}",
+                    route.path,
+                    RESERVED_ROUTE_ROOTS
+                        .iter()
+                        .map(|r| format!("/{r}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             // A route usually targets a manifest-managed agent; targeting a
@@ -366,6 +395,14 @@ routes:
             (
                 "agents:\n  - name: a\n    agent: a.ts\n  - name: a\n    agent: a.ts\n",
                 "duplicate agent name",
+            ),
+            (
+                "agents: []\nroutes:\n  - path: /hooks/a\n    agent: a\n    signal: s\n  - path: /hooks/a\n    agent: b\n    signal: t\n",
+                "duplicate route path",
+            ),
+            (
+                "agents: []\nroutes:\n  - path: /sessions/evil\n    agent: a\n    signal: s\n",
+                "collides with the server's built-in",
             ),
         ] {
             let path = write_manifest(dir.path(), "chidori.app.yml", body);

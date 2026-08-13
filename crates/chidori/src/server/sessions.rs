@@ -280,17 +280,6 @@ pub(super) async fn create_session(
         .unwrap()
     };
 
-    // A run refused by input-schema validation never really started — the
-    // handler was never entered and no host call was answered. Surface it as
-    // the caller error it is (400) instead of storing a failed session.
-    if let Err(e) = &result {
-        let text = agent_error_string(&state.agent_path, e);
-        if text.contains("InputValidationError:") {
-            drop(permit);
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": text }))).into_response();
-        }
-    }
-
     let mut session = StoredSession {
         id: id.clone(),
         run_id: None,
@@ -321,7 +310,35 @@ pub(super) async fn create_session(
     arm_signal_timeout(&state, &session);
     release_warm_run_if_settled(&state, &session);
     drop(permit);
+    // A run refused by input-schema validation is a caller error: answer 400
+    // (with the stored session, so nothing is lost if the classification is
+    // ever wrong — e.g. a nested sub-agent's validation error surfacing as
+    // the parent's failure after real side effects). The prefix match is
+    // deliberate: only an error whose outermost message IS the validation
+    // framing qualifies, not one merely mentioning it.
+    if session
+        .error
+        .as_deref()
+        .is_some_and(is_input_validation_refusal)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": session.error,
+                "session": session_view(&session),
+            })),
+        )
+            .into_response();
+    }
     (StatusCode::CREATED, Json(session_view(&session))).into_response()
+}
+
+/// True when a run error's outermost message is the input-schema refusal the
+/// `run(handler, { inputSchema })` wrapper throws — the exact framing the
+/// engine wraps it in, matched as a prefix so an error that merely *mentions*
+/// the marker text never qualifies.
+fn is_input_validation_refusal(error: &str) -> bool {
+    error.starts_with("JavaScript exception: InputValidationError: invalid input:")
 }
 
 /// GET /sessions — list all sessions.

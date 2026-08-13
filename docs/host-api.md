@@ -42,7 +42,8 @@ Rules:
   and coercions applied, replaces the input) or a plain JSON Schema object,
   checked structurally. Validation is deterministic and runs before any host
   call; a failure throws `InputValidationError` listing every issue, and
-  `chidori serve` answers 400 instead of storing a failed session.
+  `chidori serve` answers 400 with the issue list (the failed session is
+  still stored and echoed in the response).
 - Type the input with an inline object type or a `type` alias, never an
   `interface` — interfaces have no implicit index signature, so they fail
   the handler's `AgentJson` constraint with a confusing type error.

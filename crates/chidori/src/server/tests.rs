@@ -1646,7 +1646,9 @@ async fn get_holdings_reports_pending_operation_and_session_overlay() {
 async fn create_session_maps_input_schema_refusal_to_400() {
     // `run(handler, { inputSchema })`: a malformed input is a caller error —
     // the handler never entered, no host call was answered — so the server
-    // answers 400 with the issue list instead of storing a failed session.
+    // answers 400 with the issue list. The failed session is still stored
+    // (and echoed in the response), so nothing is lost if the classification
+    // is ever wrong for a nested validation failure.
     let (temp_dir, state) = policy_test_project(
         "chidori-server-input-schema",
         r#"
@@ -1670,10 +1672,30 @@ async fn create_session_maps_input_schema_refusal_to_400() {
         error.contains("InputValidationError:") && error.contains("topic: required"),
         "expected the validation issue list, got: {error}"
     );
-    // No failed session was stored for the refused run.
-    assert!(state.session_store.list().unwrap().is_empty());
+    // The refused run's session is stored (failed) and echoed in the body.
+    assert_eq!(body["session"]["status"], json!("failed"));
+    assert_eq!(state.session_store.list().unwrap().len(), 1);
+
+    // An agent that merely MENTIONS the marker in an ordinary throw is not a
+    // validation refusal: stored as a failed session under the normal 201.
+    let (mention_dir, mention_state) = policy_test_project(
+        "chidori-server-input-schema-mention",
+        r#"
+            import { chidori, run } from "chidori:agent";
+            run(async () => {
+                throw new Error("saw InputValidationError: invalid input: in a log");
+            });
+        "#,
+    );
+    let (status, body) = response_json(
+        create_session(State(mention_state.clone()), Json(create_request(None))).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["status"], json!("failed"));
 
     let _ = std::fs::remove_dir_all(temp_dir);
+    let _ = std::fs::remove_dir_all(mention_dir);
 }
 
 #[tokio::test]
