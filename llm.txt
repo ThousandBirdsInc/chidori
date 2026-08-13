@@ -621,6 +621,30 @@ The callback must be pure, synchronous compute: host effects, captured
 randomness, filesystem writes, timers, and async callbacks throw inside a step.
 See `docs/value-checkpoints.md`.
 
+### compensation (saga rollback)
+
+```ts
+await chidori.compensation.register("deprovision", "comp/deprovision.ts", { serverId });
+// → { registered: true }
+```
+
+Durably register an inverse action — an agent module + its input — for a side
+effect the run just performed. Registration is one journal record and performs
+nothing; on a successful run the registrations are void. When a run stops
+short (cancelled, failed, abandoned), roll it back explicitly:
+
+```bash
+chidori rollback <run_id>        # runs registered compensations newest-first
+```
+
+or `POST /sessions/{id}/cancel` with `{"compensate": true}` (deferred with a
+note when the session is still live). Each compensation executes as its own
+ordinary run — journaled, replayable, `chidori trace`-able. A failed
+compensation is reported and rollback continues past it. A completed rollback
+writes `rollback.json` into the run directory; a second rollback refuses
+(inverse actions are not re-fired). The agent path resolves like `callAgent`
+and must exist at registration.
+
 ### log
 
 ```ts

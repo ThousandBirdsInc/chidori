@@ -316,6 +316,31 @@ enum Commands {
         ci: bool,
     },
 
+    /// Run a run's registered compensations in reverse (saga rollback).
+    /// `chidori.compensation.register(name, agent, input?)` journals an
+    /// inverse action per side effect; this command executes them
+    /// newest-first — each as its own ordinary run — for a run that stopped
+    /// short (cancelled, failed, or paused-and-abandoned). Refuses a
+    /// completed run (its compensations are void) and a second rollback
+    /// (inverse actions are not re-fired).
+    Rollback {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to the current
+        /// directory)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+
+        /// Deny gated effects the compensation agents would perform.
+        #[arg(long, conflicts_with = "trusted")]
+        untrusted: bool,
+
+        /// Allow gated effects without asking (see `run --trusted`).
+        #[arg(long)]
+        trusted: bool,
+    },
+
     /// Replay a recorded run as a deterministic test: re-run the agent with
     /// every host call served from the journal, with NO provider configured
     /// and NO writes to the run directory (top-level workspace effects
@@ -858,6 +883,15 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                 false,
             )
         }
+        Commands::Rollback {
+            run_id,
+            dir,
+            untrusted,
+            trusted,
+        } => (
+            cmd_rollback(&run_id, dir.as_deref(), untrusted, trusted),
+            false,
+        ),
         Commands::Verify {
             file,
             run_id,
@@ -2802,6 +2836,77 @@ fn cmd_resume(
         "\nResumed from {run_id} ({} recorded calls replayed{remat_clause}, {live_new} executed live)",
         result.replayed_calls,
     );
+    Ok(())
+}
+
+/// `chidori rollback` — execute a run's registered compensations in reverse
+/// (`docs/host-api.md`, `runtime::compensation`). Each compensation is an
+/// agent module + its recorded input, run as its own ordinary journaled run;
+/// a failed compensation is reported and rollback continues past it.
+fn cmd_rollback(
+    run_id: &str,
+    dir: Option<&std::path::Path>,
+    untrusted: bool,
+    trusted: bool,
+) -> Result<()> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_base = base_dir.join(".chidori").join("runs");
+
+    let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    let _ = factory.hydrate(run_id);
+    let store = factory.store_for(run_id);
+
+    let providers = Arc::new(ProviderRegistry::from_env());
+    let template_engine = Arc::new(TemplateEngine::new(&base_dir));
+    let tokio_rt =
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
+    let engine = Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(Arc::new(ToolRegistry::new()))
+        .with_policy(cli_policy(untrusted, trusted))
+        .with_persist_base(run_base.clone())
+        .with_workspace_root(abs_dir(&base_dir));
+
+    let mut run_agent = |path: &Path, input: &Value| {
+        engine
+            .run_announced(path, input)
+            .map(|result| result.run_id)
+            .map_err(|err| format!("{err:#}"))
+    };
+    let outcomes =
+        crate::runtime::compensation::rollback_run(store.as_ref(), &base_dir, &mut run_agent)
+            .with_context(|| format!("rolling back run {run_id}"))?;
+
+    if outcomes.is_empty() {
+        eprintln!("Run {run_id} has no registered compensations — nothing to roll back.");
+        return Ok(());
+    }
+    let mut failed = 0usize;
+    for outcome in &outcomes {
+        match (&outcome.run_id, &outcome.error) {
+            (Some(comp_run), None) => {
+                eprintln!("  ✓ {} ({}) — run {comp_run}", outcome.name, outcome.agent)
+            }
+            (_, Some(error)) => {
+                failed += 1;
+                eprintln!("  ✗ {} ({}) — {error}", outcome.name, outcome.agent);
+            }
+            _ => {}
+        }
+    }
+    eprintln!(
+        "Rolled back {} compensation(s), newest first ({} failed). Report written to \
+         rollback.json in the run directory.",
+        outcomes.len(),
+        failed
+    );
+    if failed > 0 {
+        anyhow::bail!(
+            "{failed} compensation(s) failed — inspect their runs above and re-run them \
+             individually with `chidori run`"
+        );
+    }
     Ok(())
 }
 

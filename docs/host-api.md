@@ -486,6 +486,39 @@ it. The callback must be pure, synchronous compute: host effects, captured
 randomness, filesystem writes, timers, and async callbacks throw inside a
 step. See [Value Checkpoints](./value-checkpoints.md).
 
+### `chidori.compensation.register(name, agent, input?)` — saga rollback
+
+```ts
+const server = await chidori.tool("provision_server", { size: "large" });
+await chidori.compensation.register("deprovision", "comp/deprovision.ts", {
+  serverId: server.id,
+});
+```
+
+The journal runs forward; compensations let it run **backward**. Each
+registration durably records an inverse action — an agent module plus its
+input — for a side effect the run just performed. Registration itself does
+nothing; on a successful run the registrations are void history. When a run
+stops short (cancelled, failed, or abandoned mid-flight), roll it back:
+
+```bash
+chidori rollback <run_id>
+```
+
+or `POST /sessions/{id}/cancel` with `{"compensate": true}` (deferred with a
+note when the session is still live — roll back after it settles). Registered
+compensations execute **newest-first**, each as its own ordinary run —
+journaled, replayable, visible in `chidori trace`. A failed compensation is
+reported and rollback continues past it (the remaining inverse actions are
+independent obligations). A completed rollback writes `rollback.json` into
+the run directory and a second rollback refuses — inverse actions are not
+re-fired. Rollback is explicit, never automatic: compensations perform real
+side effects, and re-firing them is an operator decision.
+
+The `agent` path resolves like `callAgent` (relative to the project root) and
+must exist at registration — a compensation that can't resolve is useless
+exactly when it's needed.
+
 ### `chidori.log(msg, data?)` / `chidori.mark(label, data?)`
 
 ```ts

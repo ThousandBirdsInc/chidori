@@ -1121,6 +1121,50 @@ impl HostBindingBackend {
                 self.durable_call("mark", args, || Ok(serde_json::Value::Null))
                     .map(opt_null)
             }
+            // Saga compensation registration (`docs/host-api.md`): one durable
+            // record naming an inverse action — an agent module + its input —
+            // to run, newest-first, when the run is rolled back. Registration
+            // performs no side effect; execution happens only under an
+            // explicit rollback (`chidori rollback`, or cancel with
+            // `"compensate": true`).
+            "compensation" => {
+                let name = a
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("chidori.compensation.register requires a name")?
+                    .to_string();
+                let agent = a
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("chidori.compensation.register requires an agent module path")?
+                    .to_string();
+                // Fail a typo'd path at registration, like actors.spawn does
+                // for its source — a compensation that can't resolve is
+                // useless exactly when it's needed. The durable args keep the
+                // original (possibly relative) path so replay keys are stable
+                // across hosts.
+                let resolved = if std::path::Path::new(&agent).is_absolute() {
+                    std::path::PathBuf::from(&agent)
+                } else {
+                    self.template_engine().base_dir().join(&agent)
+                };
+                if !resolved.is_file() {
+                    return Err(format!(
+                        "chidori.compensation.register: agent module not found: {agent}"
+                    ));
+                }
+                let args = serde_json::json!({
+                    "name": name,
+                    "agent": agent,
+                    "input": a.get("input").cloned().unwrap_or(serde_json::Value::Null),
+                });
+                self.durable_call("compensation", args, || {
+                    Ok(serde_json::json!({ "registered": true }))
+                })
+                .map(opt_null)
+            }
             "prompt" => {
                 let text = a
                     .get("text")

@@ -1,6 +1,7 @@
 pub mod app_data;
 pub mod call_log;
 pub mod capability;
+pub mod compensation;
 pub mod context;
 pub mod cost;
 pub mod compress;

@@ -536,6 +536,13 @@ pub(super) async fn replay_session(
 pub(super) struct CancelSessionRequest {
     #[serde(default)]
     pub(super) reason: Option<String>,
+    /// Run the session's registered compensations (saga rollback,
+    /// `runtime::compensation`) after cancelling, newest-first, each as its
+    /// own ordinary run. Deferred with a note when the session was still
+    /// live — the engine may not have unwound yet — in which case
+    /// `chidori rollback <run_id>` finishes the job once it settles.
+    #[serde(default)]
+    pub(super) compensate: bool,
 }
 
 /// POST /sessions/:id/cancel — mark a session cancelled and notify a live
@@ -545,8 +552,11 @@ pub(super) async fn cancel_session(
     Path(id): Path<String>,
     body: Option<Json<CancelSessionRequest>>,
 ) -> Response {
-    let reason = body
-        .and_then(|Json(body)| body.reason)
+    let (reason, compensate) = match body {
+        Some(Json(body)) => (body.reason, body.compensate),
+        None => (None, false),
+    };
+    let reason = reason
         .filter(|reason| !reason.trim().is_empty())
         .unwrap_or_else(|| "session cancelled".to_string());
 
@@ -613,14 +623,74 @@ pub(super) async fn cancel_session(
         return resp;
     }
 
-    Json(json!({
+    // Saga rollback (`runtime::compensation`): run the journal's registered
+    // compensations newest-first, each as its own ordinary run. Deferred for
+    // a still-live session — its engine may not have unwound yet, and
+    // interleaving inverse actions with a run's final effects would be worse
+    // than asking the operator to `chidori rollback` after it settles.
+    let mut compensation: Option<Value> = None;
+    if compensate {
+        compensation = Some(match (&session.run_id, was_active) {
+            (None, _) => json!({ "ran": false, "note": "session has no run to roll back" }),
+            (Some(_), true) => json!({
+                "ran": false,
+                "note": "session was still live; roll back after it settles with \
+                         `chidori rollback <run_id>`",
+            }),
+            (Some(run_id), false) => {
+                let run_id = run_id.clone();
+                let app_state = state.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let factory =
+                        crate::runtime::store::RunStoreFactory::shared(&app_state.run_base);
+                    let store = factory.store_for(&run_id);
+                    let engine = build_engine(&app_state, None);
+                    let base_dir = app_state
+                        .agent_path
+                        .parent()
+                        .unwrap_or_else(|| FsPath::new("."))
+                        .to_path_buf();
+                    let mut run_agent = |path: &FsPath, input: &Value| {
+                        engine
+                            .run_announced(path, input)
+                            .map(|result| result.run_id)
+                            .map_err(|err| format!("{err:#}"))
+                    };
+                    crate::runtime::compensation::rollback_run(
+                        store.as_ref(),
+                        &base_dir,
+                        &mut run_agent,
+                    )
+                })
+                .await;
+                match outcome {
+                    Ok(Ok(outcomes)) => json!({
+                        "ran": true,
+                        "outcomes": outcomes,
+                        "failed": outcomes_failed(&outcomes),
+                    }),
+                    Ok(Err(err)) => json!({ "ran": false, "error": format!("{err:#}") }),
+                    Err(join_err) => json!({ "ran": false, "error": join_err.to_string() }),
+                }
+            }
+        });
+    }
+
+    let mut response = json!({
         "id": id,
         "status": "cancelled",
         "active": was_active,
         "attempt_number": active_attempt_number,
         "reason": reason,
-    }))
-    .into_response()
+    });
+    if let Some(compensation) = compensation {
+        response["compensation"] = compensation;
+    }
+    Json(response).into_response()
+}
+
+fn outcomes_failed(outcomes: &[crate::runtime::compensation::RollbackOutcome]) -> usize {
+    outcomes.iter().filter(|o| o.error.is_some()).count()
 }
 
 /// Render an agent-run error for a session's stored/returned `error` field.

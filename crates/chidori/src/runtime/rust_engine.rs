@@ -2093,6 +2093,62 @@ mod tests {
     }
 
     #[test]
+    fn compensation_register_journals_the_inverse_action() {
+        // `chidori.compensation.register(name, agent, input)` journals one
+        // durable `compensation` record — validated (the agent module must
+        // exist) but performing no side effect at registration time.
+        let ctx = RuntimeContext::new();
+        let dir = std::env::temp_dir().join(format!("chidori-rust-comp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("comp")).unwrap();
+        std::fs::write(
+            dir.join("comp").join("deprovision.ts"),
+            "export async function agent() { return { undone: true }; }\n",
+        )
+        .unwrap();
+        let path = dir.join("agent.ts");
+        // The test backend's template base dir is the process CWD, so the
+        // valid registration uses the module's absolute path (real runs
+        // resolve relative paths against the project root).
+        let comp_path = dir.join("comp").join("deprovision.ts");
+        let src = r#"
+            import { chidori, run } from "chidori:agent";
+            run(async () => {
+                const receipt = await chidori.compensation.register(
+                    "deprovision", "__COMP__", { serverId: 7 });
+                try {
+                    await chidori.compensation.register("ghost", "comp/missing.ts");
+                    return { receipt, ghost: "registered" };
+                } catch (e) {
+                    return { receipt, ghost: String(e && e.message || e) };
+                }
+            });
+        "#
+        .replace("__COMP__", &comp_path.to_string_lossy());
+        std::fs::write(&path, &src).unwrap();
+
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let output = run_agent(&path, &src, &serde_json::json!({}), &backend).unwrap();
+        assert_eq!(output["receipt"], serde_json::json!({ "registered": true }));
+        assert!(
+            output["ghost"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("agent module not found"),
+            "expected a missing-module refusal, got: {}",
+            output["ghost"]
+        );
+
+        let records = ctx.call_log().into_records();
+        let pending = crate::runtime::compensation::pending_compensations(&records);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "deprovision");
+        assert_eq!(pending[0].agent, comp_path.to_string_lossy());
+        assert_eq!(pending[0].input, serde_json::json!({ "serverId": 7 }));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn run_agent_wires_template_checkpoint_and_memory_effects() {
         // Effects beyond log/input/tool now route through the shared host backend
         // on the rust engine: minijinja templates, durable checkpoints, and the

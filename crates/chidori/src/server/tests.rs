@@ -232,6 +232,7 @@ async fn cancel_session_marks_active_session_cancelled() {
             Path("session-1".to_string()),
             Some(Json(CancelSessionRequest {
                 reason: Some("rewind".to_string()),
+                compensate: false,
             })),
         )
         .await,

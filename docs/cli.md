@@ -36,6 +36,7 @@ its job and the doc that covers it in depth.
 | `chidori resume … --trusted` | Crash recovery of a trusted tool-using run — same posture flags as `run`; continuation journals into the same run dir. |
 | `chidori resume … --allow-source-change` | Edit-and-resume: replay against edited code, divergence-checked ([divergence rules](./replay.md)). |
 | `chidori verify <agent.ts> <run_id>` | Checkpoint-as-test: replay with **no provider** and a **deny-all policy**; asserts completion with byte-identical output. Exit 0 = pass. Built for CI. Journaled workspace writes do re-materialize on disk (same bytes, fresh mtime). |
+| `chidori rollback <run_id>` | Saga rollback: run the compensations the run registered with `chidori.compensation.register(...)` newest-first, each as its own ordinary run. Refuses a completed run (compensations are void on success) and a second rollback (inverse actions are not re-fired). |
 | `chidori trace <run_id>` | Print a run's call log — every prompt, tool call, and effect, with token counts and cost (including prompt-cache read/write totals). |
 | `chidori stats` | Usage and cost totals, including prompt-cache read/write tokens. |
 | `chidori snapshot <run_id>` | Print `runtime.snapshot.json` metadata (never raw VM snapshot bytes). |

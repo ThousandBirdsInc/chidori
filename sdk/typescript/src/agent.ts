@@ -907,6 +907,23 @@ export interface Chidori {
    */
   actors: Actors;
   /**
+   * Saga-style compensations: durably register an inverse action — an agent
+   * module plus its input — for a side effect this run just performed. On a
+   * successful run the registrations are void; when a run stops short
+   * (cancelled, failed, abandoned), `chidori rollback <run_id>` (or
+   * `POST /sessions/{id}/cancel` with `"compensate": true`) executes them
+   * newest-first, each as its own ordinary journaled run.
+   */
+  compensation: {
+    /**
+     * Register one compensation. `agent` resolves like `callAgent` (relative
+     * to the project root) and must exist — a compensation that can't
+     * resolve is useless exactly when it's needed, so a bad path fails the
+     * registration.
+     */
+    register(name: string, agent: string, input?: AgentJson): Promise<{ registered: true }>;
+  };
+  /**
    * Detached durable agent processes: spawn agent modules as long-lived,
    * named runs that outlive the spawner, hibernate at listen points holding
    * no thread and no VM, and wake on mailbox deliveries or alarm deadlines
