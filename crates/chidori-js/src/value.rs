@@ -802,8 +802,17 @@ impl PropertyKey {
     /// Returns the array-index interpretation of this key if it is a canonical
     /// integer index in `[0, 2^32-1)`.
     pub fn array_index(&self) -> Option<u32> {
-        let s = self.as_str()?;
-        canonical_index(s)
+        let PropertyKey::Str(s) = self else {
+            return None;
+        };
+        // A canonical index starts with an ASCII digit; reject named keys on
+        // the raw byte view before materializing the validated `&str` (the
+        // prototype walks in `protos_allow_*_index_create` probe every own
+        // key of `Array.prototype`-class objects through here).
+        if !s.wtf8_bytes().first().is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        canonical_index(s.as_str())
     }
 }
 
