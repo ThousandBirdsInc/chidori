@@ -902,7 +902,9 @@ pub fn protos_allow_index_create(proto: Option<JsObject>, idx: u32, count: u32) 
             // String character slots, mapped Arguments, …) own their [[Set]].
             _ => return false,
         }
-        if !b.own_is_empty() {
+        // `has_idx_keys` is exact: a level with no index-keyed own props
+        // cannot contain the specific probes below.
+        if b.has_idx_keys() {
             if b.own_contains_key(&StrKeyRef(first)) {
                 return false;
             }
@@ -936,7 +938,7 @@ pub fn protos_allow_any_index_create(start: &JsObject) -> bool {
             Internal::Ordinary | Internal::Array(_) => {}
             _ => return false,
         }
-        if !b.own_is_empty() && b.own_keys_iter().any(|k| k.array_index().is_some()) {
+        if b.has_idx_keys() {
             return false;
         }
         let next = b.proto.clone();
@@ -1162,6 +1164,14 @@ pub struct ObjectData {
     /// 300+ call sites knowing.
     props: PropStorage,
     pub extensible: bool,
+    /// Exactly "some own property key is an array index" — maintained by the
+    /// own_* mutators so the prototype-chain guards in
+    /// `protos_allow_*_index_create` answer per level in O(1) instead of
+    /// probing every own key of `Array.prototype`-class objects. Kept EXACT
+    /// (insert sets it, a delete under the flag recounts, bulk installs
+    /// scan); drift could only ever be toward `true`, which merely declines
+    /// a fast path — never toward an unsound `false`.
+    has_idx_keys: bool,
     pub internal: Internal,
     /// The spec `[[PrivateElements]]` list, keyed by [`PrivateName::id`].
     /// Boxed so the common no-privates object pays one pointer. Attached
@@ -1176,6 +1186,7 @@ impl ObjectData {
             proto,
             props: PropStorage::default(),
             extensible: true,
+            has_idx_keys: false,
             internal,
             privates: None,
         }
@@ -1192,6 +1203,7 @@ impl ObjectData {
                 slots: Vec::new(),
             },
             extensible: true,
+            has_idx_keys: false,
             internal: Internal::Ordinary,
             privates: None,
         }
@@ -1204,12 +1216,18 @@ impl ObjectData {
         proto: Option<JsObject>,
         shape: Rc<crate::shape::Shape>,
         slots: Vec<Property>,
+        has_idx_keys: bool,
     ) -> Self {
         debug_assert_eq!(slots.len(), shape.len());
+        debug_assert_eq!(
+            has_idx_keys,
+            shape.keys_in_order().iter().any(|k| k.array_index().is_some())
+        );
         ObjectData {
             proto,
             props: PropStorage::Shaped { shape, slots },
             extensible: true,
+            has_idx_keys,
             internal: Internal::Ordinary,
             privates: None,
         }
@@ -1253,6 +1271,13 @@ impl ObjectData {
     // them), and probes are generic over `Equivalent<PropertyKey>` so the
     // alloc-free `StrKeyRef` guards keep working unchanged.
     // =====================================================================
+
+    /// Whether some own property key is an array index (exact — see the
+    /// field's invariant note).
+    #[inline]
+    pub fn has_idx_keys(&self) -> bool {
+        self.has_idx_keys
+    }
 
     /// The own property for `key`, if present.
     #[inline]
@@ -1332,6 +1357,7 @@ impl ObjectData {
     /// job, exactly as with the raw map.
     #[inline]
     pub fn own_insert(&mut self, key: PropertyKey, prop: Property) -> Option<Property> {
+        self.has_idx_keys |= key.array_index().is_some();
         match &mut self.props {
             PropStorage::Dict(m) => return m.insert(key, prop),
             PropStorage::Shaped { shape, slots } => {
@@ -1368,10 +1394,16 @@ impl ObjectData {
             shape.lookup(key)?;
             self.demote();
         }
-        match &mut self.props {
+        let removed = match &mut self.props {
             PropStorage::Dict(m) => m.shift_remove(key),
             PropStorage::Shaped { .. } => unreachable!("demoted above"),
+        };
+        if self.has_idx_keys && removed.is_some() {
+            // Deletes are rare and already O(n) (shift_remove); keep the
+            // flag exact by recounting.
+            self.has_idx_keys = self.own_keys_iter().any(|k| k.array_index().is_some());
         }
+        removed
     }
 
     /// The current shape, when the storage is shaped (`None` in dictionary
@@ -1504,6 +1536,7 @@ impl ObjectData {
     /// Drop every own property (GC edge-clearing).
     #[inline]
     pub fn own_clear(&mut self) {
+        self.has_idx_keys = false;
         match &mut self.props {
             PropStorage::Dict(m) => m.clear(),
             PropStorage::Shaped { shape, slots } => {
@@ -1517,6 +1550,7 @@ impl ObjectData {
     /// template instantiation).
     #[inline]
     pub fn set_props_map(&mut self, map: crate::fxhash::FxIndexMap<PropertyKey, Property>) {
+        self.has_idx_keys = map.keys().any(|k| k.array_index().is_some());
         self.props = PropStorage::Dict(map);
     }
 
@@ -1526,6 +1560,7 @@ impl ObjectData {
     /// just to be dropped).
     #[inline]
     pub fn take_props_values(&mut self) -> PropsIntoValues {
+        self.has_idx_keys = false;
         match std::mem::take(&mut self.props) {
             PropStorage::Dict(m) => PropsIntoValues::Dict(m.into_values()),
             PropStorage::Shaped { slots, .. } => PropsIntoValues::Slots(slots.into_iter()),

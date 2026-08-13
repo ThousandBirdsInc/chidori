@@ -1435,6 +1435,7 @@ impl<'a> JsonParser<'a> {
         let mut slots: Vec<Property> = Vec::with_capacity(8);
         let mut dict: Option<crate::fxhash::FxIndexMap<PropertyKey, Property>> = None;
         let mut on_path = true;
+        let mut has_idx_keys = false;
         loop {
             self.skip_ws();
             if self.pos >= self.bytes.len() || self.bytes[self.pos] != b'"' {
@@ -1446,6 +1447,7 @@ impl<'a> JsonParser<'a> {
                 return Err(vm.throw_syntax("Expected ':' in JSON object"));
             }
             self.pos += 1;
+            has_idx_keys |= key.array_index().is_some();
             let v = self.parse_value(vm)?;
             let prop = Property::data(v);
             if let Some(map) = &mut dict {
@@ -1506,7 +1508,7 @@ impl<'a> JsonParser<'a> {
                     // Remember this record's chain for its siblings.
                     self.shape_paths[self.depth - 1] = shape.path_from_root();
                 }
-                vm.alloc(ObjectData::new_shaped_with(proto, shape, slots))
+                vm.alloc(ObjectData::new_shaped_with(proto, shape, slots, has_idx_keys))
             }
         };
         Ok(Value::Object(obj))

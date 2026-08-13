@@ -107,6 +107,24 @@ pub(crate) struct RecFamily {
     ret_bool: bool,
 }
 
+
+/// Outcome of a kernel activation attempt for the caller's tier to act on:
+/// the STACK tier maps `Declined` to `step(fallback)` and `Resume(ip)` to
+/// `Ctl::Jump`; the REGISTER tier falls through to the translated fallback
+/// twin on `Declined` and jumps to the mapped register pc on `Resume`.
+pub(crate) enum KStep {
+    Declined,
+    Resume(u32),
+}
+
+/// Consecutive-net bail count at which a loop kernel's guard gives up (see
+/// `Kernel::futile`). Small enough that an object-array glue loop stops
+/// paying the per-iteration guard+bail cycle almost immediately; the −1
+/// decay per clean exit keeps healthy numeric kernels (rare warm-up bails)
+/// pinned at zero.
+pub(crate) const KERNEL_FUTILITY_LATCH: u8 = 16;
+
+
 impl Vm {
     // =====================================================================
     // Calling
@@ -532,13 +550,41 @@ impl Vm {
     /// spills in their dispatch.
     #[inline(never)]
     fn run_kernel_op(&mut self, frame: &mut Frame, idx: u32) -> Result<Ctl, Value> {
+        let out = if frame.func.proto.kernels[idx as usize]
+            .callee_slots
+            .is_empty()
+        {
+            self.run_kernel_op_impl::<false>(frame, idx, None)?
+        } else {
+            self.run_kernel_op_impl::<true>(frame, idx, None)?
+        };
+        match out {
+            KStep::Resume(ip) => Ok(Ctl::Jump(ip as usize)),
+            KStep::Declined => {
+                let proto = frame.func.proto.clone();
+                self.step(frame, &proto.kernels[idx as usize].fallback)
+            }
+        }
+    }
+
+    /// Register-tier entry (`ROp::LoopKernel`): identical guard + kernel
+    /// execution, but a decline is REPORTED (the reg code falls through to
+    /// the translated fallback twin) and an exit/bail materializes the
+    /// operand shape into the CANONICAL registers instead of the operand
+    /// stack, so the register program resumes at the mapped pc.
+    pub(crate) fn run_kernel_op_reg(
+        &mut self,
+        frame: &mut Frame,
+        idx: u32,
+        base: u16,
+    ) -> Result<KStep, Value> {
         if frame.func.proto.kernels[idx as usize]
             .callee_slots
             .is_empty()
         {
-            self.run_kernel_op_impl::<false>(frame, idx)
+            self.run_kernel_op_impl::<false>(frame, idx, Some(base))
         } else {
-            self.run_kernel_op_impl::<true>(frame, idx)
+            self.run_kernel_op_impl::<true>(frame, idx, Some(base))
         }
     }
 
@@ -547,13 +593,26 @@ impl Vm {
         &mut self,
         frame: &mut Frame,
         idx: u32,
-    ) -> Result<Ctl, Value> {
+        // `Some(base)` = register mode: exit shapes materialize into the
+        // canonical registers starting at `num_locals + base`; `None` =
+        // stack mode (shapes push onto the operand stack).
+        reg_base: Option<u16>,
+    ) -> Result<KStep, Value> {
         let proto = frame.func.proto.clone();
         let k = &proto.kernels[idx as usize];
         // An installed op budget makes per-op counts observable (the
         // exhaustion throw lands on an exact op); kernels would skew it.
         if self.op_budget.is_some() {
-            return self.step(frame, &k.fallback);
+            return Ok(KStep::Declined);
+        }
+        // Futility latch (see the field docs): a region that keeps bailing
+        // (its element/property speculation never matches the live types)
+        // stops paying the guard+enter+bail cycle per iteration.
+        if k.futile.get() >= KERNEL_FUTILITY_LATCH {
+            {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
         }
         for slot in k.locals.iter() {
             let ok = match slot {
@@ -567,17 +626,26 @@ impl Vm {
                 crate::bytecode::KSlot::Arg(_) => false,
             };
             if !ok {
-                return self.step(frame, &k.fallback);
+                {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
             }
         }
         for &l in k.bool_locals.iter() {
             if !matches!(frame.locals[l as usize], Value::Bool(_)) {
-                return self.step(frame, &k.fallback);
+                {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
             }
         }
         for &l in k.oslots.iter() {
             if !matches!(frame.locals[l as usize], Value::Object(_)) {
-                return self.step(frame, &k.fallback);
+                {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
             }
         }
         // Pinned STRING bases: each sslot local must hold a FLAT ASCII string
@@ -592,11 +660,17 @@ impl Vm {
                     if matches!(st.flatten_utf8(), Some(f) if f.len() == st.len_utf16())
             );
             if !ok {
-                return self.step(frame, &k.fallback);
+                {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
             }
         }
         if k.uses_char_code && !self.kernel_char_code_ok() {
-            return self.step(frame, &k.fallback);
+            {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
         }
         // A `StoreElem` may CREATE an element (hole fill / exact append), and
         // the spec's OrdinarySet consults the prototype chain when the own
@@ -609,7 +683,10 @@ impl Vm {
             for &l in k.oslots.iter() {
                 if let Value::Object(o) = &frame.locals[l as usize] {
                     if !crate::value::protos_allow_any_index_create(o) {
-                        return self.step(frame, &k.fallback);
+                        {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
                     }
                 }
             }
@@ -632,7 +709,10 @@ impl Vm {
                     if matches!(o.borrow().internal, Internal::TypedArray(_))
                         && !self.kernel_ta_len_ok(o)
                     {
-                        return self.step(frame, &k.fallback);
+                        {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
                     }
                 }
             }
@@ -643,7 +723,10 @@ impl Vm {
         // be the canonical builtin (methods are writable). Nothing inside a
         // kernel region can mutate globals, so entry-time checks suffice.
         if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
-            return self.step(frame, &k.fallback);
+            {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
         }
         // Pinned `Array.prototype.push` (see `KOp::ArrayPush`): the realm
         // canonical must still back `Array.prototype.push`, and EVERY push
@@ -659,12 +742,18 @@ impl Vm {
             if k.uses_array_push
                 && !self.kernel_array_method_ok("push", &self.realm.array_push.clone())
             {
-                return self.step(frame, &k.fallback);
+                {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
             }
             if k.uses_array_pop
                 && !self.kernel_array_method_ok("pop", &self.realm.array_pop.clone())
             {
-                return self.step(frame, &k.fallback);
+                {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
             }
             for op in k.code.iter() {
                 let obj = match op {
@@ -683,7 +772,10 @@ impl Vm {
                     false
                 };
                 if !ok {
-                    return self.step(frame, &k.fallback);
+                    {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
                 }
             }
         }
@@ -731,7 +823,10 @@ impl Vm {
             }
             if !ok {
                 self.kernel_prop_slots = prop_slots;
-                return self.step(frame, &k.fallback);
+                {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
             }
         }
         // Unboxed register file + array-base cache (both pooled on the Vm;
@@ -764,7 +859,10 @@ impl Vm {
                 crate::bytecode::KSlot::Arg(_) => {
                     self.kernel_regs = regs;
                     self.kernel_prop_slots = prop_slots;
-                    return self.step(frame, &k.fallback);
+                    {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
                 }
             };
             if let Value::Number(n) = v {
@@ -827,7 +925,10 @@ impl Vm {
                         sstrs.clear();
                         self.kernel_strs = sstrs;
                         self.kernel_prop_slots = prop_slots;
-                        return self.step(frame, &k.fallback);
+                        {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
                     }
                 }
             }
@@ -943,7 +1044,10 @@ impl Vm {
                 self.kernel_prop_slots = prop_slots;
                 callee_bfs.clear();
                 self.kernel_callees = callee_bfs;
-                return self.step(frame, &k.fallback);
+                {
+            k.futile.set(k.futile.get().saturating_add(1));
+            return Ok(KStep::Declined);
+        }
             }
             // Extend the register file with the callee windows and load each
             // window's upvalue snapshot ONCE (identities are pinned; callee
@@ -1625,36 +1729,49 @@ impl Vm {
             frame.locals[l as usize] = Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
         }
         writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
-        for slot in k.shapes[shape as usize].iter() {
-            match slot {
-                crate::bytecode::KShapeSlot::Num(r) => {
-                    frame.stack.push(Value::Number(w[*r as usize & KWIN_MASK]))
+        if k.shapes[shape as usize].is_empty() {
+            // Clean statement-boundary exit: healthy kernel; decay.
+            k.futile.set(k.futile.get().saturating_sub(1));
+        } else {
+            // Mid-expression bail: speculation missed; bump toward the latch.
+            k.futile.set(k.futile.get().saturating_add(1));
+        }
+        // Register mode resumes the register program at the mapped pc: the
+        // operand shape lands in the CANONICAL registers (`canon(d) =
+        // num_locals + d`) — the exact slots the seeded label state at the
+        // resume ip reads them from. Stack mode pushes the operand stack.
+        let canon_base = proto.num_locals as usize + reg_base.unwrap_or(0) as usize;
+        for (d, slot) in k.shapes[shape as usize].iter().enumerate() {
+            let v = match slot {
+                crate::bytecode::KShapeSlot::Num(r) => Value::Number(w[*r as usize & KWIN_MASK]),
+                crate::bytecode::KShapeSlot::Bool(r) => {
+                    Value::Bool(w[*r as usize & KWIN_MASK] != 0.0)
                 }
-                crate::bytecode::KShapeSlot::Bool(r) => frame
-                    .stack
-                    .push(Value::Bool(w[*r as usize & KWIN_MASK] != 0.0)),
-                crate::bytecode::KShapeSlot::Obj(o) => {
-                    frame.stack.push(Value::Object(objs[*o as usize].clone()))
-                }
+                crate::bytecode::KShapeSlot::Obj(o) => Value::Object(objs[*o as usize].clone()),
                 // The guard proved the live values ARE the canonicals.
-                crate::bytecode::KShapeSlot::MathObj => frame.stack.push(Value::Object(
-                    self.realm.math_object.clone().expect("guarded"),
-                )),
-                crate::bytecode::KShapeSlot::MathFn(kind) => frame.stack.push(Value::Object(
-                    self.realm.math_kernel[*kind as usize].clone(),
-                )),
-                crate::bytecode::KShapeSlot::ArrayPushFn => frame.stack.push(Value::Object(
-                    self.realm.array_push.clone().expect("guarded"),
-                )),
-                crate::bytecode::KShapeSlot::ArrayPopFn => frame.stack.push(Value::Object(
-                    self.realm.array_pop.clone().expect("guarded"),
-                )),
-                crate::bytecode::KShapeSlot::Str(sl) => {
-                    frame.stack.push(Value::String(sstrs[*sl as usize].clone()))
+                crate::bytecode::KShapeSlot::MathObj => {
+                    Value::Object(self.realm.math_object.clone().expect("guarded"))
                 }
-                crate::bytecode::KShapeSlot::CharCodeFn => frame.stack.push(Value::Object(
-                    self.realm.string_char_code_at.clone().expect("guarded"),
-                )),
+                crate::bytecode::KShapeSlot::MathFn(kind) => {
+                    Value::Object(self.realm.math_kernel[*kind as usize].clone())
+                }
+                crate::bytecode::KShapeSlot::ArrayPushFn => {
+                    Value::Object(self.realm.array_push.clone().expect("guarded"))
+                }
+                crate::bytecode::KShapeSlot::ArrayPopFn => {
+                    Value::Object(self.realm.array_pop.clone().expect("guarded"))
+                }
+                crate::bytecode::KShapeSlot::Str(sl) => {
+                    Value::String(sstrs[*sl as usize].clone())
+                }
+                crate::bytecode::KShapeSlot::CharCodeFn => {
+                    Value::Object(self.realm.string_char_code_at.clone().expect("guarded"))
+                }
+            };
+            if reg_base.is_some() {
+                frame.locals[canon_base + d] = v;
+            } else {
+                frame.stack.push(v);
             }
         }
         self.kernel_regs = regs;
@@ -1665,7 +1782,7 @@ impl Vm {
         self.kernel_prop_slots = prop_slots;
         callee_bfs.clear();
         self.kernel_callees = callee_bfs;
-        Ok(Ctl::Jump(resume_ip as usize))
+        Ok(KStep::Resume(resume_ip))
     }
 
     /// Execute a FUNCTION kernel (`FuncProto::fn_kernel`): the entire call
@@ -4973,6 +5090,23 @@ impl Vm {
                     wr!(*dst, Value::Bool(r));
                 }
                 // ---- control flow ----
+                ROp::LoopKernel { kernel, base } => {
+                    // Kernels stay OFF under an op budget (per-op accounting
+                    // is observable) — fall through to the fallback twin,
+                    // exactly the stack tier's policy.
+                    if self.op_budget.is_none() {
+                        match tryv!(self.run_kernel_op_reg(&mut frame, *kernel, *base)) {
+                            KStep::Declined => {}
+                            KStep::Resume(sip) => {
+                                let at = reg
+                                    .kernel_resume
+                                    .binary_search_by_key(&sip, |e| e.0)
+                                    .expect("kernel exits resume only at mapped labels");
+                                pc = reg.kernel_resume[at].1 as usize;
+                            }
+                        }
+                    }
+                }
                 ROp::Jmp { target } => pc = *target as usize,
                 ROp::BrTrue { src, target } => {
                     if self.to_boolean(&frame.locals[*src as usize]) {
