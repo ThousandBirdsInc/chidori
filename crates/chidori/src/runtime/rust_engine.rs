@@ -2000,7 +2000,8 @@ mod tests {
         // `run(handler, { inputSchema })` with a plain JSON Schema: a
         // malformed input fails as an InputValidationError before the handler
         // (or any host call) executes; a valid input runs normally.
-        let dir = std::env::temp_dir().join(format!("chidori-rust-schema-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("chidori-rust-schema-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.ts");
         let src = r#"
@@ -2051,8 +2052,8 @@ mod tests {
         // `additionalProperties: false` must reject unexpected keys even when
         // the schema declares no `properties` map (a common strict-input
         // pattern) — JSON Schema semantics, not a silent accept-all.
-        let dir = std::env::temp_dir()
-            .join(format!("chidori-rust-addprops-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("chidori-rust-addprops-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.ts");
         let src = r#"
@@ -3507,10 +3508,7 @@ mod tests {
         assert_eq!(out["collected"], serde_json::json!(["AB", "CD"]));
         assert_eq!(out["iterated"], serde_json::json!([1, 2, 3]));
         assert_eq!(out["text"], serde_json::json!("hello world"));
-        assert_eq!(
-            out["events"],
-            serde_json::json!(["w:x", "final", "finish"])
-        );
+        assert_eq!(out["events"], serde_json::json!(["w:x", "final", "finish"]));
     }
 
     #[test]
@@ -4068,10 +4066,7 @@ mod tests {
             serde_json::json!("http://a/b/c/d;p?q#s")
         );
         assert_eq!(out["toPath"], serde_json::json!("/fóó/a b"));
-        assert_eq!(
-            out["toURL"],
-            serde_json::json!("file:///dir/a%20b%23c%25d")
-        );
+        assert_eq!(out["toURL"], serde_json::json!("file:///dir/a%20b%23c%25d"));
         assert_eq!(out["trailing"], serde_json::json!("file:///dir/"));
         assert_eq!(out["scheme"], serde_json::json!("ERR_INVALID_URL_SCHEME"));
         assert_eq!(

@@ -608,7 +608,10 @@ fn boot_manifest_fleet(manifest: &crate::app_manifest::AppManifest) {
         }
         let options = crate::runtime::host_agent::SpawnOptions {
             name: Some(agent.name.clone()),
-            restart: agent.restart.clone().unwrap_or_else(|| "resume".to_string()),
+            restart: agent
+                .restart
+                .clone()
+                .unwrap_or_else(|| "resume".to_string()),
             max_restarts: agent.max_restarts.unwrap_or(3),
             backoff_ms: agent.backoff_ms.unwrap_or(0),
             model: agent.model.clone(),

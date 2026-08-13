@@ -778,9 +778,7 @@ mod tests {
         );
         write(&root.join("node_modules/process/index.js"), "");
         let resolver = make_resolver(root);
-        let res = resolver
-            .resolve("process", &root.join("agent.ts"))
-            .unwrap();
+        let res = resolver.resolve("process", &root.join("agent.ts")).unwrap();
         assert!(matches!(
             res.kind,
             ResolutionKind::NodeBuiltin { ref name } if name == "process"
@@ -799,9 +797,7 @@ mod tests {
         );
         write(&root.join("node_modules/leftpad/index.js"), "");
         let resolver = make_resolver(root);
-        let res = resolver
-            .resolve("leftpad", &root.join("agent.ts"))
-            .unwrap();
+        let res = resolver.resolve("leftpad", &root.join("agent.ts")).unwrap();
         assert!(matches!(res.kind, ResolutionKind::Package { .. }));
     }
 

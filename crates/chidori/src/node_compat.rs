@@ -266,7 +266,9 @@ fn required_specifiers(source: &str) -> BTreeSet<String> {
     while let Some(idx) = rest.find("require(") {
         rest = &rest[idx + "require(".len()..];
         let trimmed = rest.trim_start();
-        let Some(quote) = trimmed.chars().next() else { break };
+        let Some(quote) = trimmed.chars().next() else {
+            break;
+        };
         if quote != '\'' && quote != '"' {
             continue;
         }
@@ -298,7 +300,11 @@ pub fn wrap_node_test(source: &str, file_name: &str) -> String {
     let mut registry = String::new();
     for (i, name) in builtins.iter().enumerate() {
         let _ = writeln!(js, "import __m{i} from \"node:{name}\";");
-        let _ = writeln!(registry, "    {}: __m{i},", serde_json::to_string(name).unwrap());
+        let _ = writeln!(
+            registry,
+            "    {}: __m{i},",
+            serde_json::to_string(name).unwrap()
+        );
     }
     js.push_str("const __builtins = {\n");
     js.push_str(&registry);
@@ -451,7 +457,8 @@ pub fn run_suite(suite_dir: &Path) -> Vec<Outcome> {
     files.sort();
 
     let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime"));
-    let scratch = std::env::temp_dir().join(format!("chidori-node-compat-{}", uuid::Uuid::new_v4()));
+    let scratch =
+        std::env::temp_dir().join(format!("chidori-node-compat-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&scratch).expect("scratch dir");
 
     // Bound each test's pure-JS compute so a pathological vendored test (an
@@ -483,7 +490,10 @@ pub fn run_suite(suite_dir: &Path) -> Vec<Outcome> {
         // Seed the VFS with the test's own source at its __filename — in Node
         // the test file exists on disk, and some tests stat/read themselves.
         let _ = ctx.vfs_mkdir("/test/parallel", true);
-        let _ = ctx.vfs_write(&format!("/test/parallel/{file}"), source.clone().into_bytes());
+        let _ = ctx.vfs_write(
+            &format!("/test/parallel/{file}"),
+            source.clone().into_bytes(),
+        );
         let backend = HostBindingBackend::for_runtime(
             ctx,
             Arc::new(ProviderRegistry::new()),
@@ -511,10 +521,7 @@ pub fn run_suite(suite_dir: &Path) -> Vec<Outcome> {
                 Some("skip") => Outcome {
                     file,
                     status: Status::Skip,
-                    detail: value
-                        .get("reason")
-                        .and_then(|r| r.as_str())
-                        .map(first_line),
+                    detail: value.get("reason").and_then(|r| r.as_str()).map(first_line),
                 },
                 _ => Outcome {
                     file,
@@ -584,7 +591,10 @@ pub fn render_report(outcomes: &[Outcome], node_version: &str) -> String {
 
     let mut by_module: BTreeMap<&str, Vec<&Outcome>> = BTreeMap::new();
     for outcome in outcomes {
-        by_module.entry(module_of(&outcome.file)).or_default().push(outcome);
+        by_module
+            .entry(module_of(&outcome.file))
+            .or_default()
+            .push(outcome);
     }
 
     let mut out = String::new();
@@ -618,10 +628,9 @@ pub fn render_report(outcomes: &[Outcome], node_version: &str) -> String {
         let f = list.iter().filter(|o| o.status == Status::Fail).count();
         let s = list.iter().filter(|o| o.status == Status::Skip).count();
         let judged = p + f;
-        let rate = if judged == 0 {
-            "—".to_string()
-        } else {
-            format!("{}%", (p * 100) / judged)
+        let rate = match (p * 100).checked_div(judged) {
+            None => "—".to_string(),
+            Some(r) => format!("{r}%"),
         };
         let _ = writeln!(out, "| {module} | {p} | {f} | {s} | {rate} |");
     }
@@ -720,7 +729,10 @@ mod tests {
     fn node_compat_suite_matches_expectations() {
         let root = harness_root();
         let outcomes = run_suite(&root.join("suite"));
-        assert!(!outcomes.is_empty(), "no vendored tests found — run scripts/vendor-node-compat-tests.sh");
+        assert!(
+            !outcomes.is_empty(),
+            "no vendored tests found — run scripts/vendor-node-compat-tests.sh"
+        );
 
         let actual: BTreeMap<String, String> = outcomes
             .iter()
@@ -754,7 +766,8 @@ mod tests {
             )
             .unwrap();
             let report = render_report(&outcomes, &node_version);
-            let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/node-compat-report.md");
+            let docs =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/node-compat-report.md");
             std::fs::write(&docs, report).unwrap();
             eprintln!("node-compat: expectations and docs/node-compat-report.md updated");
             return;

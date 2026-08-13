@@ -107,7 +107,6 @@ pub(crate) struct RecFamily {
     ret_bool: bool,
 }
 
-
 /// Outcome of a kernel activation attempt for the caller's tier to act on:
 /// the STACK tier maps `Declined` to `step(fallback)` and `Resume(ip)` to
 /// `Ctl::Jump`; the REGISTER tier falls through to the translated fallback
@@ -123,7 +122,6 @@ pub(crate) enum KStep {
 /// decay per clean exit keeps healthy numeric kernels (rare warm-up bails)
 /// pinned at zero.
 pub(crate) const KERNEL_FUTILITY_LATCH: u8 = 16;
-
 
 impl Vm {
     // =====================================================================
@@ -610,9 +608,9 @@ impl Vm {
         // stops paying the guard+enter+bail cycle per iteration.
         if k.futile.get() >= KERNEL_FUTILITY_LATCH {
             {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                k.futile.set(k.futile.get().saturating_add(1));
+                return Ok(KStep::Declined);
+            }
         }
         for slot in k.locals.iter() {
             let ok = match slot {
@@ -627,25 +625,25 @@ impl Vm {
             };
             if !ok {
                 {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                    k.futile.set(k.futile.get().saturating_add(1));
+                    return Ok(KStep::Declined);
+                }
             }
         }
         for &l in k.bool_locals.iter() {
             if !matches!(frame.locals[l as usize], Value::Bool(_)) {
                 {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                    k.futile.set(k.futile.get().saturating_add(1));
+                    return Ok(KStep::Declined);
+                }
             }
         }
         for &l in k.oslots.iter() {
             if !matches!(frame.locals[l as usize], Value::Object(_)) {
                 {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                    k.futile.set(k.futile.get().saturating_add(1));
+                    return Ok(KStep::Declined);
+                }
             }
         }
         // Pinned STRING bases: each sslot local must hold a FLAT ASCII string
@@ -661,16 +659,16 @@ impl Vm {
             );
             if !ok {
                 {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                    k.futile.set(k.futile.get().saturating_add(1));
+                    return Ok(KStep::Declined);
+                }
             }
         }
         if k.uses_char_code && !self.kernel_char_code_ok() {
             {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                k.futile.set(k.futile.get().saturating_add(1));
+                return Ok(KStep::Declined);
+            }
         }
         // A `StoreElem` may CREATE an element (hole fill / exact append), and
         // the spec's OrdinarySet consults the prototype chain when the own
@@ -684,9 +682,9 @@ impl Vm {
                 if let Value::Object(o) = &frame.locals[l as usize] {
                     if !crate::value::protos_allow_any_index_create(o) {
                         {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                            k.futile.set(k.futile.get().saturating_add(1));
+                            return Ok(KStep::Declined);
+                        }
                     }
                 }
             }
@@ -710,9 +708,9 @@ impl Vm {
                         && !self.kernel_ta_len_ok(o)
                     {
                         {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                            k.futile.set(k.futile.get().saturating_add(1));
+                            return Ok(KStep::Declined);
+                        }
                     }
                 }
             }
@@ -724,9 +722,9 @@ impl Vm {
         // kernel region can mutate globals, so entry-time checks suffice.
         if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
             {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                k.futile.set(k.futile.get().saturating_add(1));
+                return Ok(KStep::Declined);
+            }
         }
         // Pinned `Array.prototype.push` (see `KOp::ArrayPush`): the realm
         // canonical must still back `Array.prototype.push`, and EVERY push
@@ -743,17 +741,17 @@ impl Vm {
                 && !self.kernel_array_method_ok("push", &self.realm.array_push.clone())
             {
                 {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                    k.futile.set(k.futile.get().saturating_add(1));
+                    return Ok(KStep::Declined);
+                }
             }
             if k.uses_array_pop
                 && !self.kernel_array_method_ok("pop", &self.realm.array_pop.clone())
             {
                 {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                    k.futile.set(k.futile.get().saturating_add(1));
+                    return Ok(KStep::Declined);
+                }
             }
             for op in k.code.iter() {
                 let obj = match op {
@@ -773,9 +771,9 @@ impl Vm {
                 };
                 if !ok {
                     {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                        k.futile.set(k.futile.get().saturating_add(1));
+                        return Ok(KStep::Declined);
+                    }
                 }
             }
         }
@@ -824,9 +822,9 @@ impl Vm {
             if !ok {
                 self.kernel_prop_slots = prop_slots;
                 {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                    k.futile.set(k.futile.get().saturating_add(1));
+                    return Ok(KStep::Declined);
+                }
             }
         }
         // Unboxed register file + array-base cache (both pooled on the Vm;
@@ -860,9 +858,9 @@ impl Vm {
                     self.kernel_regs = regs;
                     self.kernel_prop_slots = prop_slots;
                     {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                        k.futile.set(k.futile.get().saturating_add(1));
+                        return Ok(KStep::Declined);
+                    }
                 }
             };
             if let Value::Number(n) = v {
@@ -926,9 +924,9 @@ impl Vm {
                         self.kernel_strs = sstrs;
                         self.kernel_prop_slots = prop_slots;
                         {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                            k.futile.set(k.futile.get().saturating_add(1));
+                            return Ok(KStep::Declined);
+                        }
                     }
                 }
             }
@@ -1045,9 +1043,9 @@ impl Vm {
                 callee_bfs.clear();
                 self.kernel_callees = callee_bfs;
                 {
-            k.futile.set(k.futile.get().saturating_add(1));
-            return Ok(KStep::Declined);
-        }
+                    k.futile.set(k.futile.get().saturating_add(1));
+                    return Ok(KStep::Declined);
+                }
             }
             // Extend the register file with the callee windows and load each
             // window's upvalue snapshot ONCE (identities are pinned; callee
@@ -1761,9 +1759,7 @@ impl Vm {
                 crate::bytecode::KShapeSlot::ArrayPopFn => {
                     Value::Object(self.realm.array_pop.clone().expect("guarded"))
                 }
-                crate::bytecode::KShapeSlot::Str(sl) => {
-                    Value::String(sstrs[*sl as usize].clone())
-                }
+                crate::bytecode::KShapeSlot::Str(sl) => Value::String(sstrs[*sl as usize].clone()),
                 crate::bytecode::KShapeSlot::CharCodeFn => {
                     Value::Object(self.realm.string_char_code_at.clone().expect("guarded"))
                 }

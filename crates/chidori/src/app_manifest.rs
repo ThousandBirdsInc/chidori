@@ -48,7 +48,8 @@ use crate::recipes::Recipe;
 
 /// Manifest file names probed (in order) in the server's base directory when
 /// no explicit path is given.
-pub const MANIFEST_FILE_NAMES: &[&str] = &["chidori.app.yml", "chidori.app.yaml", "chidori.app.json"];
+pub const MANIFEST_FILE_NAMES: &[&str] =
+    &["chidori.app.yml", "chidori.app.yaml", "chidori.app.json"];
 
 /// Top-level path segments the server's built-in routes own; a manifest route
 /// under one of these would make the router panic at assembly. `acp` is the
@@ -127,14 +128,14 @@ impl AppManifest {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading app manifest {}", path.display()))?;
-        let mut manifest: AppManifest =
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                serde_json::from_str(&text)
-                    .with_context(|| format!("parsing app manifest JSON {}", path.display()))?
-            } else {
-                serde_yaml::from_str(&text)
-                    .with_context(|| format!("parsing app manifest YAML {}", path.display()))?
-            };
+        let mut manifest: AppManifest = if path.extension().and_then(|e| e.to_str()) == Some("json")
+        {
+            serde_json::from_str(&text)
+                .with_context(|| format!("parsing app manifest JSON {}", path.display()))?
+        } else {
+            serde_yaml::from_str(&text)
+                .with_context(|| format!("parsing app manifest YAML {}", path.display()))?
+        };
         manifest.base_dir = path
             .parent()
             .unwrap_or_else(|| Path::new("."))

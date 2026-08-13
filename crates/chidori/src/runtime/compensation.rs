@@ -277,8 +277,8 @@ mod tests {
             .write_call_log(&[compensation_record(1, "x", "c.ts", Value::Null)])
             .unwrap();
         store.put_blob("output.json", b"{}").unwrap();
-        let err = rollback_run(&store, Path::new("/p"), &mut |_, _| Ok("r".to_string()))
-            .unwrap_err();
+        let err =
+            rollback_run(&store, Path::new("/p"), &mut |_, _| Ok("r".to_string())).unwrap_err();
         assert!(format!("{err:#}").contains("completed successfully"));
         let _ = std::fs::remove_dir_all(dir);
     }

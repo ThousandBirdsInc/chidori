@@ -72,9 +72,10 @@ fn brotli_params(quality: Option<i64>) -> Result<brotli::enc::BrotliEncoderParam
             ))
         }
     };
-    let mut params = brotli::enc::BrotliEncoderParams::default();
-    params.quality = q;
-    Ok(params)
+    Ok(brotli::enc::BrotliEncoderParams {
+        quality: q,
+        ..Default::default()
+    })
 }
 
 /// Run one zlib codec op. `op` matches the `node:zlib` function family:
@@ -120,10 +121,9 @@ pub fn zlib_op(op: &str, data: &[u8], level: Option<i64>) -> Result<Vec<u8>, Str
                 .map_err(|e| format!("zlib: brotliCompress failed: {e}"))?;
             Ok(out)
         }
-        "brotliDecompress" => bounded_decode(
-            brotli::Decompressor::new(data, 4096),
-            "brotliDecompress",
-        ),
+        "brotliDecompress" => {
+            bounded_decode(brotli::Decompressor::new(data, 4096), "brotliDecompress")
+        }
         other => Err(format!("zlib: unknown codec op `{other}`")),
     }
 }

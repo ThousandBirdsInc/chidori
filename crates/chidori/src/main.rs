@@ -1371,7 +1371,15 @@ fn cmd_demo() -> Result<()> {
             // The demo serves the developer's own example agent on their own
             // machine — the trusted posture, like `chidori run`, on the
             // default loopback bind.
-            cmd_serve(Some(&PathBuf::from(file)), None, *port, false, false, true, None)
+            cmd_serve(
+                Some(&PathBuf::from(file)),
+                None,
+                *port,
+                false,
+                false,
+                true,
+                None,
+            )
         }
     }
 }
@@ -1768,12 +1776,7 @@ fn cmd_run(
 ///   - the previous iteration failed: the crash frontier is stripped exactly
 ///     like `resume --retry-failed`, so the failing call re-executes live
 ///     against the fixed code while everything before it replays from cache.
-fn cmd_dev(
-    file: &Path,
-    inputs: &[String],
-    untrusted: bool,
-    trusted: bool,
-) -> Result<()> {
+fn cmd_dev(file: &Path, inputs: &[String], untrusted: bool, trusted: bool) -> Result<()> {
     let input_value = parse_inputs(inputs)?;
     let base_dir = file
         .parent()
@@ -1791,16 +1794,12 @@ fn cmd_dev(
     // truncation or an edit that removes calls legitimately shortens the
     // journal — dev mode owns this run and rewriting its history is the point.
     let build_engine = || {
-        Engine::new(
-            providers.clone(),
-            template_engine.clone(),
-            tokio_rt.clone(),
-        )
-        .with_tools(Arc::new(ToolRegistry::new()))
-        .with_policy(cli_policy(untrusted, trusted))
-        .with_persist_base(run_base.clone())
-        .with_history_rewrite_allowed(true)
-        .with_workspace_root(abs_dir(&base_dir))
+        Engine::new(providers.clone(), template_engine.clone(), tokio_rt.clone())
+            .with_tools(Arc::new(ToolRegistry::new()))
+            .with_policy(cli_policy(untrusted, trusted))
+            .with_persist_base(run_base.clone())
+            .with_history_rewrite_allowed(true)
+            .with_workspace_root(abs_dir(&base_dir))
     };
 
     // ---- Initial recording run -------------------------------------------
@@ -1865,7 +1864,13 @@ fn cmd_dev(
         signatures = watch_signatures(&watch_set(&run_base, run_id.as_deref(), file));
 
         let iteration_started = std::time::SystemTime::now();
-        match dev_iteration(&build_engine, file, &input_value, run_id.as_deref(), &run_base) {
+        match dev_iteration(
+            &build_engine,
+            file,
+            &input_value,
+            run_id.as_deref(),
+            &run_base,
+        ) {
             Ok(result) => {
                 report_dev_iteration(&result, last_output.as_ref());
                 last_output = Some(result.output.clone());
@@ -1977,10 +1982,7 @@ fn run_engine(
 /// Print one dev iteration's outcome: pause state, replay/live split, and the
 /// output (or "output unchanged" when it is byte-identical to the previous
 /// iteration, which is the common case while editing past the frontier).
-fn report_dev_iteration(
-    result: &crate::runtime::engine::RunResult,
-    last_output: Option<&Value>,
-) {
+fn report_dev_iteration(result: &crate::runtime::engine::RunResult, last_output: Option<&Value>) {
     if let Some(signal) = &result.paused_signal {
         let names = signal.listen_names();
         eprintln!(
@@ -4411,10 +4413,11 @@ fn cmd_serve(
 
     // Application manifest: an explicit `--app` (or CHIDORI_APP_MANIFEST) must
     // load or the server refuses to start; the probed default is optional.
-    let app_manifest = match app
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::var("CHIDORI_APP_MANIFEST").ok().map(PathBuf::from))
-    {
+    let app_manifest = match app.map(Path::to_path_buf).or_else(|| {
+        std::env::var("CHIDORI_APP_MANIFEST")
+            .ok()
+            .map(PathBuf::from)
+    }) {
         Some(path) => Some(crate::app_manifest::AppManifest::load(&path)?),
         None => crate::app_manifest::AppManifest::find_in(&base_dir)
             .map(|path| crate::app_manifest::AppManifest::load(&path))
@@ -4426,7 +4429,11 @@ fn cmd_serve(
             manifest.name.as_deref().unwrap_or("(unnamed)"),
             manifest.agents.len(),
             manifest.fleet().count(),
-            manifest.agents.iter().filter(|a| a.schedule.is_some()).count(),
+            manifest
+                .agents
+                .iter()
+                .filter(|a| a.schedule.is_some())
+                .count(),
             manifest.routes.len(),
         );
     }
@@ -4530,7 +4537,10 @@ mod tests {
                     recorded with arguments {\"label\":\"a\"} but the agent now calls it \
                     with {\"label\":\"b\"}";
         assert_eq!(parse_divergence_seq(text), Some(7));
-        assert_eq!(parse_divergence_seq("Replay divergence at seq 123: step"), Some(123));
+        assert_eq!(
+            parse_divergence_seq("Replay divergence at seq 123: step"),
+            Some(123)
+        );
         assert_eq!(parse_divergence_seq("some unrelated error"), None);
         assert_eq!(parse_divergence_seq("Replay divergence at seq x"), None);
     }

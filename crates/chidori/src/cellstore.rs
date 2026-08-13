@@ -216,11 +216,11 @@ impl Cell {
             .get("seq")
             .and_then(|v| v.as_u64())
             .context("record body has no numeric `seq`")?;
-        let next: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(MAX(pos), 0) + 1 FROM records", [], |row| {
-                row.get(0)
-            })?;
+        let next: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(pos), 0) + 1 FROM records", [], |row| {
+                    row.get(0)
+                })?;
         self.conn.execute(
             "INSERT INTO records (seq, pos, data) VALUES (?1, ?2, ?3)
              ON CONFLICT(seq) DO UPDATE SET data = excluded.data",
@@ -235,8 +235,8 @@ impl Cell {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM records", [])?;
         {
-            let mut stmt = tx
-                .prepare_cached("INSERT INTO records (seq, pos, data) VALUES (?1, ?2, ?3)")?;
+            let mut stmt =
+                tx.prepare_cached("INSERT INTO records (seq, pos, data) VALUES (?1, ?2, ?3)")?;
             for (pos, record) in records.iter().enumerate() {
                 let seq = record
                     .get("seq")
@@ -295,9 +295,7 @@ impl Cell {
         Ok(match condition {
             Precondition::None => true,
             Precondition::Absent => current.is_none(),
-            Precondition::Matches(etag) => {
-                current.is_some_and(|bytes| blob_etag(&bytes) == *etag)
-            }
+            Precondition::Matches(etag) => current.is_some_and(|bytes| blob_etag(&bytes) == *etag),
         })
     }
 
@@ -465,7 +463,10 @@ impl Node {
     }
 
     fn db_path(&self, id: &str) -> PathBuf {
-        self.config.data_dir.join("cells").join(format!("{id}.sqlite3"))
+        self.config
+            .data_dir
+            .join("cells")
+            .join(format!("{id}.sqlite3"))
     }
 
     fn slot(&self, id: &str) -> CellSlot {
@@ -892,12 +893,7 @@ impl Node {
     /// node's cells are immediately claimable elsewhere instead of waiting
     /// out their leases.
     pub fn shutdown(&self) {
-        let slots: Vec<(String, CellSlot)> = self
-            .cells
-            .lock()
-            .unwrap()
-            .drain()
-            .collect();
+        let slots: Vec<(String, CellSlot)> = self.cells.lock().unwrap().drain().collect();
         for (id, slot) in slots {
             let Some(cell) = slot.lock().unwrap().take() else {
                 continue;
@@ -1002,7 +998,10 @@ impl Node {
                     continue;
                 };
                 if let Some(bytes) = bucket.get_object(&key)? {
-                    by_name.insert(name.to_string(), String::from_utf8_lossy(&bytes).into_owned());
+                    by_name.insert(
+                        name.to_string(),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    );
                 }
             }
         }
@@ -1075,7 +1074,9 @@ fn router(state: AppState) -> axum::Router {
         .route("/runs/{id}/blobs", get(http_blobs_list))
         .route(
             "/runs/{id}/blobs/{*key}",
-            get(http_blob_get).put(http_blob_put).delete(http_blob_delete),
+            get(http_blob_get)
+                .put(http_blob_put)
+                .delete(http_blob_delete),
         )
         .route("/registry", get(http_registry_list))
         .route(
@@ -1190,14 +1191,16 @@ async fn http_records_post(
         let record: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(value) => value,
             Err(err) => {
-                return (StatusCode::BAD_REQUEST, format!("invalid record: {err}"))
-                    .into_response()
+                return (StatusCode::BAD_REQUEST, format!("invalid record: {err}")).into_response()
             }
         };
         if let Err(err) = state.node.run_register(&id) {
             return error_response(err.into());
         }
-        match state.node.with_cell(&id, |cell| cell.record_append(&record)) {
+        match state
+            .node
+            .with_cell(&id, |cell| cell.record_append(&record))
+        {
             Ok(()) => "ok".into_response(),
             Err(err) => error_response(err),
         }
@@ -1217,8 +1220,7 @@ async fn http_records_put(
         let records: Vec<serde_json::Value> = match serde_json::from_slice(&body) {
             Ok(value) => value,
             Err(err) => {
-                return (StatusCode::BAD_REQUEST, format!("invalid journal: {err}"))
-                    .into_response()
+                return (StatusCode::BAD_REQUEST, format!("invalid journal: {err}")).into_response()
             }
         };
         if let Err(err) = state.node.run_register(&id) {
@@ -1439,8 +1441,9 @@ pub fn cmd_cell_store(
 
     // Sync loop: renewals must land well inside the lease TTL regardless of
     // how coarse --sync-secs is.
-    let tick_every = std::time::Duration::from_secs(sync_secs.max(1))
-        .min(std::time::Duration::from_secs((lease_secs.max(1)).div_ceil(3)));
+    let tick_every = std::time::Duration::from_secs(sync_secs.max(1)).min(
+        std::time::Duration::from_secs((lease_secs.max(1)).div_ceil(3)),
+    );
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loop_node = node.clone();
     let loop_stop = stop.clone();
@@ -1742,7 +1745,13 @@ mod tests {
 
         // Run index + registry endpoints.
         let (status, body) = relay
-            .request_full("GET", format!("{base}/runs"), None, "application/json", vec![])
+            .request_full(
+                "GET",
+                format!("{base}/runs"),
+                None,
+                "application/json",
+                vec![],
+            )
             .unwrap();
         assert_eq!(status, 200);
         let runs: Vec<String> = serde_json::from_slice(&body).unwrap();
@@ -1771,7 +1780,13 @@ mod tests {
         let entry: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(entry["run_id"], "run-http");
         let (status, body) = relay
-            .request_full("GET", format!("{base}/registry"), None, "application/json", vec![])
+            .request_full(
+                "GET",
+                format!("{base}/registry"),
+                None,
+                "application/json",
+                vec![],
+            )
             .unwrap();
         assert_eq!(status, 200);
         let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
@@ -1795,12 +1810,24 @@ mod tests {
         }));
         let anon = HttpRelay::new(base.clone(), None);
         let (status, _) = anon
-            .request_full("GET", format!("{base}/runs"), None, "application/json", vec![])
+            .request_full(
+                "GET",
+                format!("{base}/runs"),
+                None,
+                "application/json",
+                vec![],
+            )
             .unwrap();
         assert_eq!(status, 401);
         let authed = HttpRelay::new(base.clone(), Some("sekrit".to_string()));
         let (status, _) = authed
-            .request_full("GET", format!("{base}/runs"), None, "application/json", vec![])
+            .request_full(
+                "GET",
+                format!("{base}/runs"),
+                None,
+                "application/json",
+                vec![],
+            )
             .unwrap();
         assert_eq!(status, 200);
     }
@@ -1857,7 +1884,13 @@ mod tests {
             60_000,
             std::time::Duration::ZERO, // hibernate at the first tick
         );
-        let node_b = test_node(dir_b.path(), "node-b", Some(bucket.clone()), 60_000, LONG_IDLE);
+        let node_b = test_node(
+            dir_b.path(),
+            "node-b",
+            Some(bucket.clone()),
+            60_000,
+            LONG_IDLE,
+        );
 
         append(&node_a, "run-h", 1, "prompt").unwrap();
         node_a
@@ -1895,14 +1928,26 @@ mod tests {
         let endpoint = spawn_mock_bucket();
         let bucket = S3BlobStore::for_tests(&endpoint, "cells", "");
         let dir = tempfile::tempdir().unwrap();
-        let node = test_node(dir.path(), "node-a", Some(bucket.clone()), 60_000, LONG_IDLE);
+        let node = test_node(
+            dir.path(),
+            "node-a",
+            Some(bucket.clone()),
+            60_000,
+            LONG_IDLE,
+        );
 
         append(&node, "run-r", 1, "prompt").unwrap();
         node.tick(); // published: seq 1 is in the bucket
         append(&node, "run-r", 2, "tool").unwrap(); // never published
         drop(node); // crash: no release, no final publish
 
-        let reborn = test_node(dir.path(), "node-a", Some(bucket.clone()), 60_000, LONG_IDLE);
+        let reborn = test_node(
+            dir.path(),
+            "node-a",
+            Some(bucket.clone()),
+            60_000,
+            LONG_IDLE,
+        );
         assert_eq!(record_seqs(&reborn, "run-r"), vec![1, 2]);
         // Same epoch — a reclaim, not a takeover.
         let meta = reborn.latest_meta(&bucket, "run-r").unwrap().unwrap();
@@ -1913,7 +1958,13 @@ mod tests {
         // the lease expires.
         drop(reborn);
         let dir_b = tempfile::tempdir().unwrap();
-        let node_b = test_node(dir_b.path(), "node-b", Some(bucket.clone()), 60_000, LONG_IDLE);
+        let node_b = test_node(
+            dir_b.path(),
+            "node-b",
+            Some(bucket.clone()),
+            60_000,
+            LONG_IDLE,
+        );
         match append(&node_b, "run-r", 9, "early") {
             Err(CellError::OwnedElsewhere { owner, .. }) => assert_eq!(owner, "node-a"),
             other => panic!("expected OwnedElsewhere, got {other:?}"),
@@ -2004,8 +2055,7 @@ mod tests {
                 .map(|i| {
                     let base = base.clone();
                     scope.spawn(move || {
-                        let store =
-                            HttpRunStore::new(HttpRelay::new(base, None), "run-contended");
+                        let store = HttpRunStore::new(HttpRelay::new(base, None), "run-contended");
                         let owner = format!("proc-{i}");
                         match crate::runtime::store::acquire_lease(&store, &owner, ttl).unwrap() {
                             Ok(lease) => Ok(lease.owner),
@@ -2042,9 +2092,11 @@ mod tests {
             winner
         );
         crate::runtime::store::release_lease(&store, &winner).unwrap();
-        assert!(crate::runtime::store::acquire_lease(&store, "outsider", ttl)
-            .unwrap()
-            .is_ok());
+        assert!(
+            crate::runtime::store::acquire_lease(&store, "outsider", ttl)
+                .unwrap()
+                .is_ok()
+        );
     }
 
     /// A node fenced by a takeover answers 409, and the client turns that into
@@ -2089,13 +2141,10 @@ mod tests {
         // limits). Assert the real behavior so the gap stays visible.
         store.put_blob("manifest.json", b"{}").unwrap();
         assert!(store.flush().is_ok(), "besteffort logs and continues");
-        let holder = crate::runtime::store::acquire_lease(
-            &store,
-            "proc-a",
-            chrono::Duration::seconds(60),
-        )
-        .expect("fencing is a standdown, not an error")
-        .expect_err("a fenced node must not believe it holds the lease");
+        let holder =
+            crate::runtime::store::acquire_lease(&store, "proc-a", chrono::Duration::seconds(60))
+                .expect("fencing is a standdown, not an error")
+                .expect_err("a fenced node must not believe it holds the lease");
         assert_eq!(holder.owner, "node-b");
     }
 
