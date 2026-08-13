@@ -1820,9 +1820,9 @@ no semantic surface at all.
 | wall per render (warm avg) | ~37 ms | ~31 ms | −16% |
 
 Gates: full chidori-js suite green (219 tests, incl. record→replay
-byte-identity and the kernels/reg differential corpora), clippy clean,
-React markup byte-identical to Node before/after; Test262 gate result
-recorded below.
+byte-identity and the kernels/reg differential corpora), Test262 gate
+green (0 regressions, 99.49%), clippy clean, React markup byte-identical
+to Node before/after.
 
 **Where React render latency stands (idle container, warm avg/min):**
 
@@ -1839,12 +1839,20 @@ register/stack dispatch ~27%, boxed `Value` clone/drop ~17%, the residual
 index-key walk ~7% (a per-shape/per-object cached verdict is the next
 lever if it matters), IC + property probes ~6%.
 
-**Reading for the browser use case:** ~30 ms per full re-render at 100
-rows (≈50–90 ms as wasm, at wasm's typical 1.5–3× interpreter penalty)
-sits inside the ~100 ms perceived-instant budget — form/dashboard-class
-agent UIs re-rendered per click are fine natively and workable in-browser;
-500+ row tables or per-keystroke re-render are not, and 60 fps was never
-the target (`docs/dom-runtime-prototype.md`). The honest levers, in order:
+**Measured in the browser** (chidori-wasm `evalScript` in headless
+Chromium on the same container, per-render isolated by a 2-tick/12-tick
+diff so per-call engine + bundle compile costs cancel): 10 rows ~12 ms,
+100 rows ~40 ms (1.3× native), 500 rows ~214 ms (1.4×) — the wasm
+penalty at realistic sizes is ~1.3–1.5×, not the 2–3× folklore figure.
+The wasm artifact is 7.8 MB (2.2 MB gzipped), a page-load cost, not a
+latency one.
+
+**Reading for the browser use case:** ~30 ms native / ~40 ms in-browser
+per full re-render at 100 rows sits inside the ~100 ms perceived-instant
+budget — form/dashboard-class agent UIs re-rendered per click are fine
+natively and workable in-browser; 500+ row tables or per-keystroke
+re-render are not, and 60 fps was never the target
+(`docs/dom-runtime-prototype.md`). The honest levers, in order:
 render less (memoized subtrees render fine today — this benchmark
 deliberately re-renders everything), the §6.12.2 structural work (smaller
 `Value`, reg-tier superinstructions, ObjectData arena), and only then
