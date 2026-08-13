@@ -65,6 +65,15 @@ const CORPUS: &[&str] = &[
     // Deeply nested call expressions (argument ranges stay contiguous).
     "function add(a, b) { return a + b; } console.log(add(add(1, add(2, 3)), add(add(4, 5), 6)));",
 
+    // Direct-eval completion values through empty try/catch: the tiniest
+    // handler-carrying programs, where the catch's exception register sits
+    // ABOVE the emitted code's touched high-water mark (only the runtime
+    // completion walk writes it) — the peephole's read scan must size its
+    // tables from the ops' actual operands, not `max_reg` (pinned: this
+    // shape panicked the translator).
+    "console.log(eval('1; try { } catch (err) { }'), eval('2; try { 3; } catch (err) { }'), \
+     eval('4; try { } catch (err) { 5; }'), eval('6; try { 7; } catch (err) { 8; }'));",
+
     // ---- TDZ and the init dataflow ----
     "try { t1; } catch (e) { console.log('read', e.constructor.name); } let t1 = 1; console.log(t1);",
     "try { t2 = 5; } catch (e) { console.log('write', e.constructor.name); } let t2; console.log(t2);",

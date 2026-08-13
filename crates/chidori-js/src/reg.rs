@@ -1817,7 +1817,19 @@ fn reg_peephole(
     max_reg: u16,
 ) -> Vec<u32> {
     let n = code.len();
-    let mut reads = vec![0u32; max_reg as usize + 1];
+    // Size the read-count table from an actual scan, not `max_reg`: ops can
+    // READ registers no emitted op ever wrote — a catch body reads its
+    // exception from `canon(handler depth)`, which only the runtime
+    // completion walk writes — and those sit above the touched high-water
+    // mark.
+    let mut top = max_reg as usize + 1;
+    for op in code.iter() {
+        rop_for_each_read(op, kernels, |r| top = top.max(r as usize + 1));
+        if let Some(d) = rop_dst(op) {
+            top = top.max(d as usize + 1);
+        }
+    }
+    let mut reads = vec![0u32; top];
     for op in code.iter() {
         rop_for_each_read(op, kernels, |r| reads[r as usize] += 1);
     }
