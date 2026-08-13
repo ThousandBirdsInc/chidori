@@ -86,6 +86,13 @@ export interface Branch {
    * display; absent on branches stashed before self-modification existed).
    */
   source?: string;
+  /**
+   * The implementation-history commit this timeline's code sits at
+   * (source-history.ts) — timelines are branch heads over one shared,
+   * content-addressed history, so switching paths moves HEAD instead of
+   * copying source. Absent on branches stashed before history existed.
+   */
+  headId?: string;
 }
 
 /** The persisted branch set: the active path's label plus stashed timelines. */

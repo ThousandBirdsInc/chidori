@@ -41,6 +41,16 @@ import {
   freshBranches,
   truncateAtTurn,
 } from './timeline';
+import {
+  freshHistory,
+  moveHead,
+  parseHistory,
+  recordCommit,
+  type PlaygroundCommit,
+  type SourceHistoryEvent,
+  type SourceHistoryStore,
+} from './source-history';
+import { HistoryPanel } from './history-panel';
 
 // The CodeMirror editor is a heavy chunk; load it only when the
 // "under the hood" panel is first opened.
@@ -57,6 +67,7 @@ const ASSETS = `${BASE}/chidori-wasm`;
 const SAVE_KEY = 'chidori-playground-chat-v1';
 const BRANCH_KEY = 'chidori-playground-branches-v1';
 const SOURCE_KEY = 'chidori-playground-source-v1';
+const HISTORY_KEY = 'chidori-playground-history-v1';
 // The exchanged OpenRouter key lives in sessionStorage: it survives the PKCE
 // redirect back to this page, and is gone when the tab closes. The storage
 // key is shared site-wide (lib/openrouter.ts), so one login also powers the
@@ -138,6 +149,7 @@ export function PlaygroundClient() {
   const [model, setModel] = useState('openrouter/auto');
   const [branchState, setBranchState] = useState<BranchStore>(freshBranches);
   const [source, setSource] = useState(DEFAULT_AGENT_SOURCE);
+  const [history, setHistory] = useState<SourceHistoryStore>(freshHistory);
   /** Latches true the first time "under the hood" opens (mounts the editor). */
   const [hoodOpened, setHoodOpened] = useState(false);
 
@@ -158,6 +170,9 @@ export function PlaygroundClient() {
   const pinnedRef = useRef(true);
   const branchRef = useRef(branchState);
   const sourceRef = useRef(source);
+  const historyRef = useRef(history);
+  /** A history restore in flight: its commit id tags the resulting commit. */
+  const pendingRestoreRef = useRef<string | null>(null);
   /** An update_source edit accepted this turn, waiting for the turn to end. */
   const pendingSourceRef = useRef<string | null>(null);
   /** Reverts an in-flight hot-swap if replaying the full journal fails. */
@@ -173,6 +188,43 @@ export function PlaygroundClient() {
       /* storage full/blocked — branches just won't survive a reload */
     }
   }, []);
+
+  const updateHistory = useCallback((next: SourceHistoryStore) => {
+    historyRef.current = next;
+    setHistory(next);
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+    } catch {
+      /* storage full/blocked — history just won't survive a reload */
+    }
+  }, []);
+
+  /**
+   * Record the source version now active into the implementation history —
+   * the playground's mirror of the runtime's source history
+   * (docs/source-history.md). Recording dedupes against HEAD, so every call
+   * site invokes it unconditionally; `turnFrontier` is the number of user
+   * turns already journaled, anchoring the version to the execution history
+   * exactly like a run commit's journal frontier. Async (WebCrypto hashing)
+   * and best-effort — callers fire and forget.
+   */
+  const recordHistory = useCallback(
+    (event: SourceHistoryEvent, text: string, restores?: string) => {
+      const agent = agentRef.current;
+      const blobText = agent
+        ? new TextDecoder().decode(agent.blob())
+        : localStorage.getItem(SAVE_KEY) ?? '';
+      const frontier = blobText ? countTurns(blobText) : 0;
+      void recordCommit(historyRef.current, event, text, frontier, { restores })
+        .then((result) => {
+          if (result) updateHistory(result.store);
+        })
+        .catch(() => {
+          /* hashing unavailable — history stays as it was */
+        });
+    },
+    [updateHistory],
+  );
 
   const refreshFeed = useCallback(() => {
     const agent = agentRef.current;
@@ -363,13 +415,19 @@ export function PlaygroundClient() {
         setHasSaved(true);
         setStatusLine('Restored from localStorage — earlier turns replayed offline.');
         drive(agent, token);
+        // Conversations saved before history existed get their root commit
+        // here; dedupe makes this a no-op for every later restore.
+        recordHistory(
+          historyRef.current.commits.length === 0 ? 'run_start' : 'source_change',
+          sourceRef.current,
+        );
         return true;
       } catch {
         localStorage.removeItem(SAVE_KEY);
         return false;
       }
     },
-    [buildHost, drive],
+    [buildHost, drive, recordHistory],
   );
 
   useEffect(() => {
@@ -385,6 +443,16 @@ export function PlaygroundClient() {
       }
     } catch {
       /* corrupted branch store — start fresh */
+    }
+    try {
+      const rawHistory = localStorage.getItem(HISTORY_KEY);
+      const parsedHistory = rawHistory ? parseHistory(rawHistory) : null;
+      if (parsedHistory) {
+        historyRef.current = parsedHistory;
+        setHistory(parsedHistory);
+      }
+    } catch {
+      /* storage blocked — history starts fresh */
     }
     try {
       const savedSource = localStorage.getItem(SOURCE_KEY);
@@ -464,7 +532,13 @@ export function PlaygroundClient() {
     }) as AgentHandle;
     agentRef.current = agent;
     drive(agent, token);
-  }, [buildHost, drive]);
+    // The version that starts the run is the history's root — the same
+    // `run_start` commit the runtime records on a run's first persist.
+    recordHistory(
+      historyRef.current.commits.length === 0 ? 'run_start' : 'source_change',
+      sourceRef.current,
+    );
+  }, [buildHost, drive, recordHistory]);
 
   const send = useCallback(
     (text: string) => {
@@ -613,6 +687,10 @@ export function PlaygroundClient() {
           prevBlobText,
           `⚠️ Hot-swap reverted — the journal could not replay under the new code: ${err}`,
         );
+        // The revert is history too: the chain shows edit → back, and the
+        // reverted commit reuses the original version's stored object
+        // (content addressing — no second copy).
+        recordHistory('source_change', prevSource);
         deliver();
       };
       const ok = startFromBlob(
@@ -627,9 +705,15 @@ export function PlaygroundClient() {
         fallback?.('restore failed');
         return;
       }
+      // Chain the accepted version onto the implementation history — a
+      // `restore` when a history panel click swapped an old version back in,
+      // an ordinary `source_change` otherwise.
+      const restores = pendingRestoreRef.current;
+      pendingRestoreRef.current = null;
+      recordHistory(restores ? 'restore' : 'source_change', next, restores ?? undefined);
       deliver();
     },
-    [applySource, startFromBlob],
+    [applySource, startFromBlob, recordHistory],
   );
 
   useEffect(() => {
@@ -654,6 +738,17 @@ export function PlaygroundClient() {
           // Nothing recorded yet: compile-check now, run it on first message.
           (loaded.wasm as WasmModule).stripTypes(next, 'agent.ts');
           applySource(next);
+          const restores = pendingRestoreRef.current;
+          pendingRestoreRef.current = null;
+          recordHistory(
+            restores
+              ? 'restore'
+              : historyRef.current.commits.length === 0
+                ? 'run_start'
+                : 'source_change',
+            next,
+            restores ?? undefined,
+          );
           setStatusLine('🧬 Source updated — your next message starts the agent on the edited code.');
           return null;
         }
@@ -661,10 +756,11 @@ export function PlaygroundClient() {
         hotSwap(next);
         return null;
       } catch (err) {
+        pendingRestoreRef.current = null;
         return String(err);
       }
     },
-    [applySource, validateSwap, hotSwap],
+    [applySource, validateSwap, hotSwap, recordHistory],
   );
 
   /**
@@ -716,6 +812,9 @@ export function PlaygroundClient() {
             blob: current,
             turns: countTurns(current),
             source: sourceRef.current,
+            // Timelines are branch heads over the shared implementation
+            // history: the stash remembers which commit its code sits at.
+            headId: historyRef.current.head ?? undefined,
           },
         ],
       });
@@ -738,6 +837,7 @@ export function PlaygroundClient() {
           blob: current,
           turns: countTurns(current),
           source: sourceRef.current,
+          headId: historyRef.current.head ?? undefined,
         });
       }
       if (
@@ -750,9 +850,18 @@ export function PlaygroundClient() {
         // the branch's stashed source keeps the display honest.
         applySource(target.source ?? DEFAULT_AGENT_SOURCE);
         updateBranches({ activeLabel: target.label, nextId: store.nextId, stashed });
+        if (target.headId) {
+          // Switching timelines moves HEAD to that timeline's commit —
+          // history itself never rewrites, exactly like `git switch`.
+          updateHistory(moveHead(historyRef.current, target.headId));
+        } else {
+          // A stash from before history existed: give its code a commit so
+          // HEAD matches what is actually running.
+          recordHistory('source_change', target.source ?? DEFAULT_AGENT_SOURCE);
+        }
       }
     },
-    [currentBlobText, startFromBlob, updateBranches, applySource],
+    [currentBlobText, startFromBlob, updateBranches, applySource, updateHistory, recordHistory],
   );
 
   const dropBranch = useCallback(
@@ -775,14 +884,42 @@ export function PlaygroundClient() {
     swapFallbackRef.current = null;
     localStorage.removeItem(SAVE_KEY);
     localStorage.removeItem(BRANCH_KEY);
+    localStorage.removeItem(HISTORY_KEY);
     branchRef.current = freshBranches();
     setBranchState(branchRef.current);
+    historyRef.current = freshHistory();
+    setHistory(historyRef.current);
+    pendingRestoreRef.current = null;
     applySource(DEFAULT_AGENT_SOURCE);
     setFeed([]);
     setBusy(null);
     setStatusLine('');
     setHasSaved(false);
   }, [applySource]);
+
+  /**
+   * Restore a recorded version from the history panel: the stored source
+   * goes through the same gate as any edit (compile, replay-validate,
+   * hot-swap), and the accepted swap is recorded as a `restore` commit
+   * pointing at what it brought back — git-revert semantics, history only
+   * ever grows.
+   */
+  const restoreCommit = useCallback(
+    (commit: PlaygroundCommit) => {
+      const text = historyRef.current.objects[commit.object];
+      if (text === undefined) {
+        setStatusLine('Restore failed: that version’s source object is missing.');
+        return;
+      }
+      pendingRestoreRef.current = commit.id;
+      const error = applyManualEdit(text);
+      if (error) {
+        pendingRestoreRef.current = null;
+        setStatusLine(`Restore rejected: ${error}`);
+      }
+    },
+    [applyManualEdit],
+  );
 
   const connectOpenRouter = useCallback(() => {
     // Redirects to openrouter.ai's consent page; the redirect back lands on
@@ -1136,6 +1273,13 @@ export function PlaygroundClient() {
             edit that would change already-journaled effect calls is rejected as divergence.
           </li>
           <li>
+            Every version that runs is history: each accepted rewrite becomes a commit in the{' '}
+            <em>implementation history</em> below — a content-addressed, git-like chain recorded
+            alongside the journal, each version anchored to the turns that executed under it.
+            The same mechanism records every run&apos;s source history on disk (
+            <code>chidori history</code>).
+          </li>
+          <li>
             Docs answers are grounded: these docs are indexed at build time, retrieved into the
             model&apos;s context, and exposed as the <code>search_docs</code> tool.
           </li>
@@ -1163,6 +1307,40 @@ export function PlaygroundClient() {
             {source}
           </pre>
         )}
+      </details>
+
+      {/*
+       * The implementation history: the execution side of this chat lives in
+       * the journal (the feed above); this is the code side — the git-like
+       * chain of every agent.ts version that ran, mirroring what
+       * `chidori history <run-id>` shows for a persisted run.
+       */}
+      <details className="mt-4 rounded-xl border border-fd-border bg-fd-card/30 p-4">
+        <summary className="cursor-pointer text-sm font-medium select-none marker:text-fd-muted-foreground">
+          Implementation history
+          {history.commits.length > 0 && (
+            <span className="ml-2 font-mono text-[11px] font-normal text-fd-muted-foreground">
+              {history.commits.length} version{history.commits.length === 1 ? '' : 's'}
+            </span>
+          )}
+        </summary>
+        <p className="mt-2 text-xs text-fd-muted-foreground">
+          The journal records what this chat <em>did</em>; this chain records what
+          the agent <em>was</em> — every source version that ran, as git-like
+          commits anchored to the turns executed under each. Ask the agent to
+          rewrite its code (or edit it under the hood) to grow the chain; diff any
+          two versions; restore an old one and the journal replays against it.
+          Timelines (⑂) are branch heads over this one shared history — the same
+          model <code>chidori history</code> shows for a persisted run.
+        </p>
+        <HistoryPanel
+          history={history}
+          timelineHeads={branchState.stashed.map((b) => ({ label: b.label, head: b.headId }))}
+          activeLabel={branchState.activeLabel}
+          currentTurns={userTurns}
+          busy={busy !== null}
+          onRestore={restoreCommit}
+        />
       </details>
     </div>
   );

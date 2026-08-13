@@ -157,6 +157,11 @@ pub(crate) struct ScaffoldPersister {
     /// so they are serialized once here and written once per run.
     blob_bytes: Vec<u8>,
     blob_written: std::sync::atomic::AtomicBool,
+    /// One source-history recording attempt per persister: the initial
+    /// (or resumed) code version joins `history/commits.jsonl` on the first
+    /// persist. Recording dedupes against the history head, so a resume with
+    /// unchanged code appends nothing; best-effort, like the branch store.
+    source_history_recorded: std::sync::atomic::AtomicBool,
     /// The longest call log ever durably written for this run — loaded once
     /// from the previous manifest (resume) and advanced with each write.
     /// A resume attempt that diverged or was denied early carries a SHORTER
@@ -188,6 +193,7 @@ impl ScaffoldPersister {
             modules: std::sync::OnceLock::new(),
             blob_bytes: serde_json::to_vec(&blob).unwrap_or_default(),
             blob_written: std::sync::atomic::AtomicBool::new(false),
+            source_history_recorded: std::sync::atomic::AtomicBool::new(false),
             checkpoint_floor: std::sync::OnceLock::new(),
         }
     }
@@ -276,13 +282,26 @@ impl ScaffoldPersister {
         // Write through the run's store handle when persistence is enabled, so
         // a configured durable mirror receives the scaffold too; identical
         // on-disk layout either way.
-        let store = match ctx.store() {
-            Some(store) => SnapshotStore::with_store(self.base.join(&self.run_id), store),
-            None => SnapshotStore::new(self.base.join(&self.run_id)),
+        let run_store: Arc<dyn crate::runtime::store::RunStore> = match ctx.store() {
+            Some(store) => store,
+            None => Arc::new(crate::runtime::store::FsRunStore::new(
+                self.base.join(&self.run_id),
+            )),
         };
+        let store = SnapshotStore::with_store(self.base.join(&self.run_id), run_store.clone());
         if !self.blob_written.load(Ordering::Acquire) {
             store.put_snapshot_blob(&manifest, &self.blob_bytes)?;
             self.blob_written.store(true, Ordering::Release);
+        }
+        if !self.source_history_recorded.swap(true, Ordering::AcqRel) {
+            if let Err(err) = self.record_source_history(ctx, run_store.as_ref()) {
+                tracing::warn!(
+                    run_id = %self.run_id,
+                    error = %err,
+                    "failed to record the run's source history (execution continues; \
+                     `chidori history` will be missing this version)"
+                );
+            }
         }
         store.put_manifest(&manifest)?;
         if compact || ctx.call_log_checkpoint_dirty() {
@@ -295,6 +314,51 @@ impl ScaffoldPersister {
             store.compact_host_promises(&manifest.host_promises)?;
         }
         store.put_pending(manifest.pending.as_ref())
+    }
+
+    /// Record the run's current implementation — the entry plus every
+    /// imported module, full text — into the git-like source history under
+    /// the run dir (`history/`, see `runtime::source_history`), anchored at
+    /// the current journal frontier. `record_commit`'s head-tree dedupe makes
+    /// this a no-op for a resume with unchanged code (and for the
+    /// edit-and-resume path, whose accepted change was already recorded by
+    /// `validate_manifest_for_resume`); a differing tree that reaches here
+    /// anyway (e.g. an embedder resuming without the validation surface)
+    /// chains as a `resume_source_change`.
+    fn record_source_history(
+        &self,
+        ctx: &RuntimeContext,
+        store: &dyn crate::runtime::store::RunStore,
+    ) -> Result<()> {
+        use crate::runtime::source_history::{self, CommitInput, SourceCommitEvent};
+
+        let (modules, _) = self.modules()?;
+        let module_paths: Vec<PathBuf> = modules.iter().map(|module| module.path.clone()).collect();
+        let mut files = vec![(self.path.clone(), self.source.clone())];
+        files.extend(source_history::read_source_files(&module_paths)?);
+        let event = match source_history::head_commit(store)? {
+            Some(_) => SourceCommitEvent::ResumeSourceChange,
+            None => SourceCommitEvent::RunStart,
+        };
+        // Cross-run dedupe: under the standard `.chidori/runs` layout, the
+        // same agent tree recorded by many runs is stored once in the sibling
+        // `history-objects/` cache and hardlinked into each run's store.
+        let cache = source_history::cross_run_cache(&self.base);
+        source_history::record_commit(
+            store,
+            CommitInput {
+                event,
+                run_id: &self.run_id,
+                branch_id: None,
+                entry_path: &self.path,
+                files: &files,
+                journal_frontier: ctx.call_log_len() as u64,
+                extra_parent: None,
+                share_from: &[],
+                backfill_cache: cache.as_deref(),
+            },
+        )?;
+        Ok(())
     }
 }
 
@@ -1127,6 +1191,108 @@ mod tests {
     /// VM image, so persistence tests assert that shape.
     fn rust_engine_active() -> bool {
         true
+    }
+
+    /// The scaffold's first persist records the run's implementation into the
+    /// git-like source history (`history/` under the run dir); a re-persist
+    /// and a resume with unchanged code append nothing, and a resume with
+    /// edited code chains a `resume_source_change` commit onto the head.
+    #[test]
+    fn scaffold_persist_records_source_history() {
+        use crate::runtime::source_history::{self, SourceCommitEvent};
+        use crate::runtime::store::FsRunStore;
+
+        let base =
+            std::env::temp_dir().join(format!("chidori-scaffold-history-{}", uuid::Uuid::new_v4()));
+        let proj = base.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("agent.ts");
+        let v1 = "export async function agent() { return { v: 1 }; }\n";
+        std::fs::write(&path, v1).unwrap();
+        let run_id = "run-history";
+        let policy = RuntimePolicy::durable_default(run_id);
+        let ctx = RuntimeContext::new();
+
+        let persister = ScaffoldPersister::new(&base, run_id, &path, v1, &policy);
+        persister.persist(&ctx, CheckpointWrite::Compact).unwrap();
+        persister.persist(&ctx, CheckpointWrite::IfDirty).unwrap();
+
+        let store = FsRunStore::new(base.join(run_id));
+        let commits = source_history::load_commits(&store).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].event, SourceCommitEvent::RunStart);
+        assert_eq!(commits[0].run_id, run_id);
+        assert_eq!(
+            source_history::load_object(&store, commits[0].tree_object(&path).unwrap())
+                .unwrap()
+                .unwrap(),
+            v1
+        );
+
+        // Resume with unchanged code: a fresh persister dedupes to a no-op.
+        ScaffoldPersister::new(&base, run_id, &path, v1, &policy)
+            .persist(&ctx, CheckpointWrite::Compact)
+            .unwrap();
+        assert_eq!(source_history::load_commits(&store).unwrap().len(), 1);
+
+        // Resume with edited code chains onto the head.
+        let v2 = "export async function agent() { return { v: 2 }; }\n";
+        std::fs::write(&path, v2).unwrap();
+        ScaffoldPersister::new(&base, run_id, &path, v2, &policy)
+            .persist(&ctx, CheckpointWrite::Compact)
+            .unwrap();
+        let commits = source_history::load_commits(&store).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[1].event, SourceCommitEvent::ResumeSourceChange);
+        assert_eq!(commits[1].parents, vec![commits[0].id.clone()]);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Under the standard `.chidori/runs` layout, identical trees recorded
+    /// by different runs share one stored object: the first run back-fills
+    /// the sibling `history-objects/` cache and every later run hardlinks
+    /// from it (inode-verified) — cross-run dedupe.
+    #[cfg(unix)]
+    #[test]
+    fn scaffold_history_dedupes_across_runs_via_cache() {
+        use crate::runtime::source_history;
+        use std::os::unix::fs::MetadataExt;
+
+        let root =
+            std::env::temp_dir().join(format!("chidori-cross-run-dedupe-{}", uuid::Uuid::new_v4()));
+        let base = root.join(".chidori").join("runs");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("agent.ts");
+        let src = "export async function agent() { return { same: true }; }\n";
+        std::fs::write(&path, src).unwrap();
+        let ctx = RuntimeContext::new();
+        for run_id in ["run-a", "run-b"] {
+            let policy = RuntimePolicy::durable_default(run_id);
+            ScaffoldPersister::new(&base, run_id, &path, src, &policy)
+                .persist(&ctx, CheckpointWrite::Compact)
+                .unwrap();
+        }
+
+        let hex = source_history::object_hex(src);
+        let cache_object = root
+            .join(".chidori")
+            .join(source_history::CROSS_RUN_OBJECT_CACHE_DIR)
+            .join(&hex);
+        let run_a_object = base
+            .join("run-a")
+            .join(source_history::SOURCE_OBJECTS_PREFIX)
+            .join(&hex);
+        let run_b_object = base
+            .join("run-b")
+            .join(source_history::SOURCE_OBJECTS_PREFIX)
+            .join(&hex);
+        let cache_ino = cache_object.metadata().unwrap().ino();
+        assert_eq!(run_a_object.metadata().unwrap().ino(), cache_ino);
+        assert_eq!(run_b_object.metadata().unwrap().ino(), cache_ino);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     struct FixedTestProvider {

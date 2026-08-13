@@ -56,6 +56,8 @@ use crate::runtime::snapshot::{
     CallLogSequenceRange, HostOperationId, ParallelBranchManifest, BRANCHES_DIR,
     DEFAULT_BRANCH_SEQUENCE_RANGE_WIDTH,
 };
+use crate::runtime::source_history::{self, CommitInput, SourceCommitEvent};
+use crate::runtime::store::FsRunStore;
 use crate::runtime::typescript::bindings::HostBindingBackend;
 use crate::runtime::vfs::Vfs;
 
@@ -520,7 +522,14 @@ pub(crate) fn resume_branch(
         error: None,
     });
 
-    run_persisted_branch(backend, &op_dir, &branch_dir, meta, replay_log)
+    run_persisted_branch(
+        backend,
+        &op_dir,
+        &branch_dir,
+        meta,
+        replay_log,
+        SourceCommitEvent::BranchResume,
+    )
 }
 
 /// Re-run a persisted branch **fresh from its parent anchor** with whatever
@@ -535,7 +544,14 @@ pub(crate) fn rerun_branch(
     branch_id: &str,
 ) -> std::result::Result<Value, String> {
     let (op_dir, branch_dir, meta) = find_branch(run_dir, branch_id)?;
-    run_persisted_branch(backend, &op_dir, &branch_dir, meta, Vec::new())
+    run_persisted_branch(
+        backend,
+        &op_dir,
+        &branch_dir,
+        meta,
+        Vec::new(),
+        SourceCommitEvent::BranchRerun,
+    )
 }
 
 /// Shared core of [`resume_branch`] / [`rerun_branch`]: rebuild the branch
@@ -547,8 +563,46 @@ fn run_persisted_branch(
     branch_dir: &Path,
     mut meta: BranchMeta,
     replay_log: Vec<CallRecord>,
+    history_event: SourceCommitEvent,
 ) -> std::result::Result<Value, String> {
     let anchor = load_anchor(op_dir)?;
+
+    // Whatever `source.ts` now contains is the implementation about to run:
+    // chain it into the branch's source history before executing. The
+    // head-tree dedupe makes this a no-op when the code is unchanged (the
+    // plain resume case), so only real edits grow the chain. Best-effort.
+    match std::fs::read_to_string(branch_dir.join(BRANCH_SOURCE_FILE)) {
+        Ok(source_text) => {
+            let entry = PathBuf::from(&meta.original_source);
+            let files = vec![(entry.clone(), source_text)];
+            // An edit that restores content the run (or a sibling) already
+            // recorded hardlinks the existing object instead of rewriting it.
+            let share_dirs: Vec<PathBuf> = op_dir
+                .parent()
+                .and_then(Path::parent)
+                .map(|run_dir| vec![run_dir.join(source_history::SOURCE_OBJECTS_PREFIX)])
+                .unwrap_or_default();
+            if let Err(err) = source_history::record_commit(
+                &FsRunStore::new(branch_dir),
+                CommitInput {
+                    event: history_event,
+                    run_id: &meta.parent_run_id,
+                    branch_id: Some(&meta.branch_id),
+                    entry_path: &entry,
+                    files: &files,
+                    journal_frontier: replay_log.len() as u64,
+                    extra_parent: None,
+                    share_from: &share_dirs,
+                    backfill_cache: None,
+                },
+            ) {
+                tracing::warn!(error = %err, branch = %meta.branch_id, "failed to record branch source history");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, branch = %meta.branch_id, "failed to read branch source for history");
+        }
+    }
     let branch_ctx = RuntimeContext::for_branch_resume(
         replay_log,
         anchor.vfs,
@@ -610,13 +664,64 @@ fn persist_anchor_and_sources(
     let bytes = serde_json::to_vec_pretty(anchor).map_err(|err| err.to_string())?;
     std::fs::write(&anchor_path, bytes)
         .map_err(|err| format!("writing {}: {err}", anchor_path.display()))?;
+    // The fork is a code-history event too: each branch's history opens with
+    // a `branch_fork` commit of the variant's own source, parented on the
+    // parent run's head commit — the git-like fork point tying the branch's
+    // implementation chain back to the trunk's.
+    let run_dir = op_dir.parent().and_then(Path::parent);
+    let fork_parent = run_dir
+        .and_then(|run_dir| {
+            source_history::head_commit(&FsRunStore::new(run_dir))
+                .ok()
+                .flatten()
+        })
+        .map(|head| head.id);
+    // Object dedupe across the fork: the parent run's objects plus every
+    // sibling branch already recorded in this loop. Variants that share a
+    // strategy file (or reuse a trunk module) hardlink one stored copy
+    // instead of writing it once per branch.
+    let mut share_dirs: Vec<PathBuf> = run_dir
+        .map(|run_dir| vec![run_dir.join(source_history::SOURCE_OBJECTS_PREFIX)])
+        .unwrap_or_default();
     for (index, variant) in variants.iter().enumerate() {
         let dir = branch_dir(op_dir, index as u32);
         std::fs::create_dir_all(&dir)
             .map_err(|err| format!("creating {}: {err}", dir.display()))?;
+        let branch_id = format!(
+            "{}-op{}-branch-{}",
+            anchor.parent_run_id, anchor.branch_seq, index
+        );
+        let files = vec![(PathBuf::from(&variant.source), variant.source_text.clone())];
+        if let Err(err) = source_history::record_commit(
+            &FsRunStore::new(&dir),
+            CommitInput {
+                event: SourceCommitEvent::BranchFork,
+                run_id: &anchor.parent_run_id,
+                branch_id: Some(&branch_id),
+                entry_path: Path::new(&variant.source),
+                files: &files,
+                journal_frontier: anchor.branch_seq,
+                extra_parent: fork_parent.clone(),
+                share_from: &share_dirs,
+                backfill_cache: None,
+            },
+        ) {
+            tracing::warn!(error = %err, branch = %branch_id, "failed to record branch fork source history");
+        }
+        share_dirs.push(dir.join(source_history::SOURCE_OBJECTS_PREFIX));
+        // Materialize the editable `source.ts` as a copy-on-write clone of
+        // the immutable object just recorded (shared blocks until the user
+        // edits it, on filesystems that support reflink); plain write when
+        // the history recording didn't land.
         let source_path = dir.join(BRANCH_SOURCE_FILE);
-        std::fs::write(&source_path, &variant.source_text)
-            .map_err(|err| format!("writing {}: {err}", source_path.display()))?;
+        let object_path = dir
+            .join(source_history::SOURCE_OBJECTS_PREFIX)
+            .join(source_history::object_hex(&variant.source_text));
+        if !(object_path.is_file() && source_history::cow_clone(&object_path, &source_path).is_ok())
+        {
+            std::fs::write(&source_path, &variant.source_text)
+                .map_err(|err| format!("writing {}: {err}", source_path.display()))?;
+        }
     }
     Ok(())
 }
@@ -1207,6 +1312,102 @@ mod tests {
             meta.output,
             Some(json!({ "version": "v2-edited", "note": "from-parent", "suffix": "s1" }))
         );
+
+        // The branch's implementation history is git-like: the fork commit
+        // holds the original strategy, the rerun commit chains the edit onto
+        // it, and both full texts are recoverable from the branch store.
+        use crate::runtime::source_history::{self, SourceCommitEvent};
+        let history_store = crate::runtime::store::FsRunStore::new(&branch_dir);
+        let commits = source_history::load_commits(&history_store).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].event, SourceCommitEvent::BranchFork);
+        assert_eq!(commits[0].branch_id.as_deref(), Some(branch_id.as_str()));
+        assert_eq!(commits[1].event, SourceCommitEvent::BranchRerun);
+        assert_eq!(commits[1].parents, vec![commits[0].id.clone()]);
+        let strategy_path = std::path::PathBuf::from(&meta.original_source);
+        let forked = source_history::load_object(
+            &history_store,
+            commits[0].tree_object(&strategy_path).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let rerun_text = source_history::load_object(
+            &history_store,
+            commits[1].tree_object(&strategy_path).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(forked.contains("\"v1\""));
+        assert!(rerun_text.contains("\"v2-edited\""));
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Two variants forked from the SAME strategy file store its text once:
+    /// the second branch's history object is a hardlink of the first's
+    /// (inode-verified), and each branch's editable `source.ts` still
+    /// carries the full content (a CoW clone, never a hardlink — edits must
+    /// not write through to the shared immutable object).
+    #[cfg(unix)]
+    #[test]
+    fn fork_dedupes_identical_variant_sources_across_branches() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "chidori-branch-dedupe-base-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dir =
+            std::env::temp_dir().join(format!("chidori-branch-dedupe-{}", uuid::Uuid::new_v4()));
+        write_branch_sources(&dir);
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const outcomes = await chidori.branch([
+                    { label: "a", source: "__DIR__/branches/double.ts", input: { base: 1 } },
+                    { label: "b", source: "__DIR__/branches/double.ts", input: { base: 2 } },
+                ]);
+                return { outcomes };
+            }
+        "#
+        .replace("__DIR__", &dir.to_string_lossy());
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let run_dir = ctx.enable_persistence(base.clone());
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+        assert_eq!(output["outcomes"].as_array().unwrap().len(), 2);
+
+        let strategy_text =
+            std::fs::read_to_string(dir.join("branches").join("double.ts")).unwrap();
+        let hex = crate::runtime::source_history::object_hex(&strategy_text);
+        let (op_dir, branch_a_dir, _) = super::scan_branches(&run_dir).unwrap().remove(0);
+        let branch_b_dir = super::branch_dir(&op_dir, 1);
+        let object_a = branch_a_dir
+            .join(crate::runtime::source_history::SOURCE_OBJECTS_PREFIX)
+            .join(&hex);
+        let object_b = branch_b_dir
+            .join(crate::runtime::source_history::SOURCE_OBJECTS_PREFIX)
+            .join(&hex);
+        assert_eq!(
+            object_a.metadata().unwrap().ino(),
+            object_b.metadata().unwrap().ino(),
+            "identical variant sources must share one hardlinked object"
+        );
+        for branch_dir in [&branch_a_dir, &branch_b_dir] {
+            let source_path = branch_dir.join(super::BRANCH_SOURCE_FILE);
+            assert_eq!(
+                std::fs::read_to_string(&source_path).unwrap(),
+                strategy_text
+            );
+            assert_ne!(
+                source_path.metadata().unwrap().ino(),
+                object_a.metadata().unwrap().ino(),
+                "the editable source.ts must never hardlink the immutable object"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(base);

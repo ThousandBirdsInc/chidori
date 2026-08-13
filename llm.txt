@@ -387,6 +387,17 @@ chidori branch-rerun <run-id> <branch-id>                   # re-run edited sour
 A resumed or re-run branch updates only its own store; the parent's recorded
 `branch` outcome is immutable history. See `docs/branching-execution.md`.
 
+Every source version a run or branch executes is also recorded as a git-like
+commit chain alongside the journal (content-addressed, hardlink-deduped):
+
+```bash
+chidori history <run-id>                    # commits + the journal ranges each ran
+chidori history <run-id> --show <commit>    # print a stored version
+chidori history <run-id> --diff <a>..<b>    # unified diff between versions
+```
+
+See `docs/source-history.md`.
+
 ### actors: spawn / send / receive / join / stop / status / lookup
 
 ```ts

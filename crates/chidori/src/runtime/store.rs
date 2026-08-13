@@ -79,6 +79,38 @@ pub trait RunStore: Send + Sync + std::fmt::Debug {
     /// Read a named auxiliary artifact. `Ok(None)` when absent.
     fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
+    /// Whether `key` exists, without reading its bytes. The source-history
+    /// object writer calls this per file on every recording point, so the
+    /// filesystem backend answers with one `stat` instead of a full read; the
+    /// default is correct for every backend, just not as cheap.
+    fn has_blob(&self, key: &str) -> Result<bool> {
+        Ok(self.get_blob(key)?.is_some())
+    }
+
+    /// Append one line to a line-oriented blob (the source-history commit
+    /// log). O(1) on the filesystem backend — must-not-rewrite is the same
+    /// contract as [`RunStore::append_record`]. The default is a
+    /// read-modify-write for backends with no native append; `line` must not
+    /// contain a newline (one is added).
+    fn append_blob_line(&self, key: &str, line: &[u8]) -> Result<()> {
+        let mut bytes = self.get_blob(key)?.unwrap_or_default();
+        bytes.extend_from_slice(line);
+        bytes.push(b'\n');
+        self.put_blob(key, &bytes)
+    }
+
+    /// The real filesystem path behind `key`, for stores that ARE a local
+    /// directory. This is the hook for content-addressed object sharing —
+    /// hardlink dedupe and copy-on-write clones between history stores —
+    /// which only makes sense for immutable, content-addressed blobs.
+    /// `None` — the default — disables sharing: the correct answer for
+    /// remote backends, and deliberately for [`TeeRunStore`] (a hardlink
+    /// into the primary would bypass the mirror write, leaving the durable
+    /// copy without the object).
+    fn blob_os_path(&self, _key: &str) -> Option<PathBuf> {
+        None
+    }
+
     /// Remove a named auxiliary artifact. Removing an absent key is Ok.
     fn delete_blob(&self, key: &str) -> Result<()>;
 
@@ -267,6 +299,36 @@ impl RunStore for FsRunStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err).with_context(|| format!("reading blob {key}")),
         }
+    }
+
+    fn has_blob(&self, key: &str) -> Result<bool> {
+        Ok(self.blob_path(key)?.is_file())
+    }
+
+    fn append_blob_line(&self, key: &str, line: &[u8]) -> Result<()> {
+        let path = self.blob_path(key)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("appending {}", path.display()))?;
+        file.write_all(line)
+            .with_context(|| format!("appending {}", path.display()))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("appending {}", path.display()))?;
+        if self.fsync_writes {
+            file.sync_data()
+                .with_context(|| format!("syncing {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn blob_os_path(&self, key: &str) -> Option<PathBuf> {
+        self.blob_path(key).ok()
     }
 
     fn delete_blob(&self, key: &str) -> Result<()> {
@@ -1215,6 +1277,21 @@ impl RunStore for TeeRunStore {
         }
     }
 
+    // Same primary-then-secondary semantics as `get_blob`.
+    fn has_blob(&self, key: &str) -> Result<bool> {
+        Ok(self.primary.has_blob(key)? || self.secondary.has_blob(key)?)
+    }
+
+    fn append_blob_line(&self, key: &str, line: &[u8]) -> Result<()> {
+        self.primary.append_blob_line(key, line)?;
+        self.secondary.append_blob_line(key, line)
+    }
+
+    // Deliberately the default `None` (not the primary's path): a hardlinked
+    // or cloned object would land only on local disk, and the mirror — the
+    // copy that survives losing this machine — would never see its bytes.
+    // Tee'd stores take the `put_blob` path for history objects instead.
+
     fn delete_blob(&self, key: &str) -> Result<()> {
         self.primary.delete_blob(key)?;
         self.secondary.delete_blob(key)
@@ -1321,6 +1398,18 @@ impl RunStore for ScopedRunStore {
 
     fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.inner.get_blob(&self.key(key))
+    }
+
+    fn has_blob(&self, key: &str) -> Result<bool> {
+        self.inner.has_blob(&self.key(key))
+    }
+
+    fn append_blob_line(&self, key: &str, line: &[u8]) -> Result<()> {
+        self.inner.append_blob_line(&self.key(key), line)
+    }
+
+    fn blob_os_path(&self, key: &str) -> Option<PathBuf> {
+        self.inner.blob_os_path(&self.key(key))
     }
 
     fn delete_blob(&self, key: &str) -> Result<()> {
@@ -2212,7 +2301,8 @@ mod tests {
     /// the run.
     #[test]
     fn lease_is_fleet_state_not_per_machine() {
-        let base = std::env::temp_dir().join(format!("chidori-store-fleet-{}", uuid::Uuid::new_v4()));
+        let base =
+            std::env::temp_dir().join(format!("chidori-store-fleet-{}", uuid::Uuid::new_v4()));
         let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
         // Two machines: their own run directories, one shared mirror.
         let machine = |name: &str| {
