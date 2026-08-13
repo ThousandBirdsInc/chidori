@@ -153,6 +153,21 @@ pub enum DefKind {
     MethodSetter,
 }
 
+/// One arm of a fused strict-equality branch chain ([`ROp::CmpBrKN`]):
+/// branch to `target` when `regs[a] === consts[konst]` equals `br_on_eq`
+/// (the folding of the original arm's `CmpOp::StrictEq`/`StrictNe` ×
+/// `if_true`). `cost` is the arm's exact stack-op units, charged inline
+/// when the arm is reached (the HEAD arm's units live in
+/// [`RegProto::costs`] instead; its `cost` field is 0).
+#[derive(Clone, Debug)]
+pub struct CmpKArm {
+    pub a: u16,
+    pub konst: u32,
+    pub br_on_eq: bool,
+    pub target: u32,
+    pub cost: u32,
+}
+
 /// The register instruction set. `dst`/`src`/operand fields index the
 /// frame's register file (`frame.locals`); `target` fields are absolute
 /// indices into [`RegProto::code`]; `name`/`konst`/`idx` fields index the
@@ -211,6 +226,24 @@ pub enum ROp {
     Arg {
         dst: u16,
         idx: u32,
+    },
+    /// Fused run of `n` consecutive `Arg` ops with contiguous `dst`/`idx`
+    /// ranges — the declared-function parameter prologue (`Arg{d,0};
+    /// Arg{d+1,1}; …`) in ONE dispatch. Built by the post-emission peephole;
+    /// all components are budget-pure, so the fused op's cost is the head's.
+    ArgN {
+        dst0: u16,
+        idx0: u32,
+        n: u16,
+    },
+    /// Two back-to-back register moves in one dispatch (flush traffic at
+    /// control-flow edges). Executed strictly in order (`d1` is written
+    /// before `s2` is read), so overlapping pairs keep exact semantics.
+    Mov2 {
+        d1: u16,
+        s1: u16,
+        d2: u16,
+        s2: u16,
     },
     RestArgs {
         dst: u16,
@@ -416,6 +449,20 @@ pub enum ROp {
         konst: u32,
         if_true: bool,
         target: u32,
+    },
+    /// Fused chain of ≥2 back-to-back STRICT-equality `CmpBrK` ops (the
+    /// switch / dispatch-ladder shape: `escapeHtml`'s per-char switch,
+    /// `$$typeof` ladders). Arms run in order; the first whose strict
+    /// compare equals `br_on_eq` branches to its target, else fall through
+    /// past the chain. Strict equality never runs user code and never
+    /// throws, so fusing is observably identical — EXCEPT for the op
+    /// budget, which must drain per stack op on the path actually taken:
+    /// the head arm's units sit in `RegProto::costs` like any anchor's, and
+    /// each later arm carries its own units in [`CmpKArm::cost`], charged
+    /// inline when (and only when) the arm is reached — exactly where the
+    /// stack tier's per-op check would have fired.
+    CmpBrKN {
+        arms: Box<[CmpKArm]>,
     },
     /// Fused `typeof x ===/!== "<one of the eight typeof names>"` in branch
     /// position — a direct type-tag test replacing the
@@ -920,6 +967,7 @@ fn rop_budget_pure(op: &ROp) -> bool {
         ROp::Charge
             | ROp::LoopKernel { .. }
             | ROp::Mov { .. }
+            | ROp::Mov2 { .. }
             | ROp::Const { .. }
             | ROp::Undef { .. }
             | ROp::Null { .. }
@@ -927,6 +975,16 @@ fn rop_budget_pure(op: &ROp) -> bool {
             | ROp::Hole { .. }
             | ROp::This { .. }
             | ROp::NewTarget { .. }
+            // `LoadArg` is a pure push and `BindThisSloppy` a pure in-place
+            // coercion (ToObject on a primitive receiver — no user code, no
+            // throw: null/undefined route to the global). Deferring their
+            // units to the next anchor crosses only pure ops, which is the
+            // exactness rule every entry in this list already rides on —
+            // and it makes both cost-0, so the dead-store eliminator can
+            // drop an unused prologue (`this`/`new.target`/params) whole.
+            | ROp::Arg { .. }
+            | ROp::ArgN { .. }
+            | ROp::BindThisSloppy { .. }
     )
 }
 
@@ -1276,6 +1334,20 @@ pub fn regify(
     }
     debug_assert_eq!(e.pending, 0);
     rpc_at[code.len()] = e.code.len() as u32;
+    // Post-emission cleanup + fusion (copy-prop, dead-store elimination,
+    // superinstructions), then remap `rpc_at` through the compaction so
+    // every downstream consumer (targets, positions, kernel resumes) sees
+    // the final indices.
+    {
+        let mut label_rpc = vec![false; e.code.len() + 1];
+        for &t in &labels {
+            label_rpc[rpc_at[t as usize] as usize] = true;
+        }
+        let remap = reg_peephole(&mut e.code, &mut e.costs, &label_rpc, kernels, e.max_reg);
+        for v in rpc_at.iter_mut() {
+            *v = remap[*v as usize];
+        }
+    }
     // Per-register-op source positions, derived from the finished `rpc_at`
     // map: every register op emitted for stack ip `i` — flushes and charge
     // sinks included — lands in `[rpc_at[i], rpc_at[i+1])` (interior ops of a
@@ -1308,6 +1380,12 @@ pub fn regify(
             }
             if *finally != u32::MAX {
                 *finally = rpc_at[*finally as usize];
+            }
+            continue;
+        }
+        if let ROp::CmpBrKN { arms } = op {
+            for arm in arms.iter_mut() {
+                arm.target = rpc_at[arm.target as usize];
             }
             continue;
         }
@@ -1418,6 +1496,495 @@ fn rop_set_dst(op: &mut ROp, new_dst: u16) -> bool {
     }
 }
 
+/// The register `op` writes as its sole register result, if it is one of the
+/// [`rop_set_dst`] retargetable defs (kept in sync with that list: the
+/// peephole checks this before calling `rop_set_dst`).
+fn rop_dst(op: &ROp) -> Option<u16> {
+    match op {
+        ROp::Mov { dst, .. }
+        | ROp::Const { dst, .. }
+        | ROp::Undef { dst }
+        | ROp::Null { dst }
+        | ROp::Bool { dst, .. }
+        | ROp::Hole { dst }
+        | ROp::This { dst }
+        | ROp::NewTarget { dst }
+        | ROp::Arg { dst, .. }
+        | ROp::RestArgs { dst, .. }
+        | ROp::Arguments { dst }
+        | ROp::LoadCell { dst, .. }
+        | ROp::AddCellK { dst, .. }
+        | ROp::ArithCellK { dst, .. }
+        | ROp::LoadUpvalue { dst, .. }
+        | ROp::LoadGlobal { dst, .. }
+        | ROp::LoadGlobalTypeof { dst, .. }
+        | ROp::Add { dst, .. }
+        | ROp::AddK { dst, .. }
+        | ROp::Arith { dst, .. }
+        | ROp::ArithK { dst, .. }
+        | ROp::Unary { dst, .. }
+        | ROp::Cmp { dst, .. }
+        | ROp::InstanceOf { dst, .. }
+        | ROp::GetProp { dst, .. }
+        | ROp::SetProp { dst, .. }
+        | ROp::GetElem { dst, .. }
+        | ROp::SetElem { dst, .. }
+        | ROp::DelProp { dst, .. }
+        | ROp::DelElem { dst, .. }
+        | ROp::HasProp { dst, .. }
+        | ROp::Call { dst, .. }
+        | ROp::New { dst, .. }
+        | ROp::CallSpread { dst, .. }
+        | ROp::NewSpread { dst, .. }
+        | ROp::Closure { dst, .. }
+        | ROp::NewObject { dst }
+        | ROp::NewArray { dst, .. }
+        | ROp::NewObjectTpl { dst, .. }
+        | ROp::GetTemplateObject { dst, .. }
+        | ROp::NewRegExp { dst, .. }
+        | ROp::ConcatStrings { dst, .. }
+        | ROp::GetIterator { dst, .. }
+        | ROp::IterNext { dst, .. } => Some(*dst),
+        _ => None,
+    }
+}
+
+/// Visit every register the op READS. Exhaustive by construction (no
+/// wildcard arm): adding an `ROp` variant forces a decision here, which is
+/// what keeps the dead-store eliminator sound. Register-file reads only —
+/// cells, upvalues, globals, consts and frame state are not registers.
+/// `LoopKernel` counts every frame LOCAL its kernel maps (entry guard reads
+/// them; exits write them back), via the kernel's slot tables.
+fn rop_for_each_read(op: &ROp, kernels: &[crate::bytecode::Kernel], mut f: impl FnMut(u16)) {
+    use crate::bytecode::KSlot;
+    match op {
+        ROp::Charge
+        | ROp::Undef { .. }
+        | ROp::Null { .. }
+        | ROp::Bool { .. }
+        | ROp::Hole { .. }
+        | ROp::This { .. }
+        | ROp::NewTarget { .. }
+        | ROp::Arg { .. }
+        | ROp::ArgN { .. }
+        | ROp::RestArgs { .. }
+        | ROp::Arguments { .. }
+        | ROp::Const { .. }
+        | ROp::InitLocalTdz { .. }
+        | ROp::LoadCell { .. }
+        | ROp::InitCellTdz { .. }
+        | ROp::IncCell { .. }
+        | ROp::LoadCellInit { .. }
+        | ROp::AddCellK { .. }
+        | ROp::ArithCellK { .. }
+        | ROp::CmpBrCellK { .. }
+        | ROp::LoadUpvalue { .. }
+        | ROp::LoadGlobal { .. }
+        | ROp::LoadGlobalTypeof { .. }
+        | ROp::DeclareGlobal { .. }
+        | ROp::CanDeclareGlobalFunc { .. }
+        | ROp::Jmp { .. }
+        | ROp::RetCompletion
+        | ROp::ThrowConstAssign
+        | ROp::PushTryHandler { .. }
+        | ROp::PopTryHandler
+        | ROp::CompletionJump { .. }
+        | ROp::EndFinally
+        | ROp::Closure { .. }
+        | ROp::NewObject { .. }
+        | ROp::GetTemplateObject { .. }
+        | ROp::NewRegExp { .. }
+        | ROp::ForInNext { .. }
+        | ROp::ForInPop => {}
+        ROp::LoopKernel { kernel, .. } => {
+            let k = &kernels[*kernel as usize];
+            for s in k.locals.iter() {
+                if let KSlot::Local(l) = s {
+                    f(*l as u16);
+                }
+            }
+            for &l in k.bool_locals.iter() {
+                f(l as u16);
+            }
+            for &l in k.oslots.iter() {
+                f(l as u16);
+            }
+            for &l in k.sslots.iter() {
+                f(l as u16);
+            }
+        }
+        ROp::Mov { src, .. }
+        | ROp::TdzCheck { src }
+        | ROp::StoreCell { src, .. }
+        | ROp::StoreCellChecked { src, .. }
+        | ROp::InitCell { src, .. }
+        | ROp::StoreUpvalue { src, .. }
+        | ROp::StoreUpvalueChecked { src, .. }
+        | ROp::StoreGlobal { src, .. }
+        | ROp::DefineGlobalFunc { src, .. }
+        | ROp::Unary { src, .. }
+        | ROp::BrTrue { src, .. }
+        | ROp::BrFalse { src, .. }
+        | ROp::BrFalsyKeep { src, .. }
+        | ROp::BrTruthyKeep { src, .. }
+        | ROp::BrNotNullishKeep { src, .. }
+        | ROp::TypeofBr { src, .. }
+        | ROp::Ret { src }
+        | ROp::Throw { src }
+        | ROp::RequireObjectCoercible { src }
+        | ROp::RequireCoercible { src }
+        | ROp::RequireIterResult { src }
+        | ROp::GetIterator { src, .. }
+        | ROp::ForInEnumerate { src, .. } => f(*src),
+        ROp::Mov2 { s1, s2, .. } => {
+            f(*s1);
+            f(*s2);
+        }
+        ROp::BindThisSloppy { reg } | ROp::BrNullishUndef { reg, .. } => f(*reg),
+        ROp::StoreLocalChecked { local, src } => {
+            // The store TDZ-checks the slot's CURRENT value: a read.
+            f(*local);
+            f(*src);
+        }
+        ROp::IncLocal { local, .. } => f(*local),
+        ROp::Add { a, b, .. }
+        | ROp::Arith { a, b, .. }
+        | ROp::Cmp { a, b, .. }
+        | ROp::InstanceOf { a, b, .. }
+        | ROp::CmpBr { a, b, .. } => {
+            f(*a);
+            f(*b);
+        }
+        ROp::AddK { a, .. } | ROp::ArithK { a, .. } | ROp::CmpBrK { a, .. } => f(*a),
+        ROp::CmpBrKN { arms } => {
+            for arm in arms.iter() {
+                f(arm.a);
+            }
+        }
+        ROp::GetProp { obj, .. } | ROp::DelProp { obj, .. } => f(*obj),
+        ROp::SetProp { obj, src, .. } => {
+            f(*obj);
+            f(*src);
+        }
+        ROp::GetElem { obj, key, .. } | ROp::DelElem { obj, key, .. } => {
+            f(*obj);
+            f(*key);
+        }
+        ROp::SetElem { obj, key, src, .. } => {
+            f(*obj);
+            f(*key);
+            f(*src);
+        }
+        ROp::HasProp { key, obj, .. } => {
+            f(*key);
+            f(*obj);
+        }
+        ROp::Call {
+            func,
+            this,
+            at,
+            argc,
+            ..
+        } => {
+            f(*func);
+            f(*this);
+            for j in 0..*argc {
+                f(*at + j);
+            }
+        }
+        ROp::New { ctor, at, argc, .. } => {
+            f(*ctor);
+            for j in 0..*argc {
+                f(*at + j);
+            }
+        }
+        ROp::CallSpread {
+            func, this, args, ..
+        } => {
+            f(*func);
+            f(*this);
+            f(*args);
+        }
+        ROp::NewSpread { ctor, args, .. } => {
+            f(*ctor);
+            f(*args);
+        }
+        ROp::IteratorClose { it } => f(*it),
+        ROp::NewArray { at, n, .. } | ROp::ConcatStrings { at, n, .. } => {
+            for j in 0..*n {
+                f(*at + j);
+            }
+        }
+        ROp::NewObjectTpl { at, n, .. } => {
+            for j in 0..*n {
+                f(*at + j);
+            }
+        }
+        ROp::ArraySpread { arr, src } => {
+            f(*arr);
+            f(*src);
+        }
+        ROp::DefineProp { obj, key, val, .. } => {
+            f(*obj);
+            f(*key);
+            f(*val);
+        }
+        ROp::SetHomeObject { obj, val } => {
+            f(*obj);
+            f(*val);
+        }
+        ROp::ObjectSpread { target, src } => {
+            f(*target);
+            f(*src);
+        }
+        ROp::CopyDataPropsExcept { target, src, at, n } => {
+            f(*target);
+            f(*src);
+            for j in 0..*n {
+                f(*at + j);
+            }
+        }
+        ROp::SetFunctionNameFromKey { key, val, .. } => {
+            f(*key);
+            f(*val);
+        }
+        ROp::SetProtoFromLiteral { obj, src } => {
+            f(*obj);
+            f(*src);
+        }
+        ROp::IterNext { it, .. } => f(*it),
+        ROp::IterStepValue { next, it, .. } => {
+            f(*next);
+            f(*it);
+        }
+    }
+}
+
+/// Drop `dead` ops from `code`/`costs`, returning the index remap
+/// (`len + 1` entries; a deleted index maps to its next survivor, and the
+/// trailing entry maps `len` to the new length).
+fn compact_rops(code: &mut Vec<ROp>, costs: &mut Vec<u32>, dead: &[bool]) -> Vec<u32> {
+    let n = code.len();
+    let mut remap = Vec::with_capacity(n + 1);
+    let mut w = 0usize;
+    for i in 0..n {
+        remap.push(w as u32);
+        if !dead[i] {
+            if w != i {
+                code.swap(w, i);
+                costs.swap(w, i);
+            }
+            w += 1;
+        } else {
+            debug_assert_eq!(costs[i], 0, "deleted register ops must be uncharged");
+        }
+    }
+    remap.push(w as u32);
+    code.truncate(w);
+    costs.truncate(w);
+    remap
+}
+
+/// Post-emission optimization over the finished register code (branch
+/// targets still STACK ips — the caller remaps them afterwards through the
+/// returned compaction map):
+///
+/// 1. **Copy-prop**: `def{dst: t}; Mov{dst: d, src: t}` where the `Mov` is
+///    the program's ONLY reader of `t` and not a jump-in target → retarget
+///    the def to `d`, drop the `Mov`. (Adjacent, so nothing can observe `t`
+///    or `d` in between; on a throw inside the def neither is written,
+///    exactly as before.)
+/// 2. **Dead-store elimination**, to a fixpoint: a budget-pure effect-free
+///    def whose `dst` no op (nor any embedded kernel) ever reads is
+///    dropped — which deletes the unused parts of the declared-function
+///    prologue (`this` + sloppy rebind, `new.target`, unread params) and
+///    the flush traffic feeding them. Locals are frame-private (closures
+///    capture cells, never locals) and value drop-timing is unobservable
+///    (no finalizers), so an unread store is dead by construction. Only
+///    cost-0 ops are eligible, so the budget drain is untouched.
+/// 3. **Superinstructions**: contiguous `Arg` runs fuse to [`ROp::ArgN`],
+///    back-to-back strict-equality `CmpBrK`s fuse to [`ROp::CmpBrKN`]
+///    (interior arms carry their exact units, charged inline when
+///    reached), and leftover adjacent `Mov` pairs fuse to [`ROp::Mov2`].
+///    Interior ops of a fusion must not be jump-in targets.
+///
+/// Returns the composed remap `old index → new index` for `rpc_at`.
+fn reg_peephole(
+    code: &mut Vec<ROp>,
+    costs: &mut Vec<u32>,
+    label_rpc: &[bool],
+    kernels: &[crate::bytecode::Kernel],
+    max_reg: u16,
+) -> Vec<u32> {
+    let n = code.len();
+    let mut reads = vec![0u32; max_reg as usize + 1];
+    for op in code.iter() {
+        rop_for_each_read(op, kernels, |r| reads[r as usize] += 1);
+    }
+    let mut dead = vec![false; n];
+
+    // -- 1. copy-prop ------------------------------------------------------
+    for i in 0..n.saturating_sub(1) {
+        if dead[i] || label_rpc[i + 1] || costs[i + 1] != 0 {
+            continue;
+        }
+        let ROp::Mov { dst: d, src: t } = code[i + 1] else {
+            continue;
+        };
+        if d == t || reads[t as usize] != 1 || rop_dst(&code[i]) != Some(t) {
+            continue;
+        }
+        if rop_set_dst(&mut code[i], d) {
+            dead[i + 1] = true;
+            reads[t as usize] = 0;
+        }
+    }
+
+    // -- 2. dead-store elimination (fixpoint) ------------------------------
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            if dead[i] || costs[i] != 0 {
+                continue;
+            }
+            let removable = match &code[i] {
+                ROp::Mov { dst, .. }
+                | ROp::Const { dst, .. }
+                | ROp::Undef { dst }
+                | ROp::Null { dst }
+                | ROp::Bool { dst, .. }
+                | ROp::Hole { dst }
+                | ROp::This { dst }
+                | ROp::NewTarget { dst }
+                | ROp::Arg { dst, .. } => reads[*dst as usize] == 0,
+                // Reads + rewrites its own register: removable when nothing
+                // ELSE reads it (the coercion allocates at most a primitive
+                // wrapper — unobservable when the result is never seen).
+                ROp::BindThisSloppy { reg } => reads[*reg as usize] == 1,
+                _ => false,
+            };
+            if removable {
+                dead[i] = true;
+                rop_for_each_read(&code[i], kernels, |r| reads[r as usize] -= 1);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let remap1 = compact_rops(code, costs, &dead);
+    // Jump-in flags on the compacted indices (a deleted label position
+    // marks its next survivor: jumps land there).
+    let mut label2 = vec![false; code.len() + 1];
+    for (i, &is_l) in label_rpc.iter().enumerate() {
+        if is_l {
+            label2[remap1[i] as usize] = true;
+        }
+    }
+
+    // -- 3. superinstructions ---------------------------------------------
+    let m = code.len();
+    let mut dead2 = vec![false; m];
+    let strict_arm = |op: &ROp| -> Option<CmpKArm> {
+        if let ROp::CmpBrK {
+            cmp,
+            a,
+            konst,
+            if_true,
+            target,
+        } = op
+        {
+            // Strict equality only: it never runs user code and never
+            // throws, so executing arm k of the chain is observably
+            // identical to dispatching its original op.
+            let br_on_eq = match cmp {
+                CmpOp::StrictEq => *if_true,
+                CmpOp::StrictNe => !*if_true,
+                _ => return None,
+            };
+            Some(CmpKArm {
+                a: *a,
+                konst: *konst,
+                br_on_eq,
+                target: *target,
+                cost: 0,
+            })
+        } else {
+            None
+        }
+    };
+    let mut i = 0usize;
+    while i < m {
+        if dead2[i] {
+            i += 1;
+            continue;
+        }
+        if let Some(head) = strict_arm(&code[i]) {
+            let mut arms = vec![head];
+            let mut j = i + 1;
+            while j < m && !label2[j] && !dead2[j] {
+                let Some(mut arm) = strict_arm(&code[j]) else {
+                    break;
+                };
+                arm.cost = costs[j];
+                arms.push(arm);
+                j += 1;
+            }
+            if arms.len() >= 2 {
+                for k in i + 1..j {
+                    dead2[k] = true;
+                    costs[k] = 0; // moved into the arm's inline charge
+                }
+                code[i] = ROp::CmpBrKN {
+                    arms: arms.into_boxed_slice(),
+                };
+            }
+            i = j;
+            continue;
+        }
+        if let ROp::Arg { dst, idx } = code[i] {
+            let mut k = 1usize;
+            while i + k < m
+                && !label2[i + k]
+                && !dead2[i + k]
+                && costs[i + k] == 0
+                && dst as usize + k <= u16::MAX as usize
+                && matches!(&code[i + k], ROp::Arg { dst: d2, idx: i2 }
+                    if *d2 as usize == dst as usize + k && *i2 as usize == idx as usize + k)
+            {
+                k += 1;
+            }
+            if k >= 2 {
+                for d in dead2.iter_mut().take(i + k).skip(i + 1) {
+                    *d = true;
+                }
+                code[i] = ROp::ArgN {
+                    dst0: dst,
+                    idx0: idx,
+                    n: k as u16,
+                };
+                i += k;
+                continue;
+            }
+        }
+        if i + 1 < m && !label2[i + 1] && !dead2[i + 1] && costs[i + 1] == 0 {
+            if let (&ROp::Mov { dst: d1, src: s1 }, &ROp::Mov { dst: d2, src: s2 }) =
+                (&code[i], &code[i + 1])
+            {
+                code[i] = ROp::Mov2 { d1, s1, d2, s2 };
+                dead2[i + 1] = true;
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let remap2 = compact_rops(code, costs, &dead2);
+    remap1.iter().map(|&r| remap2[r as usize]).collect()
+}
+
 impl Emitter<'_> {
     fn canon(&self, depth: usize) -> u16 {
         self.num_locals + depth as u16
@@ -1463,9 +2030,27 @@ impl Emitter<'_> {
 
     /// Sink accumulated pure units into a [`ROp::Charge`] — required before
     /// a control-flow join reached by fall-through, so every path into the
-    /// join has charged exactly its own units.
+    /// join has charged exactly its own units. When the op just emitted is
+    /// itself budget-pure and uncharged (the flush `Mov`s that precede most
+    /// joins), the units attach to IT instead of a fresh `Charge`: only
+    /// pure ops separate the new charge point from the old one, so the
+    /// drain is exact — and a whole dispatch disappears. (Never a
+    /// `LoopKernel`: charging a loop's worth of pending before the kernel
+    /// header is fine, but the header op is a label and jump-in paths must
+    /// not pay this path's units.)
     fn sink_pending(&mut self) {
         if self.pending > 0 {
+            if let Some(last) = self.code.last() {
+                let i = self.code.len() - 1;
+                if rop_budget_pure(last)
+                    && !matches!(last, ROp::LoopKernel { .. } | ROp::Charge)
+                    && self.costs[i] == 0
+                {
+                    self.costs[i] = self.pending;
+                    self.pending = 0;
+                    return;
+                }
+            }
             let n = self.pending;
             self.pending = 0;
             self.push_op(ROp::Charge);

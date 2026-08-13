@@ -30,8 +30,9 @@ pub mod localize;
 pub mod module;
 pub mod names;
 /// Phase-0 opcode-frequency instrumentation; present only under the
-/// `op-histogram` feature (see `docs/interpreter-optimization.md`).
-#[cfg(feature = "op-histogram")]
+/// `op-histogram` feature (see `docs/interpreter-optimization.md`), or
+/// `rop-histogram` (the register-tier twin, which keeps the reg tier ON).
+#[cfg(any(feature = "op-histogram", feature = "rop-histogram"))]
 pub mod opstats;
 pub mod promise;
 pub mod proxy;

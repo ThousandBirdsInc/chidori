@@ -19,6 +19,11 @@ path = "src/lib.rs"
 # nothing. Enable for analysis only: `cargo run --example opstats --features
 # op-histogram`. See docs/interpreter-optimization.md (Phase 0).
 op-histogram = []
+# Register-tier twin of `op-histogram`: records executed `ROp`s (and adjacent
+# pairs) from `run_reg_frame` WITHOUT disabling the register tier — the data
+# that drives reg-tier superinstruction selection. OFF by default; when off
+# the call site is `#[cfg]`-removed and the loop is byte-identical.
+rop-histogram = []
 # Opt-in mimalloc global allocator for the `run` example binary — an
 # allocator EXPERIMENT knob, not a recommendation. OFF by default, twice
 # over: (a) it's a C library (vendored and built by libmimalloc-sys), and the
@@ -86,6 +91,11 @@ harness = false
 [[bench]]
 name = "memory"
 harness = false
+
+# Register-tier opcode-frequency analyzer; needs the instrumented loop.
+[[example]]
+name = "ropstats"
+required-features = ["rop-histogram"]
 
 # Workspace-wide lint levels (see [workspace.lints] in the root Cargo.toml).
 [lints]

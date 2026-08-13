@@ -26,6 +26,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+#[cfg(feature = "op-histogram")]
 use crate::bytecode::Op;
 
 thread_local! {
@@ -52,9 +53,20 @@ pub struct Report {
 
 /// Record one executed opcode. Called once per dispatched instruction from the
 /// interpreter loop when the `op-histogram` feature is on.
+#[cfg(feature = "op-histogram")]
 #[inline]
 pub fn record(op: &Op) {
-    let name = variant_name(op);
+    record_name(variant_name(op));
+}
+
+/// Register-tier twin: record one executed `ROp` (feature `rop-histogram`).
+#[cfg(feature = "rop-histogram")]
+#[inline]
+pub fn record_rop(op: &crate::reg::ROp) {
+    record_name(variant_name(op));
+}
+
+fn record_name(name: &'static str) {
     HIST.with(|h| {
         let mut h = h.borrow_mut();
         h.total += 1;
@@ -93,7 +105,7 @@ pub fn take() -> Report {
 /// `Variant { .. }`; we keep the leading identifier. The result is interned so
 /// the histogram can key on `&'static str` (cheap to hash/copy) rather than
 /// allocating a `String` per executed opcode.
-fn variant_name(op: &Op) -> &'static str {
+fn variant_name<T: std::fmt::Debug>(op: &T) -> &'static str {
     let dbg = format!("{op:?}");
     let end = dbg
         .find(|c: char| !(c.is_alphanumeric() || c == '_'))

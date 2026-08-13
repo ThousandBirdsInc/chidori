@@ -1221,7 +1221,10 @@ impl ObjectData {
         debug_assert_eq!(slots.len(), shape.len());
         debug_assert_eq!(
             has_idx_keys,
-            shape.keys_in_order().iter().any(|k| k.array_index().is_some())
+            shape
+                .keys_in_order()
+                .iter()
+                .any(|k| k.array_index().is_some())
         );
         ObjectData {
             proto,

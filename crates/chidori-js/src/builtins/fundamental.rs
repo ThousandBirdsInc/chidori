@@ -1668,7 +1668,10 @@ fn ordinary_set_prototype_of(vm: &Vm, o: &JsObject, proto: Option<JsObject>) -> 
             o.borrow_mut()
                 .privates
                 .get_or_insert_with(Default::default)
-                .insert(CTOR_HINT_PRIVATE_ID, PrivateElement::Field(Value::String(name)));
+                .insert(
+                    CTOR_HINT_PRIVATE_ID,
+                    PrivateElement::Field(Value::String(name)),
+                );
         }
     }
     o.borrow_mut().proto = proto;
