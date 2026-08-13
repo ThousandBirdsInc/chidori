@@ -16,12 +16,16 @@
 //!   identical by construction. The translation changes only WHERE operands
 //!   live (indexed registers instead of a stack), never what runs.
 //! - **Whole-function eligibility.** Translation is all-or-nothing per
-//!   function: any op outside the translated subset (try/finally handlers,
-//!   `with`/direct-`eval` scope machinery, class `super`/private elements,
-//!   suspension ops, `Op::LoopKernel`, …) declines the function and it keeps
-//!   the stack interpreter. Loop-kernelized functions keep the stack tier so
-//!   their unboxed kernels — far faster than boxed register ops — stay in
-//!   charge.
+//!   function: any op outside the translated subset (`with`/direct-`eval`
+//!   scope machinery, class `super`/private elements, suspension ops, …)
+//!   declines the function and it keeps the stack interpreter.
+//! - **Loop kernels EMBED** (docs §6.10.2/§6.18): `Op::LoopKernel` becomes
+//!   [`ROp::LoopKernel`] followed by its translated fallback twin, so a
+//!   kernel-carrying glue function no longer forfeits the register tier.
+//!   The unboxed kernel stays in charge of its loop when its guard passes;
+//!   exits and bails materialize into canonical registers (on top of the
+//!   header's base depth) and resume at mapped register pcs
+//!   ([`RegProto::kernel_resume`]).
 //! - **Registers are `frame.locals`.** Register `0..num_locals` ARE the
 //!   localized bindings (same slots, same TDZ marker); `num_locals..` are the
 //!   canonical homes of the stack machine's operand-stack depths. A frame
@@ -1154,14 +1158,10 @@ pub fn regify(
             // The header is a back-edge target, so it is a label; its depth
             // is the BASE every exit shape sits on top of (an enclosing
             // for-of's iterator lives below the loop on the operand stack).
-            let Some(base) = label_states.get(&(ip as u32)).map(|st| st.depth) else {
-                return None;
-            };
+            let base = label_states.get(&(ip as u32)).map(|st| st.depth)?;
             for kop in k.code.iter() {
                 if let crate::bytecode::KOp::Exit { resume_ip, shape } = kop {
-                    let Some(st) = label_states.get(resume_ip) else {
-                        return None;
-                    };
+                    let st = label_states.get(resume_ip)?;
                     if st.depth != base + k.shapes[*shape as usize].len() as u32 {
                         return None;
                     }
