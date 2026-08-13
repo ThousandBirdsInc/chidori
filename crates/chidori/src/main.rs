@@ -316,6 +316,21 @@ enum Commands {
         ci: bool,
     },
 
+    /// What is this run holding right now? One view of a run's live
+    /// obligations: the pending host operation it is parked on, queued
+    /// signals in its inbox, actors it spawned and has not settled, detached
+    /// agents it launched (with their registry state), open branches, and
+    /// armed compensations.
+    Holdings {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to the current
+        /// directory)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+    },
+
     /// Run a run's registered compensations in reverse (saga rollback).
     /// `chidori.compensation.register(name, agent, input?)` journals an
     /// inverse action per side effect; this command executes them
@@ -883,6 +898,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                 false,
             )
         }
+        Commands::Holdings { run_id, dir } => (cmd_holdings(&run_id, dir.as_deref()), false),
         Commands::Rollback {
             run_id,
             dir,
@@ -2836,6 +2852,29 @@ fn cmd_resume(
         "\nResumed from {run_id} ({} recorded calls replayed{remat_clause}, {live_new} executed live)",
         result.replayed_calls,
     );
+    Ok(())
+}
+
+/// `chidori holdings` — aggregate what a run is holding right now (pending
+/// operation, signal inbox, open actors, detached agents, branches, armed
+/// compensations) into one JSON view. See `runtime::holdings`.
+fn cmd_holdings(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_base = base_dir.join(".chidori").join("runs");
+    let run_dir = run_base.join(run_id);
+
+    let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    let _ = factory.hydrate(run_id);
+    let store = factory.store_for(run_id);
+    let registry_factory = factory.clone();
+    let lookup = move |name: &str| registry_factory.registry_get(name).ok().flatten();
+
+    let holdings =
+        crate::runtime::holdings::compute_holdings(run_id, store.as_ref(), &run_dir, &lookup)
+            .with_context(|| format!("computing holdings for run {run_id}"))?;
+    println!("{}", serde_json::to_string_pretty(&holdings)?);
     Ok(())
 }
 

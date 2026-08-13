@@ -9,6 +9,7 @@ pub mod crypto;
 pub mod engine;
 /// Typed error taxonomy: the pause interrupt and run-failure classification.
 pub mod errors;
+pub mod holdings;
 pub mod host_actor;
 /// Detached, durable, addressable agent processes (`chidori.agents.*`).
 pub mod host_agent;

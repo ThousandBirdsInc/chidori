@@ -40,6 +40,7 @@ its job and the doc that covers it in depth.
 | `chidori trace <run_id>` | Print a run's call log — every prompt, tool call, and effect, with token counts and cost (including prompt-cache read/write totals). |
 | `chidori stats` | Usage and cost totals, including prompt-cache read/write tokens. |
 | `chidori snapshot <run_id>` | Print `runtime.snapshot.json` metadata (never raw VM snapshot bytes). |
+| `chidori holdings <run_id>` | What the run is holding right now: its pending host operation, queued signals, actors it spawned and has not settled, detached agents it launched (with registry state), open branches, and armed compensations. Also served as `GET /sessions/{id}/holdings`. |
 
 Run journals live under `.chidori/runs/<run_id>/` next to the agent file;
 pass `--dir <path>` when tracing from elsewhere.

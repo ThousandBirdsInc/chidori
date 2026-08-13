@@ -72,6 +72,7 @@ Exposes:
 - `GET  /sessions/{id}` — get session result
 - `GET  /sessions/{id}/checkpoint` — get the call log and snapshot manifest metadata
 - `GET  /sessions/{id}/snapshot` — inspect the durable journal-scaffold manifest metadata (no VM image — resume is call-log replay)
+- `GET  /sessions/{id}/holdings` — what the run is holding right now: pending host operation, queued signals, unsettled actors, detached agents (with registry state), open branches, armed compensations
 - `POST /sessions/{id}/resume` — answer a paused `input()` call and continue the run
 - `POST /sessions/{id}/approve` — approve or deny a policy-gated call that paused the run
 - `POST /sessions/{id}/signal` — deliver a signal `{ name, payload?, from? }`: resolves+resumes a run paused-waiting on that name (200); delivers in-memory to a live streaming run, resuming a matching pause in-process (202 `delivered_live`); else enqueues into the durable mailbox (202 `queued`); 409 for a terminal run

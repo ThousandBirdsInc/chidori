@@ -787,6 +787,10 @@ Session endpoints:
 - `GET /sessions/{id}/checkpoint`: get call log plus optional
   `snapshot_manifest`.
 - `GET /sessions/{id}/snapshot`: get only snapshot manifest metadata.
+- `GET /sessions/{id}/holdings`: what the run is holding right now — pending
+  host operation, queued signals, unsettled actors, detached agents (with
+  registry state), open branches, armed compensations. CLI twin:
+  `chidori holdings <run_id>`.
 - `POST /sessions/{id}/resume`: resume a paused `input()` session.
 - `POST /sessions/{id}/signal`: deliver `{ name, payload?, from? }` — resolves
   a matching signal pause (200), delivers live to a streaming run

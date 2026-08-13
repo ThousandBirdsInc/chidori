@@ -693,6 +693,74 @@ fn outcomes_failed(outcomes: &[crate::runtime::compensation::RollbackOutcome]) -
     outcomes.iter().filter(|o| o.error.is_some()).count()
 }
 
+/// GET /sessions/:id/holdings — what the session's run is holding right now
+/// (`runtime::holdings`): its pending host operation, queued signals, open
+/// actors, detached agents, branches, and armed compensations, plus the
+/// session-level pause state the server tracks.
+pub(super) async fn get_holdings(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let session = match state.session_store.get(&id) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Session not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("session store: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+    let Some(run_id) = session.run_id.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "session has no run to inspect (it never started one)"})),
+        )
+            .into_response();
+    };
+
+    let run_base = state.run_base.clone();
+    let holdings = tokio::task::spawn_blocking(move || {
+        let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+        let _ = factory.hydrate(&run_id);
+        let store = factory.store_for(&run_id);
+        let run_dir = run_base.join(&run_id);
+        let registry_factory = factory.clone();
+        let lookup = move |name: &str| registry_factory.registry_get(name).ok().flatten();
+        crate::runtime::holdings::compute_holdings(&run_id, store.as_ref(), &run_dir, &lookup)
+    })
+    .await;
+
+    match holdings {
+        Ok(Ok(mut holdings)) => {
+            // Overlay the session-level pause state the server tracks beyond
+            // the run directory (signal listen set + timeout deadline).
+            holdings["session"] = json!({
+                "id": session.id,
+                "status": session.status,
+                "pending_prompt": session.pending_prompt,
+                "pending_signal_names": session.pending_signal_names,
+                "pending_signal_deadline": session.pending_signal_deadline,
+            });
+            Json(holdings).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": join_err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// Render an agent-run error for a session's stored/returned `error` field.
 /// Uncaught-exception stack frames arrive from the engine in transpiled
 /// coordinates; remap them to positions in the original TypeScript against

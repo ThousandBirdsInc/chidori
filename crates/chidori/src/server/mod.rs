@@ -56,7 +56,8 @@ use sessions::resume::{approve_session, resume_session, signal_session};
 use sessions::stream::{attach_session_stream, stream_session, SessionEventLog};
 use sessions::{
     agent_error_string, arm_signal_timeout, cancel_session, create_session, get_checkpoint,
-    get_session, get_snapshot_manifest, list_agents, list_sessions, replay_session, session_policy,
+    get_holdings, get_session, get_snapshot_manifest, list_agents, list_sessions, replay_session,
+    session_policy,
 };
 
 // Test-only re-imports: they keep the flat namespace the test module's
@@ -817,6 +818,7 @@ pub async fn serve(
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}/checkpoint", get(get_checkpoint))
         .route("/sessions/{id}/snapshot", get(get_snapshot_manifest))
+        .route("/sessions/{id}/holdings", get(get_holdings))
         .route("/sessions/{id}/replay", post(replay_session))
         .route("/sessions/{id}/resume", post(resume_session))
         .route("/sessions/{id}/signal", post(signal_session))
