@@ -460,6 +460,26 @@ export interface RetryOptions {
  */
 export type ActorRestartStrategy = "never" | "clean" | "resume";
 
+/**
+ * The narrowed context view a spawn hands its child (`docs/actors.md`).
+ * Every field can only NARROW what the spawner itself holds — a child never
+ * widens: `tools` intersects with the spawner's registry, `workspace` is a
+ * relative `..`-free subpath under the spawner's workspace root, `model`
+ * re-points the child's default model (a routing choice, not a capability).
+ */
+export interface SpawnIntercept {
+  /** Default model for the child's prompts (e.g. a cheaper model for a fan-out worker). */
+  model?: string;
+  /**
+   * Registry tool names (MCP / native) the child may call — intersected with
+   * the spawner's own registry. In-VM `defineTool` functions are plain code
+   * in the child's module and are not governed by this list.
+   */
+  tools?: string[];
+  /** Relative subpath (no `..`) the child's workspace root narrows to. */
+  workspace?: string | { root: string };
+}
+
 export interface SpawnActorOptions {
   /** Register the actor under a name for `actors.lookup`/`actors.send` addressing. */
   name?: string;
@@ -475,6 +495,8 @@ export interface SpawnActorOptions {
    * (default 300 000 ms).
    */
   idleTimeoutMs?: number;
+  /** Narrow the child's context: default model, registry tools, workspace subtree. */
+  intercept?: SpawnIntercept;
 }
 
 /** How an actor's supervision loop settled. */
@@ -885,6 +907,23 @@ export interface Chidori {
    */
   actors: Actors;
   /**
+   * Saga-style compensations: durably register an inverse action — an agent
+   * module plus its input — for a side effect this run just performed. On a
+   * successful run the registrations are void; when a run stops short
+   * (cancelled, failed, abandoned), `chidori rollback <run_id>` (or
+   * `POST /sessions/{id}/cancel` with `"compensate": true`) executes them
+   * newest-first, each as its own ordinary journaled run.
+   */
+  compensation: {
+    /**
+     * Register one compensation. `agent` resolves like `callAgent` (relative
+     * to the project root) and must exist — a compensation that can't
+     * resolve is useless exactly when it's needed, so a bad path fails the
+     * registration.
+     */
+    register(name: string, agent: string, input?: AgentJson): Promise<{ registered: true }>;
+  };
+  /**
    * Detached durable agent processes: spawn agent modules as long-lived,
    * named runs that outlive the spawner, hibernate at listen points holding
    * no thread and no VM, and wake on mailbox deliveries or alarm deadlines
@@ -975,6 +1014,31 @@ export const chidori: Chidori = new Proxy({} as Chidori, {
 });
 
 /**
+ * The minimal [Standard Schema](https://github.com/standard-schema/standard-schema)
+ * surface {@link run}'s `inputSchema` accepts — satisfied by any Zod, Valibot,
+ * or ArkType schema without importing their types.
+ */
+export interface StandardSchemaLike {
+  "~standard": {
+    version?: number;
+    vendor?: string;
+    validate: (value: unknown) => unknown;
+  };
+}
+
+export interface RunOptions {
+  /**
+   * Validate the run input before the handler executes — deterministically,
+   * before the first host call, so a malformed input fails fast (the server
+   * answers 400) instead of surfacing mid-run. Either a Standard Schema
+   * validator (Zod, Valibot, ArkType, …), whose validated value — defaults
+   * and coercions applied — replaces the input; or a plain JSON Schema
+   * object, checked structurally.
+   */
+  inputSchema?: StandardSchemaLike | JsonObject;
+}
+
+/**
  * Define the agent entrypoint. Call it once at the top level of an agent module
  * with your handler; the runtime invokes the handler with the run input and
  * uses its return value as the output. This replaces the old "export a function
@@ -984,11 +1048,25 @@ export const chidori: Chidori = new Proxy({} as Chidori, {
  * import { run } from "chidori:agent";
  * run(async (input) => ({ greeting: `hello ${input.name}` }));
  * ```
+ *
+ * Pass `inputSchema` to validate the input before the handler runs:
+ *
+ * ```ts
+ * run(async (input: { topic: string }) => ({ ok: true }), {
+ *   inputSchema: {
+ *     type: "object",
+ *     properties: { topic: { type: "string", minLength: 1 } },
+ *     required: ["topic"],
+ *   },
+ * });
+ * ```
  */
 export function run<TInput extends AgentJson = JsonObject, TOutput extends AgentOutput = AgentOutput>(
   handler: AgentFunction<TInput, TOutput>,
+  options?: RunOptions,
 ): void {
   void handler;
+  void options;
   throw new Error(
     "run() is only available inside the chidori runtime; this import is " +
       "replaced when an agent runs under chidori.",

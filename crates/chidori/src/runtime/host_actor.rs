@@ -160,6 +160,129 @@ struct SupervisionOptions {
     max_restarts: u32,
     backoff_ms: u64,
     idle_timeout_ms: u64,
+    intercept: Option<InterceptConfig>,
+}
+
+/// The narrowed context view a spawn's `intercept` option hands the child
+/// actor (`docs/actors.md`). Every field can only NARROW what the spawner
+/// itself holds — a child never widens:
+/// - `model` re-points the child's default model (a routing choice, not a
+///   capability);
+/// - `tools` intersects with the spawner's registry — names the spawner
+///   doesn't hold simply don't exist for the child (registry tools only;
+///   in-VM `defineTool` functions are plain code in the child's module);
+/// - `workspace` is a relative, `..`-free subpath joined under the spawner's
+///   workspace root.
+#[derive(Debug, Clone)]
+struct InterceptConfig {
+    model: Option<String>,
+    tools: Option<Vec<String>>,
+    workspace: Option<String>,
+}
+
+impl InterceptConfig {
+    fn parse(options: &Value) -> Result<Option<Self>, String> {
+        let Some(value) = options.get("intercept").filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        if !value.is_object() {
+            return Err("chidori.actors.spawn: `intercept` must be an object".to_string());
+        }
+        let model = value
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let tools = match value.get("tools") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(|item| {
+                        item.as_str().map(str::to_string).ok_or_else(|| {
+                            "chidori.actors.spawn: intercept.tools must be an array of tool names"
+                                .to_string()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Some(_) => {
+                return Err(
+                    "chidori.actors.spawn: intercept.tools must be an array of tool names"
+                        .to_string(),
+                )
+            }
+        };
+        let workspace = match value.get("workspace") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(Value::Object(map)) => map
+                .get("root")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            Some(_) => {
+                return Err(
+                    "chidori.actors.spawn: intercept.workspace must be a subpath string \
+                     (or { root: \"subpath\" })"
+                        .to_string(),
+                )
+            }
+        };
+        if let Some(ref sub) = workspace {
+            let path = std::path::Path::new(sub);
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(
+                    "chidori.actors.spawn: intercept.workspace must be a relative subpath \
+                     without `..` — a child can only narrow its spawner's workspace, never \
+                     escape it"
+                        .to_string(),
+                );
+            }
+        }
+        if model.is_none() && tools.is_none() && workspace.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            model,
+            tools,
+            workspace,
+        }))
+    }
+
+    fn to_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        if let Some(model) = &self.model {
+            map.insert("model".to_string(), json!(model));
+        }
+        if let Some(tools) = &self.tools {
+            map.insert("tools".to_string(), json!(tools));
+        }
+        if let Some(workspace) = &self.workspace {
+            map.insert("workspace".to_string(), json!(workspace));
+        }
+        Value::Object(map)
+    }
+
+    /// Apply the context-level narrowings to a fresh actor iteration context.
+    fn apply_to_ctx(&self, parent_ctx: &RuntimeContext, ctx: &RuntimeContext) {
+        if let Some(model) = &self.model {
+            ctx.set_default_model(model.clone());
+        }
+        if let Some(sub) = &self.workspace {
+            match parent_ctx.workspace_root() {
+                Some(root) => ctx.set_workspace_root(root.join(sub)),
+                None => tracing::warn!(
+                    "actor intercept: spawner has no workspace root; workspace narrowing to \
+                     `{sub}` skipped"
+                ),
+            }
+        }
+    }
 }
 
 impl SupervisionOptions {
@@ -203,12 +326,13 @@ impl SupervisionOptions {
                 .and_then(Value::as_u64)
                 .filter(|ms| *ms > 0)
                 .unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
+            intercept: InterceptConfig::parse(options)?,
         })
     }
 
     /// The normalized options object stored in the durable `spawn_actor` args.
     fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "name": self.name,
             "restart": match self.restart {
                 RestartStrategy::Never => "never",
@@ -218,7 +342,13 @@ impl SupervisionOptions {
             "maxRestarts": self.max_restarts,
             "backoffMs": self.backoff_ms,
             "idleTimeoutMs": self.idle_timeout_ms,
-        })
+        });
+        // Only present when set: journals recorded before intercepts existed
+        // must keep producing byte-identical durable args on replay.
+        if let Some(intercept) = &self.intercept {
+            value["intercept"] = intercept.to_json();
+        }
+        value
     }
 }
 
@@ -1493,6 +1623,12 @@ fn supervise(
             std::mem::take(&mut carried_inbox),
             hub.clone(),
         );
+        // Context-level intercept narrowings (default model, workspace
+        // subtree) apply to every iteration — including restart re-creations,
+        // whose options round-trip through the durable spawn args.
+        if let Some(intercept) = &options.intercept {
+            intercept.apply_to_ctx(parent_ctx, &ctx);
+        }
         pump_mailbox(shared, &ctx);
         // Inline listen-point wait: a `chidori.signal` with an empty inbox
         // blocks HERE for the next matching delivery (or its own timeout) and
@@ -1530,6 +1666,15 @@ fn supervise(
                 restarts,
                 replay,
             );
+        };
+        // Tool narrowing intersects with the spawner's own registry: a name
+        // the spawner doesn't hold simply doesn't exist for the child, so a
+        // child can never widen its view.
+        let iter_backend = match options.intercept.as_ref().and_then(|i| i.tools.as_deref()) {
+            Some(names) => iter_backend
+                .with_tools_restricted(names)
+                .unwrap_or(iter_backend),
+            None => iter_backend,
         };
         let result = crate::runtime::rust_engine::run_agent_file(source, input, &iter_backend);
 
@@ -1798,6 +1943,151 @@ mod tests {
         let path = dir.join("actors").join(name);
         std::fs::write(&path, source).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn intercept_parse_accepts_narrowings_and_rejects_escapes() {
+        use super::InterceptConfig;
+
+        // No intercept / empty intercept → None (durable args stay identical
+        // to pre-intercept journals).
+        assert!(InterceptConfig::parse(&json!({})).unwrap().is_none());
+        assert!(InterceptConfig::parse(&json!({ "intercept": {} }))
+            .unwrap()
+            .is_none());
+
+        let parsed = InterceptConfig::parse(&json!({
+            "intercept": { "model": "cheap-model", "tools": ["adder"], "workspace": "sub/dir" }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("cheap-model"));
+        assert_eq!(parsed.tools.as_deref(), Some(&["adder".to_string()][..]));
+        assert_eq!(parsed.workspace.as_deref(), Some("sub/dir"));
+
+        // `{ root }` object form.
+        let parsed = InterceptConfig::parse(&json!({
+            "intercept": { "workspace": { "root": "research" } }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.workspace.as_deref(), Some("research"));
+
+        // Narrow-only: parent escapes and absolute paths are refused.
+        for workspace in ["../outside", "a/../../b", "/etc"] {
+            let err = InterceptConfig::parse(&json!({ "intercept": { "workspace": workspace } }))
+                .unwrap_err();
+            assert!(
+                err.contains("only narrow"),
+                "expected a narrow-only refusal for {workspace}, got: {err}"
+            );
+        }
+
+        let err =
+            InterceptConfig::parse(&json!({ "intercept": { "tools": "adder" } })).unwrap_err();
+        assert!(err.contains("array of tool names"));
+    }
+
+    #[test]
+    fn actor_intercept_narrows_the_tool_registry() {
+        // Same worker module, spawned twice: with the spawner's full registry
+        // the tool resolves; with `intercept.tools: []` the narrowed child
+        // sees an empty registry and the call fails.
+        let dir = test_dir("intercept-tools");
+        let worker = write_agent(
+            &dir,
+            "worker.ts",
+            r#"
+            export async function agent() {
+                const sum = await chidori.tool("adder", { a: 20, b: 22 });
+                return { sum };
+            }
+            "#,
+        );
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const wide = await chidori.actors.spawn("__WORKER__", {});
+                const wideOutcome = await chidori.actors.join(wide.pid);
+                const narrow = await chidori.actors.spawn("__WORKER__", {}, {
+                    intercept: { tools: [] },
+                });
+                const narrowOutcome = await chidori.actors.join(narrow.pid);
+                return { wideOutcome, narrowOutcome };
+            }
+        "#
+        .replace("__WORKER__", &worker);
+        std::fs::write(&path, &src).unwrap();
+
+        let mut tools = ToolRegistry::new();
+        tools.register_native(
+            "adder",
+            "Add two numbers",
+            Vec::new(),
+            |args: serde_json::Value| {
+                let a = args.get("a").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let b = args.get("b").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                Ok(json!(a + b))
+            },
+        );
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(tools));
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+
+        assert_eq!(output["wideOutcome"]["status"], json!("completed"));
+        assert_eq!(output["wideOutcome"]["output"], json!({ "sum": 42 }));
+        assert_eq!(output["narrowOutcome"]["status"], json!("failed"));
+        let error = output["narrowOutcome"]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("Unknown tool: adder"),
+            "expected the narrowed registry to miss, got: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn actor_intercept_narrows_the_workspace_root() {
+        // The child's workspace root is the spawner's root joined with the
+        // intercept subpath: its writes land under the subtree, never beside
+        // the spawner's files.
+        let dir = test_dir("intercept-ws");
+        let worker = write_agent(
+            &dir,
+            "worker.ts",
+            r#"
+            export async function agent() {
+                await chidori.workspace.write("note.txt", "from the child");
+                return { wrote: true };
+            }
+            "#,
+        );
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const { pid } = await chidori.actors.spawn("__WORKER__", {}, {
+                    intercept: { workspace: "sandbox" },
+                });
+                const outcome = await chidori.actors.join(pid);
+                return { outcome };
+            }
+        "#
+        .replace("__WORKER__", &worker);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        ctx.set_workspace_root(&dir);
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+
+        assert_eq!(output["outcome"]["status"], json!("completed"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sandbox").join("note.txt")).unwrap(),
+            "from the child"
+        );
+        assert!(!dir.join("note.txt").exists());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

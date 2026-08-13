@@ -310,7 +310,35 @@ pub(super) async fn create_session(
     arm_signal_timeout(&state, &session);
     release_warm_run_if_settled(&state, &session);
     drop(permit);
+    // A run refused by input-schema validation is a caller error: answer 400
+    // (with the stored session, so nothing is lost if the classification is
+    // ever wrong — e.g. a nested sub-agent's validation error surfacing as
+    // the parent's failure after real side effects). The prefix match is
+    // deliberate: only an error whose outermost message IS the validation
+    // framing qualifies, not one merely mentioning it.
+    if session
+        .error
+        .as_deref()
+        .is_some_and(is_input_validation_refusal)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": session.error,
+                "session": session_view(&session),
+            })),
+        )
+            .into_response();
+    }
     (StatusCode::CREATED, Json(session_view(&session))).into_response()
+}
+
+/// True when a run error's outermost message is the input-schema refusal the
+/// `run(handler, { inputSchema })` wrapper throws — the exact framing the
+/// engine wraps it in, matched as a prefix so an error that merely *mentions*
+/// the marker text never qualifies.
+fn is_input_validation_refusal(error: &str) -> bool {
+    error.starts_with("JavaScript exception: InputValidationError: invalid input:")
 }
 
 /// GET /sessions — list all sessions.
@@ -525,6 +553,13 @@ pub(super) async fn replay_session(
 pub(super) struct CancelSessionRequest {
     #[serde(default)]
     pub(super) reason: Option<String>,
+    /// Run the session's registered compensations (saga rollback,
+    /// `runtime::compensation`) after cancelling, newest-first, each as its
+    /// own ordinary run. Deferred with a note when the session was still
+    /// live — the engine may not have unwound yet — in which case
+    /// `chidori rollback <run_id>` finishes the job once it settles.
+    #[serde(default)]
+    pub(super) compensate: bool,
 }
 
 /// POST /sessions/:id/cancel — mark a session cancelled and notify a live
@@ -534,8 +569,11 @@ pub(super) async fn cancel_session(
     Path(id): Path<String>,
     body: Option<Json<CancelSessionRequest>>,
 ) -> Response {
-    let reason = body
-        .and_then(|Json(body)| body.reason)
+    let (reason, compensate) = match body {
+        Some(Json(body)) => (body.reason, body.compensate),
+        None => (None, false),
+    };
+    let reason = reason
         .filter(|reason| !reason.trim().is_empty())
         .unwrap_or_else(|| "session cancelled".to_string());
 
@@ -602,14 +640,142 @@ pub(super) async fn cancel_session(
         return resp;
     }
 
-    Json(json!({
+    // Saga rollback (`runtime::compensation`): run the journal's registered
+    // compensations newest-first, each as its own ordinary run. Deferred for
+    // a still-live session — its engine may not have unwound yet, and
+    // interleaving inverse actions with a run's final effects would be worse
+    // than asking the operator to `chidori rollback` after it settles.
+    let mut compensation: Option<Value> = None;
+    if compensate {
+        compensation = Some(match (&session.run_id, was_active) {
+            (None, _) => json!({ "ran": false, "note": "session has no run to roll back" }),
+            (Some(_), true) => json!({
+                "ran": false,
+                "note": "session was still live; roll back after it settles with \
+                         `chidori rollback <run_id>`",
+            }),
+            (Some(run_id), false) => {
+                let run_id = run_id.clone();
+                let app_state = state.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let factory =
+                        crate::runtime::store::RunStoreFactory::shared(&app_state.run_base);
+                    let store = factory.store_for(&run_id);
+                    let engine = build_engine(&app_state, None);
+                    let base_dir = app_state
+                        .agent_path
+                        .parent()
+                        .unwrap_or_else(|| FsPath::new("."))
+                        .to_path_buf();
+                    let mut run_agent = |path: &FsPath, input: &Value| {
+                        engine
+                            .run_announced(path, input)
+                            .map(|result| result.run_id)
+                            .map_err(|err| format!("{err:#}"))
+                    };
+                    crate::runtime::compensation::rollback_run(
+                        store.as_ref(),
+                        &base_dir,
+                        &mut run_agent,
+                    )
+                })
+                .await;
+                match outcome {
+                    Ok(Ok(outcomes)) => json!({
+                        "ran": true,
+                        "outcomes": outcomes,
+                        "failed": outcomes_failed(&outcomes),
+                    }),
+                    Ok(Err(err)) => json!({ "ran": false, "error": format!("{err:#}") }),
+                    Err(join_err) => json!({ "ran": false, "error": join_err.to_string() }),
+                }
+            }
+        });
+    }
+
+    let mut response = json!({
         "id": id,
         "status": "cancelled",
         "active": was_active,
         "attempt_number": active_attempt_number,
         "reason": reason,
-    }))
-    .into_response()
+    });
+    if let Some(compensation) = compensation {
+        response["compensation"] = compensation;
+    }
+    Json(response).into_response()
+}
+
+fn outcomes_failed(outcomes: &[crate::runtime::compensation::RollbackOutcome]) -> usize {
+    outcomes.iter().filter(|o| o.error.is_some()).count()
+}
+
+/// GET /sessions/:id/holdings — what the session's run is holding right now
+/// (`runtime::holdings`): its pending host operation, queued signals, open
+/// actors, detached agents, branches, and armed compensations, plus the
+/// session-level pause state the server tracks.
+pub(super) async fn get_holdings(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let session = match state.session_store.get(&id) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Session not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("session store: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+    let Some(run_id) = session.run_id.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "session has no run to inspect (it never started one)"})),
+        )
+            .into_response();
+    };
+
+    let run_base = state.run_base.clone();
+    let holdings = tokio::task::spawn_blocking(move || {
+        let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+        let _ = factory.hydrate(&run_id);
+        let store = factory.store_for(&run_id);
+        let run_dir = run_base.join(&run_id);
+        let registry_factory = factory.clone();
+        let lookup = move |name: &str| registry_factory.registry_get(name).ok().flatten();
+        crate::runtime::holdings::compute_holdings(&run_id, store.as_ref(), &run_dir, &lookup)
+    })
+    .await;
+
+    match holdings {
+        Ok(Ok(mut holdings)) => {
+            // Overlay the session-level pause state the server tracks beyond
+            // the run directory (signal listen set + timeout deadline).
+            holdings["session"] = json!({
+                "id": session.id,
+                "status": session.status,
+                "pending_prompt": session.pending_prompt,
+                "pending_signal_names": session.pending_signal_names,
+                "pending_signal_deadline": session.pending_signal_deadline,
+            });
+            Json(holdings).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": join_err.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 /// Render an agent-run error for a session's stored/returned `error` field.

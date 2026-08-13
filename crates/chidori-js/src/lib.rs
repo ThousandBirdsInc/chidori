@@ -549,6 +549,37 @@ impl Engine {
             });
         self.vm
             .define_value(&chidori, "actors", Value::Object(actors));
+        // chidori.compensation.register(name, agent, input?) — saga-style
+        // compensation: durably register an inverse action (an agent module +
+        // its input) to be run, newest-first, if this run is rolled back after
+        // a cancel or failure. Registration is one durable record; the
+        // compensations themselves execute only under an explicit rollback
+        // (they are void on successful completion).
+        let compensation = self.vm.new_object();
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&compensation, "register", 3, move |vm, _t, args| {
+                let name = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let agent = args
+                    .get(1)
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let input = args
+                    .get(2)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "compensation",
+                    serde_json::json!({ "name": name, "agent": agent, "input": input }),
+                )
+            });
+        self.vm
+            .define_value(&chidori, "compensation", Value::Object(compensation));
         // chidori.agents.<method> — detached, durable, addressable agent
         // processes. Unlike actors (in-run, fold-at-join), a detached agent is
         // its own durable run with a registered name, a durable mailbox, and a

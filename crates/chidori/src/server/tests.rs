@@ -232,6 +232,7 @@ async fn cancel_session_marks_active_session_cancelled() {
             Path("session-1".to_string()),
             Some(Json(CancelSessionRequest {
                 reason: Some("rewind".to_string()),
+                compensate: false,
             })),
         )
         .await,
@@ -1558,6 +1559,144 @@ const HTTP_AGENT: &str = r#"
         return { status: res.status };
     }
 "#;
+
+#[tokio::test]
+async fn get_holdings_reports_pending_operation_and_session_overlay() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "chidori-server-holdings-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let agent_path = temp_dir.join("agent.ts");
+    std::fs::write(&agent_path, "export async function agent() { return {}; }").unwrap();
+    let run_base = temp_dir.join(".chidori").join("runs");
+    let run_id = "run-holdings";
+
+    // A paused run: pending signal operation persisted in the run dir.
+    use crate::runtime::store::RunStore as _;
+    let store = crate::runtime::store::FsRunStore::new(run_base.join(run_id));
+    let pending = PendingHostOperation::new(
+        HostOperationId(3),
+        3,
+        PendingHostOperationKind::Signal,
+        json!({ "name": "review" }),
+    )
+    .with_function("signal");
+    store
+        .put_blob(
+            crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE,
+            &serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+    let state = test_state(run_base, agent_path);
+    let session = StoredSession {
+        id: "session-h".to_string(),
+        run_id: Some(run_id.to_string()),
+        status: SessionStatus::Paused,
+        input: json!({}),
+        output: None,
+        call_log: Vec::new(),
+        error: None,
+        pending_seq: Some(3),
+        pending_prompt: None,
+        pending_details: None,
+        pending_signal_name: Some("review".to_string()),
+        pending_signal_names: vec!["review".to_string()],
+        pending_signal_deadline: None,
+        pending_approval: None,
+        approvals: Vec::new(),
+        policy_profile: None,
+        created_at: chrono::Utc::now(),
+    };
+    state.session_store.put(&session).unwrap();
+
+    let (status, body) = response_json(
+        get_holdings(State(state.clone()), Path("session-h".to_string())).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status_hint"], json!("paused"));
+    assert_eq!(body["pending"]["kind"], json!("signal"));
+    assert_eq!(body["pending"]["args"]["name"], json!("review"));
+    assert_eq!(body["session"]["pending_signal_names"], json!(["review"]));
+
+    // Unknown session → 404; a session that never started a run → 409.
+    let (status, _) = response_json(
+        get_holdings(State(state.clone()), Path("nope".to_string())).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let mut runless = session.clone();
+    runless.id = "session-runless".to_string();
+    runless.run_id = None;
+    state.session_store.put(&runless).unwrap();
+    let (status, body) = response_json(
+        get_holdings(State(state), Path("session-runless".to_string())).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap_or_default().contains("no run"));
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[tokio::test]
+async fn create_session_maps_input_schema_refusal_to_400() {
+    // `run(handler, { inputSchema })`: a malformed input is a caller error —
+    // the handler never entered, no host call was answered — so the server
+    // answers 400 with the issue list. The failed session is still stored
+    // (and echoed in the response), so nothing is lost if the classification
+    // is ever wrong for a nested validation failure.
+    let (temp_dir, state) = policy_test_project(
+        "chidori-server-input-schema",
+        r#"
+            import { chidori, run } from "chidori:agent";
+            run(async (input) => ({ topic: input.topic }), {
+                inputSchema: {
+                    type: "object",
+                    properties: { topic: { type: "string" } },
+                    required: ["topic"],
+                },
+            });
+        "#,
+    );
+
+    let (status, body) =
+        response_json(create_session(State(state.clone()), Json(create_request(None))).await).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("InputValidationError:") && error.contains("topic: required"),
+        "expected the validation issue list, got: {error}"
+    );
+    // The refused run's session is stored (failed) and echoed in the body.
+    assert_eq!(body["session"]["status"], json!("failed"));
+    assert_eq!(state.session_store.list().unwrap().len(), 1);
+
+    // An agent that merely MENTIONS the marker in an ordinary throw is not a
+    // validation refusal: stored as a failed session under the normal 201.
+    let (mention_dir, mention_state) = policy_test_project(
+        "chidori-server-input-schema-mention",
+        r#"
+            import { chidori, run } from "chidori:agent";
+            run(async () => {
+                throw new Error("saw InputValidationError: invalid input: in a log");
+            });
+        "#,
+    );
+    let (status, body) = response_json(
+        create_session(State(mention_state.clone()), Json(create_request(None))).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["status"], json!("failed"));
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+    let _ = std::fs::remove_dir_all(mention_dir);
+}
 
 #[tokio::test]
 async fn create_session_rejects_unknown_policy_profile() {

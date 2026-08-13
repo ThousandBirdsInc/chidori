@@ -35,6 +35,15 @@ Rules:
 - Import `{ chidori, run }` from `chidori:agent` and call `run(handler)` at
   the top level. (Legacy fallback: `export async function agent(input,
   chidori)` is still accepted when `run(...)` wasn't called.)
+- Optionally validate the input before the handler executes with
+  `run(handler, { inputSchema })`: either a
+  [Standard Schema](https://github.com/standard-schema/standard-schema)
+  validator (any Zod/Valibot/ArkType schema — its validated value, defaults
+  and coercions applied, replaces the input) or a plain JSON Schema object,
+  checked structurally. Validation is deterministic and runs before any host
+  call; a failure throws `InputValidationError` listing every issue, and
+  `chidori serve` answers 400 with the issue list (the failed session is
+  still stored and echoed in the response).
 - Type the input with an inline object type or a `type` alias, never an
   `interface` — interfaces have no implicit index signature, so they fail
   the handler's `AgentJson` constraint with a confusing type error.
@@ -46,6 +55,31 @@ Rules:
   `Math.random` policies by default.
 - Local TypeScript imports are governed by runtime policy. Dynamic imports
   are rejected.
+
+Try the validation live — this example runs in your browser, and the input is
+editable: delete `topic` (or set it to a number, or add an extra key) and the
+run refuses with the full issue list before the handler executes:
+
+```ts
+import { chidori, run } from "chidori:agent";
+
+run(
+  async (input: { topic: string }) => {
+    await chidori.log("handler entered — input passed the schema", {
+      topic: input.topic,
+    });
+    return { topic: input.topic };
+  },
+  {
+    inputSchema: {
+      type: "object",
+      properties: { topic: { type: "string", minLength: 1 } },
+      required: ["topic"],
+      additionalProperties: false,
+    },
+  },
+);
+```
 
 ## LLM calls
 
@@ -477,6 +511,56 @@ deterministic computation in a step so resuming a long run does not re-pay
 it. The callback must be pure, synchronous compute: host effects, captured
 randomness, filesystem writes, timers, and async callbacks throw inside a
 step. See [Value Checkpoints](./value-checkpoints.md).
+
+### `chidori.compensation.register(name, agent, input?)` — saga rollback
+
+```ts
+const server = await chidori.tool("provision_server", { size: "large" });
+await chidori.compensation.register("deprovision", "comp/deprovision.ts", {
+  serverId: server.id,
+});
+```
+
+The journal runs forward; compensations let it run **backward**. Each
+registration durably records an inverse action — an agent module plus its
+input — for a side effect the run just performed. Registration itself does
+nothing; on a successful run the registrations are void history. When a run
+stops short (cancelled, failed, or abandoned mid-flight), roll it back:
+
+```bash
+chidori rollback <run_id>
+```
+
+or `POST /sessions/{id}/cancel` with `{"compensate": true}` (deferred with a
+note when the session is still live — roll back after it settles). Registered
+compensations execute **newest-first**, each as its own ordinary run —
+journaled, replayable, visible in `chidori trace`. A failed compensation is
+reported and rollback continues past it (the remaining inverse actions are
+independent obligations). A completed rollback writes `rollback.json` into
+the run directory and a second rollback refuses — inverse actions are not
+re-fired. Rollback is explicit, never automatic: compensations perform real
+side effects, and re-firing them is an operator decision.
+
+The `agent` path resolves like `callAgent` (relative to the project root) and
+must exist at registration — a compensation that can't resolve is useless
+exactly when it's needed.
+
+Watch the ledger arm itself — this example registers two compensations and
+then fails; the runner reports the armed inverse actions **newest-first**,
+exactly the plan `chidori rollback <run_id>` would execute (delete the
+`throw` and the registrations become void history instead):
+
+```ts
+import { chidori, run } from "chidori:agent";
+
+run(async () => {
+  await chidori.compensation.register("deprovision", "comp/deprovision.ts", {
+    serverId: "srv-7",
+  });
+  await chidori.compensation.register("notify-oncall", "comp/notify.ts");
+  throw new Error("provisioning failed halfway");
+});
+```
 
 ### `chidori.log(msg, data?)` / `chidori.mark(label, data?)`
 

@@ -57,7 +57,83 @@ const __rawTool = chidori.tool;
 const __rawSignal = chidori.signal;
 const __rawStep = chidori.step;
 let __runHandler = null;
-function run(handler) { __runHandler = handler; }
+let __runOptions = null;
+function run(handler, options) { __runHandler = handler; __runOptions = options ?? null; }
+
+// ---- input schema validation: run(handler, { inputSchema }) --------------
+// Mirrors the native runtime's INPUT_SCHEMA_SCRIPT semantics: a Standard
+// Schema validator's value replaces the input; a plain JSON Schema object is
+// checked structurally; failures throw InputValidationError listing every
+// issue — before the handler (or any journaled effect) runs.
+const __fmtPath = (path) => path.map((p) => (typeof p === 'object' && p !== null ? p.key : p)).join('.');
+const __jsTypeOf = (v) => {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  const t = typeof v;
+  if (t === 'number') return Number.isInteger(v) ? 'integer' : 'number';
+  return t;
+};
+function __checkJsonSchema(schema, value, path, issues) {
+  if (schema === true || schema == null) return;
+  const where = path || 'input';
+  if (schema === false) { issues.push(where + ': schema forbids this value'); return; }
+  if (typeof schema !== 'object') return;
+  if (schema.const !== undefined && JSON.stringify(value) !== JSON.stringify(schema.const)) { issues.push(where + ': expected const ' + JSON.stringify(schema.const)); return; }
+  if (Array.isArray(schema.enum) && !schema.enum.some((e) => JSON.stringify(e) === JSON.stringify(value))) { issues.push(where + ': expected one of ' + schema.enum.map((e) => JSON.stringify(e)).join(', ')); return; }
+  if (schema.type) {
+    const actual = __jsTypeOf(value);
+    const allowed = Array.isArray(schema.type) ? schema.type : [schema.type];
+    const ok = allowed.some((t) => t === actual || (t === 'number' && actual === 'integer'));
+    if (!ok) { issues.push(where + ': expected ' + allowed.join(' | ') + ', got ' + actual); return; }
+  }
+  if (typeof value === 'string') {
+    if (schema.minLength != null && value.length < schema.minLength) issues.push(where + ': shorter than minLength ' + schema.minLength);
+    if (schema.maxLength != null && value.length > schema.maxLength) issues.push(where + ': longer than maxLength ' + schema.maxLength);
+    if (schema.pattern != null && !(new RegExp(schema.pattern)).test(value)) issues.push(where + ': does not match pattern ' + schema.pattern);
+  }
+  if (typeof value === 'number') {
+    if (schema.minimum != null && value < schema.minimum) issues.push(where + ': below minimum ' + schema.minimum);
+    if (schema.maximum != null && value > schema.maximum) issues.push(where + ': above maximum ' + schema.maximum);
+  }
+  if (Array.isArray(value)) {
+    if (schema.minItems != null && value.length < schema.minItems) issues.push(where + ': fewer than minItems ' + schema.minItems);
+    if (schema.maxItems != null && value.length > schema.maxItems) issues.push(where + ': more than maxItems ' + schema.maxItems);
+    if (schema.items) value.forEach((v, i) => __checkJsonSchema(schema.items, v, where + '[' + i + ']', issues));
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    if (Array.isArray(schema.required)) { for (const key of schema.required) { if (!(key in value)) issues.push(where + '.' + key + ': required'); } }
+    if (schema.properties) { for (const key of Object.keys(schema.properties)) { if (key in value) __checkJsonSchema(schema.properties[key], value[key], path ? path + '.' + key : key, issues); } }
+    if (schema.additionalProperties === false) {
+      const props = schema.properties || {};
+      for (const key of Object.keys(value)) { if (!(key in props)) issues.push(where + '.' + key + ': unexpected property'); }
+    }
+  }
+}
+async function __validateInput(schema, input) {
+  const NL = String.fromCharCode(10);
+  const fail = (lines) => {
+    const err = new Error('invalid input:' + NL + lines.map((l) => '  - ' + l).join(NL));
+    err.name = 'InputValidationError';
+    throw err;
+  };
+  if (schema && typeof schema === 'object' && schema['~standard'] && typeof schema['~standard'].validate === 'function') {
+    let result = schema['~standard'].validate(input);
+    if (result && typeof result.then === 'function') result = await result;
+    if (result.issues) fail(result.issues.map((i) => (i.path && i.path.length ? i.message + ' (at ' + __fmtPath(i.path) + ')' : i.message)));
+    return result.value;
+  }
+  const issues = [];
+  __checkJsonSchema(schema, input, '', issues);
+  if (issues.length) fail(issues);
+  return input;
+}
+
+// ---- saga compensations: chidori.compensation.register -------------------
+// Registration journals one record (via the log effect, so restored and
+// replayed runs repaint identically) and performs nothing; the armed list is
+// reported newest-first if the run fails — exactly what a native
+// "chidori rollback <run_id>" would execute.
+const __compensations = [];
 function defineTool(def) {
   if (!def || typeof def.name !== 'string' || typeof def.run !== 'function') {
     throw new Error('defineTool needs { name, description, parameters, run }');
@@ -101,6 +177,15 @@ chidori.step = (label, fn) => __rawStep(typeof fn === 'function' ? fn : label);
 chidori.mark = async (label, data) => {
   __feed({ k: 'op', op: 'mark', label: String(label), data: data === undefined ? null : data });
   return __rawLog('mark:' + String(label), data === undefined ? null : data);
+};
+chidori.compensation = {
+  register: async (name, agent, input) => {
+    const entry = { name: String(name), agent: String(agent), input: input === undefined ? null : input };
+    await __rawLog('compensation:' + entry.name, entry);
+    __compensations.push(entry);
+    __feed({ k: 'op', op: 'chidori.compensation.register', label: entry.name + ' \\u2192 ' + entry.agent, data: entry.input });
+    return { registered: true };
+  },
 };
 
 // ---- signals, receive, alarms -------------------------------------------
@@ -778,13 +863,31 @@ async function __main() {
   const fragmentValue = await __example();
   if (fragmentValue !== undefined) __feed({ k: 'result', value: fragmentValue });
   if (__runHandler) {
-    const output = await __runHandler(${asJsLiteral(input)});
+    let __input = ${asJsLiteral(input)};
+    // run(handler, { inputSchema }): validate the reader-provided input
+    // before the handler executes — edit the input above to a shape the
+    // schema rejects and the run refuses with the issue list.
+    if (__runOptions && __runOptions.inputSchema != null) {
+      __input = await __validateInput(__runOptions.inputSchema, __input);
+      __feed({ k: 'op', op: 'run · inputSchema', label: 'input validated before the handler ran', data: null });
+    }
+    const output = await __runHandler(__input);
     __feed({ k: 'result', value: output === undefined ? null : output });
   }
   __feed({ k: 'done' });
 }
 __main().catch((err) => {
   __feed({ k: 'error', text: String(err && err.message ? err.message : err) });
+  // The run stopped short: report what a rollback would execute — the
+  // registered compensations, newest first (void on a successful run).
+  if (__compensations.length) {
+    __feed({
+      k: 'op',
+      op: 'chidori rollback (armed)',
+      label: 'compensations run newest-first when this run is rolled back',
+      data: __compensations.slice().reverse(),
+    });
+  }
 });
 `;
 }

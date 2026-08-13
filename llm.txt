@@ -30,6 +30,15 @@ Rules:
 - Import `{ chidori, run }` from `chidori:agent` and call `run(handler)` at the
   top level. (Legacy fallback: `export async function agent(input, chidori)`
   is still accepted when `run(...)` wasn't called.)
+- Optionally validate the input before the handler executes with
+  `run(handler, { inputSchema })`. `inputSchema` is either a Standard Schema
+  validator (any Zod/Valibot/ArkType schema — its validated value, defaults and
+  coercions applied, replaces the input) or a plain JSON Schema object (checked
+  structurally: type/properties/required/items/enum/const/bounds/pattern).
+  Validation is deterministic and runs before any host call; a failure throws
+  `InputValidationError` listing every issue, and `chidori serve` answers 400
+  with the issue list (the failed session is still stored and echoed in the
+  response).
 - Type the input with an inline object type or a `type` alias, never an
   `interface` — interfaces have no implicit index signature, so they fail the
   handler's `AgentJson` constraint with a confusing type error.
@@ -52,6 +61,9 @@ chidori run agents/my_agent.ts --input '{"document": "text"}'
 chidori run agents/my_agent.ts --model deepseek-chat   # default model for prompts (or CHIDORI_MODEL)
 chidori run agents/my_agent.ts --stream
 chidori run agents/my_agent.ts --trace
+chidori dev agents/my_agent.ts --input key=value  # edit-and-replay loop: records one run, re-runs on every
+                                            # save with recorded calls replayed free; a divergent edit is
+                                            # reported with its seq and re-records live from there
 chidori chat --system "You are a concise assistant." --model claude-sonnet
 chidori chat agents/chat.ts                 # chat through a conversational agent file
 chidori serve agents/webhook.ts --port 8080 --trusted
@@ -67,6 +79,12 @@ chidori verify agents/my_agent.ts <run_id>  # checkpoint-as-test: replay with NO
                                             # "N workspace re-materialization(s)") — same bytes, fresh mtime.
 chidori trace <run_id>
 chidori snapshot <run_id>
+chidori holdings <run_id>                   # what the run holds right now: pending operation, queued
+                                            # signals, unsettled actors, detached agents, branches,
+                                            # armed compensations
+chidori rollback <run_id>                   # saga rollback: run registered compensations newest-first
+chidori serve agents/app.ts --app chidori.app.yml  # boot from an application manifest: keep_alive
+                                            # detached-agent fleet, cron schedules, webhook routes
 ```
 
 `chidori init [dir] --template docs|chat|worker` scaffolds a starter project
@@ -408,6 +426,11 @@ const worker = await chidori.actors.spawn("workers/researcher.ts", { topic }, {
   restart: "resume",       // "never" (default) | "clean" | "resume"
   maxRestarts: 3,
   backoffMs: 500,          // doubles per attempt
+  intercept: {             // narrow the child's context — never widen:
+    model: "cheap-model",  //   default model for the child's prompts
+    tools: ["search"],     //   registry tools, intersected with the spawner's
+    workspace: "research", //   relative `..`-free subpath of the spawner's root
+  },
 });
 
 // Message passing (never blocks). String-addressed sends take a pid, a
@@ -619,6 +642,30 @@ The callback must be pure, synchronous compute: host effects, captured
 randomness, filesystem writes, timers, and async callbacks throw inside a step.
 See `docs/value-checkpoints.md`.
 
+### compensation (saga rollback)
+
+```ts
+await chidori.compensation.register("deprovision", "comp/deprovision.ts", { serverId });
+// → { registered: true }
+```
+
+Durably register an inverse action — an agent module + its input — for a side
+effect the run just performed. Registration is one journal record and performs
+nothing; on a successful run the registrations are void. When a run stops
+short (cancelled, failed, abandoned), roll it back explicitly:
+
+```bash
+chidori rollback <run_id>        # runs registered compensations newest-first
+```
+
+or `POST /sessions/{id}/cancel` with `{"compensate": true}` (deferred with a
+note when the session is still live). Each compensation executes as its own
+ordinary run — journaled, replayable, `chidori trace`-able. A failed
+compensation is reported and rollback continues past it. A completed rollback
+writes `rollback.json` into the run directory; a second rollback refuses
+(inverse actions are not re-fired). The agent path resolves like `callAgent`
+and must exist at registration.
+
 ### log
 
 ```ts
@@ -761,6 +808,10 @@ Session endpoints:
 - `GET /sessions/{id}/checkpoint`: get call log plus optional
   `snapshot_manifest`.
 - `GET /sessions/{id}/snapshot`: get only snapshot manifest metadata.
+- `GET /sessions/{id}/holdings`: what the run is holding right now — pending
+  host operation, queued signals, unsettled actors, detached agents (with
+  registry state), open branches, armed compensations. CLI twin:
+  `chidori holdings <run_id>`.
 - `POST /sessions/{id}/resume`: resume a paused `input()` session.
 - `POST /sessions/{id}/signal`: deliver `{ name, payload?, from? }` — resolves
   a matching signal pause (200), delivers live to a streaming run

@@ -72,6 +72,7 @@ Exposes:
 - `GET  /sessions/{id}` — get session result
 - `GET  /sessions/{id}/checkpoint` — get the call log and snapshot manifest metadata
 - `GET  /sessions/{id}/snapshot` — inspect the durable journal-scaffold manifest metadata (no VM image — resume is call-log replay)
+- `GET  /sessions/{id}/holdings` — what the run is holding right now: pending host operation, queued signals, unsettled actors, detached agents (with registry state), open branches, armed compensations
 - `POST /sessions/{id}/resume` — answer a paused `input()` call and continue the run
 - `POST /sessions/{id}/approve` — approve or deny a policy-gated call that paused the run
 - `POST /sessions/{id}/signal` — deliver a signal `{ name, payload?, from? }`: resolves+resumes a run paused-waiting on that name (200); delivers in-memory to a live streaming run, resuming a matching pause in-process (202 `delivered_live`); else enqueues into the durable mailbox (202 `queued`); 409 for a terminal run
@@ -79,6 +80,49 @@ Exposes:
 - `POST /sessions/{id}/cancel` — cancel a running or stored session
 - `POST /sessions/stream` — run a session with SSE call and prompt progress events
 - `GET  /sessions/{id}/stream` — re-attach to a session's SSE events: replays everything already emitted (so a dropped client catches up), then follows a still-running streaming session live until it settles; for a settled session, replays the logged call records and closes with a `done` event carrying the final state
+
+### The application manifest (`chidori.app.yml`)
+
+A server usually hosts more than one thing: a detached-agent fleet, cron
+schedules, webhook endpoints. The application manifest gives that composition
+a source-controlled definition instead of runtime state — `chidori serve`
+boots the whole application from it:
+
+```yaml
+name: support-desk
+agents:
+  - name: triage
+    agent: agents/triage.ts     # entry, relative to the manifest
+    keep_alive: true            # spawn at boot; re-arm forever after
+    input: { queue: "inbound" }
+    restart: resume             # never | clean | resume (default)
+  - name: standup-scribe
+    agent: agents/scribe.ts
+    schedule: "0 9 * * 1-5"     # cron → runs as a scheduled session
+routes:
+  - path: /webhooks/github
+    agent: triage               # deliver the request body into this agent's
+    signal: github-event        # mailbox as this named signal
+```
+
+The server picks up `chidori.app.yml` (or `.yaml`/`.json`) next to the agent
+file automatically; `--app <path>` or `CHIDORI_APP_MANIFEST` names one
+explicitly. Semantics:
+
+- **`keep_alive: true`** — at boot, if the name is not already live in the
+  [detached-agent registry](./detached-agents.md), the agent is spawned; live
+  incarnations are re-armed as usual, settled ones are replaced by a fresh
+  spawn (mailbox migration included). The manifest is idempotent across
+  restarts.
+- **`schedule`** — the entry becomes a [recipe](./cli.md): same cron loop,
+  listed under `GET /recipes`, runnable manually via
+  `POST /recipes/{name}/run`.
+- **`routes`** — each path is served as a real route (behind the same bearer
+  auth as everything else); a request's JSON body is delivered to the named
+  agent's durable mailbox as the named signal, waking a hibernating agent.
+
+A manifest error — a missing agent file, an invalid cron, a route path
+without a leading `/` — stops the server before it binds.
 
 ## 3. Event-driven agents
 

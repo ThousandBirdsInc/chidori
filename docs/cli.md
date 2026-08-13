@@ -22,9 +22,11 @@ its job and the doc that covers it in depth.
 | Command | What it does |
 |---|---|
 | `chidori run <agent.ts> --input key=value` | One-shot run. `--input` takes `key=value` pairs or a JSON object; `--model` sets the run's default model; `--stream` emits NDJSON progress events; `--trace` prints the call log as it grows. |
+| `chidori dev <agent.ts> --input key=value` | Edit-and-replay loop: records one run, then watches the agent and its imported modules and re-runs on every save with recorded calls replayed from the journal — zero tokens for everything the recording answers. An edit past the recorded calls continues live; an edit that changes an already-recorded call is reported with its exact seq and the run re-records live from there. A failed iteration strips its crash frontier on the next save, so only the failing call retries. |
 | `chidori chat [agent.ts]` | Interactive multi-turn REPL backed by `conversation()`. With no file, chats with the model directly (`--system`, `--model`); with a conversational agent file, chats through it. Each turn is a durable host call; prior turns replay for free, so only the newest message reaches the provider. `--resume <session_id>` reprints the transcript for $0 and continues the same session. |
 | `chidori serve <agent.ts> --port 8080` | HTTP session server: sessions, pause/resume, signals, SSE streaming ([Running Modes](./running-modes.md)). In production, set `CHIDORI_API_KEY` for bearer auth and see the [Deployment](./deployment.md) checklist. |
 | `chidori serve --port 8080` | Fleet-only server (no agent file): hosts detached agents; sessions must name an agent. |
+| `chidori serve --app chidori.app.yml` | Boot from an application manifest: a declared detached-agent fleet (`keep_alive`), cron schedules, and webhook routes that deliver into agent mailboxes as signals ([Running Modes](./running-modes.md)). Picked up automatically when `chidori.app.yml` sits next to the agent file. |
 
 ## Replay, resume, and testing
 
@@ -34,9 +36,11 @@ its job and the doc that covers it in depth.
 | `chidori resume … --trusted` | Crash recovery of a trusted tool-using run — same posture flags as `run`; continuation journals into the same run dir. |
 | `chidori resume … --allow-source-change` | Edit-and-resume: replay against edited code, divergence-checked ([divergence rules](./replay.md)). |
 | `chidori verify <agent.ts> <run_id>` | Checkpoint-as-test: replay with **no provider** and a **deny-all policy**; asserts completion with byte-identical output. Exit 0 = pass. Built for CI. Journaled workspace writes do re-materialize on disk (same bytes, fresh mtime). |
+| `chidori rollback <run_id>` | Saga rollback: run the compensations the run registered with `chidori.compensation.register(...)` newest-first, each as its own ordinary run. Refuses a completed run (compensations are void on success) and a second rollback (inverse actions are not re-fired). |
 | `chidori trace <run_id>` | Print a run's call log — every prompt, tool call, and effect, with token counts and cost (including prompt-cache read/write totals). |
 | `chidori stats` | Usage and cost totals, including prompt-cache read/write tokens. |
 | `chidori snapshot <run_id>` | Print `runtime.snapshot.json` metadata (never raw VM snapshot bytes). |
+| `chidori holdings <run_id>` | What the run is holding right now: its pending host operation, queued signals, actors it spawned and has not settled, detached agents it launched (with registry state), open branches, and armed compensations. Also served as `GET /sessions/{id}/holdings`. |
 | `chidori history <run_id>` | The code side of the run's history: the git-like chain of source versions (run start, accepted edits, branch forks/reruns), each anchored to the journal records that executed under it. `--show <commit>` prints a stored version, `--diff <a>..<b>` (or `--diff <commit>` vs its parent) compares two, `--json` for machines ([source history](./source-history.md)). |
 
 Run journals live under `.chidori/runs/<run_id>/` next to the agent file;
