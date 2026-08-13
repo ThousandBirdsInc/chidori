@@ -728,6 +728,14 @@ pub(crate) fn run_module(
         .map_err(|e| anyhow::anyhow!("installing chidori.renderDOM: {e}"))?;
 
     let slot = engine.install_entrypoint();
+    // Wrap the native `run` registrar with input-schema validation
+    // (`run(handler, { inputSchema })`): a Standard Schema validator or a
+    // plain JSON Schema checked before the first line of agent code runs.
+    // Must evaluate after `install_entrypoint` (it closes over the native
+    // registrar) and before the module graph evaluates.
+    engine
+        .eval_cached(crate::runtime::typescript::helpers::INPUT_SCHEMA_SCRIPT)
+        .map_err(|e| anyhow::anyhow!("installing input-schema validation: {e}"))?;
 
     let entry_key = path.to_string_lossy().to_string();
     // Resolve each `(specifier, importer)` to a sibling `.ts`/`.js` file (or, for
@@ -1983,6 +1991,103 @@ mod tests {
         let records = ctx.call_log().into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].function, "log");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_input_schema_json_schema_rejects_and_accepts() {
+        // `run(handler, { inputSchema })` with a plain JSON Schema: a
+        // malformed input fails as an InputValidationError before the handler
+        // (or any host call) executes; a valid input runs normally.
+        let dir = std::env::temp_dir().join(format!("chidori-rust-schema-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            import { chidori, run } from "chidori:agent";
+            run(async (input: { topic: string }) => {
+                await chidori.log("ran");
+                return { topic: input.topic };
+            }, {
+                inputSchema: {
+                    type: "object",
+                    properties: { topic: { type: "string", minLength: 1 } },
+                    required: ["topic"],
+                },
+            });
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        // Missing required field: refused, no host call recorded.
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let err = run_agent(&path, src, &serde_json::json!({}), &backend).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("InputValidationError:") && text.contains("topic: required"),
+            "expected an input-validation refusal, got: {text}"
+        );
+        assert_eq!(ctx.call_log().into_records().len(), 0);
+
+        // Wrong type is named field-by-field.
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let err = run_agent(&path, src, &serde_json::json!({ "topic": 7 }), &backend).unwrap_err();
+        assert!(format!("{err:#}").contains("topic: expected string, got integer"));
+
+        // Valid input runs the handler.
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let output =
+            run_agent(&path, src, &serde_json::json!({ "topic": "ok" }), &backend).unwrap();
+        assert_eq!(output, serde_json::json!({ "topic": "ok" }));
+        assert_eq!(ctx.call_log().into_records().len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_input_schema_standard_schema_validates_and_replaces_input() {
+        // A Standard Schema validator (`~standard.validate`): its issues
+        // refuse the run, and its validated value — defaults applied —
+        // replaces the input the handler sees.
+        let dir =
+            std::env::temp_dir().join(format!("chidori-rust-stdschema-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            import { run } from "chidori:agent";
+            const schema = {
+                "~standard": {
+                    version: 1,
+                    vendor: "test",
+                    validate(value: any) {
+                        if (typeof value?.n !== "number") {
+                            return { issues: [{ message: "n must be a number", path: ["n"] }] };
+                        }
+                        return { value: { n: value.n, label: value.label ?? "default" } };
+                    },
+                },
+            };
+            run(async (input: { n: number; label: string }) => {
+                return { n: input.n, label: input.label };
+            }, { inputSchema: schema });
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let err = run_agent(&path, src, &serde_json::json!({ "n": "x" }), &backend).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("InputValidationError:") && text.contains("n must be a number (at n)"),
+            "expected the standard-schema issue, got: {text}"
+        );
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let output = run_agent(&path, src, &serde_json::json!({ "n": 2 }), &backend).unwrap();
+        assert_eq!(output, serde_json::json!({ "n": 2, "label": "default" }));
 
         let _ = std::fs::remove_dir_all(dir);
     }

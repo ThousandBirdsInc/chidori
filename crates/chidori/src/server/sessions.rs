@@ -280,6 +280,17 @@ pub(super) async fn create_session(
         .unwrap()
     };
 
+    // A run refused by input-schema validation never really started — the
+    // handler was never entered and no host call was answered. Surface it as
+    // the caller error it is (400) instead of storing a failed session.
+    if let Err(e) = &result {
+        let text = agent_error_string(&state.agent_path, e);
+        if text.contains("InputValidationError:") {
+            drop(permit);
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": text }))).into_response();
+        }
+    }
+
     let mut session = StoredSession {
         id: id.clone(),
         run_id: None,

@@ -975,6 +975,31 @@ export const chidori: Chidori = new Proxy({} as Chidori, {
 });
 
 /**
+ * The minimal [Standard Schema](https://github.com/standard-schema/standard-schema)
+ * surface {@link run}'s `inputSchema` accepts — satisfied by any Zod, Valibot,
+ * or ArkType schema without importing their types.
+ */
+export interface StandardSchemaLike {
+  "~standard": {
+    version?: number;
+    vendor?: string;
+    validate: (value: unknown) => unknown;
+  };
+}
+
+export interface RunOptions {
+  /**
+   * Validate the run input before the handler executes — deterministically,
+   * before the first host call, so a malformed input fails fast (the server
+   * answers 400) instead of surfacing mid-run. Either a Standard Schema
+   * validator (Zod, Valibot, ArkType, …), whose validated value — defaults
+   * and coercions applied — replaces the input; or a plain JSON Schema
+   * object, checked structurally.
+   */
+  inputSchema?: StandardSchemaLike | JsonObject;
+}
+
+/**
  * Define the agent entrypoint. Call it once at the top level of an agent module
  * with your handler; the runtime invokes the handler with the run input and
  * uses its return value as the output. This replaces the old "export a function
@@ -984,11 +1009,25 @@ export const chidori: Chidori = new Proxy({} as Chidori, {
  * import { run } from "chidori:agent";
  * run(async (input) => ({ greeting: `hello ${input.name}` }));
  * ```
+ *
+ * Pass `inputSchema` to validate the input before the handler runs:
+ *
+ * ```ts
+ * run(async (input: { topic: string }) => ({ ok: true }), {
+ *   inputSchema: {
+ *     type: "object",
+ *     properties: { topic: { type: "string", minLength: 1 } },
+ *     required: ["topic"],
+ *   },
+ * });
+ * ```
  */
 export function run<TInput extends AgentJson = JsonObject, TOutput extends AgentOutput = AgentOutput>(
   handler: AgentFunction<TInput, TOutput>,
+  options?: RunOptions,
 ): void {
   void handler;
+  void options;
   throw new Error(
     "run() is only available inside the chidori runtime; this import is " +
       "replaced when an agent runs under chidori.",

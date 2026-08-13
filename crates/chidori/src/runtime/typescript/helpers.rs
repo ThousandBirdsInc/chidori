@@ -836,6 +836,149 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
 /// APIs, but `node:buffer` and `node:fs` shims (and lots of real packages) need
 /// `TextEncoder`/`TextDecoder`/`atob`/`btoa`. Pure-JS, deterministic, no host
 /// access — safe to install unconditionally like `URLSearchParams`.
+/// Input-schema validation for the `run(handler, { inputSchema })` form.
+///
+/// Wraps the native `run` registrar (so it MUST be evaluated after
+/// `install_entrypoint`): when the second argument carries an `inputSchema`,
+/// the handler is wrapped to validate the run input before the first line of
+/// agent code executes. Two schema forms are accepted:
+///
+/// - a [Standard Schema](https://github.com/standard-schema/standard-schema)
+///   validator (`~standard.validate`) — any of Zod/Valibot/ArkType — whose
+///   validated (possibly defaulted/coerced) value replaces the input;
+/// - a plain JSON Schema object, checked structurally against the common
+///   subset (type/properties/required/items/enum/const/bounds/pattern).
+///
+/// Validation is pure and deterministic (a function of the input alone), so
+/// it happens before any host call and replays identically. A failure throws
+/// an `InputValidationError` listing every issue — the server maps it to a
+/// 400 instead of storing a failed session.
+pub(crate) const INPUT_SCHEMA_SCRIPT: &str = r#"
+(() => {
+  const nativeRun = globalThis.run;
+  if (typeof nativeRun !== "function") return;
+
+  const fmtPath = (path) =>
+    path.map((p) => (typeof p === "object" && p !== null ? p.key : p)).join(".");
+
+  const jsTypeOf = (v) => {
+    if (v === null) return "null";
+    if (Array.isArray(v)) return "array";
+    const t = typeof v;
+    if (t === "number") return Number.isInteger(v) ? "integer" : "number";
+    return t;
+  };
+
+  function checkJsonSchema(schema, value, path, issues) {
+    if (schema === true || schema == null) return;
+    if (schema === false) {
+      issues.push(`${path || "input"}: schema forbids this value`);
+      return;
+    }
+    if (typeof schema !== "object") return;
+    const where = path || "input";
+    if (schema.const !== undefined && JSON.stringify(value) !== JSON.stringify(schema.const)) {
+      issues.push(`${where}: expected const ${JSON.stringify(schema.const)}`);
+      return;
+    }
+    if (Array.isArray(schema.enum) && !schema.enum.some((e) => JSON.stringify(e) === JSON.stringify(value))) {
+      issues.push(`${where}: expected one of ${schema.enum.map((e) => JSON.stringify(e)).join(", ")}`);
+      return;
+    }
+    if (schema.type) {
+      const actual = jsTypeOf(value);
+      const allowed = Array.isArray(schema.type) ? schema.type : [schema.type];
+      const ok = allowed.some((t) => t === actual || (t === "number" && actual === "integer"));
+      if (!ok) {
+        issues.push(`${where}: expected ${allowed.join(" | ")}, got ${actual}`);
+        return;
+      }
+    }
+    if (typeof value === "string") {
+      if (schema.minLength != null && value.length < schema.minLength)
+        issues.push(`${where}: shorter than minLength ${schema.minLength}`);
+      if (schema.maxLength != null && value.length > schema.maxLength)
+        issues.push(`${where}: longer than maxLength ${schema.maxLength}`);
+      if (schema.pattern != null && !new RegExp(schema.pattern).test(value))
+        issues.push(`${where}: does not match pattern ${schema.pattern}`);
+    }
+    if (typeof value === "number") {
+      if (schema.minimum != null && value < schema.minimum)
+        issues.push(`${where}: below minimum ${schema.minimum}`);
+      if (schema.maximum != null && value > schema.maximum)
+        issues.push(`${where}: above maximum ${schema.maximum}`);
+    }
+    if (Array.isArray(value)) {
+      if (schema.minItems != null && value.length < schema.minItems)
+        issues.push(`${where}: fewer than minItems ${schema.minItems}`);
+      if (schema.maxItems != null && value.length > schema.maxItems)
+        issues.push(`${where}: more than maxItems ${schema.maxItems}`);
+      if (schema.items)
+        value.forEach((v, i) => checkJsonSchema(schema.items, v, `${where}[${i}]`, issues));
+    }
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      if (Array.isArray(schema.required)) {
+        for (const key of schema.required) {
+          if (!(key in value)) issues.push(`${where}.${key}: required`);
+        }
+      }
+      if (schema.properties) {
+        for (const key of Object.keys(schema.properties)) {
+          if (key in value)
+            checkJsonSchema(schema.properties[key], value[key], path ? `${path}.${key}` : key, issues);
+        }
+      }
+      if (schema.additionalProperties === false && schema.properties) {
+        for (const key of Object.keys(value)) {
+          if (!(key in schema.properties)) issues.push(`${where}.${key}: unexpected property`);
+        }
+      }
+    }
+  }
+
+  const fail = (lines) => {
+    const err = new Error("invalid input:\n" + lines.map((l) => "  - " + l).join("\n"));
+    err.name = "InputValidationError";
+    throw err;
+  };
+
+  globalThis.__chidori_validate_input = async function (schema, input) {
+    if (
+      schema &&
+      typeof schema === "object" &&
+      schema["~standard"] &&
+      typeof schema["~standard"].validate === "function"
+    ) {
+      let result = schema["~standard"].validate(input);
+      if (result && typeof result.then === "function") result = await result;
+      if (result.issues) {
+        fail(
+          result.issues.map((i) =>
+            i.path && i.path.length ? `${i.message} (at ${fmtPath(i.path)})` : i.message,
+          ),
+        );
+      }
+      return result.value;
+    }
+    const issues = [];
+    checkJsonSchema(schema, input, "", issues);
+    if (issues.length) fail(issues);
+    return input;
+  };
+
+  globalThis.run = function run(handler, options) {
+    const schema = options && options.inputSchema;
+    if (typeof handler !== "function" || schema == null) return nativeRun(handler);
+    const wrapped = async function (input, chidoriArg) {
+      const validated = await globalThis.__chidori_validate_input(schema, input);
+      return handler(validated, chidoriArg);
+    };
+    wrapped.inputSchema = schema;
+    return nativeRun(wrapped);
+  };
+})();
+"#;
+
 pub(crate) const TEXT_ENCODING_POLYFILL: &str = r#"
 (function () {
     const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

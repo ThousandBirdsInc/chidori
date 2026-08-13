@@ -1560,6 +1560,40 @@ const HTTP_AGENT: &str = r#"
 "#;
 
 #[tokio::test]
+async fn create_session_maps_input_schema_refusal_to_400() {
+    // `run(handler, { inputSchema })`: a malformed input is a caller error —
+    // the handler never entered, no host call was answered — so the server
+    // answers 400 with the issue list instead of storing a failed session.
+    let (temp_dir, state) = policy_test_project(
+        "chidori-server-input-schema",
+        r#"
+            import { chidori, run } from "chidori:agent";
+            run(async (input) => ({ topic: input.topic }), {
+                inputSchema: {
+                    type: "object",
+                    properties: { topic: { type: "string" } },
+                    required: ["topic"],
+                },
+            });
+        "#,
+    );
+
+    let (status, body) =
+        response_json(create_session(State(state.clone()), Json(create_request(None))).await).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("InputValidationError:") && error.contains("topic: required"),
+        "expected the validation issue list, got: {error}"
+    );
+    // No failed session was stored for the refused run.
+    assert!(state.session_store.list().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[tokio::test]
 async fn create_session_rejects_unknown_policy_profile() {
     let (temp_dir, state) = policy_test_project("chidori-server-policy-unknown", HTTP_AGENT);
 

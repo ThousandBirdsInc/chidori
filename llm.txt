@@ -30,6 +30,14 @@ Rules:
 - Import `{ chidori, run }` from `chidori:agent` and call `run(handler)` at the
   top level. (Legacy fallback: `export async function agent(input, chidori)`
   is still accepted when `run(...)` wasn't called.)
+- Optionally validate the input before the handler executes with
+  `run(handler, { inputSchema })`. `inputSchema` is either a Standard Schema
+  validator (any Zod/Valibot/ArkType schema — its validated value, defaults and
+  coercions applied, replaces the input) or a plain JSON Schema object (checked
+  structurally: type/properties/required/items/enum/const/bounds/pattern).
+  Validation is deterministic and runs before any host call; a failure throws
+  `InputValidationError` listing every issue, and `chidori serve` answers 400
+  instead of storing a failed session.
 - Type the input with an inline object type or a `type` alias, never an
   `interface` — interfaces have no implicit index signature, so they fail the
   handler's `AgentJson` constraint with a confusing type error.
