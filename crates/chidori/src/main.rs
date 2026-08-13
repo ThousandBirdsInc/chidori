@@ -116,6 +116,37 @@ enum Commands {
         no_isolate: bool,
     },
 
+    /// Watch an agent and re-run it on every save, replaying recorded calls
+    /// from the journal so edits cost zero tokens. The first run records a
+    /// journal; each save re-executes the (edited) agent against it. An edit
+    /// past the recorded calls continues live; an edit that changes an
+    /// already-recorded call is reported with its exact seq and the run
+    /// re-records live from that point, so the journal always tracks the
+    /// newest code. Exit with Ctrl-C.
+    Dev {
+        /// Path to the agent .ts file
+        file: PathBuf,
+
+        /// Input as key=value pairs or a JSON string.
+        /// Use @filename to read value from a file.
+        #[arg(short, long)]
+        input: Vec<String>,
+
+        /// Default model for prompts that don't set one in code (equivalent
+        /// to CHIDORI_MODEL).
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Run under the built-in deny-by-default `untrusted` policy profile
+        /// (see `run --untrusted`).
+        #[arg(long, conflicts_with = "trusted")]
+        untrusted: bool,
+
+        /// Opt out of the ask-before-powerful-effects default (see `run --trusted`).
+        #[arg(long)]
+        trusted: bool,
+    },
+
     /// Internal: the isolate worker. Runs one agent over a stdin/stdout frame
     /// protocol on behalf of a parent supervisor; not meant to be invoked
     /// directly. See `crate::runtime::isolate`.
@@ -681,6 +712,7 @@ fn on_js_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 fn display_project_root_of(command: &Commands) -> Option<PathBuf> {
     let file = match command {
         Commands::Run { file, .. }
+        | Commands::Dev { file, .. }
         | Commands::Check { file }
         | Commands::Resume { file, .. }
         | Commands::Verify { file, .. } => file.clone(),
@@ -731,6 +763,19 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                 cmd_run(&file, &input, trace, verbose, untrusted, trusted)
             };
             (result, false)
+        }
+        Commands::Dev {
+            file,
+            input,
+            model,
+            untrusted,
+            trusted,
+        } => {
+            if let Some(ref model) = model {
+                std::env::set_var("CHIDORI_MODEL", model);
+            }
+            crate::runtime::isolate::warn_if_untrusted_without_isolation(untrusted);
+            (cmd_dev(&file, &input, untrusted, trusted), false)
         }
         Commands::RunWorker => unreachable!("handled before the dispatch match"),
         Commands::Demo => (cmd_demo(), false),
@@ -1590,6 +1635,325 @@ fn cmd_run(
     }
 
     Ok(())
+}
+
+/// `chidori dev` — the edit-and-replay loop as a first-class mode.
+///
+/// The first run records a journal like plain `chidori run`. After that the
+/// command watches the entry file plus every module the run's snapshot
+/// manifest fingerprints, and each save re-executes the (edited) agent with
+/// recorded calls replayed from the journal — zero tokens for everything the
+/// recording already answers. Three outcomes per save:
+///
+///   - the edit is past the recorded calls: the prefix replays free and the
+///     new tail executes live, extending the journal;
+///   - the edit changed an already-recorded call: the divergence is reported
+///     with its exact seq, the journal is truncated just before it, and the
+///     run re-records live from that point (the dev-mode answer to the
+///     fail-loud default `resume` keeps);
+///   - the previous iteration failed: the crash frontier is stripped exactly
+///     like `resume --retry-failed`, so the failing call re-executes live
+///     against the fixed code while everything before it replays from cache.
+fn cmd_dev(
+    file: &Path,
+    inputs: &[String],
+    untrusted: bool,
+    trusted: bool,
+) -> Result<()> {
+    let input_value = parse_inputs(inputs)?;
+    let base_dir = file
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let run_base = base_dir.join(".chidori").join("runs");
+
+    let providers = Arc::new(ProviderRegistry::from_env());
+    let template_engine = Arc::new(TemplateEngine::new(&base_dir));
+    let tokio_rt =
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
+
+    // One engine per iteration (the builder methods consume), sharing the
+    // expensive parts. `with_history_rewrite_allowed` because a divergence
+    // truncation or an edit that removes calls legitimately shortens the
+    // journal — dev mode owns this run and rewriting its history is the point.
+    let build_engine = || {
+        Engine::new(
+            providers.clone(),
+            template_engine.clone(),
+            tokio_rt.clone(),
+        )
+        .with_tools(Arc::new(ToolRegistry::new()))
+        .with_policy(cli_policy(untrusted, trusted))
+        .with_persist_base(run_base.clone())
+        .with_history_rewrite_allowed(true)
+        .with_workspace_root(abs_dir(&base_dir))
+    };
+
+    // ---- Initial recording run -------------------------------------------
+    eprintln!("[dev] recording initial run of {}…", file.display());
+    let started = std::time::SystemTime::now();
+    let mut last_output: Option<Value> = None;
+    let mut run_id: Option<String> = match run_engine(&build_engine(), file, &input_value) {
+        Ok(result) => {
+            report_dev_iteration(&result, None);
+            last_output = Some(result.output.clone());
+            Some(result.run_id)
+        }
+        Err(err) => {
+            eprintln!("[dev] run failed: {err:#}");
+            // The engine announced and persisted the run before failing; adopt
+            // its journal so the next save replays the good prefix for free
+            // and only re-executes the failing call.
+            let adopted = newest_run_dir_since(&run_base, started);
+            if adopted.is_none() {
+                eprintln!("[dev] no journal recorded — the next save re-runs from scratch");
+            }
+            adopted
+        }
+    };
+
+    // ---- Watch loop -------------------------------------------------------
+    eprintln!("[dev] watching for changes (Ctrl-C to exit)…");
+    let mut signatures = watch_signatures(&watch_set(&run_base, run_id.as_deref(), file));
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let watched = watch_set(&run_base, run_id.as_deref(), file);
+        let current = watch_signatures(&watched);
+        // A path both maps know about with differing signatures is an edit; a
+        // path only `current` knows (a module added by the last iteration)
+        // is baseline growth, not a change, and folds in below.
+        let changed: Vec<&PathBuf> = watched
+            .iter()
+            .filter(|p| match (signatures.get(*p), current.get(*p)) {
+                (Some(prev), Some(cur)) => prev != cur,
+                _ => false,
+            })
+            .collect();
+        if changed.is_empty() {
+            signatures = current;
+            continue;
+        }
+        for path in &changed {
+            eprintln!("\n[dev] changed: {}", path.display());
+        }
+        // Debounce: editors write in bursts; settle, then baseline the watch
+        // set BEFORE running so an edit made during a long run still triggers
+        // the next iteration.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        signatures = watch_signatures(&watch_set(&run_base, run_id.as_deref(), file));
+
+        let iteration_started = std::time::SystemTime::now();
+        match dev_iteration(&build_engine, file, &input_value, run_id.as_deref(), &run_base) {
+            Ok(result) => {
+                report_dev_iteration(&result, last_output.as_ref());
+                last_output = Some(result.output.clone());
+                run_id = Some(result.run_id);
+            }
+            Err(err) => {
+                eprintln!("[dev] run failed: {err:#}");
+                if run_id.is_none() {
+                    run_id = newest_run_dir_since(&run_base, iteration_started);
+                }
+            }
+        }
+    }
+}
+
+/// One dev-loop re-run: replay the journal against the current source, with
+/// crash-frontier stripping for a previously failed run and truncate-and-
+/// re-record when the edit diverges from an already-recorded call.
+fn dev_iteration(
+    build_engine: &dyn Fn() -> Engine,
+    file: &Path,
+    input_value: &Value,
+    run_id: Option<&str>,
+    run_base: &Path,
+) -> Result<crate::runtime::engine::RunResult> {
+    // No journal yet (the very first run never persisted): plain fresh run.
+    let Some(run_id) = run_id else {
+        return run_engine(&build_engine(), file, input_value);
+    };
+
+    // ABI and policy drift stay fatal; source-change refusal is downgraded —
+    // dev mode *is* the edit-and-resume opt-in.
+    crate::runtime::snapshot::validate_manifest_for_resume(run_base, Some(run_id), file, true)?;
+
+    let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
+    let _ = factory.hydrate(run_id);
+    let mut records = factory
+        .store_for(run_id)
+        .load_call_log()?
+        .unwrap_or_default();
+
+    // A failed previous iteration left its crash frontier in the journal;
+    // strip it (exactly like `resume --retry-failed`) so the fixed code
+    // re-executes the failing call live instead of diverging against it.
+    if records.last().is_some_and(|r| r.error.is_some()) {
+        let before = records.len();
+        records = crate::runtime::host_actor::strip_crash_frontier(records);
+        eprintln!(
+            "[dev] stripped {} failed record(s) from the previous attempt",
+            before - records.len()
+        );
+    }
+
+    let input_value = dev_run_input(run_base, run_id, input_value);
+
+    // Divergence loop: each truncation lands strictly earlier in the journal,
+    // so this terminates; the bound is sheer paranoia.
+    for _ in 0..32 {
+        let result = build_engine().resume_run(file, &input_value, records.clone(), run_id);
+        match result {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                let text = format!("{err:#}");
+                let Some(seq) = parse_divergence_seq(&text) else {
+                    return Err(err);
+                };
+                let dropped = records.iter().filter(|r| r.seq >= seq).count();
+                let first_line = text.lines().next().unwrap_or("divergence").to_string();
+                eprintln!("[dev] {first_line}");
+                eprintln!(
+                    "[dev] edit changed recorded history — re-recording live from seq {seq} \
+                     ({dropped} recorded call(s) discarded, everything before replays free)"
+                );
+                records.retain(|r| r.seq < seq);
+            }
+        }
+    }
+    anyhow::bail!("dev loop: divergence truncation did not converge (this is a bug)")
+}
+
+/// The recorded input travels with the run (like `resume`): once a journal
+/// exists, its `input.json` wins over the command line so replay keys match.
+/// Before any journal exists the CLI input is authoritative.
+fn dev_run_input(run_base: &Path, run_id: &str, cli_input: &Value) -> Value {
+    let input_path = run_base.join(run_id).join("input.json");
+    std::fs::read_to_string(&input_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| cli_input.clone())
+}
+
+/// Run an engine with the same stderr prompt-progress notes as plain
+/// `chidori run`.
+fn run_engine(
+    engine: &Engine,
+    file: &Path,
+    input_value: &Value,
+) -> Result<crate::runtime::engine::RunResult> {
+    match spawn_prompt_progress_listener() {
+        Some((event_tx, drain)) => {
+            let result = engine.run_streaming_announced(file, input_value, event_tx);
+            drain.join().ok();
+            result
+        }
+        None => engine.run_announced(file, input_value),
+    }
+}
+
+/// Print one dev iteration's outcome: pause state, replay/live split, and the
+/// output (or "output unchanged" when it is byte-identical to the previous
+/// iteration, which is the common case while editing past the frontier).
+fn report_dev_iteration(
+    result: &crate::runtime::engine::RunResult,
+    last_output: Option<&Value>,
+) {
+    if let Some(signal) = &result.paused_signal {
+        let names = signal.listen_names();
+        eprintln!(
+            "[dev] run {} paused, awaiting signal{} '{}' (deliver via `chidori serve`)",
+            result.run_id,
+            if names.len() > 1 { " (any of)" } else { "" },
+            names.join("', '")
+        );
+        return;
+    }
+    let total = result.call_log.records().len() as u64;
+    let live = total.saturating_sub(result.replayed_calls);
+    if last_output == Some(&result.output) {
+        eprintln!(
+            "[dev] run {} ok — {} call(s) replayed, {} live; output unchanged",
+            result.run_id, result.replayed_calls, live
+        );
+    } else {
+        eprintln!(
+            "[dev] run {} ok — {} call(s) replayed, {} live",
+            result.run_id, result.replayed_calls, live
+        );
+        match serde_json::to_string_pretty(&result.output) {
+            Ok(text) => println!("{text}"),
+            Err(_) => println!("{}", result.output),
+        }
+    }
+}
+
+/// The files a dev session watches: the entry file plus every module the
+/// run's snapshot manifest fingerprints (the exact set the resume check
+/// verifies). Falls back to just the entry when no manifest exists yet.
+fn watch_set(run_base: &Path, run_id: Option<&str>, file: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![file.to_path_buf()];
+    if let Some(run_id) = run_id {
+        if let Ok(manifest) =
+            crate::runtime::snapshot::SnapshotStore::new(run_base.join(run_id)).load_manifest()
+        {
+            paths.push(manifest.entry.path.clone());
+            for module in &manifest.modules {
+                paths.push(module.path.clone());
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Cheap change signature per watched file: (mtime, len). Content hashing is
+/// unnecessary — a same-second same-length edit re-runs at worst a free
+/// replay.
+fn watch_signatures(
+    paths: &[PathBuf],
+) -> std::collections::HashMap<PathBuf, Option<(std::time::SystemTime, u64)>> {
+    paths
+        .iter()
+        .map(|p| {
+            let sig = std::fs::metadata(p)
+                .ok()
+                .and_then(|m| Some((m.modified().ok()?, m.len())));
+            (p.clone(), sig)
+        })
+        .collect()
+}
+
+/// Extract the seq from a `Replay divergence at seq N: …` error rendering.
+fn parse_divergence_seq(text: &str) -> Option<u64> {
+    const MARKER: &str = "Replay divergence at seq ";
+    let rest = &text[text.find(MARKER)? + MARKER.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// After a failed run (whose `RunResult` — and run id — never came back),
+/// find the run directory the engine created after `since`, so the dev loop
+/// can adopt its journal.
+fn newest_run_dir_since(run_base: &Path, since: std::time::SystemTime) -> Option<String> {
+    let entries = std::fs::read_dir(run_base).ok()?;
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let meta = entry.metadata().ok()?;
+        if !meta.is_dir() {
+            continue;
+        }
+        let created = meta.modified().ok()?;
+        if created < since {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if newest.as_ref().is_none_or(|(t, _)| created > *t) {
+            newest = Some((created, name));
+        }
+    }
+    newest.map(|(_, name)| name)
 }
 
 /// Like `cmd_run` but emits each `CallRecord` as a newline-delimited JSON
@@ -3514,6 +3878,32 @@ mod tests {
     // serve_policy reads CHIDORI_POLICY* env vars only on its non-flag paths;
     // the flag-driven branches below are deterministic regardless of ambient
     // configuration. Nothing in this test binary sets those vars in-process.
+
+    #[test]
+    fn parse_divergence_seq_extracts_the_seq() {
+        // The exact rendering `runtime::context::try_replay` produces, framed
+        // by the JS-exception wrapper the engine adds — the dev loop parses
+        // the full rendered chain.
+        let text = "JavaScript exception: Error: Replay divergence at seq 7: `mark` was \
+                    recorded with arguments {\"label\":\"a\"} but the agent now calls it \
+                    with {\"label\":\"b\"}";
+        assert_eq!(parse_divergence_seq(text), Some(7));
+        assert_eq!(parse_divergence_seq("Replay divergence at seq 123: step"), Some(123));
+        assert_eq!(parse_divergence_seq("some unrelated error"), None);
+        assert_eq!(parse_divergence_seq("Replay divergence at seq x"), None);
+    }
+
+    #[test]
+    fn watch_set_falls_back_to_the_entry_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("agent.ts");
+        // No run yet (no manifest): the watch set is just the entry.
+        assert_eq!(watch_set(dir.path(), None, &entry), vec![entry.clone()]);
+        assert_eq!(
+            watch_set(dir.path(), Some("missing-run"), &entry),
+            vec![entry]
+        );
+    }
 
     #[test]
     fn serve_policy_untrusted_flag_is_deny_by_default() {
