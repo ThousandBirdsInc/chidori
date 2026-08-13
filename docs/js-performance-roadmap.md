@@ -1930,6 +1930,115 @@ cliffs: register dispatch ~16%, boxed `Value` clone/drop ~18%, call
 ceremony ~8% — the §6.12.2 levers (smaller `Value`, reg superinstructions,
 ObjectData arena) are the next altitude.
 
+## 6.19 The structural-tax round (2026-08-13): reg-tier peephole +
+superinstructions, inline clone/drop, and two measured negatives
+
+Follow-up to §6.18's closing assessment ("register dispatch ~16%, boxed
+`Value` clone/drop ~18%, call ceremony ~8% — the §6.12.2 levers are the
+next altitude"). This round took the two levers that survived measurement
+and, just as deliberately, measured-and-declined the other two. All safe
+Rust, zero new dependencies; every change gated by the full suites (26
+suites incl. record→replay byte-identity, both differential corpora + their
+budget sweeps), RESULT checksums byte-identical throughout.
+
+1. **Register-tier peephole + superinstructions** (`reg_peephole`, run at
+   the end of `regify` over the finished code, `rpc_at` remapped through
+   the compaction). Selection was driven by a new execution-weighted `ROp`
+   histogram (`rop-histogram` feature + `examples/ropstats.rs` — the
+   register-tier twin of `op-histogram` that keeps the reg tier ON):
+   - **Dead-store elimination** (fixpoint): a budget-pure def whose dst no
+     op or embedded kernel ever reads is deleted. This removes the unused
+     declared-function prologue whole — `this` + sloppy rebind,
+     `new.target`, unread params were ~12% of all dispatched register ops
+     on the React render workload. `LoadArg`/`BindThisSloppy` joined the
+     budget-pure set (their units defer to the next anchor across a
+     pure-only gap — the existing exactness rule), which makes dead
+     prologue stores cost-0 and hence deletable.
+   - **Copy-prop**: `def{t}; Mov{d, src: t}` with the `Mov` the sole
+     reader of `t` retargets the def and deletes the `Mov`.
+   - **Superinstructions**: contiguous `Arg` runs → `ArgN`; adjacent `Mov`
+     pairs → `Mov2`; and back-to-back STRICT-equality `CmpBrK` ladders →
+     `CmpBrKN` — the switch/dispatch-chain shape (escapeHtml's per-char
+     switch, `$$typeof` ladders; measured chains average ~8 arms, 471k
+     CmpBrK dispatches collapsed to 58k). Budget exactness: interior arms
+     carry their exact stack-op units, charged INLINE only when the arm is
+     reached — the point where the stack tier's per-op check would have
+     fired. Arms compare against constants in place
+     (`strict_eq_konst` — no const clone, no drop; strict equality is
+     total, so no bail surface).
+   - `sink_pending` attaches stranded pure units to a trailing pure op
+     instead of emitting a `Charge` dispatch (241k → 53k Charges).
+2. **Inline clone/drop** — the accessible half of the "boxed `Value`
+   clone/drop ~18%" tax turned out to be CALL + dynamic-match overhead,
+   not the refcounts: `Value::clone` and the `Value` drop glue compiled
+   out of line (~36 and ~19 instructions per call, 3.3M/3.6M calls per 10
+   renders). `Clone` for `Value` and `JsString` is now hand-written and
+   inline (every arm a scalar copy or `Rc` bump); the register write path
+   (`wr!`) skips the drop-glue call entirely when the old value owns
+   nothing (Undefined/Null/Bool/Number/TDZ/Hole).
+
+### 6.19.1 Measured (callgrind, whole workload, deterministic)
+
+| workload | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| React render (100 rows × 10, §6.17 shape) | 1.888 G | 1.800 G | **−4.7%** |
+| mixed_helpers | 1.948 G | 1.917 G | −1.6% |
+| json_roundtrip | 1.200 G | 1.195 G | −0.5% |
+| sort / fib_recursive (kernel-owned) | — | — | ±0.01% |
+
+Register dispatches on the React workload fell 20% (6.68 M → 5.33 M per
+10 renders); the modest instruction delta against that is the honest
+finding — at ~38 instructions per eliminated dispatch, dispatch-count
+optimization is near its floor, and the remaining cost is op BODIES.
+
+### 6.19.2 Measured and declined: the other two levers
+
+- **ObjectData nursery ring (the "arena" lever)** — built in full: a
+  bounded ring of handles over recent allocations, reuse-in-place at
+  `strong_count == 1` (the cell pool's provably-unreachable discipline),
+  GC-integrated (dead entries scrubbed at collection start, live handles
+  released so cycles stay collectable — the gc suite caught exactly that),
+  registry-safe (reused allocations are already tracked). Instructions:
+  json_roundtrip **−4.9%**, mixed_helpers −1.7%, React −0.4%. Interleaved
+  wall-clock (the decisive metric for allocator work, per the mimalloc
+  lesson): json_roundtrip **+5–10% SLOWER**, React ~+5% slower,
+  mixed_helpers ~4% faster — FIFO and LIFO probe orders both. Deferred
+  frees on cache-cold entries and reuse of cache-cold memory lose to
+  glibc's tcache, which recycles just-freed hot chunks. REVERTED; the
+  design is recorded here for any future revisit (it should ride a
+  different allocator story, not fight tcache).
+- **Smaller `Value` representation** — measured first: `Value` is ALREADY
+  24 bytes (the compiler folds its discriminant into `JsString`'s niche;
+  there is no padding to reclaim). Reaching 16 bytes requires a
+  thin-pointer `JsString`, which forfeits the inline ≤22-byte string arm —
+  a measured win (§ the `Inline` repr) — and adds an indirection to every
+  string touch. Declined; the accessible share of the clone/drop tax was
+  the call overhead, taken by item 2 above.
+
+### 6.19.3 Where the next altitude actually is
+
+The post-round React profile still has no cliff: reg dispatch ~11%,
+clone+drop ~13%, `step` (stack-tier remnants) ~3%, malloc/free ~4.5%,
+generic `get_prop` ~5%, `make_arguments_object` ~2.4%, call ceremony ~5%.
+The levers with shapes, in value order:
+
+- **Slow-path `get_prop` misses** (~5% of React): the ICs cache own and
+  direct-proto HITS, but React reads absent props (`config.key`,
+  `config.ref`) constantly and a MISS re-probes the whole chain every
+  time. Negative caching needs a validation story for dictionary-mode
+  prototypes (`Object.prototype` has no shape identity); the §6.16
+  rejection of per-object generation counters stands, so this wants
+  either shape-mode intrinsic prototypes or a chain-version scheme.
+- **Clone/drop EVENT elimination**: a real liveness pass over register
+  code could turn last-use `Mov`/`Ret`/argument reads into MOVES
+  (no refcount, no drop). The peephole's read-counting is the seed; the
+  full version needs per-edge liveness (loops make flow-insensitive
+  "read once" unsafe).
+- `make_arguments_object` (~2.4%): pre-sized dict construction + cached
+  `%Array.prototype.values%`.
+- The stack tier's remaining share in React is small; further reg-tier
+  breadth (more translatable shapes) matters more than more fusion.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

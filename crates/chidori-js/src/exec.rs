@@ -5000,7 +5000,8 @@ impl Vm {
                         }
                         // Strict equality is total: compare against the
                         // constant IN PLACE (no clone, no drop, no throw).
-                        let r = self.strict_eq_konst(&frame, &frame.locals[arm.a as usize], arm.konst);
+                        let r =
+                            self.strict_eq_konst(&frame, &frame.locals[arm.a as usize], arm.konst);
                         if r == arm.br_on_eq {
                             pc = arm.target as usize;
                             break;
