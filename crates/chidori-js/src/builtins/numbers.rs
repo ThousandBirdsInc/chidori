@@ -1508,7 +1508,12 @@ impl<'a> JsonParser<'a> {
                     // Remember this record's chain for its siblings.
                     self.shape_paths[self.depth - 1] = shape.path_from_root();
                 }
-                vm.alloc(ObjectData::new_shaped_with(proto, shape, slots, has_idx_keys))
+                vm.alloc(ObjectData::new_shaped_with(
+                    proto,
+                    shape,
+                    slots,
+                    has_idx_keys,
+                ))
             }
         };
         Ok(Value::Object(obj))

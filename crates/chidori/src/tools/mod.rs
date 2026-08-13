@@ -127,8 +127,7 @@ impl ToolRegistry {
     /// Intersection semantics: names this registry doesn't hold are simply
     /// absent from the copy, so a child can never widen its parent's view.
     pub fn restricted_to(&self, names: &[String]) -> ToolRegistry {
-        let allowed: std::collections::HashSet<&str> =
-            names.iter().map(String::as_str).collect();
+        let allowed: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
         ToolRegistry {
             tools: self
                 .tools

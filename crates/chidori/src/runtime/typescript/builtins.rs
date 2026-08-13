@@ -6123,7 +6123,9 @@ mod tests {
         assert!(shim_source("stream/promises")
             .unwrap()
             .contains("from \"node:stream\""));
-        assert!(shim_source("querystring").unwrap().contains("function parse"));
+        assert!(shim_source("querystring")
+            .unwrap()
+            .contains("function parse"));
         assert!(shim_source("string_decoder")
             .unwrap()
             .contains("function StringDecoder"));
@@ -6151,7 +6153,9 @@ mod tests {
         // counterpart and fails loud; `SourceTextModule` supports sources
         // without import/export declarations and fails loud past that.)
         assert!(shim_source("vm").unwrap().contains("with (globalThis."));
-        assert!(shim_source("vm").unwrap().contains("class SourceTextModule"));
+        assert!(shim_source("vm")
+            .unwrap()
+            .contains("class SourceTextModule"));
         assert!(shim_source("vm")
             .unwrap()
             .contains("vm.SourceTextModule with import/export declarations is not supported"));

@@ -2025,8 +2025,14 @@ mod tests {
             "Add two numbers",
             Vec::new(),
             |args: serde_json::Value| {
-                let a = args.get("a").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let b = args.get("b").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let a = args
+                    .get("a")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let b = args
+                    .get("b")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
                 Ok(json!(a + b))
             },
         );
@@ -2037,7 +2043,9 @@ mod tests {
         assert_eq!(output["wideOutcome"]["status"], json!("completed"));
         assert_eq!(output["wideOutcome"]["output"], json!({ "sum": 42 }));
         assert_eq!(output["narrowOutcome"]["status"], json!("failed"));
-        let error = output["narrowOutcome"]["error"].as_str().unwrap_or_default();
+        let error = output["narrowOutcome"]["error"]
+            .as_str()
+            .unwrap_or_default();
         assert!(
             error.contains("Unknown tool: adder"),
             "expected the narrowed registry to miss, got: {error}"

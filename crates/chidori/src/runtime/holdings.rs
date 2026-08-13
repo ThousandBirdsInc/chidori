@@ -35,9 +35,8 @@ pub fn compute_holdings(
     // Coarse lifecycle hint from the run directory's artifacts alone.
     let completed = store.get_blob("output.json")?.is_some();
     let pending_blob = store.get_blob(PENDING_HOST_OPERATION_FILE)?;
-    let failed = !completed
-        && pending_blob.is_none()
-        && records.last().is_some_and(|r| r.error.is_some());
+    let failed =
+        !completed && pending_blob.is_none() && records.last().is_some_and(|r| r.error.is_some());
     let status_hint = if completed {
         "completed"
     } else if pending_blob.is_some() {
@@ -70,9 +69,7 @@ pub fn compute_holdings(
         .map(|m| {
             m.host_promises
                 .iter()
-                .filter(|p| {
-                    matches!(p.state, crate::runtime::snapshot::HostPromiseState::Pending)
-                })
+                .filter(|p| matches!(p.state, crate::runtime::snapshot::HostPromiseState::Pending))
                 .count()
         })
         .unwrap_or(0);
@@ -103,9 +100,7 @@ pub fn compute_holdings(
 fn open_actors(records: &[CallRecord]) -> Vec<Value> {
     let settled: std::collections::HashSet<&str> = records
         .iter()
-        .filter(|r| {
-            matches!(r.function.as_str(), "join_actor" | "stop_actor") && r.error.is_none()
-        })
+        .filter(|r| matches!(r.function.as_str(), "join_actor" | "stop_actor") && r.error.is_none())
         .filter_map(|r| r.args.get("pid").and_then(Value::as_str))
         .collect();
     records
@@ -141,8 +136,8 @@ fn detached_agents(
                 "run_id": r.result.get("runId").cloned(),
                 "spawned_at_seq": r.seq,
             });
-            if let Some(descriptor) = registry_lookup(&name)
-                .and_then(|v| v.get("descriptor").cloned())
+            if let Some(descriptor) =
+                registry_lookup(&name).and_then(|v| v.get("descriptor").cloned())
             {
                 entry["status"] = descriptor.get("status").cloned().unwrap_or(Value::Null);
                 entry["waiting_for"] = descriptor
@@ -164,7 +159,7 @@ fn detached_agents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::store::{FsRunStore, RunStore as _};
+    use crate::runtime::store::FsRunStore;
     use chrono::Utc;
 
     fn record(seq: u64, function: &str, args: Value, result: Value) -> CallRecord {

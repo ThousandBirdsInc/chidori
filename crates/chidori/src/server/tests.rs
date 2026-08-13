@@ -1562,10 +1562,8 @@ const HTTP_AGENT: &str = r#"
 
 #[tokio::test]
 async fn get_holdings_reports_pending_operation_and_session_overlay() {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "chidori-server-holdings-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_dir =
+        std::env::temp_dir().join(format!("chidori-server-holdings-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
     let agent_path = temp_dir.join("agent.ts");
     std::fs::write(&agent_path, "export async function agent() { return {}; }").unwrap();
@@ -1611,10 +1609,9 @@ async fn get_holdings_reports_pending_operation_and_session_overlay() {
     };
     state.session_store.put(&session).unwrap();
 
-    let (status, body) = response_json(
-        get_holdings(State(state.clone()), Path("session-h".to_string())).await,
-    )
-    .await;
+    let (status, body) =
+        response_json(get_holdings(State(state.clone()), Path("session-h".to_string())).await)
+            .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status_hint"], json!("paused"));
     assert_eq!(body["pending"]["kind"], json!("signal"));
@@ -1622,22 +1619,21 @@ async fn get_holdings_reports_pending_operation_and_session_overlay() {
     assert_eq!(body["session"]["pending_signal_names"], json!(["review"]));
 
     // Unknown session → 404; a session that never started a run → 409.
-    let (status, _) = response_json(
-        get_holdings(State(state.clone()), Path("nope".to_string())).await,
-    )
-    .await;
+    let (status, _) =
+        response_json(get_holdings(State(state.clone()), Path("nope".to_string())).await).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     let mut runless = session.clone();
     runless.id = "session-runless".to_string();
     runless.run_id = None;
     state.session_store.put(&runless).unwrap();
-    let (status, body) = response_json(
-        get_holdings(State(state), Path("session-runless".to_string())).await,
-    )
-    .await;
+    let (status, body) =
+        response_json(get_holdings(State(state), Path("session-runless".to_string())).await).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap_or_default().contains("no run"));
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no run"));
 
     let _ = std::fs::remove_dir_all(temp_dir);
 }

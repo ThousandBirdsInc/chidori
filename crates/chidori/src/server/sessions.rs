@@ -714,7 +714,10 @@ fn outcomes_failed(outcomes: &[crate::runtime::compensation::RollbackOutcome]) -
 /// (`runtime::holdings`): its pending host operation, queued signals, open
 /// actors, detached agents, branches, and armed compensations, plus the
 /// session-level pause state the server tracks.
-pub(super) async fn get_holdings(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub(super) async fn get_holdings(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
     let session = match state.session_store.get(&id) {
         Ok(Some(session)) => session,
         Ok(None) => {
