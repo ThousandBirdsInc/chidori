@@ -152,9 +152,13 @@ function ExamplePicker({
 }) {
   const [open, setOpen] = useState(false);
   const boxRef = useRef<HTMLDivElement | null>(null);
+  const listRef = useRef<HTMLUListElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
+    // The picker sits centered in the scrollable feed box; the panel opens
+    // downward past the fold, so bring it fully into view.
+    listRef.current?.scrollIntoView({ block: 'nearest' });
     const close = (e: PointerEvent) => {
       if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
     };
@@ -190,6 +194,7 @@ function ExamplePicker({
       </button>
       {open && (
         <ul
+          ref={listRef}
           role="listbox"
           aria-label="Example prompts"
           className="absolute left-1/2 top-full z-10 mt-2 max-h-72 w-[min(24rem,calc(100vw-3rem))] -translate-x-1/2 overflow-y-auto rounded-xl border border-fd-border bg-fd-background p-1.5 text-left shadow-lg"
