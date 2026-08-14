@@ -427,7 +427,8 @@ deadline. `intercept` (`{ model, tools, workspace }`) scopes the child down —
 it can only *narrow* what the parent already has, never widen it; the actor's
 model is set via `intercept.model` (there is no top-level `model` option).
 Actor death is observable via a `"__chidori.down__"` message;
-actors form supervision trees (depth ≤ 4, ≤ 128 actors per run); join/stop
+actors form supervision trees (three generations of actors below the run,
+≤ 128 actors per run); join/stop
 are owner-only. Full semantics, including the intercept discussion:
 [Actors](./actors.md).
 

@@ -63,7 +63,7 @@ the render with a template-not-found error.
 
 ## Undefined variables fail loudly
 
-The engine runs minijinja with `UndefinedBehavior::SemiStrict`. In practice:
+Rendering is semi-strict about undefined variables. In practice:
 
 - **Printing an undefined variable is an error.** `Hello {{ name }}!` with no
   `name` in the variables fails the call — a typo cannot silently render as an

@@ -84,6 +84,10 @@ remaining distance.
 
 ## Architecture: capability injection, not ambient authority
 
+> This page cites source files and test names deliberately: a security claim
+> you can check against the code is worth more than one you have to take on
+> faith. The other guides stay at the behavioral level.
+
 The pure engine (`crates/chidori-js`) is a parser (`oxc`) → bytecode compiler →
 stack VM with `Rc<RefCell>` reference counting. Two properties make it a sandbox:
 
@@ -283,9 +287,9 @@ owns the policy:
 Deliberately **not** set: `RLIMIT_AS` (address-space caps are too blunt — a
 multi-threaded VM over-reserves virtual memory) and `RLIMIT_NPROC` (counts every
 process of the real uid, fragile under shared-uid concurrency; blocking `fork`
-belongs to seccomp). A hard per-run memory ceiling via cgroup v2 `memory.max` is
-not yet wired; the in-process heap watchdog (a clean per-process measure under
-isolation) is the stand-in.
+belongs to seccomp). There is no hard per-run memory ceiling via cgroup v2
+`memory.max`; the in-process heap watchdog (a clean per-process measure under
+isolation) is the enforcement that exists.
 
 On top of the floor the **parent** runs a wall-clock **deadline-kill** watchdog
 (`CHIDORI_ISOLATE_DEADLINE_MS`): a thread that `SIGKILL`s a wedged child that has
@@ -326,8 +330,8 @@ remain legal:
   `fork`/`clone` are *not* denied (the watchdog thread needs them, and a fork
   that cannot `exec` gains no code) — the `exec*` denial is what forecloses code
   execution. It is a **denylist, not an allowlist**, deliberately: it cannot
-  false-positive-kill the engine and ships real confinement today; the
-  near-empty allowlist remains the end goal.
+  false-positive-kill the engine and ships real confinement today. (A
+  near-empty allowlist would be the stricter posture; it is not what ships.)
 
   A denylist only holds if it covers each capability's *aliases*, not just its
   obvious spelling — the reason several of the entries above look redundant.
@@ -361,7 +365,7 @@ remain legal:
 | Network egress blocked at OS | ✅ empty netns | ✅ Seatbelt deny |
 | Filesystem writes blocked at OS | ✅ Landlock + seccomp | ✅ Seatbelt deny |
 | Syscall confinement | ✅ seccomp denylist | ⚠️ Seatbelt (coarser) |
-| Hard memory ceiling | ⏳ cgroup `memory.max` (not yet wired) | ⏳ not yet wired |
+| Hard memory ceiling | ❌ (heap watchdog only) | ❌ (heap watchdog only) |
 
 Windows is not a shipped isolation target.
 
@@ -428,9 +432,9 @@ engine is safe Rust); they are confinement and resource-precision gaps.
    the trip every 256 ops). A run can therefore overshoot the cap briefly before
    unwinding. Bounded in practice because the per-op size caps mean no single
    opcode allocates more than ~16 MB, but it is not a hard instantaneous ceiling.
-   A *hard*, kernel-enforced ceiling (cgroup v2 `memory.max`) under
-   [`--isolate`](#os-level-isolation---isolate) is not yet wired — see
-   the isolation gap below.
+   There is no *hard*, kernel-enforced ceiling (cgroup v2 `memory.max`) under
+   [`--isolate`](#os-level-isolation---isolate) — see the isolation gap
+   below.
 
 3. **OS-level isolation is default-on only for the CLI on Unix.** Embedders of
    the library, `--no-isolate` runs, and non-Unix platforms run the engine
@@ -441,12 +445,13 @@ engine is safe Rust); they are confinement and resource-precision gaps.
    Unix); everywhere else the operator must enable it. Sub-gaps within the
    isolated path:
    - **No hard memory ceiling.** cgroup v2 `memory.max` needs delegation and
-     is not yet wired; `RLIMIT_AS` is too blunt for a multi-threaded VM. The polled
-     heap watchdog (cleaner per-process under isolation) is the stand-in.
-   - **seccomp is a denylist, not an allowlist.** Real confinement today but the
-     near-empty allowlist remains the stronger end state.
-   - **Rootless net-ns and mount/pid namespaces** are not yet wired (the empty
-     network namespace needs `CAP_SYS_ADMIN` and is skipped rootless; the socket
+     is not used; `RLIMIT_AS` is too blunt for a multi-threaded VM. The polled
+     heap watchdog (cleaner per-process under isolation) is the enforcement
+     that exists.
+   - **seccomp is a denylist, not an allowlist.** Real confinement today; a
+     near-empty allowlist would be the stricter posture.
+   - **No rootless net-ns or mount/pid namespaces** (the empty network
+     namespace needs `CAP_SYS_ADMIN` and is skipped rootless; the socket
      seccomp block is the rootless backstop).
    - **The macOS Seatbelt path is runtime-unverified** (type-checked only — no
      macOS CI host yet); it degrades to a logged skip on failure.

@@ -141,10 +141,12 @@ you want enforced single writers on your own infrastructure; the Durable
 Object relay when you want the strongest failover guarantees and don't mind
 depending on Cloudflare.
 
-Only the bottom three rows survive machine loss, and only the bottom three
-**enforce** the run lease rather than leaving it advisory — see
+Only the bottom three rows survive machine loss. Lease enforcement is a
+separate axis: `sqlite`, the cell store, and the Durable Object relay
+**enforce** the run lease with a real compare-and-swap, while `fs` and
+`s3://` leave it advisory (last-writer-wins) — see
 [leases](./durable-storage.md#leases-single-writer-ownership), which is what
-makes the deploy-overlap hazard below go away.
+makes the deploy-overlap hazard below go away on the enforcing backends.
 
 ### Self-hosting the strongest tier: `chidori cell-store`
 

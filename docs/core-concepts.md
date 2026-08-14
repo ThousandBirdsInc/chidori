@@ -45,7 +45,7 @@ The terms the rest of the docs lean on:
 | `chidori.actors.spawn(source, input, options)` | Start an agent module as a supervised, addressable, concurrent actor process with a durable mailbox and restart policy; returns a handle with `send`/`join`/`stop`/`status` ([details](./actors.md)) |
 | `chidori.actors.send(to, name, payload)` | Deliver a named message to an actor (pid or registered name) or to `"parent"` (the sender's spawner); never blocks |
 | `chidori.actors.join(target, options)` / `chidori.actors.stop(target, options)` | Settle an actor (owner-only): wait for its supervision loop, fold its records into this run's journal, return `{ status, output?, error?, restarts }` |
-| `chidori.actors.status(target)` / `chidori.actors.lookup(name)` | Lifecycle snapshot / name-registry lookup (a handle, or `null`) |
+| `chidori.actors.status(target)` / `chidori.actors.lookup(name)` | Point-in-time lifecycle view / name-registry lookup (a handle, or `null`) |
 | `chidori.receive(names, options)` | Top-level (not under `chidori.actors`) — blocking in-place message consumption from the caller's mailbox (fan-in via an array; `timeoutMs` resolves to the timeout sentinel) |
 | `chidori.agents.spawn(source, input, options)` (+ `send`/`status`/`join`/`stop`/`lookup`) | Launch a detached durable agent — its own run id and journal, a registered name, a hibernate/wake lifecycle; it outlives the spawner ([details](./detached-agents.md)) |
 | `chidori.alarm(ms)` | Durable timer — hibernate until the deadline, then resolve to the timeout sentinel `{ timedOut: true }`; survives process restarts |

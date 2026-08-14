@@ -140,7 +140,7 @@ ignores `--model`, `--untrusted`/`--trusted`, `--until-seq`, and
 
 ### `chidori verify <agent.ts> <run_id>`
 
-Checkpoint-as-test for CI: replays with an empty provider registry, an empty
+Replay-as-test for CI: replays with an empty provider registry, an empty
 tool registry, and the `untrusted` profile, and requires the run to complete
 with byte-identical output — there is no `--allow-source-change` escape.
 Journaled top-level workspace writes do re-materialize to real disk (same
@@ -249,10 +249,11 @@ Configuration resolves per field as CLI flag → environment →
 ## Approval postures
 
 The posture decides what happens when an agent reaches a **gated effect**.
-Exactly four targets are gated: network (`fetch` / `node:http`),
-`chidori.tool` calls, workspace mutations (writes and deletes — list, read,
-and manifest are always allowed), and app-data. LLM prompts and pure compute
-are never gated.
+Exactly four target families are gated: network (`fetch` / `node:http`),
+`chidori.tool` calls, workspace access (writes and deletes ask; list, read,
+and manifest route through the same gate but are allowlisted in both
+built-in profiles), and app-data. LLM prompts and pure compute are never
+gated.
 
 | Context | Behavior |
 |---|---|

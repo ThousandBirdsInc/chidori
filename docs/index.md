@@ -22,16 +22,16 @@ can log it, cache it, replay it, pause on it, and resume from it:
 
 | Because every effect is recorded… | …you get |
 |---|---|
-| The call log is a deterministic record | **Replay any run with zero LLM calls** — byte-identical output, no tokens billed ([Replay & Resume](./replay.md)) |
-| Runs checkpoint at every host safepoint | **Crash recovery** — kill the process mid-run, resume in a new one ([Durable Storage](./durable-storage.md)) |
+| The journal is a deterministic record | **Replay any run with zero LLM calls** — byte-identical output, no tokens billed ([Replay & Resume](./replay.md)) |
+| Runs persist at every host safepoint | **Crash recovery** — kill the process mid-run, resume in a new one ([Durable Storage](./durable-storage.md)) |
 | A pause is just a host call with no answer yet | **Humans in the loop without a live process** — suspend to disk, resume days later ([Signals](./signals.md)) |
 | A recording fully specifies behavior | **Recorded runs as CI tests** — `chidori verify` asserts zero drift for $0 ([Replay & Resume](./replay.md#replay-as-test)) |
 | Code changes are events too | **Implementation history** — a git-like chain of every source version that ran, diffable, anchored to the journal ([Source History](./source-history.md)) |
 
 ## Where to start
 
-1. [Getting Started](./getting-started.md) — install the binary, run the
-   demos.
+1. [Getting Started](./getting-started.md) — install the binary, scaffold
+   and run your first agent.
 2. [Your First Agent](./your-first-agent.md) — a fifteen-minute tutorial:
    write an agent, pause it for approval, replay it for $0, check it into
    CI.

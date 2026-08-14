@@ -53,7 +53,8 @@ chidori serve agents/my_agent.ts --port 8080
 ```
 
 Bare `chidori serve` runs the **`untrusted`** policy profile: gated effects
-(network via `fetch`/`node:http`, tool calls, workspace writes) are refused
+(network via `fetch`/`node:http`, tool calls, workspace writes, app data)
+are refused
 — sessions arrive from callers you may not control. `--trusted` opts into
 the permissive allow-all posture, and a per-session `policy_profile`
 overlay can only tighten the server's policy, never loosen it. Full posture
@@ -89,6 +90,8 @@ Exposes:
 - `GET  /sessions/{id}/stream` — re-attach to a session's SSE events: replays everything already emitted (so a dropped client catches up), then follows a still-running streaming session live until it settles; for a settled session, replays the logged call records and closes with a `done` event carrying the final state
 - `GET  /agents/detached` — list registered [detached agents](./detached-agents.md) and their registry state
 - `POST /agents/detached/{name}/send` — deliver a signal into a [detached agent](./detached-agents.md)'s durable mailbox
+- `GET  /recipes` — list scheduled recipes (from the [application manifest](#the-application-manifest-chidoriappyml))
+- `POST /recipes/{name}/run` — run a scheduled recipe manually, outside its cron loop
 
 ### The application manifest (`chidori.app.yml`)
 
@@ -123,9 +126,9 @@ explicitly. Semantics:
   incarnations are re-armed as usual, settled ones are replaced by a fresh
   spawn (mailbox migration included). The manifest is idempotent across
   restarts.
-- **`schedule`** — the entry becomes a [recipe](./cli.md): same cron loop,
-  listed under `GET /recipes`, runnable manually via
-  `POST /recipes/{name}/run`.
+- **`schedule`** — the entry becomes a recipe: same cron loop, listed under
+  `GET /recipes`, runnable manually via `POST /recipes/{name}/run` (both in
+  the endpoint list above).
 - **`routes`** — each path is served as a real route (behind the same bearer
   auth as everything else); a request's JSON body is delivered to the named
   agent's durable mailbox as the named signal, waking a hibernating agent.

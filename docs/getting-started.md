@@ -102,8 +102,8 @@ What this demonstrates:
 > [Host API](./host-api.md).
 
 > **Approval prompts:** `chidori run` asks at the terminal before powerful
-> effects (network, tool calls, workspace writes) — the full posture table
-> is in the [CLI reference](./cli.md#approval-postures).
+> effects (network, tool calls, workspace writes, app data) — the full
+> posture table is in the [CLI reference](./cli.md#approval-postures).
 
 ## 5. Inspect the run
 

@@ -145,7 +145,10 @@ chidori checkpoint export <run-id>              # -> <run-id>.chidori-run.tar.gz
 chidori checkpoint import <archive> --dir ci/   # restore under ci/.chidori/runs/
 ```
 
-(`chidori checkpoint` archives and restores whole run directories;
+(`chidori checkpoint` archives and restores whole run directories — the
+right artifact for eval cases, which replay complete runs. For slim CI
+fixtures that only `chidori verify` reads, use `chidori export --fixture`
+instead — see [Replay as test](./replay.md#replay-as-test).
 `chidori snapshot <run_id>`, despite the neighboring name, just pretty-prints
 a run's snapshot manifest — see the [CLI](./cli.md).)
 
