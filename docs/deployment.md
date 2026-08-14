@@ -7,8 +7,9 @@ description: "Running agents in production: config, durability tiers, recipes fo
 
 A deployment is four things: the `chidori` binary, your agent's `.ts` files,
 a handful of environment variables, and one state directory — `.chidori/`
-next to the agent file, where every journal, checkpoint, and the
-detached-agent registry live. There is no Node runtime, database server,
+next to the agent file, where every journal, `checkpoint.json`, and the
+[detached-agent registry](./detached-agents.md) live. There is no Node
+runtime, database server,
 queue, or worker fleet to provision.
 
 You make two decisions: **where the journal lives** and **where the process
@@ -33,7 +34,7 @@ flowchart LR
 
     subgraph host["One machine — VM, container, or pod"]
         server["chidori serve agent.ts<br/>the single writer for this agent's runs"]
-        state[(".chidori/<br/>journals · checkpoints ·<br/>detached-agent registry")]
+        state[(".chidori/<br/>journals · checkpoint.json ·<br/>detached-agent registry")]
     end
 
     mirror[("CHIDORI_RUN_STORE mirror<br/>sqlite · s3://bucket ·<br/>chidori cell-store · DO relay")]
@@ -52,6 +53,11 @@ Concurrency for many users comes from *sessions inside* that one process
 and its mirror — not from running more copies of the process. That is what
 the three rules below encode.
 
+When one server hosts more than a single agent file — a detached-agent
+fleet, cron schedules, webhook routes — describe the app in a manifest and
+start it with `chidori serve --app chidori.app.yml`; see the
+[CLI reference](./cli.md) and [Running Modes](./running-modes.md).
+
 ## Three rules every deployment follows
 
 1. **All state is one directory.** Back up `.chidori/` — or mirror it with
@@ -65,7 +71,8 @@ the three rules below encode.
    paused runs need a live server, so no scale-to-zero or app-sleep.
    Auto-restart *is* the recovery mechanism: at boot the server re-arms the
    [detached-agent fleet](./detached-agents.md) and resumes interrupted runs
-   by replay from their last safepoint.
+   by replaying their journals from the last safepoint
+   ([Replay & Resume](./replay.md)).
 
 ## Configuration (identical on every host)
 
@@ -73,7 +80,8 @@ the three rules below encode.
 ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY, or CHIDORI_OPENAI_COMPAT_URL + _KEY (any OpenAI-compatible endpoint)
 CHIDORI_API_KEY=<long random>       # bearer auth on everything except GET /health
 CHIDORI_DB_PATH=.chidori/sessions.sqlite3   # session index; this path is the default (`:memory:` opts out)
-CHIDORI_RUN_STORE=sqlite            # journal mirror — see table below
+CHIDORI_RUN_STORE=sqlite            # journal mirror for a persistent VM whose disk you back up;
+                                    # use s3://bucket when the machine is ephemeral — see Decision 1
 CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't recorded
 ```
 
@@ -101,11 +109,11 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   policy), `CHIDORI_ALLOW_UNAUTHENTICATED=1` overrides the refusal.
 - **TLS:** the server speaks plain HTTP on whatever it binds. Put a reverse
   proxy or the platform's TLS in front, and firewall the port.
-- **Policy:** `chidori serve` is **deny-by-default** — gated effects (`fetch`,
-  workspace mutations) are refused until you configure `CHIDORI_POLICY_FILE`
-  (an explicit allowlist; malformed policy fails closed) or pass `--trusted`
-  for a server running only your own code. See
-  [sandbox model](./sandbox-model.md).
+- **Policy:** `chidori serve` defaults to the `untrusted` profile — gated
+  host calls (network fetch, workspace writes, tools, app data) are refused
+  until you configure `CHIDORI_POLICY_FILE` (an explicit allowlist; malformed
+  policy fails closed) or pass `--trusted` for a server running only your own
+  code. See [sandbox model](./sandbox-model.md).
 - **Optional:** `CHIDORI_CORS_ORIGINS` for browser callers;
   `CHIDORI_MAX_CONCURRENT_SESSIONS` (default 8) to cap parallel runs;
   `CHIDORI_SECRET_ENV` to pass secrets as placeholder tokens the journal
@@ -124,8 +132,8 @@ Each tier survives strictly more:
 | unset / `fs` | crash, restart, redeploy | nothing |
 | `sqlite` | + single-file backup; enforced single writer (one host) | nothing |
 | `s3://bucket/prefix` | **+ machine loss** (hydration) | any S3 API: AWS, R2, GCS, Backblaze, self-hosted MinIO |
-| `https://…` → `chidori cell-store` | + machine loss, **enforced single writer across hosts**, per-run isolation | an S3 bucket + a store node you run |
-| `https://…` → Durable Object relay | + cross-DC replication, 30-day PITR, enforced single writer | [Cloudflare Durable Objects](../integrations/cloudflare-durable-objects/) |
+| `http(s)://…` → `chidori cell-store` | + machine loss, **enforced single writer across hosts**, per-run isolation | an S3 bucket + a store node you run |
+| `http(s)://…` → Durable Object relay | + cross-DC replication, 30-day PITR, enforced single writer | [Cloudflare Durable Objects](../integrations/cloudflare-durable-objects/) |
 
 Rule of thumb: `sqlite` on a durable disk you back up; `s3://` when the
 machine is ephemeral (containers, managed hosts); `chidori cell-store` when
@@ -152,6 +160,8 @@ chidori cell-store --bucket s3://acme-chidori-cells \
   --listen 0.0.0.0:9700 --lease-secs 30 --sync-secs 2
 
 # Agent tier — every shard points at the store instead of at a bucket.
+# The cell store speaks plain HTTP: keep this on the private network,
+# with auth via the bearer token below.
 export CHIDORI_RUN_STORE="http://store.internal:9700"
 export CHIDORI_RUN_STORE_TOKEN="<long random>"
 export CHIDORI_DURABILITY=strict
@@ -174,7 +184,7 @@ What it buys a production deployment:
   stands down at its next lease renewal (see [when things fail](#when-things-fail)).
 - **Much lower write latency and S3 cost under `strict`.** Strict makes every
   journal append synchronous; against `s3://` that is an S3 PUT round-trip
-  *per host effect*, while the cell store acknowledges on a local commit and
+  *per host call*, while the cell store acknowledges on a local commit and
   batches bucket traffic onto the `--sync-secs` cadence.
 - **One place to operate.** Sharded agent servers share one store endpoint;
   cells shard by construction on run id, and `GET /status` reports which
@@ -198,7 +208,8 @@ give `CHIDORI_RUN_STORE_TOKEN` the same rotation treatment as
 ### A VM — simplest, no specialized providers
 
 Any Linux machine from any host. Install the binary
-([README](../README.md#0-install)), copy the project to `/opt/my-agent`, put
+([Getting Started](./getting-started.md)), copy the project to
+`/opt/my-agent`, put
 the env block above in `/etc/chidori/env` (mode `0600`), and run it under
 systemd:
 
@@ -430,8 +441,9 @@ active–active is a documented non-goal
 ([durable storage](./durable-storage.md)).
 
 One caveat as runs grow long rather than numerous: resuming a very long
-run replays its whole journal (fast and $0, but O(history) — see
-[resume performance](./resume-performance.md)).
+run replays its whole journal — fast and $0, but O(history);
+[value checkpoints](./value-checkpoints.md) bound the pure-compute share of
+that replay.
 
 ## When things fail
 
@@ -481,6 +493,19 @@ sequenceDiagram
   expires (immediately, if the old node shut down gracefully). Active–active
   is still not a supported mode — nothing routes requests to a run's owner (a
   documented non-goal in [durable storage](./durable-storage.md)).
+
+## The other direction: `chidori deploy`
+
+Everything above is about operating a server yourself. `chidori deploy` is
+the managed alternative: it pushes a local agent directory to a Chidori
+Deploy server, which stores it as an immutable new live version — in the
+style of Val Town's `vt` — so a deployment is a push, not a provisioning
+step. `chidori deploy login` authenticates once via browser OAuth; a bare
+`chidori deploy` pushes the current directory; `versions`, `rollback`, and
+`promote` manage which version is live; `logs`, `watch` (push on change),
+`list`, `schedule` (cron-fired runs), and `fleet` round out the loop. See the
+[CLI reference](./cli.md) for the full subcommand list, configuration
+precedence, and ignore rules.
 
 ## Production checklist
 
