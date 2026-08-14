@@ -5,11 +5,12 @@ description: "Supervised, message-passing agent processes: spawn, send, receive,
 
 # Actors: supervised, message-passing agent processes
 
-Actors let one agent run start other agent modules as long-lived, concurrent,
-addressable processes — each with its own durable mailbox and a runtime-owned
-restart policy — and coordinate with them through named messages. They compose
-three things the runtime already guarantees (isolated per-run VMs, durable
-mailboxes, resume-by-replay) into a process model:
+An **actor** is a supervised, addressable, concurrent agent process: an agent
+module started by a run, executing alongside it with its own isolated VM, its
+own durable mailbox that other parties can deliver into while it runs, and a
+runtime-owned restart policy. The spawning run talks to it through named
+messages and eventually **settles** it — collecting its outcome and folding
+its recorded history into the run's own journal.
 
 ```ts
 import { chidori, run } from "chidori:agent";
@@ -31,7 +32,7 @@ run(async () => {
   await b.send("review", draft.payload);
 
   // Settle them: outcomes carry output/error/restart counts, and each actor's
-  // full call history folds into this run's durable log.
+  // full call history folds into this run's journal.
   const research = await a.join();
   const review = await b.join();
   return { research: research.output, review: review.output };
@@ -40,25 +41,27 @@ run(async () => {
 
 ## The model
 
-**An actor is a supervised sibling of a [branch](./branching-execution.md)
-sub-run.** Like a branch it runs its own source module on a fresh, isolated VM
-with records confined to a reserved, disjoint call-log sequence range. Unlike a
-branch it is *detached and addressable*: it runs concurrently with the spawning
-run on its own OS thread, has a mailbox other parties can deliver into while it
-runs, and settles when it finishes (or when its restart budget is spent), not
-when a fan-out returns.
+Actors sit between two neighboring primitives. Like a
+[branch](./branching-execution.md) sub-run, an actor runs its own source
+module on a fresh, isolated VM and its records ultimately join the spawning
+run's journal. Unlike a branch it is *concurrent and addressable*: it runs
+alongside the spawning run, has a mailbox other parties can deliver into while
+it runs, and settles when it finishes (or when its restart budget is spent),
+not when a fan-out returns. And unlike a
+[detached agent](./detached-agents.md), an actor lives *inside* its spawning
+run — it is joined by its owner and gone when the run ends.
 
-**Each actor runs a supervision loop.** One iteration = one pass of the actor's
-module under the standard resume-by-replay model: the actor's accumulated call
-log replays from the top (recorded effects return from cache, side-effect
-free), then execution goes live at the frontier.
+**Each actor runs under a supervision loop.** One iteration = one pass of the
+actor's module under the standard resume-by-replay model: the actor's
+accumulated journal replays from the top (recorded effects return from cache,
+side-effect free), then execution goes live at the frontier.
 
 In the steady state an actor stays **live across messages**: a
 `chidori.signal` listen point with an empty mailbox blocks in place until the
-next matching message (or the listen point's own `timeoutMs`) arrives and
-then simply continues — the module is not re-executed per message, so
-processing M messages costs O(M), not O(M²). The loop re-enters the module
-only when:
+next matching message (or the listen point's own `timeoutMs` — enforced
+in-process inside an actor) arrives and then simply continues — the module is
+not re-executed per message, so processing M messages costs O(M), not O(M²).
+The loop re-enters the module only when:
 
 - the actor parks — the idle cap elapses with no message, or a stop is
   requested — and a later delivery wakes it (resume-by-replay);
@@ -67,7 +70,7 @@ only when:
 **Messages are signals.** An actor's mailbox uses the same
 `{ name, payload, from }` envelope and delivery-ordered consumption as the
 [signals](./signals.md) mailbox, and messages are consumable at the standard
-listen points (`chidori.signal`, `pollSignal`) as well as with
+listen points (`chidori.signal`, `chidori.pollSignal`) as well as with
 `chidori.receive`. `from` carries the sender's identity in the same shape
 external signals use: `{ kind: "agent", id }`, where `id` is the sending
 actor's pid or `"run"`.
@@ -78,11 +81,12 @@ actor's pid or `"run"`.
 
 ```ts
 const worker = await chidori.actors.spawn(source, input?, {
-  name?: string,          // register for actors.lookup / actors.send addressing
+  name?: string,          // register for actors.lookup / actors.send addressing;
+                          // "parent" and "actor-*" are reserved and rejected
   restart?: "never" | "clean" | "resume",   // default "never"
   maxRestarts?: number,   // default 3
   backoffMs?: number,     // base restart delay, doubles per attempt; default 0
-  idleTimeoutMs?: number, // empty-mailbox park cap; default 300000
+  idleTimeoutMs?: number, // empty-mailbox park cap; default 300000 (5 minutes)
   intercept?: {           // narrow the child's context (never widen)
     model?: string,       // default model for the child's prompts
     tools?: string[],     // registry tools the child may call (intersection)
@@ -92,13 +96,13 @@ const worker = await chidori.actors.spawn(source, input?, {
 ```
 
 `source` resolves like a `branch` variant source: the actor's own module, run
-with `input`. Pids are allocated in spawn order (`actor-1`, `actor-2`, …). A
-run may spawn at most 128 actors in total (the whole tree, restarted children
-included). Actors can spawn actors — see [Supervision
-trees](#supervision-trees) — but joining and stopping are **owner-only**: an
-actor is settled by whoever spawned it (its records fold into the spawner's
-log). `actors.spawn` inside a `chidori.branch` sub-run is rejected for the same
-range-confinement reason as nested branches.
+with `input`. Pids are allocated in spawn order (`actor-1`, `actor-2`, …) —
+which is why `actor-*` names are reserved. A run may spawn at most 128 actors
+in total (the whole tree, restarted children included). Actors can spawn
+actors — see [Supervision trees](#supervision-trees) — but joining and
+stopping are **owner-only**: an actor is settled by whoever spawned it (its
+records fold into the spawner's journal). `actors.spawn` inside a
+`chidori.branch` sub-run is rejected, like nested branches.
 
 ### intercept: handing a child a narrower context
 
@@ -116,7 +120,7 @@ what the spawner itself holds — a child never widens:
   root becomes the spawner's root joined with it, so its reads and writes are
   confined to that subtree.
 
-The intercept travels in the durable spawn args, so restarts and replay
+The intercept travels in the durable spawn record, so restarts and replay
 re-create the child under the identical narrowed view. Children that spawn
 their own actors narrow from their already-narrowed context — the tree only
 ever gets tighter toward the leaves.
@@ -149,11 +153,25 @@ top-level actor.
 
 ### receive
 
+`chidori.receive` is a **top-level host function** — it is not under
+`chidori.actors`, because it works in any run, actor or not:
+
 ```ts
 const msg = await chidori.receive("draft");                  // { name, payload, from }
 const msg = await chidori.receive(["draft", "cancel"]);      // fan-in
 const msg = await chidori.receive("draft", { timeoutMs: 60000 }); // may be { timedOut: true }
 ```
+
+Blocking, in-place consumption, in delivery order. Inside an actor it drains
+the actor's own mailbox; in the spawning run it drains parent-addressed
+messages (plus any pre-queued external signals). The difference from
+`chidori.signal`: `signal` pauses the whole run — unwinding the VM so an
+*external* party can deliver-and-resume later — while `receive` parks in
+place and is woken directly by in-process senders. Use `signal` for
+deliveries from outside the process, `receive` for actor traffic. A `receive`
+with no timeout, no live actors, and an empty mailbox fails fast instead of
+blocking forever; the timeout sentinel is the same `{ timedOut: true }` shape
+signals use.
 
 ### Monitoring: `__chidori.down__`
 
@@ -181,17 +199,6 @@ once every spawned actor has settled and no matching message is queued:
 nothing in-process can deliver anymore, so waiting out the timeout would be
 pure starvation. The error names `__chidori.down__` as the way to observe
 the failures.
-
-Blocking, in-place consumption, in delivery order. Inside an actor it drains
-the actor's own mailbox; in the spawning run it drains parent-addressed
-messages (plus any pre-queued external signals). The difference from
-`chidori.signal`: `signal` pauses the whole run — unwinding the VM so an
-*external* party can deliver-and-resume later — while `receive` parks the
-calling thread and is woken directly by in-process senders. Use `signal` for
-deliveries from outside the process, `receive` for actor traffic. A `receive`
-with no timeout, no live actors, and an empty mailbox fails fast instead of
-blocking forever; the timeout sentinel is the same `{ timedOut: true }` shape
-signals use.
 
 ### actors.join / actors.stop
 
@@ -223,8 +230,8 @@ await chidori.actors.lookup("researcher");  // a handle, or null
 | Strategy | On iteration failure |
 |---|---|
 | `never` (default) | The failure is the actor's final outcome. |
-| `clean` | Re-run the module from scratch: fresh call log, the spawn-time VFS anchor, the original input. |
-| `resume` | Replay the accumulated call log with the **crash frontier** (the trailing failed records) stripped: completed work returns from cache, the failing call re-executes live. The strip cascades to the frontier's *nested* effects — a failed tool call's inner `http` record is discarded with it, so the retry re-drives the upstream for real instead of replaying a recorded 5xx forever. |
+| `clean` | Re-run the module from scratch: fresh journal, the spawn-time workspace anchor, the original input. |
+| `resume` | Replay the accumulated journal with the **crash frontier** (the trailing failed records) stripped: completed work returns from cache, the failing call re-executes live. The strip cascades to the frontier's *nested* effects — a failed tool call's inner HTTP record is discarded with it, so the retry re-drives the upstream for real instead of replaying a recorded 5xx forever. |
 
 `resume` is the strategy a process-restart model cannot express: the actor
 comes back *with its history* and retries from the exact point of failure,
@@ -234,8 +241,8 @@ and handled — are preserved, since their consumption shaped the control flow
 that followed. Note that a deterministic in-code `throw` (one not caused by a
 live host-call failure) will recur under `resume`; `maxRestarts` bounds the
 loop either way. Messages consumed by a failed attempt are redelivered under
-`resume` (their consumption is in the replayed log) but lost under `clean`,
-matching the from-scratch semantics.
+`resume` (their consumption is in the replayed journal) but lost under
+`clean`, matching the from-scratch semantics.
 
 ## Supervision trees
 
@@ -270,61 +277,53 @@ The tree rules:
   `join`/`stop` it; anyone may `send` to it. `"parent"` from a
   child addresses its owning actor's mailbox (received there with
   `chidori.receive`), not the run.
-- **Ranges nest.** A child's reserved sequence range is carved out of its
-  owner's range (each level subdivides by 1000: 10^12 for a top-level actor,
-  10^9 for its children, 10^6, then 10^3). That containment is what lets a
-  whole subtree merge upward join by join while every record still lands
-  inside the top-level actor's range at the final confinement check. The
-  subdivision bounds tree depth: a fourth-generation actor has no headroom
-  left to subdivide and its `spawn` is refused with a clear error.
+- **Depth is bounded.** The tree supports three generations of actors below
+  the run; a fourth-generation `spawn` is refused with a clear error.
 - **Supervisors reap their children.** When an actor settles — completed,
   failed, stopped, or paused — its still-live children are cooperatively
   stopped first, transitively, so children never outlive their supervisor. A
-  `clean` restart also reaps the failed attempt's children (its discarded log
-  is about to re-run the spawns live) and releases their registered names for
-  the retry to re-claim. A `resume` restart keeps children: the replayed
-  `spawn_actor` records return their cached pids and the same live children
-  answer.
-- **Replay absorbs the whole tree at one join.** A grandchild's records carry
-  `parent_seq` → its owner's `join_actor` record → the run's `join_actor`
-  record, so replaying the run's join absorbs every level in one pass.
+  `clean` restart also reaps the failed attempt's children (its discarded
+  journal is about to re-run the spawns live) and releases their registered
+  names for the retry to re-claim. A `resume` restart keeps children: the
+  replayed spawns return their cached pids and the same live children answer.
+- **A join settles the whole subtree.** A child's records fold into its
+  owner's history at the owner's join, so by the time the run joins a
+  top-level actor, that one settle carries every level below it.
 
 ## Durability and replay
 
-Every actor primitive is an ordinary durable host call on the calling run's
-log — `spawn_actor`, `send_actor`, `receive`, `join_actor`, `stop_actor`,
-`actor_status`, `whereis` — so the whole conversation replays from cache:
-a replayed parent never re-runs actors, re-delivers messages, or re-waits.
+Every actor primitive — spawn, send, receive, join, stop, status, lookup — is
+an ordinary recorded host call on the calling run's journal, so the whole
+conversation replays from cache: a replayed parent never re-runs actors,
+re-delivers messages, or re-waits.
 
-The actor's own records stay inside its reserved sequence range and fold into
-the parent's log at the join, stamped with the `join_actor` call's seq as
-their parent. On replay, absorbing the join record absorbs the whole actor
-subtree — the same mechanism as branch fan-outs — keeping the sequence
-counter aligned and the full cross-actor trace in one journal.
+The actor's own records fold into the parent's journal at the join, nested
+under it — so on replay, replaying the join replays the whole actor subtree,
+and the full cross-actor trace lives in one journal.
 
 If a run crashes *between* a spawn and its join, the actor's in-flight records
-were never merged and are discarded — but the recorded `spawn_actor` and
-`send_actor` calls are sufficient to re-create it. On resume, the first live
-call that addresses the actor (a send, join, stop, or status) re-spawns it
-fresh and re-seeds its mailbox from the recorded sends, so unjoined actor work
-re-executes rather than being lost (at-least-once semantics for the unjoined
-window).
+were never folded in and are discarded — but the recorded spawn and sends are
+sufficient to re-create it. On resume, the first live call that addresses the
+actor (a send, join, stop, or status) re-spawns it fresh and re-seeds its
+mailbox from the recorded sends, so unjoined actor work re-executes rather
+than being lost (at-least-once semantics for the unjoined window).
 
 ## Semantics worth knowing
 
-- **Concurrency is real but bounded**: each actor is an OS thread with its own
-  VM (like a concurrent branch wave). Actors suit tens of concurrent
+- **Concurrency is real but bounded**: each actor runs on its own thread with
+  its own VM (like a concurrent branch wave). Actors suit tens of concurrent
   LLM-bound processes, not tens of thousands of compute-bound ones.
-- **Selective receive** falls out of names: `receive(["a", "b"])` and
-  the fan-in `signal([...])` consume the lowest-delivery-seq match and leave everything else
-  queued.
+- **Selective receive** falls out of names: `receive(["a", "b"])` and the
+  fan-in `signal([...])` consume the earliest-delivered match and leave
+  everything else queued.
 - **Idle actors park, not leak**: an actor waiting on an empty mailbox with no
   explicit timeout settles as `paused` after `idleTimeoutMs` (default 5
   minutes), so an orphaned wait cannot hold a thread forever — and a settling
   supervisor reaps its subtree on the way out.
-- **Join what you spawn**: records only merge at a join/stop, and only the
+- **Join what you spawn**: records only fold in at a join/stop, and only the
   spawner may settle an actor. Ending the parent run with actors unjoined
-  discards their (unmerged) work.
-- **Hot code reload across restarts**: each supervision-loop iteration re-reads
-  the actor's source module, so an edited module + `resume` restart follows the
-  same modify-and-resume contract as run resume (divergence detection applies).
+  discards their (unfolded) work.
+- **Hot code reload across restarts**: each supervision-loop iteration
+  re-reads the actor's source module, so an edited module + `resume` restart
+  follows the same modify-and-resume contract as run resume (divergence
+  detection applies — see [Replay & Resume](./replay.md)).
