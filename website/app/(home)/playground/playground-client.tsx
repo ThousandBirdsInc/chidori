@@ -74,17 +74,156 @@ const HISTORY_KEY = 'chidori-playground-history-v1';
 // docs pages' runnable examples — and a login started there works here.
 const OR_KEY = OPENROUTER_KEY_STORAGE;
 
-const SUGGESTIONS = [
-  'What is chidori, in one paragraph?',
-  'How does offline replay work?',
-  'Show me your own source code',
-  'Rewrite your code: add a ⚡ to every reply',
-  'Weather in Tokyo',
-  'Make a form to plan a trip',
-  'Chart the first 10 fibonacci numbers',
-  'Roll 3d6',
-  'A color palette for a storm at dusk',
+interface Example {
+  prompt: string;
+  title: string;
+  /** What the example actually demonstrates about the runtime. */
+  detail: string;
+}
+
+const EXAMPLES: Example[] = [
+  {
+    prompt: 'What is chidori, in one paragraph?',
+    title: 'Ask what chidori is',
+    detail:
+      'Docs-grounded Q&A: the agent retrieves from these docs with its search_docs tool, so the answer is cited, not guessed.',
+  },
+  {
+    prompt: 'How does offline replay work?',
+    title: 'Ask about offline replay',
+    detail:
+      'Another retrieval-grounded answer — this one explains the effect journal that makes this very chat replayable.',
+  },
+  {
+    prompt: 'Show me your own source code',
+    title: 'Read its own source',
+    detail:
+      'The read_source tool returns agent.ts — the live program running this chat, the same code shown under the hood below.',
+  },
+  {
+    prompt: 'Rewrite your code: add a ⚡ to every reply',
+    title: 'Rewrite itself mid-chat',
+    detail:
+      'Self-modification: update_source stages new code, validates it by replaying the journal, then hot-swaps it in — same conversation, new program.',
+  },
+  {
+    prompt: 'Weather in Tokyo',
+    title: 'Call a live tool',
+    detail:
+      'A real network call runs exactly once, its result is journaled, and every replay repaints the weather card offline.',
+  },
+  {
+    prompt: 'Make a form to plan a trip',
+    title: 'Generate an inline form',
+    detail:
+      'Generative UI: the form tool emits a JSON Schema the page renders, and submitting flows through the same journaled chidori.input() as a typed message.',
+  },
+  {
+    prompt: 'Chart the first 10 fibonacci numbers',
+    title: 'Draw a chart',
+    detail:
+      'The model computes the series, and the chart card re-renders from the journaled tool result on every restore and replay.',
+  },
+  {
+    prompt: 'Roll 3d6',
+    title: 'Roll some dice',
+    detail:
+      'Journaled randomness: the rolls are recorded as effects, so replays repaint the same dice instead of re-rolling.',
+  },
+  {
+    prompt: 'A color palette for a storm at dusk',
+    title: 'Paint a color palette',
+    detail:
+      'A mood becomes deterministic swatches, rendered as a card straight from the journaled tool result.',
+  },
 ];
+
+/**
+ * The empty chat's example picker: a dropdown instead of a wall of pills,
+ * so each example has room to say what it actually demonstrates. Picking
+ * one sends its prompt as the first message.
+ */
+function ExamplePicker({
+  disabled,
+  onPick,
+}: {
+  disabled: boolean;
+  onPick: (prompt: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const listRef = useRef<HTMLUListElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    // The picker sits centered in the scrollable feed box; the panel opens
+    // downward past the fold, so bring it fully into view.
+    listRef.current?.scrollIntoView({ block: 'nearest' });
+    const close = (e: PointerEvent) => {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [open]);
+
+  return (
+    <div ref={boxRef} className="relative">
+      <button
+        id="example-picker"
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        disabled={disabled}
+        className="inline-flex h-9 items-center gap-2 rounded-lg border border-fd-border bg-fd-background px-3.5 text-sm font-medium transition-colors hover:bg-fd-accent disabled:pointer-events-none disabled:opacity-40"
+        onClick={() => setOpen((o) => !o)}
+      >
+        Try an example
+        <svg
+          width="10"
+          height="10"
+          viewBox="0 0 10 10"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          aria-hidden
+          className={`transition-transform ${open ? 'rotate-180' : ''}`}
+        >
+          <path d="m2 3.5 3 3 3-3" />
+        </svg>
+      </button>
+      {open && (
+        <ul
+          ref={listRef}
+          role="listbox"
+          aria-label="Example prompts"
+          className="absolute left-1/2 top-full z-10 mt-2 max-h-72 w-[min(24rem,calc(100vw-3rem))] -translate-x-1/2 overflow-y-auto rounded-xl border border-fd-border bg-fd-background p-1.5 text-left shadow-lg"
+        >
+          {EXAMPLES.map((ex) => (
+            <li key={ex.prompt} role="option" aria-selected={false}>
+              <button
+                type="button"
+                className="w-full rounded-lg px-3 py-2 text-left transition-colors hover:bg-fd-accent"
+                onClick={() => {
+                  setOpen(false);
+                  onPick(ex.prompt);
+                }}
+              >
+                <span className="block text-sm font-medium">{ex.title}</span>
+                <span className="mt-0.5 block font-mono text-[11px] text-fd-primary">
+                  “{ex.prompt}”
+                </span>
+                <span className="mt-0.5 block text-xs leading-relaxed text-fd-muted-foreground">
+                  {ex.detail}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 interface RunView {
   status: string;
@@ -1109,18 +1248,7 @@ export function PlaygroundClient() {
                   rewindable, branchable.
                 </p>
               </div>
-              <div className="flex max-w-lg flex-wrap justify-center gap-2">
-                {SUGGESTIONS.map((s) => (
-                  <button
-                    key={s}
-                    className="rounded-full border border-fd-border px-3.5 py-2 text-xs transition-colors hover:bg-fd-accent disabled:opacity-40"
-                    disabled={!ready}
-                    onClick={() => send(s)}
-                  >
-                    {s}
-                  </button>
-                ))}
-              </div>
+              <ExamplePicker disabled={!ready} onPick={send} />
             </div>
           ) : (
             <div className="flex flex-col gap-3">
