@@ -13,9 +13,9 @@ description: "The security model: deny-by-default capability injection, resource
 > are documented in [Current gaps](#current-gaps).
 > **Engine:** the pure-Rust `chidori-js` engine — the only JS engine in
 > the tree.
-> **Related:** [`docs/os-isolation-plan.md`](./os-isolation-plan.md),
-> [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md),
-> [`docs/conformance.md`](./conformance.md).
+> **Related:** [Captured Effects](./captured-effects-vfs-crypto-timers.md),
+> [Conformance](./conformance.md), and the
+> [OS isolation engineering note in the repo](./os-isolation-plan.md).
 
 This document describes what kind of sandbox the `chidori-js` runtime is, what it
 confines, what it deliberately does *not* confine, and which protections are
@@ -39,13 +39,17 @@ given.
 What it is **not** (by default): a containment boundary for the powerful effects
 the host *does* inject (`http`, `workspace.*`). Those are real capabilities;
 whether granting them is "safe" depends entirely on whether the agent code is
-trusted.
+trusted. Granting them is governed by the
+[approval policy](#the-untrusted-policy-profile-deny-by-default): bare
+`chidori run` asks before each gated effect (`supervised` profile),
+`chidori serve` denies by default (`untrusted` profile), and the permissive
+posture requires an explicit `--trusted`.
 
 For that case there is an **OS-level isolation mode** — on by default for the
 CLI on Unix, opt-in for embedders and elsewhere (`--isolate` /
 `CHIDORI_ISOLATE=process`): each run executes in a disposable
 child process that holds *only* the JS engine and brokers every effect back to
-the trusted parent over a pipe. The child runs under a per-OS sandbox (Linux:
+the trusted parent process (the runtime) over a pipe. The child runs under a per-OS sandbox (Linux:
 empty network namespace + Landlock read-only filesystem + seccomp syscall
 denylist; macOS: a Seatbelt deny profile) plus a `setrlimit` floor and a
 parent-side deadline-kill — so even a total compromise of the interpreter has no
@@ -58,7 +62,7 @@ The framework's primary model is **trusted, developer-authored agent code**. The
 "sandbox" exists chiefly to make execution *deterministic and replayable* (route
 all non-determinism through captured effects) and to provide *defense-in-depth*
 against bugs and accidental resource exhaustion — see the product framing in
-[`docs/conformance.md`](./conformance.md) (language conformance measured bare,
+[Conformance](./conformance.md) (language conformance measured bare,
 with the security sandbox and deterministic replay layered on top).
 
 This doc additionally evaluates the engine against a stricter model —
@@ -74,7 +78,7 @@ remaining distance.
 | Hang the host with an infinite loop | ✅ Yes — opcode budget |
 | OOM the host (string / heap growth) | ✅ Yes — string cap + memory ceiling |
 | Crash the host with a panic | ✅ Yes — `catch_unwind` boundary |
-| Abuse an injected powerful effect (`http`, `workspace`) | ✅ On the server (deny-by-default unless the operator opts out); ⚠️ on the bare CLI only if the operator gates it — see [gaps](#current-gaps) |
+| Abuse an injected powerful effect (`http`, `workspace`) | ✅ Policy-gated on every surface: bare `chidori run` asks per gated effect (`supervised`); `chidori serve` denies by default (`untrusted`); permissive only via explicit `--trusted` — see [the policy profiles](#the-untrusted-policy-profile-deny-by-default) |
 | Starve co-tenant agents / exceed a per-agent memory quota | ✅ Per-run meter (thread-attributed; small cross-thread drift) — see [gaps](#current-gaps) |
 | Break out of the process / OS | ✅ CLI on Unix (isolation on by default): confined child process — seccomp/Seatbelt + netns/Landlock + rlimits — see [OS-level isolation](#os-level-isolation---isolate). ⚠️ Embedders / `--no-isolate` / non-Unix: none (in-process) |
 
@@ -112,8 +116,8 @@ stack VM with `Rc<RefCell>` reference counting. Two properties make it a sandbox
 The production wiring lives in `src/runtime/rust_engine.rs::run_module`, which
 builds a fresh engine per run, installs the captured-effect natives + determinism
 prelude, forwards `chidori.*` to the shared `HostBindingBackend` (the durable
-host machinery — call log, replay, policy, MCP, OTEL), then runs the agent's
-entrypoint.
+host machinery — the journal, replay, policy, MCP, OTEL), then runs the
+agent's entrypoint.
 
 ## Filesystem isolation (`node:fs` → VFS)
 
@@ -194,7 +198,7 @@ The same watchdog can enforce a wall-clock deadline, also via `vm.interrupt`.
 
 - `max_call_depth = 2000` guards native-stack overflow from deep JS recursion
   (`crates/chidori-js/src/vm.rs`).
-- `REGEX_STEP_LIMIT = 100_000` bounds catastrophic backtracking / ReDoS
+- `REGEX_STEP_LIMIT = 10_000_000` bounds catastrophic backtracking / ReDoS
   (`crates/chidori-js/src/regexp.rs`).
 
 ### Panic containment
@@ -212,9 +216,9 @@ The same watchdog can enforce a wall-clock deadline, also via `vm.interrupt`.
 | Memory watchdog poll interval (ms) | `CHIDORI_JS_MEM_POLL_MS` | `10` | — |
 | Wall-clock deadline (ms) | `CHIDORI_JS_DEADLINE_MS` | off | — |
 | String length | (compile constant) | 2^28 (~268M) code units | — |
-| Dense array length | (compile constant) | 1,000,000 | — |
+| Dense array backing store | (compile constant) | 2^25 (33,554,432) elements; longer lengths fall back to a sparse tail | — |
 | Call depth | (compile constant) | 2,000 | — |
-| Regex steps | (compile constant) | 100,000 | — |
+| Regex steps | (compile constant) | 10,000,000 | — |
 
 ## OS-level isolation (`--isolate`)
 
@@ -223,22 +227,22 @@ the VM shares its address space with the host: there is no OS boundary, so a
 hypothetical interpreter RCE would land in the host process. Isolation adds
 that boundary. It is **on by default for the `chidori` CLI on Unix** (see
 [Enabling it](#enabling-it) — embedders and non-Unix platforms keep the
-historical opt-in) and **additive** — agent code, the SDKs, the durable call
-log, and replay semantics are byte-for-byte unchanged (asserted by
+historical opt-in) and **additive** — agent code, the SDKs, the journal, and
+replay semantics are byte-for-byte unchanged (asserted by
 `rust_engine::tests::isolated_run_matches_in_process_byte_for_byte`). The full
-design lives in [`docs/os-isolation-plan.md`](./os-isolation-plan.md); this
-is the operator-facing summary. Code: `crates/chidori/src/runtime/isolate/`.
+design lives in the [OS isolation engineering note in the repo](./os-isolation-plan.md);
+this is the operator-facing summary. Code: `crates/chidori/src/runtime/isolate/`.
 
 ### Process-per-run with brokered effects
 
 Each run executes in a **disposable child process** (`chidori __run-worker`, a
-hidden subcommand) that holds *only* the JavaScript engine. Every host op — each
+hidden subcommand) that holds *only* the JavaScript engine. Every host call — each
 `chidori.*` effect (`log`, `prompt`, `tool`, `callAgent`, `http`, `memory`,
 `template`, `checkpoint`, `input`, `workspace.*`), every captured sync native
 (VFS read/write, crypto hash/HMAC/random, DOM render), and every module load — is
 **RPC'd back to the parent** over a length-prefixed JSON frame protocol on the
 child's stdin/stdout (`isolate/protocol.rs`). The parent keeps doing all real I/O
-and owns the durable call log, policy gate, MCP, providers, and OTEL; the child
+and owns the journal, policy gate, MCP, providers, and OTEL; the child
 only computes JavaScript.
 
 This is cheap because the host-call boundary was *already* a single synchronous
@@ -248,9 +252,9 @@ round-trip — semantically identical to the VM, which already blocks on effects
 inline. The cost is one IPC hop per effect, dwarfed by LLM/tool latency.
 
 - **Disposable, leak-free.** The child exits after one run, so the `Rc<RefCell>`
-  cross-run cycle-leak concern (gap #6) does not apply to the isolated path, and
-  the per-run heap meter becomes a clean per-process measure (no cross-tenant
-  attribution drift — gaps #2/#3).
+  cross-run cycle-leak concern does not apply to the isolated path, and
+  the per-run heap meter becomes a clean per-process measure with no cross-tenant
+  attribution drift (see [Current gaps](#current-gaps) for both).
 - **Pause/resume/replay for free.** Pause = the child returns the pause sentinel
   and exits; resume/replay = the parent spawns a fresh worker and serves recorded
   effect results over the same pipe (the child cannot tell record from replay).
@@ -402,25 +406,10 @@ line describing the active posture. Isolation (process sandbox) and
 
 ## Current gaps
 
-These are the known limitations as of this writing. None of them are
-memory-safety holes (the engine is safe Rust); they are confinement and
-resource-precision gaps.
+These are the known limitations. None of them are memory-safety holes (the
+engine is safe Rust); they are confinement and resource-precision gaps.
 
-1. **The bare-CLI default is allow.** The powerful effects — `http` (real
-   outbound network requests) and `workspace.*` (real disk I/O within a sanitized
-   root) — all pass through the policy enforcement gate (`enforce_policy`), and the
-   surface where untrusted callers actually arrive is deny-by-default:
-   **`chidori serve` runs under the [`untrusted` profile](#the-untrusted-policy-profile-deny-by-default)
-   unless the operator explicitly configures policy** (any valid `CHIDORI_POLICY*`
-   source, or the `--trusted` flag to opt back into the permissive default;
-   malformed policy configuration fails closed to deny rather than falling back to
-   allow-all). What is deliberately permissive is `chidori run` without
-   flags: local CLI runs of developer-authored code get the
-   `AlwaysAllow` fallback, with `--untrusted` /
-   `CHIDORI_POLICY_PROFILE=untrusted` available when the code being run is not
-   trusted.
-
-2. **Per-run memory accounting is thread-attributed, not ownership-attributed.**
+1. **Per-run memory accounting is thread-attributed, not ownership-attributed.**
    Each run registers a per-run meter on its execution thread
    (`src/mem_guard.rs::RunMeterGuard`), so the cap measures that run's own
    allocations and concurrent runs do not trip each other's caps. The residual
@@ -434,16 +423,16 @@ resource-precision gaps.
    drift disappears**: each run is its own process, so the meter is a clean
    per-process measure with no cross-tenant attribution.
 
-3. **Memory enforcement granularity.** The live-heap check is polled (watchdog
+2. **Memory enforcement granularity.** The live-heap check is polled (watchdog
    every ~10 ms by default, tunable via `CHIDORI_JS_MEM_POLL_MS`; the VM observes
    the trip every 256 ops). A run can therefore overshoot the cap briefly before
    unwinding. Bounded in practice because the per-op size caps mean no single
    opcode allocates more than ~16 MB, but it is not a hard instantaneous ceiling.
    A *hard*, kernel-enforced ceiling (cgroup v2 `memory.max`) under
    [`--isolate`](#os-level-isolation---isolate) is not yet wired — see
-   gap #4.
+   the isolation gap below.
 
-4. **OS-level isolation is default-on only for the CLI on Unix.** Embedders of
+3. **OS-level isolation is default-on only for the CLI on Unix.** Embedders of
    the library, `--no-isolate` runs, and non-Unix platforms run the engine
    in-process with the host — no seccomp, namespace, or separate-process
    boundary — so that posture is purely capability-confinement plus Rust
@@ -462,12 +451,14 @@ resource-precision gaps.
    - **The macOS Seatbelt path is runtime-unverified** (type-checked only — no
      macOS CI host yet); it degrades to a logged skip on failure.
 
-5. **Container element counts beyond arrays are uncapped.** Arrays are bounded by
-   `MAX_DENSE_ARRAY` (2^25, ~33.5M), but `Map`/`Set`/object property counts are not
-   individually capped. The memory ceiling (gap 2) is the backstop for the bytes
-   they consume; there is no separate per-container element limit.
+4. **Container element counts beyond arrays are uncapped.** The dense backing
+   store of an array is bounded by `MAX_DENSE_ARRAY` (2^25, ~33.5M elements;
+   longer lengths fall back to a sparse tail), but `Map`/`Set`/object property
+   counts are not individually capped. The per-run memory ceiling (see
+   [Resource limits](#resource-limits-dos-protection)) is the backstop for the
+   bytes they consume; there is no separate per-container element limit.
 
-6. **Cycles are reclaimed only at run boundaries.** `Rc<RefCell>` cannot
+5. **Cycles are reclaimed only at run boundaries.** `Rc<RefCell>` cannot
    reclaim cycles mid-run. `run_module` calls `Vm::dispose()` after every run
    (`src/runtime/rust_engine.rs`), which breaks the outgoing edges of every
    object the VM allocated — including cycles disconnected from the realm
@@ -480,22 +471,27 @@ resource-precision gaps.
    entirely**: the child process exits after one run (spawn-per-run, no warm
    pool), so no state — leaked or otherwise — survives across runs.
 
-7. **Engine maturity.** The pure-Rust engine is at 99.08% Test262 (see
-   [`docs/conformance.md`](./conformance.md)); spec deviations are not
+6. **Engine maturity.** The pure-Rust engine is at 99.08% Test262 (see
+   [Conformance](./conformance.md)); spec deviations are not
    memory-unsafe but can produce surprising behavior or, in edge cases, perturb
    determinism/replay. This is a correctness-maturity caveat, not a containment
    risk.
 
 ## The `untrusted` policy profile (deny-by-default)
 
-The permission policy (`src/policy.rs`) gates the powerful host effects — `http`,
-every `workspace:*` action (`workspace:list` / `read` / `write` / `delete` /
-`manifest`), `tool:<name>` calls, and `app_data:<action>` — through
-`enforce_policy` (`src/runtime/typescript/bindings.rs`). The fallback for an unmatched effect
-depends on the surface: on `chidori run` (trusted, developer-authored code on the
-developer's own machine) it is `AlwaysAllow`; on **`chidori serve`** — the surface
-untrusted callers reach — it is **deny-by-default** unless the operator
-explicitly configures policy.
+The permission policy (`src/policy.rs`) gates exactly four target families —
+`http` (all `fetch`/`node:http` traffic), every `workspace:*` action
+(`workspace:list` / `read` / `write` / `delete` / `manifest`), `tool:<name>`
+calls, and `app_data:<action>` — through `enforce_policy`
+(`src/runtime/typescript/bindings.rs`). Everything else — LLM prompt calls,
+`log`, `template`, `memory`, signals, `callAgent`, pure compute — is never
+gated. The fallback for an unmatched gated effect depends on the surface: bare
+**`chidori run`** (also `dev`, `chat`, `resume`, and the branch commands)
+resolves to the [**`supervised`** profile](#the-supervised-profile-ask-before) —
+ask-before with a read-only workspace allowlist — and bare **`chidori serve`**
+resolves to the **`untrusted`** profile — deny-by-default. The permissive
+no-rules `AlwaysAllow` configuration is reachable only via `--trusted` (or an
+explicitly permissive `CHIDORI_POLICY*` source).
 
 The **`untrusted`** profile is a ready-made, deny-by-default policy you can select
 by name — no hand-written JSON. It is what `chidori serve` runs under out of the
@@ -531,13 +527,16 @@ Selection order is the `--untrusted` flag first, then env-driven resolution:
 `CHIDORI_POLICY_FILE` → `CHIDORI_POLICY` (inline JSON) → `CHIDORI_POLICY_PROFILE`
 (a built-in name) → the surface default. The surface default differs:
 
-- **`chidori run`** falls back to the permissive profile (`AlwaysAllow`, no
-  rules) — the historical default for trusted local development.
+- **`chidori run`** (and `dev`, `chat`, `resume`, `branch-resume`,
+  `branch-rerun`) falls back to the `supervised` profile — every gated effect
+  asks for approval, with a default reason explaining the posture.
 - **`chidori serve`** falls back to the `untrusted` profile, with a denial
   reason that names the opt-outs. A malformed `CHIDORI_POLICY*` source fails
-  closed to this default rather than silently serving allow-all. Pass
-  `--trusted` to restore the permissive `chidori run` resolution (the startup
-  banner's `Policy:` line reports the active posture either way).
+  closed to this default rather than silently serving allow-all.
+
+`--trusted` selects the permissive no-rules configuration (`AlwaysAllow`
+fallback) on any of these commands; it conflicts with `--untrusted`, and the
+startup banner's `Policy:` line reports the active posture either way.
 
 To customize further, copy the profile's shape into your own `CHIDORI_POLICY`
 JSON (rules + `"default": "never_allow"`) — full schema below.
@@ -590,20 +589,41 @@ falls back to the deny-by-default `untrusted` profile, never to allow-all.
 Every denied gated call is reported on the server's stderr (as well as in
 the run journal), so a misconfigured policy is audible, not silent.
 
-### The `supervised` profile (ask-by-default)
+### The `supervised` profile (ask-before)
 
-The **`supervised`** profile is the approval-flow sibling of `untrusted`: the same
-read-only workspace allowlist, but the fallback is `AskBefore` instead of
-`NeverAllow`. Under the server, a gated call suspends the run — the session
-transitions to `awaitingapproval` with a `pending_approval` carrying the
-`(target, args)` being asked about — and `POST /sessions/:id/approve` with
-`{"decision": "allow"}` or `{"decision": "deny"}` settles it. Approvals are
-remembered per `(target, args)` for the rest of the session, so the agent does not
-re-ask for an identical call. On the bare CLI (where nothing can answer the
-prompt) the gated call errors instead, unless `CHIDORI_POLICY_AUTO_APPROVE=1`.
+The **`supervised`** profile is the approval-flow sibling of `untrusted` — the
+same read-only workspace allowlist, but the fallback is `AskBefore` instead of
+`NeverAllow` — and it is what bare `chidori run` (and `dev`, `chat`, `resume`,
+and the branch commands) resolves to. When a gated effect reaches an `AskBefore`
+decision, the runtime resolves it in a fixed order:
 
-Select it anywhere a profile name is accepted: `CHIDORI_POLICY_PROFILE=supervised`
-or a session's `policy_profile` field (below).
+1. **Replay bypass.** A call answered from the journal never re-asks.
+2. **Per-run approval cache.** Approvals are remembered per `(target, args)`
+   for the rest of the run, so an identical call is not re-asked.
+3. **`CHIDORI_POLICY_AUTO_APPROVE=1`.** Auto-approves ask-gated calls (useful
+   in scripts). It applies only to `AskBefore` decisions — it never overrides a
+   `NeverAllow` rule or profile.
+4. **Server approval pause.** Under `chidori serve`, a gated call suspends the
+   run: the session transitions to `awaitingapproval` with a `pending_approval`
+   carrying the `(target, args)` being asked about, and
+   `POST /sessions/:id/approve` with `{"decision": "allow"}` or
+   `{"decision": "deny"}` settles it.
+5. **Terminal prompt.** On the CLI, the run pauses and asks:
+
+   ```
+   Allow? [y]es once (remembered for these args) / [a]ll further <target> calls this run / [N]o
+   ```
+
+   The prompt opens `/dev/tty` on Unix, so it works even with piped stdin or
+   `--stream`; where `/dev/tty` is unavailable it falls back to stdin+stderr
+   when both are TTYs.
+6. **Fail closed.** With no terminal to ask (scripts, CI), the gated call fails
+   with an error naming the escapes: `--trusted`, or an explicit
+   `CHIDORI_POLICY*` configuration.
+
+Select it explicitly anywhere a profile name is accepted:
+`CHIDORI_POLICY_PROFILE=supervised` or a session's `policy_profile` field
+(below).
 
 ### Per-session profiles over the HTTP API
 
@@ -665,7 +685,7 @@ The protections above are exercised by:
 
 OS isolation (`--isolate`) is exercised by:
 - `src/runtime/rust_engine.rs::tests::isolated_run_matches_in_process_byte_for_byte`
-  — the worker's output **and** host-call log match the in-process path exactly.
+  — the worker's output **and** journal match the in-process path exactly.
 - `crates/chidori/tests/isolate_limits.rs` (skip-aware where a layer is
   unavailable): `isolated_run_succeeds_under_the_default_resource_floor` (no false
   positives), `seccomp_blocks_a_denied_syscall` (a post-filter `socket()` probe is

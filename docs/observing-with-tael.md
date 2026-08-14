@@ -1,13 +1,13 @@
 ---
 title: "Observing with Tael"
-description: "OTLP export, run-trace correlation, checkpoint-backed golden cases, and the self-harness loop."
+description: "OTLP export, run-trace correlation, golden cases backed by recorded runs, and the self-improvement loop."
 ---
 
 # Observing runs with Tael
 
 Chidori emits standard OTLP spans for every run — one parent span per run, one
 child span per host call (`prompt`, `tool`, `http`, `branch`, …), nested by the
-same parent/child structure the call log records. Any OTLP backend works
+same parent/child structure the journal (the run's call log) records. Any OTLP backend works
 (Jaeger, Tempo, Honeycomb, Datadog); this guide uses
 [**tael**](https://github.com/ThousandBirds/app-tael), the AI-agent-native
 observability CLI, because the two products share a design goal: **a tael trace
@@ -25,10 +25,11 @@ and a Chidori run are two views of the same object.**
 # Terminal 1: tael server (OTLP gRPC on :4317, REST API on :7701)
 tael serve
 
-# Terminal 2: any chidori command, pointed at it
+# Terminal 2: scaffold a tool-loop agent, then run it pointed at tael
+chidori init tael-demo --template worker
+cd tael-demo
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
-chidori run examples/agents/worker.ts \
-  --input task="Reverse the word 'chidori'." --tools examples/tools
+chidori run agent.ts --input task="Reverse the word 'chidori'."
 ```
 
 That's the whole integration. No collector, no SDK, no code changes.
@@ -43,7 +44,7 @@ tael query traces --last 10m --format table
 tael query traces --attribute chidori.run_id=<run-id>
 
 # The full waterfall: run span → host calls → JS function spans,
-# plus the Chidori correlation footer (run id, checkpoint path, branches)
+# plus the Chidori correlation footer (run id, run-directory path, branches)
 tael get trace <trace-id> --format table
 ```
 
@@ -54,7 +55,7 @@ tael get trace <trace-id> --format table
 | Attribute | Where | Meaning |
 |---|---|---|
 | `chidori.run_id` | every span | Join key: `chidori resume <agent.ts> <run_id>` replays this exact run |
-| `chidori.checkpoint_path` | run span | The replayable artifact on disk (`.chidori/runs/<run id>/`) |
+| `chidori.checkpoint_path` | run span | The replayable [run directory](./durable-storage.md) on disk (`.chidori/runs/<run_id>/`) |
 | `chidori.branch_id` / `chidori.branch_label` | spans inside a `chidori.branch` variant | Which fan-out variant a call executed in |
 | `chidori.prompt.request_digest` | prompt spans | Content-addressed key for "the same prompt across runs" |
 | `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens` / `cache_creation_tokens` / `cache_read_tokens` | prompt spans | OTEL GenAI semantic conventions — model, tokens, prompt-cache effectiveness |
@@ -66,16 +67,20 @@ tael get trace <trace-id> --format table
 
 The correlation is bidirectional, and it's the point:
 
-**Trace → run.** `tael get trace <id>` prints the run id and checkpoint path.
-From there:
+**Trace → run.** `tael get trace <id>` prints the run id and run-directory
+path. From there:
 
 ```bash
 chidori resume <agent.ts> <run-id>            # replay it, $0, milliseconds
-chidori resume <agent.ts> <run-id> --ci       # regression mode: exit 0 = byte-identical, 3 = drift
+chidori resume <agent.ts> <run-id> --ci       # regression mode: exit 0 = match, 3 = diverged, 1 = error
 chidori branches <run-id>                     # its branch fan-outs
 chidori branch-rerun <run-id> <branch-id>     # re-run one variant from the anchor
-chidori checkpoint export <run-id>            # portable .tar.gz of the run
+chidori checkpoint export <run-id>            # portable .tar.gz of the run directory
 ```
+
+The replay/resume contract lives in [Replay & Resume](./replay.md), branch
+fan-outs in [Branching Execution](./branching-execution.md), and the run
+directory's contents in [Durable Storage](./durable-storage.md).
 
 **Run → trace.** From any chidori run id:
 
@@ -87,11 +92,13 @@ tael experiment compare <run-id>                        # a chidori.branch A/B a
 
 ## Branch fan-outs as experiments
 
-A `chidori.branch` fork renders as one subtree per variant, each span stamped
-with its `chidori.branch_label`. Tael's experiment comparison reads those
-labels directly — a branch A/B **is** an experiment, no extra instrumentation:
+A [`chidori.branch`](./branching-execution.md) fork renders as one subtree per
+variant, each span stamped with its `chidori.branch_label`. Tael's experiment
+comparison reads those labels directly — a branch A/B **is** an experiment, no
+extra instrumentation:
 
 ```bash
+# from a repo checkout
 chidori run examples/branching/agent.ts --input topic="postmortem"
 tael experiment compare <run-id> --format table
 # Variant        Traces  Spans  Errors  Error %  Avg ms ...
@@ -99,12 +106,12 @@ tael experiment compare <run-id> --format table
 # outline-first  1       15     1       6.70     1204.9
 ```
 
-## Golden cases that are checkpoints
+## Golden cases that are recorded runs
 
 `tael eval case add --from-trace <id>` promotes a failure into a regression
 case. When the trace carries `chidori.run_id`, tael records the run id and
-checkpoint path on the case — so the case's fixture is not a *description* of
-the failed run, it is the failed run itself:
+run-directory path on the case — so the case's fixture is not a *description*
+of the failed run, it is the failed run itself:
 
 ```bash
 # Promote: the case records chidori_run_id + chidori_checkpoint_path
@@ -121,11 +128,15 @@ tael eval run cases.jsonl --suite my-agent \
 ```
 
 `chidori resume --ci` prints a machine-readable JSON report and exits 0 when
-the replay matched the checkpoint exactly, 3 on divergence (with the first
-mismatching call in the report), 1 on error. Strict mode also compares the
-arguments the agent passes *now* against what the checkpoint recorded, so a
-changed prompt or tool call fails loudly instead of returning a stale cached
-result.
+the replay matched the journal exactly, 3 on divergence, 1 on error — the
+report carries a `divergence` record naming the kind (`source_changed`,
+`missing_call`, `changed_call`, or `extra_call`), so a changed prompt or tool
+call fails loudly instead of returning a stale replayed result. In `--ci` mode
+the flags `--model`, `--trusted`, `--untrusted`, `--until-seq`, and
+`--retry-failed` are ignored. When all you need is a pass/fail gate,
+`chidori verify` is the simpler variant: exit 0 on pass, 1 on any failure.
+Both contracts are in the [CLI](./cli.md) reference; the replay model itself
+is in [Replay & Resume](./replay.md).
 
 Archive a fixture without knowing the runs layout:
 
@@ -134,13 +145,17 @@ chidori checkpoint export <run-id>              # -> <run-id>.chidori-run.tar.gz
 chidori checkpoint import <archive> --dir ci/   # restore under ci/.chidori/runs/
 ```
 
+(`chidori checkpoint` archives and restores whole run directories;
+`chidori snapshot <run_id>`, despite the neighboring name, just pretty-prints
+a run's snapshot manifest — see the [CLI](./cli.md).)
+
 ## The full loop
 
-These pieces compose into a self-improvement harness — observe failures in
-tael, fork controlled experiments with `chidori.branch`, validate against
-checkpoint-backed eval suites, guard with `tael signal trend`. The runnable
-end-to-end demo lives at
-[`examples/self-harness-loop/`](../examples/self-harness-loop/).
+These pieces compose into a self-improvement loop — observe failures in
+tael, fork controlled experiments with [`chidori.branch`](./branching-execution.md),
+validate against eval suites backed by recorded runs, guard with
+`tael signal trend`. The runnable end-to-end demo lives at
+[`examples/self-harness-loop/`](../examples/self-harness-loop/) in the repo.
 
 ## Notes
 

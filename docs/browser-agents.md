@@ -34,7 +34,9 @@ every effect is journaled, browser runs get the full durability story:
   ESM package that presents the `chidori.*` agent API over the runtime and
   implements the host effects with browser primitives.
 
-Build the assets with [`scripts/build-wasm.sh`](../scripts/build-wasm.sh).
+Build the assets with [`scripts/build-wasm.sh`](../scripts/build-wasm.sh),
+which copies the SDK into the wasm `pkg/` output — that is why every sample
+below imports from `./pkg/chidori-browser.js`.
 
 ## A minimal client-side agent
 
@@ -69,12 +71,18 @@ Build the assets with [`scripts/build-wasm.sh`](../scripts/build-wasm.sh).
 </script>
 ```
 
-The agent surface is the durable core of the [host API](./host-api.md):
+The agent surface is the durable core of the [Host API](./host-api.md):
 `chidori.prompt`, `chidori.input`, `chidori.tool`, `chidori.log`,
 `chidori.fetch`, `chidori.sleep`, `chidori.now`, `chidori.random`,
 `chidori.signal`, and `chidori.step`. Payload shapes match the native host.
-Contexts, conversations, actors, and workspace are native-runtime features
-and are not available client-side.
+
+> **The browser surface is intentionally different from native agents.**
+> `chidori.fetch`, `chidori.sleep`, `chidori.now`, and `chidori.random` are
+> browser-only spellings — a native agent uses the global `fetch` and has no
+> `chidori.fetch`. In the other direction, contexts, conversations, actors,
+> workspace, memory, and agents are native-runtime features that are not
+> available client-side. See [Core Concepts](./core-concepts.md) and the
+> [Host API](./host-api.md) for the native surface.
 
 ## Real LLMs from a page
 
@@ -108,7 +116,8 @@ lives in — and is revocable from — the user's own OpenRouter account.
 
 ## What stays native
 
-The browser build swaps the host, not the harness. The native runtime's
+The browser build swaps how effects reach the world; the recording contract
+is unchanged. The native runtime's
 process isolation, SQLite stores, `chidori serve`, actors, and detached
 agents remain server-side features — in a tab, the browser itself is the
 sandbox, `localStorage`/IndexedDB is the store, and the page is the event
