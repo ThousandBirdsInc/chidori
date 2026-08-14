@@ -9,6 +9,33 @@ const REPO = 'https://github.com/ThousandBirdsInc/chidori';
 const DOCS_DIR = path.resolve(process.cwd(), '../docs');
 
 /**
+ * Repo-only pages: kept in docs/ for contributors (readable on GitHub) but
+ * not built into the site. Internal engineering notes and the historical
+ * usability-review logs live here; links to them from site pages are
+ * rewritten to GitHub URLs below.
+ */
+const REPO_ONLY_SLUGS = new Set([
+  'README',
+  'posts/harness-engineering-thread',
+  'interpreter-optimization',
+  'js-performance-roadmap',
+  'js-object-shapes-design',
+  'jit',
+  'os-isolation-plan',
+  'resume-performance',
+  'dom-runtime-prototype',
+  'ai-sdk-gap-analysis',
+  'rust-style-guide',
+  'releasing',
+  'consumer-usability-review',
+  'consumer-usability-review-2',
+  'consumer-usability-review-3',
+  'consumer-usability-review-4',
+  'consumer-usability-review-5',
+  'consumer-usability-review-6',
+]);
+
+/**
  * The content in ../docs is plain CommonMark written to be readable on
  * GitHub, so pages link to each other as `./page.md` and to files elsewhere
  * in the repo as `../examples/...`. Rewrite both at compile time:
@@ -33,8 +60,7 @@ function remarkRepoLinks(): Transformer<Root> {
       const resolved = path.posix.normalize(path.posix.join('docs', fromDir, target));
       if (resolved.startsWith('docs/') && resolved.endsWith('.md')) {
         const slug = resolved.slice('docs/'.length, -'.md'.length);
-        // README.md is the GitHub-facing directory index, not a site page.
-        if (slug !== 'README' && slug !== 'posts/harness-engineering-thread') {
+        if (!REPO_ONLY_SLUGS.has(slug)) {
           node.url = slug === 'index' ? `/docs${anchor}` : `/docs/${slug}${anchor}`;
           return;
         }
@@ -54,8 +80,7 @@ export const docs = defineDocs({
   docs: {
     files: [
       '**/*.md',
-      '!README.md',
-      '!posts/harness-engineering-thread.md',
+      ...[...REPO_ONLY_SLUGS].map((slug) => `!${slug}.md`),
       '!node_modules/**',
     ],
   },

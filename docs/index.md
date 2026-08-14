@@ -25,7 +25,7 @@ can log it, cache it, replay it, pause on it, and resume from it:
 | The call log is a deterministic record | **Replay any run with zero LLM calls** — byte-identical output, no tokens billed ([Replay & Resume](./replay.md)) |
 | Runs checkpoint at every host safepoint | **Crash recovery** — kill the process mid-run, resume in a new one ([Durable Storage](./durable-storage.md)) |
 | A pause is just a host call with no answer yet | **Humans in the loop without a live process** — suspend to disk, resume days later ([Signals](./signals.md)) |
-| A recording fully specifies behavior | **Checkpoints as CI tests** — `chidori verify` asserts zero drift for $0 ([Value Checkpoints](./value-checkpoints.md)) |
+| A recording fully specifies behavior | **Recorded runs as CI tests** — `chidori verify` asserts zero drift for $0 ([Replay & Resume](./replay.md#replay-as-test)) |
 | Code changes are events too | **Implementation history** — a git-like chain of every source version that ran, diffable, anchored to the journal ([Source History](./source-history.md)) |
 
 ## Where to start
@@ -50,12 +50,12 @@ Evaluating against other frameworks? Start with the
 - **Using Chidori** — guides for agent authors and operators, roughly in
   reading order.
 - **Reference** — the complete host API and CLI, for lookup.
-- **Engineering Notes** — internal design records for contributors. Status
-  headers inside each file are authoritative; several document retired or
-  superseded work.
-- **Usability Reviews** — six rounds of hands-on reviews that shaped the
-  developer experience.
+- **Internals** — how the engine and runtime work, for the curious and for
+  contributors.
 - **Posts** — longer-form writing about the ideas behind the framework.
+
+Deeper engineering notes and the historical usability reviews live in the
+repository under [`docs/`](./README.md) rather than on this site.
 
 ## Other references
 
