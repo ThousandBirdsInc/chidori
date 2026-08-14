@@ -1,6 +1,6 @@
 ---
 title: "Common Patterns"
-description: "Task-oriented recipes: approval gates, tool loops, fan-out, multiplayer review, scheduled agents, and checkpoint tests — which primitive fits which job."
+description: "Task-oriented recipes: approval gates, tool loops, fan-out, multiplayer review, scheduled agents, and recorded runs as CI tests — which primitive fits which job."
 ---
 
 # Common patterns
@@ -19,16 +19,16 @@ covers it in depth, and to a runnable example where one exists.
 | Run several prompts concurrently | `chidori.util.parallel` | [below](#fan-out-drafts-concurrently) |
 | Compare whole strategies, not just prompts | `chidori.branch` | [Branching Execution](./branching-execution.md) |
 | Run long-lived concurrent workers with supervision | `chidori.actors` | [Actors](./actors.md) |
-| Run a service that outlives any one run | `chidori.agents` + `chidori.alarm` | [Detached Agents](./detached-agents.md) |
+| Run a service that outlives any one run | `chidori.agents` + `chidori.alarm` | [Detached Agents](./detached-agents.md) · [Host API](./host-api.md) |
 | Remember things across runs | `chidori.memory` | [Memory](./memory.md) |
 | Avoid re-paying expensive compute on resume | `chidori.step` | [Value Checkpoints](./value-checkpoints.md) |
-| Pin agent behavior in CI | `chidori verify` | [below](#checkpoint-as-test) |
+| Pin agent behavior in CI | `chidori verify` | [below](#pin-behavior-with-a-recorded-run) |
 
 ## Approval gates that show their work
 
 Never make a human approve blind: pass the artifact under review as
-`details`. The CLI prints it above the prompt; a paused session exposes it
-as `pending_details` next to `pending_prompt`.
+`details` ([Core Concepts](./core-concepts.md) covers how gates surface
+it).
 
 ```ts
 const draft = await chidori.prompt("Draft the announcement.", { type: "draft" });
@@ -72,7 +72,7 @@ run(async (input: { event: { method: string; path: string; body?: unknown } }) =
 ```
 
 Branch on `input.event` early, as above: **every** request runs the whole
-agent, so return a cheap `4xx` for non-events before any model call. A run
+agent, so return a cheap 404 for non-events before any model call. A run
 that **pauses** (on `input()`, a signal, or a policy approval) is stored as
 a real session and answered `202` with the session view, so the caller can
 resume or signal it later — a webhook can open a long-lived, durable
@@ -82,9 +82,9 @@ workflow. Deep doc: [Running Modes](./running-modes.md) (which also covers
 
 ## Give the model tools, keep the loop
 
-`prompt()` with `tools` runs the whole provider tool-use loop for you.
-Hand-roll with `context().respond()` / `toolResult()` only when you need
-per-step control:
+`prompt()` with `tools` runs the whole provider tool-use loop for you —
+[Core Concepts](./core-concepts.md) covers the loop and when to hand-roll
+it with `context()`:
 
 ```ts
 const answer = await chidori.prompt(input.question, {
@@ -135,6 +135,11 @@ const first = await chidori.signal(["design-review", "security-review"], {
 if (first.timedOut) return { escalated: true };
 ```
 
+Note on `timeoutMs`: the deadline is enforced by the serving process —
+under `chidori serve` sessions, and in-process for actors and detached
+agents; on a bare top-level `chidori run` pause it is inert (the CLI prints
+the pause and exits).
+
 Deliver with `POST /sessions/{id}/signal` — the server resolves a matching
 pause, pushes to a live streaming run, or queues into the mailbox. Example:
 [`examples/multiplayer-review/`](../examples/multiplayer-review/), deep doc:
@@ -183,20 +188,23 @@ callback must be pure, synchronous compute — host effects inside a step
 throw. Deep doc: [Value Checkpoints](./value-checkpoints.md), example:
 [`examples/agents/value_checkpoint.ts`](../examples/agents/value_checkpoint.ts).
 
-## Checkpoint-as-test
+## Pin behavior with a recorded run
 
 A recorded run is a complete, deterministic specification of your agent's
-behavior. Commit one and assert against it in CI:
+behavior. Export it as a fixture (the raw run directory is heavy — don't
+commit that), commit the fixture, and assert against it in CI:
 
 ```bash
-chidori run agent.ts --input question="smoke test"   # record once
-git add .chidori/runs/<run_id>                        # commit the recording
-chidori verify agent.ts <run_id>                      # in CI: exit 0 = no drift
+chidori run agent.ts --input question="smoke test"          # record once
+chidori export <run_id> --fixture tests/fixtures            # the four artifacts verify reads
+git add tests/fixtures                                       # commit the fixture
+chidori verify agent.ts <run_id> --runs-dir tests/fixtures   # in CI: exit 0 = no drift
 ```
 
-`verify` replays with no provider configured and a deny-all policy — if the
-agent's prompts, tool calls, or control flow drift from the recording, it
-fails. A full integration test that costs $0 and runs in milliseconds.
+`verify` replays with no providers, no tools, and the `untrusted` policy
+profile — if the agent's prompts, tool calls, or control flow drift from
+the recording, it fails. A full integration test that costs $0 and runs in
+milliseconds. Full contract: [Replay as test](./replay.md#replay-as-test).
 [Observing with Tael](./observing-with-tael.md) builds its golden regression
 cases on the same mechanism.
 

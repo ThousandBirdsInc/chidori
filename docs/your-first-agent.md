@@ -5,22 +5,16 @@ description: "A hands-on tutorial: write a durable agent from scratch, pause it 
 
 # Your first agent
 
-[Getting Started](./getting-started.md) runs Chidori's pre-built examples.
-This tutorial has you **write your own agent** and walks it through the full
-durability loop: run it, trace its call log, pause it for a human, replay it
-with zero LLM calls, and turn the recording into a CI test. Plan for about
-fifteen minutes.
+[Getting Started](./getting-started.md) gets you from install to a served,
+pausable agent. This tutorial has you **write your own agent** and walks it
+through the full durability loop: run it, trace its journal, pause it for a
+human, replay it with zero LLM calls, and turn the recording into a CI
+test. Plan for about fifteen minutes.
 
-You need the `chidori` binary ([install](./getting-started.md)) and,
-ideally, a provider key exported in your shell:
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...   # or another provider — see below
-```
-
-Any Anthropic, OpenAI, or OpenAI-compatible key works
-([provider setup](./host-api.md#providers--model-selection)), and
-`chidori model-login` gives you a zero-setup OpenRouter fallback.
+You need the `chidori` binary and a connected model —
+[Getting Started](./getting-started.md) covers both (`chidori model-login`
+or a provider key). Work in the project `chidori init` scaffolded there, or
+any fresh directory.
 
 > **No API key?** Set `CHIDORI_TEST_LLM_RESPONSE="(test reply)"` and every
 > prompt call returns that static string instead of calling a provider — so
@@ -30,8 +24,7 @@ Any Anthropic, OpenAI, or OpenAI-compatible key works
 
 ## 1. Write the agent
 
-An agent is one ordinary TypeScript file. Create a fresh directory and save
-this as `research.ts`:
+An agent is one ordinary TypeScript file. Save this as `research.ts`:
 
 ```ts
 import { chidori, run, defineTool } from "chidori:agent";
@@ -42,9 +35,8 @@ const NOTES = [
   "2026-05-18 standup: actors supervision tree shipped; joins fold logs correctly.",
 ];
 
-// A tool is just a function with a documented signature. `run` executes in
-// the agent's own VM, so closures over NOTES work, and every invocation is
-// journaled for the trace.
+// A tool is just a function with a documented signature; closures over
+// NOTES work, and every invocation is journaled.
 const searchNotes = defineTool({
   name: "search_notes",
   description: "Keyword search over the team's standup notes.",
@@ -60,9 +52,7 @@ const searchNotes = defineTool({
 run(async (input: { question: string }) => {
   await chidori.log("Researching", { question: input.question });
 
-  // One call runs the whole provider tool-use loop: the model calls
-  // search_notes, the runtime executes it and feeds results back, up to
-  // maxTurns, then returns the final text.
+  // One call runs the whole provider tool-use loop, up to maxTurns.
   const answer = await chidori.prompt(
     `Answer from the standup notes, citing dates: ${input.question}`,
     { tools: [searchNotes], maxTurns: 4, type: "final" },
@@ -84,14 +74,15 @@ run(async (input: { question: string }) => {
 Three things to notice before running it:
 
 - **Every side effect goes through a host call.** `chidori.log`,
-  `chidori.prompt`, `chidori.input` — each is recorded in the run's call
-  log. The `if`s, `await`s, and string munging between them are plain
+  `chidori.prompt`, `chidori.input` — each is recorded in the run's
+  journal. The `if`s, `await`s, and string munging between them are plain
   TypeScript.
-- **The tool needs no registration.** `defineTool` wraps a function in the
-  `name`/`description`/`parameters` the model reads; you pass the handle
-  straight into `prompt()`.
+- **The tool needs no registration** — a tool is just a function, and you
+  pass the `defineTool` handle straight into `prompt()`
+  ([Core Concepts](./core-concepts.md) covers the tool model).
 - **Type the input with an object type, not an `interface`** — interfaces
-  fail the handler's JSON constraint with a confusing error.
+  fail the handler's JSON constraint with a confusing error
+  ([Host API](./host-api.md#agent-shape)).
 
 ## 2. Run it
 
@@ -116,10 +107,10 @@ run completes and prints its JSON output, something like:
 }
 ```
 
-> `chidori run` asks y/a/N approval before *powerful* effects — network
-> access, `chidori.tool` calls, workspace writes. This agent's tool is pure
-> in-VM compute, so the only pause you see is your own `input()` gate. See
-> [Running Modes](./running-modes.md) for postures and `--trusted`.
+> `chidori run` asks for approval before *powerful* effects — this agent's
+> tool is pure in-VM compute, so the only pause you see is your own
+> `input()` gate; postures and `--trusted` are in the
+> [CLI reference](./cli.md#approval-postures).
 
 ## 3. Read the record
 
@@ -133,43 +124,63 @@ chidori trace "$RUN_ID"
 
 The trace is the run's complete story: the `log` call, each model turn and
 `search_notes` invocation inside the prompt loop, your `input()` answer, and
-the token counts and cost of every prompt. This call log — not a framework
-abstraction — is what makes everything in the next two steps possible.
+the token counts and cost of every prompt. This journal (the run's call
+log) — not a framework abstraction — is what makes everything in the next
+two steps possible.
 
 ## 4. Replay it for $0
+
+The concept is *replay*; the CLI command that performs it is
+`chidori resume` (one command covers both replaying a finished run and
+resuming a paused one — a completed journal simply has nothing left to
+continue):
 
 ```bash
 chidori resume research.ts "$RUN_ID"
 ```
 
 The agent code re-executes from the top — but every host call returns its
-recorded result from the call log instead of touching the world. No model is
+recorded result from the journal instead of touching the world. No model is
 called, no tokens are billed, nobody is asked to approve anything, and the
 output is byte-identical to step 2. This is the same mechanism that powers
-crash recovery: a run that dies halfway replays to the frontier of its log
-and **continues live from there** ([how replay works](./replay.md)).
+crash recovery: a run that dies halfway replays to the frontier of its
+journal and **continues live from there** ([how replay works](./replay.md)).
 
-Two variants worth knowing now:
+Three variants worth knowing now:
 
 - `chidori resume research.ts <run_id> --allow-source-change` — replay
   against *edited* agent code, divergence-checked. Fix a bug three runs deep
   without re-paying the first three runs.
+- `chidori dev research.ts` — the edit-iterate loop as a command: it watches
+  the file and re-runs on every save, replaying recorded calls from the
+  journal so edits cost zero tokens.
 - A paused server-mode session resumes the same way, minutes or days later,
   in a fresh process ([Signals](./signals.md)).
 
 ## 5. Turn the recording into a test
 
+Don't commit the raw run directory — it contains a multi-MB snapshot blob.
+Export just the four small artifacts `verify` reads, and commit those:
+
 ```bash
-chidori verify research.ts "$RUN_ID"
+chidori export "$RUN_ID" --fixture tests/fixtures
+git add tests/fixtures
 ```
 
-`verify` replays the run with **no provider configured and a deny-all
-policy** and asserts it completes with byte-identical output. Exit code 0
-means the agent's behavior hasn't drifted from the recording. Commit
-`.chidori/runs/<run_id>/` to git and this is a full integration test of your
-agent — prompts, tool loop, approval gate and all — that costs $0 and runs in
-milliseconds in CI. See [Value Checkpoints](./value-checkpoints.md) for
-bounding replay cost as runs grow.
+Then, in CI:
+
+```bash
+chidori verify research.ts "$RUN_ID" --runs-dir tests/fixtures
+```
+
+`verify` replays the run with **no providers, no tools, and the `untrusted`
+policy profile** and asserts it completes with byte-identical output. Exit
+code 0 means the agent's behavior hasn't drifted from the recording — a
+full integration test of your agent, prompts, tool loop, approval gate and
+all, that costs $0 and runs in milliseconds. Full contract:
+[Replay as test](./replay.md#replay-as-test); see
+[Value Checkpoints](./value-checkpoints.md) for bounding replay cost as
+runs grow.
 
 ## Where next
 

@@ -42,15 +42,17 @@ tools, context, caching) are built in, replay is byte-identical with
 **zero** model calls (not a re-execution that calls the model again), and
 the runtime is one binary rather than a server + workers + queue. The
 [comparison table in the README](../README.md#️-how-chidori-compares) puts
-these side by side, and the
-[AI SDK gap analysis](./ai-sdk-gap-analysis.md) is an honest
+these side by side, and an engineering note in the repo, the
+[AI SDK gap analysis](./ai-sdk-gap-analysis.md) (GitHub), is an honest
 feature-by-feature comparison against Vercel's AI SDK.
 
 ### Where are my graphs and activity definitions?
 
 There aren't any. Orchestration is ordinary control flow in your handler,
-and every `await chidori.*` call is already a durable, replayable
-safepoint — you don't annotate steps or define activities. If you're
+and every `await chidori.*` call is already a safepoint — a host call where
+the run can pause, persist, and later resume
+([Core Concepts](./core-concepts.md)) — so you don't annotate steps or
+define activities. If you're
 reaching for a fan-out node, see
 [Common Patterns](./patterns.md) for what to use instead
 (`util.parallel`, `branch`, actors).
@@ -66,19 +68,19 @@ tools without crawling the source.
 ### What does a replay cost?
 
 Nothing. Replay re-executes your TypeScript, but every host call — every
-prompt, tool call, HTTP request — returns its recorded result from the call
-log. No provider is contacted and no tokens are billed. `chidori verify`
-enforces this posture (no provider configured, deny-all policy) and asserts
-byte-identical output ([Replay & Resume](./replay.md)).
+prompt, tool call, HTTP request — returns its recorded result from the
+journal. No provider is contacted and no tokens are billed. `chidori verify`
+enforces this posture (no providers, no tools, the `untrusted` profile) and
+asserts byte-identical output ([Replay & Resume](./replay.md)).
 
 ### What happens if I edit my agent after recording a run?
 
-Resume is divergence-checked: it rejects incompatible source hashes rather
-than silently replaying stale code. To deliberately replay a recorded run
-against edited code, pass `--allow-source-change` — edit-and-resume, still
-divergence-checked ([divergence rules](./replay.md)). In CI, `chidori verify` fails when
-behavior drifts from the recording — which is exactly what makes recordings
-useful as tests.
+Resume is divergence-checked: it refuses changed source rather than
+silently pairing recorded results with edited code; pass
+`--allow-source-change` to deliberately opt into edit-and-resume. The full
+divergence rules live in [Replay & Resume](./replay.md). In CI,
+`chidori verify` fails when behavior drifts from the recording — which is
+exactly what makes recordings useful as tests.
 
 ### Can agents use tools from MCP servers?
 
@@ -103,9 +105,10 @@ only happens if you configure it
 
 Set `CHIDORI_API_KEY` — bearer auth on everything except `GET /health`. It
 accepts a comma-separated list for zero-downtime key rotation, and SDK
-clients pass the same key (`{ apiKey }` / `api_key=`). Remember `serve` is
-deny-by-default for powerful effects: granting them in production is an
-explicit policy decision, not a flag you copy from a tutorial.
+clients pass the same key (`{ apiKey }` / `api_key=`). Remember bare
+`serve` runs the `untrusted` profile — powerful effects are refused, and
+granting them in production is an explicit policy decision, not a flag you
+copy from a tutorial ([CLI reference](./cli.md#approval-postures)).
 [Deployment](./deployment.md) has the full checklist, including recipes for
 a plain VM, Fly.io, and Kubernetes.
 
@@ -128,10 +131,10 @@ response and no network at all.
 
 ### My run fails in CI but works at my terminal
 
-`chidori run` **asks** for approval before powerful effects (network, tool
-calls, workspace writes) — and with no terminal to ask at, it **fails
-closed**. Pass `--trusted` in scripts and CI, or configure an explicit
-policy ([Running Modes](./running-modes.md)).
+`chidori run` asks for approval at the terminal before powerful effects and
+fails closed when there is no terminal to ask at — pass `--trusted` in
+scripts and CI, or configure an explicit policy
+([CLI reference](./cli.md#approval-postures)).
 
 ### My agent hangs waiting for input in a script
 

@@ -1,27 +1,33 @@
 ---
 title: "Replay & Resume"
-description: "The record/checkpoint/replay model: how resume works, what counts as divergence, and what keeps replay byte-identical."
+description: "The record/replay model: how resume works, what counts as divergence, and how a recorded run becomes a $0 CI test with export --fixture and verify."
 ---
 
 # How replay works
 
-![Animation: an original run executes prompt, tool, and http calls while recording each one into a numbered call log; the call log becomes a JSON checkpoint; replay re-runs the same code answering every host call from the log — identical output, zero LLM calls](../.github/record-replay.svg)
+![Animation: an original run executes prompt, tool, and http calls while recording each one into the numbered journal; replay re-runs the same code answering every host call from the journal — identical output, zero LLM calls](../.github/record-replay.svg)
 
-TypeScript durable runs use deterministic runtime policy plus cached host-call
-results. Given the same inputs, compatible source hashes, and the same cached
-results for host calls, agent control flow is expected to produce the same
-outputs.
+TypeScript durable runs use deterministic runtime policy plus recorded
+host-call results. Given the same inputs, compatible source hashes, and the
+same recorded results for host calls, agent control flow is expected to
+produce the same outputs.
 
-1. **Original run:** Every `prompt()`, `tool()`, `fetch()` call is logged with seq number + result.
-2. **Checkpoint:** The call log is a JSON array — save it to disk, send it over the wire, commit it to git.
-3. **Replay:** Re-run the agent with the call log pre-loaded. Each host function call checks the log for its seq number — hit returns the cached result instantly, miss executes normally.
+1. **Original run:** every `prompt()`, `tool()`, `fetch()` call is recorded
+   — sequence number plus result — in the journal (the run's call log), the
+   append-only `records.jsonl` file in the run directory
+   `.chidori/runs/<run_id>/`.
+2. **Persist:** the journal is written as the run executes, so whatever
+   already happened is on disk when the run pauses, crashes, or completes.
+3. **Replay:** re-run the agent with the journal loaded. Each host call
+   checks the journal at its sequence number — a hit returns the recorded
+   result instantly, a miss executes live.
 
 Replay is guarded, not best-effort:
 
 - **Source verification:** every resume surface (the server's resume/approve
   routes *and* `chidori resume`) verifies the agent's entry + module source
   fingerprints against the run's snapshot manifest before replaying, and
-  refuses on mismatch — cached results are never paired with changed code
+  refuses on mismatch — recorded results are never paired with changed code
   *silently*. (Runs persisted before manifests existed skip with a warning.)
 - **Edit-and-resume is an explicit opt-in:** pass `--allow-source-change` to
   `chidori resume` (or `"allow_source_change": true` on the server's
@@ -33,14 +39,14 @@ Replay is guarded, not best-effort:
   run's git-like source history, so the version that produced the journaled
   prefix and the version taking over both stay recoverable — inspect and
   diff them with `chidori history <run-id>`
-  ([`docs/source-history.md`](./source-history.md)).
+  ([Source History](./source-history.md)).
 - **Divergence checks compare arguments, not just names:** a replayed call
   must match the recorded call's function *and* arguments (the derived
-  `request_digest` field is ignored). A completed async host operation whose
+  `request_digest` field is ignored). A completed async host call whose
   recorded arguments differ from the re-executed call's is a hard divergence
   error instead of a silent live re-execution of the side effect.
 - **Escape hatch:** `CHIDORI_REPLAY_LAX=1` downgrades argument-level
-  divergence to a warning (serving the cached result / re-executing live,
+  divergence to a warning (serving the recorded result / re-executing live,
   the historical behavior). Function-name mismatches are always fatal.
 
 `chidori resume` carries the run's own configuration so recovery needs no
@@ -63,26 +69,57 @@ flag archaeology:
   concurrent driver of the same run dir.
 
 This means you can:
-- **Debug without spending money:** save a failing session, replay locally with breakpoints.
-- **Run deterministic tests:** check in a run directory, and `chidori verify
-  <agent.ts> <run_id>` asserts it still replays cleanly: no provider
-  configured, deny-all policy, no writes to the run directory, output must be
-  identical to the recorded one and every call must come from the journal
-  (top-level workspace effects re-materialize their recorded artifacts —
-  workspace state is real disk, not journal-served).
-  Exit 0 on pass — a full integration test that costs $0 and runs in
-  milliseconds, built for CI. A full run directory is heavy (the runtime
-  snapshot blob alone can run to tens of MB), so don't commit it raw:
-  `chidori export <run_id> --fixture tests/fixtures` copies just the four
-  artifacts `verify` reads (`records.jsonl`, `runtime.snapshot.json`,
-  `output.json`, `input.json`) into `tests/fixtures/<run_id>/` — typically
-  a few KB. Commit that, and point verify at it with
-  `chidori verify agent.ts <run_id> --runs-dir tests/fixtures`. Export
-  refuses runs whose journal isn't a complete verifiable record (still
-  leased by a live process, paused at a pending operation, or never
-  completed).
-- **Resume after crashes:** the runtime can persist checkpoints after each call; on restart, replay picks up where it left off.
-- **Pause for human approval:** `input()` suspends execution; when the human responds, the agent replays to that point and continues.
+
+- **Debug without spending money:** save a failing session, replay locally
+  with breakpoints.
+- **Iterate for free:** `chidori dev agent.ts` is the edit-and-replay loop
+  as a command — it watches the file and re-runs on every save, replaying
+  recorded calls from the journal so edits cost zero tokens.
+- **Run deterministic tests:** a recorded run is a $0 CI test — see
+  [Replay as test](#replay-as-test) below.
+- **Resume after crashes:** the journal persists after each host call; on
+  restart, replay picks up where it left off.
+- **Pause for human approval:** `input()` suspends execution; when the human
+  responds, the agent replays to that point and continues.
+
+## Replay as test
+
+A recorded run is a complete, deterministic specification of your agent's
+behavior — commit one and assert against it in CI.
+
+Don't commit the raw run directory: it is heavy (the runtime snapshot blob
+alone can run to tens of MB). Instead,
+`chidori export <run_id> --fixture tests/fixtures` copies just the four
+artifacts `verify` reads (`records.jsonl`, `runtime.snapshot.json`,
+`output.json`, `input.json`) into `tests/fixtures/<run_id>/` — typically a
+few KB. Export refuses runs whose journal isn't a complete verifiable
+record (still leased by a live process, paused at a pending host call, or
+never completed).
+
+```bash
+chidori export <run_id> --fixture tests/fixtures             # once, after recording
+git add tests/fixtures
+chidori verify agent.ts <run_id> --runs-dir tests/fixtures   # in CI
+```
+
+`chidori verify` replays the run in the strictest posture: no providers
+configured, no tools registered, the `untrusted` policy profile, and no
+`--allow-source-change` escape. It exits 0 on pass and 1 on any failure,
+with a distinct message for each cause: source drift, an unclean replay, a
+run that pauses instead of completing, unexpected live calls, or output
+that isn't byte-identical.
+
+One caveat: workspace state is real disk, not journal-served, so top-level
+journaled workspace writes *do* re-materialize their recorded artifacts
+during verify — the same bytes, with a fresh mtime. Everything else replays
+without touching the world, and nothing is written to the run directory
+itself.
+
+When you need a machine-readable result rather than pass/fail,
+`chidori resume <agent.ts> <run_id> --ci` replays and emits a JSON report,
+with distinct exit codes: 0 on match, 3 on divergence, 1 on error. Flags
+and exit codes for both commands:
+[CLI reference](./cli.md#replay-resume-and-testing).
 
 ## Replaying from an SDK
 
@@ -115,7 +152,7 @@ from chidori import AgentClient, Checkpoint
 client = AgentClient("http://localhost:8080")
 cp = Checkpoint.load("/tmp/session.json")
 
-# Replay: re-executes the agent but returns cached host-call results
+# Replay: re-executes the agent but returns recorded host-call results
 replayed = client.replay(cp)
 assert replayed.output == session.output  # identical output
 ```
