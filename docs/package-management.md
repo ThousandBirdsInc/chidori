@@ -66,7 +66,7 @@ Environment overrides:
    top of `node_modules`, shared transitive dependencies hoist to the top, and
    version conflicts nest under their dependent
    (`node_modules/a/node_modules/b`). The plan is exactly what the runtime's
-   Node-style resolver (`runtime/typescript/resolver.rs`) expects to walk.
+   Node-style module resolver expects to walk.
 3. **Fetch.** Only store misses are downloaded (up to 8 tarballs
    concurrently), verified, and extracted into the store atomically (temp dir
    + rename, so racing installs can't corrupt an entry).
@@ -152,7 +152,7 @@ three cliffs, concretely:
 
    How faithful each shim is, is measured — not asserted: a vendored subset
    of Node core's own test suite runs against the shims in CI, with per-file
-   results in [`docs/node-compat-report.md`](node-compat-report.md).
+   results in the [Node Compatibility Report](./node-compat-report.md).
 3. **No native addons.** There is no node-gyp build step (lifecycle scripts
    never run) and no way to load a `.node` binary. Packages that depend on
    `node-gyp-build`, `prebuild-install`, `bindings`, etc. cannot work, even
@@ -169,19 +169,19 @@ each added package for these three cliffs and prints a `warning:` when it
 finds one (no ESM build, native-addon markers, imports of unprovided
 builtins). The scan is a bounded heuristic: it can miss dynamically computed
 specifiers, so a quiet `add` is strong — not perfect — evidence of
-compatibility. `chidori check agent.ts` gives the definitive answer for
-static imports: it resolves the agent's full module graph — local files,
+compatibility. `chidori check agent.ts` (see the [CLI](./cli.md)) gives the
+definitive answer for static imports: it resolves the agent's full module graph — local files,
 node_modules packages (minified dist files included), re-export edges,
 builtin shims — with the same resolver the runtime uses, so a package that
 cannot load fails `check` with the importing file and line. (Dynamic
 `import()` inside a dependency's lazy path is only policy-checked at the
 moment it executes.)
 
-## Out of scope (v1) and why
+## Not supported (and why)
 
-- **Lifecycle scripts** — by design, see above. Not "not yet": running
-  arbitrary registry-supplied shell on `install` is incompatible with
-  chidori's sandbox posture.
+- **Lifecycle scripts** — by design, see above: running arbitrary
+  registry-supplied shell on `install` is incompatible with chidori's sandbox
+  posture.
 - **`node_modules/.bin` linking** — chidori doesn't execute package binaries;
   there's no Node process to run them.
 - **git / file / workspace / `npm:` alias dependencies** — not resolvable
@@ -190,8 +190,8 @@ moment it executes.)
   with a warning instead of blocking the project: `add`/`install`/`remove`
   proceed for everything else, package.json keeps the entry verbatim, and a
   `node_modules` entry another tool materialized for it is never pruned.
-- **Full CommonJS emulation (`require`)** — would need a synchronous module
-  linker path in the engine; revisit if real agent dependencies demand it.
+- **Full CommonJS `require` emulation** — not supported; ESM imports cover
+  the supported surface (leaf CJS files load as described above).
 - **Auto-installed peer dependencies** — warned instead; install explicitly.
 
 ## Comparison notes (bun, pnpm)
@@ -204,9 +204,10 @@ lockfile. Capabilities those toolchains have that chidori intentionally does
 
 - **Sandboxed execution of untrusted packages** (`bunx`-style exec modes):
   chidori already has a stronger equivalent at the runtime layer — the
-  deny-by-default `--untrusted` policy profile and OS-level `--isolate`
-  process sandbox apply to *all* agent code, packages included, not just a
-  special exec mode.
+  deny-by-default `untrusted` profile (`--untrusted`, see the
+  [CLI](./cli.md)) and the OS-level `--isolate` process sandbox (see the
+  [Sandbox Model](./sandbox-model.md)) apply to *all* agent code, packages
+  included, not just a special exec mode.
 - **Parse-once toolchain** (one AST feeding runtime/linter/formatter): chidori
   already parses with oxc once per module on the load path; lint/format are
   editor/CI concerns out of chidori's scope.

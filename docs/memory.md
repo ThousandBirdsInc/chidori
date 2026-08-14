@@ -1,20 +1,19 @@
 ---
 title: "Memory"
-description: "chidori.memory: a persistent cross-run key-value store \u2014 namespacing, on-disk anchoring, replay semantics."
+description: "chidori.memory: a persistent cross-run key-value store — namespacing, on-disk anchoring, replay semantics."
 ---
 
 # Memory — persistent key-value storage across runs
 
 > `chidori.memory` is a small, namespaced, JSON key-value store that persists
 > **across runs** — the place for what an agent learns in one session and
-> should remember in the next. **Related:** `docs/core-concepts.md`,
-> `docs/replay.md`, `docs/value-checkpoints.md`. API reference: `llm.txt`.
-> Implementation: `crates/chidori/src/runtime/memory.rs`,
-> `crates/chidori/src/runtime/typescript/bindings.rs` (`memory_base`).
-> Example: `examples/release-notes-concierge/agent.ts` (the house-style
-> pattern).
+> should remember in the next. **Related:** [Core Concepts](./core-concepts.md),
+> [Replay & Resume](./replay.md), [Value Checkpoints](./value-checkpoints.md),
+> [Durable Storage](./durable-storage.md). API reference:
+> [Host API](./host-api.md). Example:
+> `examples/release-notes-concierge/agent.ts` (the house-style pattern).
 
-## 1. What this is
+## What this is
 
 Runs are durable, but a run's journal belongs to *that run*. `chidori.memory`
 is the store that outlives the run: JSON values keyed by string, anchored to
@@ -32,24 +31,27 @@ The canonical pattern (from `examples/release-notes-concierge`): at the end of
 a session, distill what the human's feedback taught the agent and `set` it;
 at the start of the next session, `get` it and fold it into the system prompt.
 
-## 2. API
+## API
 
-Every method takes a trailing `options` object accepting `namespace`
-(default `"default"`); `list` also accepts `prefix`.
+Every method takes a trailing `options` object; the options are exactly
+`namespace` (default `"default"`) and, on `list` only, `prefix`.
 
 - `set(key, value, options?)` → `null`. `value` is any JSON-compatible value.
 - `get(key, options?)` → the stored value, or `null` when the key is absent.
-- `delete(key, options?)` → `true` if the key existed, else `false`.
-- `list(options?)` → `[{ key, value }, …]`; with `prefix`, only keys starting
-  with that prefix.
+- `delete(key, options?)` → resolves to whether the key existed: `true` if it
+  did, else `false`.
+- `list(options?)` → an array of `{ key, value }` entries; with `prefix`, only
+  entries whose keys start with that prefix.
 - `clear(options?)` → `null`; empties the namespace (the file remains, as
   `{}`).
 
 Namespaces isolate stores: `get("k", { namespace: "per-user" })` never sees
-the default namespace's `k`. Namespace names are sanitized for the filesystem
-— any character outside `[A-Za-z0-9_-]` becomes `_`.
+the default namespace's `k`. Each namespace is its own file,
+`.chidori/memory/<namespace>.json`, anchored to the workspace root (below).
+Namespace names are sanitized for the filesystem — any character outside
+`[A-Za-z0-9_-]` becomes `_`.
 
-## 3. Where it lives on disk
+## Where it lives on disk
 
 Each namespace is one pretty-printed JSON object at:
 
@@ -71,24 +73,21 @@ So memory is **anchored to the agent, like runs and workspace files**:
 running the same agent from a different working directory sees the same
 store, and two different agent directories are two independent stores.
 
-## 4. Record vs. replay
+## Record vs. replay
 
-Every memory action is a durable `memory` host call in the run's journal:
+Every memory action is a journaled `memory` host call. Live, the action
+executes against the JSON file (a whole-file load → mutate → save for writes)
+and its result is journaled; on replay, the journaled result is returned and
+the store is **not touched** — a replayed `get` returns the value as it was at
+recording time even if the file has changed since, and a replayed `set` does
+not re-write the file ([Replay & Resume](./replay.md)). Only live continuation
+past the recorded frontier hits the store again.
 
-- **Live**, the action executes against the JSON file (a whole-file
-  load → mutate → save for writes) and its result is recorded.
-- **On replay** (`chidori resume`, `chidori verify`, server replay), the
-  recorded result is returned and the store is **not touched** — no file is
-  read or written. A replayed `get` returns the value as it was at recording
-  time even if the file has changed since; a replayed `set` does not re-write
-  the file. Only live continuation past the recorded frontier (crash
-  recovery's new work) hits the store again.
+Memory calls are never policy-gated: they behave the same under the
+`supervised` profile (the bare `chidori run` default), the `untrusted`
+profile, and `--trusted` — see the [CLI reference](./cli.md).
 
-Memory is a *pure* effect for policy purposes: it is never policy-gated, so
-it works identically under `--trusted`, ask-mode, and the `untrusted`
-profile.
-
-## 5. Concurrency
+## Concurrency
 
 Writes are whole-file read-modify-write with **no cross-process locking**.
 Within a single run, host calls execute one at a time, so an agent's own
@@ -100,11 +99,15 @@ lessons, per-user notes under distinct keys or namespaces); use
 [signals/mailboxes](./signals.md) or [actor messages](./actors.md) for
 cross-agent coordination.
 
-## 6. Memory vs. its neighbors
+## Memory vs. its neighbors
+
+This table is the canonical boundary map for Chidori's state surfaces — the
+other state pages link here rather than restating it.
 
 | Store | Scope | For |
 |---|---|---|
 | `chidori.memory` | The agent, across all runs | What the agent has learned; small JSON state |
 | `chidori.workspace` | The project directory, across runs | Deliverable files (documents, code) — policy-gated |
-| `chidori.step` | One run's journal | Memoizing expensive pure compute within a run ([value checkpoints](./value-checkpoints.md)) |
-| Run journal | One run | Every recorded effect; replay/resume ([replay](./replay.md)) |
+| `chidori.step` | One run's journal | Memoizing expensive pure compute within a run ([Value Checkpoints](./value-checkpoints.md)) |
+| Run journal | One run | Every journaled host call; replay/resume ([Replay & Resume](./replay.md)) |
+| Run store | The `.chidori/runs/` tree, plus an optional durable mirror | Where the journal's bytes physically live — backends, hydration, machine-loss survival ([Durable Storage](./durable-storage.md)) |

@@ -1,6 +1,6 @@
 ---
 title: "Core Concepts"
-description: "Agents, host functions, and the mental model: the chidori.* surface, tools, streaming, and prompt caching."
+description: "Agents, host functions, and the shared vocabulary: the chidori.* surface, the journal, safepoints, tools, streaming, and prompt caching."
 ---
 
 # Core concepts: agents & host functions
@@ -13,6 +13,22 @@ effects through the `chidori` object — agents never touch the outside world
 directly, so the runtime sees and records everything. See the
 [Host API Reference](./host-api.md) for every method option by option
 (shipped in the repo as [`llm.txt`](../llm.txt) for LLM consumption).
+
+## Vocabulary
+
+The terms the rest of the docs lean on:
+
+| Term | Meaning |
+|---|---|
+| **host function** | A `chidori.*` API the agent calls. |
+| **host call** | One recorded effect flowing through the runtime — an entry in the journal. Host functions make host calls. |
+| **journal** | The run's call log: the append-only record of its host calls, stored as `records.jsonl` in the run directory `.chidori/runs/<run_id>/`. |
+| **safepoint** | Every host call is one — a moment where the run can pause, persist, and later resume. |
+| **snapshot** | The runtime snapshot blob (`runtime.snapshot.json`), used to accelerate resume. |
+| **value checkpoint** | A `chidori.step` result memoized in the journal. |
+| **replay** | Re-executing an agent against a completed journal — $0, byte-identical. |
+| **resume** | Re-executing against a journal that ends at a pause or crash, then continuing live. |
+| **run** / **session** | A run is one recorded execution. A session is a run served over HTTP under `chidori serve` — a session id is a run id. |
 
 ## Host functions
 
@@ -28,9 +44,13 @@ directly, so the runtime sees and records everything. See the
 | `chidori.branch(variants)` | Fork the run into per-strategy sub-runs from the current state; returns every outcome for comparison ([details](./branching-execution.md)) |
 | `chidori.actors.spawn(source, input, options)` | Start an agent module as a supervised, addressable, concurrent actor process with a durable mailbox and restart policy; returns a handle with `send`/`join`/`stop`/`status` ([details](./actors.md)) |
 | `chidori.actors.send(to, name, payload)` | Deliver a named message to an actor (pid or registered name) or to `"parent"` (the sender's spawner); never blocks |
-| `chidori.receive(names, options)` | Blocking in-place message consumption from the caller's mailbox (fan-in via an array; `timeoutMs` resolves to the timeout sentinel) |
-| `chidori.actors.join(target, options)` / `chidori.actors.stop(target, options)` | Settle an actor (owner-only): wait for its supervision loop, fold its records into this run's log, return `{ status, output?, error?, restarts }` |
-| `chidori.actors.status(target)` / `chidori.actors.lookup(name)` | Lifecycle snapshot / name-registry lookup (a handle, or `null`) |
+| `chidori.actors.join(target, options)` / `chidori.actors.stop(target, options)` | Settle an actor (owner-only): wait for its supervision loop, fold its records into this run's journal, return `{ status, output?, error?, restarts }` |
+| `chidori.actors.status(target)` / `chidori.actors.lookup(name)` | Point-in-time lifecycle view / name-registry lookup (a handle, or `null`) |
+| `chidori.receive(names, options)` | Top-level (not under `chidori.actors`) — blocking in-place message consumption from the caller's mailbox (fan-in via an array; `timeoutMs` resolves to the timeout sentinel) |
+| `chidori.agents.spawn(source, input, options)` (+ `send`/`status`/`join`/`stop`/`lookup`) | Launch a detached durable agent — its own run id and journal, a registered name, a hibernate/wake lifecycle; it outlives the spawner ([details](./detached-agents.md)) |
+| `chidori.alarm(ms)` | Durable timer — hibernate until the deadline, then resolve to the timeout sentinel `{ timedOut: true }`; survives process restarts |
+| `chidori.compensation.register(name, agent, input?)` | Arm a saga compensation: durably record an inverse action (agent module + input) for [`chidori rollback`](./cli.md#branching--recovery) to run if the run stops short |
+| `chidori.appData.write(sql, params)` / `chidori.appData.query(sql, params)` | Host-brokered SQL against a run-bound app-data cluster — params bound server-side; the agent never holds a credential |
 | `chidori.input(msg, options)` | Human-in-the-loop — pauses execution |
 | `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued; `timeoutMs` resolves to a `{ timedOut: true }` sentinel after the deadline |
 | `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
@@ -38,7 +58,7 @@ directly, so the runtime sees and records everything. See the
 | `chidori.memory.set/get/delete/list/clear` | Persistent key-value storage, namespaced on disk under the agent's `.chidori/memory/` (anchored to the workspace root, like runs; `CHIDORI_MEMORY_DIR` overrides) ([details](./memory.md)) |
 | `chidori.workspace.{list,read,write,delete,manifest}` | Shared workspace files under the run's workspace root — policy-gated, recorded like every other effect |
 | `chidori.log(msg, data)` | Structured logging |
-| `chidori.mark(label, data)` | Record a labelled trace marker in the call log (the durable *value* checkpoint is `chidori.step`) |
+| `chidori.mark(label, data)` | Record a labelled trace marker in the journal (the durable *value* checkpoint is `chidori.step`) |
 | `chidori.step(name, fn)` | Durable value checkpoint — run pure compute once, journal the result, never re-pay it on replay/resume |
 | `chidori.util.retry(fn, options)` | Retry with backoff (in-VM helper) |
 | `chidori.util.tryCall(fn)` | Capture errors without raising (in-VM helper) |
@@ -92,7 +112,7 @@ approves blind.
 There is no `chidori.http`. Networking is done with the **standard web/Node
 APIs** — `fetch` (plus `Headers`/`Request`/`Response`) and the
 `node:http`/`node:https` client modules — which the runtime replaces with
-captured versions backed by a single policy-gated host op. Because the capture
+captured versions backed by a single policy-gated host call. Because the capture
 lives at the base networking layer, every request inherits the same security
 policy (allow / ask / deny), approval-pause, and deterministic record/replay —
 including requests made deep inside a dependency:
@@ -106,10 +126,10 @@ const res = await fetch("https://example.com/search", {
 const data = await res.json();
 ```
 
-See also [`docs/signals.md`](./signals.md) for the multiplayer signal model,
-[`docs/actors.md`](./actors.md) for the actor process model,
-[`docs/value-checkpoints.md`](./value-checkpoints.md) for `chidori.step`, and
-[`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md)
+See also [Signals](./signals.md) for the multiplayer signal model,
+[Actors](./actors.md) for the actor process model,
+[Value Checkpoints](./value-checkpoints.md) for `chidori.step`, and
+[Captured Effects, VFS, Crypto & Timers](./captured-effects-vfs-crypto-timers.md)
 for the captured networking/filesystem/crypto/timer model.
 
 ## Streaming prompt progress
@@ -148,16 +168,17 @@ Cache effectiveness is measurable: prompt records and OTEL spans carry
 `cache_creation`/`cache_read` token counts, and `total_cost_usd` prices them
 at the provider's cached rates. Caching never changes results — replay returns
 recorded results and pays zero tokens either way. See
-[`docs/context-management.md`](./context-management.md).
+[Context Management](./context-management.md).
 
 When a conversation outgrows the window, `await ctx.compact({ budgetTokens })`
 is the explicit (never automatic) escape valve: it folds the older turns into
 one durable summary segment via a recorded prompt call — so it replays
 deterministically — and keeps the stable head and newest turns verbatim under
 a fresh cache breakpoint. And setting `CHIDORI_PROMPT_CACHE_DIR=<dir>` opts
-into a local content-addressed response cache: an exact repeat of a prompt,
-even across runs, is served locally without calling the provider and still
-recorded as a normal call-log entry.
+into a local response cache — content-addressed files on disk, shared by
+every run and process pointed at the same directory: an exact repeat of a
+prompt is served locally without calling the provider and still recorded as
+a normal journal entry.
 
 ## Conversational agents
 

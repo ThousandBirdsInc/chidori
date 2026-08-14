@@ -281,7 +281,7 @@ the approval model.)
 
 For a guided walkthrough — inspecting a run, the demo picker, and the
 human-in-the-loop pause/resume loop — see
-[**Getting started & demos**](./docs/getting-started.md).
+[**Getting Started**](./docs/getting-started.md).
 
 ## 🧰 What You Can Build
 
@@ -422,7 +422,7 @@ cd website && npm install && npm run dev
 
 | Topic | What's there |
 |---|---|
-| [Getting started & demos](./docs/getting-started.md) | Demo picker, inspecting a run, human-in-the-loop walkthrough, example agents |
+| [Getting Started](./docs/getting-started.md) | Install, scaffold and run your first agent, inspect a durable run, pause/resume walkthrough |
 | [Your first agent](./docs/your-first-agent.md) | Fifteen-minute tutorial: write an agent, pause it for approval, replay it for $0, check it into CI |
 | [Common patterns](./docs/patterns.md) | Task-oriented recipes: approval gates, tool loops, fan-out, webhooks, scheduled agents, checkpoint tests |
 | [FAQ](./docs/faq.md) | Python support, Node, providers, comparisons, data locality, troubleshooting |

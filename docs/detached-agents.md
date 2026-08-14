@@ -5,14 +5,15 @@ description: "Durable, addressable, hibernating agent processes that outlive the
 
 # Detached agents: durable, addressable, hibernating processes
 
-`chidori.agents.spawn` starts an agent module as a **detached durable
-process** — the durable-object-shaped sibling of an in-run actor
-(`docs/actors.md`). Where an actor lives inside its spawning run (its records
-fold into the parent journal at a join; ending the run discards unjoined
-work), a detached agent is **its own durable run**: its own journal under
-`.chidori/runs/<run_id>/`, a registered name that outlives the spawner, a
-durable mailbox any party can deliver into (agents, later runs, HTTP
-clients), a runtime-owned restart policy, and a hibernate/wake lifecycle.
+A **detached agent** is a long-lived, named agent process that the runtime
+supervises outside any one run or session. It is its own durable run — its own
+journal under `.chidori/runs/<run_id>/` — with a registered name that outlives
+whoever spawned it, a durable mailbox any party can deliver into (other
+agents, later runs, HTTP clients), a runtime-owned restart policy, and a
+hibernate/wake lifecycle. `chidori.agents.spawn` starts one; where an
+[actor](./actors.md) lives inside its spawning run (its records fold into the
+parent journal at a join; ending the run discards unjoined work), a detached
+agent keeps existing after the spawning run returns.
 
 ```ts
 import { chidori, run } from "chidori:agent";
@@ -49,48 +50,55 @@ run(async () => {
 ## The model
 
 **A detached agent is a durable run with a name.** The spawning run's journal
-records only the `spawn_agent` / `send_agent` / `join_agent` host calls —
-one durable record each, replayed from cache like everything else. The
-agent's own effects live in its own journal, under its own run id, its own
-deterministic policy seed, and its own persistence handle (including any
-configured durable mirror — `docs/durable-storage.md`). There is no
-fold-at-join and no sequence-range carve-out: the two journals are simply
-separate runs that talk.
+records only the spawn/send/join host calls — one durable record each,
+replayed from cache like everything else. The agent's own effects live in its
+own journal, under its own run id and its own persistence handle (including
+any configured durable mirror — see [Durable Storage](./durable-storage.md)).
+There is no fold-at-join: the two journals are simply separate runs that talk.
 
 **Hibernation holds nothing.** When the agent reaches a
 `chidori.signal(name)` / `chidori.alarm(ms)` listen point with an empty
-mailbox, the standard pause unwinds the VM; the supervisor persists the
-listen state (names, pending seq, deadline) into the agent's registry entry
-and the thread exits. A hibernating agent costs zero threads and zero
-memory. A matching delivery — or the alarm deadline — re-enters the module
-under resume-by-replay: recorded effects return from cache and execution
-goes live at the listen frontier.
+mailbox, the standard pause unwinds the VM; the runtime persists the listen
+state (names, pending position, any deadline) into the agent's durable
+descriptor and the thread exits. A hibernating agent costs zero threads and
+zero memory. A matching delivery — or the alarm or `timeoutMs` deadline,
+which **is enforced in-process** for a detached agent — re-enters the module
+under resume-by-replay: recorded effects return from cache and execution goes
+live at the listen frontier.
 
-**The registry is durable.** Every lifecycle transition persists the agent's
-descriptor to `<run_base>/agents/<name>.json` (and the durable mirror's
-registry). At boot, `chidori serve` re-arms the whole fleet from the
-registry: agents that were mid-run when the previous process died are woken
-(resume-by-replay continues at the frontier), and hibernating agents'
-alarm deadlines are re-armed. This is what makes a detached agent survive a
-server restart — or, with a durable mirror, machine replacement.
+**The registry is durable — and it is what survives restarts.** On disk, the
+fleet lives in three places, all inside your project's `.chidori/`:
 
-**Leases prevent double-drivers — and dead drivers don't wedge agents.**
-Before executing, the supervisor takes the agent run's lease (`lease.json`,
-TTL 5 minutes, renewed per iteration) and releases it on hibernate/settle. A
-wake that finds the lease held **waits for it**: a live holder keeps
-renewing (so the waiter stands down to the genuine driver), while a dead
-node's lease expires unrenewed and transfers. A once-a-second reconciler
-(the same thread that arms alarm deadlines) additionally re-drives any
-`running` agent that has no worker thread, so an agent whose driver died —
-including one killed mid-first-execution before it ever hibernated — is
-picked back up instead of sitting `running` forever. A queued `send` to
-such an agent also wakes it directly.
+- the **registry descriptor**, `.chidori/runs/agents/<name>.json` — a sibling
+  of the run directories, one file per named agent;
+- a copy of the descriptor inside the agent's own run directory
+  (`agent.json`);
+- the agent's **signal inbox**, `<run dir>/signals/inbox.json`.
+
+All of it mirrors to the configured run-store backend
+([Durable Storage](./durable-storage.md)). At boot, `chidori serve` re-arms
+the whole fleet from the **registry** — merged with the backend's copy, with
+the local registry winning where they disagree: agents that were mid-run when
+the previous process died are woken (resume-by-replay continues at the
+frontier), and hibernating agents' alarm and timeout deadlines are re-armed.
+This is what makes a detached agent survive a server restart — or, with a
+durable backend, machine replacement.
+
+**One driver at a time — and dead drivers don't wedge agents.** Before
+executing, the runtime takes a short-lived, regularly renewed lease on the
+agent's run and releases it on hibernate/settle. A wake that finds the lease
+held waits for it: a live holder keeps renewing (so the waiter stands down to
+the genuine driver), while a dead process's lease expires unrenewed and
+transfers. The server also periodically re-drives any `running` agent that has
+no worker thread, so an agent whose driver died — including one killed before
+it ever hibernated — is picked back up instead of sitting `running` forever.
+A queued `send` to such an agent also wakes it directly.
 
 **Status tells the truth about liveness.** `status()` /
 `GET /agents/detached/{name}` include `live: boolean` — whether a worker
 thread in this process is executing the agent right now. `status:
-"running", live: false` means the driver died and the reconciler will
-re-drive it, not that work is happening.
+"running", live: false` means the driver died and the server will re-drive
+it, not that work is happening.
 
 ## API
 
@@ -98,16 +106,25 @@ re-drive it, not that work is happening.
 
 ```ts
 const svc = await chidori.agents.spawn(source, input?, {
-  name?: string,          // registry name; generated when omitted
+  name?: string,          // registry name; generated when omitted.
+                          // Allowed characters: letters, digits, "-", "_", "."
   restart?: "never" | "clean" | "resume",   // default "resume"
   maxRestarts?: number,   // default 3
   backoffMs?: number,     // base restart delay, doubles per attempt; default 0
   model?: string,         // default model for the agent's prompts; defaults to
                           // the spawner's resolved model and travels with the
-                          // agent's descriptor across wakes and restarts
+                          // agent's durable descriptor across wakes and restarts
 });
 // → handle { name, runId, send(), join(), stop(), status() }
 ```
+
+These options are deliberately **not** the same as `chidori.actors.spawn`:
+`restart` defaults to `"resume"` (a service should come back) rather than
+`"never"`; `model` is a top-level option rather than part of an `intercept`;
+and there is no `intercept` and no `idleTimeoutMs` — a detached agent is not a
+scoped child of its spawner, and hibernating on an empty mailbox is its normal
+state, not a leak to cap. See the side-by-side comparison in
+[Host API](./host-api.md).
 
 Requires persistence (detached agents *are* durable runs). A live agent
 squats on its name; a settled one may be replaced by a fresh spawn — and
@@ -124,11 +141,11 @@ await chidori.agents.send("inbox-triager", "email", payload);
 // → { delivered: boolean }    (false once the agent has settled)
 ```
 
-Deliveries are durable (the agent's `signals/inbox.json`) and write-through
-to a live agent's in-memory mailbox. A hibernating agent is woken only by a
-name in its listen set; other messages queue for later listen points. Inside
-the agent, messages are consumed with the ordinary listen verbs
-(`chidori.signal`, `chidori.receive`, `pollSignal`).
+Deliveries are durable (they land in the agent's signal inbox on disk) and
+write through to a live agent's in-memory mailbox. A hibernating agent is
+woken only by a name in its listen set; other messages queue for later listen
+points. Inside the agent, messages are consumed with the ordinary listen verbs
+(`chidori.signal`, `chidori.receive`, `chidori.pollSignal`).
 
 ### agents.join / stop / status / lookup
 
@@ -136,7 +153,7 @@ the agent, messages are consumed with the ordinary listen verbs
 await svc.join({ timeoutMs: 30000 });
 // → { name, runId, status, output?, error?, restarts, waitingFor?, deadline? }
 await svc.stop();       // cooperative: a live LLM call finishes first
-await svc.status();     // point-in-time snapshot, never blocks
+await svc.status();     // point-in-time view, never blocks
 await chidori.agents.lookup("inbox-triager");   // handle or null
 ```
 
@@ -151,17 +168,21 @@ with guidance rather than hanging.
 const fired = await chidori.alarm(24 * 60 * 60 * 1000);   // { timedOut: true }
 ```
 
-A durable timer, lowered onto the signal machinery: a listen on the reserved
+A durable timer, built on the signal machinery: a listen on the reserved
 name `__chidori.alarm__` with the delay as its timeout. In a detached agent
-the alarm **hibernates** the agent and the supervisor's timer wakes it at
-the deadline — surviving process restarts, because the deadline rides the
-registry descriptor. In a server session the existing signal-timeout
-machinery arms it (and re-arms after a server restart). At-least-once: a
-wake that finds the deadline passed fires immediately.
+the alarm **hibernates** the agent and the runtime's timer wakes it at the
+deadline — surviving process restarts, because the deadline rides the durable
+descriptor. In a server session the signal-timeout machinery arms it (and
+re-arms after a server restart) — see
+[Signals](./signals.md#timeoutms) for where deadlines are and are not
+enforced. At-least-once: a wake that finds the deadline passed fires
+immediately.
 
 ## Restart strategies
 
-Same table as actors, applied to the agent's own durable journal:
+Detached agents use the same three strategies as [actors](./actors.md),
+applied to the agent's own durable journal — but the default is `resume`, not
+`never`:
 
 | Strategy | On iteration failure |
 |---|---|
@@ -173,21 +194,22 @@ Same table as actors, applied to the agent's own durable journal:
 
 ```
 GET  /agents/detached               → registry listing
-GET  /agents/detached/{name}        → status snapshot
+GET  /agents/detached/{name}        → status view
 POST /agents/detached/{name}/send   → { name, payload } — deliver + wake
 POST /agents/detached/{name}/stop   → cooperative stop
 ```
 
-`send` is how external systems talk to a hibernating fleet: a webhook
-handler POSTs to the agent's mailbox and the server wakes it, runs it to its
-next hibernate point, and goes back to holding nothing.
+The full HTTP endpoint reference lives in
+[Running Modes](./running-modes.md). `send` is how external systems talk to a
+hibernating fleet: a webhook handler POSTs to the agent's mailbox and the
+server wakes it, runs it to its next hibernate point, and goes back to
+holding nothing.
 
 **Fleet-only serving.** `chidori serve` without an agent file hosts *just*
-the fleet: it re-arms every registered agent from `.chidori/runs/` in the
-current directory and exposes the `/agents/detached/*` endpoints; session
-requests must then name an agent per request (the `agent` field) or are
-rejected with guidance. Use it when the only thing to run is a fleet a
-previous `chidori run` spawned:
+the fleet: it re-arms every agent in the current directory's registry and
+exposes the `/agents/detached/*` endpoints; session requests must then name
+an agent per request (the `agent` field) or are rejected with guidance. Use
+it when the only thing to run is a fleet a previous `chidori run` spawned:
 
 ```bash
 chidori serve --port 8080          # no FILE: fleet-only
@@ -206,7 +228,7 @@ chidori serve --port 8080          # no FILE: fleet-only
   (`chidori serve`, or any run that sends to them) resumes them. A server is
   the natural home for a fleet.
 - **Interactive pauses settle as `paused`.** `chidori.input()` and policy
-  approvals inside a detached agent have no interactive counterpart yet; the
+  approvals inside a detached agent have no interactive counterpart; the
   agent settles as `paused` with the prompt in its status.
 - **At-least-once around crashes.** A crash between an effect and its
   recording re-executes that effect on wake (the same window every replay

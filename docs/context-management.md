@@ -8,12 +8,12 @@ description: "Immutable prompt contexts, provider prompt caching, explicit windo
 > Provider prompt caching, the `chidori.context` builder, the
 > `chidori.conversation` wrapper, window compaction, and the local
 > content-addressed prompt cache — on by default where noted below.
-> **Related:** `docs/signals.md`, `docs/branching-execution.md`,
-> `docs/captured-effects-vfs-crypto-timers.md`, `docs/architecture.md`.
-> API reference: `sdk/typescript/src/agent.ts`, `llm.txt`. Example:
-> `examples/agents/context_qa.ts`.
+> **Related:** [Memory](./memory.md), [Value Checkpoints](./value-checkpoints.md),
+> [Signals](./signals.md), [Branching Execution](./branching-execution.md).
+> API reference: [Host API](./host-api.md) (`llm.txt` is the LLM-consumable
+> copy). Example: `examples/agents/context_qa.ts`.
 
-## 1. What this is
+## What this is
 
 Chidori gives agents a first-class way to **manage the context they push into an
 LLM prompt** — one that is:
@@ -28,24 +28,26 @@ There are three layers, each usable on its own:
 1. **Automatic provider prompt caching.** Every `chidori.prompt` and every turn
    of the native tool-use loop marks its stable head (system + tools +
    conversation prefix) with provider cache breakpoints by default. No author
-   change is required to get the discount. (§4)
+   change is required to get the discount. See
+   [Provider prompt caching](#provider-prompt-caching).
 2. **`chidori.context`** — an immutable, content-addressed, turn-structured value
    you build up (`.system()`, `.tools()`, `.doc()`, `.user()`, `.assistant()`)
    and then `.prompt()` against. Appending a turn returns a *new* handle that
    structurally shares the prefix, so the stable head is laid out once and reused
-   across every turn, tool-use round, and branch fork. (§2, §3)
+   across every turn, tool-use round, and branch fork.
 3. **`chidori.conversation`** — a small stateful wrapper over `Context` for the
    common chat shape, plus opt-in **window compaction** (`.compact()`) and an
-   opt-in **local content-addressed prompt cache**. (§3.3, §5, §6)
+   opt-in **local content-addressed prompt cache**.
 
 The load-bearing correctness property: **caching is always a live-only cost
-optimization.** The recorded call-log result is the source of truth; replay
-returns it without sending a request or consulting any cache, so an agent stays
-fully deterministic and replayable no matter how aggressively it caches. (§7)
+optimization.** The journaled result — the journal is the run's call log — is
+the source of truth; replay returns it without sending a request or consulting
+any cache, so an agent stays fully deterministic and replayable no matter how
+aggressively it caches. See [Caching and replay](#caching-and-replay).
 
 ---
 
-## 2. Core concept — immutable, prefix-sharing context
+## Core concept: immutable, prefix-sharing context
 
 A `Context` is an **immutable singly-linked chain of segments**. Each builder
 call (`.system()`, `.user()`, `.doc()`, …) allocates one new frozen segment node
@@ -61,26 +63,26 @@ const b = base.user("question B");   // independent — shares `base` by referen
 property is what makes:
 
 - **forks cheap** — building N continuations from one base costs N segment
-  allocations, not N prefix copies (§8);
+  allocations, not N prefix copies (see
+  [Composition with branching and signals](#composition-with-branching-and-signals));
 - **cache prefixes stable** — the same stable head produces the same provider
   cache breakpoint every turn, so it warms once and reads thereafter;
 - **content-addressed dedup possible** — `digest()` hashes the assembled
-  request (a versioned sha256, `host_core::prompt_request_digest`), and the
-  local prompt cache (§6) keys on the same digest.
+  request (a versioned sha256), and the
+  [local prompt cache](#the-local-prompt-cache) keys on the same digest.
 
-Builder methods are pure in-VM structure building — no host round-trip. Only
+Builder methods are pure in-VM structure building — no host call. Only
 `.prompt()` / `.respond()` (and `.compact()`, which issues a summarization
-prompt) cross the durable host boundary, so the only recorded effect is the
-actual LLM call.
+prompt) make host calls, so the only journaled effect is the actual LLM call.
 
 ---
 
-## 3. API surface
+## API surface
 
-All types live in `sdk/typescript/src/agent.ts` (authoring-time declarations; the
-runtime injects the concrete `chidori` host object). Full reference in `llm.txt`.
+The types below are the authoring-time declarations; the runtime injects the
+concrete `chidori` host object. Full reference: [Host API](./host-api.md).
 
-### 3.1 `chidori.context` — the builder
+### `chidori.context` — the builder
 
 ```ts
 type CacheTtl = "5m" | "1h";
@@ -96,7 +98,7 @@ interface Context {
 
   // Freeze everything appended so far as a cacheable prefix (one provider
   // cache breakpoint). Coalesced to the provider's cap — latest wins. Most
-  // authors never need this; stable heads are auto-marked (§4.1).
+  // authors never need this; stable heads are auto-marked by default.
   cacheBreakpoint(ttl?: CacheTtl): Context;
 
   // --- execution (the only durable host calls) ---
@@ -106,10 +108,10 @@ interface Context {
   // Single structured turn for author-driven tool loops.
   respond(options?: PromptOptions): Promise<{ response: LlmResponseJson; context: Context }>;
 
-  // --- window management (§5) ---
+  // --- window management ---
   compact(options?: CompactOptions): Promise<Context>;
 
-  // --- introspection (pure, never recorded) ---
+  // --- introspection (pure, never journaled) ---
   digest(options?: PromptOptions): string;   // stable content hash of the assembled request
   estimateTokens(): number;                  // rough local estimate for window budgeting
 }
@@ -121,7 +123,7 @@ chidori.context(seed?: { system?: string; tools?: string[] }): Context;
 `chidori.prompt(text, opts)` is unchanged — it is effectively sugar for
 `chidori.context(opts).user(text).prompt(opts)` discarding the returned context.
 
-### 3.2 `PromptOptions.cache`
+### `PromptOptions.cache`
 
 `PromptOptions` gains an optional cache posture:
 
@@ -135,7 +137,7 @@ bill repeated prefixes at the cached rate. `false` disables marking for that cal
 `"1h"` (or `{ ttl: "1h" }`) requests the extended TTL. **Caching never changes a
 response — only how it is billed.**
 
-### 3.3 `chidori.conversation` — the stateful wrapper
+### `chidori.conversation` — the stateful wrapper
 
 For the most common shape, a multi-turn chat, `chidori.conversation()` owns the
 running context (system + tools frozen as a cacheable prefix) so you write
@@ -169,17 +171,16 @@ const transcript = await chat.loop({ prompt: "you>" });
 when set, each turn first runs the same budgeted `Context.compact()` (a no-op
 until the tail exceeds budget). `Conversation.loop()` reads a human message via
 `chidori.input()` each turn and ends on an exit word or an `until` predicate;
-see `ConversationLoopOptions` in `agent.ts`.
+see `ConversationLoopOptions` in the [Host API](./host-api.md).
 
 ---
 
-## 4. Provider prompt caching
+## Provider prompt caching
 
-### 4.1 Default auto-marking — the zero-author win
+### Default auto-marking — the zero-author win
 
-When assembling any `LlmRequest` — both the single-shot `chidori.prompt` path and
-the native tool-use loop (`crates/chidori/src/runtime/native.rs`) — the runtime
-auto-marks cacheable boundaries:
+When assembling any LLM request — both the single-shot `chidori.prompt` path and
+the native tool-use loop — the runtime auto-marks cacheable boundaries:
 
 - the **`system`** block (stable for the whole run),
 - the **`tools`** array (stable for the whole tool-use loop),
@@ -187,62 +188,59 @@ auto-marks cacheable boundaries:
   whenever a follow-up sharing the prefix is plausible: the request carries
   tools (so a tool-use loop is likely) or is already multi-turn.
 
-This is `host_core::auto_mark_prompt_cache`
-(`crates/chidori/src/runtime/host_core.rs`), gated by a default-on posture that
-`PromptOptions.cache: false` disables per call
-(`host_core::cache_posture_from_options`). So a 10-turn tool-use agent with a 20K
-prefix pays for that prefix once instead of ten times, with no code change.
+Auto-marking is on by default and disabled per call by
+`PromptOptions.cache: false`. So a 10-turn tool-use agent with a 20K prefix pays
+for that prefix once instead of ten times, with no code change.
 
-### 4.2 What goes on the wire
+### What goes on the wire
 
-- **Anthropic** (`crates/chidori/src/providers/anthropic.rs`): `build_request_body`
-  emits `cache_control: {"type":"ephemeral"}` on the marked system block (using
-  the structured-system form the API requires for caching), the last tool entry,
-  and each marked message's last content block. Marks are coalesced to
-  Anthropic's 4-breakpoint cap (latest wins). The
+- **Anthropic**: the runtime emits `cache_control: {"type":"ephemeral"}` on the
+  marked system block (using the structured-system form the API requires for
+  caching), the last tool entry, and each marked message's last content block.
+  Marks are coalesced to Anthropic's 4-breakpoint cap (latest wins). The
   `anthropic-beta: extended-cache-ttl-2025-04-11` header is sent **only** when a
   `1h` TTL is requested. An unmarked request serializes byte-identically to the
   pre-caching wire format.
-- **OpenAI** (`crates/chidori/src/providers/openai.rs`): caching is automatic on
-  exact prefixes, so there is no marker to emit — the immutable-prefix design
-  feeds it naturally. The path parses `prompt_tokens_details.cached_tokens` and
-  reports `input_tokens` as the fresh share so the two providers agree on
-  semantics. OpenAI has no cache-write billing, so `cache_creation_tokens` is
-  always 0 there.
+- **OpenAI**: caching is automatic on exact prefixes, so there is no marker to
+  emit — the immutable-prefix design feeds it naturally. The runtime parses
+  `prompt_tokens_details.cached_tokens` and reports `input_tokens` as the fresh
+  share so the two providers agree on semantics. OpenAI has no cache-write
+  billing, so `cache_creation_tokens` is always 0 there.
 
-### 4.3 Cache accounting
+### Cache accounting
 
-- `TokenUsage` (`crates/chidori/src/runtime/call_log.rs`) carries optional
-  `cache_creation_tokens` / `cache_read_tokens` (skip-serialized when absent, so
-  old logs still deserialize). Anthropic's `cache_creation_input_tokens` /
-  `cache_read_input_tokens` are parsed on both the blocking and SSE paths.
-- `crates/chidori/src/runtime/cost.rs` prices cache **writes at 1.25×** base
-  input and **reads at 0.1×** base for Anthropic (0.5× reads for OpenAI), so
-  `total_cost_usd` reflects the real bill.
-- `RunSpan` (`crates/chidori/src/runtime/otel.rs`) stamps
-  `gen_ai.usage.cache_creation_tokens` / `_read_tokens` on prompt spans, so cache
-  effectiveness is visible in OTEL with no new pipeline.
+- Each prompt record's `token_usage` carries optional `cache_creation_tokens` /
+  `cache_read_tokens` (absent on journals recorded before caching existed, which
+  still load fine). Anthropic's `cache_creation_input_tokens` /
+  `cache_read_input_tokens` are parsed on both the blocking and streaming paths.
+- Cost accounting prices cache **writes at 1.25×** base input and **reads at
+  0.1×** base for Anthropic (0.5× reads for OpenAI), so `total_cost_usd`
+  reflects the real bill.
+- Prompt spans are stamped with `gen_ai.usage.cache_creation_tokens` /
+  `_read_tokens`, so cache effectiveness is visible in OTEL with no new pipeline
+  ([Observing with Tael](./observing-with-tael.md)).
 
-### 4.4 `cacheBreakpoint()` is advisory and coalesced
+### `cacheBreakpoint()` is advisory and coalesced
 
 Authors call `.cacheBreakpoint(ttl?)` to express intent — "freeze everything up
 to here as a cacheable prefix." The assembler places at most the provider's
 maximum breakpoints at the latest marks that still cover the stable prefix, and
 logs a debug event when older marks are dropped (no silent truncation of
-intent). Because
-auto-marking already covers the common case, most authors never call it; reach
-for it to pin a large `doc()` with a `1h` TTL across a long, human-paced run.
+intent). Because auto-marking already covers the common case, most authors never
+call it; reach for it to pin a large `doc()` with a `1h` TTL across a long,
+human-paced run.
 
 ---
 
-## 5. Window compaction — `Context.compact()`
+## Window compaction
 
 `compact()` is explicit, opt-in window management. It splits the chain into the
 stable head (system / tools / docs) and the conversation tail, summarizes
 everything older than the newest `keepTurns` turns (default 2) **through a
-recorded `prompt` host call**, and rebuilds the chain as: head + one `summary`
-segment + a fresh cache breakpoint + the kept turns verbatim. The host maps the
-summary segment to a `<conversation-summary>…</conversation-summary>` user turn.
+journaled `prompt` host call**, and rebuilds the chain as: head + one `summary`
+segment + a fresh cache breakpoint + the kept turns verbatim. The runtime maps
+the summary segment to a `<conversation-summary>…</conversation-summary>` user
+turn.
 
 ```ts
 interface CompactOptions {
@@ -268,96 +266,89 @@ for (const question of questions) {
 }
 ```
 
-Because the summary is produced by a **recorded** prompt call, it is durable and
-replays deterministically. Compaction is **never automatic** — silent truncation
-would change what the model sees, and therefore results, invisibly. (When you do
-want it folded into a chat loop automatically-on-overflow, set
-`ConversationOptions.compact`, which runs this same budgeted compaction each turn
-— still opt-in, still recorded.)
+Because the summary is produced by a **journaled** prompt call, it is durable
+and replays deterministically. Compaction is **never automatic** — silent
+truncation would change what the model sees, and therefore results, invisibly.
+(When you do want it folded into a chat loop automatically-on-overflow, set
+`ConversationOptions.compact`, which runs this same budgeted compaction each
+turn — still opt-in, still journaled.)
 
 ---
 
-## 6. Local content-addressed prompt cache (opt-in)
+## The local prompt cache
 
-Set `CHIDORI_PROMPT_CACHE_DIR=<dir>` to enable a process-local cache
-(`crates/chidori/src/runtime/prompt_cache.rs`) keyed on `request_digest` — a
-versioned sha256 over the fully assembled request (model, system, tools,
-messages, cache layout, max_tokens, temperature), recomputed after any model
-override so it keys on the request actually sent.
+Set `CHIDORI_PROMPT_CACHE_DIR=<dir>` to enable a directory-backed,
+content-addressed prompt cache keyed on the request digest — a versioned sha256
+over the fully assembled request (model, system, tools, messages, cache layout,
+max_tokens, temperature), recomputed after any model override so it keys on the
+request actually sent.
 
-- It is consulted in `execute_prompt_text` / `execute_prompt_response` on the
-  **live path only** — strictly *after* the replay short-circuit and the
-  completed-host-operation replay decline (§7).
-- A hit completes the same begin/safepoint/resolve/record sequence as a provider
-  success, recording the identical result with `token_usage: None` (nothing was
-  billed). Two runs that issue an identical prompt get identical recorded
-  results; the second just doesn't pay the provider.
-- Successful live responses write through atomically (temp file + rename).
-- Disabled (the default) the module is inert. Both the `chidori.prompt` / context
-  paths and the native tool loop get it for free, since all route through the two
-  executors.
+- **The cache is shared across runs and processes** that point at the same
+  directory: one file per digest, written atomically (temp file + rename), so
+  concurrent runs are safe. A fleet shares the cache exactly when it shares the
+  directory (for example, a mounted volume).
+- It is consulted on the **live path only** — replay short-circuits to the
+  journaled result first and never reads any cache. A read or parse failure is
+  a miss, never an error.
+- A hit completes the same journaling sequence as a provider success, recording
+  the identical result with `token_usage: None` (nothing was billed). Two runs
+  that issue an identical prompt get identical journaled results; the second
+  just doesn't pay the provider.
+- Disabled (the default), the cache is inert. Both the `chidori.prompt` /
+  context paths and the native tool-use loop get it for free.
 
 ---
 
-## 7. Determinism & replay (why caching is safe)
+## Caching and replay
 
-Adding provider prompt caching and the local cache does **not** change any
-recorded result or any replay:
+Replay re-executes an agent against its journal and returns every journaled
+result without sending a request — see [Replay & Resume](./replay.md) for the
+model. What matters here is that caching never changes a journaled result:
 
 - **Provider cache changes billing, not output.** A `cache_control` marker tells
   the provider to bill a prefix as a read instead of fresh input; the returned
-  content blocks are identical to an uncached send. The recorded
-  `CallRecord.result` is the response, so it is invariant under cache
-  hits/misses. Only `token_usage` differs (the creation-vs-read split), and that
-  is recorded as observed — descriptive metadata, never a replay match key.
-- **Replay never sends a request, so never consults any cache.**
-  `try_replay_checked(seq, "prompt")` short-circuits to the recorded result
-  before request assembly or any provider call. A replayed run can run with
-  caching entirely disabled and produce a byte-identical call log. *The log is
-  the source of truth; every cache is a live-only optimization* — the same
-  argument the signal mailbox makes (see the determinism argument in
-  `docs/signals.md`).
-- **The local cache is served only on the live path**, after the replay
-  short-circuit has already declined, then recorded as a normal `CallRecord` —
-  exactly as if the provider had answered.
+  content blocks are identical to an uncached send, so the journaled result is
+  invariant under cache hits and misses. Only `token_usage` differs (the
+  creation-vs-read split), and that is recorded as observed — descriptive
+  metadata, never a replay match key.
+- **The local cache is served only on the live path**, then journaled as a
+  normal record — exactly as if the provider had answered.
 - **The digest is self-describing, not a match key.** Every prompt record's args
-  carry `request_digest`. Replay still matches on `(seq, function)`, not on args
-  content; host-promise completed-operation matching explicitly **ignores** the
-  digest (`snapshot.rs::completed_args_match`), so a digest-scheme change can
-  never force a completed effect to re-execute. `Context.digest()` is a
-  synchronous pure host call (`contextDigest`) and is never recorded.
-
-Non-determinism that is **not** introduced: cache TTL expiry between turns only
-flips a read back to a creation — a *cost* difference, recorded faithfully, never
-a *content* difference. Auto-marking is a pure function of the request shape, so
-the same context produces the same layout every assembly.
+  carry `request_digest`, but replay matching explicitly ignores it — so a
+  digest-scheme change can only cause a local-cache miss (a cost event), never
+  force a completed effect to re-execute. `Context.digest()` is pure and never
+  journaled.
+- **Cache TTL expiry between turns only flips a read back to a creation** — a
+  *cost* difference, recorded faithfully, never a *content* difference.
+  Auto-marking is a pure function of the request shape, so the same context
+  produces the same layout every assembly.
 
 ---
 
-## 8. Composition with branching & signals
+## Composition with branching and signals
 
-- **Branching (`docs/branching-execution.md`).** In-VM, N continuations built
-  from one base `Context` share its segment chain by reference (§2) — N segment
-  allocations, not N prefix copies. A `chidori.branch` variant runs its own
-  module on a fresh `RuntimeContext` (parent VFS + JSON input), so a `Context`
-  handle does not cross that boundary — but a branch that rebuilds the same
-  stable head reads the provider cache the parent already warmed. The reserved
-  per-branch `CallLogSequenceRange` keeps each branch's prompt records in range,
-  so caching composes with branch determinism for free.
-- **Signals (`docs/signals.md`).** A delivered signal's payload can be appended
-  as a context segment (a `user`/`toolResult` turn), so
+- **Branching** ([Branching Execution](./branching-execution.md)). In-VM, N
+  continuations built from one base `Context` share its segment chain by
+  reference — N segment allocations, not N prefix copies. A `chidori.branch`
+  variant runs its own module in a fresh VM (parent VFS + JSON input), so a
+  `Context` handle does not cross that boundary — but a branch that rebuilds the
+  same stable head reads the provider cache the parent already warmed. Each
+  branch's prompt records land in the branch's own reserved journal range, so
+  caching composes with branch determinism for free.
+- **Signals** ([Signals](./signals.md)). A delivered signal's payload can be
+  appended as a context segment (a `user`/`toolResult` turn), so
   externally-pushed, multiplayer information enters the conversation as a
-  recorded, cacheable turn. The signal is already in the call log; the context
+  journaled, cacheable turn. The signal is already in the journal; the context
   append is just where it lands in the prompt.
 
-Templating composes cleanly too: minijinja (`crates/chidori/src/runtime/template.rs`,
-`chidori.template()`) renders the *text* that goes inside `.system()` /
-`.doc()` / `.user()`. Context never re-implements templating; templating never
-models turns or caching. They are orthogonal layers.
+Templating composes cleanly too: [`chidori.template`](./template.md) renders the
+*text* that goes inside `.system()` / `.doc()` / `.user()`. Context never
+re-implements templating; templating never models turns or caching. They are
+orthogonal layers.
 
 ---
 
-## 9. Worked example — research assistant over a large corpus
+## Worked example: research assistant over a large corpus
 
 An analyst agent answers a sequence of questions against a fixed corpus. The
 system instructions and the corpus are identical for every question, so they are
@@ -417,8 +408,8 @@ On the wire, question by question:
 The corpus is paid at full rate **once** instead of once per question — roughly a
 70–85% reduction in input-token cost on Anthropic pricing, with identical
 answers. The split is recorded on each prompt record's `token_usage` in the
-call log (and stamped on the OTEL prompt spans, §4.3) — `input_tokens` is the
-fresh share only:
+journal (and stamped on the OTEL prompt spans — see
+[Cache accounting](#cache-accounting)) — `input_tokens` is the fresh share only:
 
 ```
 prompt Q1   input=45   cache_creation=19,488  cache_read=0       ← warms cache
@@ -426,63 +417,26 @@ prompt Q2   input=61   cache_creation=0       cache_read=19,488  ← hit
 prompt Q3   input=58   cache_creation=0       cache_read=19,488  ← hit
 ```
 
-Because each `.prompt()` records the full assembled request digest and response,
-`chidori resume` / `trace` reproduces the exact conversation and the **replay
-pays zero tokens** (§7). The agent is simultaneously cheap live (provider cache),
-free on replay (call log), and fully auditable (digest per turn).
+Because each `.prompt()` journals the full assembled request digest and
+response, `chidori resume` / `chidori trace` reproduce the exact conversation
+without re-billing a token ([Caching and replay](#caching-and-replay) above).
+The agent is simultaneously cheap live (provider cache), free on replay
+(journal), and fully auditable (digest per turn).
 
 ---
 
-## 10. Implementation map
-
-Where each piece lives, for maintainers:
-
-| Concern | Location |
-|---|---|
-| `CacheTtl`, `CacheLayout`, `Message.cache_control` | `crates/chidori/src/providers/mod.rs` |
-| `TokenUsage` cache fields | `crates/chidori/src/runtime/call_log.rs` |
-| Anthropic `cache_control` emission, beta header, usage parsing | `crates/chidori/src/providers/anthropic.rs` (`build_request_body`, `cache_control_json`) |
-| OpenAI `cached_tokens` parsing | `crates/chidori/src/providers/openai.rs` |
-| Auto-marking + posture | `crates/chidori/src/runtime/host_core.rs` (`auto_mark_prompt_cache`, `cache_posture_from_options`) |
-| Request digest | `crates/chidori/src/runtime/host_core.rs` (`prompt_request_digest`) |
-| Cache pricing | `crates/chidori/src/runtime/cost.rs` |
-| Span attributes | `crates/chidori/src/runtime/otel.rs` |
-| Immutable segment builder, `compact()` | `crates/chidori/src/runtime/typescript/helpers.rs` |
-| Context flattening, `context_request_parts`, `contextDigest` | `crates/chidori/src/runtime/typescript/bindings.rs` |
-| Completed-op match (ignores digest) | `crates/chidori/src/runtime/snapshot.rs` (`completed_args_match`) |
-| Local content-addressed cache | `crates/chidori/src/runtime/prompt_cache.rs` |
-| Native tool-use loop (auto-cached) | `crates/chidori/src/runtime/native.rs` |
-| SDK types & example | `sdk/typescript/src/agent.ts`, `examples/agents/context_qa.ts` |
-
-`chidori-js` is the only JavaScript engine — everything here ships
-unconditionally; there is no engine feature flag to gate on.
-
----
-
-## 11. Tests
-
-The guarantees above are pinned by `cargo test -p chidori --lib`:
-
-- `providers/anthropic.rs`: `unmarked_request_body_has_no_cache_control`,
-  `marked_request_emits_cache_control_layout`,
-  `usage_cache_token_fields_parse_and_default`.
-- `runtime/cost.rs`: `test_cache_tokens_price_at_documented_multiples`.
-- `runtime/prompt_cache.rs`: `store_then_lookup_roundtrips_and_misses_are_none`,
-  `disabled_without_env_flag`.
-
----
-
-## 12. Limitations & not-yet-supported
+## Limitations
 
 - **No raw `Message[]` escape hatch.** `Context` is the structured surface; a
   raw-wire-model path for power users is intentionally not exposed.
-- **No cross-run / fleet-shared cache.** The local content-addressed cache
-  (§6) is process-local, keyed on our own digest; a shared store across a fleet
-  is future work.
+- **The local prompt cache is shared exactly as far as its directory.** Runs and
+  processes pointing at the same `CHIDORI_PROMPT_CACHE_DIR` share it; there is
+  no fleet-wide shared cache beyond that — a fleet shares the cache only if it
+  shares that directory or volume.
 - **No typed segment-schema registry.** Segments are untyped text/blocks; there
   is no declare-and-validate layer for expected docs.
-- **Provider-specific cache strategies beyond Anthropic/OpenAI** (e.g. Gemini
-  implicit caching) are not wired behind `cacheBreakpoint` yet.
+- **Not supported: provider-specific cache strategies beyond Anthropic/OpenAI**
+  (e.g. Gemini implicit caching) behind `cacheBreakpoint`.
 - **Compaction is single-strategy** (summarize-older-than-`keepTurns`); there is
   no pluggable compaction policy.
 - **Digest canonicalization is versioned but not pluggable** — a scheme change

@@ -1,6 +1,6 @@
 ---
 title: "Running Modes"
-description: "One-shot CLI runs vs. the HTTP session server, approval postures, policy profiles, and --trusted."
+description: "One-shot CLI runs, the HTTP session server and its endpoint reference, event-driven handlers and the serve status-code contract, and approval postures."
 ---
 
 # Running modes
@@ -12,7 +12,6 @@ API, and event-driven HTTP handlers.
 
 ```bash
 chidori init my-agent --template chat         # scaffold a starter project (or: docs, worker)
-chidori demo                                  # pick from runnable examples
 chidori run agents/my_agent.ts --input key=value
 chidori run agents/my_agent.ts --input '{"complex": "input"}'
 chidori chat --system "You are concise."     # interactive multi-turn chat REPL
@@ -25,6 +24,10 @@ an agent and README. Omit `--template` to choose interactively. The `docs`
 template chats with a bundled copy of the Chidori docs; the `chat` template is
 a conversational agent; the `worker` template is an autonomous tool-using loop
 whose tools are defined inline with `defineTool`.
+
+`chidori run` asks for approval at the terminal before powerful effects and
+fails closed without a terminal — postures and `--trusted` are in the
+[CLI reference](./cli.md#approval-postures).
 
 `chidori chat` is a built-in conversational REPL backed by
 [`chidori.conversation()`](./core-concepts.md#conversational-agents). With no
@@ -49,37 +52,46 @@ a crash interrupted mid-generation — and continues the conversation in place.
 chidori serve agents/my_agent.ts --port 8080
 ```
 
-The server is **deny-by-default**: unless you configure a policy
-(`CHIDORI_POLICY*` env vars) or pass `--trusted`, gated effects (network
-requests via `fetch`/`node:http`, workspace mutations) are refused — sessions
-arrive from callers you may not control. Local `chidori run` is
-**ask-by-default**: with nothing configured, gated effects pause for a y/a/N
-prompt on your terminal (and fail closed without one); pass `--trusted` for
-the permissive allow-all posture when running agents you wrote yourself. See
-[`docs/sandbox-model.md`](./sandbox-model.md).
+Bare `chidori serve` runs the **`untrusted`** policy profile: gated effects
+(network via `fetch`/`node:http`, tool calls, workspace writes, app data)
+are refused
+— sessions arrive from callers you may not control. `--trusted` opts into
+the permissive allow-all posture, and a per-session `policy_profile`
+overlay can only tighten the server's policy, never loosen it. Full posture
+table: [CLI reference](./cli.md#approval-postures) and
+[Sandbox Model](./sandbox-model.md).
 
-It also binds **loopback only** (`127.0.0.1`) by default. To make it reachable
-from the network, pass `--host 0.0.0.0` (or set `CHIDORI_HOST`) — which
-requires `CHIDORI_API_KEY` to be set, since an exposed unauthenticated server
-would let anyone on the network execute agents. See
-[`docs/deployment.md`](./deployment.md).
+The server also binds **loopback only** (`127.0.0.1`) by default. To make it
+reachable from the network, pass `--host 0.0.0.0` (or set `CHIDORI_HOST`) —
+which requires `CHIDORI_API_KEY` to be set, since an exposed unauthenticated
+server would let anyone on the network execute agents
+(`CHIDORI_ALLOW_UNAUTHENTICATED=1` explicitly opts out). See
+[Deployment](./deployment.md).
+
+A **session** is a run addressed over HTTP: a session id *is* a run id, and
+the session's journal lives in `.chidori/runs/<session_id>/`.
 
 Exposes:
 - `GET  /health` — health check
-- `ANY  /*` — any request is passed to `agent(event)` as an event dict
+- `ANY  /*` — any other request is folded into `{ event: … }` and run as the
+  agent's input (see [Event-driven agents](#3-event-driven-agents))
 - `POST /sessions` — create a session and run the agent with given input
 - `GET  /sessions` — list all sessions
 - `GET  /sessions/{id}` — get session result
-- `GET  /sessions/{id}/checkpoint` — get the call log and snapshot manifest metadata
-- `GET  /sessions/{id}/snapshot` — inspect the durable journal-scaffold manifest metadata (no VM image — resume is call-log replay)
-- `GET  /sessions/{id}/holdings` — what the run is holding right now: pending host operation, queued signals, unsettled actors, detached agents (with registry state), open branches, armed compensations
+- `GET  /sessions/{id}/checkpoint` — get the session's journal records and snapshot manifest metadata
+- `GET  /sessions/{id}/snapshot` — inspect the snapshot manifest metadata (no VM image — resume is journal replay)
+- `GET  /sessions/{id}/holdings` — what the run is holding right now: the pending host call it is parked on, queued signals, unsettled actors, detached agents (with registry state), open branches, armed compensations
 - `POST /sessions/{id}/resume` — answer a paused `input()` call and continue the run
 - `POST /sessions/{id}/approve` — approve or deny a policy-gated call that paused the run
 - `POST /sessions/{id}/signal` — deliver a signal `{ name, payload?, from? }`: resolves+resumes a run paused-waiting on that name (200); delivers in-memory to a live streaming run, resuming a matching pause in-process (202 `delivered_live`); else enqueues into the durable mailbox (202 `queued`); 409 for a terminal run
-- `POST /sessions/{id}/replay` — replay from a session's checkpoint
+- `POST /sessions/{id}/replay` — replay a session from its journal
 - `POST /sessions/{id}/cancel` — cancel a running or stored session
 - `POST /sessions/stream` — run a session with SSE call and prompt progress events
 - `GET  /sessions/{id}/stream` — re-attach to a session's SSE events: replays everything already emitted (so a dropped client catches up), then follows a still-running streaming session live until it settles; for a settled session, replays the logged call records and closes with a `done` event carrying the final state
+- `GET  /agents/detached` — list registered [detached agents](./detached-agents.md) and their registry state
+- `POST /agents/detached/{name}/send` — deliver a signal into a [detached agent](./detached-agents.md)'s durable mailbox
+- `GET  /recipes` — list scheduled recipes (from the [application manifest](#the-application-manifest-chidoriappyml))
+- `POST /recipes/{name}/run` — run a scheduled recipe manually, outside its cron loop
 
 ### The application manifest (`chidori.app.yml`)
 
@@ -114,9 +126,9 @@ explicitly. Semantics:
   incarnations are re-armed as usual, settled ones are replaced by a fresh
   spawn (mailbox migration included). The manifest is idempotent across
   restarts.
-- **`schedule`** — the entry becomes a [recipe](./cli.md): same cron loop,
-  listed under `GET /recipes`, runnable manually via
-  `POST /recipes/{name}/run`.
+- **`schedule`** — the entry becomes a recipe: same cron loop, listed under
+  `GET /recipes`, runnable manually via `POST /recipes/{name}/run` (both in
+  the endpoint list above).
 - **`routes`** — each path is served as a real route (behind the same bearer
   auth as everything else); a request's JSON body is delivered to the named
   agent's durable mailbox as the named signal, waking a hibernating agent.
@@ -126,8 +138,8 @@ without a leading `/` — stops the server before it binds.
 
 ## 3. Event-driven agents
 
-Any request to a non-session route is folded into an **event dict** and
-passed to the agent as its input:
+Any request to a non-session route is folded into an **event object** and
+passed to your `run(async (input) => …)` handler as its input:
 
 ```jsonc
 {
@@ -141,50 +153,61 @@ passed to the agent as its input:
 }
 ```
 
-The response mapping: an agent output of `{status, body, headers?}` becomes
-the HTTP response (status code, JSON body, extra headers); any other output
-returns as `200` JSON. Two behaviors to design for:
-
-- **Every request runs the whole agent** — including health probes and
-  scanner traffic. Branch on `input.event` early and return a cheap
-  `{status: 400, ...}` for non-events before any model call, or the strays
-  will cost tokens. (With `CHIDORI_API_KEY` set, unauthenticated requests
-  are rejected before the agent runs.) The server short-circuits the most
-  common automatic noise for you: requests for `/favicon.ico`,
-  `/robots.txt`, `/apple-touch-icon*`, and anything under `/.well-known/`
-  get an immediate empty `404` without invoking the agent. If your agent
-  genuinely serves those paths, set `CHIDORI_SERVE_ALL_PATHS=1` to route
-  every path to `agent(event)` again.
-- **A run that pauses becomes a session.** If the agent reaches a
-  `chidori.signal(...)` listen point, an `input()` call, or a policy
-  approval gate, the server persists it as a real session and answers
-  `202 Accepted` with the session view (`id`, `status`,
-  `pending_signal_names`, ...). Deliver / resume / approve it through the
-  normal `/sessions/{id}/*` endpoints — a webhook can open a long-lived,
-  human-gated run and hand the caller the id to drive it with.
-
-An agent can also make outbound requests while handling an event:
+There is no built-in routing: the whole agent runs for every request, so
+branch on `input.event` early and return a cheap 404 for paths you don't
+handle:
 
 ```ts
-// agents/webhook.ts
-import { run, type JsonObject } from "chidori:agent";
+// agents/pr_triage.ts
+import { chidori, run } from "chidori:agent";
 
-run(async (input: { url: string; payload?: JsonObject }) => {
-  // `fetch` is the runtime's captured networking surface — policy-gated,
-  // pausable for approval, and recorded for replay.
-  const response = await fetch(input.url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(input.payload ?? { source: "chidori" }),
-  });
-  return { status: response.status, body: await response.json() };
+run(async (input: { event: { method: string; path: string; body?: unknown } }) => {
+  const { event } = input;
+  if (event.method !== "POST" || event.path !== "/hooks/pr") {
+    return { status: 404, body: { error: "not found" } }; // cheap 404 before any model call
+  }
+  const triage = await chidori.prompt(
+    `Triage this pull request event:\n${JSON.stringify(event.body)}`,
+    { type: "final" },
+  );
+  return { status: 200, body: { triage } };
 });
 ```
 
 ```bash
-chidori serve agents/webhook.ts --port 8080 --trusted   # the agent makes a network call via fetch
+chidori serve agents/pr_triage.ts --port 8080
 
-curl -X POST http://localhost:8080/github \
+curl -X POST http://localhost:8080/hooks/pr \
   -H "Content-Type: application/json" \
   -d '{"action": "opened", "pull_request": {"title": "Add login"}}'
 ```
+
+The status-code contract:
+
+- An agent output carrying **both** `status` and `body` becomes the HTTP
+  response — that status code, JSON body, and any extra `headers`. Any
+  other output (including `status` without `body`) returns as `200` JSON.
+- **A run that pauses becomes a session, answered `202`.** If the agent
+  reaches a `chidori.signal(...)` listen point, an `input()` call, or a
+  policy approval gate, the server persists it as a real session and
+  answers `202 Accepted` with the session view (`id`, `status`,
+  `pending_signal_names`, ...). Deliver / resume / approve it through the
+  normal `/sessions/{id}/*` endpoints — a webhook can open a long-lived,
+  human-gated run and hand the caller the id to drive it with.
+- **An agent throw returns `500`** with `{ "error": … }`.
+- **Probe noise is short-circuited with an empty `404`**: requests for
+  `/favicon.ico`, `/robots.txt`, `/apple-touch-icon*`, and anything under
+  `/.well-known/` never invoke the agent. If your agent genuinely serves
+  those paths, set `CHIDORI_SERVE_ALL_PATHS=1` to route every path to your
+  handler again. (Beyond that noise, **every request runs the whole
+  agent** — including health probes and scanner traffic; that's why the
+  early cheap 404 above matters, or the strays will cost tokens. With
+  `CHIDORI_API_KEY` set, unauthenticated requests are rejected before the
+  agent runs.)
+
+An agent can also make *outbound* requests while handling an event: `fetch`
+is the runtime's captured networking surface — policy-gated, pausable for
+approval, and journaled for replay.
+[`examples/agents/webhook.ts`](../examples/agents/webhook.ts) is the
+outbound-fetch example — note it is a `chidori run` demo taking
+`--input url=…`, not an inbound handler.

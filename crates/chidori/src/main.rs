@@ -1519,12 +1519,12 @@ fn cli_policy(untrusted: bool, trusted: bool) -> Arc<policy::PolicyConfig> {
 }
 
 /// Resolve the permission policy for `chidori serve`. Unlike `chidori run`
-/// (trusted, developer-authored code on the developer's own machine), the
-/// server is the surface untrusted callers reach, so when the operator has
-/// said nothing it is deny-by-default. Precedence:
+/// (which asks at the terminal by default), the server is the surface
+/// untrusted callers reach with no operator present, so when the operator
+/// has said nothing it is deny-by-default. Precedence:
 ///   1. `--untrusted` — deny-by-default, wins over all CHIDORI_POLICY* env.
-///   2. `--trusted` — the permissive `chidori run` resolution (env-driven,
-///      allow-all when nothing is configured).
+///   2. `--trusted` — env-driven resolution, allow-all when nothing is
+///      configured.
 ///   3. Explicit, valid CHIDORI_POLICY* configuration — as configured.
 ///   4. Nothing configured (or only malformed configuration, which fails
 ///      closed) — the deny-by-default serve profile.

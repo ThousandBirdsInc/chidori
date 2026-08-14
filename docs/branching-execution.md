@@ -26,18 +26,17 @@ branch and compare.
 
 A branch is a **separate continuation source run once** — not a re-run of the
 parent. Re-running the parent's source would re-reach `chidori.branch` and
-recurse, so the prefix is **handed over as state** (the parent's captured VFS
-plus an explicit `input`), not replayed. Branches act on the *result* of the
-prefix; they don't re-derive it. Each branch is a new durable sub-run: the
-orchestrator runs each variant's module on a fresh `RuntimeContext` seeded from
-the parent's anchor, collects the outcomes, and returns them. The whole fan-out
-is one recorded host call on the parent, so the parent's own replay returns the
-outcomes from cache.
+recurse, so the prefix is **handed over as state** (the parent's captured
+workspace state plus an explicit `input`), not replayed. Branches act on the
+*result* of the prefix; they don't re-derive it. Each branch is a new durable
+sub-run seeded from the parent's anchor; the runtime runs each variant's
+module, collects the outcomes, and returns them. The whole fan-out is one
+recorded host call on the parent, so the parent's own [replay](./replay.md)
+returns the outcomes from cache.
 
-The orchestration lives in `crates/chidori/src/runtime/host_branch.rs`; the SDK
-types live in `sdk/typescript/src/agent.ts`. See also
-[`docs/architecture.md`](./architecture.md) and
-[`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md).
+Signals compose with branching — a branch listening on a signal drains the
+parent run's shared mailbox; see
+[Signals § Composition with branching](./signals.md#composition-with-branching).
 
 ## The agent-facing API
 
@@ -53,7 +52,7 @@ type BranchVariant = {
 
 type BranchOutcome = {
   label: string;
-  branchId: string;              // <parent run id>-op<branch seq>-branch-<k>
+  branchId: string;              // maps 1:1 to the branch's store path
   status: "completed" | "paused" | "failed";
   output?: AgentJson;            // when completed
   pendingPrompt?: string;        // when paused (e.g. a chidori.input prompt)
@@ -77,72 +76,63 @@ branch(variants: BranchVariant[], options?: {
   anything — and without recording anything.
 - Returns **all** outcomes (compare, don't merge). The agent runs its own
   selection: `const best = outcomes.reduce(pick);`
-- A `paused` outcome carries a `branchId` the host can resume out-of-band (see
-  below), keeping the JS surface a single awaited Promise.
+- A `paused` outcome carries a `branchId` you can resume out-of-band with
+  `chidori branch-resume` (see below), keeping the JS surface a single awaited
+  Promise.
 
 ## How it works
 
-The `branch` call executes inside the durable boundary as a single recorded
-call whose result is the outcomes array — on parent replay it returns cached
-and the branches never re-run. For each variant, the orchestrator:
+The `branch` call is a single recorded host call whose result is the outcomes
+array — on parent replay it returns cached and the branches never re-run. For
+each variant, the runtime:
 
-1. Reserves a disjoint `CallLogSequenceRange` via `ParallelBranchManifest`
-   (width 10,000 per branch). The slot is derived from the `branch` call's own
-   seq — `slot = seq / (width × count) + 1`, `base = slot × width × count` —
-   so successive branch ops in one run get reserved blocks that grow linearly
-   and stay disjoint from each other and from every earlier record.
-2. Builds a **fresh `RuntimeContext`** seeded with the parent's VFS snapshot,
-   the reserved range as its sequence base, a call stack seeded with the
-   parent's `branch` seq (so branch records nest), and the parent's OTEL run
-   span (so branch spans stream under the parent's `branch` span).
-3. Runs the branch's source module with the variant's `input` — live, through
-   the same host-effect path as any run, under the same `PolicyConfig`.
-4. Settles the outcome — `completed` with the module's return value, `paused`
-   with the pending prompt when the branch suspended on a host op, or `failed`
-   with the error — validates that every record the branch produced sits
-   inside its reserved range, and folds the branch's records into the parent
-   log. The fold advances the parent's counter past the reserved ranges the
-   same way `absorb_replayed_subtree` does on replay, so live and replayed
-   sequence numbering stay aligned.
+1. Anchors the branch on the parent's state at the fork: the parent's captured
+   workspace state plus the variant's explicit `input`.
+2. Runs the branch's source module as its own durable sub-run — live, through
+   the same recorded-effect path as any run, under the same approval policy as
+   the parent, journaling into the branch's own store.
+3. Settles the outcome — `completed` with the module's return value, `paused`
+   with the pending prompt when the branch suspended on a host call, or
+   `failed` with the error — and folds the branch's records into the parent's
+   journal, so the full fan-out is one auditable history.
 
-Variants run in **waves of `options.concurrency` worker threads** (default 1 —
-sequential; clamped to the variant count). Each branch gets its own JS VM and
-context inside its thread; settling, validation, merging, and persistence
-happen back on the parent thread, in variant order, after the wave joins — so
-the durable log and the outcomes array are deterministic regardless of
-completion order. Branches are in-process workers under the parent run's slot;
-the server's run semaphore is not involved.
+Variants run in **waves of `options.concurrency` workers** (default 1 —
+sequential; clamped to the variant count). Each branch gets its own isolated
+JS VM; outcomes are settled and persisted in variant order after each wave
+finishes, so the journal and the outcomes array are deterministic regardless
+of completion order.
 
-**Nested `chidori.branch` inside a branch is rejected**: a nested fork would
-allocate sequence ranges outside the parent branch's reserved range. The
-rejection surfaces as a `failed` outcome for that branch.
+**Nested `chidori.branch` inside a branch is rejected**; the rejection
+surfaces as a `failed` outcome for that branch rather than failing the whole
+call.
 
-Tracing is free: branch records carry `parent_seq` = the `branch` call's seq,
-so with `OTEL_EXPORTER_OTLP_ENDPOINT` set the operator sees the fork live as a
+Tracing is free: branch records nest under the `branch` call, so with
+`OTEL_EXPORTER_OTLP_ENDPOINT` set the operator sees the fork live as a
 `branch` span with one child subtree per strategy, side by side.
 
 ## The branch store
 
-When the parent run persists (`.chidori/runs/<run id>/`), every branch sub-run
+When the parent run persists (`.chidori/runs/<run_id>/`), every branch sub-run
 is persisted under it:
 
 ```text
-<run dir>/branches/op-<branch seq, zero-padded to 20 digits>/
-  anchor.json              fork-time anchor: the parent VFS snapshot
+<run dir>/branches/op-<fork point>/
+  anchor.json              fork-time anchor: the parent's captured workspace state
   branch-<k>/
     source.ts              the branch's own EDITABLE source copy
-    checkpoint.json        the branch's call log (same shape as a run's)
-    branch.json            metadata: label, id, status, pending input,
-                           reserved sequence range, input, output/error
-    history/               the branch's git-like source history: a
-                           `branch_fork` commit of the variant's source
-                           (parented on the parent run's head commit), plus
-                           one commit per accepted edit (`docs/source-history.md`)
+    checkpoint.json        the branch's journal artifact (a compacted journal —
+                           not the parent's records.jsonl format)
+    branch.json            metadata: label, id, status, pending input, input,
+                           output/error
+    history/               the branch's git-like source history: a fork commit
+                           of the variant's source, parented on the parent
+                           run's head commit, plus one commit per accepted
+                           edit ([Source History](./source-history.md))
 ```
 
 The anchor and the per-branch source copies are written **before** the fan-out
 runs, so even a crash mid-fan-out leaves re-runnable branch stores behind. The
-`branchId` (`<run>-op<seq>-branch-<k>`) maps 1:1 to the store path.
+`branchId` in each outcome maps 1:1 to the branch's store path.
 
 ## Resume and edit-and-rerun
 
@@ -151,66 +141,65 @@ has moved on:
 
 ```bash
 # List a run's persisted branches and their states:
-chidori branches <run-id>
+chidori branches <run_id>
 
 # A branch paused on chidori.input()? Answer it:
-chidori branch-resume <run-id> <branch-id> --value "blue"
+chidori branch-resume <run_id> <branch_id> --value "blue"
 
 # Edit a strategy and re-run ONLY that branch from the same anchored state:
-$EDITOR .chidori/runs/<run-id>/branches/op-*/branch-001/source.ts
-chidori branch-rerun <run-id> <branch-id>
+$EDITOR .chidori/runs/<run_id>/branches/op-*/branch-001/source.ts
+chidori branch-rerun <run_id> <branch_id>
 ```
 
-Both commands default their model to the one recorded in the parent run's
-manifest (override with `--model` or `CHIDORI_MODEL`), and accept
-`--trusted`/`--untrusted` for the branch's live gated effects — the same
-posture flags as `chidori run`.
+Note that `branch-resume`'s short flag `-v` means `--value` (the response to
+deliver), not verbose. Both commands default their model to the one recorded
+in the parent run's manifest (override with `--model` or `CHIDORI_MODEL`), and
+accept `--trusted`/`--untrusted` for the branch's live gated effects — the
+same posture flags as `chidori run`.
 
-- **Resume** replays the branch's checkpoint with a synthetic `input` record at
-  the pending seq (the same mechanism the server's `/resume` uses), then runs
-  the branch's `source.ts` live to its next outcome. Resume answers `input()`
-  pauses; approval/signal pauses are reported but not resumable out-of-band.
-- **Edit-and-rerun** discards the previous checkpoint and re-runs the branch
-  **fresh from the parent anchor** with whatever `source.ts` now contains. The
-  anchored state (fork-time VFS + the variant's `input`) is identical to the
-  original fork, so only the branch's code is the variable. Branch runs never
-  go through the run manifest's source-hash gate — the anchor is the captured
-  state, not a source identity check.
+- **Resume** replays the branch's journal with your `--value` answering the
+  pending `input()` (the same mechanism the server's `/resume` uses), then
+  runs the branch's `source.ts` live to its next outcome. Resume answers
+  `input()` pauses; approval/signal pauses are reported but not resumable
+  out-of-band.
+- **Edit-and-rerun** discards the branch's previous journal and re-runs the
+  branch **fresh from the parent anchor** with whatever `source.ts` now
+  contains. The anchored state (fork-time workspace state + the variant's
+  `input`) is identical to the original fork, so only the branch's code is the
+  variable. Branch runs never go through the run manifest's source-identity
+  gate — the anchor is the captured state, not a source check.
 
 A resumed or re-run branch updates only its own store; the parent's recorded
 `branch` outcome is immutable history (compare, don't merge). The branch's
-**code** history is kept too: each edit that actually runs (`branch-rerun`,
-or a resume whose `source.ts` changed) chains a commit onto the branch's
+**code** history is kept too: each edit that actually runs (`branch-rerun`, or
+a resume whose `source.ts` changed) chains a commit onto the branch's
 `history/` store, so every strategy version that ever ran from the anchor
-stays recoverable and diffable — `chidori history <run-id>` shows the chains
+stays recoverable and diffable — `chidori history <run_id>` shows the chains
 and `--diff` compares any two versions (see
-[`docs/source-history.md`](./source-history.md)).
+[Source History](./source-history.md)).
 
 ## Correctness and determinism
 
-- **Parent determinism:** the `branch` op is recorded with the outcomes as its
-  result; parent replay short-circuits the fan-out like any cached host call.
-- **No record collisions:** reserved per-branch sequence ranges guarantee
-  disjointness, and every branch record is validated against its range before
-  it joins the parent's durable log — a violation (e.g. a branch that outgrew
-  its range width) fails the call rather than corrupting the log.
-- **Nesting integrity:** branch records carry `parent_seq` = the `branch`
-  call's seq, matching the established nesting invariant.
+- **Parent determinism:** the `branch` call is recorded with the outcomes as
+  its result; parent replay short-circuits the fan-out like any cached host
+  call.
 - **Branch determinism:** a persisted branch is replayable from its own stored
-  checkpoint; resume is checkpoint replay plus live continuation, confined to
-  the same reserved range.
-- **State-handover fidelity:** branches inherit the VFS plus the explicit
-  `input`, not the parent's in-flight JS locals. The agent passes what a
-  branch needs.
+  journal; resume is that replay plus live continuation.
+- **One coherent history:** each branch journals into its own store; settling
+  folds its records into the parent's journal, so live runs and replays see
+  the identical, collision-free record — a branch that violates this invariant
+  fails the call rather than corrupting the journal.
+- **State-handover fidelity:** branches inherit the captured workspace state
+  plus the explicit `input`, not the parent's in-flight JS locals. The agent passes
+  what a branch needs.
 
 ## Cost, safety, concurrency
 
 N branches make N sets of **live** host calls past the fork — real LLM/tool
 spend. The controls: `options.concurrency` caps simultaneous live branches
-(default 1), the fan-out is hard-capped at 16 variants, and each branch
-context enforces the same policy layer as the parent. Branches use separate
-`RuntimeContext`s and separate VMs on separate threads; no shared mutable
-state.
+(default 1), the fan-out is hard-capped at 16 variants, and each branch runs
+under the same approval policy as the parent. Branches use separate, isolated
+VMs; no shared mutable state.
 
 ## Example
 

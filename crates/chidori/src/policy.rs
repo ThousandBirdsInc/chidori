@@ -225,9 +225,9 @@ fn untrusted_profile() -> PolicyConfig {
 /// The policy `chidori serve` runs under when the operator has not configured
 /// one. The server is the surface untrusted callers reach, so sessions there
 /// are deny-by-default out of the box: the `untrusted` profile, with a
-/// fallback reason telling the operator how to relax it. `chidori run` keeps
-/// the permissive default — the primary model for local CLI runs is trusted,
-/// developer-authored agent code.
+/// fallback reason telling the operator how to relax it. (`chidori run`
+/// defaults to the ask-by-default `supervised` profile instead — see
+/// [`run_default_profile`].)
 pub fn serve_default_profile() -> PolicyConfig {
     let mut cfg = untrusted_profile();
     cfg.default_reason = Some(
