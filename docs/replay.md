@@ -119,7 +119,7 @@ When you need a machine-readable result rather than pass/fail,
 `chidori resume <agent.ts> <run_id> --ci` replays and emits a JSON report,
 with distinct exit codes: 0 on match, 3 on divergence, 1 on error. Flags
 and exit codes for both commands:
-[CLI reference](./cli.md#replay-resume-and-testing).
+[CLI reference](./cli.md#replay--testing).
 
 ## Replaying from an SDK
 
