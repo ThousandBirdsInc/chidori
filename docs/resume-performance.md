@@ -352,6 +352,16 @@ still restores in a reader that has never heard of one.
 
 `CHIDORI_VM_IMAGE=0` turns image-writing off.
 
+**Where this is wired today — and where it is not.** Imaging is on by default
+in `RustReplayEngine` (the `SnapshotCapableJsEngine` seam): its `snapshot()`
+now emits an image-carrying `DurableBlob`, and `restore()` prefers the image.
+The mainline agent loop (`rust_engine.rs::run_module`) does **not** run on
+that seam — it dispatches host effects synchronously and resumes by call-log
+re-execution, exactly the situation §5 describes — so ordinary
+`chidori serve`/`chidori run` artifacts do not carry images yet. Routing the
+mainline through the suspended-engine path is the §5 conversion; the image
+format is what makes its durable half exist.
+
 ### 7.3 Measured
 
 `cargo bench -p chidori-js --bench vm_image` resumes the same suspension both
@@ -369,6 +379,12 @@ The image is **flat in history** — 10.2 KB whether the journal is 0.6 KB or
 103 KB — which is the property that matters, and the one that a duplicated
 journal or an unpruned pending-op map silently destroys (a test pins it:
 `image_size_tracks_live_state_not_history`).
+
+Cross-process restore is verified for real, not simulated:
+`examples/image_xproc.rs` records to a suspension and writes the artifact in
+one OS process, then a separate invocation restores it — asserting the image
+path was taken — and finishes the run, with private fields, a mid-`yield`
+generator, and closure state intact across the address-space boundary.
 
 Resume time shows the honest trade: the image path pays a fixed ~1.4 ms to
 rebuild the eager realm and walk the baseline, so **short runs still resume
