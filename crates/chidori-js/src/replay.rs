@@ -82,8 +82,19 @@ impl JournalState {
 /// separated from the state cell it was built against — reusing one means
 /// overwriting that cell's *contents*, not swapping the `Rc`.
 struct BaselinedVm {
-    vm: Vm,
+    /// `Some` until consumed by a restore. Optioned so [`Drop`] can dispose an
+    /// unconsumed target (pool cleared, thread ending) while a consumed one
+    /// moves its VM into the [`ReplayRuntime`], whose own drop disposes it.
+    vm: Option<Vm>,
     state: Rc<RefCell<JournalState>>,
+}
+
+impl Drop for BaselinedVm {
+    fn drop(&mut self) {
+        if let Some(vm) = &mut self.vm {
+            vm.dispose();
+        }
+    }
 }
 
 thread_local! {
@@ -151,6 +162,18 @@ pub struct ReplayRuntime {
     started: bool,
 }
 
+impl Drop for ReplayRuntime {
+    fn drop(&mut self) {
+        // Break the realm's Rc cycles on the way out. Reference counting
+        // cannot reclaim the realm graph (ctor↔prototype, closure↔cell), so
+        // without this every runtime this process ever built leaks its realm —
+        // ~0.7 MB per restore, which the repeated-restore pattern the pool
+        // exists for turns into an unbounded accumulation. Mirrors the
+        // explicit dispose `run_module` does for the mainline engine.
+        self.vm.dispose();
+    }
+}
+
 impl ReplayRuntime {
     /// Create a runtime in record mode for a fresh durable execution.
     pub fn record(bundle: &str, effects: &[&str]) -> ReplayRuntime {
@@ -184,7 +207,18 @@ impl ReplayRuntime {
         journal_bytes: &[u8],
         effects: &[&str],
     ) -> Result<ReplayRuntime, String> {
-        let journal = Journal::from_bytes(journal_bytes)?;
+        Self::restore_with_journal(bundle, Journal::from_bytes(journal_bytes)?, effects)
+    }
+
+    /// As [`Self::restore`], with the journal already parsed — the blob path
+    /// carries the structure directly, so re-encoding it to bytes just to
+    /// parse them again here would reintroduce the cost the inline journal
+    /// removed.
+    pub fn restore_with_journal(
+        bundle: &str,
+        journal: Journal,
+        effects: &[&str],
+    ) -> Result<ReplayRuntime, String> {
         let bundle_hash = Journal::hash_bundle(bundle);
         // The journal pins the bundle it was recorded against; actually
         // compare the pin. A changed bundle is legal (modify-and-resume is
@@ -292,6 +326,16 @@ impl ReplayRuntime {
         journal_bytes: &[u8],
         effects: &[&str],
     ) -> Result<ReplayRuntime, String> {
+        Self::from_image_with_journal(img, bundle, Journal::from_bytes(journal_bytes)?, effects)
+    }
+
+    /// As [`Self::from_image`], with the journal already parsed.
+    pub fn from_image_with_journal(
+        img: &RuntimeImage,
+        bundle: &str,
+        journal: Journal,
+        effects: &[&str],
+    ) -> Result<ReplayRuntime, String> {
         if img.version != crate::image::IMAGE_VERSION {
             return Err(format!(
                 "runtime image version {} but this engine writes {}",
@@ -308,7 +352,6 @@ impl ReplayRuntime {
                     .to_string(),
             );
         }
-        let journal = Journal::from_bytes(journal_bytes)?;
         let restored = JournalState {
             journal,
             mode: Mode::Record,
@@ -335,16 +378,19 @@ impl ReplayRuntime {
         // A VM at the baseline the imaging side built, pooled or fresh. Taken
         // only after the version and bundle checks above, so a rejected image
         // never burns a primed target.
-        let taken = Self::take_baselined(effects);
+        let mut taken = Self::take_baselined(effects);
         // The effect natives already hold this cell; give them the restored
         // journal by overwriting its contents rather than swapping the `Rc`,
         // which they would not see.
         *taken.state.borrow_mut() = restored;
         let mut rt = ReplayRuntime {
-            vm: taken.vm,
+            vm: taken
+                .vm
+                .take()
+                .expect("a restore target always carries its VM until consumed"),
             bundle,
             bundle_hash,
-            state: taken.state,
+            state: taken.state.clone(),
             started: img.started,
         };
         // Compile (not run) the bundle so imaged closures resolve to bytecode.
@@ -365,17 +411,14 @@ impl ReplayRuntime {
     /// is what makes a restore target reusable across different programs.
     fn build_baselined(effects: &[&str]) -> BaselinedVm {
         let state = Rc::new(RefCell::new(JournalState::empty()));
-        let mut rt = ReplayRuntime {
-            vm: Vm::new(),
-            bundle: String::new(),
-            bundle_hash: String::new(),
-            state: state.clone(),
-            started: false,
-        };
-        rt.install_effects(effects);
-        rt.install_memo();
-        rt.vm.mark_image_baseline();
-        BaselinedVm { vm: rt.vm, state }
+        let mut vm = Vm::new();
+        Self::install_effects_on(&mut vm, &state, effects);
+        Self::install_memo_on(&mut vm, &state);
+        vm.mark_image_baseline();
+        BaselinedVm {
+            vm: Some(vm),
+            state,
+        }
     }
 
     /// Pre-build the restore target for `effects` so the next
@@ -442,94 +485,115 @@ impl ReplayRuntime {
     /// journal. Calling `name(...args)` returns a promise that resolves from the
     /// journal (replay) or pends awaiting a live result (record/frontier).
     fn install_effects(&mut self, effects: &[&str]) {
-        let global = self.vm.realm.global.clone();
+        Self::install_effects_on(&mut self.vm, &self.state, effects);
+    }
+
+    /// The body of [`Self::install_effects`], usable before a `ReplayRuntime`
+    /// exists — the pre-built restore targets install the same natives on a
+    /// bare VM, and `ReplayRuntime` now has a `Drop`, so its fields cannot be
+    /// moved out to build one after the fact.
+    fn install_effects_on(target: &mut Vm, st: &Rc<RefCell<JournalState>>, effects: &[&str]) {
+        let global = target.realm.global.clone();
         for name in effects {
             let nm = name.to_string();
-            let state = self.state.clone();
-            self.vm
-                .define_method(&global, name, 1, move |vm, _this, args| {
-                    let args_json = Json::Array(args.iter().map(|a| vm.value_to_json(a)).collect());
-                    // Allocate the deterministic key.
-                    let (site, seq) = {
-                        let mut s = state.borrow_mut();
-                        let seq = *s.counters.get(&nm).unwrap_or(&0);
-                        s.counters.insert(nm.clone(), seq + 1);
-                        (nm.clone(), seq)
-                    };
-                    // Ordered journal consumption: the next recorded entry must match
-                    // this call's key, else an edit changed already-executed effects
-                    // (fail-loud divergence, the P4 default policy).
-                    enum Decision {
-                        Resolve(Json),
-                        Reject(String),
-                        Frontier,
-                        Diverged(String),
-                    }
-                    let decision = {
-                        let mut s = state.borrow_mut();
-                        let cursor = s.cursor;
-                        if cursor < s.journal.entries.len() {
-                            let entry = s.journal.entries[cursor].clone();
-                            if entry.site != site || entry.seq != seq {
-                                let msg = format!(
+            let state = st.clone();
+            target.define_method(&global, name, 1, move |vm, _this, args| {
+                let args_json = Json::Array(args.iter().map(|a| vm.value_to_json(a)).collect());
+                // Allocate the deterministic key.
+                let (site, seq) = {
+                    let mut s = state.borrow_mut();
+                    let seq = *s.counters.get(&nm).unwrap_or(&0);
+                    s.counters.insert(nm.clone(), seq + 1);
+                    (nm.clone(), seq)
+                };
+                // Ordered journal consumption: the next recorded entry must match
+                // this call's key, else an edit changed already-executed effects
+                // (fail-loud divergence, the P4 default policy).
+                enum Decision {
+                    Resolve(Json),
+                    Reject(String),
+                    Frontier,
+                    Diverged(String),
+                }
+                let decision = {
+                    let mut s = state.borrow_mut();
+                    let cursor = s.cursor;
+                    if cursor < s.journal.entries.len() {
+                        let entry = s.journal.entries[cursor].clone();
+                        if entry.site != site || entry.seq != seq {
+                            let msg = format!(
                                 "expected effect '{}'#{} from journal but program called '{}'#{} \
                                  (an edit changed already-executed code before the resume point{})",
-                                entry.site, entry.seq, site, seq,
-                                if s.bundle_changed { "; the code bundle differs from the recorded one" } else { "" }
+                                entry.site,
+                                entry.seq,
+                                site,
+                                seq,
+                                if s.bundle_changed {
+                                    "; the code bundle differs from the recorded one"
+                                } else {
+                                    ""
+                                }
                             );
-                                s.divergence = Some(msg.clone());
-                                Decision::Diverged(msg)
-                            } else if entry.args != Json::Null && entry.args != args_json {
-                                // Same effect, same position, different request:
-                                // replaying the recorded result would answer a
-                                // question the program no longer asks.
-                                let msg = format!(
-                                    "effect '{}'#{} was recorded with args {} but the program now \
+                            s.divergence = Some(msg.clone());
+                            Decision::Diverged(msg)
+                        } else if entry.args != Json::Null && entry.args != args_json {
+                            // Same effect, same position, different request:
+                            // replaying the recorded result would answer a
+                            // question the program no longer asks.
+                            let msg = format!(
+                                "effect '{}'#{} was recorded with args {} but the program now \
                                      calls it with {} (an edit changed an already-executed call's \
                                      arguments before the resume point{})",
-                                    site, seq, entry.args, args_json,
-                                    if s.bundle_changed { "; the code bundle differs from the recorded one" } else { "" }
-                                );
-                                s.divergence = Some(msg.clone());
-                                Decision::Diverged(msg)
-                            } else {
-                                s.cursor += 1;
-                                match entry.outcome {
-                                    EffectOutcome::Resolved(j) => Decision::Resolve(j),
-                                    EffectOutcome::Rejected(m) => Decision::Reject(m),
+                                site,
+                                seq,
+                                entry.args,
+                                args_json,
+                                if s.bundle_changed {
+                                    "; the code bundle differs from the recorded one"
+                                } else {
+                                    ""
                                 }
-                            }
+                            );
+                            s.divergence = Some(msg.clone());
+                            Decision::Diverged(msg)
                         } else {
-                            Decision::Frontier
+                            s.cursor += 1;
+                            match entry.outcome {
+                                EffectOutcome::Resolved(j) => Decision::Resolve(j),
+                                EffectOutcome::Rejected(m) => Decision::Reject(m),
+                            }
                         }
-                    };
-                    let (id, promise) = vm.register_host_op();
-                    state.borrow_mut().pending.insert(
-                        id,
-                        PendingOp {
-                            name: nm.clone(),
-                            args: args_json,
-                            site,
-                            seq,
-                        },
-                    );
-                    match decision {
-                        Decision::Resolve(j) => {
-                            let v = vm.json_to_value(&j);
-                            vm.resolve_host_op(id, v);
-                        }
-                        Decision::Reject(msg) => {
-                            let e = vm.make_error(ErrorKind::Error, &msg);
-                            vm.reject_host_op(id, e);
-                        }
-                        Decision::Diverged(msg) => {
-                            let e = vm.make_error(ErrorKind::Error, &msg);
-                            vm.reject_host_op(id, e);
-                        }
-                        Decision::Frontier => { /* stays pending; resolved live */ }
+                    } else {
+                        Decision::Frontier
                     }
-                    Ok(Value::Object(promise))
-                });
+                };
+                let (id, promise) = vm.register_host_op();
+                state.borrow_mut().pending.insert(
+                    id,
+                    PendingOp {
+                        name: nm.clone(),
+                        args: args_json,
+                        site,
+                        seq,
+                    },
+                );
+                match decision {
+                    Decision::Resolve(j) => {
+                        let v = vm.json_to_value(&j);
+                        vm.resolve_host_op(id, v);
+                    }
+                    Decision::Reject(msg) => {
+                        let e = vm.make_error(ErrorKind::Error, &msg);
+                        vm.reject_host_op(id, e);
+                    }
+                    Decision::Diverged(msg) => {
+                        let e = vm.make_error(ErrorKind::Error, &msg);
+                        vm.reject_host_op(id, e);
+                    }
+                    Decision::Frontier => { /* stays pending; resolved live */ }
+                }
+                Ok(Value::Object(promise))
+            });
         }
     }
 
@@ -540,96 +604,97 @@ impl ReplayRuntime {
     /// memoized rather than re-executed. The result must be JSON-serializable
     /// (a plain value, not a continuation).
     fn install_memo(&mut self) {
-        let global = self.vm.realm.global.clone();
-        let state = self.state.clone();
-        self.vm
-            .define_method(&global, "durableStep", 1, move |vm, _this, args| {
-                let f = args.first().cloned().unwrap_or(Value::Undefined);
-                let site = "durableStep".to_string();
-                let seq = {
-                    let mut s = state.borrow_mut();
-                    let seq = *s.counters.get(&site).unwrap_or(&0);
-                    s.counters.insert(site.clone(), seq + 1);
-                    seq
-                };
-                enum Decision {
-                    Cached(Json),
-                    CachedErr(String),
-                    Run,
-                    Diverged(String),
-                }
-                let decision = {
-                    let mut s = state.borrow_mut();
-                    let cursor = s.cursor;
-                    if cursor < s.journal.entries.len() {
-                        let entry = s.journal.entries[cursor].clone();
-                        if entry.site == site && entry.seq == seq {
-                            s.cursor += 1;
-                            match entry.outcome {
-                                EffectOutcome::Resolved(j) => Decision::Cached(j),
-                                EffectOutcome::Rejected(m) => Decision::CachedErr(m),
-                            }
-                        } else {
-                            let msg = format!(
-                                "expected '{}'#{} from journal but program reached durableStep#{} \
-                             (edit changed already-executed code)",
-                                entry.site, entry.seq, seq
-                            );
-                            s.divergence = Some(msg.clone());
-                            Decision::Diverged(msg)
+        Self::install_memo_on(&mut self.vm, &self.state);
+    }
+
+    /// As [`Self::install_effects_on`], for the `durableStep` helper.
+    fn install_memo_on(target: &mut Vm, st: &Rc<RefCell<JournalState>>) {
+        let global = target.realm.global.clone();
+        let state = st.clone();
+        target.define_method(&global, "durableStep", 1, move |vm, _this, args| {
+            let f = args.first().cloned().unwrap_or(Value::Undefined);
+            let site = "durableStep".to_string();
+            let seq = {
+                let mut s = state.borrow_mut();
+                let seq = *s.counters.get(&site).unwrap_or(&0);
+                s.counters.insert(site.clone(), seq + 1);
+                seq
+            };
+            enum Decision {
+                Cached(Json),
+                CachedErr(String),
+                Run,
+                Diverged(String),
+            }
+            let decision = {
+                let mut s = state.borrow_mut();
+                let cursor = s.cursor;
+                if cursor < s.journal.entries.len() {
+                    let entry = s.journal.entries[cursor].clone();
+                    if entry.site == site && entry.seq == seq {
+                        s.cursor += 1;
+                        match entry.outcome {
+                            EffectOutcome::Resolved(j) => Decision::Cached(j),
+                            EffectOutcome::Rejected(m) => Decision::CachedErr(m),
                         }
                     } else {
-                        Decision::Run
+                        let msg = format!(
+                            "expected '{}'#{} from journal but program reached durableStep#{} \
+                             (edit changed already-executed code)",
+                            entry.site, entry.seq, seq
+                        );
+                        s.divergence = Some(msg.clone());
+                        Decision::Diverged(msg)
                     }
-                };
-                let (id, promise) = vm.register_host_op();
-                let key = crate::host::HostKey { site, seq };
-                match decision {
-                    Decision::Cached(j) => {
-                        let v = vm.json_to_value(&j);
-                        vm.resolve_host_op(id, v);
-                    }
-                    Decision::CachedErr(m) => {
-                        let e = vm.make_error(ErrorKind::Error, &m);
-                        vm.reject_host_op(id, e);
-                    }
-                    Decision::Diverged(m) => {
-                        let e = vm.make_error(ErrorKind::Error, &m);
-                        vm.reject_host_op(id, e);
-                    }
-                    Decision::Run => match vm.call(f, Value::Undefined, &[]) {
-                        Ok(v) => {
-                            let j = vm.value_to_json(&v);
-                            {
-                                let mut s = state.borrow_mut();
-                                s.journal.append(
-                                    &key,
-                                    Json::Null,
-                                    EffectOutcome::Resolved(j.clone()),
-                                );
-                                s.cursor = s.journal.entries.len();
-                            }
-                            let rv = vm.json_to_value(&j);
-                            vm.resolve_host_op(id, rv);
-                        }
-                        Err(e) => {
-                            let msg = vm.error_to_string(&e);
-                            {
-                                let mut s = state.borrow_mut();
-                                s.journal.append(
-                                    &key,
-                                    Json::Null,
-                                    EffectOutcome::Rejected(msg.clone()),
-                                );
-                                s.cursor = s.journal.entries.len();
-                            }
-                            let err = vm.make_error(ErrorKind::Error, &msg);
-                            vm.reject_host_op(id, err);
-                        }
-                    },
+                } else {
+                    Decision::Run
                 }
-                Ok(Value::Object(promise))
-            });
+            };
+            let (id, promise) = vm.register_host_op();
+            let key = crate::host::HostKey { site, seq };
+            match decision {
+                Decision::Cached(j) => {
+                    let v = vm.json_to_value(&j);
+                    vm.resolve_host_op(id, v);
+                }
+                Decision::CachedErr(m) => {
+                    let e = vm.make_error(ErrorKind::Error, &m);
+                    vm.reject_host_op(id, e);
+                }
+                Decision::Diverged(m) => {
+                    let e = vm.make_error(ErrorKind::Error, &m);
+                    vm.reject_host_op(id, e);
+                }
+                Decision::Run => match vm.call(f, Value::Undefined, &[]) {
+                    Ok(v) => {
+                        let j = vm.value_to_json(&v);
+                        {
+                            let mut s = state.borrow_mut();
+                            s.journal
+                                .append(&key, Json::Null, EffectOutcome::Resolved(j.clone()));
+                            s.cursor = s.journal.entries.len();
+                        }
+                        let rv = vm.json_to_value(&j);
+                        vm.resolve_host_op(id, rv);
+                    }
+                    Err(e) => {
+                        let msg = vm.error_to_string(&e);
+                        {
+                            let mut s = state.borrow_mut();
+                            s.journal.append(
+                                &key,
+                                Json::Null,
+                                EffectOutcome::Rejected(msg.clone()),
+                            );
+                            s.cursor = s.journal.entries.len();
+                        }
+                        let err = vm.make_error(ErrorKind::Error, &msg);
+                        vm.reject_host_op(id, err);
+                    }
+                },
+            }
+            Ok(Value::Object(promise))
+        });
     }
 
     fn start(&mut self) -> Result<(), String> {
@@ -845,11 +910,47 @@ impl ReplayRuntime {
 /// A self-describing durable artifact: the code bundle plus its effect journal.
 /// `restore` needs the bundle (the journal references it by content hash), so we
 /// bundle them together rather than threading the bundle through the trait.
+/// The journal inside a [`DurableBlob`]. Written inline — the parsed structure
+/// itself — so the artifact is encoded once and decoded once. It used to travel
+/// as the journal's serialized bytes (`Vec<u8>`), which serde_json renders as a
+/// JSON array of numbers and which then had to be parsed as JSON *again*; that
+/// double decode was the single largest history-dependent cost of an image
+/// restore (~2.5 ms of a 1600-effect restore). The legacy arm keeps every blob
+/// written in the old shape readable; writers emit `Inline`. The one-way cost:
+/// a binary from before this change cannot read a new artifact's journal — an
+/// accepted break for a run artifact written and read by the same deployment
+/// (the snapshot ABI gates cross-version restores anyway).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum JournalBlob {
+    /// The journal as structure (a JSON object). Tried first by the untagged
+    /// decoder; a legacy byte array cannot match it.
+    Inline(Journal),
+    /// Pre-existing artifacts: the journal's JSON as raw bytes.
+    Legacy(Vec<u8>),
+}
+
+impl JournalBlob {
+    /// The journal, whichever shape it traveled in.
+    pub fn parse(&self) -> Result<Journal, String> {
+        match self {
+            JournalBlob::Inline(j) => Ok(j.clone()),
+            JournalBlob::Legacy(bytes) => Journal::from_bytes(bytes),
+        }
+    }
+}
+
+impl Default for JournalBlob {
+    fn default() -> Self {
+        JournalBlob::Inline(Journal::default())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct DurableBlob {
     pub bundle: String,
     pub effects: Vec<String>,
-    pub journal: Vec<u8>,
+    pub journal: JournalBlob,
     /// A VM image of the same suspension point, when one could be taken.
     ///
     /// Strictly a fast path: [`ReplayRuntime::from_blob`] uses it to skip
@@ -884,7 +985,7 @@ impl ReplayRuntime {
         let blob = DurableBlob {
             bundle: self.bundle.clone(),
             effects: effects.iter().map(|s| s.to_string()).collect(),
-            journal: self.journal_bytes(),
+            journal: JournalBlob::Inline(self.state.borrow().journal.clone()),
             image,
         };
         serde_json::to_vec(&blob).unwrap_or_default()
@@ -900,21 +1001,20 @@ impl ReplayRuntime {
     pub fn from_blob_reporting(bytes: &[u8]) -> Result<(ReplayRuntime, RestorePath), String> {
         let blob: DurableBlob = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         let effect_names: Vec<&str> = blob.effects.iter().map(|s| s.as_str()).collect();
+        let journal = blob.journal.parse()?;
         let mut declined = None;
         if let Some(image) = &blob.image {
-            match Self::from_image(image, &blob.bundle, &blob.journal, &effect_names) {
+            // The clone keeps the parsed journal available for the fallback;
+            // cloning entries is microseconds against the parse it replaces.
+            match Self::from_image_with_journal(image, &blob.bundle, journal.clone(), &effect_names)
+            {
                 Ok(rt) => return Ok((rt, RestorePath::Image)),
                 // Never fatal: the journal can always rebuild this state, so a
                 // stale or inapplicable image costs time, not correctness.
                 Err(e) => declined = Some(e),
             }
         }
-        let rt = Self::from_blob_by_replay(&blob)?;
+        let rt = Self::restore_with_journal(&blob.bundle, journal, &effect_names)?;
         Ok((rt, RestorePath::Replay { reason: declined }))
-    }
-
-    fn from_blob_by_replay(blob: &DurableBlob) -> Result<ReplayRuntime, String> {
-        let effects: Vec<&str> = blob.effects.iter().map(|s| s.as_str()).collect();
-        ReplayRuntime::restore(&blob.bundle, &blob.journal, &effects)
     }
 }

@@ -181,7 +181,7 @@ impl ScaffoldPersister {
         let blob = chidori_js::replay::DurableBlob {
             bundle: source.to_string(),
             effects: Vec::new(),
-            journal: Vec::new(),
+            journal: Default::default(),
             // The scaffold blob exists so a crash before the first safepoint
             // still leaves a resumable artifact; there is no VM to image yet.
             image: None,

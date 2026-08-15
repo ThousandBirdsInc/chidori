@@ -479,8 +479,8 @@ fn durable_blob_prefers_the_image_and_still_carries_the_journal() {
     let decoded: chidori_js::replay::DurableBlob = serde_json::from_slice(&blob).unwrap();
     assert_eq!(decoded.bundle, ASYNC_BUNDLE);
     assert!(
-        !decoded.journal.is_empty(),
-        "the journal is still the record"
+        !decoded.journal.parse().unwrap().bundle_hash.is_empty(),
+        "the journal is still the record (it pins the bundle even before any entry lands)"
     );
     assert!(decoded.image.is_some(), "an image should have been taken");
 
@@ -710,4 +710,72 @@ fn priming_is_idempotent_and_clearable() {
     drop(rt);
     let out = finish_from_image(&image, &journal, effects, op_id);
     assert_eq!(out.0.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The blob envelope and the lifetime of a runtime.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_legacy_blob_with_a_byte_array_journal_still_restores() {
+    // Blobs written before the inline-journal change carried the journal as
+    // raw JSON bytes — serialized by serde_json as an array of numbers. The
+    // untagged decoder must keep accepting that shape forever; artifacts on
+    // disk do not get rewritten.
+    let (rt, _op, journal) = record_until_suspended(ASYNC_BUNDLE, &["fetchValue", "report"]);
+    drop(rt);
+
+    let legacy = serde_json::json!({
+        "bundle": ASYNC_BUNDLE,
+        "effects": ["fetchValue", "report"],
+        "journal": journal, // Vec<u8> → JSON array of numbers, the old wire shape
+    });
+    let bytes = serde_json::to_vec(&legacy).unwrap();
+
+    let (mut rt2, path) = ReplayRuntime::from_blob_reporting(&bytes)
+        .expect("the legacy journal shape must keep parsing");
+    assert_eq!(path, RestorePath::Replay { reason: None });
+
+    let mut suspend = suspend_at_first_fetch;
+    let op_id = match rt2.drive(&mut suspend).unwrap() {
+        DriveOutcome::Suspended { op_id, .. } => op_id,
+        DriveOutcome::Completed => panic!("expected a suspension"),
+    };
+    let mut reported = Vec::new();
+    let mut handler = |name: &str, args: &Json| -> Option<Result<Json, String>> {
+        if name == "report" {
+            reported.push(args[0].clone());
+        }
+        Some(Ok(json!(32)))
+    };
+    rt2.provide_and_drive(op_id, Ok(json!(10)), &mut handler as Handler)
+        .unwrap();
+    assert_eq!(reported, vec![json!({"total": 42, "seen": ["a", "b"]})]);
+}
+
+#[test]
+fn dropping_a_runtime_releases_its_realm() {
+    // The realm graph is full of Rc cycles reference counting cannot reclaim;
+    // ReplayRuntime's Drop breaks them via Vm::dispose. Hold a weak handle to
+    // the global object across the drop: if the realm leaked, the cycle keeps
+    // the global alive and the upgrade succeeds.
+    let (rt, _op, journal) = record_until_suspended(ASYNC_BUNDLE, &["fetchValue", "report"]);
+    let blob = rt.to_blob(&["fetchValue", "report"]);
+    let weak_recorder = std::rc::Rc::downgrade(&rt.vm.realm.global.0);
+    drop(rt);
+    assert!(
+        weak_recorder.upgrade().is_none(),
+        "the recording runtime leaked its realm"
+    );
+    let _ = journal;
+
+    // Same check for the image-restore path — the restored heap is grafted
+    // onto the realm, so a leak here would also pin every restored object.
+    let (rt2, _) = ReplayRuntime::from_blob_reporting(&blob).unwrap();
+    let weak_restored = std::rc::Rc::downgrade(&rt2.vm.realm.global.0);
+    drop(rt2);
+    assert!(
+        weak_restored.upgrade().is_none(),
+        "the image-restored runtime leaked its realm"
+    );
 }

@@ -7,7 +7,6 @@
 //!
 //! Run with `cargo run --release -p chidori-js --example image_profile`.
 
-use chidori_js::journal::Journal;
 use chidori_js::replay::{DriveOutcome, DurableBlob, ReplayRuntime};
 use chidori_js::vm::Vm;
 use serde_json::{json, Value as Json};
@@ -89,7 +88,7 @@ fn main() {
         });
         let decoded: DurableBlob = serde_json::from_slice(&blob).unwrap();
         let t_journal = med(reps, || {
-            std::hint::black_box(Journal::from_bytes(&decoded.journal).unwrap());
+            std::hint::black_box(decoded.journal.parse().unwrap());
         });
         let t_total = med(reps, || {
             std::hint::black_box(ReplayRuntime::from_blob(&blob).unwrap());

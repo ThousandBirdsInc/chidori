@@ -432,10 +432,10 @@ with a heap that does not grow:
 
 | journaled effects | journal | image | replay resume | image resume | image resume (primed) |
 |---|---|---|---|---|---|
-| 10 | 0.6 KB | 10.2 KB | 1.7 ms | 4.0 ms | 0.22 ms |
-| 100 | 6.2 KB | 10.2 KB | 1.7 ms | 3.8 ms | 0.45 ms |
-| 400 | 25 KB | 10.2 KB | 2.2 ms | 4.3 ms | 1.1 ms |
-| 1600 | 103 KB | 10.2 KB | 4.8 ms | 6.5 ms | 3.3 ms |
+| 10 | 0.6 KB | 10.2 KB | 0.35 ms | 1.2 ms | 0.10 ms |
+| 100 | 6.2 KB | 10.2 KB | 0.48 ms | 1.3 ms | 0.19 ms |
+| 400 | 25 KB | 10.2 KB | 0.75 ms | 1.6 ms | 0.50 ms |
+| 1600 | 103 KB | 10.2 KB | 1.9 ms | 2.9 ms | 1.8 ms |
 
 (Medians on one idle machine, all six columns measured together — read the
 columns against each other, not against absolute numbers from another host.)
@@ -451,10 +451,19 @@ one OS process, then a separate invocation restores it — asserting the image
 path was taken — and finishes the run, with private fields, a mid-`yield`
 generator, and closure state intact across the address-space boundary.
 
-Resume time shows the honest trade: the image path pays a fixed ~1.4 ms
+These numbers include the **inline-journal envelope fix**: `DurableBlob`
+used to carry the journal as its serialized bytes, which serde_json renders
+as a JSON array of numbers and which every restore then parsed as JSON a
+second time — ~2.5 ms of a 1600-effect restore, on *both* paths (replay paid
+it too). The journal now travels as structure (`JournalBlob::Inline`), encoded
+once and decoded once; a `Legacy` arm keeps every already-written artifact
+readable (pinned by `a_legacy_blob_with_a_byte_array_journal_still_restores`),
+while binaries from before the change cannot read new artifacts — an accepted
+break for a run artifact written and read by the same deployment.
+
+Resume time shows the honest trade: the image path pays a fixed ~1 ms
 prologue before it can decode anything, so **short runs still resume faster by
-replay** — on this machine the unprimed image path does not cross replay
-anywhere in the measured range. `examples/image_profile.rs` breaks the
+replay** on the unprimed path. `examples/image_profile.rs` breaks the
 prologue down: `Vm::new` ~0.45 ms, materializing every lazy builtin section
 ~0.52 ms, the baseline BFS ~0.25 ms, the fingerprint pass ~0.17 ms. At 100
 journaled effects that prologue is ~84% of the whole restore, and none of it
@@ -463,8 +472,8 @@ depends on the image being restored — only on the effect list.
 So it can be paid in advance. `ReplayRuntime::prime_image_restore(effects)`
 builds that VM ahead of time and parks it in a thread-local; the next restore
 with the same effect list takes it and skips straight to decode plus graph
-rebuild. That is the last column: **0.45 ms at 100 effects against replay's
-1.7 ms**, and a win at every length measured. Priming is opt-in because it
+rebuild. That is the last column: **0.19 ms at 100 effects against replay's
+0.48 ms**, and a win at every length measured. Priming is opt-in because it
 does not make a restore cheaper in total — it moves the cost to whoever calls
 it. It pays for the case it exists for, a worker node that restores
 repeatedly and can prime while idle, and is a pure loss for a process that
@@ -480,6 +489,12 @@ path at longer histories, and it makes each prime cheaper. Digests are
 unchanged by all of this (verified identical before and after, which is what
 lets an image cross between engines built either way).
 
+Runtimes also no longer leak: the realm graph is Rc cycles that reference
+counting cannot reclaim, and every discarded `ReplayRuntime` used to strand
+~0.7 MB of it. `ReplayRuntime` (and an unconsumed pooled restore target) now
+disposes its VM on drop — measured residual is ~0.4 KB per restore, allocator
+noise, pinned by `dropping_a_runtime_releases_its_realm`.
+
 Build-once-clone-many realm templates — flagged in §4 and
 `interpreter-optimization.md` §11.4 — remain the way to cut the prologue
 itself rather than relocate it.
@@ -489,10 +504,11 @@ itself rather than relocate it.
 Resume stops being process-local. A suspended agent can be picked up by any
 node holding its cell, at a cost set by its live state rather than its age —
 which is the prerequisite for treating storage nodes as workers
-(`docs/durable-storage.md`). It does not by itself make that fleet exist; the
-remaining gaps (materializing agent source on the waking node, per-node config
-and secrets, multi-tenant isolation with a warm pool, inbound routing) are
-unchanged.
+(`docs/durable-storage.md`). It does not by itself make that fleet exist; source
+materialization on the waking node and owner-addressed routing have since
+landed (see `docs/durable-storage.md` and `docs/detached-agents.md`), leaving
+per-node config/secrets and multi-tenant warm-pool isolation as the remaining
+gaps.
 
 ### 7.5 Not covered yet
 

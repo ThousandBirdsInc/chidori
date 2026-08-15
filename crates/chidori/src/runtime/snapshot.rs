@@ -1813,7 +1813,7 @@ mod source_change_history_tests {
         let blob = chidori_js::replay::DurableBlob {
             bundle: original.to_string(),
             effects: Vec::new(),
-            journal: Vec::new(),
+            journal: Default::default(),
             image: None,
         };
         SnapshotStore::new(&run_dir)

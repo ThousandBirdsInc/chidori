@@ -1188,7 +1188,7 @@ mod tests {
         let blob = chidori_js::replay::DurableBlob {
             bundle: source.to_string(),
             effects: Vec::new(),
-            journal: Vec::new(),
+            journal: Default::default(),
             image: None,
         };
         store

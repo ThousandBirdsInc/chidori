@@ -73,7 +73,11 @@ pub mod driver {
             let effects = blob.effects.clone();
             let refs: Vec<&str> = effects.iter().map(String::as_str).collect();
             Ok(Driver {
-                runtime: ReplayRuntime::restore(&blob.bundle, &blob.journal, &refs)?,
+                runtime: ReplayRuntime::restore_with_journal(
+                    &blob.bundle,
+                    blob.journal.parse()?,
+                    &refs,
+                )?,
                 effects,
             })
         }
