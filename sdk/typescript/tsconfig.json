@@ -11,7 +11,6 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "baseUrl": ".",
     "paths": {
       "@1kbirds/chidori/agent": ["./src/agent.ts"]
     }

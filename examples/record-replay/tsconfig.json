@@ -9,7 +9,6 @@
     "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "types": [],
-    "baseUrl": ".",
     "paths": {
       "chidori:agent": ["../../sdk/typescript/src/agent.ts"],
       "@1kbirds/chidori": ["../../sdk/typescript/src/index.ts"]
