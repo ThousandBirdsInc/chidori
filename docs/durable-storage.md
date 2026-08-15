@@ -142,8 +142,11 @@ Durability shape: local disk stays the fast primary (a node restart reclaims
 its own cells losslessly, unpublished writes included); the bucket is the
 copy that survives losing the machine, fresh to within one sync window. Run
 several nodes against one bucket for failover; note that a client talks to
-one node — a cell owned by another live node is refused, not proxied
-(routing, like celld's V8 application runtime, is out of scope here).
+one node — a cell owned by another live node is refused, not proxied. Routing
+is out of scope for the same reason celld's V8 application runtime is: a cell
+here holds the run's code but never runs it (the engine lives in the Chidori
+process), so "wrong node, here is the owner" is a complete answer to a client
+that only reads and appends bytes.
 
 ## Write-error policy: `CHIDORI_DURABILITY`
 

@@ -39,10 +39,16 @@
 //! §Leases): two processes racing for the same run cannot both win.
 //!
 //! What this deliberately does not implement from celld: the V8/Wrangler
-//! application runtime (Chidori has its own engine; cells here hold run
-//! journals, not application code) and inter-node request routing (a client
-//! talks to one node; a cell owned by another live node answers 409 with the
-//! owner's identity rather than proxying).
+//! application runtime and inter-node request routing — which are the same
+//! omission twice. A cell here does hold the run's code (source history's
+//! content-addressed module objects and the snapshot's durable bundle live in
+//! its blob space like any other artifact), but this node never *executes*
+//! it: the engine runs in the Chidori process, and the store is a data plane
+//! behind the REST protocol. celld must route a request to the owning node
+//! because that is the only place the object's code can run; a client here
+//! only reads and appends bytes, so a cell owned by another live node answers
+//! 409 naming the owner rather than proxying, and standing down is a complete
+//! response.
 //!
 //! Durability model: local disk is the fast primary — a node restart loses
 //! nothing (the owner reclaims its own cells and their local databases).
