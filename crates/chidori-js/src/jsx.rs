@@ -26,11 +26,11 @@ pub fn transpile_jsx(src: &str) -> Result<String, String> {
         .with_jsx(true)
         .with_module(true);
     let parsed = Parser::new(&allocator, src, source_type).parse();
-    if !parsed.errors.is_empty() {
+    if !parsed.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
             parsed
-                .errors
+                .diagnostics
                 .iter()
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
@@ -47,10 +47,10 @@ pub fn transpile_jsx(src: &str) -> Result<String, String> {
     options.jsx.runtime = JsxRuntime::Classic; // emit React.createElement, not jsx-runtime imports
     let ret = Transformer::new(&allocator, Path::new("agent.tsx"), &options)
         .build_with_scoping(scoping, &mut program);
-    if !ret.errors.is_empty() {
+    if !ret.diagnostics.is_empty() {
         return Err(format!(
             "JSX transform error: {}",
-            ret.errors
+            ret.diagnostics
                 .iter()
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()

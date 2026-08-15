@@ -2,7 +2,7 @@
 name = "chidori"
 version = "3.8.0"
 edition = "2021"
-# oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
+# oxc relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
 authors = ["Colton Pierson <colton@thousandbirds.ai>"]
 description = "The agent framework where every run is durable, replayable, and resumable by default. Plain async TypeScript agents on an embedded pure-Rust JS engine."
@@ -119,11 +119,11 @@ opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"], optional = t
 # that missed constructs like type predicates (`(t): t is string => ...`),
 # `satisfies` in odd positions, and overload signatures. oxc parses to a real
 # AST and emits JS via codegen, so unsupported sugar can't slip through.
-oxc = { version = "0.133", features = ["transformer", "codegen", "semantic", "ast_visit"] }
+oxc = { version = "0.138", features = ["transformer", "codegen", "semantic", "ast_visit"] }
 # Generated→original position lookup for the codegen source maps that back
 # error-frame remapping (`CodegenReturn::map` is this crate's `SourceMap`;
 # the oxc facade does not re-export it).
-oxc_sourcemap = "6"
+oxc_sourcemap = "8"
 nodejs-semver = "5.0.0"
 tar = "0.4.46"
 flate2 = "1.1.9"

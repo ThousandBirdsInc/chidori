@@ -231,7 +231,7 @@ fn transpile_source(path: &Path, source: &str) -> Result<String> {
 pub fn transpile_source_with_map(
     path: &Path,
     source: &str,
-) -> Result<(String, oxc_sourcemap::SourceMap)> {
+) -> Result<(String, oxc_sourcemap::SourceMap<'static>)> {
     let (js, map) = transpile_source_impl(path, source, true)?;
     map.map(|m| (js, m))
         .ok_or_else(|| anyhow::anyhow!("codegen produced no source map"))
@@ -241,18 +241,18 @@ fn transpile_source_impl(
     path: &Path,
     source: &str,
     with_map: bool,
-) -> Result<(String, Option<oxc_sourcemap::SourceMap>)> {
+) -> Result<(String, Option<oxc_sourcemap::SourceMap<'static>>)> {
     // Treat input as TypeScript regardless of extension — agents may live in
     // `agent.ts` / `tools/*.ts` and the snapshot pipeline only calls us with TS.
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
     let allocator = Allocator::default();
 
     let parser_ret = Parser::new(&allocator, source, source_type).parse();
-    if !parser_ret.errors.is_empty() {
+    if !parser_ret.diagnostics.is_empty() {
         anyhow::bail!(
             "{}: TypeScript parse error:{}",
             path.display(),
-            render_diagnostics(path, source, &parser_ret.errors)
+            render_diagnostics(path, source, &parser_ret.diagnostics)
         );
     }
     let mut program = parser_ret.program;
@@ -261,11 +261,11 @@ fn transpile_source_impl(
         // Transformer roughly triples scope/symbol/reference allocations.
         .with_excess_capacity(2.0)
         .build(&program);
-    if !semantic_ret.errors.is_empty() {
+    if !semantic_ret.diagnostics.is_empty() {
         anyhow::bail!(
             "{}: TypeScript semantic error:{}",
             path.display(),
-            render_diagnostics(path, source, &semantic_ret.errors)
+            render_diagnostics(path, source, &semantic_ret.diagnostics)
         );
     }
     let scoping = semantic_ret.semantic.into_scoping();
@@ -283,11 +283,11 @@ fn transpile_source_impl(
     transform_options.jsx.runtime = oxc::transformer::JsxRuntime::Classic;
     let transformer_ret = Transformer::new(&allocator, path, &transform_options)
         .build_with_scoping(scoping, &mut program);
-    if !transformer_ret.errors.is_empty() {
+    if !transformer_ret.diagnostics.is_empty() {
         anyhow::bail!(
             "{}: TypeScript transform error:{}",
             path.display(),
-            render_diagnostics(path, source, &transformer_ret.errors)
+            render_diagnostics(path, source, &transformer_ret.diagnostics)
         );
     }
 
@@ -316,7 +316,11 @@ fn transpile_source_impl(
     // preserving codegen's line structure is what lets runtime stack frames
     // map back to real positions in the original TypeScript.
     let js = strip_chidori_sdk_imports(&codegen_ret.code);
-    Ok((js, codegen_ret.map))
+    // oxc_sourcemap 8's `SourceMap<'a>` borrows its source/name strings from
+    // the arena, which dies with this function. `into_owned` lifts it to
+    // `'static`; it only copies the strings that are still borrowed, and only
+    // on the `with_map` path (error remapping), never the hot transpile path.
+    Ok((js, codegen_ret.map.map(|m| m.into_owned())))
 }
 
 /// Blank (not remove) each `chidori:agent` import line, preserving all other
@@ -415,7 +419,7 @@ fn find_dynamic_import(path: &Path, source: &str) -> Option<usize> {
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
-    if !parsed.errors.is_empty() {
+    if !parsed.diagnostics.is_empty() {
         return None;
     }
     let mut finder = Finder { first: None };
@@ -616,7 +620,7 @@ fn ast_import_specifiers(path: &Path, source: &str) -> Option<Vec<CollectedSpeci
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
-    if !parsed.errors.is_empty() {
+    if !parsed.diagnostics.is_empty() {
         return None;
     }
     let mut out = Vec::new();

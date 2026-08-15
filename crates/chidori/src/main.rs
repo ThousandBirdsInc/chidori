@@ -1145,10 +1145,12 @@ fn report_cli_error(e: &anyhow::Error) {
             .filter_map(|f| {
                 let offset = byte_offset_of(source, f.line, f.col)?;
                 seen.insert(offset).then(|| {
+                    // oxc-miette 3 narrowed label spans to u32; a project
+                    // source file that large can't reach here anyway.
                     LabeledSpan::new(
                         Some(format!("at {}", f.name)),
-                        offset,
-                        identifier_len_at(source, offset).max(1),
+                        offset as u32,
+                        identifier_len_at(source, offset).max(1) as u32,
                     )
                 })
             })
@@ -1162,7 +1164,7 @@ fn report_cli_error(e: &anyhow::Error) {
     let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor());
     let mut rendered = String::new();
     let ok = match snippet_source {
-        Some((file, source)) if diagnostic.labels.is_some() => {
+        Some((file, source)) if !diagnostic.labels.is_empty() => {
             let report = diagnostic.with_source_code(NamedSource::new(file, source));
             handler
                 .render_report(&mut rendered, report.as_ref())
