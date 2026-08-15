@@ -84,6 +84,24 @@ frontier), and hibernating agents' alarm and timeout deadlines are re-armed.
 This is what makes a detached agent survive a server restart — or, with a
 durable backend, machine replacement.
 
+**Source is materialized wherever the agent wakes.** The descriptor stores
+the source path as given at spawn (so replay keys stay stable across hosts),
+and resolving it against the local project directory is the fast path. When
+that file is not on the waking node — the fleet case, where a wake lands
+wherever a lease can be taken rather than where the tree happens to live —
+the runtime rebuilds the agent's implementation from its own run store before
+failing: the head commit of the run's
+[source history](./source-history.md) (entry plus every imported module,
+content-addressed full text) is written under
+`.chidori/materialized/<run_id>/`, a sibling of `runs/`, at the tree's
+recorded *relative* layout so relative imports still resolve. Runs recorded
+before source history existed fall back to the entry text in the snapshot's
+durable bundle — enough for a single-module agent. Paths from the store are
+untrusted input to a path join: anything that would land outside the
+materialization root is refused, never written. Materialization is idempotent
+(a file already present with the recorded content is left alone), and a
+failure keeps the original error, noting that materialization was attempted.
+
 **One driver at a time — and dead drivers don't wedge agents.** Before
 executing, the runtime takes a short-lived, regularly renewed lease on the
 agent's run and releases it on hibernate/settle. A wake that finds the lease

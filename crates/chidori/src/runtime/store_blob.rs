@@ -397,6 +397,7 @@ impl S3BlobStore {
             content_type,
             headers,
             false,
+            false,
         )
     }
 
@@ -405,7 +406,7 @@ impl S3BlobStore {
     fn delete_object_async(&self, key: &str) -> Result<()> {
         let (url, headers, content_type) = self.build_signed("DELETE", key, &[], None)?;
         self.relay
-            .request_async("DELETE", url, None, content_type, headers, true)
+            .request_async("DELETE", url, None, content_type, headers, true, false)
     }
 }
 

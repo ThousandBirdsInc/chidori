@@ -950,7 +950,13 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             );
             return;
         };
-        let resolved = resolve_source(&parts.template_engine, &descriptor.source);
+        let resolved = match resolve_wake_source(&parts, store.as_ref(), &descriptor) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                settle(hub, entry, "failed", None, Some(err));
+                return;
+            }
+        };
         let source_text = match std::fs::read_to_string(&resolved) {
             Ok(source) => source,
             Err(err) => {
@@ -1239,6 +1245,116 @@ fn resolve_source(template_engine: &TemplateEngine, source: &str) -> PathBuf {
     }
 }
 
+/// Resolve the entry module for one wake of a detached agent.
+///
+/// The descriptor's `source` is the path as given at spawn, so a node that
+/// holds the agent's project tree resolves it locally — that stays the fast
+/// path, and nothing else is read. A node that does **not** have the tree
+/// (the fleet case: any node may wake any agent it can lease) materializes
+/// the run's own recorded implementation out of its durable store instead
+/// (`source_history::materialize_source`), then runs from there. Failing that,
+/// the spawning run's materialized tree is the last resort — a freshly
+/// spawned agent has no history of its own yet, so its module can only come
+/// from the spawner's (see `resolve_spawn_source`).
+fn resolve_wake_source(
+    parts: &AgentRuntimeParts,
+    store: &dyn crate::runtime::store::RunStore,
+    descriptor: &AgentDescriptor,
+) -> Result<PathBuf, String> {
+    let resolved = resolve_source(&parts.template_engine, &descriptor.source);
+    if resolved.is_file() {
+        return Ok(resolved);
+    }
+    let mut attempts = Vec::new();
+    match materialize_run_source(parts, store, &descriptor.run_id) {
+        Ok(Some(entry)) => return Ok(entry),
+        Ok(None) => attempts.push("the run store holds no recorded source".to_string()),
+        Err(err) => attempts.push(err),
+    }
+    if let Ok(root) = crate::runtime::source_history::materialization_root(
+        &parts.run_base,
+        &descriptor.owner_run_id,
+    ) {
+        let inherited = root.join(&descriptor.source);
+        if inherited.is_file() {
+            return Ok(inherited);
+        }
+    }
+    Err(format!(
+        "reading {}: no such file on this node, and materializing the agent's source \
+         from the durable run store failed ({})",
+        resolved.display(),
+        attempts.join("; ")
+    ))
+}
+
+/// Materialize `run_id`'s recorded source tree under this node's
+/// materialization root, returning the entry module. `Ok(None)` means the
+/// store holds no recoverable source (never executed anywhere, or its
+/// history was pruned).
+fn materialize_run_source(
+    parts: &AgentRuntimeParts,
+    store: &dyn crate::runtime::store::RunStore,
+    run_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let root = crate::runtime::source_history::materialization_root(&parts.run_base, run_id)
+        .map_err(|err| format!("{err:#}"))?;
+    match crate::runtime::source_history::materialize_source(store, &root) {
+        Ok(Some(entry)) => {
+            tracing::info!(
+                run_id,
+                entry = %entry.display(),
+                "materialized the run's source from the durable store"
+            );
+            Ok(Some(entry))
+        }
+        Ok(None) => Ok(None),
+        Err(err) => Err(format!("{err:#}")),
+    }
+}
+
+/// Check a spawn's source module is reachable before recording the spawn, so
+/// a typo fails at the call rather than inside the agent's first iteration.
+///
+/// The spawning run's recorded tree is consulted on a local miss: a run
+/// resumed on a node that does not hold its project directory would otherwise
+/// fail here on a module it may not even need to read — a replayed
+/// `spawn_agent` returns the agent's identity from cache and starts nothing.
+/// A freshly spawned agent has no history of its own yet, so the materialized
+/// spawner tree is also where its first iteration finds the module
+/// (`resolve_wake_source`).
+fn resolve_spawn_source(
+    backend: &HostBindingBackend,
+    ctx: &RuntimeContext,
+    parts: &AgentRuntimeParts,
+    source: &str,
+) -> Result<(), String> {
+    if resolve_source(&backend.template_engine(), source).is_file() {
+        return Ok(());
+    }
+    let run_id = ctx.run_id();
+    let store = match ctx.store() {
+        Some(store) => store,
+        None => RunStoreFactory::shared(&parts.run_base).store_for(&run_id),
+    };
+    if matches!(
+        materialize_run_source(parts, store.as_ref(), &run_id),
+        Ok(Some(_))
+    ) {
+        if let Ok(root) =
+            crate::runtime::source_history::materialization_root(&parts.run_base, &run_id)
+        {
+            if root.join(source).is_file() {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "chidori.agents.spawn: source module not found: {source} (absent on this node, and \
+         materializing the spawning run's recorded source did not produce it)"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Host bindings (`chidori.agents.*`)
 // ---------------------------------------------------------------------------
@@ -1317,11 +1433,7 @@ pub(crate) fn spawn_agent(backend: &HostBindingBackend, a: &Value) -> Result<Val
         // wake in a differently-configured process keeps the same model.
         options.model = Some(ctx.config().model);
     }
-    if !resolve_source(&backend.template_engine(), &source).is_file() {
-        return Err(format!(
-            "chidori.agents.spawn: source module not found: {source}"
-        ));
-    }
+    resolve_spawn_source(backend, ctx, &parts, &source)?;
     let call_args = json!({
         "source": source,
         "input": input,
@@ -1489,6 +1601,36 @@ mod tests {
 
     fn unique(name: &str) -> String {
         format!("{name}-{}", &uuid::Uuid::new_v4().to_string()[..8])
+    }
+
+    /// Poll an agent's status until it settles (or the deadline passes) —
+    /// wakes run on their own thread, so the test observes the descriptor.
+    fn wait_for_settled(parts: &AgentRuntimeParts, name: &str) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = hub().status(parts, name).unwrap();
+            let settled = matches!(
+                status["status"].as_str().unwrap_or_default(),
+                "completed" | "failed" | "stopped" | "paused"
+            );
+            if settled || std::time::Instant::now() >= deadline {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The run id the parent's `spawn_agent` record minted.
+    fn spawned_run_id(ctx: &RuntimeContext) -> String {
+        ctx.call_log()
+            .into_records()
+            .iter()
+            .find(|r| r.function == "spawn_agent")
+            .expect("spawn_agent record")
+            .result["runId"]
+            .as_str()
+            .expect("runId")
+            .to_string()
     }
 
     #[test]
@@ -1696,6 +1838,137 @@ mod tests {
         );
         let restarts = output["outcome"]["restarts"].as_u64().unwrap();
         assert!(restarts >= 1, "expected at least one restart");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The fleet case: a wake lands wherever a lease can be taken, not where
+    /// the agent's project tree happens to be. With the local tree gone, the
+    /// run's own recorded source history is the source of truth — entry AND
+    /// imported module, at their recorded relative layout, so the import
+    /// still resolves.
+    #[test]
+    fn wakes_from_materialized_source_when_the_local_tree_is_gone() {
+        let dir = test_dir("materialize");
+        write_module(&dir, "lib.ts", "export const greeting = \"hi\";\n");
+        write_module(
+            &dir,
+            "listener.ts",
+            r#"
+            import { greeting } from "./lib.ts";
+            export async function agent() {
+                await chidori.log("armed");
+                const msg = await chidori.signal("go");
+                return { got: msg.payload, greeting };
+            }
+            "#,
+        );
+        let agent_name = unique("materialized");
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const svc = await chidori.agents.spawn("services/listener.ts", {}, { name: "__NAME__" });
+                const status = await svc.join({ timeoutMs: 5000 });
+                return { status: status.status };
+            }
+        "#
+        .replace("__NAME__", &agent_name);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), &dir);
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+        assert_eq!(output["status"], json!("hibernating"));
+        let run_id = spawned_run_id(&ctx);
+
+        std::fs::remove_dir_all(dir.join("services")).unwrap();
+
+        let parts = hub().installed_parts().unwrap();
+        hub()
+            .send(
+                &parts,
+                &agent_name,
+                "go",
+                json!({ "speed": "fast" }),
+                json!({ "kind": "test" }),
+            )
+            .unwrap();
+        let outcome = wait_for_settled(&parts, &agent_name);
+        assert_eq!(outcome["status"], json!("completed"), "{outcome}");
+        assert_eq!(
+            outcome["output"],
+            json!({ "got": { "speed": "fast" }, "greeting": "hi" })
+        );
+
+        // The tree came out of the run store, into the materialization root.
+        // (The hub is process-global, so derive the root from this test's own
+        // run base rather than whatever parts another test installed last.)
+        let root = crate::runtime::source_history::materialization_root(
+            &dir.join(".chidori").join("runs"),
+            &run_id,
+        )
+        .unwrap();
+        assert!(root.join("listener.ts").is_file(), "{}", root.display());
+        assert!(root.join("lib.ts").is_file());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A run recorded before source history existed has no `history/` at all,
+    /// only the entry text inside the snapshot blob's `DurableBlob.bundle`.
+    /// That is still enough to wake a single-module agent on a node with no
+    /// copy of its source.
+    #[test]
+    fn wakes_from_the_snapshot_bundle_for_a_pre_source_history_run() {
+        let dir = test_dir("bundle-wake");
+        write_module(
+            &dir,
+            "solo.ts",
+            r#"
+            export async function agent() {
+                await chidori.log("armed");
+                const msg = await chidori.signal("go");
+                return { got: msg.payload };
+            }
+            "#,
+        );
+        let agent_name = unique("legacy");
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const svc = await chidori.agents.spawn("services/solo.ts", {}, { name: "__NAME__" });
+                const status = await svc.join({ timeoutMs: 5000 });
+                return { status: status.status };
+            }
+        "#
+        .replace("__NAME__", &agent_name);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), &dir);
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+        assert_eq!(output["status"], json!("hibernating"));
+        let run_id = spawned_run_id(&ctx);
+
+        // Age the run into the pre-source-history shape, then take its source
+        // away: only the manifest + durable bundle remain.
+        let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+        std::fs::remove_dir_all(run_dir.join("history")).unwrap();
+        std::fs::remove_dir_all(dir.join("services")).unwrap();
+
+        let parts = hub().installed_parts().unwrap();
+        hub()
+            .send(
+                &parts,
+                &agent_name,
+                "go",
+                json!({ "speed": "slow" }),
+                json!({ "kind": "test" }),
+            )
+            .unwrap();
+        let outcome = wait_for_settled(&parts, &agent_name);
+        assert_eq!(outcome["status"], json!("completed"), "{outcome}");
+        assert_eq!(outcome["output"], json!({ "got": { "speed": "slow" } }));
 
         let _ = std::fs::remove_dir_all(dir);
     }

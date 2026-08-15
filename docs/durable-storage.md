@@ -141,21 +141,46 @@ The celld model, applied to runs:
 Durability shape: local disk stays the fast primary (a node restart reclaims
 its own cells losslessly, unpublished writes included); the bucket is the
 copy that survives losing the machine, fresh to within one sync window. Run
-several nodes against one bucket for failover; note that a client talks to
-one node — a cell owned by another live node is refused, not proxied. Routing
-is out of scope for the same reason celld's V8 application runtime is: a cell
-here holds the run's code but never runs it (the engine lives in the Chidori
-process), so "wrong node, here is the owner" is a complete answer to a client
-that only reads and appends bytes.
+several nodes against one bucket for failover.
 
-If that ever changes — nodes executing the runs they own, so the fleet scales
-workers rather than just storage — the prerequisite is a suspended agent that
-any node can pick up cheaply. That now exists: see
-[VM images](./resume-performance.md#7-landed-vm-images),
-which make resume cost track a run's live state instead of its history. The
-remaining gaps are materializing agent source on the waking node, per-node
-config and secrets, multi-tenant isolation with a warm pool, and inbound
-routing.
+**Routing: a 409 you can follow.** A client still talks to one node, and a
+cell owned by another live node is refused rather than proxied — full
+request routing is out of scope for the same reason celld's V8 application
+runtime is: a cell here holds the run's code but never runs it (the engine
+lives in the Chidori process), so "wrong node, here is the owner" is a
+complete answer to a client that only reads and appends bytes. What the
+refusal now carries is an *address*. Start a node with
+`--advertise http://host:9700` and that URL is stamped into every ownership
+record it writes, next to the epoch, so the current owner's address is as
+durable as its identity; the 409 body gains `owner_url` alongside `owner` and
+`lease_expires_at`. A client relay that gets such a 409 retries the same
+request — same path, same body, same bearer token — against the owner,
+**exactly once**: if the owner also refuses, that fence stands rather than
+starting a chase. Both halves are optional and compatible in either
+direction: meta records and 409 bodies without the field parse fine (a node
+with no `--advertise`, or an older one, just doesn't hand out an address),
+and an older client ignores a field it doesn't know.
+
+Lease traffic is deliberately exempt. A 409 about a run's `lease.json` **is**
+the ownership verdict ([Leases](#leases-single-writer-ownership)), so it is
+never re-aimed: a node that lost its cell stands down exactly as before
+instead of arbitrating ownership through the node that took it over.
+Following applies to the read/append traffic addressed at a store, not to who
+may run the run.
+
+Nodes that execute the runs they own — the fleet scaling workers rather than
+just storage — need more than that. The prerequisite of a suspended agent any
+node can pick up cheaply exists: see
+[VM images](./resume-performance.md#7-landed-vm-images), which make resume
+cost track a run's live state instead of its history. Agent source is no
+longer a gap either: a node that lacks an agent's project tree materializes
+it from the run's own durable source history (or, for older runs, the
+snapshot bundle) and runs from there — see
+[Detached agents](./detached-agents.md). The remaining gaps are per-node
+config and secrets distribution, multi-tenant isolation with a warm pool,
+and routing beyond this one-hop follow: nothing here places work on a node,
+picks an owner by load, or drains one for maintenance — ownership is still
+decided by whoever asks first after a lease lapses.
 
 ## Write-error policy: `CHIDORI_DURABILITY`
 
@@ -288,7 +313,8 @@ poisoned by a mirror-write failure.
   GitHub.)
 * **No multi-node routing.** Leases arbitrate double-execution; they do not
   route requests to a run's owner. One server (or CLI process) drives a run
-  at a time.
+  at a time. (The cell store's `--advertise` + one-hop follow redirects a
+  *store* client to the owning node; it does not move execution.)
 * **Branch stores mirror through the parent run's handle** (scoped keys), but
   out-of-band branch *reads* (`chidori branches`) stay filesystem-local —
   hydrate the run first on a fresh machine.
@@ -306,10 +332,14 @@ Stated so the guarantees above aren't read as stronger than they are:
   iteration) and stands down then. Its in-flight journal appends between
   those points surface as generic mirror-write failures — logged under
   `besteffort`, run-poisoning under `strict`.
-* **The cell store does not route.** A cell owned by another live node is
-  refused with a `409` naming the owner, not proxied. Single ownership is
-  solved at the storage layer; picking *which* node should serve a given run
-  is the operator's job — one `chidori serve` per agent, as
+* **The cell store still does not route, it redirects.** A cell owned by
+  another live node is refused with a `409` naming the owner — never proxied.
+  With `--advertise` the refusal also carries the owner's URL and the client
+  retries there once, which is redirection, not request routing: no node
+  forwards traffic, nothing places work on a node or picks an owner by load,
+  and lease arbitration never follows. Single ownership is solved at the
+  storage layer; picking *which* node should serve a given run is still the
+  operator's job — one `chidori serve` per agent, as
   [Deployment](./deployment.md) describes.
 * **Cell-store bucket freshness is the sync cadence.** An acknowledged write
   is durable on the owning node's disk (`synchronous=FULL`) but reaches the
