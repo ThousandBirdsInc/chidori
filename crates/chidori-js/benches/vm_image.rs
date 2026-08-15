@@ -7,7 +7,7 @@
 //! Run with `cargo bench -p chidori-js --bench vm_image`.
 
 use chidori_js::replay::{DriveOutcome, ReplayRuntime};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use serde_json::{json, Value as Json};
 
 /// A run that accumulates `iters` journaled host calls and then suspends,
@@ -60,6 +60,24 @@ fn bench_resume(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("image", iters), &with_image, |b, blob| {
             b.iter(|| ReplayRuntime::from_blob(blob).unwrap())
         });
+        // Restore *latency* when the prologue has already been paid — the
+        // worker-node case, where a node primes between jobs rather than on
+        // the critical path. `PerIteration` puts the prime in setup, outside
+        // the timed region, which is the honest way to state that: the work
+        // still happens, it just is not what the resuming request waits for.
+        // Read alongside `image` above, which is the same restore with the
+        // prologue counted; total work per restore is unchanged.
+        group.bench_with_input(
+            BenchmarkId::new("image_primed", iters),
+            &with_image,
+            |b, blob| {
+                b.iter_batched(
+                    || ReplayRuntime::prime_image_restore(&["step", "report"]),
+                    |_| ReplayRuntime::from_blob(blob).unwrap(),
+                    BatchSize::PerIteration,
+                )
+            },
+        );
     }
     group.finish();
 }

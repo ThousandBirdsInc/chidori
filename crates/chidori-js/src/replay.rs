@@ -57,6 +57,50 @@ struct JournalState {
     bundle_changed: bool,
 }
 
+impl JournalState {
+    /// The state a not-yet-used restore target carries: the host natives close
+    /// over it at construction, and the real journal is written into it when
+    /// the VM is actually consumed by a restore.
+    fn empty() -> JournalState {
+        JournalState {
+            journal: Journal::default(),
+            mode: Mode::Record,
+            counters: HashMap::new(),
+            pending: HashMap::new(),
+            cursor: 0,
+            divergence: None,
+            bundle_changed: false,
+        }
+    }
+}
+
+/// A restore target built ahead of time: a VM sitting at the image baseline,
+/// paired with the journal state its host natives close over.
+///
+/// The pairing is the whole point. `install_effects` captures the runtime's
+/// `Rc<RefCell<JournalState>>` inside each effect native, so a VM cannot be
+/// separated from the state cell it was built against — reusing one means
+/// overwriting that cell's *contents*, not swapping the `Rc`.
+struct BaselinedVm {
+    vm: Vm,
+    state: Rc<RefCell<JournalState>>,
+}
+
+thread_local! {
+    /// At most one spare baselined VM per effect-name list, filled only by an
+    /// explicit [`ReplayRuntime::prime_image_restore`] call.
+    ///
+    /// Deliberately not self-refilling. Building a baselined VM costs the same
+    /// whenever it happens, so refilling inside `from_image` would move the
+    /// work around without removing any of it — a throughput wash that only
+    /// looks like a win if you stop measuring at the `return`. Priming is
+    /// opt-in so the caller decides when to spend it: a worker node primes at
+    /// startup and again after a restore, while it is idle, and the restore
+    /// itself then skips the whole prologue.
+    static RESTORE_POOL: RefCell<HashMap<Vec<String>, BaselinedVm>> =
+        RefCell::new(HashMap::new());
+}
+
 /// A pending host op, as written into a runtime image.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PendingOpImg {
@@ -265,7 +309,7 @@ impl ReplayRuntime {
             );
         }
         let journal = Journal::from_bytes(journal_bytes)?;
-        let state = Rc::new(RefCell::new(JournalState {
+        let restored = JournalState {
             journal,
             mode: Mode::Record,
             counters: img.counters.clone(),
@@ -287,23 +331,90 @@ impl ReplayRuntime {
                 .collect(),
             divergence: None,
             bundle_changed: false,
-        }));
+        };
+        // A VM at the baseline the imaging side built, pooled or fresh. Taken
+        // only after the version and bundle checks above, so a rejected image
+        // never burns a primed target.
+        let taken = Self::take_baselined(effects);
+        // The effect natives already hold this cell; give them the restored
+        // journal by overwriting its contents rather than swapping the `Rc`,
+        // which they would not see.
+        *taken.state.borrow_mut() = restored;
         let mut rt = ReplayRuntime {
-            vm: Vm::new(),
+            vm: taken.vm,
             bundle,
             bundle_hash,
-            state,
+            state: taken.state,
             started: img.started,
         };
-        // Reproduce the baseline exactly as the imaging side built it.
-        rt.install_effects(effects);
-        rt.install_memo();
-        rt.vm.mark_image_baseline();
         // Compile (not run) the bundle so imaged closures resolve to bytecode.
         let proto = crate::compiler::compile_script_cached(&rt.bundle)?;
         rt.vm.register_image_unit(rt.bundle_hash.clone(), proto);
         rt.vm.restore_image(&img.vm).map_err(|e| e.to_string())?;
         Ok(rt)
+    }
+
+    /// Build the VM an image restore for `effects` needs: fresh realm, effect
+    /// natives and the memo helper installed, every lazy builtin section
+    /// materialized, baseline marked. This is exactly the prologue
+    /// [`Self::from_image`] would otherwise run inline, factored out so it can
+    /// also be run ahead of time.
+    ///
+    /// The bundle plays no part — the baseline is the realm plus the host
+    /// surface, and the bundle is only compiled (never run) afterwards — which
+    /// is what makes a restore target reusable across different programs.
+    fn build_baselined(effects: &[&str]) -> BaselinedVm {
+        let state = Rc::new(RefCell::new(JournalState::empty()));
+        let mut rt = ReplayRuntime {
+            vm: Vm::new(),
+            bundle: String::new(),
+            bundle_hash: String::new(),
+            state: state.clone(),
+            started: false,
+        };
+        rt.install_effects(effects);
+        rt.install_memo();
+        rt.vm.mark_image_baseline();
+        BaselinedVm { vm: rt.vm, state }
+    }
+
+    /// Pre-build the restore target for `effects` so the next
+    /// [`Self::from_blob`]/[`Self::from_image`] with the same effect list skips
+    /// the prologue (fresh realm, host surface, baseline walk — about 1.4 ms).
+    ///
+    /// This does not make a restore cheaper in total; it moves that cost to
+    /// wherever this is called. It pays off for the pattern it exists for — a
+    /// worker node that restores repeatedly and can prime while idle — and is
+    /// a pure loss for a process that restores once. Hence opt-in.
+    ///
+    /// Holds one baselined VM (~0.7 MB) per distinct effect list until taken;
+    /// [`Self::clear_image_restore_pool`] drops them.
+    pub fn prime_image_restore(effects: &[&str]) {
+        let key: Vec<String> = effects.iter().map(|s| s.to_string()).collect();
+        if RESTORE_POOL.with(|p| p.borrow().contains_key(&key)) {
+            return;
+        }
+        // Built outside the pool borrow: constructing a realm runs arbitrary
+        // engine code, which must not re-enter a borrowed thread-local.
+        let built = Self::build_baselined(effects);
+        RESTORE_POOL.with(|p| p.borrow_mut().insert(key, built));
+    }
+
+    /// Drop every pooled restore target on this thread.
+    pub fn clear_image_restore_pool() {
+        RESTORE_POOL.with(|p| p.borrow_mut().clear());
+    }
+
+    /// Take the pooled restore target for `effects`, or build one now.
+    ///
+    /// Always *removes* what it takes: `restore_image` mutates the VM it lands
+    /// in, so a target is single-use and must never be handed out twice.
+    fn take_baselined(effects: &[&str]) -> BaselinedVm {
+        let key: Vec<String> = effects.iter().map(|s| s.to_string()).collect();
+        match RESTORE_POOL.with(|p| p.borrow_mut().remove(&key)) {
+            Some(b) => b,
+            None => Self::build_baselined(effects),
+        }
     }
 
     pub fn journal_bytes(&self) -> Vec<u8> {
