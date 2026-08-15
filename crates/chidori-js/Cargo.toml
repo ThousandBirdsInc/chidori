@@ -2,7 +2,7 @@
 name = "chidori-js"
 version = "0.3.3"
 edition = "2021"
-# oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
+# oxc relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
 license = "Apache-2.0"
 description = "Pure-Rust JavaScript engine with deterministic-replay durable execution. No C, no boa_engine."
@@ -35,7 +35,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 # Front end only: we consume the oxc AST and write no lexer/parser of our own.
-oxc = { version = "0.133", features = ["semantic", "transformer", "codegen"] }
+oxc = { version = "0.138", features = ["semantic", "transformer", "codegen"] }
 # Span→line/column resolution for parse-error rendering (oxc diagnostics carry
 # miette labeled spans; `SourceCode::read_span` turns a byte offset into a
 # position). Core only — no report-rendering features. Already in the tree
@@ -72,7 +72,7 @@ temporal_rs = "0.2.3"
 mimalloc = { version = "0.1", optional = true, default-features = false }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 
 # Micro-benchmarks for the JS-execution hot paths (compile, interpreter loop,
 # property access, calls, arrays, strings). Run with `cargo bench -p chidori-js`.

@@ -30,7 +30,7 @@ jobs:
     name: chidori-js vs Node vs Bun vs CPython
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -50,7 +50,7 @@ jobs:
       # The runner image ships a python3, but pin explicitly so the cpython
       # column doesn't silently vanish (the harness skips missing runtimes)
       # or drift across image updates.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -94,7 +94,7 @@ jobs:
 
       - name: Upload benchmark report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: js-benchmark-report
           path: |
@@ -108,7 +108,7 @@ jobs:
         if: >-
           github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

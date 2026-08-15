@@ -24,8 +24,8 @@ pub fn strip_types(source: &str, filename: &str) -> Result<String, String> {
     let allocator = Allocator::default();
 
     let parser_ret = Parser::new(&allocator, source, source_type).parse();
-    if !parser_ret.errors.is_empty() {
-        return Err(render_errors("parse", filename, &parser_ret.errors));
+    if !parser_ret.diagnostics.is_empty() {
+        return Err(render_errors("parse", filename, &parser_ret.diagnostics));
     }
     let mut program = parser_ret.program;
 
@@ -33,8 +33,12 @@ pub fn strip_types(source: &str, filename: &str) -> Result<String, String> {
         // Transformer roughly triples scope/symbol/reference allocations.
         .with_excess_capacity(2.0)
         .build(&program);
-    if !semantic_ret.errors.is_empty() {
-        return Err(render_errors("semantic", filename, &semantic_ret.errors));
+    if !semantic_ret.diagnostics.is_empty() {
+        return Err(render_errors(
+            "semantic",
+            filename,
+            &semantic_ret.diagnostics,
+        ));
     }
     let scoping = semantic_ret.semantic.into_scoping();
 
@@ -42,11 +46,11 @@ pub fn strip_types(source: &str, filename: &str) -> Result<String, String> {
     transform_options.jsx.runtime = JsxRuntime::Classic;
     let transformer_ret = Transformer::new(&allocator, path, &transform_options)
         .build_with_scoping(scoping, &mut program);
-    if !transformer_ret.errors.is_empty() {
+    if !transformer_ret.diagnostics.is_empty() {
         return Err(render_errors(
             "transform",
             filename,
-            &transformer_ret.errors,
+            &transformer_ret.diagnostics,
         ));
     }
 

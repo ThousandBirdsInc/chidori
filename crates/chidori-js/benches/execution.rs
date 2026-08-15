@@ -25,7 +25,8 @@ use std::time::Duration;
 use chidori_js::bytecode::FuncProto;
 use chidori_js::compiler::compile_script;
 use chidori_js::{Engine, Value};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 // Workload corpus shared with `benches/memory.rs` so time and memory numbers
 // describe the same programs.

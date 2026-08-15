@@ -61,15 +61,11 @@ fn decode_lone_surrogates(value: &str) -> JsString {
 fn render_diagnostic(src: &str, e: &oxc::diagnostics::OxcDiagnostic, line_offset: u32) -> String {
     use miette::SourceCode as _;
     let msg = e.to_string();
-    let Some(offset) = e
-        .labels
-        .as_ref()
-        .and_then(|l| l.first())
-        .map(|l| l.offset())
-    else {
+    let Some(offset) = e.labels.first().map(|l| l.offset()) else {
         return msg;
     };
-    let Ok(span) = src.read_span(&miette::SourceSpan::new(offset.into(), 0), 0, 0) else {
+    let Ok(span) = src.read_span(&miette::SourceSpan::new((offset as usize).into(), 0), 0, 0)
+    else {
         return msg;
     };
     let line = (span.line() as u32 + 1).saturating_sub(line_offset).max(1);
@@ -155,20 +151,20 @@ pub fn compile_script_kernels(src: &str, kernels: bool) -> Result<FuncProto, Str
     let allocator = Allocator::default();
     let source_type = SourceType::script();
     let ret = Parser::new(&allocator, src, source_type).parse();
-    if !ret.errors.is_empty() {
+    if !ret.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            render_diagnostics(src, &ret.errors, 0)
+            render_diagnostics(src, &ret.diagnostics, 0)
         ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&program);
-    if !sem.errors.is_empty() {
+    if !sem.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            render_diagnostics(src, &sem.errors, 0)
+            render_diagnostics(src, &sem.diagnostics, 0)
         ));
     }
     let mut c = Compiler::new();
@@ -191,20 +187,20 @@ pub fn compile_script_regs(src: &str, regs: bool) -> Result<FuncProto, String> {
     let allocator = Allocator::default();
     let source_type = SourceType::script();
     let ret = Parser::new(&allocator, src, source_type).parse();
-    if !ret.errors.is_empty() {
+    if !ret.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            render_diagnostics(src, &ret.errors, 0)
+            render_diagnostics(src, &ret.diagnostics, 0)
         ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&program);
-    if !sem.errors.is_empty() {
+    if !sem.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            render_diagnostics(src, &sem.errors, 0)
+            render_diagnostics(src, &sem.diagnostics, 0)
         ));
     }
     let mut c = Compiler::new();
@@ -241,10 +237,10 @@ fn compile_script_impl(
     // surface as SyntaxError via the semantic pass below when strict.
     let source_type = SourceType::script();
     let ret = Parser::new(&allocator, src, source_type).parse();
-    if !ret.errors.is_empty() {
+    if !ret.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            render_diagnostics(src, &ret.errors, 0)
+            render_diagnostics(src, &ret.diagnostics, 0)
         ));
     }
     let program = ret.program;
@@ -254,10 +250,10 @@ fn compile_script_impl(
     let sem = oxc::semantic::SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&program);
-    if !sem.errors.is_empty() {
+    if !sem.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            render_diagnostics(src, &sem.errors, 0)
+            render_diagnostics(src, &sem.diagnostics, 0)
         ));
     }
     let mut c = Compiler::new();
@@ -336,10 +332,10 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
         Wrap::Function | Wrap::Method => 1,
     } + u32::from(desc.strict);
     let ret = Parser::new(&allocator, &wrapped, source_type).parse();
-    if !ret.errors.is_empty() {
+    if !ret.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            render_diagnostics(&wrapped, &ret.errors, wrapper_lines)
+            render_diagnostics(&wrapped, &ret.diagnostics, wrapper_lines)
         ));
     }
     let program = ret.program;
@@ -356,7 +352,7 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
         .flat_map(|p| p.names.iter().map(|(n, _)| n.as_str()))
         .collect();
     let sem_errors: Vec<String> = sem
-        .errors
+        .diagnostics
         .iter()
         .filter(|e| {
             let msg = e.to_string();
@@ -563,20 +559,20 @@ pub fn compile_module_labeled(
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_module(true);
     let ret = Parser::new(&allocator, src, source_type).parse();
-    if !ret.errors.is_empty() {
+    if !ret.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            render_diagnostics(src, &ret.errors, 0)
+            render_diagnostics(src, &ret.diagnostics, 0)
         ));
     }
     let program = ret.program;
     let sem = oxc::semantic::SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&program);
-    if !sem.errors.is_empty() {
+    if !sem.diagnostics.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            render_diagnostics(src, &sem.errors, 0)
+            render_diagnostics(src, &sem.diagnostics, 0)
         ));
     }
     let mut c = Compiler::new();

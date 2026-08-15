@@ -2,7 +2,7 @@
 name = "chidori-wasm"
 version = "0.1.0"
 edition = "2021"
-# oxc 0.133 (via chidori-js) relies on `if let` guards, stabilized in Rust 1.95.
+# oxc (via chidori-js) relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
 description = "Browser embedding of the chidori-js engine and durable replay runtime, via wasm-bindgen."
 publish = false
@@ -20,7 +20,7 @@ chidori-js = { path = "../chidori-js", version = "0.3.3" }
 # TypeScript stripping for browser-authored agents, mirroring the native
 # runtime's transpile defaults (crates/chidori/src/runtime/typescript). Same
 # version/features as chidori-js, so this adds no new crates to the build.
-oxc = { version = "0.133", features = ["semantic", "transformer", "codegen"] }
+oxc = { version = "0.138", features = ["semantic", "transformer", "codegen"] }
 serde_json = "1"
 # Kept in lockstep with the wasm-bindgen-cli version used by
 # scripts/build-wasm.sh — the CLI refuses to process a module built by a

@@ -387,7 +387,7 @@ fn callback_state() -> String {
     use rand::RngCore;
 
     let mut bytes = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -416,7 +416,7 @@ fn pkce_pair() -> (String, String) {
     use sha2::{Digest, Sha256};
 
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
 
     let digest = Sha256::digest(verifier.as_bytes());

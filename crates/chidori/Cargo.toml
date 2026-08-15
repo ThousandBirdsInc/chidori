@@ -2,7 +2,7 @@
 name = "chidori"
 version = "3.8.0"
 edition = "2021"
-# oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
+# oxc relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
 authors = ["Colton Pierson <colton@thousandbirds.ai>"]
 description = "The agent framework where every run is durable, replayable, and resumable by default. Plain async TypeScript agents on an embedded pure-Rust JS engine."
@@ -51,7 +51,7 @@ url = "2"
 # HTTP server for serve command
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 
 # Template engine
 minijinja = { version = "2", features = ["loader"] }
@@ -74,14 +74,14 @@ chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 tokio-stream = "0.1"
 async-stream = "0.3"
-sha2 = "0.10"
-sha1 = "0.10"
+sha2 = "0.11"
+sha1 = "0.11"
 # Constant-time comparison for API-key checks (already in-tree via `digest`).
 subtle = "2"
-hmac = "0.12"
+hmac = "0.13"
 base64 = "0.22"
 hex = "0.4"
-rand = "0.8"
+rand = "0.9"
 
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
 chidori-js = { path = "../chidori-js", version = "0.3.3" }
@@ -104,9 +104,12 @@ serde_yaml = "0.9"
 # dependency graph, so dev builds can drop it with `--no-default-features`
 # (runtime/otel.rs is swapped for a no-op stub; everything else compiles
 # unchanged).
-opentelemetry = { version = "0.27", optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
+opentelemetry = { version = "0.32", optional = true }
+# No `rt-tokio`: since 0.28 the batch span processor drives itself from a
+# dedicated background thread, so the async-runtime variants (now gated behind
+# `experimental_async_runtime`) are no longer on our path.
+opentelemetry_sdk = { version = "0.32", optional = true }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"], optional = true }
 
 # Checkpoint export: `chidori checkpoint export <run_id>` archives a run dir
 # as a .tar.gz so a golden eval case's fixture can be committed to git or
@@ -116,11 +119,11 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = t
 # that missed constructs like type predicates (`(t): t is string => ...`),
 # `satisfies` in odd positions, and overload signatures. oxc parses to a real
 # AST and emits JS via codegen, so unsupported sugar can't slip through.
-oxc = { version = "0.133", features = ["transformer", "codegen", "semantic", "ast_visit"] }
+oxc = { version = "0.138", features = ["transformer", "codegen", "semantic", "ast_visit"] }
 # Generated→original position lookup for the codegen source maps that back
 # error-frame remapping (`CodegenReturn::map` is this crate's `SourceMap`;
 # the oxc facade does not re-export it).
-oxc_sourcemap = "6"
+oxc_sourcemap = "8"
 nodejs-semver = "5.0.0"
 tar = "0.4.46"
 flate2 = "1.1.9"
@@ -141,8 +144,8 @@ landlock = "0.4"
 tempfile = "3"
 # In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
 # with the runtime `opentelemetry_sdk` features for test builds.
-opentelemetry_sdk = { version = "0.27", features = ["testing"] }
-criterion = "0.5"
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+criterion = "0.8"
 
 # Runtime-layer perf coverage (journal replay lookup, session/run stores,
 # per-run construction costs). See `benches/runtime.rs`.

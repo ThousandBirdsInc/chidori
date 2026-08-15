@@ -8,7 +8,7 @@
 //! resume replays the exact bytes.
 
 use anyhow::{bail, Result};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 
@@ -51,7 +51,7 @@ pub fn hmac(algorithm: &str, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 pub fn random_bytes(n: usize) -> Vec<u8> {
     use rand::RngCore;
     let mut bytes = vec![0u8; n];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes
 }
 

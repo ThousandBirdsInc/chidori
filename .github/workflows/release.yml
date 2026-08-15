@@ -29,7 +29,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check the version train
         run: |
@@ -51,7 +51,7 @@ jobs:
       run:
         working-directory: sdk/typescript
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
@@ -105,9 +105,9 @@ jobs:
       contents: read
       id-token: write # PyPI trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -137,7 +137,7 @@ jobs:
       contents: read
       id-token: write # crates.io trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Install the *pinned* toolchain up front so the first cargo invocation
       # in publish.sh doesn't pay the auto-fetch. Installing `stable` here
@@ -220,7 +220,7 @@ jobs:
             os: ubuntu-22.04-arm
             pgo: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rust-toolchain.toml pins the channel and cargo always builds with that
       # pinned toolchain — so the cross target and llvm-tools have to be added
@@ -254,7 +254,7 @@ jobs:
           tar -C "target/${{ matrix.target }}/release" -czf "${name}.tar.gz" chidori
           shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: chidori-${{ matrix.target }}
           path: |
@@ -270,12 +270,12 @@ jobs:
     permissions:
       contents: write # create the release + upload assets
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history so --generate-notes finds the prior tag
 
       - name: Download prebuilt binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: chidori-*
           path: dist

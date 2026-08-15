@@ -29,8 +29,7 @@ use opentelemetry::trace::{
 };
 use opentelemetry::{Context, KeyValue};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-use opentelemetry_sdk::runtime;
-use opentelemetry_sdk::trace::TracerProvider as SdkTracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -53,11 +52,9 @@ impl OtelHandle {
     /// Flush any buffered spans while keeping the exporter alive for later runs.
     pub fn force_flush(&self) {
         let debug = std::env::var("CHIDORI_OTEL_DEBUG").as_deref() == Ok("1");
-        for r in self.provider.force_flush() {
-            if let Err(e) = r {
-                if debug {
-                    eprintln!("otel: flush error: {e:?}");
-                }
+        if let Err(e) = self.provider.force_flush() {
+            if debug {
+                eprintln!("otel: flush error: {e:?}");
             }
         }
     }
@@ -83,8 +80,10 @@ impl OtelHandle {
 /// tracing is active, `None` when the env var was unset or the exporter
 /// failed to start.
 ///
-/// Must be called from inside a running Tokio runtime — the batch span
-/// processor spawns background tasks on the `Tokio` runtime channel.
+/// Must be called from inside a running Tokio runtime — the OTLP/gRPC
+/// exporter is built on tonic, which needs an ambient reactor. (The batch
+/// span processor itself no longer does: since SDK 0.28 it drives exports
+/// from its own dedicated thread rather than a runtime channel.)
 pub fn init_from_env() -> Option<&'static OtelHandle> {
     HANDLE.get_or_init(try_init).as_ref()
 }
@@ -130,11 +129,12 @@ fn try_init() -> Option<OtelHandle> {
     };
 
     let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter, runtime::Tokio)
-        .with_resource(Resource::new(vec![KeyValue::new(
-            "service.name",
-            service_name,
-        )]))
+        .with_batch_exporter(exporter)
+        .with_resource(
+            Resource::builder()
+                .with_attribute(KeyValue::new("service.name", service_name))
+                .build(),
+        )
         .build();
 
     global::set_tracer_provider(provider.clone());
@@ -395,7 +395,6 @@ impl RunSpan {
         let builder = SpanBuilder::from_name(span_name_for(record))
             .with_kind(span_kind_for(&record.function))
             .with_start_time(start_time)
-            .with_end_time(end_time)
             .with_attributes(attrs);
 
         let mut span = tracer.build_with_context(builder, parent_cx);
@@ -876,9 +875,7 @@ mod tests {
     }
 
     use opentelemetry::trace::SpanId;
-    use opentelemetry_sdk::export::trace::SpanData;
-    use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
-    use opentelemetry_sdk::trace::SimpleSpanProcessor;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SimpleSpanProcessor, SpanData};
     use std::sync::Mutex as StdMutex;
 
     // Swapping the process-global tracer provider is not thread-safe across
@@ -913,7 +910,7 @@ mod tests {
         let _guard = PROVIDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
-            .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+            .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
             .build();
         global::set_tracer_provider(provider.clone());
         let run = run_span_for_test("agent", "r1");
@@ -966,7 +963,7 @@ mod tests {
         let _guard = PROVIDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
-            .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+            .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
             .build();
         global::set_tracer_provider(provider.clone());
 
@@ -1101,7 +1098,7 @@ mod tests {
         let _guard = PROVIDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
-            .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+            .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
             .build();
         global::set_tracer_provider(provider.clone());
 
@@ -1146,7 +1143,7 @@ mod tests {
         let _guard = PROVIDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
-            .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+            .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
             .build();
         global::set_tracer_provider(provider.clone());
 

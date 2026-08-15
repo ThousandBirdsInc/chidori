@@ -182,7 +182,7 @@ pub fn object_id(text: &str) -> String {
 /// The bare hex of a text's content address — its file name inside an
 /// objects directory (`history/objects/<hex>`, or the cross-run cache).
 pub fn object_hex(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 fn object_key(id: &str) -> Result<String> {
@@ -335,7 +335,10 @@ pub fn record_commit(store: &dyn RunStore, input: CommitInput<'_>) -> Result<Opt
     for entry in &tree {
         identity.push_str(&format!("tree {} {}\n", entry.object, entry.path.display()));
     }
-    let id = format!("sha256:{:x}", Sha256::digest(identity.as_bytes()));
+    let id = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(identity.as_bytes()))
+    );
 
     let commit = SourceCommit {
         id,
