@@ -650,6 +650,15 @@ enum Commands {
         #[arg(long)]
         node_id: Option<String>,
 
+        /// URL other parties can reach THIS node at (e.g.
+        /// http://10.0.0.7:9700). Stamped into the ownership records this
+        /// node writes, so a cell owned here answers other nodes' clients
+        /// with an address they can follow instead of a bare node id. Omit
+        /// on a single-node store, or when clients should stand down rather
+        /// than follow.
+        #[arg(long, value_name = "URL")]
+        advertise: Option<String>,
+
         /// Cell ownership lease TTL in seconds. Takeover of a dead node's
         /// cells waits this long; node clocks must be sane within a fraction
         /// of it.
@@ -1070,6 +1079,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             bucket,
             data_dir,
             node_id,
+            advertise,
             lease_secs,
             sync_secs,
             idle_secs,
@@ -1079,6 +1089,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
                 bucket.as_deref(),
                 &data_dir,
                 node_id,
+                advertise,
                 lease_secs,
                 sync_secs,
                 idle_secs,

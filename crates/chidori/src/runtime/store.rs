@@ -714,6 +714,18 @@ impl HttpRunStore {
             urlencode_path(key)
         )
     }
+
+    /// Whether a 409 on this blob may be re-aimed at the owner the server
+    /// names. Journal and artifact traffic may: the owner's store is the one
+    /// that should have served it. Lease traffic may NOT — a 409 about
+    /// `lease.json` IS the fencing verdict ([`acquire_lease`]), and following
+    /// it would let a node that lost its cell keep arbitrating ownership
+    /// through the node that took over.
+    /// Matched on the key's last segment, so a scoped store's branch lease
+    /// (`branches/…/lease.json`) is exempt too.
+    fn follows_owner(key: &str) -> bool {
+        key.rsplit('/').next() != Some(LEASE_FILE)
+    }
 }
 
 /// The store refused an operation because this node no longer owns the run —
@@ -724,12 +736,20 @@ impl HttpRunStore {
 #[derive(Debug, Clone)]
 pub struct FencedError {
     pub owner: String,
+    /// The owner's advertised address, when the 409 named one (`--advertise`
+    /// on the owning cell-store node). `None` against a server that does not
+    /// send the field — an older node, or one with no advertised URL — which
+    /// is why the relay only follows an owner it was actually given.
+    pub owner_url: Option<String>,
     pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl std::fmt::Display for FencedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "run is owned by `{}`", self.owner)?;
+        if let Some(url) = &self.owner_url {
+            write!(f, " at {url}")?;
+        }
         if let Some(expires) = self.lease_expires_at {
             write!(f, " (lease expires {expires})")?;
         }
@@ -758,6 +778,11 @@ fn relay_error(what: &str, status: u16, body: &[u8]) -> anyhow::Error {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string(),
+            owner_url: parsed
+                .as_ref()
+                .and_then(|v| v.get("owner_url"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             lease_expires_at: parsed
                 .as_ref()
                 .and_then(|v| v.get("lease_expires_at"))
@@ -803,6 +828,11 @@ struct HttpRelayRequest {
     content_type: &'static str,
     /// Extra headers, verbatim — the S3 backend's SigV4 signature headers.
     headers: Vec<(String, String)>,
+    /// Whether a 409 naming a reachable owner may be re-aimed at that owner
+    /// (see [`follow_owner_url`]). Set for ordinary run-store traffic; clear
+    /// for lease arbitration and for backends that sign their own absolute
+    /// URLs.
+    follow_owner: bool,
     reply: RelayReply,
 }
 
@@ -818,6 +848,60 @@ enum RelayReply {
         describe: String,
         tolerate_not_found: bool,
     },
+}
+
+/// Issue one relay request on the worker's blocking client.
+fn send_relay_request(
+    client: &reqwest::blocking::Client,
+    token: Option<&str>,
+    method: &'static str,
+    url: &str,
+    body: Option<Vec<u8>>,
+    content_type: &'static str,
+    headers: &[(String, String)],
+) -> Result<(u16, Vec<u8>)> {
+    let mut builder = match method {
+        "GET" => client.get(url),
+        "PUT" => client.put(url),
+        "POST" => client.post(url),
+        "DELETE" => client.delete(url),
+        other => anyhow::bail!("unsupported relay method {other}"),
+    };
+    if let Some(token) = token {
+        builder = builder.bearer_auth(token);
+    }
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    if let Some(body) = body {
+        builder = builder.header("content-type", content_type).body(body);
+    }
+    let response = builder.send()?;
+    let status = response.status().as_u16();
+    let bytes = response.bytes()?;
+    Ok((status, bytes.to_vec()))
+}
+
+/// Where to retry a 409 that names the owner's address: the same path, on the
+/// owner. `None` — meaning surface the fence — unless the body carries an
+/// `owner_url` that is an http(s) address other than this relay's own base,
+/// and the request went to that base in the first place (a backend signing
+/// absolute URLs of its own is never re-aimed).
+fn follow_owner_url(base_url: &str, url: &str, body: &[u8]) -> Option<String> {
+    if base_url.is_empty() {
+        return None;
+    }
+    let path = url.strip_prefix(base_url)?;
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let owner = parsed
+        .get("owner_url")?
+        .as_str()?
+        .trim_end_matches('/')
+        .to_string();
+    if owner == base_url || !(owner.starts_with("http://") || owner.starts_with("https://")) {
+        return None;
+    }
+    Some(format!("{owner}{path}"))
 }
 
 /// Bookkeeping for pipelined relay requests: how many are still in the
@@ -862,6 +946,7 @@ impl HttpRelay {
         let (sender, receiver) = std::sync::mpsc::channel::<HttpRelayRequest>();
         let async_state: Arc<(Mutex<AsyncRelayState>, std::sync::Condvar)> = Arc::default();
         let worker_async_state = async_state.clone();
+        let worker_base_url = base_url.clone();
         std::thread::Builder::new()
             .name("chidori-run-store-relay".to_string())
             .spawn(move || {
@@ -871,39 +956,46 @@ impl HttpRelay {
                 for request in receiver {
                     let result = match &client {
                         Ok(client) => {
-                            let builder = match request.method {
-                                "GET" => Some(client.get(&request.url)),
-                                "PUT" => Some(client.put(&request.url)),
-                                "POST" => Some(client.post(&request.url)),
-                                "DELETE" => Some(client.delete(&request.url)),
-                                _ => None,
+                            // The retry needs the body again, so it is held
+                            // back only for requests that may follow — the
+                            // signed-URL backends keep moving theirs through
+                            // without a copy.
+                            let retry_body = if request.follow_owner {
+                                request.body.clone()
+                            } else {
+                                None
                             };
-                            match builder {
-                                None => Err(anyhow::anyhow!(
-                                    "unsupported relay method {}",
-                                    request.method
-                                )),
-                                Some(mut builder) => {
-                                    if let Some(ref token) = token {
-                                        builder = builder.bearer_auth(token);
+                            let first = send_relay_request(
+                                client,
+                                token.as_deref(),
+                                request.method,
+                                &request.url,
+                                request.body,
+                                request.content_type,
+                                &request.headers,
+                            );
+                            // Follow the owner, exactly one hop: a 409 that
+                            // carries the owner's address is retried there
+                            // with the same path, body and credentials. The
+                            // second answer stands whatever it is — a 409
+                            // from the owner is a genuine fence, and one hop
+                            // cannot loop.
+                            match first {
+                                Ok((409, body)) if request.follow_owner => {
+                                    match follow_owner_url(&worker_base_url, &request.url, &body) {
+                                        Some(next) => send_relay_request(
+                                            client,
+                                            token.as_deref(),
+                                            request.method,
+                                            &next,
+                                            retry_body,
+                                            request.content_type,
+                                            &request.headers,
+                                        ),
+                                        None => Ok((409, body)),
                                     }
-                                    for (name, value) in &request.headers {
-                                        builder = builder.header(name, value);
-                                    }
-                                    if let Some(body) = request.body {
-                                        builder = builder
-                                            .header("content-type", request.content_type)
-                                            .body(body);
-                                    }
-                                    builder.send().map_err(anyhow::Error::from).and_then(
-                                        |response| {
-                                            let status = response.status().as_u16();
-                                            let bytes =
-                                                response.bytes().map_err(anyhow::Error::from)?;
-                                            Ok((status, bytes.to_vec()))
-                                        },
-                                    )
                                 }
+                                other => other,
                             }
                         }
                         Err(err) => Err(anyhow::anyhow!("building relay http client: {err}")),
@@ -959,11 +1051,12 @@ impl HttpRelay {
         body: Option<Vec<u8>>,
         content_type: &'static str,
     ) -> Result<(u16, Vec<u8>)> {
-        self.request_full(method, url, body, content_type, Vec::new())
+        self.dispatch(method, url, body, content_type, Vec::new(), true)
     }
 
     /// Full-control request used by the S3 backend: caller-supplied headers
-    /// (the SigV4 signature set) ride verbatim.
+    /// (the SigV4 signature set) ride verbatim. Never follows an owner — these
+    /// are absolute, individually signed URLs, not run-store paths.
     pub(crate) fn request_full(
         &self,
         method: &'static str,
@@ -971,6 +1064,22 @@ impl HttpRelay {
         body: Option<Vec<u8>>,
         content_type: &'static str,
         headers: Vec<(String, String)>,
+    ) -> Result<(u16, Vec<u8>)> {
+        self.dispatch(method, url, body, content_type, headers, false)
+    }
+
+    /// Send one request on the relay thread and block for its outcome.
+    /// `follow_owner` decides whether a 409 naming a reachable owner is
+    /// retried once against that owner (see [`follow_owner_url`]).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch(
+        &self,
+        method: &'static str,
+        url: String,
+        body: Option<Vec<u8>>,
+        content_type: &'static str,
+        headers: Vec<(String, String)>,
+        follow_owner: bool,
     ) -> Result<(u16, Vec<u8>)> {
         let (reply, receive) = std::sync::mpsc::channel();
         self.sender
@@ -980,6 +1089,7 @@ impl HttpRelay {
                 body,
                 content_type,
                 headers,
+                follow_owner,
                 reply: RelayReply::Sync(reply),
             })
             .map_err(|_| anyhow::anyhow!("run-store relay thread is gone"))?;
@@ -993,6 +1103,7 @@ impl HttpRelay {
     /// ordering against later sync requests (checkpoint PUTs, loads) is
     /// preserved. Outcomes are collected in the relay's async state and
     /// surfaced by [`Self::barrier`]. Bounded by [`RELAY_MAX_IN_FLIGHT`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_async(
         &self,
         method: &'static str,
@@ -1001,6 +1112,7 @@ impl HttpRelay {
         content_type: &'static str,
         headers: Vec<(String, String)>,
         tolerate_not_found: bool,
+        follow_owner: bool,
     ) -> Result<()> {
         {
             let (lock, cvar) = &*self.async_state;
@@ -1018,6 +1130,7 @@ impl HttpRelay {
                 body,
                 content_type,
                 headers,
+                follow_owner,
                 reply: RelayReply::Async {
                     describe,
                     tolerate_not_found,
@@ -1077,6 +1190,7 @@ impl RunStore for HttpRunStore {
                 "application/json",
                 Vec::new(),
                 false,
+                true,
             );
         }
         self.relay.expect_ok(
@@ -1119,13 +1233,16 @@ impl RunStore for HttpRunStore {
                 "application/octet-stream",
                 Vec::new(),
                 false,
+                Self::follows_owner(key),
             );
         }
-        let (status, body) = self.relay.request_typed(
+        let (status, body) = self.relay.dispatch(
             "PUT",
             self.blob_url(key),
             Some(bytes.to_vec()),
             "application/octet-stream",
+            Vec::new(),
+            Self::follows_owner(key),
         )?;
         if (200..300).contains(&status) {
             Ok(())
@@ -1135,7 +1252,14 @@ impl RunStore for HttpRunStore {
     }
 
     fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let (status, bytes) = self.relay.request("GET", self.blob_url(key), None)?;
+        let (status, bytes) = self.relay.dispatch(
+            "GET",
+            self.blob_url(key),
+            None,
+            "application/json",
+            Vec::new(),
+            Self::follows_owner(key),
+        )?;
         match status {
             404 => Ok(None),
             s if (200..300).contains(&s) => Ok(Some(bytes)),
@@ -1152,9 +1276,17 @@ impl RunStore for HttpRunStore {
                 "application/json",
                 Vec::new(),
                 true,
+                Self::follows_owner(key),
             );
         }
-        let (status, _) = self.relay.request("DELETE", self.blob_url(key), None)?;
+        let (status, _) = self.relay.dispatch(
+            "DELETE",
+            self.blob_url(key),
+            None,
+            "application/json",
+            Vec::new(),
+            Self::follows_owner(key),
+        )?;
         if status == 404 || (200..300).contains(&status) {
             Ok(())
         } else {
@@ -1198,12 +1330,13 @@ impl RunStore for HttpRunStore {
             Some(bytes) => ("PUT", Some(bytes.to_vec()), "application/octet-stream"),
             None => ("DELETE", None, "application/json"),
         };
-        let (status, response) = self.relay.request_full(
+        let (status, response) = self.relay.dispatch(
             method,
             self.blob_url(key),
             body,
             content_type,
             vec![precondition],
+            Self::follows_owner(key),
         )?;
         match status {
             412 => Ok(false),
@@ -2114,6 +2247,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    /// A stub node that refuses everything with the cell store's 409 — naming
+    /// an owner, and optionally that owner's address — while counting the
+    /// requests it received. The counter is what proves the follow is one hop
+    /// and that lease traffic never takes it.
+    struct FencingNode {
+        url: String,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+        /// The address this node reports as the owner's, settable after both
+        /// nodes exist so a test can point them at each other.
+        owner_url: Arc<Mutex<Option<String>>>,
+    }
+
+    impl FencingNode {
+        fn hits(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn points_at(&self, other: &FencingNode) {
+            *self.owner_url.lock().unwrap() = Some(other.url.clone());
+        }
+    }
+
+    fn spawn_fencing_node(owner: &str) -> FencingNode {
+        use axum::extract::State;
+        use axum::http::StatusCode;
+
+        #[derive(Clone)]
+        struct Fence {
+            owner: String,
+            owner_url: Arc<Mutex<Option<String>>>,
+            hits: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        let fence = Fence {
+            owner: owner.to_string(),
+            owner_url: Arc::new(Mutex::new(None)),
+            hits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let node = FencingNode {
+            url: String::new(),
+            hits: fence.hits.clone(),
+            owner_url: fence.owner_url.clone(),
+        };
+        let app = axum::Router::new()
+            .fallback(|State(fence): State<Fence>| async move {
+                fence.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut body = serde_json::json!({
+                    "error": "cell owned elsewhere",
+                    "owner": fence.owner,
+                });
+                if let Some(url) = fence.owner_url.lock().unwrap().clone() {
+                    body["owner_url"] = serde_json::Value::String(url);
+                }
+                (StatusCode::CONFLICT, axum::Json(body))
+            })
+            .with_state(fence);
+        FencingNode {
+            url: serve_in_process(app),
+            ..node
+        }
+    }
+
+    /// Serve `app` on an ephemeral loopback port (the relay's client is
+    /// blocking, so the server needs its own runtime on its own thread) and
+    /// return its base URL.
+    fn serve_in_process(app: axum::Router) -> String {
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        format!("http://{}", addr_rx.recv().unwrap())
+    }
+
+    /// Following the owner is exactly ONE hop. Two nodes pointing at each
+    /// other must not start a chase: the second 409 is the answer, and each
+    /// node saw exactly one request.
+    #[test]
+    fn owner_follow_is_a_single_hop() {
+        // The worst case for a follow rule: two nodes each naming the other.
+        let first = spawn_fencing_node("node-1");
+        let second = spawn_fencing_node("node-2");
+        first.points_at(&second);
+        second.points_at(&first);
+        let store = HttpRunStore::new(HttpRelay::new(first.url.clone(), None), "run-x");
+
+        let err = store.get_blob("manifest.json").unwrap_err();
+        let fenced = fenced_owner(&err).expect("409 stays a fence");
+        assert_eq!(fenced.owner, "node-2", "the second answer is the verdict");
+        assert_eq!(first.hits(), 1);
+        assert_eq!(second.hits(), 1);
+    }
+
+    /// Fencing is not weakened by routing: a 409 about the run LEASE is the
+    /// ownership verdict itself, so it is never re-aimed at the owner — the
+    /// node stands down exactly as before, and the owner is never asked.
+    #[test]
+    fn lease_traffic_never_follows_the_owner() {
+        let owner = spawn_fencing_node("node-owner");
+        let fenced = spawn_fencing_node("node-fenced");
+        fenced.points_at(&owner);
+        let store = HttpRunStore::new(HttpRelay::new(fenced.url.clone(), None), "run-x");
+
+        let holder = acquire_lease(&store, "proc-a", chrono::Duration::seconds(60))
+            .expect("fencing is a standdown, not an error")
+            .expect_err("a fenced node must not believe it holds the lease");
+        assert_eq!(holder.owner, "node-fenced");
+        assert_eq!(fenced.hits(), 1);
+        assert_eq!(
+            owner.hits(),
+            0,
+            "lease arbitration must not be routed to the owner"
+        );
+
+        // The 409 still hands the address up to callers that want it.
+        let err = store.get_blob(LEASE_FILE).unwrap_err();
+        assert_eq!(
+            fenced_owner(&err).unwrap().owner_url.as_deref(),
+            Some(owner.url.as_str())
+        );
+    }
+
     /// An in-process HTTP server speaking the run-store relay protocol over
     /// memory — the same protocol the Cloudflare Durable Object shim
     /// (`integrations/cloudflare-durable-objects`) serves. Returns its base
@@ -2347,6 +2609,7 @@ mod tests {
         fn append_record(&self, _: &CallRecord) -> Result<()> {
             Err(anyhow::Error::new(FencedError {
                 owner: "node-live".to_string(),
+                owner_url: None,
                 lease_expires_at: None,
             }))
         }
@@ -2363,6 +2626,7 @@ mod tests {
             // Wrapped in context to prove the chain walk finds it.
             Err(anyhow::Error::new(FencedError {
                 owner: "node-live".to_string(),
+                owner_url: None,
                 lease_expires_at: None,
             })
             .context("reading blob lease.json"))

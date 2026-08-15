@@ -18,6 +18,7 @@ pub mod host_core;
 /// OS-level isolation: run an agent in a sandboxed child process and broker its
 /// host effects back over a pipe (see `docs/os-isolation-plan.md`).
 pub mod isolate;
+pub mod mainline_image;
 pub mod memory;
 pub mod native;
 // OTLP span export (tael/Jaeger/Tempo). The real implementation carries the

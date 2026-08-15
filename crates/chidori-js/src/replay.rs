@@ -57,6 +57,89 @@ struct JournalState {
     bundle_changed: bool,
 }
 
+impl JournalState {
+    /// The state a not-yet-used restore target carries: the host natives close
+    /// over it at construction, and the real journal is written into it when
+    /// the VM is actually consumed by a restore.
+    fn empty() -> JournalState {
+        JournalState {
+            journal: Journal::default(),
+            mode: Mode::Record,
+            counters: HashMap::new(),
+            pending: HashMap::new(),
+            cursor: 0,
+            divergence: None,
+            bundle_changed: false,
+        }
+    }
+}
+
+/// A restore target built ahead of time: a VM sitting at the image baseline,
+/// paired with the journal state its host natives close over.
+///
+/// The pairing is the whole point. `install_effects` captures the runtime's
+/// `Rc<RefCell<JournalState>>` inside each effect native, so a VM cannot be
+/// separated from the state cell it was built against — reusing one means
+/// overwriting that cell's *contents*, not swapping the `Rc`.
+struct BaselinedVm {
+    /// `Some` until consumed by a restore. Optioned so [`Drop`] can dispose an
+    /// unconsumed target (pool cleared, thread ending) while a consumed one
+    /// moves its VM into the [`ReplayRuntime`], whose own drop disposes it.
+    vm: Option<Vm>,
+    state: Rc<RefCell<JournalState>>,
+}
+
+impl Drop for BaselinedVm {
+    fn drop(&mut self) {
+        if let Some(vm) = &mut self.vm {
+            vm.dispose();
+        }
+    }
+}
+
+thread_local! {
+    /// At most one spare baselined VM per effect-name list, filled only by an
+    /// explicit [`ReplayRuntime::prime_image_restore`] call.
+    ///
+    /// Deliberately not self-refilling. Building a baselined VM costs the same
+    /// whenever it happens, so refilling inside `from_image` would move the
+    /// work around without removing any of it — a throughput wash that only
+    /// looks like a win if you stop measuring at the `return`. Priming is
+    /// opt-in so the caller decides when to spend it: a worker node primes at
+    /// startup and again after a restore, while it is idle, and the restore
+    /// itself then skips the whole prologue.
+    static RESTORE_POOL: RefCell<HashMap<Vec<String>, BaselinedVm>> =
+        RefCell::new(HashMap::new());
+}
+
+/// A pending host op, as written into a runtime image.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PendingOpImg {
+    name: String,
+    args: Json,
+    site: String,
+    seq: u64,
+}
+
+/// A [`ReplayRuntime`] image: the VM image plus the journal bookkeeping that
+/// lives outside the VM. Both halves are needed — the heap says what the
+/// program *is*, the cursor says where the journal picks up.
+///
+/// The journal itself is deliberately NOT in here. It already travels with the
+/// artifact ([`DurableBlob::journal`]) and is what the fallback path needs;
+/// carrying a second copy would make the image grow with history, which is the
+/// one thing it exists not to do.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeImage {
+    version: u32,
+    bundle_hash: String,
+    counters: HashMap<String, u64>,
+    cursor: usize,
+    pending: Vec<(u64, PendingOpImg)>,
+    started: bool,
+    vm: crate::image::VmImage,
+}
+
 /// Outcome of driving the runtime.
 #[derive(Debug)]
 pub enum DriveOutcome {
@@ -77,6 +160,18 @@ pub struct ReplayRuntime {
     bundle_hash: String,
     state: Rc<RefCell<JournalState>>,
     started: bool,
+}
+
+impl Drop for ReplayRuntime {
+    fn drop(&mut self) {
+        // Break the realm's Rc cycles on the way out. Reference counting
+        // cannot reclaim the realm graph (ctor↔prototype, closure↔cell), so
+        // without this every runtime this process ever built leaks its realm —
+        // ~0.7 MB per restore, which the repeated-restore pattern the pool
+        // exists for turns into an unbounded accumulation. Mirrors the
+        // explicit dispose `run_module` does for the mainline engine.
+        self.vm.dispose();
+    }
 }
 
 impl ReplayRuntime {
@@ -112,7 +207,18 @@ impl ReplayRuntime {
         journal_bytes: &[u8],
         effects: &[&str],
     ) -> Result<ReplayRuntime, String> {
-        let journal = Journal::from_bytes(journal_bytes)?;
+        Self::restore_with_journal(bundle, Journal::from_bytes(journal_bytes)?, effects)
+    }
+
+    /// As [`Self::restore`], with the journal already parsed — the blob path
+    /// carries the structure directly, so re-encoding it to bytes just to
+    /// parse them again here would reintroduce the cost the inline journal
+    /// removed.
+    pub fn restore_with_journal(
+        bundle: &str,
+        journal: Journal,
+        effects: &[&str],
+    ) -> Result<ReplayRuntime, String> {
         let bundle_hash = Journal::hash_bundle(bundle);
         // The journal pins the bundle it was recorded against; actually
         // compare the pin. A changed bundle is legal (modify-and-resume is
@@ -137,6 +243,221 @@ impl ReplayRuntime {
         rt.install_effects(effects);
         rt.install_memo();
         Ok(rt)
+    }
+
+    /// Turn on VM imaging: freeze everything built so far — the realm, the
+    /// effect functions, the memo helper — as the image baseline, so an image
+    /// only has to carry what the *program* creates.
+    ///
+    /// Call before the bundle starts. The restoring side reaches the same
+    /// baseline by construction: same engine, same effect names, same order.
+    /// That is also what re-binds host effects on the way back — the restored
+    /// natives close over the *new* process's journal state, and the image
+    /// refers to them by baseline id rather than trying to serialize a Rust
+    /// closure.
+    pub fn enable_imaging(&mut self) {
+        self.vm.mark_image_baseline();
+    }
+
+    /// Capture the live runtime — heap, closures, promises, suspended frames,
+    /// plus the journal cursor — as a restorable image.
+    ///
+    /// `Err` means this state has no image form (see
+    /// [`crate::image::ImageError::Unsupported`]); the caller keeps the
+    /// journal and resumes by replay instead. It is never wrong to fall back.
+    pub fn to_image(&self) -> Result<RuntimeImage, String> {
+        if !self.vm.has_image_baseline() {
+            return Err("imaging was not enabled on this runtime".to_string());
+        }
+        let vm = self.vm.snapshot_image().map_err(|e| e.to_string())?;
+        let s = self.state.borrow();
+        let img = RuntimeImage {
+            version: crate::image::IMAGE_VERSION,
+            bundle_hash: self.bundle_hash.clone(),
+            counters: s.counters.clone(),
+            cursor: s.cursor,
+            // Only ops that are STILL pending. `JournalState::pending` keeps
+            // an entry per host call ever made — handy for divergence
+            // messages, but it grows with history, and copying it wholesale
+            // would make the image O(history) through the back door. The VM's
+            // own pending-host map is the authoritative live set (entries are
+            // removed as ops settle), and a settled op can never be resolved
+            // again after a restore.
+            pending: {
+                let mut live: Vec<(u64, PendingOpImg)> = s
+                    .pending
+                    .iter()
+                    .filter(|(id, _)| self.vm.pending_host.contains_key(*id))
+                    .map(|(id, op)| {
+                        (
+                            *id,
+                            PendingOpImg {
+                                name: op.name.clone(),
+                                args: op.args.clone(),
+                                site: op.site.clone(),
+                                seq: op.seq,
+                            },
+                        )
+                    })
+                    .collect();
+                // HashMap order is not stable; sort so the same suspension
+                // always produces the same bytes.
+                live.sort_by_key(|(id, _)| *id);
+                live
+            },
+            started: self.started,
+            vm,
+        };
+        Ok(img)
+    }
+
+    /// Rebuild a runtime from an image: the heap comes back as it was, and the
+    /// bundle is **not** re-executed. This is the O(live state) counterpart of
+    /// [`Self::restore`]'s O(history) replay.
+    ///
+    /// The bundle is still required — it is recompiled so closures can point at
+    /// real bytecode — and it must be the same source the image was taken
+    /// against, which is checked. An *edited* bundle has no meaning here (there
+    /// is no re-execution to absorb the edit); resume that through
+    /// [`Self::restore`], which is what modify-and-resume is for.
+    pub fn from_image(
+        img: &RuntimeImage,
+        bundle: &str,
+        journal_bytes: &[u8],
+        effects: &[&str],
+    ) -> Result<ReplayRuntime, String> {
+        Self::from_image_with_journal(img, bundle, Journal::from_bytes(journal_bytes)?, effects)
+    }
+
+    /// As [`Self::from_image`], with the journal already parsed.
+    pub fn from_image_with_journal(
+        img: &RuntimeImage,
+        bundle: &str,
+        journal: Journal,
+        effects: &[&str],
+    ) -> Result<ReplayRuntime, String> {
+        if img.version != crate::image::IMAGE_VERSION {
+            return Err(format!(
+                "runtime image version {} but this engine writes {}",
+                img.version,
+                crate::image::IMAGE_VERSION
+            ));
+        }
+        let bundle = bundle.to_string();
+        let bundle_hash = Journal::hash_bundle(&bundle);
+        if bundle_hash != img.bundle_hash {
+            return Err(
+                "image was taken against a different bundle; resume by journal replay \
+                 (`restore`) if the source was edited"
+                    .to_string(),
+            );
+        }
+        let restored = JournalState {
+            journal,
+            mode: Mode::Record,
+            counters: img.counters.clone(),
+            cursor: img.cursor,
+            pending: img
+                .pending
+                .iter()
+                .map(|(id, op)| {
+                    (
+                        *id,
+                        PendingOp {
+                            name: op.name.clone(),
+                            args: op.args.clone(),
+                            site: op.site.clone(),
+                            seq: op.seq,
+                        },
+                    )
+                })
+                .collect(),
+            divergence: None,
+            bundle_changed: false,
+        };
+        // A VM at the baseline the imaging side built, pooled or fresh. Taken
+        // only after the version and bundle checks above, so a rejected image
+        // never burns a primed target.
+        let mut taken = Self::take_baselined(effects);
+        // The effect natives already hold this cell; give them the restored
+        // journal by overwriting its contents rather than swapping the `Rc`,
+        // which they would not see.
+        *taken.state.borrow_mut() = restored;
+        let mut rt = ReplayRuntime {
+            vm: taken
+                .vm
+                .take()
+                .expect("a restore target always carries its VM until consumed"),
+            bundle,
+            bundle_hash,
+            state: taken.state.clone(),
+            started: img.started,
+        };
+        // Compile (not run) the bundle so imaged closures resolve to bytecode.
+        let proto = crate::compiler::compile_script_cached(&rt.bundle)?;
+        rt.vm.register_image_unit(rt.bundle_hash.clone(), proto);
+        rt.vm.restore_image(&img.vm).map_err(|e| e.to_string())?;
+        Ok(rt)
+    }
+
+    /// Build the VM an image restore for `effects` needs: fresh realm, effect
+    /// natives and the memo helper installed, every lazy builtin section
+    /// materialized, baseline marked. This is exactly the prologue
+    /// [`Self::from_image`] would otherwise run inline, factored out so it can
+    /// also be run ahead of time.
+    ///
+    /// The bundle plays no part — the baseline is the realm plus the host
+    /// surface, and the bundle is only compiled (never run) afterwards — which
+    /// is what makes a restore target reusable across different programs.
+    fn build_baselined(effects: &[&str]) -> BaselinedVm {
+        let state = Rc::new(RefCell::new(JournalState::empty()));
+        let mut vm = Vm::new();
+        Self::install_effects_on(&mut vm, &state, effects);
+        Self::install_memo_on(&mut vm, &state);
+        vm.mark_image_baseline();
+        BaselinedVm {
+            vm: Some(vm),
+            state,
+        }
+    }
+
+    /// Pre-build the restore target for `effects` so the next
+    /// [`Self::from_blob`]/[`Self::from_image`] with the same effect list skips
+    /// the prologue (fresh realm, host surface, baseline walk — about 1.4 ms).
+    ///
+    /// This does not make a restore cheaper in total; it moves that cost to
+    /// wherever this is called. It pays off for the pattern it exists for — a
+    /// worker node that restores repeatedly and can prime while idle — and is
+    /// a pure loss for a process that restores once. Hence opt-in.
+    ///
+    /// Holds one baselined VM (~0.7 MB) per distinct effect list until taken;
+    /// [`Self::clear_image_restore_pool`] drops them.
+    pub fn prime_image_restore(effects: &[&str]) {
+        let key: Vec<String> = effects.iter().map(|s| s.to_string()).collect();
+        if RESTORE_POOL.with(|p| p.borrow().contains_key(&key)) {
+            return;
+        }
+        // Built outside the pool borrow: constructing a realm runs arbitrary
+        // engine code, which must not re-enter a borrowed thread-local.
+        let built = Self::build_baselined(effects);
+        RESTORE_POOL.with(|p| p.borrow_mut().insert(key, built));
+    }
+
+    /// Drop every pooled restore target on this thread.
+    pub fn clear_image_restore_pool() {
+        RESTORE_POOL.with(|p| p.borrow_mut().clear());
+    }
+
+    /// Take the pooled restore target for `effects`, or build one now.
+    ///
+    /// Always *removes* what it takes: `restore_image` mutates the VM it lands
+    /// in, so a target is single-use and must never be handed out twice.
+    fn take_baselined(effects: &[&str]) -> BaselinedVm {
+        let key: Vec<String> = effects.iter().map(|s| s.to_string()).collect();
+        match RESTORE_POOL.with(|p| p.borrow_mut().remove(&key)) {
+            Some(b) => b,
+            None => Self::build_baselined(effects),
+        }
     }
 
     pub fn journal_bytes(&self) -> Vec<u8> {
@@ -164,94 +485,115 @@ impl ReplayRuntime {
     /// journal. Calling `name(...args)` returns a promise that resolves from the
     /// journal (replay) or pends awaiting a live result (record/frontier).
     fn install_effects(&mut self, effects: &[&str]) {
-        let global = self.vm.realm.global.clone();
+        Self::install_effects_on(&mut self.vm, &self.state, effects);
+    }
+
+    /// The body of [`Self::install_effects`], usable before a `ReplayRuntime`
+    /// exists — the pre-built restore targets install the same natives on a
+    /// bare VM, and `ReplayRuntime` now has a `Drop`, so its fields cannot be
+    /// moved out to build one after the fact.
+    fn install_effects_on(target: &mut Vm, st: &Rc<RefCell<JournalState>>, effects: &[&str]) {
+        let global = target.realm.global.clone();
         for name in effects {
             let nm = name.to_string();
-            let state = self.state.clone();
-            self.vm
-                .define_method(&global, name, 1, move |vm, _this, args| {
-                    let args_json = Json::Array(args.iter().map(|a| vm.value_to_json(a)).collect());
-                    // Allocate the deterministic key.
-                    let (site, seq) = {
-                        let mut s = state.borrow_mut();
-                        let seq = *s.counters.get(&nm).unwrap_or(&0);
-                        s.counters.insert(nm.clone(), seq + 1);
-                        (nm.clone(), seq)
-                    };
-                    // Ordered journal consumption: the next recorded entry must match
-                    // this call's key, else an edit changed already-executed effects
-                    // (fail-loud divergence, the P4 default policy).
-                    enum Decision {
-                        Resolve(Json),
-                        Reject(String),
-                        Frontier,
-                        Diverged(String),
-                    }
-                    let decision = {
-                        let mut s = state.borrow_mut();
-                        let cursor = s.cursor;
-                        if cursor < s.journal.entries.len() {
-                            let entry = s.journal.entries[cursor].clone();
-                            if entry.site != site || entry.seq != seq {
-                                let msg = format!(
+            let state = st.clone();
+            target.define_method(&global, name, 1, move |vm, _this, args| {
+                let args_json = Json::Array(args.iter().map(|a| vm.value_to_json(a)).collect());
+                // Allocate the deterministic key.
+                let (site, seq) = {
+                    let mut s = state.borrow_mut();
+                    let seq = *s.counters.get(&nm).unwrap_or(&0);
+                    s.counters.insert(nm.clone(), seq + 1);
+                    (nm.clone(), seq)
+                };
+                // Ordered journal consumption: the next recorded entry must match
+                // this call's key, else an edit changed already-executed effects
+                // (fail-loud divergence, the P4 default policy).
+                enum Decision {
+                    Resolve(Json),
+                    Reject(String),
+                    Frontier,
+                    Diverged(String),
+                }
+                let decision = {
+                    let mut s = state.borrow_mut();
+                    let cursor = s.cursor;
+                    if cursor < s.journal.entries.len() {
+                        let entry = s.journal.entries[cursor].clone();
+                        if entry.site != site || entry.seq != seq {
+                            let msg = format!(
                                 "expected effect '{}'#{} from journal but program called '{}'#{} \
                                  (an edit changed already-executed code before the resume point{})",
-                                entry.site, entry.seq, site, seq,
-                                if s.bundle_changed { "; the code bundle differs from the recorded one" } else { "" }
+                                entry.site,
+                                entry.seq,
+                                site,
+                                seq,
+                                if s.bundle_changed {
+                                    "; the code bundle differs from the recorded one"
+                                } else {
+                                    ""
+                                }
                             );
-                                s.divergence = Some(msg.clone());
-                                Decision::Diverged(msg)
-                            } else if entry.args != Json::Null && entry.args != args_json {
-                                // Same effect, same position, different request:
-                                // replaying the recorded result would answer a
-                                // question the program no longer asks.
-                                let msg = format!(
-                                    "effect '{}'#{} was recorded with args {} but the program now \
+                            s.divergence = Some(msg.clone());
+                            Decision::Diverged(msg)
+                        } else if entry.args != Json::Null && entry.args != args_json {
+                            // Same effect, same position, different request:
+                            // replaying the recorded result would answer a
+                            // question the program no longer asks.
+                            let msg = format!(
+                                "effect '{}'#{} was recorded with args {} but the program now \
                                      calls it with {} (an edit changed an already-executed call's \
                                      arguments before the resume point{})",
-                                    site, seq, entry.args, args_json,
-                                    if s.bundle_changed { "; the code bundle differs from the recorded one" } else { "" }
-                                );
-                                s.divergence = Some(msg.clone());
-                                Decision::Diverged(msg)
-                            } else {
-                                s.cursor += 1;
-                                match entry.outcome {
-                                    EffectOutcome::Resolved(j) => Decision::Resolve(j),
-                                    EffectOutcome::Rejected(m) => Decision::Reject(m),
+                                site,
+                                seq,
+                                entry.args,
+                                args_json,
+                                if s.bundle_changed {
+                                    "; the code bundle differs from the recorded one"
+                                } else {
+                                    ""
                                 }
-                            }
+                            );
+                            s.divergence = Some(msg.clone());
+                            Decision::Diverged(msg)
                         } else {
-                            Decision::Frontier
+                            s.cursor += 1;
+                            match entry.outcome {
+                                EffectOutcome::Resolved(j) => Decision::Resolve(j),
+                                EffectOutcome::Rejected(m) => Decision::Reject(m),
+                            }
                         }
-                    };
-                    let (id, promise) = vm.register_host_op();
-                    state.borrow_mut().pending.insert(
-                        id,
-                        PendingOp {
-                            name: nm.clone(),
-                            args: args_json,
-                            site,
-                            seq,
-                        },
-                    );
-                    match decision {
-                        Decision::Resolve(j) => {
-                            let v = vm.json_to_value(&j);
-                            vm.resolve_host_op(id, v);
-                        }
-                        Decision::Reject(msg) => {
-                            let e = vm.make_error(ErrorKind::Error, &msg);
-                            vm.reject_host_op(id, e);
-                        }
-                        Decision::Diverged(msg) => {
-                            let e = vm.make_error(ErrorKind::Error, &msg);
-                            vm.reject_host_op(id, e);
-                        }
-                        Decision::Frontier => { /* stays pending; resolved live */ }
+                    } else {
+                        Decision::Frontier
                     }
-                    Ok(Value::Object(promise))
-                });
+                };
+                let (id, promise) = vm.register_host_op();
+                state.borrow_mut().pending.insert(
+                    id,
+                    PendingOp {
+                        name: nm.clone(),
+                        args: args_json,
+                        site,
+                        seq,
+                    },
+                );
+                match decision {
+                    Decision::Resolve(j) => {
+                        let v = vm.json_to_value(&j);
+                        vm.resolve_host_op(id, v);
+                    }
+                    Decision::Reject(msg) => {
+                        let e = vm.make_error(ErrorKind::Error, &msg);
+                        vm.reject_host_op(id, e);
+                    }
+                    Decision::Diverged(msg) => {
+                        let e = vm.make_error(ErrorKind::Error, &msg);
+                        vm.reject_host_op(id, e);
+                    }
+                    Decision::Frontier => { /* stays pending; resolved live */ }
+                }
+                Ok(Value::Object(promise))
+            });
         }
     }
 
@@ -262,96 +604,97 @@ impl ReplayRuntime {
     /// memoized rather than re-executed. The result must be JSON-serializable
     /// (a plain value, not a continuation).
     fn install_memo(&mut self) {
-        let global = self.vm.realm.global.clone();
-        let state = self.state.clone();
-        self.vm
-            .define_method(&global, "durableStep", 1, move |vm, _this, args| {
-                let f = args.first().cloned().unwrap_or(Value::Undefined);
-                let site = "durableStep".to_string();
-                let seq = {
-                    let mut s = state.borrow_mut();
-                    let seq = *s.counters.get(&site).unwrap_or(&0);
-                    s.counters.insert(site.clone(), seq + 1);
-                    seq
-                };
-                enum Decision {
-                    Cached(Json),
-                    CachedErr(String),
-                    Run,
-                    Diverged(String),
-                }
-                let decision = {
-                    let mut s = state.borrow_mut();
-                    let cursor = s.cursor;
-                    if cursor < s.journal.entries.len() {
-                        let entry = s.journal.entries[cursor].clone();
-                        if entry.site == site && entry.seq == seq {
-                            s.cursor += 1;
-                            match entry.outcome {
-                                EffectOutcome::Resolved(j) => Decision::Cached(j),
-                                EffectOutcome::Rejected(m) => Decision::CachedErr(m),
-                            }
-                        } else {
-                            let msg = format!(
-                                "expected '{}'#{} from journal but program reached durableStep#{} \
-                             (edit changed already-executed code)",
-                                entry.site, entry.seq, seq
-                            );
-                            s.divergence = Some(msg.clone());
-                            Decision::Diverged(msg)
+        Self::install_memo_on(&mut self.vm, &self.state);
+    }
+
+    /// As [`Self::install_effects_on`], for the `durableStep` helper.
+    fn install_memo_on(target: &mut Vm, st: &Rc<RefCell<JournalState>>) {
+        let global = target.realm.global.clone();
+        let state = st.clone();
+        target.define_method(&global, "durableStep", 1, move |vm, _this, args| {
+            let f = args.first().cloned().unwrap_or(Value::Undefined);
+            let site = "durableStep".to_string();
+            let seq = {
+                let mut s = state.borrow_mut();
+                let seq = *s.counters.get(&site).unwrap_or(&0);
+                s.counters.insert(site.clone(), seq + 1);
+                seq
+            };
+            enum Decision {
+                Cached(Json),
+                CachedErr(String),
+                Run,
+                Diverged(String),
+            }
+            let decision = {
+                let mut s = state.borrow_mut();
+                let cursor = s.cursor;
+                if cursor < s.journal.entries.len() {
+                    let entry = s.journal.entries[cursor].clone();
+                    if entry.site == site && entry.seq == seq {
+                        s.cursor += 1;
+                        match entry.outcome {
+                            EffectOutcome::Resolved(j) => Decision::Cached(j),
+                            EffectOutcome::Rejected(m) => Decision::CachedErr(m),
                         }
                     } else {
-                        Decision::Run
+                        let msg = format!(
+                            "expected '{}'#{} from journal but program reached durableStep#{} \
+                             (edit changed already-executed code)",
+                            entry.site, entry.seq, seq
+                        );
+                        s.divergence = Some(msg.clone());
+                        Decision::Diverged(msg)
                     }
-                };
-                let (id, promise) = vm.register_host_op();
-                let key = crate::host::HostKey { site, seq };
-                match decision {
-                    Decision::Cached(j) => {
-                        let v = vm.json_to_value(&j);
-                        vm.resolve_host_op(id, v);
-                    }
-                    Decision::CachedErr(m) => {
-                        let e = vm.make_error(ErrorKind::Error, &m);
-                        vm.reject_host_op(id, e);
-                    }
-                    Decision::Diverged(m) => {
-                        let e = vm.make_error(ErrorKind::Error, &m);
-                        vm.reject_host_op(id, e);
-                    }
-                    Decision::Run => match vm.call(f, Value::Undefined, &[]) {
-                        Ok(v) => {
-                            let j = vm.value_to_json(&v);
-                            {
-                                let mut s = state.borrow_mut();
-                                s.journal.append(
-                                    &key,
-                                    Json::Null,
-                                    EffectOutcome::Resolved(j.clone()),
-                                );
-                                s.cursor = s.journal.entries.len();
-                            }
-                            let rv = vm.json_to_value(&j);
-                            vm.resolve_host_op(id, rv);
-                        }
-                        Err(e) => {
-                            let msg = vm.error_to_string(&e);
-                            {
-                                let mut s = state.borrow_mut();
-                                s.journal.append(
-                                    &key,
-                                    Json::Null,
-                                    EffectOutcome::Rejected(msg.clone()),
-                                );
-                                s.cursor = s.journal.entries.len();
-                            }
-                            let err = vm.make_error(ErrorKind::Error, &msg);
-                            vm.reject_host_op(id, err);
-                        }
-                    },
+                } else {
+                    Decision::Run
                 }
-                Ok(Value::Object(promise))
-            });
+            };
+            let (id, promise) = vm.register_host_op();
+            let key = crate::host::HostKey { site, seq };
+            match decision {
+                Decision::Cached(j) => {
+                    let v = vm.json_to_value(&j);
+                    vm.resolve_host_op(id, v);
+                }
+                Decision::CachedErr(m) => {
+                    let e = vm.make_error(ErrorKind::Error, &m);
+                    vm.reject_host_op(id, e);
+                }
+                Decision::Diverged(m) => {
+                    let e = vm.make_error(ErrorKind::Error, &m);
+                    vm.reject_host_op(id, e);
+                }
+                Decision::Run => match vm.call(f, Value::Undefined, &[]) {
+                    Ok(v) => {
+                        let j = vm.value_to_json(&v);
+                        {
+                            let mut s = state.borrow_mut();
+                            s.journal
+                                .append(&key, Json::Null, EffectOutcome::Resolved(j.clone()));
+                            s.cursor = s.journal.entries.len();
+                        }
+                        let rv = vm.json_to_value(&j);
+                        vm.resolve_host_op(id, rv);
+                    }
+                    Err(e) => {
+                        let msg = vm.error_to_string(&e);
+                        {
+                            let mut s = state.borrow_mut();
+                            s.journal.append(
+                                &key,
+                                Json::Null,
+                                EffectOutcome::Rejected(msg.clone()),
+                            );
+                            s.cursor = s.journal.entries.len();
+                        }
+                        let err = vm.make_error(ErrorKind::Error, &msg);
+                        vm.reject_host_op(id, err);
+                    }
+                },
+            }
+            Ok(Value::Object(promise))
+        });
     }
 
     fn start(&mut self) -> Result<(), String> {
@@ -366,6 +709,13 @@ impl ReplayRuntime {
         // pipeline once per thread instead of once per restore. An *edited*
         // bundle is a different source string and simply misses the cache.
         let proto = crate::compiler::compile_script_cached(&self.bundle)?;
+        if self.vm.has_image_baseline() {
+            // Imaged closures address their bytecode as (unit, const path);
+            // the restoring side recompiles the same source and registers the
+            // same key, so the paths resolve there too.
+            self.vm
+                .register_image_unit(self.bundle_hash.clone(), proto.clone());
+        }
         let func = self.vm.make_closure(proto, Vec::new());
         match self.vm.call(Value::Object(func), Value::Undefined, &[]) {
             Ok(_) => Ok(()),
@@ -560,28 +910,111 @@ impl ReplayRuntime {
 /// A self-describing durable artifact: the code bundle plus its effect journal.
 /// `restore` needs the bundle (the journal references it by content hash), so we
 /// bundle them together rather than threading the bundle through the trait.
+/// The journal inside a [`DurableBlob`]. Written inline — the parsed structure
+/// itself — so the artifact is encoded once and decoded once. It used to travel
+/// as the journal's serialized bytes (`Vec<u8>`), which serde_json renders as a
+/// JSON array of numbers and which then had to be parsed as JSON *again*; that
+/// double decode was the single largest history-dependent cost of an image
+/// restore (~2.5 ms of a 1600-effect restore). The legacy arm keeps every blob
+/// written in the old shape readable; writers emit `Inline`. The one-way cost:
+/// a binary from before this change cannot read a new artifact's journal — an
+/// accepted break for a run artifact written and read by the same deployment
+/// (the snapshot ABI gates cross-version restores anyway).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum JournalBlob {
+    /// The journal as structure (a JSON object). Tried first by the untagged
+    /// decoder; a legacy byte array cannot match it.
+    Inline(Journal),
+    /// Pre-existing artifacts: the journal's JSON as raw bytes.
+    Legacy(Vec<u8>),
+}
+
+impl JournalBlob {
+    /// The journal, whichever shape it traveled in.
+    pub fn parse(&self) -> Result<Journal, String> {
+        match self {
+            JournalBlob::Inline(j) => Ok(j.clone()),
+            JournalBlob::Legacy(bytes) => Journal::from_bytes(bytes),
+        }
+    }
+}
+
+impl Default for JournalBlob {
+    fn default() -> Self {
+        JournalBlob::Inline(Journal::default())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct DurableBlob {
     pub bundle: String,
     pub effects: Vec<String>,
-    pub journal: Vec<u8>,
+    pub journal: JournalBlob,
+    /// A VM image of the same suspension point, when one could be taken.
+    ///
+    /// Strictly a fast path: [`ReplayRuntime::from_blob`] uses it to skip
+    /// replay and falls back to bundle+journal whenever it is absent or does
+    /// not apply. The field is additive, so an artifact carrying an image
+    /// still restores correctly in a reader that has never heard of one — it
+    /// ignores the field and replays, which is always right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<Box<RuntimeImage>>,
+}
+
+/// Which path a restore actually took. Worth surfacing: the image is a cache,
+/// and a cache that silently stops hitting is a performance bug nobody sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestorePath {
+    /// Rebuilt from the VM image — O(live state), no re-execution.
+    Image,
+    /// Re-executed against the journal. `reason` is `None` when the artifact
+    /// carried no image at all, and `Some` when one was present but declined.
+    Replay { reason: Option<String> },
 }
 
 impl ReplayRuntime {
-    /// Serialize the full durable artifact (bundle + journal).
+    /// Serialize the full durable artifact (bundle + journal), including a VM
+    /// image when imaging is enabled and this state can be imaged.
     pub fn to_blob(&self, effects: &[&str]) -> Vec<u8> {
+        let image = if self.vm.has_image_baseline() {
+            self.to_image().ok().map(Box::new)
+        } else {
+            None
+        };
         let blob = DurableBlob {
             bundle: self.bundle.clone(),
             effects: effects.iter().map(|s| s.to_string()).collect(),
-            journal: self.journal_bytes(),
+            journal: JournalBlob::Inline(self.state.borrow().journal.clone()),
+            image,
         };
         serde_json::to_vec(&blob).unwrap_or_default()
     }
 
-    /// Reconstruct a runtime from a `to_blob` artifact, replaying to the frontier.
+    /// Reconstruct a runtime from a `to_blob` artifact: from its VM image when
+    /// there is a usable one, otherwise by replaying the journal.
     pub fn from_blob(bytes: &[u8]) -> Result<ReplayRuntime, String> {
+        Ok(Self::from_blob_reporting(bytes)?.0)
+    }
+
+    /// As [`Self::from_blob`], also reporting which path was taken.
+    pub fn from_blob_reporting(bytes: &[u8]) -> Result<(ReplayRuntime, RestorePath), String> {
         let blob: DurableBlob = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        let effects: Vec<&str> = blob.effects.iter().map(|s| s.as_str()).collect();
-        ReplayRuntime::restore(&blob.bundle, &blob.journal, &effects)
+        let effect_names: Vec<&str> = blob.effects.iter().map(|s| s.as_str()).collect();
+        let journal = blob.journal.parse()?;
+        let mut declined = None;
+        if let Some(image) = &blob.image {
+            // The clone keeps the parsed journal available for the fallback;
+            // cloning entries is microseconds against the parse it replaces.
+            match Self::from_image_with_journal(image, &blob.bundle, journal.clone(), &effect_names)
+            {
+                Ok(rt) => return Ok((rt, RestorePath::Image)),
+                // Never fatal: the journal can always rebuild this state, so a
+                // stale or inapplicable image costs time, not correctness.
+                Err(e) => declined = Some(e),
+            }
+        }
+        let rt = Self::restore_with_journal(&blob.bundle, journal, &effect_names)?;
+        Ok((rt, RestorePath::Replay { reason: declined }))
     }
 }

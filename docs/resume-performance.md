@@ -5,7 +5,9 @@ description: "Resume cost analysis and optimization notes."
 
 # Resume performance: what a resume costs, and how to make it cheap
 
-> **Status:** the two caches below are **landed** (branch
+> **Status:** VM images (§7) are **landed** — a suspended engine now has a
+> durable form, so resume is no longer process-local. The two caches below are
+> **landed** (branch
 > `claude/chidori-js-jit-compiler-btc3ec`); the warm-standby design in §5 is
 > **landed** for `input()` pauses on the session server (see §5.1). **Related:** [`docs/value-checkpoints.md`](./value-checkpoints.md)
 > (the `chidori.step` memoization primitive),
@@ -249,6 +251,68 @@ Measured (debug build, 600-record history, via the HTTP server): resume
 23 ms warm vs 213 ms replay — and the warm number is flat in history size
 where the replay number grows with it.
 
+### 5.2 Landed (flagged): the mainline pause conversion
+
+> `crates/chidori/src/runtime/mainline_image.rs`, `CHIDORI_MAINLINE_IMAGE=1`
+
+§5.1 keeps the paused VM alive in the process that started the run; §7 gives a
+suspended VM a durable form. Neither reached the mainline agent loop, because
+there a pause was still an **error unwind**: `run_module` dispatched host
+effects synchronously and `PAUSE_MARKER` tore the engine down with the Rust
+stack, so at the moment the run paused there was nothing left to image.
+
+Behind `CHIDORI_MAINLINE_IMAGE` (default **off**) the pause-capable effects go
+through the engine's async host-promise path instead. `Vm::effect_suspend`
+classifies a host dispatch failure: a pause yields a pending host promise
+(`register_host_op`) rather than a thrown error, the awaiting frame parks, and
+the driver stops at a quiescent point. There the run captures a VM image and
+writes it to `vm_image.json` beside — never instead of — the journal scaffold
+the unwinding path has always written, then returns the **identical** paused
+`RunResult`, reconstructed from the same wire string the unwind raised, so
+every caller upstream (`surface_pause`, the CLI, the session server) is
+unchanged.
+
+A resume prefers the image. `run_module` rebuilds the engine exactly as the
+imaging side did — same construction, same preludes, SDK sugar, fetch polyfill,
+DOM and entrypoint registrar, in the same order — marks the same baseline,
+recompiles the module graph as image compilation units *without evaluating it*,
+restores, and resolves the parked op with the delivered answer. The recorded
+journal becomes the run's history rather than something to re-execute
+(`RuntimeContext::adopt_replay_log_as_history`). Every rejection —
+envelope version, a changed entry, a journal that is not this image's frontier
+plus one delivery, a baseline or compilation-unit mismatch, a decode failure —
+logs at `debug` and re-runs with ordinary re-execution on a fresh engine, with
+nothing consumed from the journal. The property that makes this a cache and not
+a second source of truth is pinned by a differential test
+(`mainline_image::tests::image_resume_and_replay_resume_agree_on_output_and_journal`):
+resuming from the image and resuming by re-execution leave the same output and
+the same journal.
+
+**What is converted:** `input()` pauses only — the dominant production pause,
+and the one whose delivery is a plain value. Approval and signal/alarm pauses
+keep the classic unwind and resume by re-execution; their delivery paths
+re-derive state (policy decisions, the signal mailbox and its timeout arming)
+on the re-execution they still perform, so converting them is a separate
+change, not a longer list. Non-pausing effects stay synchronous on purpose:
+moving them onto promises would change microtask interleaving, which replay
+determinism depends on.
+
+**Caveats a reader should know.** §5.1 still wins where it applies: a
+`WarmInputBridge` intercepts the `input()` pause before it ever becomes a host
+failure, so a server run that parks warm never reaches this path — the image is
+for the cold resume the warm path cannot serve. Only the outermost module of a
+run images — sub-agents and tool files drive their own engines against the same
+durable context. Imaging forces eager realm construction (§7.1), and a pause is no
+longer observable in JS as a thrown exception, so a `try/catch` around
+`await chidori.input()` no longer sees one and `finally` blocks do not run at
+the pause; that is the point of the conversion, and it is why it is flagged.
+Effects that fire *after* a pause in the same turn park unresolved without
+reaching the host, so the paused journal matches the unwind's exactly; the
+synchronous captured natives (`node:` crypto/fs) are not gated that way and can
+still run in a post-pause microtask. With the flag off, none of this exists:
+no image is written, no image is read, and the pause path is byte-identical to
+before.
+
 ## 6. Order of remaining work, by expected value
 
 1. ~~**Warm-standby conversion (§5)**~~ — landed for input pauses (§5.1);
@@ -258,9 +322,202 @@ where the replay number grows with it.
    half (§4.2): the four deferrable namespace sections now materialize on
    first use, cutting the cold realm build roughly in half.
    Build-once-clone-many shared templates remain unexplored.
-3. **Per-segment replay-cost tracing** — a `chidori trace` view attributing
+3. **Build-once-clone-many realm templates** — the fixed ~1.4 ms an image
+   restore pays to rebuild the eager realm and walk the baseline (§7.3) is now
+   the dominant term on that path, and it is the same cost
+   `interpreter-optimization.md` §11.4 flags as INVESTIGATE.
+4. **Per-segment replay-cost tracing** — a `chidori trace` view attributing
    replay time to inter-effect segments, so authors know exactly what to wrap
    in `chidori.step`.
-4. **Interpreter data-model work** (shape-keyed inline caches, property-key
+5. **Interpreter data-model work** (shape-keyed inline caches, property-key
    interning) — speeds whatever replay remains; see the research summary in
    `interpreter-optimization.md`/`jit.md`.
+
+---
+
+## 7. Landed: VM images
+
+> `crates/chidori-js/src/image.rs`
+
+§5.1's warm resume removes the O(history) term only where the process never
+died — the paused engine is parked in memory, so the fast path belongs to
+whoever started the run. That is exactly the property a fleet cannot have. A
+run migrating to another node is the cold path by definition, and the cold
+path was replay.
+
+A **VM image** is the durable form of a suspended engine: the live heap,
+closures and upvalue cells, promises with their reaction lists, and suspended
+async/generator frames — serialized, and rebuilt in a *different* process
+without re-executing anything.
+
+### 7.1 Realm-relative, so intrinsics are never serialized
+
+A realm is thousands of objects wired together with native Rust function
+pointers. None of that is writable, and none of it needs to be: building an
+engine and evaluating the same prelude is deterministic. So an image is taken
+against a **baseline**.
+
+`Vm::mark_image_baseline()` walks the realm from `Realm::object_roots()` in a
+fixed order and numbers every reachable object, binding cell and symbol. After
+that, the image carries only what the *program* creates; anything older is a
+`u32`. The restoring VM reaches the same baseline by construction — same
+engine, same effect names, same order — and the ids resolve against its own
+objects.
+
+That is also how host effects re-bind. The effect functions are native
+closures over *this process's* journal state; they are in the baseline, so the
+image refers to them by id and the restored program calls the new process's
+closures without anything having to serialize a Rust closure.
+
+Two consequences worth knowing:
+
+- **Baseline objects are not frozen.** Top-level `var`s land on the global
+  object and scripts do patch `Array.prototype`. Every baseline object is
+  fingerprinted at mark time and re-checked at snapshot time; whatever moved
+  is written as an **overlay** (its full property table) and reapplied on
+  restore. An untouched intrinsic costs one hash.
+- **Imaging forces eager realm construction.** Lazily-installed builtin
+  sections (§4.2) would otherwise land *after* the baseline, making
+  `new Date()` enough to fail an image — and, worse, the restoring side would
+  install a different subset because it does not execute the program.
+  `mark_image_baseline` materializes them all. The lazy path is unchanged for
+  everyone else; this is a one-time build cost per imaging VM, traded for
+  making resume history-independent.
+
+Bytecode is not serialized either. `FuncProto`s are addressed as
+`(unit, path-of-const-indices)` against compilation units registered with
+`Vm::register_image_unit`, and each unit's shape is digested so a recompile
+that produced different bytecode fails as a `Mismatch` instead of resuming
+wrong.
+
+### 7.2 Partiality is the design
+
+Some live state genuinely has no serialized form: a queued `Microtask::Job` is
+a Rust closure, a `new Promise(executor)` hands the program native
+resolve/reject functions capturing Rust state, a generator caught mid-step has
+its frame on the native stack. `snapshot_image` returns
+`ImageError::Unsupported` naming the cause rather than guessing.
+
+That is a routine outcome, not a bug. The image rides *inside* the existing
+durable artifact as an additive field:
+
+```rust
+DurableBlob { bundle, effects, journal, image: Option<RuntimeImage> }
+```
+
+`from_blob` prefers the image and falls back to journal replay whenever it is
+absent, stale, or inapplicable — reporting which path it took
+(`RestorePath`). The journal remains the source of truth throughout; the image
+is a cache over deterministic computation, and a cache miss costs latency,
+never correctness. The field is additive, so an artifact carrying an image
+still restores in a reader that has never heard of one.
+
+`CHIDORI_VM_IMAGE=0` turns image-writing off.
+
+**Where this is wired today — and where it is not.** Imaging is on by default
+in `RustReplayEngine` (the `SnapshotCapableJsEngine` seam): its `snapshot()`
+now emits an image-carrying `DurableBlob`, and `restore()` prefers the image.
+The mainline agent loop (`rust_engine.rs::run_module`) does **not** run on
+that seam — it dispatches host effects synchronously and resumes by call-log
+re-execution, exactly the situation §5 describes — so ordinary
+`chidori serve`/`chidori run` artifacts do not carry images yet. Routing the
+mainline through the suspended-engine path is the §5 conversion; the image
+format is what makes its durable half exist.
+
+### 7.3 Measured
+
+`cargo bench -p chidori-js --bench vm_image` resumes the same suspension both
+ways across run lengths. A loop that awaits N host effects and then suspends,
+with a heap that does not grow:
+
+| journaled effects | journal | image | replay resume | image resume | image resume (primed) |
+|---|---|---|---|---|---|
+| 10 | 0.6 KB | 10.2 KB | 0.35 ms | 1.2 ms | 0.10 ms |
+| 100 | 6.2 KB | 10.2 KB | 0.48 ms | 1.3 ms | 0.19 ms |
+| 400 | 25 KB | 10.2 KB | 0.75 ms | 1.6 ms | 0.50 ms |
+| 1600 | 103 KB | 10.2 KB | 1.9 ms | 2.9 ms | 1.8 ms |
+
+(Medians on one idle machine, all six columns measured together — read the
+columns against each other, not against absolute numbers from another host.)
+
+The image is **flat in history** — 10.2 KB whether the journal is 0.6 KB or
+103 KB — which is the property that matters, and the one that a duplicated
+journal or an unpruned pending-op map silently destroys (a test pins it:
+`image_size_tracks_live_state_not_history`).
+
+Cross-process restore is verified for real, not simulated:
+`examples/image_xproc.rs` records to a suspension and writes the artifact in
+one OS process, then a separate invocation restores it — asserting the image
+path was taken — and finishes the run, with private fields, a mid-`yield`
+generator, and closure state intact across the address-space boundary.
+
+These numbers include the **inline-journal envelope fix**: `DurableBlob`
+used to carry the journal as its serialized bytes, which serde_json renders
+as a JSON array of numbers and which every restore then parsed as JSON a
+second time — ~2.5 ms of a 1600-effect restore, on *both* paths (replay paid
+it too). The journal now travels as structure (`JournalBlob::Inline`), encoded
+once and decoded once; a `Legacy` arm keeps every already-written artifact
+readable (pinned by `a_legacy_blob_with_a_byte_array_journal_still_restores`),
+while binaries from before the change cannot read new artifacts — an accepted
+break for a run artifact written and read by the same deployment.
+
+Resume time shows the honest trade: the image path pays a fixed ~1 ms
+prologue before it can decode anything, so **short runs still resume faster by
+replay** on the unprimed path. `examples/image_profile.rs` breaks the
+prologue down: `Vm::new` ~0.45 ms, materializing every lazy builtin section
+~0.52 ms, the baseline BFS ~0.25 ms, the fingerprint pass ~0.17 ms. At 100
+journaled effects that prologue is ~84% of the whole restore, and none of it
+depends on the image being restored — only on the effect list.
+
+So it can be paid in advance. `ReplayRuntime::prime_image_restore(effects)`
+builds that VM ahead of time and parks it in a thread-local; the next restore
+with the same effect list takes it and skips straight to decode plus graph
+rebuild. That is the last column: **0.19 ms at 100 effects against replay's
+0.48 ms**, and a win at every length measured. Priming is opt-in because it
+does not make a restore cheaper in total — it moves the cost to whoever calls
+it. It pays for the case it exists for, a worker node that restores
+repeatedly and can prime while idle, and is a pure loss for a process that
+restores once. A primed target is single-use (`restore_image` mutates the VM
+it lands in) and keyed by effect list, with the baseline digest still standing
+behind that key; `tests/vm_image.rs` pins the differential (primed and cold
+restores agree), single-use consumption, and non-substitution across effect
+lists.
+
+The baseline walk also stopped allocating a `Vec` and cloning every `Value`
+per property, and pre-sizes its maps — worth a few percent on the unprimed
+path at longer histories, and it makes each prime cheaper. Digests are
+unchanged by all of this (verified identical before and after, which is what
+lets an image cross between engines built either way).
+
+Runtimes also no longer leak: the realm graph is Rc cycles that reference
+counting cannot reclaim, and every discarded `ReplayRuntime` used to strand
+~0.7 MB of it. `ReplayRuntime` (and an unconsumed pooled restore target) now
+disposes its VM on drop — measured residual is ~0.4 KB per restore, allocator
+noise, pinned by `dropping_a_runtime_releases_its_realm`.
+
+Build-once-clone-many realm templates — flagged in §4 and
+`interpreter-optimization.md` §11.4 — remain the way to cut the prologue
+itself rather than relocate it.
+
+### 7.4 What this unlocks
+
+Resume stops being process-local. A suspended agent can be picked up by any
+node holding its cell, at a cost set by its live state rather than its age —
+which is the prerequisite for treating storage nodes as workers
+(`docs/durable-storage.md`). It does not by itself make that fleet exist; source
+materialization on the waking node and owner-addressed routing have since
+landed (see `docs/durable-storage.md` and `docs/detached-agents.md`), leaving
+per-node config/secrets and multi-tenant warm-pool isolation as the remaining
+gaps.
+
+### 7.5 Not covered yet
+
+Extending the format is additive — add an `IntImg` arm and its decode. Today's
+refusals:
+
+- `Internal::Temporal` (opaque `temporal_rs` slot) and `IteratorHelper`.
+- Native closures created after the baseline — chiefly promise-executor
+  resolve/reject functions held across a suspension, and proxy revokers.
+- `Microtask::Job` in the queue, and generators in `Executing`.
+- Baseline objects whose *internal slot* changed kind (nothing in script does
+  this today; refused so the format stays honest if that changes).

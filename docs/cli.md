@@ -210,6 +210,7 @@ See [Durable Storage](./durable-storage.md).
 | `--bucket s3://bucket[/prefix]` | Omit for single-node, no replication. |
 | `--data-dir` | `.chidori/cellstore` |
 | `--node-id` | Generated and persisted. |
+| `--advertise URL` | Omit. The address this node is reachable at; it rides the ownership records, so a client refused with 409 is handed somewhere to go and follows it once. |
 | `--lease-secs` / `--sync-secs` / `--idle-secs` | 30 / 2 / 300 |
 
 ### `chidori deploy`

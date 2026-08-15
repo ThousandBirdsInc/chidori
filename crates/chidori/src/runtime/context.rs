@@ -1098,6 +1098,43 @@ impl RuntimeContext {
             .is_some_and(|journal| journal.by_seq.contains_key(&next))
     }
 
+    /// The records this context would replay, in journal order. Read-only —
+    /// the mainline VM-image resume (`runtime::mainline_image`, doc §5.2) uses
+    /// it to decide whether an image lines up with the journal it is being
+    /// asked to continue.
+    pub(crate) fn replay_records(&self) -> Option<Vec<CallRecord>> {
+        let inner = self.inner.lock().unwrap();
+        inner.replay_log.as_ref().map(|j| j.records.clone())
+    }
+
+    /// Adopt the replay journal as this run's own history and stop replaying.
+    ///
+    /// The mainline image resume restores the VM instead of re-executing it, so
+    /// nothing will ever call `try_replay` for the recorded prefix: the records
+    /// have to move into the active log directly (the resumed run's artifact
+    /// must still carry its full history) and the sequence counter has to
+    /// continue past them, or the next live effect would collide with a
+    /// recorded seq. They count as replayed for reporting — served from the
+    /// journal without re-executing is exactly what `replayed_calls` means.
+    ///
+    /// Marks the log checkpoint-dirty for the same reason [`Self::try_replay`]
+    /// does: these records bypass `record_call`'s append, so the next full
+    /// checkpoint is what makes them durable under this run again.
+    pub(crate) fn adopt_replay_log_as_history(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(journal) = inner.replay_log.take() else {
+            return;
+        };
+        let mut max_seq = inner.seq;
+        for record in journal.records {
+            max_seq = max_seq.max(record.seq);
+            inner.call_log.push(record);
+            inner.replay_hits += 1;
+        }
+        inner.seq = max_seq;
+        inner.call_log_dirty = true;
+    }
+
     pub fn try_replay(&self, seq: u64) -> Option<CallRecord> {
         let mut inner = self.inner.lock().unwrap();
         let mut record = {

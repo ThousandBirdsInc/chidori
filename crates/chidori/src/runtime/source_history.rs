@@ -52,6 +52,12 @@
 //! Every recording point dedupes against the store's head commit: recording
 //! an identical tree is a no-op, so resume-without-edit, replay, and repeated
 //! safepoints never grow the history.
+//!
+//! The read side is [`materialize_source`]: because the store holds every
+//! module's full text, a node that does NOT have an agent's source tree on
+//! disk can rebuild it from the head commit and run from there — which is
+//! what lets any node in a fleet wake any run it can lease
+//! (`docs/detached-agents.md`).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -475,6 +481,203 @@ pub fn read_source_files(paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
                 .with_context(|| format!("reading source file {}", path.display()))
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Materialization — reading a run's implementation back out of the store
+// ---------------------------------------------------------------------------
+
+/// Directory holding source trees materialized from the durable store:
+/// `<.chidori>/materialized/<run_id>/`. A **sibling** of the standard `runs/`
+/// base (like the object cache), so run-id enumeration over the base never
+/// sees it.
+pub const MATERIALIZED_DIR: &str = "materialized";
+
+/// The materialization root for one run under `run_base`. The run id reaches
+/// here from a durable descriptor, so it is untrusted input to a path join:
+/// only a safe single component is accepted.
+pub fn materialization_root(run_base: &Path, run_id: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        safe_component(run_id),
+        "run id `{run_id}` is not a safe path component for source materialization"
+    );
+    let base = if run_base.file_name() == Some(std::ffi::OsStr::new("runs")) {
+        run_base.parent().unwrap_or(run_base).join(MATERIALIZED_DIR)
+    } else {
+        run_base.join(MATERIALIZED_DIR)
+    };
+    Ok(base.join(run_id))
+}
+
+/// The `valid_component` rule the cell store applies to ids that become path
+/// segments: no empty/`.`/`..`, no separators, no surprises.
+fn safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
+}
+
+/// Write the run's recorded implementation under `root` and return the entry
+/// module's path there — how a node that does not have an agent's source tree
+/// on local disk wakes it anyway (`docs/detached-agents.md` §Source
+/// materialization).
+///
+/// The head commit is the whole tree (entry + every imported module). Runs
+/// recorded before source history existed fall back to the snapshot
+/// manifest's `DurableBlob.bundle`, which holds the entry text alone — enough
+/// to wake a single-module agent, not enough for one with imports.
+/// `Ok(None)` when the store holds neither.
+///
+/// Recorded paths are the *recording* node's paths (usually absolute), so the
+/// tree is rebased onto `root` at its common ancestor: relative structure —
+/// and therefore relative imports — survive the move. Nothing from the store
+/// may escape `root`; see [`rebase_tree`].
+///
+/// Idempotent and cheap on the second call: a file already present with the
+/// recorded content is left alone, so a re-wake re-reads at most the head
+/// commit.
+pub fn materialize_source(store: &dyn RunStore, root: &Path) -> Result<Option<PathBuf>> {
+    let Some(commit) = head_commit(store)? else {
+        return materialize_from_bundle(store, root);
+    };
+    let rebased = rebase_tree(commit.tree.iter().map(|entry| entry.path.as_path()))?;
+    let mut entry_path = None;
+    for (entry, relative) in commit.tree.iter().zip(&rebased) {
+        let text = load_object(store, &entry.object)?.with_context(|| {
+            format!(
+                "source object {} for {} is missing from the run store",
+                short_id(&entry.object),
+                entry.path.display()
+            )
+        })?;
+        let destination = root.join(relative);
+        materialize_file(&destination, &text)?;
+        if entry.path == commit.entry_path {
+            entry_path = Some(destination);
+        }
+    }
+    let entry_path = entry_path.with_context(|| {
+        format!(
+            "source commit {} does not carry its entry module {}",
+            short_id(&commit.id),
+            commit.entry_path.display()
+        )
+    })?;
+    Ok(Some(entry_path))
+}
+
+/// Pre-source-history fallback: the entry text persisted in the snapshot
+/// blob's `DurableBlob.bundle`. `Ok(None)` when the run has no manifest, no
+/// blob, or an empty bundle.
+fn materialize_from_bundle(store: &dyn RunStore, root: &Path) -> Result<Option<PathBuf>> {
+    use crate::runtime::snapshot::{SnapshotManifest, SNAPSHOT_MANIFEST_FILE};
+
+    let Some(bytes) = store.get_blob(SNAPSHOT_MANIFEST_FILE)? else {
+        return Ok(None);
+    };
+    let manifest: SnapshotManifest =
+        serde_json::from_slice(&bytes).context("parsing the run manifest to materialize source")?;
+    let Some(bytes) = store.get_blob(&manifest.snapshot_file)? else {
+        return Ok(None);
+    };
+    let Ok(blob) = serde_json::from_slice::<chidori_js::replay::DurableBlob>(&bytes) else {
+        return Ok(None);
+    };
+    if blob.bundle.is_empty() {
+        return Ok(None);
+    }
+    let relative = rebase_tree([manifest.entry.path.as_path()])?
+        .pop()
+        .expect("rebase_tree preserves its input length");
+    let destination = root.join(relative);
+    materialize_file(&destination, &blob.bundle)?;
+    Ok(Some(destination))
+}
+
+/// Rebase recorded module paths onto a fresh root: strip the common ancestor
+/// of the absolute ones (relative paths are already their own layout) so the
+/// tree's shape is preserved rather than its recording machine's directories.
+///
+/// Security boundary: the paths come from the durable store, which the waking
+/// node did not write. A rebased path that is not a chain of plain names —
+/// `..`, a root, a drive prefix — is refused rather than written, so a
+/// hostile or corrupt commit cannot place a file outside the materialization
+/// root. Two modules that would collide onto one path are refused for the
+/// same reason: the tree must map onto disk exactly as recorded.
+fn rebase_tree<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<Vec<PathBuf>> {
+    use std::path::Component;
+
+    let paths: Vec<&Path> = paths.into_iter().collect();
+    anyhow::ensure!(!paths.is_empty(), "recorded source tree is empty");
+    for path in &paths {
+        anyhow::ensure!(
+            !path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir)),
+            "recorded source path `{}` escapes its tree",
+            path.display()
+        );
+    }
+    let ancestor = common_ancestor(
+        paths
+            .iter()
+            .filter(|path| path.is_absolute())
+            .filter_map(|path| path.parent()),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let relative = match (&ancestor, path.is_absolute()) {
+            (Some(ancestor), true) => path.strip_prefix(ancestor).unwrap_or(path).to_path_buf(),
+            _ => path.to_path_buf(),
+        };
+        anyhow::ensure!(
+            relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+                && relative.components().next().is_some(),
+            "recorded source path `{}` does not rebase to a path inside the \
+             materialization root",
+            path.display()
+        );
+        anyhow::ensure!(
+            seen.insert(relative.clone()),
+            "two recorded modules rebase onto `{}`",
+            relative.display()
+        );
+        out.push(relative);
+    }
+    Ok(out)
+}
+
+/// The longest shared directory prefix of `paths`, `None` when empty.
+fn common_ancestor<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf> {
+    let mut paths = paths.into_iter();
+    let mut shared: Vec<std::path::Component<'a>> = paths.next()?.components().collect();
+    for path in paths {
+        let other: Vec<std::path::Component<'a>> = path.components().collect();
+        let keep = shared
+            .iter()
+            .zip(&other)
+            .take_while(|(a, b)| a == b)
+            .count();
+        shared.truncate(keep);
+    }
+    Some(shared.iter().collect())
+}
+
+/// Write one materialized module, skipping the write when the file already
+/// holds exactly this text (the re-wake path).
+fn materialize_file(destination: &Path, text: &str) -> Result<()> {
+    if std::fs::read_to_string(destination).is_ok_and(|existing| existing == text) {
+        return Ok(());
+    }
+    write_file_creating_dirs(destination, text.as_bytes())
+        .with_context(|| format!("materializing {}", destination.display()))
 }
 
 /// Per-file change classification between a commit and its parent, for
@@ -929,6 +1132,149 @@ mod tests {
             Some(PathBuf::from("/proj/.chidori/history-objects"))
         );
         assert_eq!(cross_run_cache(Path::new("/tmp/some-arbitrary-base")), None);
+    }
+
+    /// Materialization is the read side of the durable source: a node with
+    /// none of the tree on disk rebuilds it from the head commit, at the
+    /// recorded relative layout (so relative imports still resolve) and
+    /// nowhere near the recording machine's absolute directories.
+    #[test]
+    fn materializes_the_recorded_tree_at_its_relative_layout() {
+        let (dir, store) = temp_store();
+        let files = vec![
+            (
+                PathBuf::from("/elsewhere/project/services/worker.ts"),
+                "import { helper } from \"../lib/util.ts\";\n".to_string(),
+            ),
+            (
+                PathBuf::from("/elsewhere/project/lib/util.ts"),
+                "export const helper = 1;\n".to_string(),
+            ),
+        ];
+        commit_files(&store, SourceCommitEvent::RunStart, &files, 0, None).unwrap();
+
+        let root = dir.join("materialized");
+        let entry = materialize_source(&store, &root).unwrap().unwrap();
+        assert_eq!(entry, root.join("services/worker.ts"));
+        assert_eq!(std::fs::read_to_string(&entry).unwrap(), files[0].1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("lib/util.ts")).unwrap(),
+            files[1].1
+        );
+
+        // Idempotent: a second wake reuses what is already there.
+        assert_eq!(materialize_source(&store, &root).unwrap().unwrap(), entry);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Runs recorded before source history existed still carry their entry
+    /// text in the snapshot blob's `DurableBlob.bundle` — enough to wake a
+    /// single-module agent on a node that has no copy of it.
+    #[test]
+    fn materializes_from_the_snapshot_bundle_without_history() {
+        use crate::runtime::snapshot::{
+            RuntimePolicy, SnapshotAbi, SnapshotManifest, SourceFingerprint, SNAPSHOT_MANIFEST_FILE,
+        };
+
+        let (dir, store) = temp_store();
+        let source = "export async function agent() { return 1; }\n";
+        let entry_path = PathBuf::from("/gone/project/services/legacy.ts");
+        let manifest = SnapshotManifest::new(
+            "run-legacy",
+            SnapshotAbi::current("chidori-quickjs"),
+            RuntimePolicy::durable_default("run-legacy"),
+            SourceFingerprint::from_source(&entry_path, source),
+            Vec::new(),
+            None,
+            0,
+        );
+        let blob = chidori_js::replay::DurableBlob {
+            bundle: source.to_string(),
+            effects: Vec::new(),
+            journal: Default::default(),
+            image: None,
+        };
+        store
+            .put_blob(&manifest.snapshot_file, &serde_json::to_vec(&blob).unwrap())
+            .unwrap();
+        store
+            .put_blob(
+                SNAPSHOT_MANIFEST_FILE,
+                &serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+
+        let root = dir.join("materialized");
+        assert!(head_commit(&store).unwrap().is_none());
+        let entry = materialize_source(&store, &root).unwrap().unwrap();
+        assert_eq!(entry, root.join("legacy.ts"));
+        assert_eq!(std::fs::read_to_string(&entry).unwrap(), source);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The store's paths are untrusted input to a path join: nothing it names
+    /// may land outside the materialization root, and an absolute path is
+    /// rebased into the root rather than followed.
+    #[test]
+    fn materialization_refuses_paths_that_escape_the_root() {
+        let (dir, store) = temp_store();
+        let escape = std::env::temp_dir().join("chidori-materialize-escape.ts");
+        let _ = std::fs::remove_file(&escape);
+        let files = vec![
+            (PathBuf::from("agent.ts"), "ok\n".to_string()),
+            (
+                PathBuf::from("../../../../../../../..")
+                    .join(escape.strip_prefix("/").unwrap_or(&escape)),
+                "pwned\n".to_string(),
+            ),
+        ];
+        commit_files(&store, SourceCommitEvent::RunStart, &files, 0, None).unwrap();
+
+        let root = dir.join("materialized");
+        let err = materialize_source(&store, &root).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("escapes its tree"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!escape.exists(), "materialization wrote outside its root");
+
+        // Absolute paths that share no ancestor with the tree are rebased
+        // under the root, never written where they claim to live.
+        let (dir2, store2) = temp_store();
+        let files = vec![
+            (PathBuf::from("/srv/app/agent.ts"), "ok\n".to_string()),
+            (
+                PathBuf::from("/etc/hostname"),
+                "not-your-host\n".to_string(),
+            ),
+        ];
+        commit_files(&store2, SourceCommitEvent::RunStart, &files, 0, None).unwrap();
+        let root2 = dir2.join("materialized");
+        let entry = materialize_source(&store2, &root2).unwrap().unwrap();
+        assert_eq!(entry, root2.join("srv/app/agent.ts"));
+        assert_eq!(
+            std::fs::read_to_string(root2.join("etc/hostname")).unwrap(),
+            "not-your-host\n"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    /// The materialization root is a sibling of `runs/` (run enumeration must
+    /// never mistake it for a run), and an unsafe run id is refused outright.
+    #[test]
+    fn materialization_root_is_a_sibling_of_the_run_base() {
+        assert_eq!(
+            materialization_root(Path::new("/proj/.chidori/runs"), "run-1").unwrap(),
+            PathBuf::from("/proj/.chidori/materialized/run-1")
+        );
+        assert_eq!(
+            materialization_root(Path::new("/tmp/base"), "run-1").unwrap(),
+            PathBuf::from("/tmp/base/materialized/run-1")
+        );
+        assert!(materialization_root(Path::new("/proj/.chidori/runs"), "../escape").is_err());
+        assert!(materialization_root(Path::new("/proj/.chidori/runs"), "").is_err());
     }
 
     #[test]
