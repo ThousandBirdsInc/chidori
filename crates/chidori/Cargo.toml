@@ -51,7 +51,7 @@ url = "2"
 # HTTP server for serve command
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 
 # Template engine
 minijinja = { version = "2", features = ["loader"] }
@@ -81,7 +81,7 @@ subtle = "2"
 hmac = "0.12"
 base64 = "0.22"
 hex = "0.4"
-rand = "0.8"
+rand = "0.9"
 
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
 chidori-js = { path = "../chidori-js", version = "0.3.3" }
@@ -142,7 +142,7 @@ tempfile = "3"
 # In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
 # with the runtime `opentelemetry_sdk` features for test builds.
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
-criterion = "0.5"
+criterion = "0.8"
 
 # Runtime-layer perf coverage (journal replay lookup, session/run stores,
 # per-run construction costs). See `benches/runtime.rs`.

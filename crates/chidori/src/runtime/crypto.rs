@@ -51,7 +51,7 @@ pub fn hmac(algorithm: &str, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 pub fn random_bytes(n: usize) -> Vec<u8> {
     use rand::RngCore;
     let mut bytes = vec![0u8; n];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes
 }
 
