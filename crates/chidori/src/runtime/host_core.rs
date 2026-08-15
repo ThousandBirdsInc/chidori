@@ -955,7 +955,7 @@ pub fn prompt_request_digest(request: &LlmRequest) -> String {
     });
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Apply the runtime context's model override (Pi-style save point) to an

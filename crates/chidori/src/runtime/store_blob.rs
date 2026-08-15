@@ -40,7 +40,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::runtime::call_log::CallRecord;
