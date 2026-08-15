@@ -285,13 +285,17 @@ impl Baseline {
 /// each object's edges in a fixed sequence (prototype, own properties in
 /// insertion order, private elements, then internal slots).
 pub(crate) fn build_baseline(vm: &Vm) -> Baseline {
+    // Pre-sized for a realm-shaped walk (~900 objects for the base realm with
+    // every lazy section materialized). Only saves rehashing; the ids still
+    // come from insertion order, so capacity cannot affect the digest.
+    const OBJ_HINT: usize = 1024;
     let mut b = Baseline {
-        obj_ids: HashMap::new(),
-        objs: Vec::new(),
+        obj_ids: HashMap::with_capacity(OBJ_HINT),
+        objs: Vec::with_capacity(OBJ_HINT),
         cell_ids: HashMap::new(),
         cells: Vec::new(),
-        sym_ids: HashMap::new(),
-        syms: Vec::new(),
+        sym_ids: HashMap::with_capacity(64),
+        syms: Vec::with_capacity(64),
         prints: Vec::new(),
         digest: 0,
     };
@@ -322,15 +326,11 @@ pub(crate) fn build_baseline(vm: &Vm) -> Baseline {
             if let PropertyKey::Sym(s) = key {
                 intern_symbol(&mut b, s);
             }
-            for v in prop_values(prop) {
-                walk_value(&v, &mut b, &mut queue);
-            }
+            for_each_prop_value(prop, |v| walk_value(v, &mut b, &mut queue));
         }
         if let Some(privs) = &data.privates {
             for el in privs.values() {
-                for v in private_values(el) {
-                    walk_value(&v, &mut b, &mut queue);
-                }
+                for_each_private_value(el, |v| walk_value(v, &mut b, &mut queue));
             }
         }
         walk_internal(&data.internal, &mut b, &mut queue);
@@ -412,34 +412,36 @@ fn intern_symbol(b: &mut Baseline, s: &JsSymbol) -> bool {
     true
 }
 
-fn prop_values(p: &Property) -> Vec<Value> {
+/// Visit a property's values in a FIXED order: data value, else getter then
+/// setter. The order is load-bearing — it decides the order the walk discovers
+/// objects in, hence their baseline ids, hence the digest — so it must not
+/// change even though nothing here reads it back.
+fn for_each_prop_value(p: &Property, mut f: impl FnMut(&Value)) {
     match &p.kind {
-        PropertyKind::Data { value, .. } => vec![value.clone()],
+        PropertyKind::Data { value, .. } => f(value),
         PropertyKind::Accessor { get, set } => {
-            let mut v = Vec::new();
             if let Some(g) = get {
-                v.push(g.clone());
+                f(g);
             }
             if let Some(s) = set {
-                v.push(s.clone());
+                f(s);
             }
-            v
         }
     }
 }
 
-fn private_values(el: &PrivateElement) -> Vec<Value> {
+/// As [`for_each_prop_value`], for a private element. Same fixed order, same
+/// reason.
+fn for_each_private_value(el: &PrivateElement, mut f: impl FnMut(&Value)) {
     match el {
-        PrivateElement::Field(v) | PrivateElement::Method(v) => vec![v.clone()],
+        PrivateElement::Field(v) | PrivateElement::Method(v) => f(v),
         PrivateElement::Accessor { get, set } => {
-            let mut out = Vec::new();
             if let Some(g) = get {
-                out.push(g.clone());
+                f(g);
             }
             if let Some(s) = set {
-                out.push(s.clone());
+                f(s);
             }
-            out
         }
     }
 }

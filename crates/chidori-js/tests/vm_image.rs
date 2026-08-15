@@ -580,3 +580,134 @@ fn an_unusable_image_falls_back_instead_of_failing() {
         .unwrap();
     assert_eq!(reported, vec![json!({"total": 42, "seen": ["a", "b"]})]);
 }
+
+// ---------------------------------------------------------------------------
+// Pre-built restore targets (`prime_image_restore`).
+//
+// Priming moves the restore prologue off the restore itself; it must not move
+// anything else. A primed restore has to be indistinguishable from a cold one,
+// and a primed target must never be handed to a restore it does not fit.
+// ---------------------------------------------------------------------------
+
+/// Resume a suspension from its image and run it to completion, returning the
+/// reported values and the resulting journal — the two observable outputs the
+/// differential checks compare.
+fn finish_from_image(
+    image: &chidori_js::replay::RuntimeImage,
+    journal: &[u8],
+    effects: &[&str],
+    op_id: u64,
+) -> (Vec<Json>, Vec<u8>) {
+    let mut rt = ReplayRuntime::from_image(image, ASYNC_BUNDLE, journal, effects).unwrap();
+    let mut reported = Vec::new();
+    let mut handler = |name: &str, args: &Json| -> Option<Result<Json, String>> {
+        match name {
+            "fetchValue" => Some(Ok(json!(32))),
+            "report" => {
+                reported.push(args[0].clone());
+                Some(Ok(json!(null)))
+            }
+            _ => Some(Ok(json!(null))),
+        }
+    };
+    rt.provide_and_drive(op_id, Ok(json!(10)), &mut handler as Handler)
+        .unwrap();
+    let j = rt.journal_bytes();
+    (reported, j)
+}
+
+#[test]
+fn a_primed_restore_is_identical_to_a_cold_one() {
+    let effects = &["fetchValue", "report"];
+    let (rt, op_id, journal) = record_until_suspended(ASYNC_BUNDLE, effects);
+    let image = rt.to_image().unwrap();
+    drop(rt);
+
+    ReplayRuntime::clear_image_restore_pool();
+    let cold = finish_from_image(&image, &journal, effects, op_id);
+
+    ReplayRuntime::prime_image_restore(effects);
+    let primed = finish_from_image(&image, &journal, effects, op_id);
+
+    assert_eq!(cold.0, primed.0, "reported values differ");
+    assert_eq!(
+        String::from_utf8_lossy(&cold.1),
+        String::from_utf8_lossy(&primed.1),
+        "journals differ"
+    );
+}
+
+#[test]
+fn a_primed_target_is_consumed_exactly_once() {
+    // `restore_image` mutates the VM it lands in, so the pooled target must be
+    // removed when taken. The restore after a single prime has to fall back to
+    // building its own — and still produce the same answer.
+    let effects = &["fetchValue", "report"];
+    let (rt, op_id, journal) = record_until_suspended(ASYNC_BUNDLE, effects);
+    let image = rt.to_image().unwrap();
+    drop(rt);
+
+    ReplayRuntime::clear_image_restore_pool();
+    ReplayRuntime::prime_image_restore(effects);
+
+    let first = finish_from_image(&image, &journal, effects, op_id);
+    let second = finish_from_image(&image, &journal, effects, op_id);
+    let third = finish_from_image(&image, &journal, effects, op_id);
+
+    assert_eq!(first.0, second.0);
+    assert_eq!(second.0, third.0);
+    assert_eq!(
+        String::from_utf8_lossy(&first.1),
+        String::from_utf8_lossy(&third.1),
+        "a reused pool slot changed the journal"
+    );
+}
+
+#[test]
+fn a_primed_target_is_never_used_for_a_different_effect_set() {
+    // Two effect lists build two different baselines. Priming one must not
+    // supply the other — the pool is keyed by the effect list, and the baseline
+    // digest stands behind it if that key were ever wrong.
+    let recorded = &["fetchValue", "report"];
+    let (rt, op_id, journal) = record_until_suspended(ASYNC_BUNDLE, recorded);
+    let image = rt.to_image().unwrap();
+    drop(rt);
+
+    ReplayRuntime::clear_image_restore_pool();
+    // Prime a *different* host surface than the image was taken against.
+    ReplayRuntime::prime_image_restore(&["fetchValue", "report", "extraEffect"]);
+
+    // The matching restore still succeeds: it must not pick up the primed
+    // target built for the other surface.
+    let ok = finish_from_image(&image, &journal, recorded, op_id);
+    assert_eq!(ok.0.len(), 1, "matching restore should have reported once");
+
+    // And restoring against the mismatched surface is still refused by the
+    // digest, primed target present or not.
+    let err = match ReplayRuntime::from_image(
+        &image,
+        ASYNC_BUNDLE,
+        &journal,
+        &["fetchValue", "report", "extraEffect"],
+    ) {
+        Err(e) => e,
+        Ok(_) => panic!("a different host surface must not silently restore"),
+    };
+    assert!(err.contains("baseline"), "got: {err}");
+}
+
+#[test]
+fn priming_is_idempotent_and_clearable() {
+    let effects = &["fetchValue", "report"];
+    ReplayRuntime::clear_image_restore_pool();
+    ReplayRuntime::prime_image_restore(effects);
+    ReplayRuntime::prime_image_restore(effects);
+    ReplayRuntime::clear_image_restore_pool();
+
+    // Clearing leaves the restore path working, just cold again.
+    let (rt, op_id, journal) = record_until_suspended(ASYNC_BUNDLE, effects);
+    let image = rt.to_image().unwrap();
+    drop(rt);
+    let out = finish_from_image(&image, &journal, effects, op_id);
+    assert_eq!(out.0.len(), 1);
+}

@@ -368,12 +368,15 @@ format is what makes its durable half exist.
 ways across run lengths. A loop that awaits N host effects and then suspends,
 with a heap that does not grow:
 
-| journaled effects | journal | image | replay resume | image resume |
-|---|---|---|---|---|
-| 10 | 0.6 KB | 10.2 KB | 0.5 ms | 5.1 ms |
-| 100 | 6.2 KB | 10.2 KB | 2.5 ms | 5.4 ms |
-| 400 | 25 KB | 10.2 KB | 3.5 ms | 6.4 ms |
-| 1600 | 103 KB | 10.2 KB | 6.9 ms | 5.6 ms |
+| journaled effects | journal | image | replay resume | image resume | image resume (primed) |
+|---|---|---|---|---|---|
+| 10 | 0.6 KB | 10.2 KB | 1.7 ms | 4.0 ms | 0.22 ms |
+| 100 | 6.2 KB | 10.2 KB | 1.7 ms | 3.8 ms | 0.45 ms |
+| 400 | 25 KB | 10.2 KB | 2.2 ms | 4.3 ms | 1.1 ms |
+| 1600 | 103 KB | 10.2 KB | 4.8 ms | 6.5 ms | 3.3 ms |
+
+(Medians on one idle machine, all six columns measured together — read the
+columns against each other, not against absolute numbers from another host.)
 
 The image is **flat in history** — 10.2 KB whether the journal is 0.6 KB or
 103 KB — which is the property that matters, and the one that a duplicated
@@ -386,13 +389,38 @@ one OS process, then a separate invocation restores it — asserting the image
 path was taken — and finishes the run, with private fields, a mid-`yield`
 generator, and closure state intact across the address-space boundary.
 
-Resume time shows the honest trade: the image path pays a fixed ~1.4 ms to
-rebuild the eager realm and walk the baseline, so **short runs still resume
-faster by replay**, and the crossover here is around a thousand journaled
-effects. Replay keeps growing past it; the image does not. The fixed term is
-the next lever, and it is the same one already flagged in §4 and
-`interpreter-optimization.md` §11.4: build-once-clone-many realm templates
-would cut most of it.
+Resume time shows the honest trade: the image path pays a fixed ~1.4 ms
+prologue before it can decode anything, so **short runs still resume faster by
+replay** — on this machine the unprimed image path does not cross replay
+anywhere in the measured range. `examples/image_profile.rs` breaks the
+prologue down: `Vm::new` ~0.45 ms, materializing every lazy builtin section
+~0.52 ms, the baseline BFS ~0.25 ms, the fingerprint pass ~0.17 ms. At 100
+journaled effects that prologue is ~84% of the whole restore, and none of it
+depends on the image being restored — only on the effect list.
+
+So it can be paid in advance. `ReplayRuntime::prime_image_restore(effects)`
+builds that VM ahead of time and parks it in a thread-local; the next restore
+with the same effect list takes it and skips straight to decode plus graph
+rebuild. That is the last column: **0.45 ms at 100 effects against replay's
+1.7 ms**, and a win at every length measured. Priming is opt-in because it
+does not make a restore cheaper in total — it moves the cost to whoever calls
+it. It pays for the case it exists for, a worker node that restores
+repeatedly and can prime while idle, and is a pure loss for a process that
+restores once. A primed target is single-use (`restore_image` mutates the VM
+it lands in) and keyed by effect list, with the baseline digest still standing
+behind that key; `tests/vm_image.rs` pins the differential (primed and cold
+restores agree), single-use consumption, and non-substitution across effect
+lists.
+
+The baseline walk also stopped allocating a `Vec` and cloning every `Value`
+per property, and pre-sizes its maps — worth a few percent on the unprimed
+path at longer histories, and it makes each prime cheaper. Digests are
+unchanged by all of this (verified identical before and after, which is what
+lets an image cross between engines built either way).
+
+Build-once-clone-many realm templates — flagged in §4 and
+`interpreter-optimization.md` §11.4 — remain the way to cut the prologue
+itself rather than relocate it.
 
 ### 7.4 What this unlocks
 
