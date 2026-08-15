@@ -104,9 +104,12 @@ serde_yaml = "0.9"
 # dependency graph, so dev builds can drop it with `--no-default-features`
 # (runtime/otel.rs is swapped for a no-op stub; everything else compiles
 # unchanged).
-opentelemetry = { version = "0.27", optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
+opentelemetry = { version = "0.32", optional = true }
+# No `rt-tokio`: since 0.28 the batch span processor drives itself from a
+# dedicated background thread, so the async-runtime variants (now gated behind
+# `experimental_async_runtime`) are no longer on our path.
+opentelemetry_sdk = { version = "0.32", optional = true }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"], optional = true }
 
 # Checkpoint export: `chidori checkpoint export <run_id>` archives a run dir
 # as a .tar.gz so a golden eval case's fixture can be committed to git or
@@ -141,7 +144,7 @@ landlock = "0.4"
 tempfile = "3"
 # In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
 # with the runtime `opentelemetry_sdk` features for test builds.
-opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 criterion = "0.8"
 
 # Runtime-layer perf coverage (journal replay lookup, session/run stores,
