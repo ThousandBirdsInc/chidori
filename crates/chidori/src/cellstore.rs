@@ -50,6 +50,15 @@
 //! 409 naming the owner rather than proxying, and standing down is a complete
 //! response.
 //!
+//! What the 409 gained is an *address*: with `--advertise <url>` the node
+//! stamps its own URL into every ownership record it writes, so the current
+//! owner's address is durable next to the epoch, and the refusal carries
+//! `owner_url` beside `owner`. The client relay re-issues that one request
+//! against the owner — exactly one hop, never a chain
+//! (`crate::runtime::store`) — which is redirection, not proxying: no request
+//! is ever forwarded by a node, and lease arbitration is exempt (a 409 about
+//! a run's lease IS the fencing verdict).
+//!
 //! Durability model: local disk is the fast primary — a node restart loses
 //! nothing (the owner reclaims its own cells and their local databases).
 //! The bucket is the copy that survives losing the machine; its freshness is
@@ -93,6 +102,13 @@ pub struct CellStoreConfig {
     /// Hibernate cells idle longer than this: final replication, published
     /// unowned (epoch kept), database closed, memory dropped.
     pub idle_hibernate: std::time::Duration,
+    /// The URL other parties can reach THIS node at (`--advertise`), stamped
+    /// into every ownership record this node writes. Ownership names a node
+    /// id, which a client cannot dial; the advertised URL is what turns
+    /// "owned elsewhere" into an address (see [`error_response`]). `None`
+    /// keeps the pre-routing behavior: the 409 names the owner and the client
+    /// stands down.
+    pub advertise: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +129,13 @@ struct CellMeta {
     /// here with an already-expired lease — "unowned without resetting the
     /// epoch"; claimability is `lease_expires_at`, not this field.
     owner: String,
+    /// Where the owner can be reached (`--advertise`), so a client refused
+    /// with 409 gets an address and not just a name. Absent on records
+    /// written by a node with no advertised URL — and on every record written
+    /// before this field existed, which is why it defaults rather than
+    /// failing the parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    advertise: Option<String>,
     lease_expires_at: DateTime<Utc>,
     /// Bucket key of the newest published snapshot of the cell's database.
     /// Carried forward on takeover until the new owner publishes its own.
@@ -132,6 +155,8 @@ impl CellMeta {
 pub enum CellError {
     OwnedElsewhere {
         owner: String,
+        /// The owner's advertised URL, when its ownership record carries one.
+        owner_url: Option<String>,
         lease_expires_at: DateTime<Utc>,
     },
     Other(anyhow::Error),
@@ -142,10 +167,15 @@ impl std::fmt::Display for CellError {
         match self {
             CellError::OwnedElsewhere {
                 owner,
+                owner_url,
                 lease_expires_at,
             } => write!(
                 f,
-                "cell is owned by node `{owner}` (lease expires {lease_expires_at})"
+                "cell is owned by node `{owner}`{} (lease expires {lease_expires_at})",
+                owner_url
+                    .as_ref()
+                    .map(|url| format!(" at {url}"))
+                    .unwrap_or_default()
             ),
             CellError::Other(err) => write!(f, "{err:#}"),
         }
@@ -591,6 +621,7 @@ impl Node {
                 Some(m) => {
                     return Err(CellError::OwnedElsewhere {
                         owner: m.owner.clone(),
+                        owner_url: m.advertise.clone(),
                         lease_expires_at: m.lease_expires_at,
                     })
                 }
@@ -605,6 +636,7 @@ impl Node {
                 cell: id.to_string(),
                 epoch: target_epoch,
                 owner: self.config.node_id.clone(),
+                advertise: self.config.advertise.clone(),
                 lease_expires_at: now + self.config.lease_ttl,
                 snapshot: prior.as_ref().and_then(|m| m.snapshot.clone()),
                 updated_at: now,
@@ -694,6 +726,7 @@ impl Node {
             cell: cell.id.clone(),
             epoch: cell.epoch,
             owner: self.config.node_id.clone(),
+            advertise: self.config.advertise.clone(),
             lease_expires_at: now + self.config.lease_ttl,
             snapshot: cell.snapshot_key.clone(),
             updated_at: now,
@@ -708,6 +741,7 @@ impl Node {
             if m.epoch > cell.epoch {
                 return Err(CellError::OwnedElsewhere {
                     owner: m.owner,
+                    owner_url: m.advertise,
                     lease_expires_at: m.lease_expires_at,
                 });
             }
@@ -774,6 +808,7 @@ impl Node {
             cell: cell.id.clone(),
             epoch: cell.epoch,
             owner: self.config.node_id.clone(),
+            advertise: self.config.advertise.clone(),
             lease_expires_at: now,
             snapshot: cell.snapshot_key.clone(),
             updated_at: now,
@@ -1133,16 +1168,22 @@ fn error_response(err: CellError) -> Response {
     match err {
         CellError::OwnedElsewhere {
             owner,
+            owner_url,
             lease_expires_at,
-        } => (
-            StatusCode::CONFLICT,
-            axum::Json(serde_json::json!({
+        } => {
+            // `owner_url` is present only when the owner advertises one; a
+            // client that does not understand the field still gets the
+            // pre-routing answer (stand down, here is who owns it).
+            let mut body = serde_json::json!({
                 "error": "cell owned elsewhere",
                 "owner": owner,
                 "lease_expires_at": lease_expires_at,
-            })),
-        )
-            .into_response(),
+            });
+            if let Some(url) = owner_url {
+                body["owner_url"] = serde_json::Value::String(url);
+            }
+            (StatusCode::CONFLICT, axum::Json(body)).into_response()
+        }
         CellError::Other(err) => {
             tracing::warn!(error = %format!("{err:#}"), "cell store request failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response()
@@ -1391,11 +1432,13 @@ async fn http_registry_put(
 
 /// `chidori cell-store`: build the node from CLI flags + environment, run the
 /// sync loop and the HTTP server, release every cell on shutdown.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_cell_store(
     listen: &str,
     bucket: Option<&str>,
     data_dir: &Path,
     node_id: Option<String>,
+    advertise: Option<String>,
     lease_secs: u64,
     sync_secs: u64,
     idle_secs: u64,
@@ -1424,12 +1467,19 @@ pub fn cmd_cell_store(
         valid_component(&node_id),
         "invalid node id `{node_id}` (allowed: ASCII letters, digits, `-`, `_`, `.`, `@`)"
     );
+    if let Some(url) = &advertise {
+        anyhow::ensure!(
+            url.starts_with("http://") || url.starts_with("https://"),
+            "--advertise must be an http(s) URL other nodes can reach this one at, got `{url}`"
+        );
+    }
     let node = Node::new(CellStoreConfig {
         data_dir: data_dir.to_path_buf(),
         node_id,
         bucket,
         lease_ttl: chrono::Duration::seconds(lease_secs.max(1) as i64),
         idle_hibernate: std::time::Duration::from_secs(idle_secs.max(1)),
+        advertise: advertise.map(|url| url.trim_end_matches('/').to_string()),
     })?;
 
     match &node.config.bucket {
@@ -1442,6 +1492,12 @@ pub fn cmd_cell_store(
             "Cell store node `{}`: single-node mode (no bucket — cells are local-only)",
             node.node_id()
         ),
+    }
+    if let Some(url) = &node.config.advertise {
+        eprintln!(
+            "Advertising this node as {url}: a cell owned here refuses other nodes' \
+             clients with an address to follow"
+        );
     }
     eprintln!("Point Chidori at it:  export CHIDORI_RUN_STORE=\"http://{listen}\"");
 
@@ -1621,6 +1677,30 @@ mod tests {
         spawn_axum(app)
     }
 
+    /// Reserve a loopback port and its URL up front, so a node can advertise
+    /// its own address before its server exists — the URL is stamped into
+    /// ownership records the moment the node acquires a cell.
+    fn reserved_listener() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
+    /// Serve `app` on an already-bound listener (see [`reserved_listener`]).
+    fn serve_on(listener: std::net::TcpListener, app: axum::Router) {
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+    }
+
     /// Serve `app` on an ephemeral loopback port from a dedicated thread with
     /// its own runtime (callers use blocking clients), returning the base URL.
     fn spawn_axum(app: axum::Router) -> String {
@@ -1646,12 +1726,26 @@ mod tests {
         lease_ms: i64,
         idle: std::time::Duration,
     ) -> Arc<Node> {
+        test_node_advertising(dir, node_id, bucket, lease_ms, idle, None)
+    }
+
+    /// A node that stamps `advertise` into every ownership record it writes —
+    /// the address a 409 hands back to a client.
+    fn test_node_advertising(
+        dir: &Path,
+        node_id: &str,
+        bucket: Option<Arc<S3BlobStore>>,
+        lease_ms: i64,
+        idle: std::time::Duration,
+        advertise: Option<String>,
+    ) -> Arc<Node> {
         Node::new(CellStoreConfig {
             data_dir: dir.to_path_buf(),
             node_id: node_id.to_string(),
             bucket,
             lease_ttl: chrono::Duration::milliseconds(lease_ms),
             idle_hibernate: idle,
+            advertise,
         })
         .unwrap()
     }
@@ -2152,6 +2246,189 @@ mod tests {
                 .expect("fencing is a standdown, not an error")
                 .expect_err("a fenced node must not believe it holds the lease");
         assert_eq!(holder.owner, "node-b");
+    }
+
+    /// Ownership names a node id, which a client cannot dial. With
+    /// `--advertise` the record carries the owner's address too: takeover
+    /// swings it to the new owner, hibernation keeps the last owner's beside
+    /// the epoch, and records written before the field existed still parse.
+    #[test]
+    fn ownership_meta_carries_the_advertised_url() {
+        let endpoint = spawn_mock_bucket();
+        let bucket = S3BlobStore::for_tests(&endpoint, "cells", "");
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let node_a = test_node_advertising(
+            dir_a.path(),
+            "node-a",
+            Some(bucket.clone()),
+            400,
+            LONG_IDLE,
+            Some("http://a.internal:9700".to_string()),
+        );
+        let node_b = test_node_advertising(
+            dir_b.path(),
+            "node-b",
+            Some(bucket.clone()),
+            60_000,
+            LONG_IDLE,
+            Some("http://b.internal:9700".to_string()),
+        );
+
+        append(&node_a, "run-adv", 1, "prompt").unwrap();
+        node_a.tick(); // replicate so B can restore after taking over
+        let meta = node_a.latest_meta(&bucket, "run-adv").unwrap().unwrap();
+        assert_eq!(meta.advertise.as_deref(), Some("http://a.internal:9700"));
+
+        // A live foreign owner is refused *with its address*.
+        match append(&node_b, "run-adv", 9, "intruder") {
+            Err(CellError::OwnedElsewhere {
+                owner, owner_url, ..
+            }) => {
+                assert_eq!(owner, "node-a");
+                assert_eq!(owner_url.as_deref(), Some("http://a.internal:9700"));
+            }
+            other => panic!("expected OwnedElsewhere, got {other:?}"),
+        }
+
+        // Takeover swings the address to the new owner, and the fenced
+        // ex-owner learns where the cell went.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        append(&node_b, "run-adv", 2, "signal").unwrap();
+        let meta = node_b.latest_meta(&bucket, "run-adv").unwrap().unwrap();
+        assert_eq!(meta.owner, "node-b");
+        assert_eq!(meta.advertise.as_deref(), Some("http://b.internal:9700"));
+        match append(&node_a, "run-adv", 3, "stale") {
+            Err(CellError::OwnedElsewhere { owner_url, .. }) => {
+                assert_eq!(owner_url.as_deref(), Some("http://b.internal:9700"));
+            }
+            other => panic!("expected OwnedElsewhere, got {other:?}"),
+        }
+
+        // Hibernation publishes the cell unowned but keeps the address of the
+        // node that last held it.
+        let dir_h = tempfile::tempdir().unwrap();
+        let node_h = test_node_advertising(
+            dir_h.path(),
+            "node-h",
+            Some(bucket.clone()),
+            60_000,
+            std::time::Duration::ZERO,
+            Some("http://h.internal:9700".to_string()),
+        );
+        append(&node_h, "run-hib", 1, "prompt").unwrap();
+        node_h.tick();
+        let meta = node_h.latest_meta(&bucket, "run-hib").unwrap().unwrap();
+        assert!(meta.claimable(Utc::now()));
+        assert_eq!(meta.advertise.as_deref(), Some("http://h.internal:9700"));
+
+        // Forward compatibility: a record written before the field existed
+        // parses as "no advertised address" rather than failing the read.
+        let legacy = serde_json::json!({
+            "cell": "run-legacy",
+            "epoch": 1,
+            "owner": "node-old",
+            "lease_expires_at": Utc::now() + chrono::Duration::seconds(60),
+            "snapshot": null,
+            "updated_at": Utc::now(),
+        });
+        bucket
+            .put_object(
+                &node_a.meta_key(&bucket, "run-legacy", 1),
+                &serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+        let meta = node_a.latest_meta(&bucket, "run-legacy").unwrap().unwrap();
+        assert_eq!(meta.owner, "node-old");
+        assert!(meta.advertise.is_none());
+        match append(&node_b, "run-legacy", 1, "prompt") {
+            Err(CellError::OwnedElsewhere { owner_url, .. }) => assert!(owner_url.is_none()),
+            other => panic!("expected OwnedElsewhere, got {other:?}"),
+        }
+    }
+
+    /// Inbound routing, minimal form: a fenced node answers 409 with the
+    /// owner's address, and the client follows it — one hop, same path, same
+    /// credentials — instead of failing. Lease traffic is exempt: a node that
+    /// lost its cell must still stand down rather than arbitrate ownership
+    /// through the node that took it.
+    #[test]
+    fn a_fenced_node_hands_the_client_to_the_owner() {
+        let endpoint = spawn_mock_bucket();
+        let bucket = S3BlobStore::for_tests(&endpoint, "cells", "");
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let (listener_a, url_a) = reserved_listener();
+        let (listener_b, url_b) = reserved_listener();
+        let node_a = test_node_advertising(
+            dir_a.path(),
+            "node-a",
+            Some(bucket.clone()),
+            400,
+            LONG_IDLE,
+            Some(url_a.clone()),
+        );
+        let node_b = test_node_advertising(
+            dir_b.path(),
+            "node-b",
+            Some(bucket.clone()),
+            60_000,
+            LONG_IDLE,
+            Some(url_b.clone()),
+        );
+        serve_on(
+            listener_a,
+            router(AppState {
+                node: node_a.clone(),
+                token: None,
+            }),
+        );
+        serve_on(
+            listener_b,
+            router(AppState {
+                node: node_b.clone(),
+                token: None,
+            }),
+        );
+
+        append(&node_a, "run-follow", 1, "prompt").unwrap();
+        node_a
+            .with_cell("run-follow", |c| c.blob_put("manifest.json", b"{\"v\":1}"))
+            .unwrap();
+        node_a.tick(); // replicate so B restores the cell on takeover
+
+        // A's lease lapses; B takes the cell over.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert_eq!(record_seqs(&node_b, "run-follow"), vec![1]);
+
+        // The client only knows A, and still gets its data.
+        let store = HttpRunStore::new(HttpRelay::new(url_a.clone(), None), "run-follow");
+        assert_eq!(
+            store.get_blob("manifest.json").unwrap().unwrap(),
+            b"{\"v\":1}"
+        );
+        assert_eq!(store.load_call_log().unwrap().unwrap().len(), 1);
+        store.put_blob("followed.json", b"{}").unwrap();
+        store.flush().unwrap();
+        assert_eq!(
+            node_b
+                .with_cell("run-follow", |c| c.blob_get("followed.json"))
+                .unwrap()
+                .unwrap(),
+            b"{}"
+        );
+
+        // Lease arbitration is NOT re-aimed: the fenced node stands down.
+        let holder =
+            crate::runtime::store::acquire_lease(&store, "proc-a", chrono::Duration::seconds(60))
+                .expect("fencing is a standdown, not an error")
+                .expect_err("a fenced node must not believe it holds the lease");
+        assert_eq!(holder.owner, "node-b");
+        assert!(node_b
+            .with_cell("run-follow", |c| c
+                .blob_get(crate::runtime::store::LEASE_FILE))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
