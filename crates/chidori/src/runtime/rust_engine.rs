@@ -407,6 +407,14 @@ pub(crate) trait RunHost {
     fn trace_sink(&self, _js: &str) -> Option<Box<dyn chidori_js::TraceObserver>> {
         None
     }
+
+    /// The durable context mainline pause imaging writes into and reads back
+    /// from (§5.2). `None` — the default — keeps the classic unwinding pause:
+    /// the recorder backend has no context at all, and the isolate worker's VM
+    /// lives in another process, where an image has no artifact to ride in.
+    fn image_ctx(&self) -> Option<RuntimeContext> {
+        None
+    }
 }
 
 /// Route a host op against an in-process [`HostBindingBackend`]. Shared by
@@ -489,6 +497,10 @@ impl RunHost for InProcessHost {
         }
         let run = self.backend.runtime_ctx()?.otel_run()?;
         Some(Box::new(run.js_trace_observer(js, JS_TRACE_MAX_DEPTH)))
+    }
+
+    fn image_ctx(&self) -> Option<RuntimeContext> {
+        self.backend.runtime_ctx().cloned()
     }
 }
 
@@ -653,6 +665,62 @@ pub(crate) fn run_module(
     input: &Value,
     host: Rc<dyn RunHost>,
 ) -> Result<Value> {
+    run_module_inner(path, source, fallback_export, input, host, true)
+}
+
+/// How far [`run_module_inner`]'s driven engine got.
+enum ModuleOutcome {
+    /// The entry settled — the classic result (`Err` is a JS exception string,
+    /// pause sentinels included).
+    Done(std::result::Result<Value, String>),
+    /// The run parked at a quiescent point under mainline pause imaging
+    /// (§5.2). The payload is the pause text the classic unwind would have
+    /// raised, so every caller upstream sees the identical error.
+    Paused(String),
+    /// A stored VM image did not apply to the engine built for it. The caller
+    /// discards this engine and re-runs with re-execution; the journal is
+    /// untouched, so nothing has been consumed.
+    ImageRejected(String),
+}
+
+thread_local! {
+    /// Only the outermost module of a run images. Sub-agents, tool files and
+    /// nested `run_module` calls drive their own engines against the SAME
+    /// durable context — letting a nested engine write the run's image would
+    /// describe a program that is not the one the run resumes.
+    static IMAGING_ENGAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Claims mainline imaging for the outermost `run_module` on this thread.
+struct ImagingClaim;
+
+impl ImagingClaim {
+    fn take() -> Option<ImagingClaim> {
+        IMAGING_ENGAGED.with(|engaged| {
+            if engaged.get() {
+                None
+            } else {
+                engaged.set(true);
+                Some(ImagingClaim)
+            }
+        })
+    }
+}
+
+impl Drop for ImagingClaim {
+    fn drop(&mut self) {
+        IMAGING_ENGAGED.with(|engaged| engaged.set(false));
+    }
+}
+
+fn run_module_inner(
+    path: &Path,
+    source: &str,
+    fallback_export: &str,
+    input: &Value,
+    host: Rc<dyn RunHost>,
+    allow_image_restore: bool,
+) -> Result<Value> {
     // `Node` accepts relative `./foo` imports *and* allowlisted `node:` builtins
     // (the special-cased `chidori` SDK import is stripped by transpilation). This
     // is the durable default so `node:fs`/`crypto`/`timers` reach the
@@ -661,6 +729,19 @@ pub(crate) fn run_module(
         import_policy: TypeScriptImportPolicy::Node,
     };
     let js = transpile_module(path, source, &opts)?;
+
+    // Mainline pause imaging (§5.2), off unless `CHIDORI_MAINLINE_IMAGE` says
+    // otherwise. `_claim` keeps it to the outermost module of the run; the
+    // context is what the image is written into and read back from, so a host
+    // without one (the recorder backend, the isolate worker) keeps the classic
+    // unwinding pause.
+    let (image_ctx, _claim) = match crate::runtime::mainline_image::enabled()
+        .then(ImagingClaim::take)
+        .flatten()
+    {
+        Some(claim) => (host.image_ctx(), Some(claim)),
+        None => (None, None),
+    };
 
     let mut engine = chidori_js::Engine::new();
     if let Some(sink) = host.trace_sink(&js) {
@@ -754,6 +835,22 @@ pub(crate) fn run_module(
         .eval_cached(crate::runtime::typescript::helpers::INPUT_SCHEMA_SCRIPT)
         .map_err(|e| anyhow::anyhow!("installing input-schema validation: {e}"))?;
 
+    // §5.2: from here on the engine is at the state both sides of an image can
+    // reproduce for free — fresh realm plus the preludes, effect natives, SDK
+    // sugar, fetch polyfill, DOM and entrypoint registrar installed above, in
+    // that order. Everything after this is the program, which is what the
+    // image carries. The baseline digest is what catches a violation of "same
+    // construction, same scripts, same order", and a mismatch declines the
+    // image rather than resuming wrong.
+    if image_ctx.is_some() {
+        // Pause-capable effects suspend instead of throwing, so a pause leaves
+        // a parked host promise and a quiescent VM.
+        engine.vm.effect_suspend = Some(Rc::new(
+            crate::runtime::mainline_image::is_suspendable_pause,
+        ));
+        engine.vm.mark_image_baseline();
+    }
+
     let entry_key = path.to_string_lossy().to_string();
     // Resolve each `(specifier, importer)` to a sibling `.ts`/`.js` file (or, for
     // `node:` specifiers, the synthetic builtin shim) and hand the linker its
@@ -802,28 +899,146 @@ pub(crate) fn run_module(
     // Install per-run resource limits (opcode budget + memory/deadline watchdog)
     // before any agent code runs, and isolate the host from an engine panic: a
     // bug in the interpreter must surface as an error, not unwind into the server.
-    let _guard = ExecutionGuard::install(&mut engine.vm);
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        engine.run_entrypoint_graph(&entry_key, &js, input, &slot, fallback_export, &mut load)
+    let guard = ExecutionGuard::install(&mut engine.vm);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &image_ctx {
+        None => ModuleOutcome::Done(engine.run_entrypoint_graph(
+            &entry_key,
+            &js,
+            input,
+            &slot,
+            fallback_export,
+            &mut load,
+        )),
+        Some(ctx) => drive_imaged(
+            &mut engine,
+            ctx,
+            &entry_key,
+            &js,
+            input,
+            &slot,
+            fallback_export,
+            &mut load,
+            allow_image_restore,
+        ),
     }));
+    // The image has to be taken while the engine is still alive, and only at
+    // the quiescent point a suspension leaves behind.
+    if let (Ok(ModuleOutcome::Paused(_)), Some(ctx)) = (&outcome, &image_ctx) {
+        crate::runtime::mainline_image::capture(ctx, &engine, &entry_key, &js);
+    }
     // Break the heap's Rc cycles before the engine drops: the result is already
     // a host `serde_json::Value`, and without this every agent run leaks its
     // realm + agent object graph in a long-lived server process.
     engine.vm.dispose();
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(panic) => {
+            return Err(anyhow::anyhow!(
+                "rust engine panicked: {}",
+                panic_payload_message(panic.as_ref())
+            ))
+        }
+    };
     match outcome {
         // A pause sentinel that unwound through the VM is a stringified JS
         // exception here — re-type it immediately so everything upstream can
         // downcast to `RunInterrupt` instead of re-parsing the message.
-        Ok(result) => result.map_err(
-            |e| match crate::runtime::errors::RunInterrupt::from_message(&e) {
+        ModuleOutcome::Done(result) => {
+            if result.is_ok() {
+                // The run settled: whatever image this run left behind now
+                // describes a program that no longer exists.
+                if let Some(ctx) = &image_ctx {
+                    let _ = crate::runtime::mainline_image::clear(ctx);
+                }
+            }
+            result.map_err(
+                |e| match crate::runtime::errors::RunInterrupt::from_message(&e) {
+                    Some(interrupt) => anyhow::Error::new(interrupt),
+                    None => anyhow::anyhow!(js_exception_message(&e)),
+                },
+            )
+        }
+        // A suspension surfaces as the identical error the unwind raised, so
+        // the pause bookkeeping upstream (`engine.rs::surface_pause`) is
+        // reached by exactly the same route.
+        ModuleOutcome::Paused(text) => Err(
+            match crate::runtime::errors::RunInterrupt::from_message(&text) {
                 Some(interrupt) => anyhow::Error::new(interrupt),
-                None => anyhow::anyhow!(js_exception_message(&e)),
+                None => anyhow::anyhow!(js_exception_message(&text)),
             },
         ),
-        Err(panic) => Err(anyhow::anyhow!(
-            "rust engine panicked: {}",
-            panic_payload_message(panic.as_ref())
-        )),
+        // Nothing was consumed from the journal, so the fallback is a plain
+        // re-run of this same module with re-execution.
+        ModuleOutcome::ImageRejected(why) => {
+            tracing::debug!(reason = %why, "mainline VM image did not restore; re-executing");
+            // The retry installs its own opcode budget / watchdog and claims
+            // imaging for itself, so this attempt's must be released first.
+            drop(guard);
+            drop(_claim);
+            run_module_inner(path, source, fallback_export, input, host, false)
+        }
+    }
+}
+
+/// Drive the engine with mainline pause imaging engaged (§5.2): restore a
+/// stored image when one applies to this resume, otherwise execute — either way
+/// reporting a suspension rather than an unwind.
+#[allow(clippy::too_many_arguments)]
+fn drive_imaged(
+    engine: &mut chidori_js::Engine,
+    ctx: &RuntimeContext,
+    entry_key: &str,
+    js: &str,
+    input: &Value,
+    slot: &Rc<std::cell::RefCell<Option<chidori_js::Value>>>,
+    fallback_export: &str,
+    load: &mut dyn FnMut(&str, &str) -> std::result::Result<(String, String), String>,
+    allow_image_restore: bool,
+) -> ModuleOutcome {
+    let restored = if allow_image_restore {
+        crate::runtime::mainline_image::accept(ctx, entry_key, js)
+    } else {
+        None
+    };
+    let outcome = match restored {
+        Some(accepted) => {
+            // Reproduce the compilation units the imaging side registered —
+            // same graph, same walk — then rebuild the post-baseline heap. A
+            // rejection here leaves the journal untouched.
+            if let Err(err) = engine.prepare_image_units(entry_key, js, load) {
+                return ModuleOutcome::ImageRejected(err);
+            }
+            if let Err(err) = engine.vm.restore_image(&accepted.image) {
+                return ModuleOutcome::ImageRejected(err.to_string());
+            }
+            // The recorded calls are now history, not something to replay:
+            // nothing will re-execute them, so they move into this run's log
+            // and the sequence counter continues past them.
+            ctx.adopt_replay_log_as_history();
+            let delivered = engine.vm.json_to_value(&accepted.delivered);
+            engine.vm.resolve_host_op(accepted.op_id, delivered);
+            engine.finish_entry()
+        }
+        None => engine.run_entrypoint_graph_suspendable(
+            entry_key,
+            js,
+            input,
+            slot,
+            fallback_export,
+            load,
+        ),
+    };
+    match outcome {
+        Ok(chidori_js::EntryOutcome::Settled(value)) => ModuleOutcome::Done(Ok(value)),
+        Ok(chidori_js::EntryOutcome::Suspended) => ModuleOutcome::Paused(
+            engine
+                .vm
+                .suspended_effects
+                .first()
+                .map(|(_, _, text)| text.clone())
+                .unwrap_or_else(|| crate::runtime::errors::PAUSE_MARKER.to_string()),
+        ),
+        Err(err) => ModuleOutcome::Done(Err(err)),
     }
 }
 

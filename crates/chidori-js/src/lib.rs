@@ -69,6 +69,32 @@ impl Default for Engine {
     }
 }
 
+/// Where the retained entry promise lives on the global object. A VM image
+/// roots from the heap, so a suspended run's continuation has to be reachable
+/// from an object the image carries; the global is a baseline object, and a
+/// property added to it rides along as an overlay.
+pub const ENTRY_PROMISE_GLOBAL: &str = "__chidori_entry_promise";
+
+/// A compiled, resolved module graph: the registry to evaluate, plus the entry
+/// module's record and its top-level binding indices (where the entrypoint
+/// export lives).
+type LinkedEntryGraph = (
+    module::ModuleRegistry,
+    std::rc::Rc<std::cell::RefCell<module::ModuleRecord>>,
+    std::collections::HashMap<String, u32>,
+);
+
+/// How far [`Engine::run_entrypoint_graph_suspendable`] / [`Engine::finish_entry`]
+/// got.
+#[derive(Debug, Clone)]
+pub enum EntryOutcome {
+    Settled(serde_json::Value),
+    /// The entry promise is still pending with a parked host effect behind it
+    /// ([`Vm::effect_suspend`]). Nothing is mid-step, so this is the point at
+    /// which a VM image can be taken.
+    Suspended,
+}
+
 impl Engine {
     pub fn new() -> Engine {
         Engine {
@@ -1018,12 +1044,107 @@ impl Engine {
         fallback_export: &str,
         load: &mut dyn FnMut(&str, &str) -> Result<(String, String), String>,
     ) -> Result<serde_json::Value, String> {
+        let (registry, entry_rec, cell_of_name) =
+            self.compile_entry_graph(entry_key, entry_src, load)?;
+        self.vm
+            .run_module_graph(&registry, entry_key)
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
+        let handler = self.entry_handler(&entry_rec, &cell_of_name, slot, fallback_export)?;
+        let ret = self.call_entry(handler, input)?;
+        let settled = self
+            .vm
+            .settle(ret)
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
+        Ok(self.vm.value_to_json(&settled))
+    }
+
+    /// As [`Engine::run_entrypoint_graph`], but for embedders whose host
+    /// effects can *suspend* (see [`Vm::effect_suspend`]): a still-pending
+    /// entry is reported as [`EntryOutcome::Suspended`] rather than the
+    /// "did not settle" error, and the entry promise is retained on the global
+    /// under [`ENTRY_PROMISE_GLOBAL`] so a restored VM can find the
+    /// continuation again. When a VM image baseline is marked, every compiled
+    /// module is also registered as an image compilation unit, in graph order —
+    /// [`Engine::prepare_image_units`] is the restoring half and must see the
+    /// same graph.
+    pub fn run_entrypoint_graph_suspendable(
+        &mut self,
+        entry_key: &str,
+        entry_src: &str,
+        input: &serde_json::Value,
+        slot: &std::rc::Rc<std::cell::RefCell<Option<Value>>>,
+        fallback_export: &str,
+        load: &mut dyn FnMut(&str, &str) -> Result<(String, String), String>,
+    ) -> Result<EntryOutcome, String> {
+        let (registry, entry_rec, cell_of_name) =
+            self.compile_entry_graph(entry_key, entry_src, load)?;
+        self.vm
+            .run_module_graph(&registry, entry_key)
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
+        let handler = self.entry_handler(&entry_rec, &cell_of_name, slot, fallback_export)?;
+        let ret = self.call_entry(handler, input)?;
+        // The entry promise is the only handle on the continuation, and a VM
+        // image roots from the *heap*, not from Rust locals — so park it on the
+        // global (a baseline object, restored as an overlay) before draining.
+        let global = self.vm.realm.global.clone();
+        self.vm.define_value(&global, ENTRY_PROMISE_GLOBAL, ret);
+        self.finish_entry()
+    }
+
+    /// Compile the module graph rooted at `entry_src` and register each module
+    /// as a VM-image compilation unit WITHOUT evaluating anything — the
+    /// restoring half of [`Engine::run_entrypoint_graph_suspendable`]. The keys
+    /// and their order must match the imaging side, which they do by
+    /// construction: the same graph walked the same way.
+    pub fn prepare_image_units(
+        &mut self,
+        entry_key: &str,
+        entry_src: &str,
+        load: &mut dyn FnMut(&str, &str) -> Result<(String, String), String>,
+    ) -> Result<(), String> {
+        self.compile_entry_graph(entry_key, entry_src, load)?;
+        Ok(())
+    }
+
+    /// Drain microtasks and report where the retained entry promise (see
+    /// [`ENTRY_PROMISE_GLOBAL`]) got to: settled with its JSON value, or still
+    /// suspended on a parked host effect. This is what a restored VM calls
+    /// after resolving the op it was parked on.
+    pub fn finish_entry(&mut self) -> Result<EntryOutcome, String> {
+        let global = Value::Object(self.vm.realm.global.clone());
+        let entry = self
+            .vm
+            .get_prop(&global, &value::PropertyKey::str(ENTRY_PROMISE_GLOBAL))
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
+        match self.vm.settle(entry) {
+            Ok(settled) => Ok(EntryOutcome::Settled(self.vm.value_to_json(&settled))),
+            // A pending entry with a parked effect behind it is a suspension,
+            // not a failure; anything else is the ordinary rejection path.
+            Err(e) => {
+                if !self.vm.suspended_effects.is_empty() {
+                    Ok(EntryOutcome::Suspended)
+                } else {
+                    Err(self.vm.error_to_string_with_stack(&e))
+                }
+            }
+        }
+    }
+
+    /// BFS the import graph, compiling each module once and recording how its
+    /// requested specifiers resolved (the linker reads `resolved` per record).
+    /// Registers each compiled module as an image unit when this VM is imaging,
+    /// so the walk order is the unit order on both sides.
+    fn compile_entry_graph(
+        &mut self,
+        entry_key: &str,
+        entry_src: &str,
+        load: &mut dyn FnMut(&str, &str) -> Result<(String, String), String>,
+    ) -> Result<LinkedEntryGraph, String> {
         let mut registry = module::ModuleRegistry::default();
-        // BFS the import graph, compiling each module once and recording how its
-        // requested specifiers resolved (the linker reads `resolved` per record).
         let mut queue: Vec<(String, String)> = vec![(entry_key.to_string(), entry_src.to_string())];
         let mut entry_cell_of_name = None;
         let mut entry_rec = None;
+        let imaging = self.vm.has_image_baseline();
         while let Some((key, src)) = queue.pop() {
             if registry.modules.contains_key(&key) {
                 continue;
@@ -1032,6 +1153,10 @@ impl Engine {
                 .map_err(|e| format!("compiling module '{key}': {e}"))?;
             let cell_of_name = compiled.cell_of_name.clone();
             let requested = compiled.requested.clone();
+            if imaging {
+                self.vm
+                    .register_image_unit(key.clone(), compiled.proto.clone());
+            }
             let mut rec = module::ModuleRecord::new(compiled);
             for spec in &requested {
                 let (dep_key, dep_src) = load(spec, &key)?;
@@ -1047,34 +1172,39 @@ impl Engine {
             }
             registry.modules.insert(key, rec);
         }
-
-        self.vm
-            .run_module_graph(&registry, entry_key)
-            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
-
         let entry_rec = entry_rec.ok_or_else(|| "entry module was not loaded".to_string())?;
         let cell_of_name =
             entry_cell_of_name.ok_or_else(|| "entry module was not compiled".to_string())?;
-        // Entrypoint: whatever `run(...)` captured, else the named export.
-        let handler = slot.borrow().clone().or_else(|| {
-            cell_of_name
-                .get(fallback_export)
-                .map(|idx| entry_rec.borrow().cells[*idx as usize].borrow().clone())
-        });
-        let handler = handler.ok_or_else(|| {
-            format!("module did not call run(...) and has no `{fallback_export}` export")
-        })?;
+        Ok((registry, entry_rec, cell_of_name))
+    }
+
+    /// The entrypoint value: whatever `run(...)` captured, else the named export.
+    fn entry_handler(
+        &self,
+        entry_rec: &std::rc::Rc<std::cell::RefCell<module::ModuleRecord>>,
+        cell_of_name: &std::collections::HashMap<String, u32>,
+        slot: &std::rc::Rc<std::cell::RefCell<Option<Value>>>,
+        fallback_export: &str,
+    ) -> Result<Value, String> {
+        slot.borrow()
+            .clone()
+            .or_else(|| {
+                cell_of_name
+                    .get(fallback_export)
+                    .map(|idx| entry_rec.borrow().cells[*idx as usize].borrow().clone())
+            })
+            .ok_or_else(|| {
+                format!("module did not call run(...) and has no `{fallback_export}` export")
+            })
+    }
+
+    /// Invoke the entrypoint as `handler(input, chidori)`.
+    fn call_entry(&mut self, handler: Value, input: &serde_json::Value) -> Result<Value, String> {
         let arg = self.vm.json_to_value(input);
         let chidori = self.chidori.clone().unwrap_or(Value::Undefined);
-        let ret = self
-            .vm
+        self.vm
             .call(handler, Value::Undefined, &[arg, chidori])
-            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
-        let settled = self
-            .vm
-            .settle(ret)
-            .map_err(|e| self.vm.error_to_string_with_stack(&e))?;
-        Ok(self.vm.value_to_json(&settled))
+            .map_err(|e| self.vm.error_to_string_with_stack(&e))
     }
 
     /// Compile, link, and evaluate the module graph rooted at `entry_src`, then
@@ -1143,11 +1273,32 @@ fn forward_effect(
     effect: &str,
     args: serde_json::Value,
 ) -> Result<Value, Value> {
+    let suspend = vm.effect_suspend.clone();
+    // Past the first parked effect the run is quiescing: every later effect
+    // parks unresolved WITHOUT reaching the host, so the durable journal
+    // records exactly what the unwinding pause path recorded and no more (an
+    // unwind stops the turn dead; a suspension would otherwise let the rest of
+    // the turn keep firing effects).
+    if suspend.is_some() && !vm.suspended_effects.is_empty() {
+        let (_, promise) = vm.register_host_op();
+        return Ok(Value::Object(promise));
+    }
     match dispatch(effect, &args) {
         Ok(j) => Ok(vm.json_to_value(&j)),
-        // A host-effect failure surfaces to JS as a plain `Error` (matching the
-        // QuickJS path), so `catch` blocks see `Error: ...`, not `TypeError: ...`.
-        Err(e) => Err(vm.make_error(crate::vm::ErrorKind::Error, &e)),
+        Err(e) => {
+            if suspend.is_some_and(|classify| classify(effect, &e)) {
+                // A pause, not a failure: yield a promise nothing will resolve
+                // in this leg. The awaiting frame parks, the driver reports
+                // `BlockedOnHost`, and the VM is left quiescent — imageable.
+                let (id, promise) = vm.register_host_op();
+                vm.suspended_effects.push((id, effect.to_string(), e));
+                return Ok(Value::Object(promise));
+            }
+            // A host-effect failure surfaces to JS as a plain `Error` (matching
+            // the QuickJS path), so `catch` blocks see `Error: ...`, not
+            // `TypeError: ...`.
+            Err(vm.make_error(crate::vm::ErrorKind::Error, &e))
+        }
     }
 }
 

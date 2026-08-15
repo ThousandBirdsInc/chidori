@@ -337,6 +337,19 @@ pub struct Vm {
     /// embedder registers each one it evaluates; restore must register the
     /// same keys, in the same order, compiled from the same source.
     pub(crate) image_units: Vec<crate::image::ImageUnit>,
+    /// Classifier consulted when a `chidori` host effect's dispatch FAILS:
+    /// `true` means the failure is a *suspension* (the durable host parked the
+    /// run), so the effect yields a pending host promise instead of throwing.
+    /// The VM then blocks on that op — a quiescent, imageable point — instead
+    /// of unwinding through JS with the host's error. `None` (the default)
+    /// leaves every failure a thrown error, which is why hosts that do not opt
+    /// in behave exactly as before.
+    pub effect_suspend: Option<std::rc::Rc<dyn Fn(&str, &str) -> bool>>,
+    /// Host ops parked by [`Self::effect_suspend`], in park order:
+    /// `(op id, effect name, the failure text that classified as a suspension)`.
+    /// Never restored from an image — a restoring VM starts with none, so its
+    /// effects dispatch live again.
+    pub suspended_effects: Vec<(u64, String, String)>,
     /// Per-realm tagged-template cache: `(FuncProto pointer, template index)`
     /// -> the cached frozen template object (spec GetTemplateObject). A shared
     /// proto is the same Parse Node, so all closures over it reuse one object.
@@ -473,6 +486,8 @@ impl Vm {
             gc_cell_roots: Vec::new(),
             image_baseline: None,
             image_units: Vec::new(),
+            effect_suspend: None,
+            suspended_effects: Vec::new(),
             template_cache: std::collections::HashMap::new(),
             value_vec_pool: Vec::new(),
             cell_pool: Vec::new(),
@@ -2255,6 +2270,10 @@ impl Vm {
         self.pending_host.clear();
         self.unhandled_rejections.clear();
         self.console_log.clear();
+        // The suspension classifier is a host closure; drop it with the rest of
+        // the host-owned state so a disposed VM holds nothing of the embedder.
+        self.effect_suspend = None;
+        self.suspended_effects.clear();
         // The dynamic-import hook closes over host module state (registries whose
         // records hold realm values); drop it so those cells don't keep cycles.
         self.dynamic_import = None;

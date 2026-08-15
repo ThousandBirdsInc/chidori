@@ -251,6 +251,68 @@ Measured (debug build, 600-record history, via the HTTP server): resume
 23 ms warm vs 213 ms replay — and the warm number is flat in history size
 where the replay number grows with it.
 
+### 5.2 Landed (flagged): the mainline pause conversion
+
+> `crates/chidori/src/runtime/mainline_image.rs`, `CHIDORI_MAINLINE_IMAGE=1`
+
+§5.1 keeps the paused VM alive in the process that started the run; §7 gives a
+suspended VM a durable form. Neither reached the mainline agent loop, because
+there a pause was still an **error unwind**: `run_module` dispatched host
+effects synchronously and `PAUSE_MARKER` tore the engine down with the Rust
+stack, so at the moment the run paused there was nothing left to image.
+
+Behind `CHIDORI_MAINLINE_IMAGE` (default **off**) the pause-capable effects go
+through the engine's async host-promise path instead. `Vm::effect_suspend`
+classifies a host dispatch failure: a pause yields a pending host promise
+(`register_host_op`) rather than a thrown error, the awaiting frame parks, and
+the driver stops at a quiescent point. There the run captures a VM image and
+writes it to `vm_image.json` beside — never instead of — the journal scaffold
+the unwinding path has always written, then returns the **identical** paused
+`RunResult`, reconstructed from the same wire string the unwind raised, so
+every caller upstream (`surface_pause`, the CLI, the session server) is
+unchanged.
+
+A resume prefers the image. `run_module` rebuilds the engine exactly as the
+imaging side did — same construction, same preludes, SDK sugar, fetch polyfill,
+DOM and entrypoint registrar, in the same order — marks the same baseline,
+recompiles the module graph as image compilation units *without evaluating it*,
+restores, and resolves the parked op with the delivered answer. The recorded
+journal becomes the run's history rather than something to re-execute
+(`RuntimeContext::adopt_replay_log_as_history`). Every rejection —
+envelope version, a changed entry, a journal that is not this image's frontier
+plus one delivery, a baseline or compilation-unit mismatch, a decode failure —
+logs at `debug` and re-runs with ordinary re-execution on a fresh engine, with
+nothing consumed from the journal. The property that makes this a cache and not
+a second source of truth is pinned by a differential test
+(`mainline_image::tests::image_resume_and_replay_resume_agree_on_output_and_journal`):
+resuming from the image and resuming by re-execution leave the same output and
+the same journal.
+
+**What is converted:** `input()` pauses only — the dominant production pause,
+and the one whose delivery is a plain value. Approval and signal/alarm pauses
+keep the classic unwind and resume by re-execution; their delivery paths
+re-derive state (policy decisions, the signal mailbox and its timeout arming)
+on the re-execution they still perform, so converting them is a separate
+change, not a longer list. Non-pausing effects stay synchronous on purpose:
+moving them onto promises would change microtask interleaving, which replay
+determinism depends on.
+
+**Caveats a reader should know.** §5.1 still wins where it applies: a
+`WarmInputBridge` intercepts the `input()` pause before it ever becomes a host
+failure, so a server run that parks warm never reaches this path — the image is
+for the cold resume the warm path cannot serve. Only the outermost module of a
+run images — sub-agents and tool files drive their own engines against the same
+durable context. Imaging forces eager realm construction (§7.1), and a pause is no
+longer observable in JS as a thrown exception, so a `try/catch` around
+`await chidori.input()` no longer sees one and `finally` blocks do not run at
+the pause; that is the point of the conversion, and it is why it is flagged.
+Effects that fire *after* a pause in the same turn park unresolved without
+reaching the host, so the paused journal matches the unwind's exactly; the
+synchronous captured natives (`node:` crypto/fs) are not gated that way and can
+still run in a post-pause microtask. With the flag off, none of this exists:
+no image is written, no image is read, and the pause path is byte-identical to
+before.
+
 ## 6. Order of remaining work, by expected value
 
 1. ~~**Warm-standby conversion (§5)**~~ — landed for input pauses (§5.1);
