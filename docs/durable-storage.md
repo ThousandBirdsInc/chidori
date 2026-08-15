@@ -148,6 +148,15 @@ here holds the run's code but never runs it (the engine lives in the Chidori
 process), so "wrong node, here is the owner" is a complete answer to a client
 that only reads and appends bytes.
 
+If that ever changes — nodes executing the runs they own, so the fleet scales
+workers rather than just storage — the prerequisite is a suspended agent that
+any node can pick up cheaply. That now exists: see
+[VM images](./resume-performance.md#7-landed-vm-images),
+which make resume cost track a run's live state instead of its history. The
+remaining gaps are materializing agent source on the waking node, per-node
+config and secrets, multi-tenant isolation with a warm pool, and inbound
+routing.
+
 ## Write-error policy: `CHIDORI_DURABILITY`
 
 Journal writes are not fire-and-forget:

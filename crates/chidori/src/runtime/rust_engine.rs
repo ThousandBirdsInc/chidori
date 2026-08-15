@@ -29,6 +29,19 @@ use crate::runtime::typescript::transpile::{transpile_module, TranspileOptions};
 
 pub use chidori_js::replay::ReplayRuntime;
 
+/// Whether to take VM images alongside the replay blob (`CHIDORI_VM_IMAGE`,
+/// default on; set `0`/`false` to write journal-only artifacts).
+///
+/// Images never replace the journal — they ride along in the same artifact and
+/// let a restore skip re-execution. Turning them off costs resume latency and
+/// nothing else, which is why the escape hatch exists and why it is safe.
+fn vm_images_enabled() -> bool {
+    !matches!(
+        std::env::var("CHIDORI_VM_IMAGE").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
 /// A durable Rust-engine instance behind the `SnapshotCapableJsEngine` trait.
 pub struct RustReplayEngine {
     rt: ReplayRuntime,
@@ -40,8 +53,12 @@ impl RustReplayEngine {
     /// Begin a fresh durable execution of `bundle`, exposing the named host
     /// effects as global async functions.
     pub fn start(bundle: &str, effects: &[&str]) -> Self {
+        let mut rt = ReplayRuntime::record(bundle, effects);
+        if vm_images_enabled() {
+            rt.enable_imaging();
+        }
         RustReplayEngine {
-            rt: ReplayRuntime::record(bundle, effects),
+            rt,
             effects: effects.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1336,11 +1353,25 @@ impl SnapshotCapableJsEngine for RustReplayEngine {
 
     fn restore(snapshot: &[u8]) -> Result<Self> {
         // Decode the self-describing blob to recover the effect names for
-        // re-snapshotting, then rebuild the runtime (replays to the frontier).
+        // re-snapshotting, then rebuild the runtime. When the artifact carries
+        // a usable VM image this costs O(live state); otherwise it replays the
+        // journal to the frontier as it always has.
         let blob: chidori_js::replay::DurableBlob =
             serde_json::from_slice(snapshot).map_err(|e| anyhow::anyhow!(e))?;
         let effects = blob.effects.clone();
-        let rt = ReplayRuntime::from_blob(snapshot).map_err(|e| anyhow::anyhow!(e))?;
+        let (rt, path) =
+            ReplayRuntime::from_blob_reporting(snapshot).map_err(|e| anyhow::anyhow!(e))?;
+        match &path {
+            chidori_js::replay::RestorePath::Image => {
+                tracing::debug!("durable resume restored from VM image (no replay)")
+            }
+            // An image that was written but declined is worth seeing: the
+            // resume is still correct, just back to O(history).
+            chidori_js::replay::RestorePath::Replay { reason: Some(why) } => {
+                tracing::debug!(reason = %why, "VM image declined; resumed by journal replay")
+            }
+            chidori_js::replay::RestorePath::Replay { reason: None } => {}
+        }
         Ok(RustReplayEngine { rt, effects })
     }
 

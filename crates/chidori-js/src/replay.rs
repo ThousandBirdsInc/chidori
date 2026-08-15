@@ -57,6 +57,34 @@ struct JournalState {
     bundle_changed: bool,
 }
 
+/// A pending host op, as written into a runtime image.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PendingOpImg {
+    name: String,
+    args: Json,
+    site: String,
+    seq: u64,
+}
+
+/// A [`ReplayRuntime`] image: the VM image plus the journal bookkeeping that
+/// lives outside the VM. Both halves are needed — the heap says what the
+/// program *is*, the cursor says where the journal picks up.
+///
+/// The journal itself is deliberately NOT in here. It already travels with the
+/// artifact ([`DurableBlob::journal`]) and is what the fallback path needs;
+/// carrying a second copy would make the image grow with history, which is the
+/// one thing it exists not to do.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeImage {
+    version: u32,
+    bundle_hash: String,
+    counters: HashMap<String, u64>,
+    cursor: usize,
+    pending: Vec<(u64, PendingOpImg)>,
+    started: bool,
+    vm: crate::image::VmImage,
+}
+
 /// Outcome of driving the runtime.
 #[derive(Debug)]
 pub enum DriveOutcome {
@@ -136,6 +164,145 @@ impl ReplayRuntime {
         };
         rt.install_effects(effects);
         rt.install_memo();
+        Ok(rt)
+    }
+
+    /// Turn on VM imaging: freeze everything built so far — the realm, the
+    /// effect functions, the memo helper — as the image baseline, so an image
+    /// only has to carry what the *program* creates.
+    ///
+    /// Call before the bundle starts. The restoring side reaches the same
+    /// baseline by construction: same engine, same effect names, same order.
+    /// That is also what re-binds host effects on the way back — the restored
+    /// natives close over the *new* process's journal state, and the image
+    /// refers to them by baseline id rather than trying to serialize a Rust
+    /// closure.
+    pub fn enable_imaging(&mut self) {
+        self.vm.mark_image_baseline();
+    }
+
+    /// Capture the live runtime — heap, closures, promises, suspended frames,
+    /// plus the journal cursor — as a restorable image.
+    ///
+    /// `Err` means this state has no image form (see
+    /// [`crate::image::ImageError::Unsupported`]); the caller keeps the
+    /// journal and resumes by replay instead. It is never wrong to fall back.
+    pub fn to_image(&self) -> Result<RuntimeImage, String> {
+        if !self.vm.has_image_baseline() {
+            return Err("imaging was not enabled on this runtime".to_string());
+        }
+        let vm = self.vm.snapshot_image().map_err(|e| e.to_string())?;
+        let s = self.state.borrow();
+        let img = RuntimeImage {
+            version: crate::image::IMAGE_VERSION,
+            bundle_hash: self.bundle_hash.clone(),
+            counters: s.counters.clone(),
+            cursor: s.cursor,
+            // Only ops that are STILL pending. `JournalState::pending` keeps
+            // an entry per host call ever made — handy for divergence
+            // messages, but it grows with history, and copying it wholesale
+            // would make the image O(history) through the back door. The VM's
+            // own pending-host map is the authoritative live set (entries are
+            // removed as ops settle), and a settled op can never be resolved
+            // again after a restore.
+            pending: {
+                let mut live: Vec<(u64, PendingOpImg)> = s
+                    .pending
+                    .iter()
+                    .filter(|(id, _)| self.vm.pending_host.contains_key(*id))
+                    .map(|(id, op)| {
+                        (
+                            *id,
+                            PendingOpImg {
+                                name: op.name.clone(),
+                                args: op.args.clone(),
+                                site: op.site.clone(),
+                                seq: op.seq,
+                            },
+                        )
+                    })
+                    .collect();
+                // HashMap order is not stable; sort so the same suspension
+                // always produces the same bytes.
+                live.sort_by_key(|(id, _)| *id);
+                live
+            },
+            started: self.started,
+            vm,
+        };
+        Ok(img)
+    }
+
+    /// Rebuild a runtime from an image: the heap comes back as it was, and the
+    /// bundle is **not** re-executed. This is the O(live state) counterpart of
+    /// [`Self::restore`]'s O(history) replay.
+    ///
+    /// The bundle is still required — it is recompiled so closures can point at
+    /// real bytecode — and it must be the same source the image was taken
+    /// against, which is checked. An *edited* bundle has no meaning here (there
+    /// is no re-execution to absorb the edit); resume that through
+    /// [`Self::restore`], which is what modify-and-resume is for.
+    pub fn from_image(
+        img: &RuntimeImage,
+        bundle: &str,
+        journal_bytes: &[u8],
+        effects: &[&str],
+    ) -> Result<ReplayRuntime, String> {
+        if img.version != crate::image::IMAGE_VERSION {
+            return Err(format!(
+                "runtime image version {} but this engine writes {}",
+                img.version,
+                crate::image::IMAGE_VERSION
+            ));
+        }
+        let bundle = bundle.to_string();
+        let bundle_hash = Journal::hash_bundle(&bundle);
+        if bundle_hash != img.bundle_hash {
+            return Err(
+                "image was taken against a different bundle; resume by journal replay \
+                 (`restore`) if the source was edited"
+                    .to_string(),
+            );
+        }
+        let journal = Journal::from_bytes(journal_bytes)?;
+        let state = Rc::new(RefCell::new(JournalState {
+            journal,
+            mode: Mode::Record,
+            counters: img.counters.clone(),
+            cursor: img.cursor,
+            pending: img
+                .pending
+                .iter()
+                .map(|(id, op)| {
+                    (
+                        *id,
+                        PendingOp {
+                            name: op.name.clone(),
+                            args: op.args.clone(),
+                            site: op.site.clone(),
+                            seq: op.seq,
+                        },
+                    )
+                })
+                .collect(),
+            divergence: None,
+            bundle_changed: false,
+        }));
+        let mut rt = ReplayRuntime {
+            vm: Vm::new(),
+            bundle,
+            bundle_hash,
+            state,
+            started: img.started,
+        };
+        // Reproduce the baseline exactly as the imaging side built it.
+        rt.install_effects(effects);
+        rt.install_memo();
+        rt.vm.mark_image_baseline();
+        // Compile (not run) the bundle so imaged closures resolve to bytecode.
+        let proto = crate::compiler::compile_script_cached(&rt.bundle)?;
+        rt.vm.register_image_unit(rt.bundle_hash.clone(), proto);
+        rt.vm.restore_image(&img.vm).map_err(|e| e.to_string())?;
         Ok(rt)
     }
 
@@ -366,6 +533,13 @@ impl ReplayRuntime {
         // pipeline once per thread instead of once per restore. An *edited*
         // bundle is a different source string and simply misses the cache.
         let proto = crate::compiler::compile_script_cached(&self.bundle)?;
+        if self.vm.has_image_baseline() {
+            // Imaged closures address their bytecode as (unit, const path);
+            // the restoring side recompiles the same source and registers the
+            // same key, so the paths resolve there too.
+            self.vm
+                .register_image_unit(self.bundle_hash.clone(), proto.clone());
+        }
         let func = self.vm.make_closure(proto, Vec::new());
         match self.vm.call(Value::Object(func), Value::Undefined, &[]) {
             Ok(_) => Ok(()),
@@ -565,22 +739,70 @@ pub struct DurableBlob {
     pub bundle: String,
     pub effects: Vec<String>,
     pub journal: Vec<u8>,
+    /// A VM image of the same suspension point, when one could be taken.
+    ///
+    /// Strictly a fast path: [`ReplayRuntime::from_blob`] uses it to skip
+    /// replay and falls back to bundle+journal whenever it is absent or does
+    /// not apply. The field is additive, so an artifact carrying an image
+    /// still restores correctly in a reader that has never heard of one — it
+    /// ignores the field and replays, which is always right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<Box<RuntimeImage>>,
+}
+
+/// Which path a restore actually took. Worth surfacing: the image is a cache,
+/// and a cache that silently stops hitting is a performance bug nobody sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestorePath {
+    /// Rebuilt from the VM image — O(live state), no re-execution.
+    Image,
+    /// Re-executed against the journal. `reason` is `None` when the artifact
+    /// carried no image at all, and `Some` when one was present but declined.
+    Replay { reason: Option<String> },
 }
 
 impl ReplayRuntime {
-    /// Serialize the full durable artifact (bundle + journal).
+    /// Serialize the full durable artifact (bundle + journal), including a VM
+    /// image when imaging is enabled and this state can be imaged.
     pub fn to_blob(&self, effects: &[&str]) -> Vec<u8> {
+        let image = if self.vm.has_image_baseline() {
+            self.to_image().ok().map(Box::new)
+        } else {
+            None
+        };
         let blob = DurableBlob {
             bundle: self.bundle.clone(),
             effects: effects.iter().map(|s| s.to_string()).collect(),
             journal: self.journal_bytes(),
+            image,
         };
         serde_json::to_vec(&blob).unwrap_or_default()
     }
 
-    /// Reconstruct a runtime from a `to_blob` artifact, replaying to the frontier.
+    /// Reconstruct a runtime from a `to_blob` artifact: from its VM image when
+    /// there is a usable one, otherwise by replaying the journal.
     pub fn from_blob(bytes: &[u8]) -> Result<ReplayRuntime, String> {
+        Ok(Self::from_blob_reporting(bytes)?.0)
+    }
+
+    /// As [`Self::from_blob`], also reporting which path was taken.
+    pub fn from_blob_reporting(bytes: &[u8]) -> Result<(ReplayRuntime, RestorePath), String> {
         let blob: DurableBlob = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let effect_names: Vec<&str> = blob.effects.iter().map(|s| s.as_str()).collect();
+        let mut declined = None;
+        if let Some(image) = &blob.image {
+            match Self::from_image(image, &blob.bundle, &blob.journal, &effect_names) {
+                Ok(rt) => return Ok((rt, RestorePath::Image)),
+                // Never fatal: the journal can always rebuild this state, so a
+                // stale or inapplicable image costs time, not correctness.
+                Err(e) => declined = Some(e),
+            }
+        }
+        let rt = Self::from_blob_by_replay(&blob)?;
+        Ok((rt, RestorePath::Replay { reason: declined }))
+    }
+
+    fn from_blob_by_replay(blob: &DurableBlob) -> Result<ReplayRuntime, String> {
         let effects: Vec<&str> = blob.effects.iter().map(|s| s.as_str()).collect();
         ReplayRuntime::restore(&blob.bundle, &blob.journal, &effects)
     }

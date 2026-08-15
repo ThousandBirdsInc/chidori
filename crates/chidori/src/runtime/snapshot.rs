@@ -1814,6 +1814,7 @@ mod source_change_history_tests {
             bundle: original.to_string(),
             effects: Vec::new(),
             journal: Vec::new(),
+            image: None,
         };
         SnapshotStore::new(&run_dir)
             .save(&manifest, &serde_json::to_vec(&blob).unwrap(), &[])

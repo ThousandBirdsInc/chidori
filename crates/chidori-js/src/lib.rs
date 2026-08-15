@@ -22,6 +22,7 @@ pub mod fxhash;
 pub mod gc;
 pub mod generator;
 pub mod host;
+pub mod image;
 pub mod iter;
 pub mod journal;
 pub mod jsx;

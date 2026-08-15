@@ -327,6 +327,16 @@ pub struct Vm {
     /// an object reachable only through such a shared cell could be collected
     /// while the host can still reach it.
     pub gc_cell_roots: Vec<std::rc::Rc<RefCell<Value>>>,
+    /// The deterministic prefix a VM image is written against (see
+    /// [`crate::image`]): every object, binding cell and symbol that existed
+    /// when [`Vm::mark_image_baseline`] ran, numbered so an image can refer to
+    /// them by id instead of serializing them. `None` until marked — imaging
+    /// is opt-in and costs nothing when unused.
+    pub(crate) image_baseline: Option<Box<crate::image::Baseline>>,
+    /// Compilation units whose `FuncProto` trees an image may address. The
+    /// embedder registers each one it evaluates; restore must register the
+    /// same keys, in the same order, compiled from the same source.
+    pub(crate) image_units: Vec<crate::image::ImageUnit>,
     /// Per-realm tagged-template cache: `(FuncProto pointer, template index)`
     /// -> the cached frozen template object (spec GetTemplateObject). A shared
     /// proto is the same Parse Node, so all closures over it reuse one object.
@@ -461,6 +471,8 @@ impl Vm {
             gc_auto_threshold: std::cell::Cell::new(crate::gc::GC_AUTO_FLOOR),
             gc_auto: true,
             gc_cell_roots: Vec::new(),
+            image_baseline: None,
+            image_units: Vec::new(),
             template_cache: std::collections::HashMap::new(),
             value_vec_pool: Vec::new(),
             cell_pool: Vec::new(),
@@ -505,6 +517,87 @@ impl Vm {
             .map_err(|e| self.throw_syntax(e.trim_start_matches("SyntaxError: ")))?;
         let func = self.make_closure(std::rc::Rc::new(proto), Vec::new());
         self.call(Value::Object(func), Value::Undefined, &[])
+    }
+
+    // -----------------------------------------------------------------
+    // VM images (see `crate::image`)
+    // -----------------------------------------------------------------
+
+    /// Freeze the current object graph as the image baseline: everything
+    /// reachable right now becomes referenceable by id, and only what happens
+    /// afterwards is serialized. Call this once the VM is in the state the
+    /// restoring side can reproduce for free — fresh realm plus whatever
+    /// preludes/polyfills the embedder always evaluates — and before any
+    /// durable program runs.
+    ///
+    /// Cost is one walk of the realm; nothing else in the engine changes
+    /// behavior, so a VM that never images pays nothing.
+    pub fn mark_image_baseline(&mut self) {
+        // Lazily-installed builtin sections (`Date`, `RegExp`, `Intl`, …) sit
+        // behind self-replacing stubs until first touched. If a section were
+        // installed *after* this point its function objects would be
+        // post-baseline, and imaging a program that merely called `new Date()`
+        // would fail on a native closure. Materialize every section now so the
+        // baseline is complete and — just as important — identical on the
+        // restoring side, which does not execute the program and so would
+        // otherwise install a different subset.
+        //
+        // The cost is giving up lazy realm construction for VMs that image.
+        // That is a one-time build cost per VM, traded against making resume
+        // O(live state); the lazy path is unchanged for everyone else.
+        let global = self.realm.global.clone();
+        crate::builtins::materialize_all_lazy(self, &global);
+        let baseline = crate::image::build_baseline(self);
+        self.image_baseline = Some(Box::new(baseline));
+    }
+
+    /// How many objects the baseline numbered (diagnostics, tests).
+    pub fn image_baseline_object_count(&self) -> usize {
+        self.image_baseline.as_ref().map_or(0, |b| b.object_count())
+    }
+
+    /// Whether [`Self::mark_image_baseline`] has run.
+    pub fn has_image_baseline(&self) -> bool {
+        self.image_baseline.is_some()
+    }
+
+    /// Digest of the baseline walk. Two VMs that agree here can exchange
+    /// images; the restore path checks it and refuses otherwise.
+    pub fn image_baseline_digest(&self) -> Option<u64> {
+        self.image_baseline.as_ref().map(|b| b.digest())
+    }
+
+    /// Register a compilation unit so closures over its code can be imaged.
+    /// `key` identifies the source (a content hash is the obvious choice);
+    /// restore must register the same keys in the same order.
+    pub fn register_image_unit(
+        &mut self,
+        key: impl Into<String>,
+        root: std::rc::Rc<crate::bytecode::FuncProto>,
+    ) {
+        self.image_units.push(crate::image::ImageUnit {
+            key: key.into(),
+            root,
+        });
+    }
+
+    /// Serialize everything that happened after the baseline.
+    ///
+    /// Returns [`crate::image::ImageError::Unsupported`] when live state has
+    /// no serialized form (a queued Rust job, a post-baseline native closure,
+    /// a generator caught mid-step). That is a routine outcome, not a bug: the
+    /// caller falls back to journal replay.
+    pub fn snapshot_image(&self) -> Result<crate::image::VmImage, crate::image::ImageError> {
+        crate::image::encode(self)
+    }
+
+    /// Rebuild post-baseline state from an image. `self` must be at the same
+    /// baseline with the same units registered; both are checked.
+    pub fn restore_image(
+        &mut self,
+        image: &crate::image::VmImage,
+    ) -> Result<(), crate::image::ImageError> {
+        crate::image::decode(self, image)
     }
 
     pub fn alloc_symbol(&mut self, description: Option<&str>) -> JsSymbol {
