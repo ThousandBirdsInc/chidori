@@ -88,7 +88,7 @@ chidori-js = { path = "../chidori-js", version = "0.3.3" }
 async-trait = "0.1"
 
 # SQLite session store
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Cron scheduler for recipes
 cron = "0.12"
