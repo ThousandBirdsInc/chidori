@@ -104,9 +104,16 @@ chidori verify agent.ts <run_id> --runs-dir tests/fixtures   # in CI
 
 `chidori verify` replays the run in the strictest posture: no providers
 configured, no tools registered, the `untrusted` policy profile, and no
-`--allow-source-change` escape. It exits 0 on pass and 1 on any failure,
-with a distinct message for each cause: source drift, an unclean replay, a
-run that pauses instead of completing, unexpected live calls, or output
+`--allow-source-change` escape. A fixture without its `runtime.snapshot.json`
+manifest is refused outright (a verification that cannot check source
+fingerprints is not a verification), replay runs with
+`CHIDORI_REPLAY_STRICT=1` — a journal miss is a hard error instead of a
+silent live fallthrough — and `CHIDORI_REPLAY_LAX` is ignored. It exits 0
+on pass and 1 on any failure, with a distinct message for each cause:
+source drift, an unclean replay, a journal the run cannot fully consume
+(the replayed run must journal exactly as many records as the fixture
+holds — a shorter path is a divergence even though nothing executed live),
+a run that pauses instead of completing, unexpected live calls, or output
 that isn't byte-identical.
 
 One caveat: workspace state is real disk, not journal-served, so top-level

@@ -3103,11 +3103,35 @@ fn cmd_verify(
         Value::Object(Default::default())
     };
 
+    // Drift gate 0: a fixture without a snapshot manifest cannot be
+    // fingerprint-checked at all — the resume path skips with a warning for
+    // pre-manifest runs, but a verification that silently skips its source
+    // gate is not a verification. `chidori export` always includes the
+    // manifest, so only hand-assembled run dirs trip this.
+    if crate::runtime::snapshot::SnapshotStore::new(run_dir.clone())
+        .load_manifest()
+        .is_err()
+    {
+        anyhow::bail!(
+            "verify refused: no runtime.snapshot.json under {} — without the manifest the \
+             source fingerprints cannot be checked. Export fixtures from complete runs with \
+             `chidori export`.",
+            run_dir.display()
+        );
+    }
+
     // Drift gate 1: the agent source must match the recorded fingerprints.
     // No `--allow-source-change` escape here — a verify against edited code
     // is not a verification.
     crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file, false)
         .context("verify refused: the agent source no longer matches this run's checkpoint")?;
+
+    // Verification posture for the replay itself: a journal miss is an error
+    // rather than a live fallthrough, and argument-drift tolerance is off —
+    // both would let a divergent journal verify clean. Process-local: verify
+    // is a one-shot CLI run, so the env vars scope to this process.
+    std::env::set_var("CHIDORI_REPLAY_STRICT", "1");
+    std::env::set_var("CHIDORI_REPLAY_LAX", "0");
 
     // No providers, deny-all policy, no persistence: the replay must be able
     // to answer EVERY effect from the journal or fail.
@@ -3159,6 +3183,19 @@ fn cmd_verify(
     }
     let records = result.call_log.records();
     let total = records.len() as u64;
+    // Structural identity: a clean verify replays the exact recorded path,
+    // so the replayed run journals exactly as many records as the recorded
+    // journal holds. Fewer means the run took a shorter path and left
+    // journal records unconsumed — a real divergence the live-count check
+    // below cannot see (unconsumed records don't execute anything).
+    if total != journal_len {
+        anyhow::bail!(
+            "verify FAILED: the replayed run journaled {total} record(s) but the recorded \
+             journal has {journal_len} — the run no longer takes the recorded path \
+             ({} served from the journal, the rest never consumed)",
+            result.replayed_calls
+        );
+    }
     let live = total.saturating_sub(result.replayed_calls);
     // Workspace effects re-execute by design on every replay (the workspace
     // is real disk state, re-materialized rather than served from the

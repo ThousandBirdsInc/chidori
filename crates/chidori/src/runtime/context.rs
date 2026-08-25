@@ -480,6 +480,18 @@ pub(crate) fn replay_lax() -> bool {
     std::env::var("CHIDORI_REPLAY_LAX").ok().as_deref() == Some("1")
 }
 
+/// True when `CHIDORI_REPLAY_STRICT=1`: while a replay journal is loaded, a
+/// cache MISS on a checked host call is a hard error instead of falling
+/// through to live execution. This is the verification posture (`chidori
+/// verify` sets it): a journal that cannot answer every effect is an
+/// incomplete fixture, and silently executing live would mask exactly the
+/// gap the verification exists to catch. Live continuation paths that
+/// legitimately run past the journal — resume past the frontier, the
+/// approve flow's never-recorded gated call — must not run under this flag.
+pub(crate) fn replay_strict() -> bool {
+    std::env::var("CHIDORI_REPLAY_STRICT").ok().as_deref() == Some("1")
+}
+
 /// Render call args for a divergence message without flooding the error with
 /// a multi-kilobyte prompt payload.
 /// Name the top-level keys that actually differ between a recorded call's
@@ -1196,7 +1208,24 @@ impl RuntimeContext {
         expected_args: &serde_json::Value,
     ) -> Result<Option<CallRecord>, String> {
         match self.try_replay(seq) {
-            None => Ok(None),
+            None => {
+                // Strict verification: a miss while a journal is loaded means
+                // the journal cannot answer this call — surface it instead of
+                // silently going live (which a verify run's deny-all policy
+                // would only catch as a confusing downstream failure, and a
+                // permissive context would not catch at all).
+                if crate::runtime::context::replay_strict()
+                    && self.inner.lock().unwrap().replay_log.is_some()
+                {
+                    return Err(format!(
+                        "Replay strict (CHIDORI_REPLAY_STRICT=1): no journal record at seq \
+                         {seq} for `{expected_fn}` — the journal cannot answer this call. \
+                         The fixture is incomplete or the run diverged; export fixtures \
+                         from complete runs with `chidori export`."
+                    ));
+                }
+                Ok(None)
+            }
             Some(record) if record.function != expected_fn => Err(format!(
                 "Replay divergence at seq {}: checkpoint has `{}` but agent called `{}`. \
                  The agent code changed since the checkpoint was saved — \
