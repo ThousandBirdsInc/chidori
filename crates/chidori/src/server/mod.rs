@@ -115,6 +115,11 @@ struct AppState {
     /// How long a warm-parked run waits for its resume before evicting itself
     /// back to the unwind path (freeing the thread and VM).
     warm_evict: std::time::Duration,
+    /// This server process's identity as a run-lease owner (unique per boot):
+    /// resume/signal/approve take the run's single-writer lease under this
+    /// name, so a second server over the same run store loses with 409
+    /// instead of interleaving writes into the same journal.
+    lease_owner: Arc<String>,
 }
 
 /// One session's warm run: the channel its parked engine thread listens on
@@ -362,6 +367,75 @@ fn validate_snapshot_manifest_for_resume(
         agent_path,
         allow_source_change,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Run lease — single-writer arbitration for server-side resumes
+// ---------------------------------------------------------------------------
+
+/// How long a server-side resume's run lease lives. A dead holder stops
+/// renewing, so the lease lapses at its expiry and the next writer takes the
+/// run over; a live holder re-acquires (same owner renews) on every leg.
+/// `CHIDORI_RUN_LEASE_TTL_SECS` overrides; the default matches the CLI
+/// resume lease (10 minutes).
+fn run_lease_ttl() -> chrono::Duration {
+    let secs = std::env::var("CHIDORI_RUN_LEASE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(600);
+    chrono::Duration::seconds(secs)
+}
+
+/// The run lease held across one server-side resume leg. Dropping it releases
+/// the lease conditionally — a lease taken over in the meantime is left alone
+/// (see [`crate::runtime::store::release_lease`]).
+struct RunLeaseGuard {
+    store: Arc<dyn crate::runtime::store::RunStore>,
+    owner: String,
+}
+
+impl Drop for RunLeaseGuard {
+    fn drop(&mut self) {
+        if let Err(err) = crate::runtime::store::release_lease(self.store.as_ref(), &self.owner) {
+            tracing::warn!("releasing run lease: {err}");
+        }
+    }
+}
+
+/// Take the run's single-writer lease before a resume/signal/approve mutates
+/// its durable state. Two servers pointed at the same run store (a shared
+/// directory, one SQLite file, or one relay) could otherwise BOTH accept a
+/// resume of the same paused run and interleave opposite continuations into
+/// one journal — the second writer must lose, visibly. Returns:
+///   * `Ok(Some(guard))` — lease held for this leg; dropping releases it.
+///   * `Ok(None)` — nothing durable to contend for (the session has no run
+///     id), or the backend could not serve the lease at all — that degrades
+///     to the same warn-and-continue posture the CLI resume uses, because
+///     refusing every resume over a lease-less backend would turn a
+///     single-server deployment into a dead one.
+///   * `Err(holder)` — another live process holds the run; the caller turns
+///     this into 409 Conflict naming the holder.
+fn acquire_run_lease(
+    state: &AppState,
+    run_id: Option<&str>,
+) -> Result<Option<RunLeaseGuard>, crate::runtime::store::RunLease> {
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(run_id);
+    match crate::runtime::store::acquire_lease(store.as_ref(), &state.lease_owner, run_lease_ttl())
+    {
+        Ok(Ok(_)) => Ok(Some(RunLeaseGuard {
+            store,
+            owner: state.lease_owner.as_str().to_string(),
+        })),
+        Ok(Err(holder)) => Err(holder),
+        Err(err) => {
+            tracing::warn!("could not take the run lease for {run_id}: {err}");
+            Ok(None)
+        }
+    }
 }
 
 enum HostPromiseCompletion {
@@ -767,6 +841,11 @@ pub async fn serve(
         signal_inbox_locks: Arc::new(StdMutex::new(HashMap::new())),
         warm_runs: Arc::new(StdMutex::new(HashMap::new())),
         warm_evict: warm_evict_from_env(),
+        lease_owner: Arc::new(format!(
+            "chidori-serve-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )),
     };
 
     // Re-arm signal-pause timeout timers (`timeoutMs`, `docs/signals.md`

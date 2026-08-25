@@ -434,12 +434,14 @@ flowchart LR
 
 A run has exactly one writer. Two replicas sharing a mirror means two
 processes appending to the same journal: requests for a run land on an
-instance that doesn't own it, and the writers race. Run leases make the
-loser stand down, but they are advisory on `fs` and `s3://` backends
-([when things fail](#when-things-fail)) — and even where they are enforced
-(`sqlite`, the Durable Object relay), the losing replica is dead weight
-that serves errors. Nothing routes a request to a run's owner;
-active–active is a documented non-goal
+instance that doesn't own it, and the writers race. The server's
+resume/signal/approve routes take the run's lease before touching durable
+state, so the second writer answers **409 Conflict** naming the holder
+instead of interleaving a second continuation — but leases are advisory on
+`fs` and `s3://` backends ([when things fail](#when-things-fail)), and even
+where they are enforced (`sqlite`, `chidori cell-store`, the Durable Object
+relay), the losing replica is dead weight that serves 409s. Nothing routes
+a request to a run's owner; active–active is a documented non-goal
 ([durable storage](./durable-storage.md)).
 
 One caveat as runs grow long rather than numerous: resuming a very long

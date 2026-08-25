@@ -273,6 +273,20 @@ before executing and releases it on hibernate/settle; a second process
 sharing the same mirror stands down, and an expired lease (a dead node)
 transfers on the next wake.
 
+**Server resumes take the lease too.** `POST /sessions/{id}/resume`, a
+`/signal` that resolves the pending pause, and `/approve` each acquire the
+run's lease for the duration of the leg and release it when the leg settles
+or re-pauses. Two `chidori serve` processes pointed at the same run store
+therefore cannot both accept a resume of the same paused run: the second
+writer gets **409 Conflict** with `lease_holder` and `lease_expires_at` in
+the body, before any durable state is touched. The same lease excludes a
+concurrent `chidori resume` of that run from the CLI. The TTL is
+`CHIDORI_RUN_LEASE_TTL_SECS` (default 600); a dead holder's lease lapses at
+its expiry and the next writer takes the run over. On a backend that cannot
+serve the lease at all the server logs a warning and proceeds (the same
+advisory posture the CLI uses) — the guarantee column in the table below
+says how strong the arbitration is per backend.
+
 **The lease is fleet state, so it lives in the shared backend.** When a
 durable mirror is configured, lease reads and writes address the mirror
 directly rather than the local filesystem copy. Reading the local primary

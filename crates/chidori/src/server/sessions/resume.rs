@@ -14,10 +14,10 @@ use crate::storage::{SessionStatus, StoredSession};
 
 use super::super::engine::build_engine;
 use super::super::{
-    complete_persisted_pending_host_operation, enqueue_signal_to_inbox, install_warm_run,
-    load_persisted_host_promises, load_persisted_signal_inbox, load_persisted_vfs,
-    release_warm_run_if_settled, session_view, store_or_500, validate_snapshot_manifest_for_resume,
-    warm_resume_enabled, AppState, HostPromiseCompletion,
+    acquire_run_lease, complete_persisted_pending_host_operation, enqueue_signal_to_inbox,
+    install_warm_run, load_persisted_host_promises, load_persisted_signal_inbox,
+    load_persisted_vfs, release_warm_run_if_settled, session_view, store_or_500,
+    validate_snapshot_manifest_for_resume, warm_resume_enabled, AppState, HostPromiseCompletion,
 };
 use super::{agent_error_string, apply_run_outcome, arm_signal_timeout, pending_listen_names};
 
@@ -27,6 +27,26 @@ use super::{agent_error_string, apply_run_outcome, arm_signal_timeout, pending_l
 /// op's function name and match-key args, so a `signal_any` pause replays as
 /// `signal_any` with its `{names}` key and a `signal` pause as `signal` with
 /// `{name}`.
+/// 409 Conflict for a run whose single-writer lease is held by another
+/// process. Names the holder and its expiry so the caller can route the
+/// request to the owner or retry after a dead holder's lease lapses.
+fn lease_conflict_response(holder: &crate::runtime::store::RunLease) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": format!(
+                "this run is being driven by another process (lease holder `{}`, expires {}); \
+                 two concurrent writers would corrupt the journal — deliver this request to \
+                 the holder, or retry after the lease expires if the holder is dead",
+                holder.owner, holder.expires_at
+            ),
+            "lease_holder": holder.owner,
+            "lease_expires_at": holder.expires_at.to_rfc3339(),
+        })),
+    )
+        .into_response()
+}
+
 pub(super) fn signal_resolution_record(
     pending: &PendingHostOperation,
     seq: u64,
@@ -244,6 +264,17 @@ pub(in crate::server) async fn resume_session(
             .into_response();
     };
 
+    // Single-writer arbitration (docs/durable-storage.md §Leases): take the
+    // run's lease for the duration of this resume leg, so a second server
+    // over the same run store — or a concurrent CLI resume — gets 409 here
+    // instead of both writers 200ing opposite continuations into one
+    // journal. Held across BOTH paths below: the warm fast path's parked VM
+    // appends to the same journal the replay path would.
+    let _lease = match acquire_run_lease(&state, original.run_id.as_deref()) {
+        Ok(guard) => guard,
+        Err(holder) => return lease_conflict_response(&holder),
+    };
+
     // Warm fast path: this session's VM is parked on its thread awaiting
     // exactly this response — deliver it and await the leg's next outcome
     // (the next pause or the terminal result). The parked engine records the
@@ -459,6 +490,15 @@ pub(in crate::server) async fn signal_session(
                 .into_response();
         };
 
+        // Single-writer arbitration: a signal that resolves the pending pause
+        // is a resume — the same journal writes, so the same lease as
+        // /resume. The enqueue branches below stay lease-free (an inbox
+        // append is not a resume).
+        let _lease = match acquire_run_lease(&state, original.run_id.as_deref()) {
+            Ok(guard) => guard,
+            Err(holder) => return lease_conflict_response(&holder),
+        };
+
         if let Err(err) = validate_snapshot_manifest_for_resume(
             &state.run_base,
             original.run_id.as_deref(),
@@ -612,6 +652,14 @@ pub(in crate::server) async fn approve_session(
             Json(json!({"error": "No pending approval on session"})),
         )
             .into_response();
+    };
+
+    // Single-writer arbitration: an approval decision mutates the run's
+    // durable state (host-promise completion) and, on allow, re-drives the
+    // run — same lease as /resume, deny path included.
+    let _lease = match acquire_run_lease(&state, original.run_id.as_deref()) {
+        Ok(guard) => guard,
+        Err(holder) => return lease_conflict_response(&holder),
     };
 
     if let Err(err) = validate_snapshot_manifest_for_resume(
