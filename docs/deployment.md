@@ -114,8 +114,17 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   until you configure `CHIDORI_POLICY_FILE` (an explicit allowlist; malformed
   policy fails closed) or pass `--trusted` for a server running only your own
   code. See [sandbox model](./sandbox-model.md).
+- **Routing:** the default answers ANY unmatched path with `agent(event)`;
+  `--strict-routes` (`CHIDORI_SERVE_ROUTES=strict`) narrows agent execution
+  to the declared routes plus the canonical `/events` entrypoint, so an
+  exposed server no longer needs a front proxy just to bound which paths
+  run code.
 - **Optional:** `CHIDORI_CORS_ORIGINS` for browser callers;
-  `CHIDORI_MAX_CONCURRENT_SESSIONS` (default 8) to cap parallel runs;
+  `CHIDORI_MAX_CONCURRENT_SESSIONS` (default 8, or `auto` to size from the
+  machine: 2× cores) to cap parallel runs — resumes, signals, approvals,
+  and replays count against the same cap, and `GET /health` reports
+  `concurrency.available_run_slots` as an admission signal for whatever
+  routes work to the process;
   `CHIDORI_SECRET_ENV` to pass secrets as placeholder tokens the journal
   never sees. OS isolation (`CHIDORI_ISOLATE=process`) is the **default on
   Unix**; opt out with `--no-isolate` / `CHIDORI_ISOLATE=off`. In containers,

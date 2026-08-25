@@ -95,6 +95,10 @@ struct AppState {
     recipes: Arc<Vec<Recipe>>,
     /// Caps the number of agent runs executing concurrently.
     run_semaphore: Arc<Semaphore>,
+    /// The cap `run_semaphore` was built with, so `/health` can report both
+    /// the ceiling and the free slots as an admission signal for whatever
+    /// routes work to this process.
+    max_concurrent: usize,
     acquire_timeout: std::time::Duration,
     active_sessions: Arc<StdMutex<HashMap<String, ActiveSession>>>,
     /// Per-run advisory locks serializing `signals/inbox.json` read-modify-write
@@ -355,6 +359,20 @@ fn snapshot_manifest_for_session(app: &AppState, session: &StoredSession) -> Opt
     serde_json::to_value(manifest).ok()
 }
 
+/// Server-wide edit-and-resume opt-in (`chidori serve --allow-source-change`
+/// / `CHIDORI_ALLOW_SOURCE_CHANGE=1`): every resume/signal/approve behaves
+/// as if the request body had set `allow_source_change: true`, so an
+/// operator iterating on an agent with runs paused does not have to thread
+/// the flag through every client. Replay's positional divergence checks
+/// still guard the already-journaled calls, and ABI/policy drift stays
+/// fatal either way — this relaxes only the source-fingerprint refusal.
+fn allow_source_change_from_env() -> bool {
+    matches!(
+        std::env::var("CHIDORI_ALLOW_SOURCE_CHANGE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
 fn validate_snapshot_manifest_for_resume(
     run_base: &FsPath,
     run_id: Option<&str>,
@@ -365,7 +383,7 @@ fn validate_snapshot_manifest_for_resume(
         run_base,
         run_id,
         agent_path,
-        allow_source_change,
+        allow_source_change || allow_source_change_from_env(),
     )
 }
 
@@ -757,12 +775,17 @@ pub async fn serve(
     // Configurable concurrency cap. Default 8 is low enough to keep one
     // LLM provider from being flooded and high enough that a small agent
     // fleet can saturate. Expose as env var so ops can tune without a
-    // rebuild.
-    let max_concurrent: usize = std::env::var("CHIDORI_MAX_CONCURRENT_SESSIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &usize| *n > 0)
-        .unwrap_or(8);
+    // rebuild; `auto` sizes it from the machine instead of the fixed
+    // default (agent runs are I/O-heavy — they block on providers and
+    // journal writes — so 2× the cores, never below the fixed default).
+    let max_concurrent: usize = match std::env::var("CHIDORI_MAX_CONCURRENT_SESSIONS") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("auto") => std::thread::available_parallelism()
+            .map(|n| n.get().saturating_mul(2))
+            .unwrap_or(8)
+            .max(8),
+        Ok(v) => v.parse().ok().filter(|n: &usize| *n > 0).unwrap_or(8),
+        Err(_) => 8,
+    };
     let acquire_timeout_ms: u64 = std::env::var("CHIDORI_ACQUIRE_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -836,6 +859,7 @@ pub async fn serve(
         mcp_tools,
         recipes: recipes_arc,
         run_semaphore: Arc::new(Semaphore::new(max_concurrent)),
+        max_concurrent,
         acquire_timeout: std::time::Duration::from_millis(acquire_timeout_ms),
         active_sessions: Arc::new(StdMutex::new(HashMap::new())),
         signal_inbox_locks: Arc::new(StdMutex::new(HashMap::new())),
@@ -1011,9 +1035,17 @@ pub async fn serve(
         }
     );
     eprintln!();
-    eprintln!(
-        "  Events:     ANY /*           → agent(event); a pausing run becomes a session (202)"
-    );
+    if events::strict_routes_from_env() {
+        eprintln!(
+            "  Events:     ANY /events      → agent(event); strict routes — every other \
+             unknown path is 404"
+        );
+    } else {
+        eprintln!(
+            "  Events:     ANY /*           → agent(event); a pausing run becomes a session \
+             (202). CHIDORI_SERVE_ROUTES=strict narrows this to /events"
+        );
+    }
     eprintln!("  Sessions:   POST /sessions   → create & run");
     eprintln!("              GET  /sessions   → list all");
     eprintln!("              GET  /sessions/{{id}}  → get result");

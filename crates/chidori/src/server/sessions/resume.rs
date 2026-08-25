@@ -13,6 +13,7 @@ use crate::runtime::snapshot::{PendingHostOperation, PendingHostOperationKind};
 use crate::storage::{SessionStatus, StoredSession};
 
 use super::super::engine::build_engine;
+use super::super::hardening::acquire_run_slot;
 use super::super::{
     acquire_run_lease, complete_persisted_pending_host_operation, enqueue_signal_to_inbox,
     install_warm_run, load_persisted_host_promises, load_persisted_signal_inbox,
@@ -264,6 +265,16 @@ pub(in crate::server) async fn resume_session(
             .into_response();
     };
 
+    // A resumed leg executes agent code exactly like a fresh run does, so it
+    // takes a run slot: without this, resumes bypass the concurrency cap and
+    // a burst of them can pile up unbounded blocking runs. Acquired BEFORE
+    // the lease so a queued request is not holding the run hostage while it
+    // waits for a slot.
+    let _permit = match acquire_run_slot(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     // Single-writer arbitration (docs/durable-storage.md §Leases): take the
     // run's lease for the duration of this resume leg, so a second server
     // over the same run store — or a concurrent CLI resume — gets 409 here
@@ -490,6 +501,14 @@ pub(in crate::server) async fn signal_session(
                 .into_response();
         };
 
+        // A signal that resolves the pending pause re-runs the agent — same
+        // run slot as /resume. The enqueue branches stay permit-free: an
+        // inbox append is a cheap durable write, not a run.
+        let _permit = match acquire_run_slot(&state).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
         // Single-writer arbitration: a signal that resolves the pending pause
         // is a resume — the same journal writes, so the same lease as
         // /resume. The enqueue branches below stay lease-free (an inbox
@@ -652,6 +671,13 @@ pub(in crate::server) async fn approve_session(
             Json(json!({"error": "No pending approval on session"})),
         )
             .into_response();
+    };
+
+    // An approval re-drives the run on allow — same run slot as /resume.
+    // (The deny path holds it only for a cheap durable write.)
+    let _permit = match acquire_run_slot(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
 
     // Single-writer arbitration: an approval decision mutates the run's

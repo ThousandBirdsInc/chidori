@@ -62,6 +62,25 @@ pub(super) fn noise_short_circuit(path: &str, serve_all_paths: bool) -> bool {
     !serve_all_paths && is_probe_noise_path(path)
 }
 
+/// `CHIDORI_SERVE_ROUTES=strict` (or `chidori serve --strict-routes`): the
+/// ANY /* fallback stops executing the agent — only the canonical `/events`
+/// entrypoint reaches agent(event); every other unknown path is 404. The
+/// `open` default keeps the documented ANY /* behavior for webhook-shaped
+/// deployments; strict is for servers that would otherwise need a front
+/// proxy just to enumerate which paths may execute code.
+pub(super) fn strict_routes_from_env() -> bool {
+    matches!(
+        std::env::var("CHIDORI_SERVE_ROUTES").as_deref(),
+        Ok("strict")
+    )
+}
+
+/// Whether a fallback request should be refused under strict routing. Pure
+/// so both modes are unit-testable without mutating process-global env.
+pub(super) fn strict_route_short_circuit(path: &str, strict: bool) -> bool {
+    strict && path != "/events"
+}
+
 pub(super) async fn handle_event(
     State(state): State<AppState>,
     method: Method,
@@ -77,6 +96,20 @@ pub(super) async fn handle_event(
     // CHIDORI_SERVE_ALL_PATHS=1 restores agent(event) for these paths.
     if noise_short_circuit(uri.path(), serve_all_paths_from_env()) {
         return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Strict routing: unknown paths are 404, full stop — only the canonical
+    // `/events` entrypoint reaches the agent, so a front proxy (or nothing at
+    // all) can reason about exactly which paths execute code.
+    if strict_route_short_circuit(uri.path(), strict_routes_from_env()) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "unknown route: this server runs with strict routes \
+                 (CHIDORI_SERVE_ROUTES=strict); deliver events to /events"
+            })),
+        )
+            .into_response();
     }
 
     // Headers go to the agent verbatim — except any that carry the server's own

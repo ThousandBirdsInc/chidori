@@ -473,6 +473,13 @@ pub(super) async fn replay_session(
         }
     };
 
+    // A replay executes the agent end-to-end (replayed calls short-circuit,
+    // but the interpreter still runs) — same run slot as any other run.
+    let _permit = match acquire_run_slot(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     let input = original.input.clone();
     let call_log = original.call_log.clone();
     let host_promises =

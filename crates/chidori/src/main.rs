@@ -613,6 +613,24 @@ enum Commands {
         /// CHIDORI_APP_MANIFEST also names one.
         #[arg(long, value_name = "MANIFEST")]
         app: Option<PathBuf>,
+
+        /// Strict routing: only the declared routes (sessions API, manifest
+        /// webhook routes) and the canonical `/events` entrypoint are served;
+        /// every other unknown path is 404 instead of executing agent(event).
+        /// Equivalent to CHIDORI_SERVE_ROUTES=strict. The open default
+        /// answers ANY /* with agent(event), which is webhook-friendly but
+        /// means any reachable path executes the agent.
+        #[arg(long)]
+        strict_routes: bool,
+
+        /// Server-wide edit-and-resume opt-in: resumes, pause-resolving
+        /// signals, and approvals proceed even when the agent source changed
+        /// since a run was recorded, as if every request body had set
+        /// `allow_source_change: true`. Equivalent to
+        /// CHIDORI_ALLOW_SOURCE_CHANGE=1. Replay's positional divergence
+        /// checks still guard the already-journaled calls.
+        #[arg(long)]
+        allow_source_change: bool,
     },
 
     /// Serve a self-hosted durable run store — the celld model
@@ -1052,6 +1070,8 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             isolate,
             no_isolate,
             app,
+            strict_routes,
+            allow_source_change,
         } => {
             if isolate {
                 crate::runtime::isolate::enable();
@@ -1060,6 +1080,14 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             }
             if let Some(ref model) = model {
                 std::env::set_var("CHIDORI_MODEL", model);
+            }
+            // Flags are sugar over the env vars the server reads, matching
+            // how --isolate/--model configure their subsystems.
+            if strict_routes {
+                std::env::set_var("CHIDORI_SERVE_ROUTES", "strict");
+            }
+            if allow_source_change {
+                std::env::set_var("CHIDORI_ALLOW_SOURCE_CHANGE", "1");
             }
             (
                 cmd_serve(
