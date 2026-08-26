@@ -541,7 +541,8 @@ fn validate_imports_inner(
                         specifier
                     );
                 }
-                let resolved = resolve_relative_import(path, project_root, &specifier, line_no)?;
+                let resolved =
+                    resolve_relative_import(path, project_root, project_root, &specifier, line_no)?;
                 imports.push(ModuleImport {
                     specifier,
                     resolved_path: Some(resolved),
@@ -550,8 +551,13 @@ fn validate_imports_inner(
             }
             TypeScriptImportPolicy::Project => {
                 if is_relative_import(&specifier) {
-                    let resolved =
-                        resolve_relative_import(path, project_root, &specifier, line_no)?;
+                    let resolved = resolve_relative_import(
+                        path,
+                        project_root,
+                        project_root,
+                        &specifier,
+                        line_no,
+                    )?;
                     imports.push(ModuleImport {
                         specifier,
                         resolved_path: Some(resolved),
@@ -736,15 +742,20 @@ fn is_relative_import(specifier: &str) -> bool {
     specifier.starts_with("./") || specifier.starts_with("../")
 }
 
+/// Resolve a relative import: joined onto `base_dir` (the importer's
+/// directory), contained within `containment_root` — the workspace root on
+/// the runtime path, so `../shared/util` between project files works while
+/// escaping the project still fails.
 pub(crate) fn resolve_relative_import(
     source_path: &Path,
-    project_root: &Path,
+    base_dir: &Path,
+    containment_root: &Path,
     specifier: &str,
     line_no: usize,
 ) -> Result<PathBuf> {
-    let path = project_root.join(specifier);
+    let path = base_dir.join(specifier);
     let normalized = normalize_path(&path);
-    let root = normalize_path(project_root);
+    let root = normalize_path(containment_root);
     if !normalized.starts_with(&root) {
         anyhow::bail!(
             "{}:{}: TypeScript import escapes project root: {}",
@@ -758,8 +769,10 @@ pub(crate) fn resolve_relative_import(
     // should not have to know our module loader is stricter. If the specifier
     // already names a file (with or without a known extension), use it as-is.
     // Otherwise probe `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs` and return the first
-    // that exists. If none exist, default to the `.ts` candidate so a missing-
-    // file error names the most likely intended path.
+    // that exists, then a directory's `index.*` (matching the Node resolver's
+    // `load_as_file` → `load_as_index` order, so `chidori check` and the
+    // runtime agree on `import "./dir"`). If none exist, default to the `.ts`
+    // candidate so a missing-file error names the most likely intended path.
     if normalized.is_file() {
         return Ok(normalized);
     }
@@ -779,6 +792,14 @@ pub(crate) fn resolve_relative_import(
         let candidate = PathBuf::from(candidate);
         if candidate.is_file() {
             return Ok(candidate);
+        }
+    }
+    if normalized.is_dir() {
+        for ext in ["ts", "tsx", "js", "mjs", "cjs"] {
+            let candidate = normalized.join(format!("index.{ext}"));
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
     }
     let mut fallback = normalized.into_os_string();

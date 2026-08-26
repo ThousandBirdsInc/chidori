@@ -158,11 +158,13 @@ fn test_state(run_base: PathBuf, agent_path: PathBuf) -> AppState {
         mcp_tools: Arc::new(Vec::new()),
         recipes: Arc::new(Vec::new()),
         run_semaphore: Arc::new(Semaphore::new(1)),
+        max_concurrent: 1,
         acquire_timeout: std::time::Duration::from_millis(1),
         active_sessions: Arc::new(StdMutex::new(HashMap::new())),
         signal_inbox_locks: Arc::new(StdMutex::new(HashMap::new())),
         warm_runs: Arc::new(StdMutex::new(HashMap::new())),
         warm_evict: warm_evict_from_env(),
+        lease_owner: Arc::new(format!("chidori-serve-test-{}", uuid::Uuid::new_v4())),
     }
 }
 
@@ -3221,4 +3223,149 @@ fn preflight_flags_only_unconditionally_denied_targets() {
     let denied = preflight::denied_static_effects(HTTP_AGENT, &layered);
     assert_eq!(denied.len(), 1, "denied: {denied:?}");
     assert_eq!(denied[0].0.target, "http");
+}
+
+// ---------------------------------------------------------------------------
+// Run lease — single-writer arbitration (docs/durable-storage.md §Leases)
+// ---------------------------------------------------------------------------
+
+/// Two servers over the same run store must not both accept a resume of the
+/// same paused run: the second writer gets 409 naming the holder, before any
+/// durable state is touched.
+#[tokio::test]
+async fn resume_session_returns_409_when_run_lease_held_elsewhere() {
+    let run_base = test_run_base("chidori-srv-lease-held");
+    let agent_path = run_base.join("agent.ts");
+    std::fs::write(&agent_path, "export async function agent() { return {}; }").unwrap();
+    let run_id = "contended-run";
+    std::fs::create_dir_all(run_base.join(run_id)).unwrap();
+    // Another process — a second server, or a CLI resume — holds the run.
+    let store = crate::runtime::store::RunStoreFactory::shared(&run_base).store_for(run_id);
+    crate::runtime::store::acquire_lease(
+        store.as_ref(),
+        "other-server",
+        chrono::Duration::minutes(10),
+    )
+    .unwrap()
+    .expect("free lease must be acquirable");
+
+    let state = test_state(run_base, agent_path);
+    let session = StoredSession {
+        id: "session-1".to_string(),
+        run_id: Some(run_id.to_string()),
+        status: SessionStatus::Paused,
+        input: json!({}),
+        output: None,
+        call_log: Vec::new(),
+        error: None,
+        pending_seq: Some(2),
+        pending_prompt: Some("continue?".to_string()),
+        pending_details: None,
+        pending_signal_name: None,
+        pending_signal_names: Vec::new(),
+        pending_signal_deadline: None,
+        pending_approval: None,
+        approvals: Vec::new(),
+        policy_profile: None,
+        created_at: chrono::Utc::now(),
+    };
+    state.session_store.put(&session).unwrap();
+
+    let (status, body) = response_json(
+        resume_session(
+            State(state.clone()),
+            Path("session-1".to_string()),
+            Json(ResumeRequest {
+                response: "yes".to_string(),
+                allow_source_change: false,
+            }),
+        )
+        .await,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["lease_holder"], json!("other-server"));
+    // The loser wrote nothing: the session is still paused and the holder's
+    // lease is intact.
+    let stored = state.session_store.get("session-1").unwrap().unwrap();
+    assert_eq!(stored.status, SessionStatus::Paused);
+    let held = crate::runtime::store::acquire_lease(
+        store.as_ref(),
+        "third-party",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap();
+    assert_eq!(held.expect_err("still held").owner, "other-server");
+}
+
+/// The guard's lifecycle: a free run is acquirable, the holder excludes other
+/// owners, the same server renews (a second leg re-acquires under the same
+/// owner), and dropping the guard releases the run for the next writer.
+#[tokio::test]
+async fn run_lease_guard_excludes_other_owners_and_releases_on_drop() {
+    let run_base = test_run_base("chidori-srv-lease-guard");
+    let agent_path = run_base.join("agent.ts");
+    std::fs::write(&agent_path, "export async function agent() { return {}; }").unwrap();
+    let run_id = "guarded-run";
+    std::fs::create_dir_all(run_base.join(run_id)).unwrap();
+    let state = test_state(run_base.clone(), agent_path);
+
+    let guard = acquire_run_lease(&state, Some(run_id))
+        .expect("free run must be acquirable")
+        .expect("run id present ⇒ a guard");
+    // Another owner loses while the guard lives.
+    let store = crate::runtime::store::RunStoreFactory::shared(&run_base).store_for(run_id);
+    let contender = crate::runtime::store::acquire_lease(
+        store.as_ref(),
+        "other-server",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap();
+    assert_eq!(
+        contender.expect_err("held by this server").owner,
+        state.lease_owner.as_str()
+    );
+    // The same server renews: a second leg re-acquires under the same owner.
+    let renewal = acquire_run_lease(&state, Some(run_id)).expect("same owner renews");
+    assert!(renewal.is_some());
+    drop(renewal);
+    drop(guard);
+    // Released: the next writer takes the run.
+    crate::runtime::store::acquire_lease(
+        store.as_ref(),
+        "other-server",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap()
+    .expect("released lease must be acquirable");
+    // Sessions with no run id have nothing durable to contend for.
+    assert!(acquire_run_lease(&state, None).unwrap().is_none());
+}
+
+/// Strict routing (`CHIDORI_SERVE_ROUTES=strict`) narrows the ANY /* event
+/// fallback to the canonical `/events` entrypoint; the open default keeps
+/// every path webhook-routable.
+#[test]
+fn strict_routes_narrow_the_event_fallback_to_events() {
+    use events::strict_route_short_circuit;
+    assert!(!strict_route_short_circuit("/hook/github", false));
+    assert!(!strict_route_short_circuit("/", false));
+    assert!(strict_route_short_circuit("/hook/github", true));
+    assert!(strict_route_short_circuit("/", true));
+    assert!(!strict_route_short_circuit("/events", true));
+}
+
+/// `/health` carries the admission signal an external router needs: the
+/// concurrency ceiling and the currently free run slots.
+#[tokio::test]
+async fn health_reports_run_slot_availability() {
+    let run_base = test_run_base("chidori-srv-health");
+    let agent_path = run_base.join("agent.ts");
+    std::fs::write(&agent_path, "export async function agent() { return {}; }").unwrap();
+    let state = test_state(run_base, agent_path);
+    let (status, body) = response_json(health(State(state)).await.into_response()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["concurrency"]["max_concurrent_sessions"], json!(1));
+    assert_eq!(body["concurrency"]["available_run_slots"], json!(1));
 }

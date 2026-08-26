@@ -358,6 +358,39 @@ impl Engine {
                     }
                 }
             });
+        // The two internal halves of `chidori.memo(name, fn)` — the
+        // ASYNC-capable durable value checkpoint. `memo`'s callback may await
+        // and perform host effects, so the awaiting itself must happen in JS:
+        // the `chidori.memo` wrapper (installed by the runtime's helper
+        // script) calls `__memoBegin` (journal probe; a hit carries the
+        // recorded value/error and the host absorbs the recorded subtree),
+        // runs the callback only on a miss, then reports the settled outcome
+        // through `__memoEnd`, which records one `memo` CallRecord at the
+        // reserved seq.
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&chidori, "__memoBegin", 1, move |vm, _t, args| {
+                let name = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                match d("memo_begin", &serde_json::json!({ "name": name })) {
+                    Ok(j) => Ok(vm.json_to_value(&j)),
+                    Err(e) => Err(vm.make_error(crate::vm::ErrorKind::Error, &e)),
+                }
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&chidori, "__memoEnd", 1, move |vm, _t, args| {
+                let payload = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                match d("memo_end", &payload) {
+                    Ok(j) => Ok(vm.json_to_value(&j)),
+                    Err(e) => Err(vm.make_error(crate::vm::ErrorKind::Error, &e)),
+                }
+            });
         let d = dispatch.clone();
         // chidori.mark(label, data) — a labelled trace marker in the call log.
         // (Named `mark`, not `checkpoint`: the durable value checkpoint is
@@ -1149,7 +1182,7 @@ impl Engine {
             if registry.modules.contains_key(&key) {
                 continue;
             }
-            let compiled = compiler::compile_module_labeled(&src, Some(&key))
+            let compiled = compiler::compile_module_labeled_cached(&src, Some(&key))
                 .map_err(|e| format!("compiling module '{key}': {e}"))?;
             let cell_of_name = compiled.cell_of_name.clone();
             let requested = compiled.requested.clone();
@@ -1226,7 +1259,7 @@ impl Engine {
             if registry.modules.contains_key(&key) {
                 continue;
             }
-            let compiled = compiler::compile_module_labeled(&src, Some(&key))
+            let compiled = compiler::compile_module_labeled_cached(&src, Some(&key))
                 .map_err(|e| format!("compiling module '{key}': {e}"))?;
             let cell_of_name = compiled.cell_of_name.clone();
             let requested = compiled.requested.clone();

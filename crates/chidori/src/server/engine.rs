@@ -80,6 +80,12 @@ pub(super) fn run_agent_sync(app: &AppState, inputs: Value) -> anyhow::Result<Va
              restart it with an agent path to serve agent runs"
         );
     }
+    // Sync caller (the ACP bridge), so no queued wait: take a run slot if one
+    // is free, shed with the same "server busy" shape the async routes use
+    // when the cap is saturated. Without this, ACP runs bypassed the cap.
+    let _permit = app.run_semaphore.clone().try_acquire_owned().map_err(|_| {
+        anyhow::anyhow!("server busy; all concurrent-session slots are in use — retry shortly")
+    })?;
     let engine = build_engine(app, None);
     let result = engine.run(&app.agent_path, &inputs)?;
     Ok(result.output)

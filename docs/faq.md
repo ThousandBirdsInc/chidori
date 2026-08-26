@@ -112,6 +112,26 @@ copy from a tutorial ([CLI reference](./cli.md#approval-postures)).
 [Deployment](./deployment.md) has the full checklist, including recipes for
 a plain VM, Fly.io, and Kubernetes.
 
+### What is the license and supply-chain posture?
+
+For a dependency/licence review, the facts are:
+
+- **Everything ships Apache-2.0**: the workspace crates (`chidori`,
+  `chidori-js`), the npm SDK (`@1kbirds/chidori`), and the PyPI SDK
+  (`chidori`) all declare `Apache-2.0`.
+- **Dependency licenses are allowlisted and CI-enforced.** `deny.toml`
+  pins the permitted set (Apache-2.0, MIT, BSD-2/3, ISC, Zlib, BSL-1.0,
+  Unicode-3.0, Unlicense — no copyleft), and `cargo deny check` runs on
+  every PR and weekly (`.github/workflows/security.yml`), covering RustSec
+  advisories, yanked crates, and license drift. A new dependency with a new
+  license fails CI until the allowlist is extended deliberately.
+- **All Rust dependencies come from crates.io** — git and alternate-registry
+  sources are denied by configuration, so the tree you audit is the tree
+  that builds.
+- **Generate your own inventory** with `cargo deny list` (or `cargo about`)
+  against the lockfile; the committed `Cargo.lock` makes the resolution
+  reproducible.
+
 ### Do sessions survive a server restart?
 
 Yes, by default: sessions persist in SQLite next to the agent

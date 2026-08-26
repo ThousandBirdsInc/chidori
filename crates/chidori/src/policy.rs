@@ -112,15 +112,15 @@ impl PolicyConfig {
                 Err(e) => tracing::warn!("CHIDORI_POLICY parse error: {}", e),
             }
         }
-        if let Ok(profile) = std::env::var("CHIDORI_POLICY_PROFILE") {
-            let profile = profile.trim();
-            if !profile.is_empty() {
-                match builtin_profile(profile) {
+        if let Ok(profile_name) = std::env::var("CHIDORI_POLICY_PROFILE") {
+            let profile_name = profile_name.trim();
+            if !profile_name.is_empty() {
+                match profile(profile_name) {
                     Some(cfg) => return Some(Arc::new(cfg)),
                     None => tracing::warn!(
                         "CHIDORI_POLICY_PROFILE: unknown profile `{}` (known: {})",
-                        profile,
-                        BUILTIN_PROFILES.join(", ")
+                        profile_name,
+                        known_profiles().join(", ")
                     ),
                 }
             }
@@ -174,11 +174,122 @@ impl PolicyConfig {
         });
         base
     }
+
+    /// The hosts this policy's unconditional `http` allow rules name — the
+    /// anchored `url_prefix` form, `AlwaysAllow` decisions only. An operator
+    /// who wrote `{"target": "http", "decision": "always_allow",
+    /// "match_args": {"url_prefix": "http://ops.internal:9911/"}}` has
+    /// already made the egress decision for that endpoint; these hosts are
+    /// registered with the SSRF guard so the policy file is the single gate
+    /// to open (previously the same host had to ALSO be listed in
+    /// `CHIDORI_HTTP_ALLOW_HOSTS`, a second gate carrying no additional
+    /// information — and one that made every private-range service a
+    /// two-step allowlisting). `AskBefore` rules are deliberately excluded:
+    /// an approval is per-call, not a standing egress allowance.
+    pub fn allowlisted_http_hosts(&self) -> Vec<String> {
+        let mut hosts = Vec::new();
+        for rule in &self.rules {
+            if rule.target != "http" || rule.decision != Decision::AlwaysAllow {
+                continue;
+            }
+            let Some(prefix) = rule
+                .match_args
+                .as_ref()
+                .and_then(|args| args.get("url_prefix"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            if let Ok(url) = url::Url::parse(prefix) {
+                if let Some(host) = url.host_str() {
+                    hosts.push(host.to_string());
+                }
+            }
+        }
+        if let Some(overlay) = &self.overlay {
+            hosts.extend(overlay.allowlisted_http_hosts());
+        }
+        hosts
+    }
+}
+
+/// Register every host `cfg` unconditionally allows for `http` with the SSRF
+/// guard, so a policy-file allowlist is sufficient on its own to reach the
+/// endpoint — including cluster services on RFC-1918 addresses. Idempotent;
+/// called wherever a policy is attached to an engine. The policy gate still
+/// runs first on every call, so this widens nothing the policy denies.
+pub fn trust_allowlisted_http_hosts(cfg: &PolicyConfig) {
+    for host in cfg.allowlisted_http_hosts() {
+        crate::runtime::ssrf::trust_host(&host);
+    }
 }
 
 /// Names of the built-in profiles selectable via `CHIDORI_POLICY_PROFILE`,
 /// the `--untrusted` CLI flag, or a session's `policy_profile` field.
 pub const BUILTIN_PROFILES: &[&str] = &["untrusted", "supervised"];
+
+/// Directory of operator-defined policy profiles: `<name>.json`, each a
+/// [`PolicyConfig`]. Every name resolvable here is selectable anywhere a
+/// built-in profile name is — `CHIDORI_POLICY_PROFILE`, a session's
+/// `policy_profile` field — so a fleet operator can generate one policy
+/// file per tenant/team and have callers pick it per session, with the
+/// same guarantees the built-ins carry: sticky for the session's lifetime,
+/// stricter-wins against the server policy, and fails closed (an unknown
+/// or unparsable name is rejected, never defaulted open).
+pub const PROFILE_DIR_ENV: &str = "CHIDORI_POLICY_PROFILE_DIR";
+
+/// Resolve a profile name: built-ins first, then `<name>.json` under
+/// `CHIDORI_POLICY_PROFILE_DIR`. `None` for anything unknown or malformed
+/// (a malformed file warns and fails closed as unknown).
+pub fn profile(name: &str) -> Option<PolicyConfig> {
+    builtin_profile(name).or_else(|| custom_profile(name))
+}
+
+fn custom_profile(name: &str) -> Option<PolicyConfig> {
+    let dir = std::env::var(PROFILE_DIR_ENV).ok()?;
+    // Profile names arrive from session requests: allow only flat,
+    // path-safe names so a caller can never traverse out of the directory.
+    let safe = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !safe {
+        return None;
+    }
+    let path = std::path::Path::new(&dir).join(format!("{name}.json"));
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<PolicyConfig>(&text) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            tracing::warn!(
+                "policy profile `{name}` ({}) is malformed and treated as unknown: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// The selectable profile names, for error messages: the built-ins plus any
+/// `*.json` files in `CHIDORI_POLICY_PROFILE_DIR`.
+pub fn known_profiles() -> Vec<String> {
+    let mut names: Vec<String> = BUILTIN_PROFILES.iter().map(|s| s.to_string()).collect();
+    if let Ok(dir) = std::env::var(PROFILE_DIR_ENV) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
 
 /// Build a ready-made [`PolicyConfig`] by name, or `None` for an unknown name.
 ///
@@ -682,5 +793,84 @@ mod tests {
         assert_eq!(decision, Decision::AlwaysAllow);
         let (decision, _) = cfg.decide("workspace:write", &json!({ "path": "a.txt" }));
         assert_eq!(decision, Decision::AlwaysAllow);
+    }
+
+    /// The single-gate contract: unconditional `http` allow rules with an
+    /// anchored `url_prefix` name their hosts for the SSRF guard; ask-gated
+    /// rules, substring matchers (no host to name), and non-http targets
+    /// contribute nothing.
+    #[test]
+    fn allowlisted_http_hosts_come_from_always_allow_url_prefix_rules_only() {
+        let rule = |target: &str, decision: Decision, args: Value| PolicyRule {
+            target: target.to_string(),
+            decision,
+            match_args: Some(args),
+            reason: None,
+        };
+        let cfg = PolicyConfig {
+            rules: vec![
+                rule(
+                    "http",
+                    Decision::AlwaysAllow,
+                    json!({"url_prefix": "http://ops.internal:9911/"}),
+                ),
+                rule(
+                    "http",
+                    Decision::AskBefore,
+                    json!({"url_prefix": "https://ask.example.com/"}),
+                ),
+                rule("http", Decision::AlwaysAllow, json!({"url": "/status/"})),
+                rule(
+                    "tool:deploy",
+                    Decision::AlwaysAllow,
+                    json!({"url_prefix": "https://tool.example.com/"}),
+                ),
+            ],
+            default: Decision::NeverAllow,
+            default_reason: None,
+            overlay: None,
+        };
+        assert_eq!(cfg.allowlisted_http_hosts(), vec!["ops.internal"]);
+    }
+
+    /// Operator-defined profiles from CHIDORI_POLICY_PROFILE_DIR resolve by
+    /// name next to the built-ins, malformed files fail closed as unknown,
+    /// and names are path-safe (a session request can never traverse out of
+    /// the directory).
+    #[test]
+    fn custom_profile_dir_resolves_named_profiles_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("team-a.json"),
+            r#"{"default": "never_allow", "rules": [
+                {"target": "http", "decision": "always_allow",
+                 "match_args": {"url_prefix": "https://api.team-a.example/"}}
+            ]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("broken.json"), "{not json").unwrap();
+        std::env::set_var(PROFILE_DIR_ENV, dir.path());
+
+        let team = profile("team-a").expect("team-a.json resolves");
+        let (decision, _) = team.decide(
+            "http",
+            &json!({"url": "https://api.team-a.example/v1/things"}),
+        );
+        assert_eq!(decision, Decision::AlwaysAllow);
+        let (decision, _) = team.decide("http", &json!({"url": "https://elsewhere.example/"}));
+        assert_eq!(decision, Decision::NeverAllow);
+
+        // Built-ins still win the name lookup; malformed and traversal-shaped
+        // names are unknown.
+        assert!(profile("untrusted").is_some());
+        assert!(profile("broken").is_none());
+        assert!(profile("../team-a").is_none());
+        assert!(profile("team-a/../../etc/passwd").is_none());
+
+        let known = known_profiles();
+        assert!(known.contains(&"team-a".to_string()), "known: {known:?}");
+        assert!(known.contains(&"untrusted".to_string()));
+
+        std::env::remove_var(PROFILE_DIR_ENV);
     }
 }

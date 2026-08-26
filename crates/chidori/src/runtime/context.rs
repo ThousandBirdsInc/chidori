@@ -239,6 +239,10 @@ struct RuntimeContextInner {
     /// Surfaced after a resume so the consumer can audit what a recovery
     /// actually replayed vs. re-executed (and re-billed).
     pub replay_hits: u64,
+    /// End-of-run engine metering reported by the VM host (`ops_used`, peak
+    /// heap, the caps in force), persisted as the run's `metrics.json` at the
+    /// next durable safepoint. `None` until the engine reports.
+    pub run_metrics: Option<serde_json::Value>,
     /// Sequence counter for call log entries.
     pub seq: u64,
     /// Pre-loaded call log for replay mode. When set, host functions
@@ -259,8 +263,9 @@ struct RuntimeContextInner {
     /// policy is strict. Checked before the next live host effect executes so
     /// a run cannot keep taking side effects its journal isn't recording.
     pub persist_failure: Option<String>,
-    /// Whether persistence failures poison the run (`CHIDORI_DURABILITY=strict`)
-    /// or are logged and tolerated (default, the pre-store behavior).
+    /// Whether persistence failures poison the run (`CHIDORI_DURABILITY=strict`
+    /// or `effect`) or are logged and tolerated (default, the pre-store
+    /// behavior).
     pub strict_durability: bool,
     /// How `input()` should behave when there is no cached response:
     /// read from stdin, or pause the run and surface the prompt to the caller.
@@ -480,6 +485,18 @@ pub(crate) fn replay_lax() -> bool {
     std::env::var("CHIDORI_REPLAY_LAX").ok().as_deref() == Some("1")
 }
 
+/// True when `CHIDORI_REPLAY_STRICT=1`: while a replay journal is loaded, a
+/// cache MISS on a checked host call is a hard error instead of falling
+/// through to live execution. This is the verification posture (`chidori
+/// verify` sets it): a journal that cannot answer every effect is an
+/// incomplete fixture, and silently executing live would mask exactly the
+/// gap the verification exists to catch. Live continuation paths that
+/// legitimately run past the journal — resume past the frontier, the
+/// approve flow's never-recorded gated call — must not run under this flag.
+pub(crate) fn replay_strict() -> bool {
+    std::env::var("CHIDORI_REPLAY_STRICT").ok().as_deref() == Some("1")
+}
+
 /// Render call args for a divergence message without flooding the error with
 /// a multi-kilobyte prompt payload.
 /// Name the top-level keys that actually differ between a recorded call's
@@ -576,13 +593,14 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: 0,
                 replay_log: None,
                 run_id: uuid::Uuid::new_v4().to_string(),
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -653,13 +671,14 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: 0,
                 replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id: uuid::Uuid::new_v4().to_string(),
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -702,13 +721,14 @@ impl RuntimeContext {
                 // handle; the first checkpoint write must include them.
                 call_log_dirty: true,
                 replay_hits: 0,
+                run_metrics: None,
                 seq,
                 replay_log: None,
                 run_id,
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -759,13 +779,14 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: base_seq,
                 replay_log: None,
                 run_id,
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: parent_inner.input_mode,
                 pending_input: None,
                 pending_approval: None,
@@ -817,13 +838,14 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: base_seq,
                 replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id,
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Pause,
                 pending_input: None,
                 pending_approval: None,
@@ -886,13 +908,14 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: base_seq,
                 replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id: actor_id.clone(),
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Pause,
                 pending_input: None,
                 pending_approval: None,
@@ -1172,6 +1195,18 @@ impl RuntimeContext {
         self.inner.lock().unwrap().replay_hits
     }
 
+    /// Record the engine's end-of-run metering (opcode count, peak heap, the
+    /// caps in force). Persisted as `metrics.json` at the next durable
+    /// safepoint, so the journal owner can bill on exact numbers instead of
+    /// just `duration_ms`.
+    pub fn set_run_metrics(&self, metrics: serde_json::Value) {
+        self.inner.lock().unwrap().run_metrics = Some(metrics);
+    }
+
+    pub fn run_metrics(&self) -> Option<serde_json::Value> {
+        self.inner.lock().unwrap().run_metrics.clone()
+    }
+
     /// Replay-cache lookup with divergence check. Returns:
     ///   Ok(Some(record)) — cached, and the cached record's function name AND
     ///                      arguments match the call the agent is making now.
@@ -1196,7 +1231,24 @@ impl RuntimeContext {
         expected_args: &serde_json::Value,
     ) -> Result<Option<CallRecord>, String> {
         match self.try_replay(seq) {
-            None => Ok(None),
+            None => {
+                // Strict verification: a miss while a journal is loaded means
+                // the journal cannot answer this call — surface it instead of
+                // silently going live (which a verify run's deny-all policy
+                // would only catch as a confusing downstream failure, and a
+                // permissive context would not catch at all).
+                if crate::runtime::context::replay_strict()
+                    && self.inner.lock().unwrap().replay_log.is_some()
+                {
+                    return Err(format!(
+                        "Replay strict (CHIDORI_REPLAY_STRICT=1): no journal record at seq \
+                         {seq} for `{expected_fn}` — the journal cannot answer this call. \
+                         The fixture is incomplete or the run diverged; export fixtures \
+                         from complete runs with `chidori export`."
+                    ));
+                }
+                Ok(None)
+            }
             Some(record) if record.function != expected_fn => Err(format!(
                 "Replay divergence at seq {}: checkpoint has `{}` but agent called `{}`. \
                  The agent code changed since the checkpoint was saved — \
@@ -1833,6 +1885,21 @@ impl RuntimeContext {
         if let Some(safepoint) = safepoint {
             safepoint.call(&operation)?;
         }
+        // CHIDORI_DURABILITY=effect: the pending-intent write above must be
+        // DURABLE before the effect fires — barrier the (still-pipelined)
+        // store here, at the one chokepoint every host-operation kind
+        // (prompt, http, tool, call_agent, …) passes through, so a crash
+        // mid-effect always leaves a durable trace that the effect may have
+        // executed. Strict mode needs no barrier: every write is already
+        // synchronous.
+        if crate::runtime::store::effect_barriers() {
+            self.flush_store().map_err(|err| {
+                anyhow::anyhow!(
+                    "refusing the live effect: the effect-intent barrier failed under \
+                     CHIDORI_DURABILITY=effect: {err}"
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -1852,6 +1919,13 @@ impl RuntimeContext {
         };
         if let Some(safepoint) = safepoint {
             safepoint.call(&record)?;
+        }
+        // CHIDORI_DURABILITY=effect: the effect's outcome is durable before
+        // the program observes it, so recovery replays this effect from the
+        // journal instead of re-executing it. Same chokepoint argument as
+        // the pre-effect barrier above.
+        if crate::runtime::store::effect_barriers() {
+            self.flush_store()?;
         }
         Ok(())
     }

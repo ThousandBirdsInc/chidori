@@ -880,6 +880,19 @@ export interface Chidori {
    */
   step<T extends AgentJson = AgentJson>(name: string, fn: () => T): Promise<T>;
   /**
+   * Async-capable durable value checkpoint: run `fn` once — it may await and
+   * perform journaled host effects (`chidori.*`, `fetch`), which record as
+   * the memo's children — and journal its JSON-serializable result; on
+   * replay/resume the recorded value (or error) is returned and neither the
+   * callback nor its inner effects re-run. Use `memo` where a checkpoint
+   * needs async work inside it, and `step` for pure synchronous compute
+   * (steps additionally *enforce* purity).
+   */
+  memo<T extends AgentJson = AgentJson>(
+    name: string,
+    fn: () => T | Promise<T>,
+  ): Promise<T>;
+  /**
    * Run another agent module inline and return its output — a synchronous
    * child call sharing this run's context and log. Of the three module
    * runners: need the answer inline → `callAgent`; comparing strategies →

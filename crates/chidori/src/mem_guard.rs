@@ -48,10 +48,28 @@ const INNER: std::alloc::System = std::alloc::System;
 /// synchronization primitive, and the watchdog only needs an approximate sample.
 static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
+/// One run's allocation meter: net live bytes plus the high-water mark, so a
+/// completed run can report its peak heap (the number metering/billing wants)
+/// and not just the instantaneous value the watchdog samples.
+#[derive(Debug, Default)]
+pub struct RunMeter {
+    net: AtomicIsize,
+    peak: AtomicIsize,
+}
+
+impl RunMeter {
+    fn charge(&self, delta: isize) {
+        let now = self.net.fetch_add(delta, Ordering::Relaxed) + delta;
+        if delta > 0 {
+            self.peak.fetch_max(now, Ordering::Relaxed);
+        }
+    }
+}
+
 thread_local! {
     /// The meter of the run currently executing on this thread, if any.
     /// `const`-initialized so the allocator's fast path never allocates.
-    static RUN_METER: RefCell<Option<Arc<AtomicIsize>>> = const { RefCell::new(None) };
+    static RUN_METER: RefCell<Option<Arc<RunMeter>>> = const { RefCell::new(None) };
 }
 
 /// Adjust both the process-wide counter and (when registered) the current
@@ -63,11 +81,11 @@ fn charge(delta: isize) {
         ALLOCATED.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
     }
     // `try_with` so an allocation during TLS teardown is counted process-wide
-    // but never panics. `fetch_add` cannot allocate, so the borrow can never
-    // be re-entered.
+    // but never panics. `fetch_add`/`fetch_max` cannot allocate, so the
+    // borrow can never be re-entered.
     let _ = RUN_METER.try_with(|slot| {
         if let Some(meter) = slot.borrow().as_ref() {
-            meter.fetch_add(delta, Ordering::Relaxed);
+            meter.charge(delta);
         }
     });
 }
@@ -82,19 +100,19 @@ fn charge(delta: isize) {
 /// — meter themselves while registered and hand accounting back to the parent
 /// afterwards.
 pub struct RunMeterGuard {
-    meter: Arc<AtomicIsize>,
-    previous: Option<Arc<AtomicIsize>>,
+    meter: Arc<RunMeter>,
+    previous: Option<Arc<RunMeter>>,
 }
 
 impl RunMeterGuard {
     pub fn install() -> Self {
-        let meter = Arc::new(AtomicIsize::new(0));
+        let meter = Arc::new(RunMeter::default());
         let previous = RUN_METER.with(|slot| slot.borrow_mut().replace(meter.clone()));
         RunMeterGuard { meter, previous }
     }
 
-    /// A sampling handle for the watchdog thread.
-    pub fn handle(&self) -> Arc<AtomicIsize> {
+    /// A sampling handle for the watchdog thread (and end-of-run reporting).
+    pub fn handle(&self) -> Arc<RunMeter> {
         self.meter.clone()
     }
 }
@@ -111,8 +129,13 @@ impl Drop for RunMeterGuard {
 
 /// Net live bytes charged to a run meter, clamped at zero (cross-thread frees
 /// can push the raw counter negative).
-pub fn run_meter_bytes(meter: &AtomicIsize) -> usize {
-    meter.load(Ordering::Relaxed).max(0) as usize
+pub fn run_meter_bytes(meter: &RunMeter) -> usize {
+    meter.net.load(Ordering::Relaxed).max(0) as usize
+}
+
+/// Peak live bytes a run meter ever reached, clamped at zero.
+pub fn run_meter_peak_bytes(meter: &RunMeter) -> usize {
+    meter.peak.load(Ordering::Relaxed).max(0) as usize
 }
 
 /// A `#[global_allocator]`-compatible wrapper over [`INNER`] that tracks live
@@ -182,6 +205,20 @@ mod tests {
         drop(guard);
         charge(512); // after unregistration nothing is charged to the meter
         assert_eq!(run_meter_bytes(&meter), at_drop);
+    }
+
+    #[test]
+    fn meter_tracks_the_high_water_mark() {
+        let guard = RunMeterGuard::install();
+        let meter = guard.handle();
+        let base = run_meter_bytes(&meter);
+        charge(1000);
+        charge(-900);
+        charge(200);
+        // Net is base+300, but the peak saw the base+1000 moment (incidental
+        // test-harness allocations can only push it higher).
+        assert_eq!(run_meter_bytes(&meter), base + 300);
+        assert!(run_meter_peak_bytes(&meter) >= base + 1000);
     }
 
     #[test]

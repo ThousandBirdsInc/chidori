@@ -260,7 +260,7 @@ impl ScaffoldPersister {
         let pending = ctx.active_pending_host_operation();
         let compact = checkpoint == CheckpointWrite::Compact;
         let (modules, module_graph) = self.modules()?;
-        let mut manifest = SnapshotManifest::new(
+        let manifest = SnapshotManifest::new(
             &self.run_id,
             SnapshotAbi::current("chidori-quickjs"),
             self.policy.clone(),
@@ -274,14 +274,15 @@ impl ScaffoldPersister {
         .with_vfs(ctx.vfs_snapshot())
         .with_default_model(Some(ctx.config().model))
         .with_pricing(std::env::var("CHIDORI_PRICING").ok());
-        // The embedded host-promise table has the same freshness contract as
-        // checkpoint.json: a compaction-time snapshot. Runtime resume never
-        // reads it (deliveries and replay load `host_promises.json` ∪ the
-        // per-op blobs); embedding the whole table per safepoint was the
-        // other O(history)-per-call term.
-        if compact {
-            manifest = manifest.with_host_promises(ctx.host_promise_records());
-        }
+        // The host-promise table is NOT embedded in the persisted manifest:
+        // runtime resume never reads it from there (deliveries and replay
+        // load `host_promises.json` ∪ the per-op blobs), so embedding it
+        // duplicated every large result value once more inside
+        // `runtime.snapshot.json` — one of the copies behind the ~4× on-disk
+        // amplification of big response bodies. Compaction below still folds
+        // the table into its own `host_promises.json`, which is the copy
+        // readers use.
+        let host_promise_records = compact.then(|| ctx.host_promise_records());
         // Write through the run's store handle when persistence is enabled, so
         // a configured durable mirror receives the scaffold too; identical
         // on-disk layout either way.
@@ -313,8 +314,18 @@ impl ScaffoldPersister {
             ctx.clear_call_log_checkpoint_dirty(call_log.len());
             floor.fetch_max(call_log.len(), Ordering::SeqCst);
         }
-        if compact {
-            store.compact_host_promises(&manifest.host_promises)?;
+        if let Some(records) = &host_promise_records {
+            store.compact_host_promises(records)?;
+        }
+        // End-of-run engine metering, when the VM host has reported it. A
+        // plain blob — never a journal record — so replay/verify semantics
+        // are untouched; billing readers find it as `metrics.json`.
+        if let Some(metrics) = ctx.run_metrics() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&metrics) {
+                if let Err(err) = run_store.put_blob("metrics.json", &bytes) {
+                    tracing::warn!(run_id = %self.run_id, error = %err, "writing metrics.json");
+                }
+            }
         }
         store.put_pending(manifest.pending.as_ref())
     }
@@ -409,12 +420,16 @@ impl Engine {
         template_engine: Arc<TemplateEngine>,
         tokio_rt: Arc<tokio::runtime::Runtime>,
     ) -> Self {
+        let policy = PolicyConfig::from_env();
+        // Same single-gate registration `with_policy` performs, for engines
+        // that run under the env-configured policy without an explicit call.
+        crate::policy::trust_allowlisted_http_hosts(&policy);
         Self {
             providers,
             template_engine,
             tokio_rt,
             tools: Arc::new(ToolRegistry::new()),
-            policy: PolicyConfig::from_env(),
+            policy,
             mcp: Arc::new(McpManager::new()),
             approvals: Vec::new(),
             persist_base: None,
@@ -445,6 +460,11 @@ impl Engine {
     }
 
     pub fn with_policy(mut self, policy: Arc<PolicyConfig>) -> Self {
+        // A policy that unconditionally allows an http endpoint has made the
+        // egress decision for it; register those hosts with the SSRF guard so
+        // the policy file is the single gate to open (idempotent, add-only —
+        // and the policy gate itself still runs first on every call).
+        crate::policy::trust_allowlisted_http_hosts(&policy);
         self.policy = policy;
         self
     }
@@ -1184,6 +1204,16 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The persisted host-promise table (`host_promises.json` ∪ per-op blobs)
+    /// — the copy readers use now that the manifest no longer embeds it.
+    fn persisted_host_promises(
+        run_dir: &std::path::Path,
+    ) -> Vec<crate::runtime::snapshot::HostPromiseRecord> {
+        let store = crate::runtime::store::FsRunStore::new(run_dir.to_path_buf());
+        crate::runtime::snapshot::load_host_promise_records(&store).unwrap()
+    }
+
     use crate::providers::{
         ContentBlock, LlmProvider, LlmRequest, LlmResponse, ProviderRegistry, TokenSink,
     };
@@ -1760,14 +1790,15 @@ mod tests {
                 "params": null,
             })
         );
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
-        assert_eq!(loaded.manifest.host_promises[0].operation.id, pending.id);
+        let table = persisted_host_promises(&run_base.join(&paused.run_id));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0].operation.id, pending.id);
         assert_eq!(
-            loaded.manifest.host_promises[0].operation.kind,
+            table[0].operation.kind,
             crate::runtime::snapshot::PendingHostOperationKind::Http
         );
         assert!(matches!(
-            loaded.manifest.host_promises[0].state,
+            table[0].state,
             crate::runtime::snapshot::HostPromiseState::Pending
         ));
         assert!(!loaded.blob.is_empty());
@@ -1844,12 +1875,13 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let manifest = SnapshotStore::new(run_dir).load_manifest().unwrap();
+        let manifest = SnapshotStore::new(run_dir.clone()).load_manifest().unwrap();
         assert_eq!(manifest.call_log_len, 1);
         assert!(manifest.pending.is_none());
-        assert_eq!(manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert!(matches!(
-            manifest.host_promises[0].state,
+            table[0].state,
             crate::runtime::snapshot::HostPromiseState::Rejected { .. }
         ));
 
@@ -1939,12 +1971,13 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let manifest = SnapshotStore::new(run_dir).load_manifest().unwrap();
+        let manifest = SnapshotStore::new(run_dir.clone()).load_manifest().unwrap();
         assert_eq!(manifest.call_log_len, 1);
         assert!(manifest.pending.is_none());
-        assert_eq!(manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert!(matches!(
-            manifest.host_promises[0].state,
+            table[0].state,
             crate::runtime::snapshot::HostPromiseState::Resolved { .. }
         ));
 
@@ -1995,15 +2028,16 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let loaded = SnapshotStore::new(run_dir).load().unwrap();
+        let loaded = SnapshotStore::new(run_dir.clone()).load().unwrap();
         assert_eq!(loaded.manifest.call_log_len, 1);
         assert!(loaded.manifest.pending.is_none());
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert_eq!(
-            loaded.manifest.host_promises[0].operation.kind,
+            table[0].operation.kind,
             crate::runtime::snapshot::PendingHostOperationKind::Prompt
         );
-        match &loaded.manifest.host_promises[0].state {
+        match &table[0].state {
             crate::runtime::snapshot::HostPromiseState::Resolved { value, .. } => {
                 assert_eq!(value, &serde_json::json!("provider result"));
             }
@@ -2130,15 +2164,16 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let loaded = SnapshotStore::new(run_dir).load().unwrap();
+        let loaded = SnapshotStore::new(run_dir.clone()).load().unwrap();
         assert_eq!(loaded.manifest.call_log_len, 1);
         assert!(loaded.manifest.pending.is_none());
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert_eq!(
-            loaded.manifest.host_promises[0].operation.kind,
+            table[0].operation.kind,
             crate::runtime::snapshot::PendingHostOperationKind::CallAgent
         );
-        match &loaded.manifest.host_promises[0].state {
+        match &table[0].state {
             crate::runtime::snapshot::HostPromiseState::Resolved { value, .. } => {
                 assert_eq!(value, &serde_json::json!({ "value": 42 }));
             }
@@ -2207,16 +2242,17 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let loaded = SnapshotStore::new(run_dir).load().unwrap();
+        let loaded = SnapshotStore::new(run_dir.clone()).load().unwrap();
         assert_eq!(loaded.manifest.call_log_len, 1);
         assert!(loaded.manifest.pending.is_none());
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert_eq!(
-            loaded.manifest.host_promises[0].operation.kind,
+            table[0].operation.kind,
             crate::runtime::snapshot::PendingHostOperationKind::Checkpoint
         );
         assert!(matches!(
-            loaded.manifest.host_promises[0].state,
+            table[0].state,
             crate::runtime::snapshot::HostPromiseState::Resolved { .. }
         ));
         assert!(!loaded.blob.is_empty());
@@ -2549,6 +2585,148 @@ def agent(value):
                         throw new Error("step callback must not re-run on replay");
                     });
                     return { total: plan.total, source: plan.source };
+                }
+            "#,
+        )
+        .unwrap();
+        let replayed = engine()
+            .run_with_replay(&path, &serde_json::json!({}), records)
+            .unwrap();
+        assert_eq!(replayed.output, recorded.output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `chidori.memo` — the async-capable value checkpoint: the callback may
+    /// await and perform journaled effects (recorded as the memo's children);
+    /// replay returns the recorded value, absorbs the recorded subtree, and
+    /// never re-runs the callback.
+    #[test]
+    fn engine_memo_memoizes_async_checkpoint_with_inner_effects_on_replay() {
+        let dir =
+            std::env::temp_dir().join(format!("chidori-engine-ts-memo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const plan = await chidori.memo("plan", async () => {
+                        await chidori.log("inside memo");
+                        let total = 0;
+                        for (let i = 0; i <= 1000; i++) total += i;
+                        return { total, source: "computed" };
+                    });
+                    return { total: plan.total, source: plan.source };
+                }
+            "#,
+        )
+        .unwrap();
+
+        let engine = || {
+            Engine::new(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+
+        let recorded = engine().run(&path, &serde_json::json!({})).unwrap();
+        assert_eq!(
+            recorded.output,
+            serde_json::json!({ "total": 500500, "source": "computed" })
+        );
+        let records = recorded.call_log.into_records();
+        // One `log` child nested under the `memo` container.
+        assert_eq!(records.len(), 2, "records: {records:?}");
+        let memo = records.iter().find(|r| r.function == "memo").unwrap();
+        let log = records.iter().find(|r| r.function == "log").unwrap();
+        assert_eq!(memo.args, serde_json::json!({ "name": "plan" }));
+        assert_eq!(
+            memo.result,
+            serde_json::json!({ "total": 500500, "source": "computed" })
+        );
+        assert_eq!(log.parent_seq, Some(memo.seq), "log nests under the memo");
+
+        // Replay against an edited body that would throw if re-executed: the
+        // journaled value must win and the inner effect must not re-fire.
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const plan = await chidori.memo("plan", async () => {
+                        throw new Error("memo callback must not re-run on replay");
+                    });
+                    return { total: plan.total, source: plan.source };
+                }
+            "#,
+        )
+        .unwrap();
+        let replayed = engine()
+            .run_with_replay(&path, &serde_json::json!({}), records)
+            .unwrap();
+        assert_eq!(replayed.output, recorded.output);
+        // Both records were consumed from the journal (the memo hit absorbs
+        // its recorded subtree), so nothing executed live.
+        assert_eq!(replayed.replayed_calls, 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A memo callback that rejects journals the error; replay re-throws the
+    /// recorded error without re-running the callback.
+    #[test]
+    fn engine_memo_replays_recorded_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-engine-ts-memo-err-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    try {
+                        await chidori.memo("fetch-plan", async () => {
+                            throw new Error("upstream unavailable");
+                        });
+                        return { outcome: "unreachable" };
+                    } catch (err) {
+                        return { outcome: String(err.message) };
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let engine = || {
+            Engine::new(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+        let recorded = engine().run(&path, &serde_json::json!({})).unwrap();
+        assert_eq!(
+            recorded.output,
+            serde_json::json!({ "outcome": "upstream unavailable" })
+        );
+        let records = recorded.call_log.into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "memo");
+        assert_eq!(records[0].error.as_deref(), Some("upstream unavailable"));
+
+        // Edited callback would now succeed; the recorded error still wins.
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    try {
+                        await chidori.memo("fetch-plan", async () => ({ fine: true }));
+                        return { outcome: "unreachable" };
+                    } catch (err) {
+                        return { outcome: String(err.message) };
+                    }
                 }
             "#,
         )

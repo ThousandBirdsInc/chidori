@@ -334,7 +334,8 @@ pub(in crate::server) async fn attach_session_stream(
 
 /// Spawn one blocking agent run for the streaming supervisor, reporting the
 /// engine result back on `result_tx`. Holds a clone of the shared run permit
-/// for the duration of the run.
+/// (and, for a resumed leg, the run's single-writer lease) for the duration
+/// of the run.
 fn spawn_streaming_run(
     state: &AppState,
     policy_profile: Option<String>,
@@ -342,11 +343,13 @@ fn spawn_streaming_run(
     input: Value,
     result_tx: tokio::sync::mpsc::UnboundedSender<anyhow::Result<RunResult>>,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    lease: Option<super::super::RunLeaseGuard>,
 ) {
     let app_state = state.clone();
     let agent_path = state.agent_path.clone();
     tokio::task::spawn_blocking(move || {
         let _run_permit = permit;
+        let _lease = lease;
         let engine = build_engine(&app_state, policy_profile.as_deref());
         let result = engine.run_with_prepared_context(&agent_path, &input, ctx);
         let _ = result_tx.send(result);
@@ -375,6 +378,21 @@ fn resume_signal_pause_in_process(
     value: Value,
 ) -> bool {
     let run_id = session.run_id.clone().unwrap_or_else(|| session.id.clone());
+    // Single-writer arbitration, same as the HTTP resume routes: this
+    // in-process resume mutates the run's durable state and re-drives the
+    // run. A lease held elsewhere (a second server, a CLI resume) means we
+    // stand down — the pause stays supervised and the holder drives it.
+    let lease = match super::super::acquire_run_lease(state, session.run_id.as_deref()) {
+        Ok(lease) => lease,
+        Err(holder) => {
+            tracing::warn!(
+                run_id = %run_id,
+                holder = %holder.owner,
+                "in-process signal resume stood down: run lease held elsewhere"
+            );
+            return false;
+        }
+    };
     let completed = {
         let lock = state.signal_inbox_lock(&run_id);
         let _guard = lock.lock().unwrap();
@@ -434,6 +452,7 @@ fn resume_signal_pause_in_process(
         session.input.clone(),
         result_tx.clone(),
         permit.clone(),
+        lease,
     );
     true
 }
@@ -557,6 +576,9 @@ pub(in crate::server) async fn stream_session(
         input.clone(),
         result_tx.clone(),
         permit.clone(),
+        // A fresh session runs under a brand-new run id — nothing to contend
+        // for; the lease guards RESUMES of persisted runs.
+        None,
     );
 
     let state_for_stream = state.clone();

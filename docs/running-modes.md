@@ -204,6 +204,13 @@ The status-code contract:
   early cheap 404 above matters, or the strays will cost tokens. With
   `CHIDORI_API_KEY` set, unauthenticated requests are rejected before the
   agent runs.)
+- **Strict routing** (`chidori serve --strict-routes`, or
+  `CHIDORI_SERVE_ROUTES=strict`) turns the catch-all off entirely: only the
+  declared routes (the sessions API, manifest webhook routes) and the
+  canonical `/events` entrypoint are served, and every other unknown path is
+  `404` without executing the agent. Use it when the server is exposed
+  without a front proxy that enumerates routes — the open default is
+  webhook-friendly, but it means any reachable path executes agent code.
 
 An agent can also make *outbound* requests while handling an event: `fetch`
 is the runtime's captured networking surface — policy-gated, pausable for

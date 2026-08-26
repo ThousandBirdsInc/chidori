@@ -100,6 +100,9 @@ to concrete hosting recipes.
 
 ## Self-hosted cell store: `chidori cell-store`
 
+> Since **3.8.0** — releases up to v3.7.0 do not ship this subcommand; on
+> those, use the Durable Object relay or `s3://` mirroring.
+
 An alternative to the Durable Object relay that runs on your own
 infrastructure, implementing the core of the design behind Deno's
 [celld](https://github.com/denoland/celld) ("self-hosted, distributed Durable
@@ -182,12 +185,62 @@ and routing beyond this one-hop follow: nothing here places work on a node,
 picks an owner by load, or drains one for maintenance — ownership is still
 decided by whoever asks first after a lease lapses.
 
+## The relay protocol: bring your own store — or your own reader
+
+`CHIDORI_RUN_STORE=http(s)://…` speaks a small REST protocol, and anything
+that implements it is a first-class backend: the self-hosted cell store and
+the Durable Object relay are two implementations, not special cases. It is
+also the supported way to make an **external system the product's source of
+truth**: with a durable mirror configured, *every* journal record, blob
+write, and registry update flows through it (the tee writes all traffic to
+both primary and mirror), so a relay you own receives the full stream as it
+happens — no polling, no post-hoc export.
+
+The surface (bearer auth via `CHIDORI_RUN_STORE_TOKEN` when set):
+
+| verb | meaning |
+|---|---|
+| `GET /runs` | list run ids |
+| `GET /runs/{id}/records` | the run's full record log (JSON array) |
+| `POST /runs/{id}/records` | append one record — O(1), keyed by `seq`; re-append replaces |
+| `PUT /runs/{id}/records` | replace the whole log (compaction rewrite) |
+| `GET /runs/{id}/blobs` · `GET/PUT/DELETE /runs/{id}/blobs/{key}` | named artifacts: `checkpoint.json`, `runtime.snapshot.json`, `host_promises*`, `metrics.json`, `lease.json`, … |
+| `GET /registry` · `GET/PUT /registry/{name}` | the detached-agent registry |
+
+Two semantics carry the correctness story: **appends are idempotent by
+`seq`** (a retried append is safe), and **blob writes honor conditional
+headers** — `If-Match: "<sha256-of-bytes>"` / `If-None-Match: *`, answered
+`412` on a lost race — which is what the lease's compare-and-swap and the
+cell store's fencing ride on. A `409` means "another node owns this run" and
+may carry `owner`/`owner_url`/`lease_expires_at` (see the cell-store section
+above for the one-hop follow).
+
+To build a **reader** (run history UI, billing pipeline, audit stream):
+either implement the protocol and point `CHIDORI_RUN_STORE` at it — you now
+observe every write in order, per run, as it happens — or run the cell
+store / your own relay and have the reader consume its storage directly.
+The record shape is the journal's `CallRecord` (`seq`, `parent_seq`,
+`function`, `args`, `result`, `duration_ms`, `token_usage`, `timestamp`,
+`error`); `metrics.json` carries the per-run engine metering. The reference
+implementations are `crates/chidori/src/cellstore.rs` and
+[`integrations/cloudflare-durable-objects`](../integrations/cloudflare-durable-objects/).
+
 ## Write-error policy: `CHIDORI_DURABILITY`
 
 Journal writes are not fire-and-forget:
 
 * **`besteffort`** (default): a failed persistence write is logged and the
   run continues — right for local dev.
+* **`effect`** (since **3.8.0**): **durable at the effect, priced at the effect.** Remote
+  appends stay pipelined (the thing that makes `strict` expensive against a
+  remote store), but each effectful host call runs a durability barrier
+  around its pending-intent write *before* the effect executes and around
+  its result record *after* it completes. A crash therefore never leaves an
+  executed effect with no durable trace — either the intent is durable
+  (recovery sees a pending operation that may have fired) or the result is —
+  while pure records (steps, logs) never pay a per-write round-trip.
+  Failed writes poison the run and filesystem writes fsync, exactly as
+  under `strict`.
 * **`strict`**: the first failed journal write **poisons the run** — the next
   live host call refuses to execute ("acting on the world without a
   recording of it"), filesystem journal writes fsync before acknowledging,
@@ -202,8 +255,11 @@ immediately instead of blocking one network round-trip per host call
 FIFO; in-flight requests are bounded, so a slow mirror applies backpressure
 rather than growing an unbounded queue). Failures surface at the next flush
 barrier — pause, settle, output gate — where besteffort logs and continues,
-exactly as its per-append handling always did. Under `strict`, every append
-stays synchronous: acknowledged by the mirror before the next effect runs.
+exactly as its per-append handling always did. Under `effect`, appends stay
+pipelined but every effectful call drains the pipeline at its two barriers
+(intent before, result after), so barrier frequency scales with effects, not
+with journal records. Under `strict`, every append stays synchronous:
+acknowledged by the mirror before the next effect runs.
 
 ## Recovery after machine loss: hydration
 
@@ -273,6 +329,20 @@ before executing and releases it on hibernate/settle; a second process
 sharing the same mirror stands down, and an expired lease (a dead node)
 transfers on the next wake.
 
+**Server resumes take the lease too.** `POST /sessions/{id}/resume`, a
+`/signal` that resolves the pending pause, and `/approve` each acquire the
+run's lease for the duration of the leg and release it when the leg settles
+or re-pauses. Two `chidori serve` processes pointed at the same run store
+therefore cannot both accept a resume of the same paused run: the second
+writer gets **409 Conflict** with `lease_holder` and `lease_expires_at` in
+the body, before any durable state is touched. The same lease excludes a
+concurrent `chidori resume` of that run from the CLI. The TTL is
+`CHIDORI_RUN_LEASE_TTL_SECS` (default 600); a dead holder's lease lapses at
+its expiry and the next writer takes the run over. On a backend that cannot
+serve the lease at all the server logs a warning and proceeds (the same
+advisory posture the CLI uses) — the guarantee column in the table below
+says how strong the arbitration is per backend.
+
 **The lease is fleet state, so it lives in the shared backend.** When a
 durable mirror is configured, lease reads and writes address the mirror
 directly rather than the local filesystem copy. Reading the local primary
@@ -310,7 +380,10 @@ poisoned by a mirror-write failure.
   memoize expensive pure compute explicitly; automatic folding of old history
   into value checkpoints is not supported. (Engineering note on the
   warm-standby direction: [resume performance](./resume-performance.md) on
-  GitHub.)
+  GitHub.) One amplification term is gone: the snapshot manifest no longer
+  embeds the host-promise table, so a large response body is stored in the
+  journal/checkpoint pair and the host-promise table — not a fourth time
+  inside `runtime.snapshot.json`.
 * **No multi-node routing.** Leases arbitrate double-execution; they do not
   route requests to a run's owner. One server (or CLI process) drives a run
   at a time. (The cell store's `--advertise` + one-hop follow redirects a

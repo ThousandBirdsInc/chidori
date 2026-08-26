@@ -267,8 +267,10 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the ~357 total). The counts
-shift as engine work lands — refresh from a `--json` report before targeting:
+The residual failures, by area (top clusters of the **208** the committed
+baseline records — the table below and the headline number come from the same
+`test262-expectations.json`). The counts shift as engine work lands —
+refresh from a `--json` report before targeting:
 
 | area | nature |
 |---|---|
@@ -287,6 +289,42 @@ shift as engine work lands — refresh from a `--json` report before targeting:
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants.
+
+## What the deviations mean for determinism and replay
+
+The question a durability adopter actually asks is not "how many Test262
+failures" but "can a deviation desynchronize a recorded run". Classified
+against the committed baseline's 208 failures:
+
+- **Every remaining deviation is *stable*: the engine produces the same
+  (spec-divergent) result on every execution of the same program.** There is
+  no randomness or environment dependence in any failing cluster. Within one
+  engine build, record and replay therefore see byte-identical behavior —
+  a spec deviation cannot, by itself, perturb a journal.
+- **Evaluation-order clusters** (compound-assignment reference order,
+  relational-operator coercion order, `yield`/generator corners — ~50 tests)
+  deviate in *which order* observable operations happen, deterministically.
+  If agent code routes such an observation through a host effect, the
+  journal records the order the engine actually used, and replay reproduces
+  it. The exposure is **cross-build replay**: a journal recorded on an
+  engine where the order was wrong, replayed on a build where it was fixed,
+  diverges — and fails **loudly** at the first divergent call
+  (`try_replay_checked` compares function + arguments), never silently.
+- **Module/`eval` clusters** (dynamic `import()` semantics, TLA ordering,
+  namespace internals, `eval`/`with`/mapped-`arguments` — ~60 tests) sit on
+  surfaces durable agents largely cannot reach: transpilation rejects
+  dynamic `import()` in project files outright, and `eval`-heavy code fails
+  before determinism is at stake.
+- **Value-shape clusters** (RegExp `v`-flag, Unicode case folding, sparse
+  indices past the dense cap, resizable-buffer corners) produce wrong-but-
+  fixed values; the record/replay argument above applies unchanged.
+
+Separately from Test262: the engine's *optimization tiers* are the one place
+an execution-order perturbation could differ between two executions of the
+same build. That surface is held to byte-identical observable behavior by
+differential test suites that run the same programs with each pass toggled
+(`tests/fusion.rs`, `tests/localize.rs`, `tests/kernels.rs`, register vs
+stack tier), and replay's positional divergence checks are the backstop.
 
 ## Reproducibility
 

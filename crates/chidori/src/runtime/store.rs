@@ -182,7 +182,7 @@ impl FsRunStore {
     pub fn new(run_dir: impl Into<PathBuf>) -> Self {
         Self {
             run_dir: run_dir.into(),
-            fsync_writes: strict_durability(),
+            fsync_writes: latching_durability(),
         }
     }
 
@@ -2056,12 +2056,53 @@ pub fn release_lease(store: &dyn RunStore, owner: &str) -> Result<()> {
     Ok(())
 }
 
+/// The run's durability posture, from `CHIDORI_DURABILITY`:
+///
+/// * `besteffort` (unset/default) — writes are buffered/pipelined; failures
+///   are logged and tolerated; barriers only at settle/pause.
+/// * `effect` — **durable at the effect, priced at the effect**: remote
+///   appends stay pipelined (the thing that makes `strict` ~2× on a remote
+///   store), but each effectful host call runs a durability barrier around
+///   its pending-intent write BEFORE the effect executes and around its
+///   result record AFTER — so a crash can never leave an executed effect
+///   with no durable trace, and pure records never pay a round-trip.
+///   Filesystem journal writes fsync, and write failures poison the run
+///   exactly as under `strict`.
+/// * `strict` — every append is synchronous and acknowledged; write
+///   failures poison the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityMode {
+    BestEffort,
+    Effect,
+    Strict,
+}
+
+pub fn durability_mode() -> DurabilityMode {
+    match std::env::var("CHIDORI_DURABILITY") {
+        Ok(v) if v.eq_ignore_ascii_case("strict") => DurabilityMode::Strict,
+        Ok(v) if v.eq_ignore_ascii_case("effect") => DurabilityMode::Effect,
+        _ => DurabilityMode::BestEffort,
+    }
+}
+
 /// Whether `CHIDORI_DURABILITY=strict` is set: journal write failures poison
 /// the run, and filesystem journal writes fsync before acknowledging.
 pub fn strict_durability() -> bool {
-    std::env::var("CHIDORI_DURABILITY")
-        .map(|v| v.eq_ignore_ascii_case("strict"))
-        .unwrap_or(false)
+    durability_mode() == DurabilityMode::Strict
+}
+
+/// Failure latching + fsync posture: `effect` and `strict` both poison the
+/// run on a failed journal write and fsync filesystem writes; only
+/// `besteffort` tolerates and buffers.
+pub fn latching_durability() -> bool {
+    durability_mode() != DurabilityMode::BestEffort
+}
+
+/// Whether effectful host calls run explicit durability barriers around
+/// their intent/result writes (the `effect` mode's mechanism; `strict`
+/// doesn't need them — every write is already synchronous).
+pub fn effect_barriers() -> bool {
+    durability_mode() == DurabilityMode::Effect
 }
 
 #[cfg(test)]

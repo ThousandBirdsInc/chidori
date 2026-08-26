@@ -104,7 +104,11 @@ pub(crate) fn run_agent_isolated(
     let killed_by_deadline = watchdog.map(|w| w.disarm()).unwrap_or(false);
     drop(to_child);
     drop(from_child);
+    let worker_pid = child.id();
     let status = child.wait();
+    // The reaped worker's per-run cgroup (memory.max ceiling) is empty now —
+    // remove it so a long-lived server doesn't accrete one dir per run.
+    super::limits::cleanup_worker_cgroup(worker_pid);
 
     match result {
         Ok(value) => Ok(value),

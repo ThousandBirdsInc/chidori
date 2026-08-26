@@ -613,6 +613,24 @@ enum Commands {
         /// CHIDORI_APP_MANIFEST also names one.
         #[arg(long, value_name = "MANIFEST")]
         app: Option<PathBuf>,
+
+        /// Strict routing: only the declared routes (sessions API, manifest
+        /// webhook routes) and the canonical `/events` entrypoint are served;
+        /// every other unknown path is 404 instead of executing agent(event).
+        /// Equivalent to CHIDORI_SERVE_ROUTES=strict. The open default
+        /// answers ANY /* with agent(event), which is webhook-friendly but
+        /// means any reachable path executes the agent.
+        #[arg(long)]
+        strict_routes: bool,
+
+        /// Server-wide edit-and-resume opt-in: resumes, pause-resolving
+        /// signals, and approvals proceed even when the agent source changed
+        /// since a run was recorded, as if every request body had set
+        /// `allow_source_change: true`. Equivalent to
+        /// CHIDORI_ALLOW_SOURCE_CHANGE=1. Replay's positional divergence
+        /// checks still guard the already-journaled calls.
+        #[arg(long)]
+        allow_source_change: bool,
     },
 
     /// Serve a self-hosted durable run store — the celld model
@@ -1052,6 +1070,8 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             isolate,
             no_isolate,
             app,
+            strict_routes,
+            allow_source_change,
         } => {
             if isolate {
                 crate::runtime::isolate::enable();
@@ -1060,6 +1080,14 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             }
             if let Some(ref model) = model {
                 std::env::set_var("CHIDORI_MODEL", model);
+            }
+            // Flags are sugar over the env vars the server reads, matching
+            // how --isolate/--model configure their subsystems.
+            if strict_routes {
+                std::env::set_var("CHIDORI_SERVE_ROUTES", "strict");
+            }
+            if allow_source_change {
+                std::env::set_var("CHIDORI_ALLOW_SOURCE_CHANGE", "1");
             }
             (
                 cmd_serve(
@@ -1508,6 +1536,30 @@ fn ensure_llm_provider_interactive() -> bool {
     }
 }
 
+/// Say out loud when `--untrusted` discards ambient CHIDORI_POLICY*
+/// configuration: the flag deliberately wins (an explicit flag beats
+/// ambient env), but silently ignoring a configured allowlist reads as
+/// "the policy file is broken" to the operator debugging a denial.
+fn warn_untrusted_overrides_env_policy() {
+    let configured: Vec<&str> = [
+        "CHIDORI_POLICY_FILE",
+        "CHIDORI_POLICY",
+        "CHIDORI_POLICY_PROFILE",
+    ]
+    .into_iter()
+    .filter(|var| std::env::var_os(var).is_some())
+    .collect();
+    if !configured.is_empty() {
+        eprintln!(
+            "chidori: note: --untrusted overrides {} — the configured policy (its allow \
+             rules included) is ignored for this invocation. To run a deny-by-default \
+             posture WITH your allowlist, put the allow rules in a policy file whose \
+             \"default\" is \"never_allow\" and drop --untrusted.",
+            configured.join(", ")
+        );
+    }
+}
+
 /// Resolve the permission policy for a CLI invocation. Precedence:
 ///   1. `--untrusted` — deny-by-default, wins over all CHIDORI_POLICY* env
 ///      (an explicit flag beats ambient configuration).
@@ -1520,6 +1572,7 @@ fn ensure_llm_provider_interactive() -> bool {
 ///      with a reason naming `--trusted` and the env knobs.
 fn cli_policy(untrusted: bool, trusted: bool) -> Arc<policy::PolicyConfig> {
     if untrusted {
+        warn_untrusted_overrides_env_policy();
         return Arc::new(
             policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
         );
@@ -1545,6 +1598,7 @@ fn cli_policy(untrusted: bool, trusted: bool) -> Arc<policy::PolicyConfig> {
 /// Returns the policy plus a posture label for the startup banner.
 fn serve_policy(untrusted: bool, trusted: bool) -> (Arc<policy::PolicyConfig>, String) {
     if untrusted {
+        warn_untrusted_overrides_env_policy();
         return (
             Arc::new(
                 policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
@@ -1767,6 +1821,26 @@ fn cmd_run(
             }
         }
         eprintln!("Duration: {}ms", result.call_log.total_duration_ms());
+        // Engine metering (metrics.json, written at the run's last durable
+        // safepoint): the exact opcode count and peak heap — the enforce-AND-
+        // bill numbers, not just wall-clock.
+        let metrics_path = base_dir
+            .join(".chidori")
+            .join("runs")
+            .join(&result.run_id)
+            .join("metrics.json");
+        if let Ok(text) = std::fs::read_to_string(&metrics_path) {
+            if let Ok(metrics) = serde_json::from_str::<Value>(&text) {
+                let ops = metrics.get("ops_used").and_then(|v| v.as_u64());
+                let peak = metrics.get("peak_heap_bytes").and_then(|v| v.as_u64());
+                if let (Some(ops), Some(peak)) = (ops, peak) {
+                    eprintln!(
+                        "Engine: {ops} ops, peak heap {:.1} MiB",
+                        peak as f64 / (1024.0 * 1024.0)
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
@@ -3075,11 +3149,35 @@ fn cmd_verify(
         Value::Object(Default::default())
     };
 
+    // Drift gate 0: a fixture without a snapshot manifest cannot be
+    // fingerprint-checked at all — the resume path skips with a warning for
+    // pre-manifest runs, but a verification that silently skips its source
+    // gate is not a verification. `chidori export` always includes the
+    // manifest, so only hand-assembled run dirs trip this.
+    if crate::runtime::snapshot::SnapshotStore::new(run_dir.clone())
+        .load_manifest()
+        .is_err()
+    {
+        anyhow::bail!(
+            "verify refused: no runtime.snapshot.json under {} — without the manifest the \
+             source fingerprints cannot be checked. Export fixtures from complete runs with \
+             `chidori export`.",
+            run_dir.display()
+        );
+    }
+
     // Drift gate 1: the agent source must match the recorded fingerprints.
     // No `--allow-source-change` escape here — a verify against edited code
     // is not a verification.
     crate::runtime::snapshot::validate_manifest_for_resume(&run_base, Some(run_id), file, false)
         .context("verify refused: the agent source no longer matches this run's checkpoint")?;
+
+    // Verification posture for the replay itself: a journal miss is an error
+    // rather than a live fallthrough, and argument-drift tolerance is off —
+    // both would let a divergent journal verify clean. Process-local: verify
+    // is a one-shot CLI run, so the env vars scope to this process.
+    std::env::set_var("CHIDORI_REPLAY_STRICT", "1");
+    std::env::set_var("CHIDORI_REPLAY_LAX", "0");
 
     // No providers, deny-all policy, no persistence: the replay must be able
     // to answer EVERY effect from the journal or fail.
@@ -3131,6 +3229,19 @@ fn cmd_verify(
     }
     let records = result.call_log.records();
     let total = records.len() as u64;
+    // Structural identity: a clean verify replays the exact recorded path,
+    // so the replayed run journals exactly as many records as the recorded
+    // journal holds. Fewer means the run took a shorter path and left
+    // journal records unconsumed — a real divergence the live-count check
+    // below cannot see (unconsumed records don't execute anything).
+    if total != journal_len {
+        anyhow::bail!(
+            "verify FAILED: the replayed run journaled {total} record(s) but the recorded \
+             journal has {journal_len} — the run no longer takes the recorded path \
+             ({} served from the journal, the rest never consumed)",
+            result.replayed_calls
+        );
+    }
     let live = total.saturating_sub(result.replayed_calls);
     // Workspace effects re-execute by design on every replay (the workspace
     // is real disk state, re-materialized rather than served from the

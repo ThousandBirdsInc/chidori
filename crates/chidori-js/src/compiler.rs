@@ -128,6 +128,50 @@ pub fn compile_script_cached(src: &str) -> Result<Rc<FuncProto>, String> {
     })
 }
 
+/// Compile a module through a thread-local (label, source)→artifact cache, so
+/// repeated compilations of the same module — every fresh engine re-walks its
+/// whole import graph per run, and a server's blocking threads are pooled and
+/// long-lived — reuse one compiled artifact instead of re-running the oxc
+/// parse → lower pipeline per module per run. This is the dominant fixed cost
+/// of a heavy module graph.
+///
+/// Soundness is the same argument as [`compile_script_cached`]: a
+/// [`FuncProto`] is immutable after compilation and all mutable linkage state
+/// lives on the per-run `ModuleRecord`, so sharing one proto across VMs on
+/// the same thread only shares immutable code. The key includes the label
+/// (it is baked into diagnostics/stack frames) and the FULL source, so a hit
+/// can never alias two distinct programs; compilation is deterministic, so a
+/// cached artifact is what a fresh compile would produce. Errors are not
+/// cached.
+pub fn compile_module_labeled_cached(
+    src: &str,
+    label: Option<&str>,
+) -> Result<crate::module::CompiledModule, String> {
+    // A heavy agent graph runs to a few hundred modules; wholesale clear at
+    // the cap (as in `compile_script_cached`) keeps worst-case memory
+    // proportional to the cap without order-dependent behavior.
+    const CACHE_CAP: usize = 1024;
+    type ModuleKey = (Option<String>, String);
+    thread_local! {
+        static MODULE_CACHE: std::cell::RefCell<
+            std::collections::HashMap<ModuleKey, crate::module::CompiledModule>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    MODULE_CACHE.with(|cache| {
+        let key = (label.map(str::to_string), src.to_string());
+        if let Some(compiled) = cache.borrow().get(&key) {
+            return Ok(compiled.clone());
+        }
+        let compiled = compile_module_labeled(src, label)?;
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, compiled.clone());
+        Ok(compiled)
+    })
+}
+
 /// Compile a script with the peephole op-fusion pass (`fuse.rs`) toggled. Used by
 /// the differential test that runs the same program with `fuse = true` and
 /// `fuse = false` and asserts byte-identical observable behavior. Production code

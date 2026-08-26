@@ -441,6 +441,16 @@ pub(crate) fn route_host_op(
         let (key, source) = load_module_source(specifier, importer)?;
         return Ok(serde_json::json!({ "key": key, "source": source }));
     }
+    if op == "__chidori_run_metrics" {
+        // End-of-run metering report from the engine (in-process or brokered
+        // from the isolate worker). Not a durable call — it lands on the
+        // context and is persisted as `metrics.json` at the next safepoint;
+        // a backend without a context (the recorder) drops it.
+        if let Some(ctx) = backend.runtime_ctx() {
+            ctx.set_run_metrics(args.clone());
+        }
+        return Ok(Value::Null);
+    }
     if op == "__chidori_dom_render" {
         let ctx = backend
             .runtime_ctx()
@@ -576,6 +586,31 @@ struct ExecutionGuard {
     /// lifetime of the run. Declared after `watchdog` is irrelevant — `Drop`
     /// joins the watchdog explicitly before this guard unregisters.
     _meter: Option<crate::mem_guard::RunMeterGuard>,
+    /// The opcode budget installed at run start; with the VM's remaining
+    /// budget at run end this yields the exact opcode count consumed.
+    initial_op_budget: Option<u64>,
+    /// The heap cap in force, echoed into the run's metrics.
+    mem_cap: Option<usize>,
+    /// The run thread's CPU clock at install, so metrics can report the
+    /// run's actual CPU time (excludes time blocked in host effects).
+    start_cpu_ns: Option<u64>,
+}
+
+/// The calling thread's CPU time (CLOCK_THREAD_CPUTIME_ID), for run metering.
+#[cfg(unix)]
+fn thread_cpu_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes a single well-formed timespec we own.
+    (unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0)
+        .then(|| ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_ns() -> Option<u64> {
+    None
 }
 
 impl ExecutionGuard {
@@ -590,10 +625,9 @@ impl ExecutionGuard {
         // Per-run accounting: register a meter on this thread (the thread the
         // VM runs on) so the cap measures this run's own allocations rather
         // than process-wide growth — concurrent runs no longer trip each
-        // other's caps.
-        let meter_guard = limits
-            .mem_cap
-            .map(|_| crate::mem_guard::RunMeterGuard::install());
+        // other's caps. Installed unconditionally: even with no cap to
+        // enforce, the meter's high-water mark is the run's peak-heap metric.
+        let meter_guard = Some(crate::mem_guard::RunMeterGuard::install());
 
         let done = Arc::new(AtomicBool::new(false));
         // Only spend a thread when there is something time- or memory-based to
@@ -629,7 +663,38 @@ impl ExecutionGuard {
             done,
             watchdog,
             _meter: meter_guard,
+            initial_op_budget: limits.op_budget,
+            mem_cap: limits.mem_cap,
+            start_cpu_ns: thread_cpu_ns(),
         }
+    }
+
+    /// The run's engine metering, read back at run end: the exact opcode
+    /// count the VM's budget accounting maintained and the peak heap the
+    /// per-run meter saw, plus the caps they ran under. This is the number
+    /// the VM always counted but never reported — a fleet can enforce AND
+    /// bill on it.
+    fn metrics(&self, vm: &chidori_js::Vm) -> Value {
+        let ops_used = self
+            .initial_op_budget
+            .and_then(|initial| vm.op_budget.map(|left| initial.saturating_sub(left)));
+        let peak = self
+            ._meter
+            .as_ref()
+            .map(|m| crate::mem_guard::run_meter_peak_bytes(&m.handle()));
+        // Same thread that ran the VM, so the delta is this run's compute —
+        // time blocked in host effects is not CPU time and is excluded.
+        let cpu_ms = self
+            .start_cpu_ns
+            .zip(thread_cpu_ns())
+            .map(|(start, now)| now.saturating_sub(start) / 1_000_000);
+        serde_json::json!({
+            "ops_used": ops_used,
+            "op_budget": self.initial_op_budget,
+            "peak_heap_bytes": peak,
+            "mem_cap_bytes": self.mem_cap,
+            "cpu_ms": cpu_ms,
+        })
     }
 }
 
@@ -926,6 +991,12 @@ fn run_module_inner(
     if let (Ok(ModuleOutcome::Paused(_)), Some(ctx)) = (&outcome, &image_ctx) {
         crate::runtime::mainline_image::capture(ctx, &engine, &entry_key, &js);
     }
+    // Metering read-back: report the exact opcode count and peak heap to the
+    // host (which persists it as the run's `metrics.json`) before the VM is
+    // disposed. Best-effort — a host without a journal (the recorder
+    // backend) answers null and nothing is stored. Read before `dispose` so
+    // the budget accounting is still intact.
+    let _ = host.call("__chidori_run_metrics", &guard.metrics(&engine.vm));
     // Break the heap's Rc cycles before the engine drops: the result is already
     // a host `serde_json::Value`, and without this every agent run leaks its
     // realm + agent object graph in a long-lived server process.

@@ -96,9 +96,12 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   to non-public addresses (loopback, RFC 1918, link-local/cloud-metadata,
   CGNAT, and their IPv6 equivalents), checked at DNS-resolution time and on
   every redirect hop, so agents can't pivot into `169.254.169.254` or
-  internal services. To let agents reach specific internal hosts, set
-  `CHIDORI_HTTP_ALLOW_HOSTS` (comma-separated hostnames, IPs, or CIDRs, e.g.
-  `localhost,10.2.0.0/16`); the single value `*` disables the guard.
+  internal services. A policy rule that unconditionally allows an `http`
+  endpoint (`always_allow` + `url_prefix`) registers its host with the
+  guard automatically — one rule opens the one gate. For allowances outside
+  the policy (or ask-gated endpoints), set `CHIDORI_HTTP_ALLOW_HOSTS`
+  (comma-separated hostnames, IPs, or CIDRs, e.g. `localhost,10.2.0.0/16`);
+  the single value `*` disables the guard.
 
 - **Bind address:** the server binds loopback (`127.0.0.1:<port>`) by
   default, so a fresh `chidori serve` is not reachable from the network. To
@@ -114,13 +117,46 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   until you configure `CHIDORI_POLICY_FILE` (an explicit allowlist; malformed
   policy fails closed) or pass `--trusted` for a server running only your own
   code. See [sandbox model](./sandbox-model.md).
+- **Routing:** the default answers ANY unmatched path with `agent(event)`;
+  `--strict-routes` (`CHIDORI_SERVE_ROUTES=strict`) narrows agent execution
+  to the declared routes plus the canonical `/events` entrypoint, so an
+  exposed server no longer needs a front proxy just to bound which paths
+  run code.
 - **Optional:** `CHIDORI_CORS_ORIGINS` for browser callers;
-  `CHIDORI_MAX_CONCURRENT_SESSIONS` (default 8) to cap parallel runs;
+  `CHIDORI_MAX_CONCURRENT_SESSIONS` (default 8, or `auto` to size from the
+  machine: 2× cores) to cap parallel runs — resumes, signals, approvals,
+  and replays count against the same cap, and `GET /health` reports
+  `concurrency.available_run_slots` as an admission signal for whatever
+  routes work to the process;
   `CHIDORI_SECRET_ENV` to pass secrets as placeholder tokens the journal
   never sees. OS isolation (`CHIDORI_ISOLATE=process`) is the **default on
   Unix**; opt out with `--no-isolate` / `CHIDORI_ISOLATE=off`. In containers,
   set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed — the
   network-namespace layer needs `CAP_SYS_ADMIN` and is skipped without it.
+- **Module compile cache:** engines reuse compiled modules across runs on
+  the same thread (keyed by path + full source), so a server's pooled
+  worker threads pay a heavy import graph's parse/compile cost once, not
+  per run — measured ~9× off the fixed per-run cost of a 40-module graph.
+  Caveat: OS isolation (`CHIDORI_ISOLATE=process`, the Unix default)
+  spawns a fresh worker per run, which starts every cache cold; for
+  throughput-critical trusted workloads, `--no-isolate` keeps the caches
+  warm and the policy sandbox + SSRF guard still apply.
+- **Metering:** every run persists `metrics.json` beside its journal — the
+  exact opcode count the VM's budget accounting maintained (`ops_used`, the
+  same units `CHIDORI_JS_OP_BUDGET` caps), the run's peak heap bytes, the
+  run thread's CPU time (`cpu_ms` — compute only, time blocked in host
+  effects excluded), and the caps in force. Billing/chargeback readers consume the blob (it is not
+  a journal record, so replay and `verify` are untouched); `chidori run
+  --trace` prints the same numbers.
+- **Hard memory ceiling (Linux):** `CHIDORI_ISOLATE_MEMORY_MAX_MB` gives
+  each isolated worker a kernel-enforced cgroup v2 `memory.max` (plus
+  `memory.swap.max=0` and `memory.oom.group=1`, so an over-limit worker is
+  OOM-killed whole). Bin-pack a fleet on this number, not on the polled
+  heap watchdog (`CHIDORI_JS_MEM_CAP_MB`), which a run can overshoot by one
+  poll interval's worth of allocation. Needs a writable cgroup directory:
+  run the service with systemd `Delegate=yes`, or point
+  `CHIDORI_ISOLATE_CGROUP_DIR` at a delegated cgroup v2 directory; without
+  one the worker says so on stderr and falls back to the watchdog.
 
 ## Decision 1: where the journal lives
 
@@ -359,6 +395,31 @@ serverless piece that exists is storage: the
 [Durable Object run store](../integrations/cloudflare-durable-objects/) is a
 Worker that runs only when a write or hydration read arrives.
 
+## What a paused run costs
+
+Capacity planning for approval-heavy workloads hinges on one fact: **a
+durably paused run is a directory, not a process.** The lifecycle has two
+phases:
+
+1. **Warm-parked (bounded, opt-out).** An `input()` pause keeps its live VM
+   parked on a blocking thread (and, under OS isolation, its worker child
+   blocked on the broker pipe) so an imminent `/resume` skips replay. This
+   costs one thread + VM per parked run and lasts at most
+   `CHIDORI_WARM_RESUME_EVICT_MS` (default 10 minutes);
+   `CHIDORI_WARM_RESUME=0` disables parking entirely for fleets that prefer
+   flat memory over fast resumes. Approval pauses never park — they unwind
+   immediately.
+2. **Passivated (unbounded, free).** At eviction — or immediately for
+   approval/unwound pauses — the run exists only as its durable artifacts
+   under `.chidori/runs/<id>`: no process, no thread, no VM. A pause held
+   for hours or days consumes disk, nothing else, and survives the server
+   dying; the later resume replays from the journal (or restores the
+   mainline VM image where enabled).
+
+So the ceiling for *concurrently executing* runs is the concurrency cap and
+the ceiling for *warm-parked* runs is threads × the eviction window — but
+the number of *outstanding paused* runs is bounded by disk alone.
+
 ## Scaling to many users
 
 Scale in two moves, in this order:
@@ -434,12 +495,14 @@ flowchart LR
 
 A run has exactly one writer. Two replicas sharing a mirror means two
 processes appending to the same journal: requests for a run land on an
-instance that doesn't own it, and the writers race. Run leases make the
-loser stand down, but they are advisory on `fs` and `s3://` backends
-([when things fail](#when-things-fail)) — and even where they are enforced
-(`sqlite`, the Durable Object relay), the losing replica is dead weight
-that serves errors. Nothing routes a request to a run's owner;
-active–active is a documented non-goal
+instance that doesn't own it, and the writers race. The server's
+resume/signal/approve routes take the run's lease before touching durable
+state, so the second writer answers **409 Conflict** naming the holder
+instead of interleaving a second continuation — but leases are advisory on
+`fs` and `s3://` backends ([when things fail](#when-things-fail)), and even
+where they are enforced (`sqlite`, `chidori cell-store`, the Durable Object
+relay), the losing replica is dead weight that serves 409s. Nothing routes
+a request to a run's owner; active–active is a documented non-goal
 ([durable storage](./durable-storage.md)).
 
 One caveat as runs grow long rather than numerous: resuming a very long

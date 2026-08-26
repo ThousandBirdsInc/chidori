@@ -194,6 +194,18 @@ pub(super) async fn acquire_run_slot(
     }
 }
 
-pub(super) async fn health() -> impl IntoResponse {
-    Json(json!({"status": "ok"}))
+/// Liveness plus an admission signal: `concurrency.available_run_slots` is
+/// how many run slots are free right now, so whatever routes work to this
+/// process (a reverse proxy, an external placement layer) can steer new
+/// runs away from a saturated instance before the 503s start.
+pub(super) async fn health(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    Json(json!({
+        "status": "ok",
+        "concurrency": {
+            "max_concurrent_sessions": state.max_concurrent,
+            "available_run_slots": state.run_semaphore.available_permits(),
+        },
+    }))
 }

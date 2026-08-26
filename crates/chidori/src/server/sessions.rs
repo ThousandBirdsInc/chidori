@@ -57,11 +57,13 @@ pub(super) struct CreateSessionRequest {
     /// agent is used.
     #[serde(default)]
     pub(super) agent: Option<String>,
-    /// Optional: a built-in policy profile name ("untrusted" or "supervised")
-    /// applied to every run of this session, layered on the server policy
-    /// with stricter-wins semantics — it can only tighten, never relax, what
-    /// the operator configured. Lets a multi-tenant front-end mix trusted
-    /// and untrusted callers on one server.
+    /// Optional: a policy profile name applied to every run of this session
+    /// — a built-in ("untrusted", "supervised") or an operator-defined
+    /// profile from CHIDORI_POLICY_PROFILE_DIR (`<name>.json`) — layered on
+    /// the server policy with stricter-wins semantics: it can only tighten,
+    /// never relax, what the operator configured. Lets a multi-tenant
+    /// front-end give each tenant/team its own generated policy on one
+    /// server.
     #[serde(default, alias = "policyProfile")]
     pub(super) policy_profile: Option<String>,
 }
@@ -70,13 +72,13 @@ pub(super) struct CreateSessionRequest {
 fn validate_policy_profile(requested: Option<&str>) -> Result<(), (StatusCode, String)> {
     match requested {
         None => Ok(()),
-        Some(name) if crate::policy::builtin_profile(name).is_some() => Ok(()),
+        Some(name) if crate::policy::profile(name).is_some() => Ok(()),
         Some(name) => Err((
             StatusCode::BAD_REQUEST,
             format!(
                 "unknown policy profile '{}' (known: {})",
                 name,
-                crate::policy::BUILTIN_PROFILES.join(", ")
+                crate::policy::known_profiles().join(", ")
             ),
         )),
     }
@@ -90,7 +92,7 @@ pub(super) fn session_policy(app: &AppState, profile: Option<&str>) -> Arc<Polic
     let Some(name) = profile else {
         return app.policy.clone();
     };
-    let profile_cfg = crate::policy::builtin_profile(name).unwrap_or_else(|| {
+    let profile_cfg = crate::policy::profile(name).unwrap_or_else(|| {
         tracing::warn!(
             "session policy profile '{}' is unknown; failing closed to 'untrusted'",
             name
@@ -471,6 +473,13 @@ pub(super) async fn replay_session(
             )
                 .into_response();
         }
+    };
+
+    // A replay executes the agent end-to-end (replayed calls short-circuit,
+    // but the interpreter still runs) — same run slot as any other run.
+    let _permit = match acquire_run_slot(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
 
     let input = original.input.clone();

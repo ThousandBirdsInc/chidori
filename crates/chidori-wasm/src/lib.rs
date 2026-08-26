@@ -375,16 +375,13 @@ mod tests {
 
         // Rewind to before turn 2 the way the playground does: parse the
         // blob, cut the journal's entry list just before the second `input`
-        // entry, and re-encode. No engine involvement — pure data work.
+        // entry, and re-encode. No engine involvement — pure data work. The
+        // journal travels INLINE (a JSON object) since the double-decode fix
+        // in `JournalBlob`, so the cut edits `blob.journal.entries` directly.
+        // Any VM image in the blob describes the un-truncated suspension and
+        // must be dropped so the restore replays the truncated journal.
         let mut blob: serde_json::Value = serde_json::from_slice(&d.to_blob()).unwrap();
-        let journal_bytes: Vec<u8> = blob["journal"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| n.as_u64().unwrap() as u8)
-            .collect();
-        let mut journal: serde_json::Value = serde_json::from_slice(&journal_bytes).unwrap();
-        let entries = journal["entries"].as_array().unwrap();
+        let entries = blob["journal"]["entries"].as_array().unwrap();
         let cut = entries
             .iter()
             .enumerate()
@@ -393,8 +390,10 @@ mod tests {
             .nth(1)
             .unwrap();
         let truncated = entries[..cut].to_vec();
-        journal["entries"] = json!(truncated);
-        blob["journal"] = json!(serde_json::to_vec(&journal).unwrap());
+        blob["journal"]["entries"] = json!(truncated);
+        if let Some(obj) = blob.as_object_mut() {
+            obj.remove("image");
+        }
 
         // The truncated blob replays turn 1 offline and blocks at turn 2's
         // `input` — ready for a different message down a new path.

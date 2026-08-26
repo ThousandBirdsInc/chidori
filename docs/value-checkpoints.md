@@ -51,7 +51,7 @@ violation it can see, loudly:
 | captured randomness (`node:crypto` `randomBytes`, `crypto.getRandomValues`) | throws (it would journal a `crypto.random` record) |
 | VFS writes (`node:fs` write/append/mkdir/rm/rename) | throws (the mutation would be lost on replay) |
 | timer / microtask scheduling (`setTimeout`, `setInterval`, `queueMicrotask`) | throws (the scheduled callback would never exist on replay) |
-| an `async` callback / returned `Promise` | throws `chidori.step callback must return synchronously` |
+| an `async` callback / returned `Promise` | throws `chidori.step callback must return synchronously` — use `chidori.memo` |
 
 Allowed: everything deterministic and recordless — plain compute, `JSON`,
 `Math.random`/`Date` (deterministic by engine policy), crypto **hashing**, and
@@ -79,6 +79,50 @@ step can never be the host call a run parks on. A crash after the callback
 starts but before its result is journaled simply re-runs the (deterministic)
 callback on resume — memoization is an optimization, never a correctness
 dependency.
+
+## `chidori.memo` — the async-capable checkpoint
+
+> Since **3.8.0**.
+
+When the value you want to checkpoint needs **async work to produce** —
+awaited effects, a `fetch`, a prompt — `chidori.step`'s purity contract is
+the wrong tool. `chidori.memo(name, fn)` is the container form:
+
+```ts
+const enriched = await chidori.memo("enrich", async () => {
+  const raw = await fetch(url).then(r => r.json()); // journaled effect
+  return expensiveTransform(raw);                    // heavy pure compute
+});
+```
+
+Live, the callback runs once; its inner host effects record as the memo's
+*children* (`parent_seq`), and its settled result (or thrown error) is
+journaled as one `memo` record. On replay, the recorded value is returned,
+the recorded subtree is absorbed (children stay in the trace, the sequence
+counter stays aligned), and neither the callback nor its inner effects
+re-run — resume skips the compute **and** the effect round-trips.
+
+Differences from `step`:
+
+- The callback may be `async` and may perform any journaled effect —
+  nothing is refused inside a memo (a memo may even contain steps and other
+  memos). The flip side: purity is **your** responsibility for whatever the
+  callback does *outside* the journal — non-journaled state mutated in the
+  callback is lost on replay, exactly like any other skipped code.
+- A memo body **can** pause (an `input()` inside it): the run parks at the
+  inner call; on resume the callback re-runs from its top with the inner
+  effects served from their records, then completes and journals the memo.
+- A crash between begin and end re-runs the callback on resume with its
+  already-journaled inner effects replayed from their own records — same
+  "optimization, not correctness dependency" posture as `step`.
+- **Do not start memos concurrently** (e.g. `Promise.all` of two memos). A
+  memo that begins while another is still in flight records as its child,
+  and a later replay of the outer memo would absorb the interleaved
+  sibling's records while its wrapper still runs — re-executing its
+  effects. Nesting a memo *inside* another memo's callback is fine (the
+  inner wrapper is skipped along with the outer callback); concurrency
+  belongs *within one* memo's callback or outside memos entirely.
+  `chidori verify` catches the misuse as a journal-consumption divergence.
 
 ## Determinism
 

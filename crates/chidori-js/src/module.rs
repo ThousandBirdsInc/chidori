@@ -58,6 +58,11 @@ pub struct ExportEntry {
 }
 
 /// The compiled artifact of a single module's source text.
+///
+/// `Clone` is shallow (the proto is a shared `Rc`) and exists for the
+/// compile cache: a cached artifact is handed out as a clone per run, while
+/// all mutable linkage state lives on [`ModuleRecord`], never here.
+#[derive(Clone)]
 pub struct CompiledModule {
     /// `Rc` so the body proto has a stable identity — the evaluator matches it by
     /// pointer to capture the module's final cells (see `Vm::module_capture`).
