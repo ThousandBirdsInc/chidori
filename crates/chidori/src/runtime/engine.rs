@@ -409,12 +409,16 @@ impl Engine {
         template_engine: Arc<TemplateEngine>,
         tokio_rt: Arc<tokio::runtime::Runtime>,
     ) -> Self {
+        let policy = PolicyConfig::from_env();
+        // Same single-gate registration `with_policy` performs, for engines
+        // that run under the env-configured policy without an explicit call.
+        crate::policy::trust_allowlisted_http_hosts(&policy);
         Self {
             providers,
             template_engine,
             tokio_rt,
             tools: Arc::new(ToolRegistry::new()),
-            policy: PolicyConfig::from_env(),
+            policy,
             mcp: Arc::new(McpManager::new()),
             approvals: Vec::new(),
             persist_base: None,
@@ -445,6 +449,11 @@ impl Engine {
     }
 
     pub fn with_policy(mut self, policy: Arc<PolicyConfig>) -> Self {
+        // A policy that unconditionally allows an http endpoint has made the
+        // egress decision for it; register those hosts with the SSRF guard so
+        // the policy file is the single gate to open (idempotent, add-only —
+        // and the policy gate itself still runs first on every call).
+        crate::policy::trust_allowlisted_http_hosts(&policy);
         self.policy = policy;
         self
     }

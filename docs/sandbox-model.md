@@ -585,9 +585,26 @@ complete shape (`src/policy.rs::PolicyConfig`):
 - **`url_prefix` anchors**: the reserved key matches when the call's `url`
   *starts with* the given string — the right shape for "this agent talks
   to this host only" (`{"url_prefix": "https://api.example.com/"}`).
-  Combine with the [SSRF guard](#per-os-confinement-isolatesandboxrs)'s
-  `CHIDORI_HTTP_ALLOW_HOSTS` for internal hosts.
 - Other JSON values must be equal.
+
+**The policy file is the single egress gate.** A rule that unconditionally
+allows an `http` endpoint (`"decision": "always_allow"` with a
+`url_prefix`) also registers that host with the
+[SSRF guard](#per-os-confinement-isolatesandboxrs), so internal and
+RFC-1918 services need only the one policy rule — no parallel
+`CHIDORI_HTTP_ALLOW_HOSTS` entry. Ask-gated (`ask_before`) endpoints are
+deliberately *not* auto-registered (an approval is per-call, not a
+standing egress allowance); for those, or for allowances outside any
+policy, `CHIDORI_HTTP_ALLOW_HOSTS` (hostnames, IPs, CIDRs) still works.
+
+**Operator-defined profiles.** Beyond the built-ins, point
+`CHIDORI_POLICY_PROFILE_DIR` at a directory of `<name>.json` policy files
+and every `<name>` becomes selectable wherever a profile name is accepted:
+`CHIDORI_POLICY_PROFILE=<name>`, or a session's `policy_profile` field on
+the server. Per-session selection keeps the built-ins' guarantees — sticky
+for the session, stricter-wins against the server policy, fails closed on
+an unknown or malformed name — so a fleet operator can generate one policy
+per tenant/team and let the front-end pick it per session.
 
 A malformed file **fails closed**: `chidori serve` logs a parse warning and
 falls back to the deny-by-default `untrusted` profile, never to allow-all.

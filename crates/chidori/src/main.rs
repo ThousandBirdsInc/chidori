@@ -1536,6 +1536,30 @@ fn ensure_llm_provider_interactive() -> bool {
     }
 }
 
+/// Say out loud when `--untrusted` discards ambient CHIDORI_POLICY*
+/// configuration: the flag deliberately wins (an explicit flag beats
+/// ambient env), but silently ignoring a configured allowlist reads as
+/// "the policy file is broken" to the operator debugging a denial.
+fn warn_untrusted_overrides_env_policy() {
+    let configured: Vec<&str> = [
+        "CHIDORI_POLICY_FILE",
+        "CHIDORI_POLICY",
+        "CHIDORI_POLICY_PROFILE",
+    ]
+    .into_iter()
+    .filter(|var| std::env::var_os(var).is_some())
+    .collect();
+    if !configured.is_empty() {
+        eprintln!(
+            "chidori: note: --untrusted overrides {} — the configured policy (its allow \
+             rules included) is ignored for this invocation. To run a deny-by-default \
+             posture WITH your allowlist, put the allow rules in a policy file whose \
+             \"default\" is \"never_allow\" and drop --untrusted.",
+            configured.join(", ")
+        );
+    }
+}
+
 /// Resolve the permission policy for a CLI invocation. Precedence:
 ///   1. `--untrusted` — deny-by-default, wins over all CHIDORI_POLICY* env
 ///      (an explicit flag beats ambient configuration).
@@ -1548,6 +1572,7 @@ fn ensure_llm_provider_interactive() -> bool {
 ///      with a reason naming `--trusted` and the env knobs.
 fn cli_policy(untrusted: bool, trusted: bool) -> Arc<policy::PolicyConfig> {
     if untrusted {
+        warn_untrusted_overrides_env_policy();
         return Arc::new(
             policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
         );
@@ -1573,6 +1598,7 @@ fn cli_policy(untrusted: bool, trusted: bool) -> Arc<policy::PolicyConfig> {
 /// Returns the policy plus a posture label for the startup banner.
 fn serve_policy(untrusted: bool, trusted: bool) -> (Arc<policy::PolicyConfig>, String) {
     if untrusted {
+        warn_untrusted_overrides_env_policy();
         return (
             Arc::new(
                 policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),

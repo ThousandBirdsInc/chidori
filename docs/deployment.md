@@ -96,9 +96,12 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   to non-public addresses (loopback, RFC 1918, link-local/cloud-metadata,
   CGNAT, and their IPv6 equivalents), checked at DNS-resolution time and on
   every redirect hop, so agents can't pivot into `169.254.169.254` or
-  internal services. To let agents reach specific internal hosts, set
-  `CHIDORI_HTTP_ALLOW_HOSTS` (comma-separated hostnames, IPs, or CIDRs, e.g.
-  `localhost,10.2.0.0/16`); the single value `*` disables the guard.
+  internal services. A policy rule that unconditionally allows an `http`
+  endpoint (`always_allow` + `url_prefix`) registers its host with the
+  guard automatically — one rule opens the one gate. For allowances outside
+  the policy (or ask-gated endpoints), set `CHIDORI_HTTP_ALLOW_HOSTS`
+  (comma-separated hostnames, IPs, or CIDRs, e.g. `localhost,10.2.0.0/16`);
+  the single value `*` disables the guard.
 
 - **Bind address:** the server binds loopback (`127.0.0.1:<port>`) by
   default, so a fresh `chidori serve` is not reachable from the network. To
