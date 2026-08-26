@@ -316,6 +316,16 @@ impl ScaffoldPersister {
         if compact {
             store.compact_host_promises(&manifest.host_promises)?;
         }
+        // End-of-run engine metering, when the VM host has reported it. A
+        // plain blob — never a journal record — so replay/verify semantics
+        // are untouched; billing readers find it as `metrics.json`.
+        if let Some(metrics) = ctx.run_metrics() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&metrics) {
+                if let Err(err) = run_store.put_blob("metrics.json", &bytes) {
+                    tracing::warn!(run_id = %self.run_id, error = %err, "writing metrics.json");
+                }
+            }
+        }
         store.put_pending(manifest.pending.as_ref())
     }
 

@@ -1821,6 +1821,26 @@ fn cmd_run(
             }
         }
         eprintln!("Duration: {}ms", result.call_log.total_duration_ms());
+        // Engine metering (metrics.json, written at the run's last durable
+        // safepoint): the exact opcode count and peak heap — the enforce-AND-
+        // bill numbers, not just wall-clock.
+        let metrics_path = base_dir
+            .join(".chidori")
+            .join("runs")
+            .join(&result.run_id)
+            .join("metrics.json");
+        if let Ok(text) = std::fs::read_to_string(&metrics_path) {
+            if let Ok(metrics) = serde_json::from_str::<Value>(&text) {
+                let ops = metrics.get("ops_used").and_then(|v| v.as_u64());
+                let peak = metrics.get("peak_heap_bytes").and_then(|v| v.as_u64());
+                if let (Some(ops), Some(peak)) = (ops, peak) {
+                    eprintln!(
+                        "Engine: {ops} ops, peak heap {:.1} MiB",
+                        peak as f64 / (1024.0 * 1024.0)
+                    );
+                }
+            }
+        }
     }
 
     Ok(())

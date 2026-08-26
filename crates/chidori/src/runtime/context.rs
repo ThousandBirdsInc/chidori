@@ -239,6 +239,10 @@ struct RuntimeContextInner {
     /// Surfaced after a resume so the consumer can audit what a recovery
     /// actually replayed vs. re-executed (and re-billed).
     pub replay_hits: u64,
+    /// End-of-run engine metering reported by the VM host (`ops_used`, peak
+    /// heap, the caps in force), persisted as the run's `metrics.json` at the
+    /// next durable safepoint. `None` until the engine reports.
+    pub run_metrics: Option<serde_json::Value>,
     /// Sequence counter for call log entries.
     pub seq: u64,
     /// Pre-loaded call log for replay mode. When set, host functions
@@ -588,6 +592,7 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: 0,
                 replay_log: None,
                 run_id: uuid::Uuid::new_v4().to_string(),
@@ -665,6 +670,7 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: 0,
                 replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id: uuid::Uuid::new_v4().to_string(),
@@ -714,6 +720,7 @@ impl RuntimeContext {
                 // handle; the first checkpoint write must include them.
                 call_log_dirty: true,
                 replay_hits: 0,
+                run_metrics: None,
                 seq,
                 replay_log: None,
                 run_id,
@@ -771,6 +778,7 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: base_seq,
                 replay_log: None,
                 run_id,
@@ -829,6 +837,7 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: base_seq,
                 replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id,
@@ -898,6 +907,7 @@ impl RuntimeContext {
                 call_log: CallLog::new(),
                 call_log_dirty: false,
                 replay_hits: 0,
+                run_metrics: None,
                 seq: base_seq,
                 replay_log: Some(ReplayJournal::new(replay_log)),
                 run_id: actor_id.clone(),
@@ -1182,6 +1192,18 @@ impl RuntimeContext {
     /// re-executed (and re-billed).
     pub fn replay_hit_count(&self) -> u64 {
         self.inner.lock().unwrap().replay_hits
+    }
+
+    /// Record the engine's end-of-run metering (opcode count, peak heap, the
+    /// caps in force). Persisted as `metrics.json` at the next durable
+    /// safepoint, so the journal owner can bill on exact numbers instead of
+    /// just `duration_ms`.
+    pub fn set_run_metrics(&self, metrics: serde_json::Value) {
+        self.inner.lock().unwrap().run_metrics = Some(metrics);
+    }
+
+    pub fn run_metrics(&self) -> Option<serde_json::Value> {
+        self.inner.lock().unwrap().run_metrics.clone()
     }
 
     /// Replay-cache lookup with divergence check. Returns:

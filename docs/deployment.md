@@ -133,6 +133,12 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   Unix**; opt out with `--no-isolate` / `CHIDORI_ISOLATE=off`. In containers,
   set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed — the
   network-namespace layer needs `CAP_SYS_ADMIN` and is skipped without it.
+- **Metering:** every run persists `metrics.json` beside its journal — the
+  exact opcode count the VM's budget accounting maintained (`ops_used`, the
+  same units `CHIDORI_JS_OP_BUDGET` caps), the run's peak heap bytes, and
+  the caps in force. Billing/chargeback readers consume the blob (it is not
+  a journal record, so replay and `verify` are untouched); `chidori run
+  --trace` prints the same numbers.
 - **Hard memory ceiling (Linux):** `CHIDORI_ISOLATE_MEMORY_MAX_MB` gives
   each isolated worker a kernel-enforced cgroup v2 `memory.max` (plus
   `memory.swap.max=0` and `memory.oom.group=1`, so an over-limit worker is
