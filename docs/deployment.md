@@ -394,6 +394,31 @@ serverless piece that exists is storage: the
 [Durable Object run store](../integrations/cloudflare-durable-objects/) is a
 Worker that runs only when a write or hydration read arrives.
 
+## What a paused run costs
+
+Capacity planning for approval-heavy workloads hinges on one fact: **a
+durably paused run is a directory, not a process.** The lifecycle has two
+phases:
+
+1. **Warm-parked (bounded, opt-out).** An `input()` pause keeps its live VM
+   parked on a blocking thread (and, under OS isolation, its worker child
+   blocked on the broker pipe) so an imminent `/resume` skips replay. This
+   costs one thread + VM per parked run and lasts at most
+   `CHIDORI_WARM_RESUME_EVICT_MS` (default 10 minutes);
+   `CHIDORI_WARM_RESUME=0` disables parking entirely for fleets that prefer
+   flat memory over fast resumes. Approval pauses never park — they unwind
+   immediately.
+2. **Passivated (unbounded, free).** At eviction — or immediately for
+   approval/unwound pauses — the run exists only as its durable artifacts
+   under `.chidori/runs/<id>`: no process, no thread, no VM. A pause held
+   for hours or days consumes disk, nothing else, and survives the server
+   dying; the later resume replays from the journal (or restores the
+   mainline VM image where enabled).
+
+So the ceiling for *concurrently executing* runs is the concurrency cap and
+the ceiling for *warm-parked* runs is threads × the eviction window — but
+the number of *outstanding paused* runs is bounded by disk alone.
+
 ## Scaling to many users
 
 Scale in two moves, in this order:

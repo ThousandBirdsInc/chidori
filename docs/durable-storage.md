@@ -100,6 +100,9 @@ to concrete hosting recipes.
 
 ## Self-hosted cell store: `chidori cell-store`
 
+> Since **3.8.0** — releases up to v3.7.0 do not ship this subcommand; on
+> those, use the Durable Object relay or `s3://` mirroring.
+
 An alternative to the Durable Object relay that runs on your own
 infrastructure, implementing the core of the design behind Deno's
 [celld](https://github.com/denoland/celld) ("self-hosted, distributed Durable
@@ -182,13 +185,53 @@ and routing beyond this one-hop follow: nothing here places work on a node,
 picks an owner by load, or drains one for maintenance — ownership is still
 decided by whoever asks first after a lease lapses.
 
+## The relay protocol: bring your own store — or your own reader
+
+`CHIDORI_RUN_STORE=http(s)://…` speaks a small REST protocol, and anything
+that implements it is a first-class backend: the self-hosted cell store and
+the Durable Object relay are two implementations, not special cases. It is
+also the supported way to make an **external system the product's source of
+truth**: with a durable mirror configured, *every* journal record, blob
+write, and registry update flows through it (the tee writes all traffic to
+both primary and mirror), so a relay you own receives the full stream as it
+happens — no polling, no post-hoc export.
+
+The surface (bearer auth via `CHIDORI_RUN_STORE_TOKEN` when set):
+
+| verb | meaning |
+|---|---|
+| `GET /runs` | list run ids |
+| `GET /runs/{id}/records` | the run's full record log (JSON array) |
+| `POST /runs/{id}/records` | append one record — O(1), keyed by `seq`; re-append replaces |
+| `PUT /runs/{id}/records` | replace the whole log (compaction rewrite) |
+| `GET /runs/{id}/blobs` · `GET/PUT/DELETE /runs/{id}/blobs/{key}` | named artifacts: `checkpoint.json`, `runtime.snapshot.json`, `host_promises*`, `metrics.json`, `lease.json`, … |
+| `GET /registry` · `GET/PUT /registry/{name}` | the detached-agent registry |
+
+Two semantics carry the correctness story: **appends are idempotent by
+`seq`** (a retried append is safe), and **blob writes honor conditional
+headers** — `If-Match: "<sha256-of-bytes>"` / `If-None-Match: *`, answered
+`412` on a lost race — which is what the lease's compare-and-swap and the
+cell store's fencing ride on. A `409` means "another node owns this run" and
+may carry `owner`/`owner_url`/`lease_expires_at` (see the cell-store section
+above for the one-hop follow).
+
+To build a **reader** (run history UI, billing pipeline, audit stream):
+either implement the protocol and point `CHIDORI_RUN_STORE` at it — you now
+observe every write in order, per run, as it happens — or run the cell
+store / your own relay and have the reader consume its storage directly.
+The record shape is the journal's `CallRecord` (`seq`, `parent_seq`,
+`function`, `args`, `result`, `duration_ms`, `token_usage`, `timestamp`,
+`error`); `metrics.json` carries the per-run engine metering. The reference
+implementations are `crates/chidori/src/cellstore.rs` and
+[`integrations/cloudflare-durable-objects`](../integrations/cloudflare-durable-objects/).
+
 ## Write-error policy: `CHIDORI_DURABILITY`
 
 Journal writes are not fire-and-forget:
 
 * **`besteffort`** (default): a failed persistence write is logged and the
   run continues — right for local dev.
-* **`effect`**: **durable at the effect, priced at the effect.** Remote
+* **`effect`** (since **3.8.0**): **durable at the effect, priced at the effect.** Remote
   appends stay pipelined (the thing that makes `strict` expensive against a
   remote store), but each effectful host call runs a durability barrier
   around its pending-intent write *before* the effect executes and around

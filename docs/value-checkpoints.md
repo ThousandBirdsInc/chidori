@@ -82,6 +82,8 @@ dependency.
 
 ## `chidori.memo` — the async-capable checkpoint
 
+> Since **3.8.0**.
+
 When the value you want to checkpoint needs **async work to produce** —
 awaited effects, a `fetch`, a prompt — `chidori.step`'s purity contract is
 the wrong tool. `chidori.memo(name, fn)` is the container form:

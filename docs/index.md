@@ -5,6 +5,13 @@ description: "What Chidori is, the one mechanism behind it, and how these docs a
 
 # Chidori documentation
 
+> **Docs track the next release.** These pages describe the code on the
+> default branch, which may include features not yet in the release you
+> installed. When running a tagged release, read the docs *at that tag*
+> (`https://github.com/ThousandBirdsInc/chidori/tree/vX.Y.Z/docs`) and trust
+> `chidori <command> --help` over any page. Features that shipped after the
+> latest release are marked with a "since" note where the skew bites.
+
 Chidori is the agent framework where every run is durable, replayable, and
 resumable by default. You write agents as plain async TypeScript — real
 `if`/`for`/`try`, real imports, no graph DSL — and run them on a single Rust
