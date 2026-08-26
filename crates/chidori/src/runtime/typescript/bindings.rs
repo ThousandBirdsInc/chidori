@@ -1113,6 +1113,29 @@ impl HostBindingBackend {
                     Ok(a.get("value").cloned().unwrap_or(serde_json::Value::Null))
                 }
             },
+            // The two halves of `chidori.memo(name, fn)` — the async-capable
+            // durable value checkpoint: the callback may perform journaled
+            // effects (recorded as the memo's children); a replay hit returns
+            // the recorded value and absorbs the recorded subtree.
+            "memo_begin" => match self {
+                HostBindingBackend::Runtime { runtime_ctx, .. } => {
+                    host_core::execute_memo_begin(runtime_ctx, a).map_err(|err| err.to_string())
+                }
+                // The recorder has no replay log, so the callback always runs.
+                HostBindingBackend::Recorder(_) => {
+                    Ok(serde_json::json!({ "cached": false, "seq": 0 }))
+                }
+            },
+            "memo_end" => match self {
+                HostBindingBackend::Runtime { runtime_ctx, .. } => {
+                    host_core::execute_memo_end(runtime_ctx, a).map_err(|err| err.to_string())
+                }
+                HostBindingBackend::Recorder(recorder) => {
+                    let name = a.get("name").cloned().unwrap_or(serde_json::Value::Null);
+                    recorder.push("memo", serde_json::json!({ "name": name }));
+                    Ok(a.get("value").cloned().unwrap_or(serde_json::Value::Null))
+                }
+            },
             "mark" => {
                 let args = serde_json::json!({
                     "label": a.get("label").cloned().unwrap_or(serde_json::Value::Null),

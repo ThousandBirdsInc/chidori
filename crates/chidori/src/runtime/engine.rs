@@ -2597,6 +2597,148 @@ def agent(value):
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `chidori.memo` — the async-capable value checkpoint: the callback may
+    /// await and perform journaled effects (recorded as the memo's children);
+    /// replay returns the recorded value, absorbs the recorded subtree, and
+    /// never re-runs the callback.
+    #[test]
+    fn engine_memo_memoizes_async_checkpoint_with_inner_effects_on_replay() {
+        let dir =
+            std::env::temp_dir().join(format!("chidori-engine-ts-memo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const plan = await chidori.memo("plan", async () => {
+                        await chidori.log("inside memo");
+                        let total = 0;
+                        for (let i = 0; i <= 1000; i++) total += i;
+                        return { total, source: "computed" };
+                    });
+                    return { total: plan.total, source: plan.source };
+                }
+            "#,
+        )
+        .unwrap();
+
+        let engine = || {
+            Engine::new(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+
+        let recorded = engine().run(&path, &serde_json::json!({})).unwrap();
+        assert_eq!(
+            recorded.output,
+            serde_json::json!({ "total": 500500, "source": "computed" })
+        );
+        let records = recorded.call_log.into_records();
+        // One `log` child nested under the `memo` container.
+        assert_eq!(records.len(), 2, "records: {records:?}");
+        let memo = records.iter().find(|r| r.function == "memo").unwrap();
+        let log = records.iter().find(|r| r.function == "log").unwrap();
+        assert_eq!(memo.args, serde_json::json!({ "name": "plan" }));
+        assert_eq!(
+            memo.result,
+            serde_json::json!({ "total": 500500, "source": "computed" })
+        );
+        assert_eq!(log.parent_seq, Some(memo.seq), "log nests under the memo");
+
+        // Replay against an edited body that would throw if re-executed: the
+        // journaled value must win and the inner effect must not re-fire.
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const plan = await chidori.memo("plan", async () => {
+                        throw new Error("memo callback must not re-run on replay");
+                    });
+                    return { total: plan.total, source: plan.source };
+                }
+            "#,
+        )
+        .unwrap();
+        let replayed = engine()
+            .run_with_replay(&path, &serde_json::json!({}), records)
+            .unwrap();
+        assert_eq!(replayed.output, recorded.output);
+        // Both records were consumed from the journal (the memo hit absorbs
+        // its recorded subtree), so nothing executed live.
+        assert_eq!(replayed.replayed_calls, 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A memo callback that rejects journals the error; replay re-throws the
+    /// recorded error without re-running the callback.
+    #[test]
+    fn engine_memo_replays_recorded_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-engine-ts-memo-err-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    try {
+                        await chidori.memo("fetch-plan", async () => {
+                            throw new Error("upstream unavailable");
+                        });
+                        return { outcome: "unreachable" };
+                    } catch (err) {
+                        return { outcome: String(err.message) };
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let engine = || {
+            Engine::new(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+        let recorded = engine().run(&path, &serde_json::json!({})).unwrap();
+        assert_eq!(
+            recorded.output,
+            serde_json::json!({ "outcome": "upstream unavailable" })
+        );
+        let records = recorded.call_log.into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "memo");
+        assert_eq!(records[0].error.as_deref(), Some("upstream unavailable"));
+
+        // Edited callback would now succeed; the recorded error still wins.
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    try {
+                        await chidori.memo("fetch-plan", async () => ({ fine: true }));
+                        return { outcome: "unreachable" };
+                    } catch (err) {
+                        return { outcome: String(err.message) };
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let replayed = engine()
+            .run_with_replay(&path, &serde_json::json!({}), records)
+            .unwrap();
+        assert_eq!(replayed.output, recorded.output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A step callback that throws journals the error, and replay re-throws the
     /// recorded error without re-running the callback — even when the edited
     /// callback would now succeed.

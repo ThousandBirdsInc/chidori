@@ -890,6 +890,94 @@ pub fn execute_step_end(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     Ok(result)
 }
 
+/// First half of `chidori.memo(name, fn)` — the ASYNC-capable durable value
+/// checkpoint (`docs/value-checkpoints.md`). Where `chidori.step` demands a
+/// synchronous pure callback, `memo` accepts an async callback whose body may
+/// itself perform journaled host effects: the memo is a *container* — its
+/// inner effects record as children (`parent_seq`), and a replay hit returns
+/// the recorded value, absorbs the recorded subtree
+/// ([`RuntimeContext::absorb_replayed_subtree`]), and never re-runs the
+/// callback. A crash between begin and end simply re-runs the callback on
+/// resume, with its inner effects served from their own records.
+pub fn execute_memo_begin(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("chidori.memo requires a string name"))?
+        .to_string();
+    if let Some(active) = ctx.active_step_name() {
+        anyhow::bail!(
+            "chidori.memo(\"{name}\") cannot start inside chidori.step(\"{active}\"): \
+             step callbacks must be pure, synchronous computation — use memo for \
+             the outer checkpoint instead"
+        );
+    }
+    let seq = ctx.next_seq();
+
+    if let Some(record) = ctx
+        .try_replay_checked(seq, "memo", &json!({ "name": name }))
+        .map_err(|err| anyhow::anyhow!(err))?
+    {
+        let recorded_name = record
+            .args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if recorded_name != name {
+            anyhow::bail!(
+                "Replay divergence at seq {seq}: checkpoint has memo \"{recorded_name}\" \
+                 but agent called memo \"{name}\". The agent code changed since the \
+                 checkpoint was saved — re-run without replay to regenerate."
+            );
+        }
+        // The callback's inner effects recorded as this memo's children;
+        // absorb them so the sequence counter stays aligned and they survive
+        // in the trace.
+        ctx.absorb_replayed_subtree(seq);
+        return Ok(match record.error {
+            Some(error) => json!({ "cached": true, "error": error }),
+            None => json!({ "cached": true, "value": record.result }),
+        });
+    }
+
+    // Live: open the container so the callback's host effects nest under it.
+    ctx.enter_call(seq);
+    Ok(json!({ "cached": false, "seq": seq }))
+}
+
+/// Second half of `chidori.memo` — close the container opened by
+/// [`execute_memo_begin`] and record the callback's outcome at the reserved
+/// seq. Returns the canonical (JSON round-tripped) value so live and replayed
+/// runs observe byte-identical results.
+pub fn execute_memo_end(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("chidori.memo requires a string name"))?;
+    let seq = args
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("chidori.memo internal error: memo_end without a seq"))?;
+    ctx.exit_call(seq);
+    let error = args.get("error").and_then(Value::as_str);
+    let result = match error {
+        Some(_) => Value::Null,
+        None => args.get("value").cloned().unwrap_or(Value::Null),
+    };
+    ctx.record_call(CallRecord {
+        seq,
+        parent_seq: None,
+        function: "memo".to_string(),
+        args: json!({ "name": name }),
+        result: result.clone(),
+        duration_ms: 0,
+        token_usage: None,
+        timestamp: Utc::now(),
+        error: error.map(str::to_string),
+    });
+    Ok(result)
+}
+
 /// Whether (and how long) a prompt request should mark cacheable prefix
 /// boundaries. The default is on with the 5-minute TTL — caching is a billing
 /// optimization that never changes a response, so it is safe by default; a

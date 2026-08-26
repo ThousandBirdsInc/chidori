@@ -28,6 +28,43 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
     // and these three are pure JS control flow that records nothing.
     globalThis.chidori.util = globalThis.chidori.util || {};
 
+    // chidori.memo(name, fn) — the ASYNC-capable durable value checkpoint
+    // (docs/value-checkpoints.md). Unlike chidori.step, the callback may
+    // await and perform journaled host effects (they record as the memo's
+    // children); on replay the recorded value returns and the callback never
+    // runs. Wired over the __memoBegin/__memoEnd natives when the engine
+    // exposes them.
+    if (globalThis.chidori.__memoBegin && !globalThis.chidori.memo) {
+        globalThis.chidori.memo = async function memo(name, fn) {
+            if (typeof name !== "string") {
+                throw new TypeError("chidori.memo requires a string name as its first argument");
+            }
+            if (typeof fn !== "function") {
+                throw new TypeError("chidori.memo requires a callback as its second argument");
+            }
+            const begin = globalThis.chidori.__memoBegin(name);
+            if (begin && begin.cached) {
+                if (begin.error !== undefined && begin.error !== null) {
+                    throw new Error(begin.error);
+                }
+                return begin.value;
+            }
+            const seq = begin ? begin.seq : 0;
+            try {
+                const value = await fn();
+                // The host round-trips the value through JSON so live and
+                // replayed runs observe byte-identical results.
+                return globalThis.chidori.__memoEnd({ name, seq, value });
+            } catch (err) {
+                const message = String(err && err.message ? err.message : err);
+                globalThis.chidori.__memoEnd({ name, seq, error: message });
+                // Rebuilt from the recorded message so the live throw matches
+                // the replayed one exactly.
+                throw new Error(message);
+            }
+        };
+    }
+
     globalThis.chidori.util.tryCall = async function tryCall(fn) {
         try {
             return { ok: true, value: await fn() };
