@@ -115,6 +115,14 @@ Differences from `step`:
 - A crash between begin and end re-runs the callback on resume with its
   already-journaled inner effects replayed from their own records — same
   "optimization, not correctness dependency" posture as `step`.
+- **Do not start memos concurrently** (e.g. `Promise.all` of two memos). A
+  memo that begins while another is still in flight records as its child,
+  and a later replay of the outer memo would absorb the interleaved
+  sibling's records while its wrapper still runs — re-executing its
+  effects. Nesting a memo *inside* another memo's callback is fine (the
+  inner wrapper is skipped along with the outer callback); concurrency
+  belongs *within one* memo's callback or outside memos entirely.
+  `chidori verify` catches the misuse as a journal-consumption divergence.
 
 ## Determinism
 

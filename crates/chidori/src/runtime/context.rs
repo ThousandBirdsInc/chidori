@@ -1885,6 +1885,21 @@ impl RuntimeContext {
         if let Some(safepoint) = safepoint {
             safepoint.call(&operation)?;
         }
+        // CHIDORI_DURABILITY=effect: the pending-intent write above must be
+        // DURABLE before the effect fires — barrier the (still-pipelined)
+        // store here, at the one chokepoint every host-operation kind
+        // (prompt, http, tool, call_agent, …) passes through, so a crash
+        // mid-effect always leaves a durable trace that the effect may have
+        // executed. Strict mode needs no barrier: every write is already
+        // synchronous.
+        if crate::runtime::store::effect_barriers() {
+            self.flush_store().map_err(|err| {
+                anyhow::anyhow!(
+                    "refusing the live effect: the effect-intent barrier failed under \
+                     CHIDORI_DURABILITY=effect: {err}"
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -1904,6 +1919,13 @@ impl RuntimeContext {
         };
         if let Some(safepoint) = safepoint {
             safepoint.call(&record)?;
+        }
+        // CHIDORI_DURABILITY=effect: the effect's outcome is durable before
+        // the program observes it, so recovery replays this effect from the
+        // journal instead of re-executing it. Same chokepoint argument as
+        // the pre-effect barrier above.
+        if crate::runtime::store::effect_barriers() {
+            self.flush_store()?;
         }
         Ok(())
     }

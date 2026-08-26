@@ -143,8 +143,9 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   warm and the policy sandbox + SSRF guard still apply.
 - **Metering:** every run persists `metrics.json` beside its journal — the
   exact opcode count the VM's budget accounting maintained (`ops_used`, the
-  same units `CHIDORI_JS_OP_BUDGET` caps), the run's peak heap bytes, and
-  the caps in force. Billing/chargeback readers consume the blob (it is not
+  same units `CHIDORI_JS_OP_BUDGET` caps), the run's peak heap bytes, the
+  run thread's CPU time (`cpu_ms` — compute only, time blocked in host
+  effects excluded), and the caps in force. Billing/chargeback readers consume the blob (it is not
   a journal record, so replay and `verify` are untouched); `chidori run
   --trace` prints the same numbers.
 - **Hard memory ceiling (Linux):** `CHIDORI_ISOLATE_MEMORY_MAX_MB` gives

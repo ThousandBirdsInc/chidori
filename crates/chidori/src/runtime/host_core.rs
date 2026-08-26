@@ -73,20 +73,11 @@ pub fn execute_durable_json_call_at_seq(
         ctx.begin_host_operation_with_function(seq, kind, Some(function.to_string()), args.clone())
     });
     if let Some(id) = host_operation {
+        // The safepoint persists the pending intent and, under
+        // CHIDORI_DURABILITY=effect, barriers it durable before the effect
+        // fires (the barrier lives in the safepoint itself so every
+        // host-operation kind — prompt paths included — gets it).
         ctx.run_host_operation_safepoint(id)?;
-        // Effect mode: the pending-intent write above must be DURABLE before
-        // the effect fires — barrier the (still-pipelined) store now, so a
-        // crash mid-effect always leaves a durable trace that the effect may
-        // have executed. Strict mode needs no barrier: every write is already
-        // synchronous.
-        if crate::runtime::store::effect_barriers() {
-            ctx.flush_store().map_err(|err| {
-                anyhow::anyhow!(
-                    "refusing live `{function}`: the effect-intent barrier failed \
-                     under CHIDORI_DURABILITY=effect: {err}"
-                )
-            })?;
-        }
     }
     let started = Utc::now();
     // Mark this call as executing so any calls made inside `live()` (a
@@ -117,12 +108,6 @@ pub fn execute_durable_json_call_at_seq(
             });
             if let Some(id) = host_operation {
                 ctx.run_host_operation_completion_safepoint(id)?;
-                // Effect mode: the result record is durable before the
-                // program observes it, so recovery replays this effect from
-                // the journal instead of re-firing it.
-                if crate::runtime::store::effect_barriers() {
-                    ctx.flush_store()?;
-                }
             }
             Ok(result)
         }
@@ -151,9 +136,6 @@ pub fn execute_durable_json_call_at_seq(
             });
             if let Some(id) = host_operation {
                 ctx.run_host_operation_completion_safepoint(id)?;
-                if crate::runtime::store::effect_barriers() {
-                    ctx.flush_store()?;
-                }
             }
             Err(anyhow::anyhow!(message))
         }

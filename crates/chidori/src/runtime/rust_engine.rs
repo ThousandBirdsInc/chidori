@@ -591,6 +591,26 @@ struct ExecutionGuard {
     initial_op_budget: Option<u64>,
     /// The heap cap in force, echoed into the run's metrics.
     mem_cap: Option<usize>,
+    /// The run thread's CPU clock at install, so metrics can report the
+    /// run's actual CPU time (excludes time blocked in host effects).
+    start_cpu_ns: Option<u64>,
+}
+
+/// The calling thread's CPU time (CLOCK_THREAD_CPUTIME_ID), for run metering.
+#[cfg(unix)]
+fn thread_cpu_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes a single well-formed timespec we own.
+    (unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0)
+        .then(|| ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_ns() -> Option<u64> {
+    None
 }
 
 impl ExecutionGuard {
@@ -645,6 +665,7 @@ impl ExecutionGuard {
             _meter: meter_guard,
             initial_op_budget: limits.op_budget,
             mem_cap: limits.mem_cap,
+            start_cpu_ns: thread_cpu_ns(),
         }
     }
 
@@ -661,11 +682,18 @@ impl ExecutionGuard {
             ._meter
             .as_ref()
             .map(|m| crate::mem_guard::run_meter_peak_bytes(&m.handle()));
+        // Same thread that ran the VM, so the delta is this run's compute —
+        // time blocked in host effects is not CPU time and is excluded.
+        let cpu_ms = self
+            .start_cpu_ns
+            .zip(thread_cpu_ns())
+            .map(|(start, now)| now.saturating_sub(start) / 1_000_000);
         serde_json::json!({
             "ops_used": ops_used,
             "op_budget": self.initial_op_budget,
             "peak_heap_bytes": peak,
             "mem_cap_bytes": self.mem_cap,
+            "cpu_ms": cpu_ms,
         })
     }
 }

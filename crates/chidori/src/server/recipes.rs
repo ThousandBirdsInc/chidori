@@ -40,6 +40,12 @@ pub(super) async fn run_recipe(
         )
             .into_response();
     };
+    // A manual recipe trigger executes a full agent run — same run slot as
+    // every other run, so recipe bursts cannot bypass the concurrency cap.
+    let _permit = match super::hardening::acquire_run_slot(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let deps = SchedulerDeps {
         providers: state.providers.clone(),
         template_engine: state.template_engine.clone(),
