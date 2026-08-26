@@ -137,10 +137,28 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   the same thread (keyed by path + full source), so a server's pooled
   worker threads pay a heavy import graph's parse/compile cost once, not
   per run — measured ~9× off the fixed per-run cost of a 40-module graph.
-  Caveat: OS isolation (`CHIDORI_ISOLATE=process`, the Unix default)
-  spawns a fresh worker per run, which starts every cache cold; for
-  throughput-critical trusted workloads, `--no-isolate` keeps the caches
-  warm and the policy sandbox + SSRF guard still apply.
+  OS isolation (`CHIDORI_ISOLATE=process`, the Unix default) spawns a
+  fresh worker per run, which starts every cache cold; close that with the
+  **warm worker pool** below, or — for throughput-critical trusted
+  workloads — `--no-isolate` keeps the in-process caches warm and the
+  policy sandbox + SSRF guard still apply.
+- **Warm worker pool (isolated serving):** `--warm-pool N`
+  (`CHIDORI_ISOLATE_WARM_POOL=N`, default 0 = off) keeps N isolate workers
+  parked per agent entry, each spawned — and its module graph compiled,
+  inside the full sandbox — *before* a run needs it. A pooled worker still
+  serves exactly **one** run and exits; nothing is ever reused across runs,
+  so the spawn-per-run disposability and memory-accounting story is
+  unchanged — the spawn and compile just happen earlier, off the request
+  path. Staleness cannot occur by construction: the caches are keyed by
+  full source, so a module edited between prewarm and run misses and
+  recompiles fresh. Parked workers expire after
+  `CHIDORI_ISOLATE_WARM_TTL_MS` (default 15 min), at most 8 entries hold
+  warm workers at once (LRU), and the pool refills in the background after
+  every run. Budget `N × entries × ~20 MB` of parked-worker memory.
+  Measured on a 41-module agent graph (release build, `POST /sessions`
+  round-trip p50): 119 ms per isolated run cold, 56 ms prewarmed — the
+  pool removes ~¾ of the isolation premium over the 33 ms in-process
+  (`--no-isolate`) floor.
 - **Metering:** every run persists `metrics.json` beside its journal — the
   exact opcode count the VM's budget accounting maintained (`ops_used`, the
   same units `CHIDORI_JS_OP_BUDGET` caps), the run's peak heap bytes, the

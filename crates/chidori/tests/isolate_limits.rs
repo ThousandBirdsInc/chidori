@@ -243,3 +243,169 @@ fn cpu_limit_terminates_a_busy_worker() {
     );
     let _ = fs::remove_dir_all(agent.parent().unwrap());
 }
+
+/// With the warm pool enabled, a one-shot `chidori run` behaves exactly as
+/// without it: the root run is correct, and the workers the pool prewarmed in
+/// the background (which never get a run — the process exits first) shut down
+/// silently on EOF instead of reporting protocol errors.
+#[test]
+fn warm_pool_enabled_run_is_correct_and_parked_workers_exit_quietly() {
+    let agent = write_agent(
+        "pool-quiet",
+        r#"
+        import { run } from "chidori:agent";
+        import { bump } from "./helper.ts";
+        run(async (input: { n: number }) => ({ out: bump(input.n ?? 1) }));
+        "#,
+    );
+    fs::write(
+        agent.parent().unwrap().join("helper.ts"),
+        "export function bump(n: number): number { return n + 1; }\n",
+    )
+    .unwrap();
+    let out = run_isolated(
+        &agent,
+        &[
+            ("CHIDORI_ISOLATE_WARM_POOL", "2"),
+            ("CHIDORI_ISOLATE_VERBOSE", "1"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "expected success; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("\"out\""),
+        "stdout missing result: {stdout}"
+    );
+    // The parked prewarmed workers see EOF at process exit — that is their
+    // normal end-of-life, not an error to report.
+    assert!(
+        !stderr.contains("isolate worker error"),
+        "parked workers must exit quietly at parent exit; stderr={stderr}"
+    );
+    let _ = fs::remove_dir_all(agent.parent().unwrap());
+}
+
+/// Minimal raw-HTTP client for the serve E2E below (no HTTP dev-dependency).
+fn http_request(port: u16, request: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    // No write-shutdown: hyper aborts on a half-closed connection. The
+    // `Connection: close` header makes the server close after the response,
+    // which ends the read.
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    response
+}
+
+/// End-to-end warm-pool proof through `chidori serve` (the pool's audience —
+/// one long-lived parent process serving many root runs): the first session
+/// cold-spawns its worker and seeds the pool; a later session draws a
+/// prewarmed one.
+#[test]
+fn warm_pool_serves_a_later_server_run_prewarmed() {
+    let agent = write_agent(
+        "serve",
+        r#"
+        import { run } from "chidori:agent";
+        import { bump } from "./helper.ts";
+        run(async (input: { n: number }) => ({ out: bump(input.n) }));
+        "#,
+    );
+    fs::write(
+        agent.parent().unwrap().join("helper.ts"),
+        "export function bump(n: number): number { return n + 1; }\n",
+    )
+    .unwrap();
+
+    let port = {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let mut server = Command::new(chidori_bin())
+        .arg("serve")
+        .arg(&agent)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--isolate")
+        .env("CHIDORI_ISOLATE_WARM_POOL", "2")
+        .env("CHIDORI_ISOLATE_VERBOSE", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Everything below must kill the server even on panic, so run it in a
+    // closure and reap afterwards.
+    let result = std::panic::catch_unwind(|| {
+        // Readiness: /health answers once the server is up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("server did not come up on port {port}");
+            }
+            let health = std::panic::catch_unwind(|| {
+                http_request(
+                    port,
+                    &format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+                )
+            });
+            if health.is_ok_and(|h| h.starts_with("HTTP/1.1 200")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        let post_session = |n: u32| {
+            let body = format!("{{\"input\":{{\"n\":{n}}}}}");
+            http_request(
+                port,
+                &format!(
+                    "POST /sessions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+
+        // First run: cold worker, seeds the pool.
+        let first = post_session(5);
+        assert!(
+            first.contains("\"out\":6") || first.contains("\"out\": 6"),
+            "first session response: {first}"
+        );
+        // Give the background prewarm ample time (measured ~70 ms in debug).
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        // Second run: must draw a prewarmed worker.
+        let second = post_session(7);
+        assert!(
+            second.contains("\"out\":8") || second.contains("\"out\": 8"),
+            "second session response: {second}"
+        );
+    });
+
+    let _ = server.kill();
+    let output = server.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Err(panic) = result {
+        panic!(
+            "serve E2E failed: {}; server stderr={stderr}",
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        );
+    }
+    assert!(
+        stderr.contains("prewarmed worker serving"),
+        "the second run should have drawn a prewarmed worker; stderr={stderr}"
+    );
+    let _ = fs::remove_dir_all(agent.parent().unwrap());
+}

@@ -30,6 +30,28 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Parent → child messages.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum FromParent {
+    /// Optional first frame, sent to a worker spawned *ahead of need* (the warm
+    /// pool): seal the sandbox now, then walk and compile `entry_path`'s module
+    /// graph — brokering `__module_load` like a run would — so the thread-local
+    /// transpile/compile caches are hot before any [`FromParent::Init`] arrives.
+    /// Nothing is linked or evaluated, and the caches are keyed by full source,
+    /// so a module that changes between prewarm and run simply misses; a
+    /// prewarmed worker still serves exactly ONE run and then exits — the
+    /// spawn-per-run disposability story is unchanged, the spawn just happened
+    /// earlier. The worker answers with [`FromChild::Warmed`] and then waits
+    /// for the ordinary `Init`.
+    Prewarm {
+        entry_path: String,
+        entry_source: String,
+        /// The determinism prelude the later run will evaluate, compiled (not
+        /// evaluated) into the script cache ahead of time. `None` skips it.
+        prelude: Option<String>,
+        /// Applied — together with the OS sandbox — BEFORE the prewarm
+        /// compile, so untrusted source is never parsed outside the same
+        /// confinement a run gets. The later `Init`'s limits are ignored by a
+        /// sealed worker.
+        limits: ResourceLimits,
+    },
     /// The one-time handoff that starts a run. The child has no filesystem, so
     /// the entry source and the determinism prelude are shipped inline; sibling
     /// imports are resolved lazily by brokering `__module_load` back to us.
@@ -56,6 +78,11 @@ pub enum FromChild {
     /// A host op the child needs the parent to perform (`chidori.*` effect,
     /// `__chidori_*` native, `__chidori_dom_render`, or `__module_load`).
     Call { op: String, args: Value },
+    /// Prewarm finished (best-effort): `modules` is how many modules were
+    /// compiled into the cache — 0 when the graph didn't compile, which is not
+    /// an error here (the run path reports it properly). The worker is now
+    /// parked waiting for its `Init`.
+    Warmed { modules: u32 },
     /// The run finished; `outcome` is the agent's output or the error.
     Done { outcome: Outcome },
 }

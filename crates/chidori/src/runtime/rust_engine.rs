@@ -923,43 +923,7 @@ fn run_module_inner(
     // string lookups resolved here (identically in-process and in the worker);
     // only the disk-reading sibling resolution is routed through `host.call` so
     // the isolate worker — which has no filesystem — brokers it to the parent.
-    let load_host = host.clone();
-    let mut load = |specifier: &str,
-                    importer_key: &str|
-     -> std::result::Result<(String, String), String> {
-        if let Some(name) = specifier.strip_prefix("node:") {
-            // Serve the shim by name under a stable synthetic key. The shim's own
-            // `node:` imports (e.g. `node:buffer`) recurse through this same
-            // branch; its body is plain JS, so it needs no transpilation.
-            let src = crate::runtime::typescript::builtins::shim_source(name).ok_or_else(|| {
-                format!(
-                    "unsupported node: builtin '{specifier}' (imported from {importer_key}); \
-                     the runtime shims the Node builtin module suite and this name is not \
-                     part of it — see docs/package-management.md#compatibility"
-                )
-            })?;
-            return Ok((format!("node:{name}"), src.to_string()));
-        }
-        // Vendored packages (react, react-dom/server, …): self-contained UMD
-        // wrapped as an ES module. Served from the built-in registry so
-        // `import React from 'react'` resolves without a node_modules install.
-        if let Some(resolved) = crate::runtime::typescript::builtins::vendored_module(specifier) {
-            return Ok(resolved);
-        }
-        let resolved = load_host.call(
-            "__module_load",
-            &serde_json::json!({ "specifier": specifier, "importer": importer_key }),
-        )?;
-        let key = resolved
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "__module_load: response missing `key`".to_string())?;
-        let src = resolved
-            .get("source")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "__module_load: response missing `source`".to_string())?;
-        Ok((key.to_string(), src.to_string()))
-    };
+    let mut load = host_module_loader(host.clone());
 
     // Install per-run resource limits (opcode budget + memory/deadline watchdog)
     // before any agent code runs, and isolate the host from an engine panic: a
@@ -1111,6 +1075,107 @@ fn drive_imaged(
         ),
         Err(err) => ModuleOutcome::Done(Err(err)),
     }
+}
+
+/// The engine's module-load callback over a [`RunHost`]: `node:` shims and
+/// vendored packages are pure string lookups resolved locally (identically
+/// in-process and in the worker); only the disk-reading sibling resolution is
+/// routed through `host.call("__module_load", …)`, so the isolate worker —
+/// which has no filesystem role — brokers it to the parent. Shared by the run
+/// path ([`run_module`]) and the warm-pool prewarm ([`prewarm_module_graph`])
+/// so both walk the graph with byte-identical keys and sources.
+pub(crate) fn host_module_loader(
+    host: Rc<dyn RunHost>,
+) -> impl FnMut(&str, &str) -> std::result::Result<(String, String), String> {
+    move |specifier: &str, importer_key: &str| {
+        if let Some(name) = specifier.strip_prefix("node:") {
+            // Serve the shim by name under a stable synthetic key. The shim's own
+            // `node:` imports (e.g. `node:buffer`) recurse through this same
+            // branch; its body is plain JS, so it needs no transpilation.
+            let src = crate::runtime::typescript::builtins::shim_source(name).ok_or_else(|| {
+                format!(
+                    "unsupported node: builtin '{specifier}' (imported from {importer_key}); \
+                     the runtime shims the Node builtin module suite and this name is not \
+                     part of it — see docs/package-management.md#compatibility"
+                )
+            })?;
+            return Ok((format!("node:{name}"), src.to_string()));
+        }
+        // Vendored packages (react, react-dom/server, …): self-contained UMD
+        // wrapped as an ES module. Served from the built-in registry so
+        // `import React from 'react'` resolves without a node_modules install.
+        if let Some(resolved) = crate::runtime::typescript::builtins::vendored_module(specifier) {
+            return Ok(resolved);
+        }
+        let resolved = host.call(
+            "__module_load",
+            &serde_json::json!({ "specifier": specifier, "importer": importer_key }),
+        )?;
+        let key = resolved
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "__module_load: response missing `key`".to_string())?;
+        let src = resolved
+            .get("source")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "__module_load: response missing `source`".to_string())?;
+        Ok((key.to_string(), src.to_string()))
+    }
+}
+
+/// Walk and compile (WITHOUT linking or evaluating) the module graph rooted at
+/// `path`, brokering module loads through `host` exactly as a run would — so
+/// this thread's transpile/script/module-compile caches are hot before a run
+/// arrives. Used by the isolate worker's prewarm phase (`FromParent::Prewarm`).
+///
+/// Soundness needs no fingerprinting: every cache is keyed by the FULL source
+/// (plus label), so a module that changes between prewarm and run simply
+/// misses and is recompiled fresh — a stale prewarm can cost time, never
+/// correctness. `prelude`, when given, is compiled (not evaluated) into the
+/// same script cache [`chidori_js::Engine::eval_cached`] reads. Returns the
+/// number of distinct modules compiled, entry included. Best-effort by
+/// contract: a graph that fails to compile returns `Err`, which callers
+/// report as diagnostics — the later run surfaces the real error properly.
+pub(crate) fn prewarm_module_graph(
+    path: &Path,
+    source: &str,
+    prelude: Option<&str>,
+    host: Rc<dyn RunHost>,
+) -> std::result::Result<usize, String> {
+    if let Some(prelude) = prelude {
+        let _ = chidori_js::compiler::compile_script_cached(prelude);
+    }
+    // The helper scripts every run evaluates verbatim (see `run_module_inner`).
+    for script in [
+        crate::runtime::typescript::helpers::CHIDORI_JS_HELPERS_SCRIPT,
+        crate::runtime::typescript::helpers::FETCH_POLYFILL,
+        crate::runtime::typescript::helpers::INPUT_SCHEMA_SCRIPT,
+    ] {
+        let _ = chidori_js::compiler::compile_script_cached(script);
+    }
+    let opts = TranspileOptions {
+        import_policy: TypeScriptImportPolicy::Node,
+    };
+    let js = transpile_module(path, source, &opts).map_err(|e| e.to_string())?;
+    let entry_key = path.to_string_lossy().to_string();
+    let keys = Rc::new(std::cell::RefCell::new(std::collections::HashSet::from([
+        entry_key.clone(),
+    ])));
+    let mut inner = host_module_loader(host);
+    let keys_seen = keys.clone();
+    let mut load = move |spec: &str, importer: &str| {
+        let resolved = inner(spec, importer);
+        if let Ok((key, _)) = &resolved {
+            keys_seen.borrow_mut().insert(key.clone());
+        }
+        resolved
+    };
+    let mut engine = chidori_js::Engine::new();
+    let result = engine.prepare_image_units(&entry_key, &js, &mut load);
+    // Break the realm's Rc cycles like every other engine teardown — the
+    // prewarm engine never ran agent code, but its realm still cycles.
+    engine.vm.dispose();
+    result.map(|()| keys.borrow().len())
 }
 
 /// Resolve `specifier` from `importer_key` (relative for agent code, full
@@ -2045,6 +2110,187 @@ mod tests {
             .get("hash")
             .and_then(|v| v.as_str())
             .is_some_and(|h| h.len() == 64));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A run on a PREWARMED worker (the warm pool's `Prewarm` → `Warmed` →
+    /// `Init` sequence) must be byte-identical — output and host-call log — to
+    /// the same run on a cold worker and in-process. Exercises the worker's
+    /// prewarm phase (graph compile via brokered `__module_load`), the parked
+    /// hand-off, and the run itself, over an in-process socketpair.
+    #[cfg(unix)]
+    #[test]
+    fn prewarmed_isolated_run_matches_in_process_byte_for_byte() {
+        use std::os::unix::net::UnixStream;
+
+        use crate::runtime::isolate::protocol::FromParent;
+        use crate::runtime::isolate::supervisor::{broker_after_init, prewarm_exchange};
+
+        let dir = std::env::temp_dir().join(format!("chidori-prewarm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            dir.join("helper.ts"),
+            "export function bump(n: number): number { return n + 1; }\n",
+        )
+        .unwrap();
+        let src = r#"
+            import { chidori, run } from "chidori:agent";
+            import { bump } from "./helper.ts";
+            import { createHash } from "node:crypto";
+            run(async (input: { value: number }) => {
+                await chidori.log("prewarm parity check");
+                const h = createHash("sha256").update("chidori").digest("hex");
+                return { value: bump(input.value), hash: h };
+            });
+        "#;
+        std::fs::write(&path, src).unwrap();
+        let input = serde_json::json!({ "value": 41 });
+
+        let host_calls = |ctx: &RuntimeContext| -> Vec<(String, Value)> {
+            ctx.call_log()
+                .into_records()
+                .into_iter()
+                .map(|r| (r.function, r.args))
+                .collect()
+        };
+
+        // 1) In-process baseline.
+        let ctx_inproc = RuntimeContext::new();
+        let backend_inproc = test_backend(ctx_inproc.clone(), Arc::new(ToolRegistry::new()));
+        let out_inproc = run_agent(&path, src, &input, &backend_inproc).unwrap();
+
+        // 2) Prewarmed brokered run.
+        let (parent_sock, child_sock) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let reader = child_sock.try_clone().unwrap();
+            crate::runtime::isolate::worker::serve(reader, child_sock)
+        });
+
+        let ctx_warm = RuntimeContext::new();
+        let backend_warm = test_backend(ctx_warm.clone(), Arc::new(ToolRegistry::new()));
+        let prelude = backend_warm
+            .runtime_policy()
+            .map(|p| rust_engine_prelude(&p));
+        let mut to_child = parent_sock.try_clone().unwrap();
+        let mut from_child: UnixStream = parent_sock;
+        let modules = prewarm_exchange(
+            &mut from_child,
+            &mut to_child,
+            FromParent::Prewarm {
+                entry_path: path.to_string_lossy().into_owned(),
+                entry_source: src.to_string(),
+                prelude: prelude.clone(),
+                limits: crate::runtime::isolate::limits::ResourceLimits::default(),
+            },
+        )
+        .unwrap();
+        // Entry + helper + node:crypto and whatever the crypto shim pulls in.
+        assert!(
+            modules >= 3,
+            "prewarm compiled the graph: {modules} modules"
+        );
+
+        let init = FromParent::Init {
+            entry_path: path.to_string_lossy().into_owned(),
+            entry_source: src.to_string(),
+            fallback_export: "agent".to_string(),
+            input: input.clone(),
+            prelude,
+            limits: crate::runtime::isolate::limits::ResourceLimits::default(),
+        };
+        crate::runtime::isolate::protocol::write_frame(&mut to_child, &init).unwrap();
+        let out_warm = broker_after_init(&mut from_child, &mut to_child, &backend_warm).unwrap();
+        worker.join().unwrap().unwrap();
+
+        assert_eq!(
+            out_warm, out_inproc,
+            "prewarmed output must match in-process"
+        );
+        assert_eq!(
+            host_calls(&ctx_warm),
+            host_calls(&ctx_inproc),
+            "prewarmed host-call log must match in-process"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A module edited between prewarm and run must NOT be served stale: the
+    /// compile caches are keyed by full source, so the run's brokered load of
+    /// the new source misses the prewarmed artifact and recompiles fresh.
+    #[cfg(unix)]
+    #[test]
+    fn prewarm_never_serves_a_stale_module() {
+        use std::os::unix::net::UnixStream;
+
+        use crate::runtime::isolate::protocol::FromParent;
+        use crate::runtime::isolate::supervisor::{broker_after_init, prewarm_exchange};
+
+        let dir = std::env::temp_dir().join(format!("chidori-stale-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let helper = dir.join("helper.ts");
+        std::fs::write(
+            &helper,
+            "export function bump(n: number): number { return n + 1; }\n",
+        )
+        .unwrap();
+        let src = r#"
+            import { run } from "chidori:agent";
+            import { bump } from "./helper.ts";
+            run(async (input: { value: number }) => ({ value: bump(input.value) }));
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let (parent_sock, child_sock) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let reader = child_sock.try_clone().unwrap();
+            crate::runtime::isolate::worker::serve(reader, child_sock)
+        });
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx, Arc::new(ToolRegistry::new()));
+        let prelude = backend.runtime_policy().map(|p| rust_engine_prelude(&p));
+        let mut to_child = parent_sock.try_clone().unwrap();
+        let mut from_child: UnixStream = parent_sock;
+        prewarm_exchange(
+            &mut from_child,
+            &mut to_child,
+            FromParent::Prewarm {
+                entry_path: path.to_string_lossy().into_owned(),
+                entry_source: src.to_string(),
+                prelude: prelude.clone(),
+                limits: crate::runtime::isolate::limits::ResourceLimits::default(),
+            },
+        )
+        .unwrap();
+
+        // Edit the helper AFTER the prewarm compiled it.
+        std::fs::write(
+            &helper,
+            "export function bump(n: number): number { return n + 100; }\n",
+        )
+        .unwrap();
+
+        let init = FromParent::Init {
+            entry_path: path.to_string_lossy().into_owned(),
+            entry_source: src.to_string(),
+            fallback_export: "agent".to_string(),
+            input: serde_json::json!({ "value": 1 }),
+            prelude,
+            limits: crate::runtime::isolate::limits::ResourceLimits::default(),
+        };
+        crate::runtime::isolate::protocol::write_frame(&mut to_child, &init).unwrap();
+        let out = broker_after_init(&mut from_child, &mut to_child, &backend).unwrap();
+        worker.join().unwrap().unwrap();
+
+        assert_eq!(
+            out,
+            serde_json::json!({ "value": 101 }),
+            "the run must see the edited helper, not the prewarmed one"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

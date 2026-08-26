@@ -298,9 +298,10 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
   (`server.rs:977` et al.); the broker loop slots in there as one task per run,
   so concurrency = many children + many broker tasks, exactly as today.
 - **Spawn-per-run by default** (clean, disposable, leak-free — and it resolves
-  gaps #2/#3/#6 for the isolated path). An optional **warm worker pool** (fork a
-  pre-sandboxed worker, hand it a bundle per run) is a latency optimization for
-  high-throughput servers, but only with a proven cross-run reset; defer to v2.
+  gaps #2/#3/#6 for the isolated path). The optional **warm worker pool**
+  (`CHIDORI_ISOLATE_WARM_POOL`, phase 5) keeps this property: it moves the
+  spawn + module-graph compile *ahead of* the run instead of reusing a worker
+  across runs, so no cross-run reset is needed — no worker ever sees two runs.
 
 ## Phasing
 
@@ -372,18 +373,30 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    link) but **runtime-unverified** — no macOS host in this environment; the
    best-effort design means a profile/load failure degrades to a logged skip
    rather than breaking a run.
-5. **Polish.** ✅ **Done (warm pool deliberately skipped)** — `--isolate` on both
+5. **Polish.** ✅ **Done** — `--isolate` on both
    `chidori run` and `chidori serve` (and `CHIDORI_ISOLATE=process`); a startup
    `Isolation:` banner line describing the posture; and an `--untrusted`→isolation
    hint. Per the chosen design the two stay **orthogonal but composable**:
    `--untrusted` (policy) and `--isolate` (process sandbox) are independent, and
    running untrusted without isolation prints a nudge rather than silently
-   changing behavior. The **warm worker pool is intentionally not built**:
-   spawn-per-run is what makes the child disposable and leak-free (it is what
-   resolves the memory-accounting/cycle-leak gaps #2/#3/#6 for the isolated path),
-   and a pool would reintroduce cross-run state hygiene concerns for a latency win
-   that the LLM/tool-dominated workload doesn't need. Revisit only if a
-   high-throughput, compute-bound deployment shows worker spawn as a real cost.
+   changing behavior.
+
+   The **warm worker pool** (`serve --warm-pool N` /
+   `CHIDORI_ISOLATE_WARM_POOL=N`, off by default) was originally skipped
+   because reusing a worker across runs would reintroduce cross-run state
+   hygiene concerns. The shipped design sidesteps that entirely: a pooled
+   worker is an ordinary spawn-per-run worker whose spawn — and whose module
+   graph parse/compile, performed inside the full sandbox via a `Prewarm`
+   protocol frame with brokered module loads — happened *before* the run
+   arrived. It serves exactly one `Init` and exits; no worker ever sees two
+   runs, so there is no reset to prove. Disposability, leak-freedom, and the
+   per-run memory accounting (gaps #2/#3/#6) are untouched; the fixed per-run
+   module compile cost (the dominant fixed cost of a heavy import graph under
+   isolation) moves off the request path. Correctness under source edits is
+   structural: every compile cache is keyed by the full source, so a stale
+   prewarm can only miss, never serve old code
+   (`rust_engine::tests::prewarm_never_serves_a_stale_module`; byte-for-byte
+   parity in `prewarmed_isolated_run_matches_in_process_byte_for_byte`).
 
 ### Configuration reference
 
@@ -396,6 +409,8 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
 | `CHIDORI_ISOLATE_NOFILE` | 256 | `RLIMIT_NOFILE` (clamped to the inherited hard limit). |
 | `CHIDORI_ISOLATE_FSIZE_BYTES` | off | `RLIMIT_FSIZE` (opt-in; off because a `0` cap also kills a redirected regular-file stderr). |
 | `CHIDORI_ISOLATE_NO_CORE` | on | Disable core dumps (`RLIMIT_CORE=0`). |
+| `CHIDORI_ISOLATE_WARM_POOL` | 0 (off) | Keep N prewarmed workers parked per agent entry (`serve --warm-pool N`); each still serves exactly one run. |
+| `CHIDORI_ISOLATE_WARM_TTL_MS` | 900000 | Discard a parked prewarmed worker older than this. |
 
 ## Verification
 

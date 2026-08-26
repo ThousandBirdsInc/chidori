@@ -54,8 +54,8 @@ impl<R: Read, W: Write> RunHost for BrokeredHost<R, W> {
             .map_err(|e| format!("isolate worker: reading reply for `{op}`: {e}"))?;
         match reply {
             FromParent::Reply(outcome) => outcome.into(),
-            FromParent::Init { .. } => {
-                Err("isolate worker: unexpected Init while awaiting a reply".to_string())
+            FromParent::Init { .. } | FromParent::Prewarm { .. } => {
+                Err("isolate worker: unexpected Init/Prewarm while awaiting a reply".to_string())
             }
         }
     }
@@ -97,10 +97,138 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
 ) -> io::Result<()> {
     let io = Rc::new(RefCell::new(WorkerIo { reader, writer }));
 
-    let init: FromParent = {
+    let first: FromParent = {
         let mut guard = io.borrow_mut();
         read_frame(&mut guard.reader)?
     };
+    // A pool-spawned worker gets a `Prewarm` frame first: seal the sandbox with
+    // the prewarm's limits, walk + compile the module graph (brokered loads,
+    // same as a run), answer `Warmed`, then wait for the ordinary `Init`. The
+    // sandbox is applied ONCE — before the prewarm compile — so untrusted
+    // source is never parsed outside the confinement a run gets, and the later
+    // `Init`'s limits are ignored by the already-sealed process.
+    let prewarm = match first {
+        FromParent::Prewarm {
+            entry_path,
+            entry_source,
+            prelude,
+            limits,
+        } => Some((entry_path, entry_source, prelude, limits)),
+        other => {
+            // Not a prewarm: fall through with the frame we already read.
+            return serve_run(io, other, apply_limits, false);
+        }
+    };
+    let (warm_path, warm_source, warm_prelude, limits) =
+        prewarm.expect("prewarm variant matched above");
+
+    // Slam the resource floor shut, then the confinement layers — before any
+    // (agent-authored) source is even parsed, and only in a real worker process
+    // (see `serve_inner`'s `apply_limits`; these mutate the *current* process,
+    // which is sound only when it is a dedicated worker).
+    let sandbox = apply_confinement(apply_limits, &limits);
+    relay_sandbox_notes(&sandbox);
+    if apply_limits && env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") && !sandbox.core_confined() {
+        let mut guard = io.borrow_mut();
+        return write_frame(
+            &mut guard.writer,
+            &FromChild::Done {
+                outcome: Outcome::Err(REQUIRE_SANDBOX_ERROR.to_string()),
+            },
+        );
+    }
+
+    let host: Rc<dyn RunHost> = Rc::new(BrokeredHost {
+        io: io.clone(),
+        prelude: None,
+    });
+    let modules = crate::runtime::rust_engine::prewarm_module_graph(
+        Path::new(&warm_path),
+        &warm_source,
+        warm_prelude.as_deref(),
+        host,
+    )
+    .unwrap_or(0); // best-effort: the run path reports real compile errors
+    {
+        let mut guard = io.borrow_mut();
+        match write_frame(
+            &mut guard.writer,
+            &FromChild::Warmed {
+                modules: modules.min(u32::MAX as usize) as u32,
+            },
+        ) {
+            Ok(()) => {}
+            // The parent going away mid-prewarm (process exit, pool discard)
+            // is this worker's normal end-of-life, not an error to report.
+            Err(e) if pipe_gone(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+
+    let init: FromParent = {
+        let mut guard = io.borrow_mut();
+        match read_frame(&mut guard.reader) {
+            Ok(frame) => frame,
+            // EOF while parked: same normal end-of-life as above — the parent
+            // exited or discarded this worker without ever assigning a run.
+            Err(e) if pipe_gone(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    };
+    serve_run(io, init, false, true)
+}
+
+/// Whether an I/O error means the parent's end of the pipe is simply gone —
+/// the quiet-shutdown signal for a prewarmed worker that never got a run.
+fn pipe_gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    )
+}
+
+/// The error a worker reports when `CHIDORI_ISOLATE_REQUIRE_SANDBOX` demands
+/// confinement the platform can't provide.
+const REQUIRE_SANDBOX_ERROR: &str = "isolation sandbox required but the platform's core \
+     confinement (seccomp on Linux, Seatbelt on macOS) could not be applied";
+
+/// Apply the rlimit floor + OS sandbox to the current process (a real worker
+/// only), returning what stuck. Every layer is best-effort: one that can't be
+/// installed degrades isolation but never fails the run, unless the operator
+/// demands `CHIDORI_ISOLATE_REQUIRE_SANDBOX`, which the callers check.
+fn apply_confinement(
+    apply_limits: bool,
+    limits: &super::limits::ResourceLimits,
+) -> super::sandbox::SandboxOutcome {
+    if apply_limits {
+        limits.apply_to_self();
+        super::sandbox::apply()
+    } else {
+        super::sandbox::SandboxOutcome::default()
+    }
+}
+
+/// Print the sandbox degradation notes when verbosity asks for them (see the
+/// comment in [`serve_run`] for why they are throttled).
+fn relay_sandbox_notes(sandbox: &super::sandbox::SandboxOutcome) {
+    if (env_truthy("CHIDORI_VERBOSE") || env_truthy("CHIDORI_ISOLATE_VERBOSE"))
+        && !env_truthy("CHIDORI_ISOLATE_SANDBOX_NOTES_QUIET")
+    {
+        for note in &sandbox.notes {
+            eprintln!("isolate worker: sandbox: {note}");
+        }
+    }
+}
+
+/// The run half of the worker: handle the `Init` frame (already read by the
+/// caller), sealing the process first unless a prewarm already did
+/// (`sealed_by_prewarm`).
+fn serve_run<R: Read + 'static, W: Write + 'static>(
+    io: Rc<RefCell<WorkerIo<R, W>>>,
+    init: FromParent,
+    apply_limits: bool,
+    sealed_by_prewarm: bool,
+) -> io::Result<()> {
     let (entry_path, entry_source, fallback_export, input, prelude, limits) = match init {
         FromParent::Init {
             entry_path,
@@ -117,10 +245,10 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
             prelude,
             limits,
         ),
-        FromParent::Reply(_) => {
+        FromParent::Reply(_) | FromParent::Prewarm { .. } => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "isolate worker: expected Init as the first frame",
+                "isolate worker: expected Init",
             ));
         }
     };
@@ -131,13 +259,17 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
     // it is a dedicated worker). Every layer is best-effort: one that can't be
     // installed degrades isolation but never fails the run, unless the operator
     // demands `CHIDORI_ISOLATE_REQUIRE_SANDBOX`, in which case a missing seccomp
-    // core fails closed.
-    let sandbox = if apply_limits {
-        limits.apply_to_self();
-        super::sandbox::apply()
-    } else {
+    // core fails closed. A prewarmed worker sealed itself before compiling
+    // (with the same checks — see `serve_inner`) and must not re-apply: rlimits
+    // and the sandbox layers are one-shot per process.
+    let sandbox = if sealed_by_prewarm {
         let _ = &limits;
+        // Already sealed, notes already relayed, REQUIRE_SANDBOX already
+        // enforced — reconstructing the outcome is unnecessary because nothing
+        // below reads it when `apply_limits` is false.
         super::sandbox::SandboxOutcome::default()
+    } else {
+        apply_confinement(apply_limits, &limits)
     };
     // Degradation notes (e.g. "landlock not enforced: no kernel support" on
     // older kernels and most containers) are diagnostics, not alarms: printed
@@ -147,23 +279,15 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
     // once per run: the supervisor marks every worker after its first (see
     // `run_agent_isolated`). Enforcement, as opposed to diagnostics, is
     // CHIDORI_ISOLATE_REQUIRE_SANDBOX below.
-    if (env_truthy("CHIDORI_VERBOSE") || env_truthy("CHIDORI_ISOLATE_VERBOSE"))
-        && !env_truthy("CHIDORI_ISOLATE_SANDBOX_NOTES_QUIET")
-    {
-        for note in &sandbox.notes {
-            eprintln!("isolate worker: sandbox: {note}");
-        }
+    if !sealed_by_prewarm {
+        relay_sandbox_notes(&sandbox);
     }
     if apply_limits && env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") && !sandbox.core_confined() {
         let mut guard = io.borrow_mut();
         return write_frame(
             &mut guard.writer,
             &FromChild::Done {
-                outcome: Outcome::Err(
-                    "isolation sandbox required but the platform's core confinement \
-                     (seccomp on Linux, Seatbelt on macOS) could not be applied"
-                        .to_string(),
-                ),
+                outcome: Outcome::Err(REQUIRE_SANDBOX_ERROR.to_string()),
             },
         );
     }
