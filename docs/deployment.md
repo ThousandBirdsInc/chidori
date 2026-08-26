@@ -133,6 +133,15 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   Unix**; opt out with `--no-isolate` / `CHIDORI_ISOLATE=off`. In containers,
   set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed — the
   network-namespace layer needs `CAP_SYS_ADMIN` and is skipped without it.
+- **Hard memory ceiling (Linux):** `CHIDORI_ISOLATE_MEMORY_MAX_MB` gives
+  each isolated worker a kernel-enforced cgroup v2 `memory.max` (plus
+  `memory.swap.max=0` and `memory.oom.group=1`, so an over-limit worker is
+  OOM-killed whole). Bin-pack a fleet on this number, not on the polled
+  heap watchdog (`CHIDORI_JS_MEM_CAP_MB`), which a run can overshoot by one
+  poll interval's worth of allocation. Needs a writable cgroup directory:
+  run the service with systemd `Delegate=yes`, or point
+  `CHIDORI_ISOLATE_CGROUP_DIR` at a delegated cgroup v2 directory; without
+  one the worker says so on stderr and falls back to the watchdog.
 
 ## Decision 1: where the journal lives
 
