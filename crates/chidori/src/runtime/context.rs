@@ -263,8 +263,9 @@ struct RuntimeContextInner {
     /// policy is strict. Checked before the next live host effect executes so
     /// a run cannot keep taking side effects its journal isn't recording.
     pub persist_failure: Option<String>,
-    /// Whether persistence failures poison the run (`CHIDORI_DURABILITY=strict`)
-    /// or are logged and tolerated (default, the pre-store behavior).
+    /// Whether persistence failures poison the run (`CHIDORI_DURABILITY=strict`
+    /// or `effect`) or are logged and tolerated (default, the pre-store
+    /// behavior).
     pub strict_durability: bool,
     /// How `input()` should behave when there is no cached response:
     /// read from stdin, or pause the run and surface the prompt to the caller.
@@ -599,7 +600,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -677,7 +678,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -727,7 +728,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
@@ -785,7 +786,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: parent_inner.input_mode,
                 pending_input: None,
                 pending_approval: None,
@@ -844,7 +845,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Pause,
                 pending_input: None,
                 pending_approval: None,
@@ -914,7 +915,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
-                strict_durability: crate::runtime::store::strict_durability(),
+                strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Pause,
                 pending_input: None,
                 pending_approval: None,

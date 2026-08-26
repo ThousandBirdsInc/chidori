@@ -53,13 +53,19 @@ pub fn execute_durable_json_call_at_seq(
         }
     }
 
-    // Strict-durability gate: once a journal write has failed, refuse to run
-    // further live side effects — the run would otherwise keep acting on the
-    // world without a recording of it (`docs/durable-storage.md`).
+    // Durability gate (strict and effect modes): once a journal write has
+    // failed, refuse to run further live side effects — the run would
+    // otherwise keep acting on the world without a recording of it
+    // (`docs/durable-storage.md`).
     if let Some(failure) = ctx.persist_failure() {
         anyhow::bail!(
             "refusing live `{function}`: durable journal write failed earlier \
-             under CHIDORI_DURABILITY=strict: {failure}"
+             under CHIDORI_DURABILITY={}: {failure}",
+            if crate::runtime::store::strict_durability() {
+                "strict"
+            } else {
+                "effect"
+            }
         );
     }
 
@@ -68,6 +74,19 @@ pub fn execute_durable_json_call_at_seq(
     });
     if let Some(id) = host_operation {
         ctx.run_host_operation_safepoint(id)?;
+        // Effect mode: the pending-intent write above must be DURABLE before
+        // the effect fires — barrier the (still-pipelined) store now, so a
+        // crash mid-effect always leaves a durable trace that the effect may
+        // have executed. Strict mode needs no barrier: every write is already
+        // synchronous.
+        if crate::runtime::store::effect_barriers() {
+            ctx.flush_store().map_err(|err| {
+                anyhow::anyhow!(
+                    "refusing live `{function}`: the effect-intent barrier failed \
+                     under CHIDORI_DURABILITY=effect: {err}"
+                )
+            })?;
+        }
     }
     let started = Utc::now();
     // Mark this call as executing so any calls made inside `live()` (a
@@ -98,6 +117,12 @@ pub fn execute_durable_json_call_at_seq(
             });
             if let Some(id) = host_operation {
                 ctx.run_host_operation_completion_safepoint(id)?;
+                // Effect mode: the result record is durable before the
+                // program observes it, so recovery replays this effect from
+                // the journal instead of re-firing it.
+                if crate::runtime::store::effect_barriers() {
+                    ctx.flush_store()?;
+                }
             }
             Ok(result)
         }
@@ -126,6 +151,9 @@ pub fn execute_durable_json_call_at_seq(
             });
             if let Some(id) = host_operation {
                 ctx.run_host_operation_completion_safepoint(id)?;
+                if crate::runtime::store::effect_barriers() {
+                    ctx.flush_store()?;
+                }
             }
             Err(anyhow::anyhow!(message))
         }

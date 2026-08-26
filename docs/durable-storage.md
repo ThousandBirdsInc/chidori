@@ -188,6 +188,16 @@ Journal writes are not fire-and-forget:
 
 * **`besteffort`** (default): a failed persistence write is logged and the
   run continues — right for local dev.
+* **`effect`**: **durable at the effect, priced at the effect.** Remote
+  appends stay pipelined (the thing that makes `strict` expensive against a
+  remote store), but each effectful host call runs a durability barrier
+  around its pending-intent write *before* the effect executes and around
+  its result record *after* it completes. A crash therefore never leaves an
+  executed effect with no durable trace — either the intent is durable
+  (recovery sees a pending operation that may have fired) or the result is —
+  while pure records (steps, logs) never pay a per-write round-trip.
+  Failed writes poison the run and filesystem writes fsync, exactly as
+  under `strict`.
 * **`strict`**: the first failed journal write **poisons the run** — the next
   live host call refuses to execute ("acting on the world without a
   recording of it"), filesystem journal writes fsync before acknowledging,
@@ -202,8 +212,11 @@ immediately instead of blocking one network round-trip per host call
 FIFO; in-flight requests are bounded, so a slow mirror applies backpressure
 rather than growing an unbounded queue). Failures surface at the next flush
 barrier — pause, settle, output gate — where besteffort logs and continues,
-exactly as its per-append handling always did. Under `strict`, every append
-stays synchronous: acknowledged by the mirror before the next effect runs.
+exactly as its per-append handling always did. Under `effect`, appends stay
+pipelined but every effectful call drains the pipeline at its two barriers
+(intent before, result after), so barrier frequency scales with effects, not
+with journal records. Under `strict`, every append stays synchronous:
+acknowledged by the mirror before the next effect runs.
 
 ## Recovery after machine loss: hydration
 
