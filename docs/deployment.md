@@ -133,6 +133,14 @@ CHIDORI_DURABILITY=strict           # refuse side effects the journal hasn't rec
   Unix**; opt out with `--no-isolate` / `CHIDORI_ISOLATE=off`. In containers,
   set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed — the
   network-namespace layer needs `CAP_SYS_ADMIN` and is skipped without it.
+- **Module compile cache:** engines reuse compiled modules across runs on
+  the same thread (keyed by path + full source), so a server's pooled
+  worker threads pay a heavy import graph's parse/compile cost once, not
+  per run — measured ~9× off the fixed per-run cost of a 40-module graph.
+  Caveat: OS isolation (`CHIDORI_ISOLATE=process`, the Unix default)
+  spawns a fresh worker per run, which starts every cache cold; for
+  throughput-critical trusted workloads, `--no-isolate` keeps the caches
+  warm and the policy sandbox + SSRF guard still apply.
 - **Metering:** every run persists `metrics.json` beside its journal — the
   exact opcode count the VM's budget accounting maintained (`ops_used`, the
   same units `CHIDORI_JS_OP_BUDGET` caps), the run's peak heap bytes, and
