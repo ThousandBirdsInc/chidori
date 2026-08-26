@@ -62,10 +62,16 @@ pub fn load_module_source(
         }
         resolution.resolved_path
     } else {
-        // Agent-code relative import: keep the historical strict behavior
-        // (rooted at the importer's directory, no escaping).
+        // Agent-code relative import: resolved against the importer's
+        // directory, contained by the WORKSPACE root — so `../shared/util`
+        // between project files works (matching what `chidori check`'s Node
+        // resolver accepts) while escaping the project still fails. With no
+        // package.json anywhere above, the workspace root falls back to the
+        // importer's directory, which is the historical strict behavior for
+        // single-file agents.
         let dir = importer.parent().unwrap_or_else(|| Path::new("."));
-        resolve_relative_import(importer, dir, specifier, 0).map_err(|e| e.to_string())?
+        let root = find_workspace_root(importer);
+        resolve_relative_import(importer, dir, &root, specifier, 0).map_err(|e| e.to_string())?
     };
 
     let key = resolved.to_string_lossy().to_string();
@@ -252,6 +258,47 @@ mod tests {
             load_module_source("data/config.json", root.join("agent.ts").to_str().unwrap())
                 .unwrap();
         assert_eq!(src, "export default {\"a\":1};\n");
+    }
+
+    /// `import "./tools"` resolves to `tools/index.ts` on the runtime path,
+    /// matching the Node resolver `chidori check` uses — check and run must
+    /// agree on directory imports.
+    #[test]
+    fn directory_import_resolves_to_index_like_check_does() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("package.json"), r#"{"name":"proj"}"#);
+        write(&root.join("agent.ts"), "");
+        write(&root.join("tools/index.ts"), "export const t = 1;\n");
+        let (key, src) =
+            load_module_source("./tools", root.join("agent.ts").to_str().unwrap()).unwrap();
+        assert!(key.ends_with("tools/index.ts"), "got: {key}");
+        assert!(src.contains("t = 1"));
+    }
+
+    /// Relative imports are contained by the WORKSPACE root, not the
+    /// importer's own directory: `../shared/util` between project files
+    /// works, escaping the project still fails.
+    #[test]
+    fn sibling_directory_import_stays_inside_the_workspace() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("package.json"), r#"{"name":"proj"}"#);
+        write(&root.join("app/agent.ts"), "");
+        write(&root.join("shared/util.ts"), "export const u = 1;\n");
+        let (key, _) = load_module_source(
+            "../shared/util",
+            root.join("app/agent.ts").to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(key.ends_with("shared/util.ts"), "got: {key}");
+
+        let err = load_module_source(
+            "../../outside-the-project",
+            root.join("app/agent.ts").to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("escapes"), "got: {err}");
     }
 
     #[test]

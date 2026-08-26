@@ -191,6 +191,21 @@ impl Resolver {
             parent_dir.join(specifier)
         };
         let normalized = normalize_path(&raw);
+        // Containment: relative (and absolute) specifiers must stay inside
+        // the project root — the same boundary the runtime loader enforces,
+        // so `chidori check` never accepts an agent the runtime will refuse,
+        // and a file under node_modules cannot `../../..` its way to
+        // arbitrary disk. The builtin shims' synthetic `/__node_builtins__/`
+        // parents are exempt (they never resolve project-relative paths).
+        let root = normalize_path(&self.project_root);
+        if !normalized.starts_with(&root) {
+            bail!(
+                "`{}` from {} escapes the project root {}",
+                specifier,
+                parent.display(),
+                self.project_root.display()
+            );
+        }
         load_as_file_or_dir(&normalized)
             .ok_or_else(|| anyhow!("cannot resolve `{}` from {}", specifier, parent.display()))
     }
