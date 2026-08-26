@@ -337,7 +337,10 @@ poisoned by a mirror-write failure.
   memoize expensive pure compute explicitly; automatic folding of old history
   into value checkpoints is not supported. (Engineering note on the
   warm-standby direction: [resume performance](./resume-performance.md) on
-  GitHub.)
+  GitHub.) One amplification term is gone: the snapshot manifest no longer
+  embeds the host-promise table, so a large response body is stored in the
+  journal/checkpoint pair and the host-promise table — not a fourth time
+  inside `runtime.snapshot.json`.
 * **No multi-node routing.** Leases arbitrate double-execution; they do not
   route requests to a run's owner. One server (or CLI process) drives a run
   at a time. (The cell store's `--advertise` + one-hop follow redirects a

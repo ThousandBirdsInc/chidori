@@ -260,7 +260,7 @@ impl ScaffoldPersister {
         let pending = ctx.active_pending_host_operation();
         let compact = checkpoint == CheckpointWrite::Compact;
         let (modules, module_graph) = self.modules()?;
-        let mut manifest = SnapshotManifest::new(
+        let manifest = SnapshotManifest::new(
             &self.run_id,
             SnapshotAbi::current("chidori-quickjs"),
             self.policy.clone(),
@@ -274,14 +274,15 @@ impl ScaffoldPersister {
         .with_vfs(ctx.vfs_snapshot())
         .with_default_model(Some(ctx.config().model))
         .with_pricing(std::env::var("CHIDORI_PRICING").ok());
-        // The embedded host-promise table has the same freshness contract as
-        // checkpoint.json: a compaction-time snapshot. Runtime resume never
-        // reads it (deliveries and replay load `host_promises.json` ∪ the
-        // per-op blobs); embedding the whole table per safepoint was the
-        // other O(history)-per-call term.
-        if compact {
-            manifest = manifest.with_host_promises(ctx.host_promise_records());
-        }
+        // The host-promise table is NOT embedded in the persisted manifest:
+        // runtime resume never reads it from there (deliveries and replay
+        // load `host_promises.json` ∪ the per-op blobs), so embedding it
+        // duplicated every large result value once more inside
+        // `runtime.snapshot.json` — one of the copies behind the ~4× on-disk
+        // amplification of big response bodies. Compaction below still folds
+        // the table into its own `host_promises.json`, which is the copy
+        // readers use.
+        let host_promise_records = compact.then(|| ctx.host_promise_records());
         // Write through the run's store handle when persistence is enabled, so
         // a configured durable mirror receives the scaffold too; identical
         // on-disk layout either way.
@@ -313,8 +314,8 @@ impl ScaffoldPersister {
             ctx.clear_call_log_checkpoint_dirty(call_log.len());
             floor.fetch_max(call_log.len(), Ordering::SeqCst);
         }
-        if compact {
-            store.compact_host_promises(&manifest.host_promises)?;
+        if let Some(records) = &host_promise_records {
+            store.compact_host_promises(records)?;
         }
         // End-of-run engine metering, when the VM host has reported it. A
         // plain blob — never a journal record — so replay/verify semantics
@@ -1203,6 +1204,16 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The persisted host-promise table (`host_promises.json` ∪ per-op blobs)
+    /// — the copy readers use now that the manifest no longer embeds it.
+    fn persisted_host_promises(
+        run_dir: &std::path::Path,
+    ) -> Vec<crate::runtime::snapshot::HostPromiseRecord> {
+        let store = crate::runtime::store::FsRunStore::new(run_dir.to_path_buf());
+        crate::runtime::snapshot::load_host_promise_records(&store).unwrap()
+    }
+
     use crate::providers::{
         ContentBlock, LlmProvider, LlmRequest, LlmResponse, ProviderRegistry, TokenSink,
     };
@@ -1779,14 +1790,15 @@ mod tests {
                 "params": null,
             })
         );
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
-        assert_eq!(loaded.manifest.host_promises[0].operation.id, pending.id);
+        let table = persisted_host_promises(&run_base.join(&paused.run_id));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0].operation.id, pending.id);
         assert_eq!(
-            loaded.manifest.host_promises[0].operation.kind,
+            table[0].operation.kind,
             crate::runtime::snapshot::PendingHostOperationKind::Http
         );
         assert!(matches!(
-            loaded.manifest.host_promises[0].state,
+            table[0].state,
             crate::runtime::snapshot::HostPromiseState::Pending
         ));
         assert!(!loaded.blob.is_empty());
@@ -1863,12 +1875,13 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let manifest = SnapshotStore::new(run_dir).load_manifest().unwrap();
+        let manifest = SnapshotStore::new(run_dir.clone()).load_manifest().unwrap();
         assert_eq!(manifest.call_log_len, 1);
         assert!(manifest.pending.is_none());
-        assert_eq!(manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert!(matches!(
-            manifest.host_promises[0].state,
+            table[0].state,
             crate::runtime::snapshot::HostPromiseState::Rejected { .. }
         ));
 
@@ -1958,12 +1971,13 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let manifest = SnapshotStore::new(run_dir).load_manifest().unwrap();
+        let manifest = SnapshotStore::new(run_dir.clone()).load_manifest().unwrap();
         assert_eq!(manifest.call_log_len, 1);
         assert!(manifest.pending.is_none());
-        assert_eq!(manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert!(matches!(
-            manifest.host_promises[0].state,
+            table[0].state,
             crate::runtime::snapshot::HostPromiseState::Resolved { .. }
         ));
 
@@ -2014,15 +2028,16 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let loaded = SnapshotStore::new(run_dir).load().unwrap();
+        let loaded = SnapshotStore::new(run_dir.clone()).load().unwrap();
         assert_eq!(loaded.manifest.call_log_len, 1);
         assert!(loaded.manifest.pending.is_none());
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert_eq!(
-            loaded.manifest.host_promises[0].operation.kind,
+            table[0].operation.kind,
             crate::runtime::snapshot::PendingHostOperationKind::Prompt
         );
-        match &loaded.manifest.host_promises[0].state {
+        match &table[0].state {
             crate::runtime::snapshot::HostPromiseState::Resolved { value, .. } => {
                 assert_eq!(value, &serde_json::json!("provider result"));
             }
@@ -2149,15 +2164,16 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let loaded = SnapshotStore::new(run_dir).load().unwrap();
+        let loaded = SnapshotStore::new(run_dir.clone()).load().unwrap();
         assert_eq!(loaded.manifest.call_log_len, 1);
         assert!(loaded.manifest.pending.is_none());
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert_eq!(
-            loaded.manifest.host_promises[0].operation.kind,
+            table[0].operation.kind,
             crate::runtime::snapshot::PendingHostOperationKind::CallAgent
         );
-        match &loaded.manifest.host_promises[0].state {
+        match &table[0].state {
             crate::runtime::snapshot::HostPromiseState::Resolved { value, .. } => {
                 assert_eq!(value, &serde_json::json!({ "value": 42 }));
             }
@@ -2226,16 +2242,17 @@ mod tests {
             .unwrap()
             .unwrap()
             .path();
-        let loaded = SnapshotStore::new(run_dir).load().unwrap();
+        let loaded = SnapshotStore::new(run_dir.clone()).load().unwrap();
         assert_eq!(loaded.manifest.call_log_len, 1);
         assert!(loaded.manifest.pending.is_none());
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
+        let table = persisted_host_promises(&run_dir);
+        assert_eq!(table.len(), 1);
         assert_eq!(
-            loaded.manifest.host_promises[0].operation.kind,
+            table[0].operation.kind,
             crate::runtime::snapshot::PendingHostOperationKind::Checkpoint
         );
         assert!(matches!(
-            loaded.manifest.host_promises[0].state,
+            table[0].state,
             crate::runtime::snapshot::HostPromiseState::Resolved { .. }
         ));
         assert!(!loaded.blob.is_empty());
