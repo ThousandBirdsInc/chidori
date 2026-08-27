@@ -176,7 +176,7 @@ Whole-run archives. `checkpoint export <run_id>` writes
 | `chidori trace <run_id>` | `-d/--dir` | Print the run's journal — every prompt, tool call, and effect, with token counts and cost (including prompt-cache read/write totals). |
 | `chidori snapshot <run_id>` | `-d/--dir` | Print `runtime.snapshot.json` metadata (never raw VM snapshot bytes). |
 | `chidori history <run_id>` | `-d/--dir`, `--show <commit>` (unique hex prefix, ≥ 4 chars), `--diff <c1[..c2]>` (conflicts with `--show`), `--path <file>`, `--json` | The run's source history: the git-like chain of source versions, each anchored to the journal records that executed under it ([Source History](./source-history.md)). |
-| `chidori stats` | `-d/--dir` | Usage and cost totals, including prompt-cache tokens (reads each run's `checkpoint.json`). |
+| `chidori stats` | `-d/--dir` | Usage and cost totals, including prompt-cache tokens (reads each run's journal). |
 
 **`--dir` defaults differ**: `resume` and `verify` default to the agent
 file's parent directory; the inspection and recovery commands (`trace`,

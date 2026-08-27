@@ -27,7 +27,7 @@ survives losing the machine.
 
 Everything a run persists flows through one run-store handle:
 
-* the journal (`records.jsonl`) and `checkpoint.json`, its compacted artifact;
+* the journal (`records.jsonl`, compacted in place at compaction points);
 * the snapshot manifest and blob;
 * the pending host call and the host-promise table;
 * the signal inbox — `signals/inbox.json` inside the run directory
@@ -48,30 +48,43 @@ This is the same local-fast / remote-durable split Cloudflare built for
 Durable Objects' storage (local disk for reads, replicated relay for
 durability) — applied to the journal.
 
-## The journal on disk: append-only + `checkpoint.json`
+## The journal on disk: one append-only file, compacted in place
 
-Two artifacts per run:
+One artifact per run:
 
 * **`records.jsonl`** — the journal: append-only, one JSON record per line,
-  one host call each. Appending a record costs O(1) bytes.
-* **`checkpoint.json`** — the compacted whole-journal artifact, rewritten at
-  **compaction points**: pause, settle, branch merges, and the first safepoint
-  after a resume replay. Steady-state per-effect safepoints persist only the
-  manifest + pending artifacts: the O(1) append already made the record
-  durable, so rewriting the whole artifact per host call would cost
-  O(history²) bytes per run for nothing. Each rewrite doubles as compaction of
-  the append-only file: it truncates `records.jsonl` to match, so neither file
-  grows past one run's history.
+  one host call each. Appending a record costs O(1) bytes. At **compaction
+  points** — pause, settle, branch merges, and the first safepoint after a
+  resume replay — the whole file is rewritten *atomically* (a sibling temp
+  file renamed into place, so a crash leaves either the previous journal or
+  the new one, never a truncated hybrid). Steady-state per-effect safepoints
+  persist only the manifest + pending artifacts: the O(1) append already made
+  the record durable, so rewriting the whole artifact per host call would
+  cost O(history²) bytes per run for nothing.
 
-Loading unions the two: the last `checkpoint.json` wins per record, and any
-tail records appended after the last compaction — the steady-state case, not
-just crash recovery — are recovered from `records.jsonl`.
+Older builds wrote a second artifact, **`checkpoint.json`** — the same log
+again as a pretty-printed array, one of the copies behind the historical ~4×
+on-disk amplification of large response bodies. Loading still unions it when
+present (`checkpoint.json` wins per record — in a dir crashed mid-rewrite
+under an old build, the checkpoint is the newer artifact — and tail records
+it doesn't know are recovered from `records.jsonl`), and the first compaction
+under the current build deletes it, upgrading the run dir to the single-copy
+layout. Object-store backends keep their own checkpoint-object semantics —
+there, the checkpoint PUT is what deletes the per-record tail objects.
 
 The **host-promise table** follows the same append+compact discipline. Each
 state change (begin/resolve/reject) writes one small per-operation blob
 (`host_promises/<id>.json`) — O(1) on every backend — instead of rewriting the
 whole table per host call. Compaction points fold the blobs into the table
 file and delete them; readers union both, per-op blobs winning by id. The
+fold also dedupes large values: a resolved operation whose value is
+byte-identical to the journal record's `result` at its seq is stored as a
+journal *reference* (`resolved_in_journal`), so a big response body lands in
+the run directory once — in the journal — not twice. The loader rehydrates
+references transparently (consumers only ever see `resolved`), the fold
+happens only on an exact-match proof, and the per-op blobs always carry the
+inline value — they are what makes a resolution durable before its journal
+record lands. The
 per-op blob is what keeps the crash-between-resolve-and-record dedup
 guarantee: a resolved effect whose journal record never landed is still
 recognized on resume and not re-executed. Recognition requires the recorded

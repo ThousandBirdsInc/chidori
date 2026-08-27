@@ -215,6 +215,13 @@ fn replay_completed_host_operation(
             Err(anyhow::anyhow!(error))
         }
         HostPromiseState::Pending => Ok(None),
+        // Never constructed in memory: `load_host_promise_records` rehydrates
+        // the durable reference form to `Resolved` before any table reaches a
+        // context. Reaching this arm means a caller bypassed the loader.
+        HostPromiseState::ResolvedInJournal { .. } => Err(anyhow::anyhow!(
+            "host promise at seq {seq} is still journal-referenced — the table was loaded \
+             without rehydration (load it via load_host_promise_records)"
+        )),
     }
 }
 

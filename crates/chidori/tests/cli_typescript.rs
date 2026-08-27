@@ -141,7 +141,10 @@ fn cli_run_typescript_agent_outputs_json_and_persists_snapshot_manifest() {
     let runs_dir = dir.join(".chidori").join("runs");
     let mut run_dirs = fs::read_dir(&runs_dir).unwrap();
     let run_dir = run_dirs.next().unwrap().unwrap().path();
-    assert!(run_dir.join("checkpoint.json").exists());
+    // Single-copy journal layout: records.jsonl is the journal; no
+    // checkpoint.json twin is written.
+    assert!(run_dir.join("records.jsonl").exists());
+    assert!(!run_dir.join("checkpoint.json").exists());
     assert!(run_dir.join("runtime.snapshot.json").exists());
     let manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(run_dir.join("runtime.snapshot.json")).unwrap())
@@ -1191,7 +1194,7 @@ fn cli_export_fixture_is_minimal_and_verify_consumes_it() {
     // Precondition for the size claim: the full run dir carries the heavy
     // resume-only artifacts export must leave behind.
     assert!(run_dir.join("runtime.snapshot").exists());
-    assert!(run_dir.join("checkpoint.json").exists());
+    assert!(run_dir.join("host_promises.json").exists());
     // A mock run's snapshot blob is tiny; real runs carry multi-MB blobs —
     // that's the whole reason export exists. Pad the blob to a representative
     // size: export must not copy it, so the fixture stays small regardless.
@@ -1213,8 +1216,8 @@ fn cli_export_fixture_is_minimal_and_verify_consumes_it() {
         "export should print the verify hint, got:\n{stdout}"
     );
 
-    // The fixture holds exactly the verify set — no snapshot blob, no
-    // duplicated checkpoint.json, no host-promise/pending/lease state.
+    // The fixture holds exactly the verify set — no snapshot blob, no legacy
+    // checkpoint.json, no host-promise/pending/lease state.
     let fixture_run = fixture.join(&run_id);
     assert!(fixture_run.join("records.jsonl").exists());
     assert!(fixture_run.join("runtime.snapshot.json").exists());

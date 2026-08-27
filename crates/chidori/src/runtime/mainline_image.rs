@@ -481,8 +481,8 @@ mod tests {
             "the pause wrote an image"
         );
         assert!(
-            run_dir.join("checkpoint.json").exists(),
-            "the classic paused artifact is untouched"
+            run_dir.join("records.jsonl").exists(),
+            "the classic paused journal is untouched"
         );
         assert!(run_dir
             .join(crate::runtime::snapshot::SNAPSHOT_MANIFEST_FILE)

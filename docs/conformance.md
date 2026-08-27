@@ -237,8 +237,9 @@ Each type covers its constructor, accessors, arithmetic (`add`/`subtract`/
 (`toPlainDate`/`toPlainDateTime`/`toInstant`/…), `toString`/`toJSON`/
 `toLocaleString` with their rounding/calendar/offset display options, and
 `from`. `Duration.round`/`total`/`compare` honor a PlainDate `relativeTo`.
-`Temporal.Now` reads the system clock (the bare conformance context, like
-`Date`; the durable runtime captures it as an effect at a higher layer).
+`Temporal.Now` reads the system clock — the one real-clock surface in the
+bare conformance context (`Date` stays frozen there by engine policy); the
+durable runtime captures time as an effect at a higher layer.
 
 The residual failures are concentrated in `ZonedDateTime`'s full property-bag
 `with` (a `PartialZonedDateTime` not yet wired), ZonedDateTime `relativeTo`,
@@ -300,7 +301,16 @@ against the committed baseline's 208 failures:
   (spec-divergent) result on every execution of the same program.** There is
   no randomness or environment dependence in any failing cluster. Within one
   engine build, record and replay therefore see byte-identical behavior —
-  a spec deviation cannot, by itself, perturb a journal.
+  a spec deviation cannot, by itself, perturb a journal. This is not an
+  assertion but a **CI-enforced invariant**: `scripts/test262.sh --stability`
+  re-runs every baseline-failing test three times (`test262-runner
+  --repeat 3`) and fails on any outcome that varies between runs; the
+  `stability` job in `.github/workflows/test262.yml` runs it beside the
+  sharded gate. (Measured at the current baseline: 208 tests × 3 runs,
+  0 unstable. The gated surface also carries no ambient nondeterminism to
+  leak into a result — `Date` is frozen and `Math.random()` is seeded per
+  VM, by engine policy; the one real-clock surface, `Temporal.Now`, is
+  opt-in and outside the committed baseline.)
 - **Evaluation-order clusters** (compound-assignment reference order,
   relational-operator coercion order, `yield`/generator corners — ~50 tests)
   deviate in *which order* observable operations happen, deterministically.

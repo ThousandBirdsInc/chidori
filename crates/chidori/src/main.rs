@@ -537,7 +537,7 @@ enum Commands {
     },
 
     /// Aggregate run history: total runs, tokens, est. cost, per-model breakdown.
-    /// Reads `.chidori/runs/<id>/checkpoint.json` in the given directory.
+    /// Reads each run's journal under `.chidori/runs/` in the given directory.
     Stats {
         /// Directory containing agent runs (defaults to current dir)
         #[arg(short, long)]
@@ -631,6 +631,16 @@ enum Commands {
         /// checks still guard the already-journaled calls.
         #[arg(long)]
         allow_source_change: bool,
+
+        /// Keep N prewarmed isolate workers parked per agent entry: each is
+        /// spawned and compiles the agent's module graph (inside the full
+        /// sandbox) BEFORE a run needs it, then serves exactly one run and
+        /// exits — removing the per-run module parse/compile cost without
+        /// ever reusing a worker across runs. Equivalent to
+        /// CHIDORI_ISOLATE_WARM_POOL=N. Only meaningful with isolation on;
+        /// the in-process path keeps its caches warm without a pool.
+        #[arg(long, value_name = "N")]
+        warm_pool: Option<usize>,
     },
 
     /// Serve a self-hosted durable run store — the celld model
@@ -1072,6 +1082,7 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             app,
             strict_routes,
             allow_source_change,
+            warm_pool,
         } => {
             if isolate {
                 crate::runtime::isolate::enable();
@@ -1088,6 +1099,9 @@ fn dispatch_command(command: Commands) -> (Result<()>, bool) {
             }
             if allow_source_change {
                 std::env::set_var("CHIDORI_ALLOW_SOURCE_CHANGE", "1");
+            }
+            if let Some(n) = warm_pool {
+                std::env::set_var("CHIDORI_ISOLATE_WARM_POOL", n.to_string());
             }
             (
                 cmd_serve(

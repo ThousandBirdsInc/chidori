@@ -11,6 +11,11 @@
 #   scripts/test262.sh --update-baseline   # re-record the committed expectations
 #   scripts/test262.sh --report        # full run -> Markdown coverage table
 #                                      #   (test262-coverage.md; CI posts it on PRs)
+#   scripts/test262.sh --stability     # run every baseline-FAILING test 3x and
+#                                      #   fail if any outcome varies between
+#                                      #   runs — the mechanical check behind
+#                                      #   docs/conformance.md's "every
+#                                      #   remaining deviation is stable" claim
 #   scripts/test262.sh test/language/expressions/addition   # run a subdir
 #   scripts/test262.sh --filter Array  # run only paths containing "Array"
 #
@@ -32,6 +37,7 @@ update=0
 gate=0
 update_baseline=0
 report=0
+stability=0
 forward=()
 for arg in "$@"; do
   case "$arg" in
@@ -39,6 +45,7 @@ for arg in "$@"; do
     --gate) gate=1 ;;
     --update-baseline) update_baseline=1 ;;
     --report) report=1 ;;
+    --stability) stability=1 ;;
     *) forward+=("$arg") ;;
   esac
 done
@@ -103,6 +110,26 @@ if [[ "$update_baseline" == "1" ]]; then
   done < <(chunk_dirs)
   echo "Baseline recorded -> $BASELINE"
   exec "$RUNNER" --test262 "$VENDOR_DIR" --state "$BASELINE" --max 0
+fi
+
+if [[ "$stability" == "1" ]]; then
+  # The determinism claim in docs/conformance.md — "every remaining deviation
+  # is stable" — held to account: run every test the committed baseline
+  # records as FAILING three times and fail if any outcome differs between
+  # runs. Failing tests are the interesting set (a passing test that flapped
+  # would already trip the --gate), and there are only a couple hundred, so
+  # this is cheap enough for every CI run.
+  echo "Stability pass: every baseline-failing test x3 -> any variation fails"
+  mapfile -t failing < <(python3 -c "
+import json
+d = json.load(open('$BASELINE'))
+print('\n'.join(sorted(k for k, v in d['results'].items() if v == 'fail')))
+")
+  if [[ ${#failing[@]} -eq 0 ]]; then
+    echo "Baseline records no failing tests; nothing to check."
+    exit 0
+  fi
+  exec "$RUNNER" --test262 "$VENDOR_DIR" --repeat 3 "${failing[@]}"
 fi
 
 if [[ "$gate" == "1" ]]; then

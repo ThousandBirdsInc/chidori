@@ -7,9 +7,9 @@
 //! `chidori verify` it in CI" impractical at tens of MB per checkpoint.
 //! `chidori verify` itself reads only four artifacts:
 //!
-//! - `records.jsonl` / `checkpoint.json` — the call journal (the two are the
-//!   same log twice; the export writes one compacted `records.jsonl` from
-//!   their union),
+//! - `records.jsonl` — the call journal (the export writes one compacted
+//!   file from the loader's view, which also folds in a legacy run dir's
+//!   `checkpoint.json` twin),
 //! - `runtime.snapshot.json` — the snapshot *manifest* (source fingerprints,
 //!   policy/ABI, recorded default model) that gates source drift,
 //! - `output.json` — the recorded output the replay must reproduce,

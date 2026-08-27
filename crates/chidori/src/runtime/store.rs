@@ -220,6 +220,32 @@ impl FsRunStore {
         }
         Ok(())
     }
+
+    /// [`Self::write_file`] with all-or-nothing semantics: write a sibling
+    /// temp file, then `rename` it into place. Used for the journal rewrite,
+    /// where an in-place truncate-then-write would leave a prefix of the log
+    /// as the only copy if the process died mid-write. Under strict
+    /// durability the temp file is synced before the rename so the rename
+    /// never publishes unflushed data.
+    fn write_file_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let tmp = path.with_extension("tmp");
+        {
+            let mut file = std::fs::File::create(&tmp)
+                .with_context(|| format!("writing {}", tmp.display()))?;
+            file.write_all(bytes)
+                .with_context(|| format!("writing {}", tmp.display()))?;
+            if self.fsync_writes {
+                file.sync_data()
+                    .with_context(|| format!("syncing {}", tmp.display()))?;
+            }
+        }
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} into place", tmp.display()))
+    }
 }
 
 impl RunStore for FsRunStore {
@@ -244,18 +270,32 @@ impl RunStore for FsRunStore {
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
-        self.write_file(
-            &self.run_dir.join(CHECKPOINT_FILE),
-            &serde_json::to_vec_pretty(records)?,
-        )?;
-        // Compact the incremental artifact to match, so the two stay
-        // consistent and the loader's union is exact.
+        // Single-copy compaction: `records.jsonl` — the journal users read
+        // directly and `chidori export` ships — is the ONE full artifact.
+        // The rewrite is atomic (tmp + rename), so a crash leaves either the
+        // previous journal or the new one, never a truncated hybrid; the old
+        // layout's `checkpoint.json` twin (the same log, pretty-printed — one
+        // of the copies behind the ~4× on-disk amplification of large
+        // response bodies) is deleted once the rename has landed. The loader
+        // still unions a `checkpoint.json` when present, so run dirs written
+        // by older builds — including one crashed mid-rewrite, where the
+        // checkpoint is the newer artifact and must win — load unchanged.
         let mut lines = Vec::new();
         for record in records {
             lines.extend(serde_json::to_vec(record)?);
             lines.push(b'\n');
         }
-        self.write_file(&self.run_dir.join(RECORDS_FILE), &lines)
+        self.write_file_atomic(&self.run_dir.join(RECORDS_FILE), &lines)?;
+        match std::fs::remove_file(self.run_dir.join(CHECKPOINT_FILE)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "removing superseded {}",
+                    self.run_dir.join(CHECKPOINT_FILE).display()
+                )
+            }),
+        }
     }
 
     fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
@@ -2196,10 +2236,64 @@ mod tests {
     fn fs_run_store_conformance() {
         let dir = std::env::temp_dir().join(format!("chidori-store-fs-{}", uuid::Uuid::new_v4()));
         conformance(&FsRunStore::new(&dir));
-        // The layout matches the established run dir shape.
-        assert!(dir.join(CHECKPOINT_FILE).is_file());
+        // Single-copy layout: `records.jsonl` is the journal; a compaction
+        // (`write_call_log` ran inside `conformance`) never leaves a
+        // `checkpoint.json` twin behind, and the atomic-rename temp file is
+        // gone.
         assert!(dir.join(RECORDS_FILE).is_file());
+        assert!(!dir.join(CHECKPOINT_FILE).exists());
+        assert!(!dir.join("records.tmp").exists());
         assert!(dir.join("signals/inbox.json").is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A run dir written by an older build — `checkpoint.json` as the
+    /// compacted artifact, `records.jsonl` as the (possibly stale) tail —
+    /// loads unchanged, and the checkpoint wins for the seqs it knows (it is
+    /// the NEWER artifact when an old build crashed mid-tail-rewrite). The
+    /// next compaction upgrades the dir to the single-copy layout.
+    #[test]
+    fn fs_run_store_loads_and_upgrades_the_legacy_checkpoint_layout() {
+        let dir =
+            std::env::temp_dir().join(format!("chidori-store-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Legacy layout: checkpoint carries the compacted truth (seq 2's
+        // record was superseded there), the tail is stale + has a stranded
+        // post-checkpoint append.
+        std::fs::write(
+            dir.join(CHECKPOINT_FILE),
+            serde_json::to_vec_pretty(&vec![record(1, "prompt"), record(2, "input_resolved")])
+                .unwrap(),
+        )
+        .unwrap();
+        let mut tail = Vec::new();
+        for r in [
+            record(1, "prompt"),
+            record(2, "input_stale"),
+            record(3, "tool"),
+        ] {
+            tail.extend(serde_json::to_vec(&r).unwrap());
+            tail.push(b'\n');
+        }
+        std::fs::write(dir.join(RECORDS_FILE), tail).unwrap();
+
+        let store = FsRunStore::new(&dir);
+        let loaded = store.load_call_log().unwrap().unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|r| r.function.as_str())
+                .collect::<Vec<_>>(),
+            vec!["prompt", "input_resolved", "tool"],
+            "checkpoint wins for known seqs; the stranded tail append survives"
+        );
+
+        // Compaction upgrades: one journal, no checkpoint twin, same content.
+        store.write_call_log(&loaded).unwrap();
+        assert!(!dir.join(CHECKPOINT_FILE).exists());
+        let reloaded = store.load_call_log().unwrap().unwrap();
+        assert_eq!(reloaded.len(), 3);
+        assert_eq!(reloaded[1].function, "input_resolved");
         let _ = std::fs::remove_dir_all(dir);
     }
 
