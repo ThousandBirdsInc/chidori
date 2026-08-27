@@ -56,3 +56,22 @@ jobs:
 
       - name: Run Test262 against the committed baseline (shard ${{ matrix.shard }}/4)
         run: scripts/test262.sh --gate
+
+  # The determinism claim behind the conformance number: every remaining
+  # deviation must be STABLE (same outcome on every execution). Re-runs each
+  # baseline-failing test 3x and fails on any variation — a couple hundred
+  # tests, so one small job beside the sharded gate.
+  stability:
+    name: Deviation stability (baseline failures x3)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test262-runner
+
+      - name: Every baseline-failing test, three runs, no variation
+        run: scripts/test262.sh --stability

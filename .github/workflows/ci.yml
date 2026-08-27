@@ -24,6 +24,15 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+      # docs/index.md promises `--help` is authoritative; hold the docs to it:
+      # every documented CHIDORI_* env var must be read by the code, and every
+      # subcommand/flag in docs/cli.md must exist on the binary (nested
+      # subcommands included). Reuses the debug binary the test step built.
+      - name: Docs drift check (env vars, CLI surface)
+        run: |
+          cargo build
+          scripts/docs-drift-check.sh
+
   typescript-sdk:
     name: TypeScript SDK
     runs-on: ubuntu-24.04

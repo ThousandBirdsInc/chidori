@@ -7,8 +7,8 @@ description: "chidori.step: journal expensive pure compute once so replay and re
 
 > `chidori.step` bounds resume cost on long histories by memoizing expensive
 > deterministic computation into the journal. A **value checkpoint** is one
-> such memoized `chidori.step` result — not to be confused with
-> `checkpoint.json` (the compacted whole-journal artifact —
+> such memoized `chidori.step` result — not to be confused with the run's
+> compacted journal artifact (`records.jsonl` —
 > [Durable Storage](./durable-storage.md)) or with the run directory itself.
 > **Related:** [Replay & Resume](./replay.md), [Memory](./memory.md),
 > [Context Management](./context-management.md). API reference:

@@ -7,7 +7,7 @@ description: "Running agents in production: config, durability tiers, recipes fo
 
 A deployment is four things: the `chidori` binary, your agent's `.ts` files,
 a handful of environment variables, and one state directory — `.chidori/`
-next to the agent file, where every journal, `checkpoint.json`, and the
+next to the agent file, where every run's journal (`records.jsonl`) and the
 [detached-agent registry](./detached-agents.md) live. There is no Node
 runtime, database server,
 queue, or worker fleet to provision.
@@ -34,7 +34,7 @@ flowchart LR
 
     subgraph host["One machine — VM, container, or pod"]
         server["chidori serve agent.ts<br/>the single writer for this agent's runs"]
-        state[(".chidori/<br/>journals · checkpoint.json ·<br/>detached-agent registry")]
+        state[(".chidori/<br/>journals (records.jsonl) ·<br/>detached-agent registry")]
     end
 
     mirror[("CHIDORI_RUN_STORE mirror<br/>sqlite · s3://bucket ·<br/>chidori cell-store · DO relay")]

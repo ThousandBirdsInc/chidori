@@ -45,6 +45,11 @@ options:
                     because some tests fail. Used by CI as a conformance gate.
   --verbose, -v     print each failure with the thrown message
   --no-modules      skip module-flag tests (they run by default)
+  --repeat <n>      run every selected test n times and report any test whose
+                    outcome differs between runs as UNSTABLE — the mechanical
+                    check behind the determinism claim in docs/conformance.md
+                    (with n > 1 the exit code reflects instability, not the
+                    plain fail count)
   --intl            also run intl402 tests
   --temporal        also run Temporal-tagged tests
   --help, -h        show this help";
@@ -164,6 +169,13 @@ struct Args {
     modules: bool,
     intl: bool,
     temporal: bool,
+    /// Run each selected test this many times (default 1). With more than one
+    /// run, a test whose outcome signature (overall status + per-variant
+    /// statuses) differs across runs is reported as UNSTABLE, and the exit
+    /// code reflects the unstable count instead of the plain fail count —
+    /// this is the mechanical check behind the "every remaining deviation is
+    /// stable" determinism claim in docs/conformance.md.
+    repeat: u32,
     /// Persistent per-test result store. When set, this run UPDATES only the
     /// entries for the tests it executes, then recomputes and prints the
     /// whole-suite total from the merged store — so a targeted re-run (e.g. one
@@ -268,7 +280,30 @@ fn run() -> ExitCode {
                         if i >= files_ref.len() {
                             break;
                         }
-                        local.push((i, run_file(&files_ref[i], args_ref, &mut cache)));
+                        let mut outcome = run_file(&files_ref[i], args_ref, &mut cache);
+                        // Stability mode: re-run and compare the outcome
+                        // SIGNATURE (overall status + per-variant statuses;
+                        // not messages, whose text can embed timings). Any
+                        // difference is engine nondeterminism — exactly what
+                        // the determinism classification in
+                        // docs/conformance.md claims cannot happen.
+                        for attempt in 2..=args_ref.repeat {
+                            let again = run_file(&files_ref[i], args_ref, &mut cache);
+                            if outcome_signature(&again) != outcome_signature(&outcome) {
+                                outcome = FileOutcome {
+                                    rel: outcome.rel.clone(),
+                                    status: "fail",
+                                    failure: Some(format!(
+                                        "UNSTABLE: run 1 was {:?} but run {attempt} was {:?}",
+                                        outcome_signature(&outcome),
+                                        outcome_signature(&again),
+                                    )),
+                                    variants: again.variants,
+                                };
+                                break;
+                            }
+                        }
+                        local.push((i, outcome));
                     }
                     local
                 })
@@ -384,6 +419,31 @@ fn run() -> ExitCode {
         }
     }
 
+    // Stability mode: with --repeat > 1 the run's verdict is whether any
+    // test's outcome varied across runs — the failing tests it is pointed at
+    // are EXPECTED to fail (that is why they are being watched), so the plain
+    // fail count is not the signal.
+    if args.repeat > 1 {
+        let unstable: Vec<&(String, String)> = failures
+            .iter()
+            .filter(|(_, why)| why.starts_with("UNSTABLE:"))
+            .collect();
+        println!(
+            "\nStability ({} tests x {} runs): {} unstable",
+            files.len(),
+            args.repeat,
+            unstable.len()
+        );
+        for (rel, why) in &unstable {
+            println!("  UNSTABLE {rel}\n           {why}");
+        }
+        return if unstable.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
+    }
+
     // Baseline gate: when committed expectations are supplied, the exit code
     // reflects REGRESSIONS against them rather than the raw fail count, so the
     // job is green as long as no previously-passing test broke.
@@ -452,6 +512,17 @@ struct FileOutcome {
     status: &'static str,
     failure: Option<String>,
     variants: Vec<(&'static str, &'static str, String)>,
+}
+
+/// A file outcome's comparison key for `--repeat` stability checking: the
+/// overall status plus each variant's status. Messages are excluded — failure
+/// text can embed environmental details (e.g. the timeout budget) without the
+/// engine's observable behavior differing.
+fn outcome_signature(fo: &FileOutcome) -> (&'static str, Vec<(&'static str, &'static str)>) {
+    (
+        fo.status,
+        fo.variants.iter().map(|(v, s, _)| (*v, *s)).collect(),
+    )
 }
 
 /// Number of parallel workers: `TEST262_JOBS` if set (and > 0), else the machine
@@ -1294,6 +1365,7 @@ fn parse_args() -> Result<Args, String> {
     let mut modules = true;
     let mut intl = false;
     let mut temporal = false;
+    let mut repeat = 1u32;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -1325,6 +1397,14 @@ fn parse_args() -> Result<Args, String> {
             "--no-modules" => modules = false,
             "--intl" => intl = true,
             "--temporal" => temporal = true,
+            "--repeat" => {
+                repeat = it
+                    .next()
+                    .ok_or("--repeat needs a value")?
+                    .parse::<u32>()
+                    .map_err(|_| "--repeat must be a number")?
+                    .max(1);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -1350,6 +1430,7 @@ fn parse_args() -> Result<Args, String> {
         modules,
         intl,
         temporal,
+        repeat,
         state,
         baseline,
     })
