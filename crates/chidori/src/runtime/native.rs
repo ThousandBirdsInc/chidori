@@ -159,10 +159,15 @@ impl NativeAgentCheckpoint {
             run_dir.join(NATIVE_AGENT_CHECKPOINT_FILE),
             serde_json::to_vec_pretty(self)?,
         )?;
-        fs::write(
-            run_dir.join("checkpoint.json"),
-            serde_json::to_vec_pretty(&self.call_log)?,
-        )?;
+        // The run-shaped journal, in the single-copy layout the runtime
+        // writes (`records.jsonl`; the loader unions a legacy
+        // `checkpoint.json` when present, but new dirs don't write one).
+        let mut lines = Vec::new();
+        for record in &self.call_log {
+            lines.extend(serde_json::to_vec(record)?);
+            lines.push(b'\n');
+        }
+        fs::write(run_dir.join("records.jsonl"), lines)?;
         Ok(())
     }
 

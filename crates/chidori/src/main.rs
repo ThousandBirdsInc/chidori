@@ -537,7 +537,7 @@ enum Commands {
     },
 
     /// Aggregate run history: total runs, tokens, est. cost, per-model breakdown.
-    /// Reads `.chidori/runs/<id>/checkpoint.json` in the given directory.
+    /// Reads each run's journal under `.chidori/runs/` in the given directory.
     Stats {
         /// Directory containing agent runs (defaults to current dir)
         #[arg(short, long)]

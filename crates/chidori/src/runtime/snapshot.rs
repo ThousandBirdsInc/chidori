@@ -296,6 +296,19 @@ pub enum HostPromiseState {
         value: Value,
         completed_at: DateTime<Utc>,
     },
+    /// A resolved operation whose value is NOT stored here: it is
+    /// byte-identical to the journal record's `result` at `operation.seq`,
+    /// and the table compaction folded it to this reference so a large
+    /// response body is stored once per run, not twice. Exists only in the
+    /// durable `host_promises.json`: [`load_host_promise_records`] rehydrates
+    /// it back to [`HostPromiseState::Resolved`] before any consumer sees the
+    /// table, and the in-memory [`HostPromiseTable`] never holds it. The
+    /// per-operation blobs (`host_promises/<id>.json`) always carry the
+    /// inline value — they are the durability primitive for a resolution
+    /// whose journal record hasn't landed yet.
+    ResolvedInJournal {
+        completed_at: DateTime<Utc>,
+    },
     Rejected {
         error: String,
         completed_at: DateTime<Utc>,
@@ -373,7 +386,9 @@ impl HostPromiseTable {
             .get(&id.0)
             .and_then(|record| match record.state {
                 HostPromiseState::Pending => Some(&record.operation),
-                HostPromiseState::Resolved { .. } | HostPromiseState::Rejected { .. } => None,
+                HostPromiseState::Resolved { .. }
+                | HostPromiseState::ResolvedInJournal { .. }
+                | HostPromiseState::Rejected { .. } => None,
             })
     }
 
@@ -394,7 +409,9 @@ impl HostPromiseTable {
                 };
                 Ok(())
             }
-            HostPromiseState::Resolved { .. } | HostPromiseState::Rejected { .. } => {
+            HostPromiseState::Resolved { .. }
+            | HostPromiseState::ResolvedInJournal { .. }
+            | HostPromiseState::Rejected { .. } => {
                 anyhow::bail!("host promise id {} is already completed", id.0)
             }
         }
@@ -413,7 +430,9 @@ impl HostPromiseTable {
                 };
                 Ok(())
             }
-            HostPromiseState::Resolved { .. } | HostPromiseState::Rejected { .. } => {
+            HostPromiseState::Resolved { .. }
+            | HostPromiseState::ResolvedInJournal { .. }
+            | HostPromiseState::Rejected { .. } => {
                 anyhow::bail!("host promise id {} is already completed", id.0)
             }
         }
@@ -424,7 +443,9 @@ impl HostPromiseTable {
             .values()
             .filter_map(|record| match record.state {
                 HostPromiseState::Pending => Some(record.operation.clone()),
-                HostPromiseState::Resolved { .. } | HostPromiseState::Rejected { .. } => None,
+                HostPromiseState::Resolved { .. }
+                | HostPromiseState::ResolvedInJournal { .. }
+                | HostPromiseState::Rejected { .. } => None,
             })
             .collect()
     }
@@ -435,7 +456,9 @@ impl HostPromiseTable {
             .rev()
             .find_map(|record| match record.state {
                 HostPromiseState::Pending => Some(record.operation.clone()),
-                HostPromiseState::Resolved { .. } | HostPromiseState::Rejected { .. } => None,
+                HostPromiseState::Resolved { .. }
+                | HostPromiseState::ResolvedInJournal { .. }
+                | HostPromiseState::Rejected { .. } => None,
             })
     }
 
@@ -506,6 +529,46 @@ pub fn load_host_promise_records(
         {
             Some(existing) => *existing = record,
             None => records.push(record),
+        }
+    }
+    // Rehydrate journal-referenced values (see
+    // [`HostPromiseState::ResolvedInJournal`]): the compaction stored only a
+    // reference for a value byte-identical to the journal record's result, so
+    // consumers — none of which know the dehydrated form — get the full
+    // `Resolved` state back. The journal is loaded once, and only when a
+    // reference is actually present. A dangling reference is a corrupted or
+    // hand-assembled run dir: fail loudly rather than re-executing a side
+    // effect whose recorded value existed.
+    if records
+        .iter()
+        .any(|record| matches!(record.state, HostPromiseState::ResolvedInJournal { .. }))
+    {
+        let journal = store
+            .load_call_log()
+            .context("loading the journal to rehydrate host-promise values")?
+            .unwrap_or_default();
+        let result_at_seq: std::collections::HashMap<u64, &Value> = journal
+            .iter()
+            .filter(|record| record.error.is_none())
+            .map(|record| (record.seq, &record.result))
+            .collect();
+        for record in &mut records {
+            if let HostPromiseState::ResolvedInJournal { completed_at } = record.state {
+                let value = result_at_seq.get(&record.operation.seq).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "host promise {} (seq {}) references its journal record for its \
+                         resolved value, but the journal has no clean record at that seq — \
+                         the run directory is inconsistent (was the journal truncated or \
+                         assembled by hand?)",
+                        record.operation.id.0,
+                        record.operation.seq
+                    )
+                })?;
+                record.state = HostPromiseState::Resolved {
+                    value: (*value).clone(),
+                    completed_at,
+                };
+            }
         }
     }
     Ok(records)
@@ -1279,11 +1342,46 @@ impl SnapshotStore {
     /// covers. Write-then-delete ordering keeps a crash in between harmless —
     /// a surviving blob carries the same state the table just folded, and the
     /// union loader lets it win by id.
-    pub fn compact_host_promises(&self, records: &[HostPromiseRecord]) -> Result<()> {
+    ///
+    /// `journal` is the run's call log as just persisted (callers compact the
+    /// journal and the table at the same safepoint): a resolved promise whose
+    /// value is byte-identical to the journal record's `result` at its seq is
+    /// folded to [`HostPromiseState::ResolvedInJournal`] instead of storing
+    /// the value a second time — historically the last copy behind the ~4×
+    /// on-disk amplification of large response bodies. The fold happens only
+    /// on that exact-match proof, so a value the journal cannot reproduce
+    /// (or a journal record that carries an error) stays inline.
+    pub fn compact_host_promises(
+        &self,
+        records: &[HostPromiseRecord],
+        journal: &[CallRecord],
+    ) -> Result<()> {
+        let result_at_seq: std::collections::HashMap<u64, &Value> = journal
+            .iter()
+            .filter(|record| record.error.is_none())
+            .map(|record| (record.seq, &record.result))
+            .collect();
+        let dehydrated: Vec<HostPromiseRecord> = records
+            .iter()
+            .map(|record| match &record.state {
+                HostPromiseState::Resolved {
+                    value,
+                    completed_at,
+                } if result_at_seq.get(&record.operation.seq) == Some(&value) => {
+                    HostPromiseRecord {
+                        operation: record.operation.clone(),
+                        state: HostPromiseState::ResolvedInJournal {
+                            completed_at: *completed_at,
+                        },
+                    }
+                }
+                _ => record.clone(),
+            })
+            .collect();
         self.store
             .put_blob(
                 HOST_PROMISE_TABLE_FILE,
-                &serde_json::to_vec_pretty(records)?,
+                &serde_json::to_vec_pretty(&dehydrated)?,
             )
             .with_context(|| format!("writing {HOST_PROMISE_TABLE_FILE}"))?;
         for key in self.store.list_blobs()? {
@@ -1924,9 +2022,11 @@ mod host_promise_union_tests {
         ));
         assert!(matches!(records[1].state, HostPromiseState::Pending));
 
-        // Compaction folds the union into the table file and retires the blobs.
+        // Compaction folds the union into the table file and retires the
+        // blobs. No journal record backs op 1's value here, so it must stay
+        // inline (the dehydration below requires an exact-match proof).
         SnapshotStore::new(&dir)
-            .compact_host_promises(&records)
+            .compact_host_promises(&records, &[])
             .unwrap();
         assert!(!store
             .list_blobs()
@@ -1939,6 +2039,107 @@ mod host_promise_union_tests {
             reloaded[0].state,
             HostPromiseState::Resolved { .. }
         ));
+        let raw: Vec<HostPromiseRecord> =
+            serde_json::from_slice(&store.get_blob(HOST_PROMISE_TABLE_FILE).unwrap().unwrap())
+                .unwrap();
+        assert!(
+            matches!(raw[0].state, HostPromiseState::Resolved { .. }),
+            "a value the journal cannot reproduce must stay inline"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn journal_record(seq: u64, result: serde_json::Value) -> crate::runtime::call_log::CallRecord {
+        crate::runtime::call_log::CallRecord {
+            seq,
+            parent_seq: None,
+            function: "prompt".to_string(),
+            args: serde_json::json!({ "n": seq }),
+            result,
+            duration_ms: 1,
+            token_usage: None,
+            timestamp: chrono::Utc::now(),
+            error: None,
+        }
+    }
+
+    /// The large-value dedupe: a resolved promise whose value the journal
+    /// record at its seq reproduces byte-for-byte is stored as a journal
+    /// reference — the on-disk table no longer carries the value — and the
+    /// loader rehydrates it transparently, so consumers see the identical
+    /// `Resolved` state.
+    #[test]
+    fn compaction_folds_journaled_values_to_references_and_load_rehydrates() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-host-promise-dedupe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = FsRunStore::new(&dir);
+
+        let big = serde_json::json!({ "body": "x".repeat(4096) });
+        let journal = vec![journal_record(1, big.clone())];
+        store.write_call_log(&journal).unwrap();
+
+        let completed_at = chrono::Utc::now();
+        let records = vec![
+            record(
+                1,
+                HostPromiseState::Resolved {
+                    value: big.clone(),
+                    completed_at,
+                },
+            ),
+            // Same seq-keyed shape but a value the journal does NOT carry.
+            record(
+                2,
+                HostPromiseState::Resolved {
+                    value: serde_json::json!("out-of-band"),
+                    completed_at,
+                },
+            ),
+        ];
+        SnapshotStore::new(&dir)
+            .compact_host_promises(&records, &journal)
+            .unwrap();
+
+        // On disk: op 1 is a reference (the table shrank past the value), op
+        // 2 stays inline.
+        let raw = store.get_blob(HOST_PROMISE_TABLE_FILE).unwrap().unwrap();
+        assert!(
+            raw.len() < 2048,
+            "the table must not carry the journaled value ({} bytes)",
+            raw.len()
+        );
+        let raw: Vec<HostPromiseRecord> = serde_json::from_slice(&raw).unwrap();
+        assert!(matches!(
+            raw[0].state,
+            HostPromiseState::ResolvedInJournal { .. }
+        ));
+        assert!(matches!(raw[1].state, HostPromiseState::Resolved { .. }));
+
+        // Loaded: byte-identical to what was compacted.
+        let loaded = load_host_promise_records(&store).unwrap();
+        match &loaded[0].state {
+            HostPromiseState::Resolved { value, .. } => assert_eq!(value, &big),
+            other => panic!("expected rehydrated Resolved, got {other:?}"),
+        }
+        match &loaded[1].state {
+            HostPromiseState::Resolved { value, .. } => {
+                assert_eq!(value, &serde_json::json!("out-of-band"));
+            }
+            other => panic!("expected inline Resolved, got {other:?}"),
+        }
+
+        // A dangling reference (journal truncated underneath the table) fails
+        // loudly instead of re-executing a side effect whose value existed.
+        store.write_call_log(&[]).unwrap();
+        let err = load_host_promise_records(&store).unwrap_err();
+        assert!(
+            err.to_string().contains("no clean record at that seq"),
+            "got: {err:#}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -313,9 +313,13 @@ impl ScaffoldPersister {
             store.write_call_log(&call_log)?;
             ctx.clear_call_log_checkpoint_dirty(call_log.len());
             floor.fetch_max(call_log.len(), Ordering::SeqCst);
-        }
-        if let Some(records) = &host_promise_records {
-            store.compact_host_promises(records)?;
+            // Table compaction rides the same safepoint as the journal write
+            // (`host_promise_records` is `Some` only at compaction points, and
+            // `compact` always takes this branch) so the dehydration below
+            // references exactly the journal that was just made durable.
+            if let Some(records) = &host_promise_records {
+                store.compact_host_promises(records, &call_log)?;
+            }
         }
         // End-of-run engine metering, when the VM host has reported it. A
         // plain blob — never a journal record — so replay/verify semantics
@@ -1214,6 +1218,16 @@ mod tests {
         crate::runtime::snapshot::load_host_promise_records(&store).unwrap()
     }
 
+    /// The run's persisted journal, via the loader (single-copy
+    /// `records.jsonl`, unioned with a legacy `checkpoint.json` if present).
+    fn persisted_journal(run_dir: &std::path::Path) -> Vec<CallRecord> {
+        use crate::runtime::store::RunStore as _;
+        crate::runtime::store::FsRunStore::new(run_dir.to_path_buf())
+            .load_call_log()
+            .unwrap()
+            .expect("run journal exists")
+    }
+
     use crate::providers::{
         ContentBlock, LlmProvider, LlmRequest, LlmResponse, ProviderRegistry, TokenSink,
     };
@@ -2044,15 +2058,7 @@ mod tests {
             other => panic!("expected resolved prompt host promise, got {other:?}"),
         }
         assert!(!loaded.blob.is_empty());
-        let checkpoint: Vec<CallRecord> = serde_json::from_slice(
-            &std::fs::read(
-                run_base
-                    .join(&loaded.manifest.run_id)
-                    .join("checkpoint.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let checkpoint = persisted_journal(&run_base.join(&loaded.manifest.run_id));
         assert_eq!(checkpoint.len(), 1);
         assert_eq!(checkpoint[0].function, "prompt");
         assert_eq!(checkpoint[0].result, serde_json::json!("provider result"));
@@ -2180,15 +2186,7 @@ mod tests {
             other => panic!("expected resolved sub-agent host promise, got {other:?}"),
         }
         assert!(!loaded.blob.is_empty());
-        let checkpoint: Vec<CallRecord> = serde_json::from_slice(
-            &std::fs::read(
-                run_base
-                    .join(&loaded.manifest.run_id)
-                    .join("checkpoint.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let checkpoint = persisted_journal(&run_base.join(&loaded.manifest.run_id));
         assert_eq!(checkpoint.len(), 1);
         assert_eq!(checkpoint[0].function, "call_agent");
         assert_eq!(
@@ -2256,15 +2254,7 @@ mod tests {
             crate::runtime::snapshot::HostPromiseState::Resolved { .. }
         ));
         assert!(!loaded.blob.is_empty());
-        let checkpoint: Vec<CallRecord> = serde_json::from_slice(
-            &std::fs::read(
-                run_base
-                    .join(&loaded.manifest.run_id)
-                    .join("checkpoint.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let checkpoint = persisted_journal(&run_base.join(&loaded.manifest.run_id));
         assert_eq!(checkpoint.len(), 1);
         assert_eq!(checkpoint[0].function, "mark");
         assert_eq!(checkpoint[0].args["label"], serde_json::json!("mid-run"));
@@ -3091,16 +3081,26 @@ def agent(value):
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].function, "prompt");
 
-        // A compaction point (pause/settle) writes the full checkpoint.
+        // A compaction point (pause/settle) rewrites the journal in place —
+        // single-copy layout: `records.jsonl` holds the full log and no
+        // `checkpoint.json` twin appears.
         persister.persist(&ctx, CheckpointWrite::Compact).unwrap();
-        let checkpoint: Vec<CallRecord> =
-            serde_json::from_slice(&std::fs::read(run_dir.join("checkpoint.json")).unwrap())
-                .unwrap();
-        assert_eq!(checkpoint.len(), 1);
+        assert!(
+            !run_dir.join("checkpoint.json").exists(),
+            "compaction must not create a duplicate checkpoint artifact"
+        );
+        let journal_lines = |run_dir: &std::path::Path| -> usize {
+            std::fs::read_to_string(run_dir.join("records.jsonl"))
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        };
+        assert_eq!(journal_lines(&run_dir), 1);
 
         // Resume replay: replayed pushes bypass the append path, so the log
-        // is checkpoint-dirty and the first safepoint persists one full
-        // checkpoint covering the replayed prefix + synthetic record.
+        // is checkpoint-dirty and the first safepoint rewrites one full
+        // journal covering the replayed prefix + synthetic record.
         let resumed = RuntimeContext::with_replay(vec![record(1, "prompt"), record(2, "input")]);
         resumed.enable_persistence_with_store(
             run_dir.clone(),
@@ -3115,37 +3115,60 @@ def agent(value):
             .persist(&resumed, CheckpointWrite::IfDirty)
             .unwrap();
         assert!(!resumed.call_log_checkpoint_dirty());
-        let checkpoint: Vec<CallRecord> =
-            serde_json::from_slice(&std::fs::read(run_dir.join("checkpoint.json")).unwrap())
-                .unwrap();
         assert_eq!(
-            checkpoint.len(),
+            journal_lines(&run_dir),
             2,
             "first safepoint past the replay frontier must persist replayed + synthetic records"
         );
 
-        // Once clean, further live records go back to append-only cadence.
+        // Once clean, further live records go back to append-only cadence:
+        // one appended line, no rewrite (the journal stays line-consistent).
         resumed.record_call(record(3, "tool"));
         resumed_persister
             .persist(&resumed, CheckpointWrite::IfDirty)
             .unwrap();
-        let checkpoint: Vec<CallRecord> =
-            serde_json::from_slice(&std::fs::read(run_dir.join("checkpoint.json")).unwrap())
-                .unwrap();
         assert_eq!(
-            checkpoint.len(),
-            2,
-            "clean safepoint must leave the checkpoint alone"
+            journal_lines(&run_dir),
+            3,
+            "the clean safepoint must leave the appended tail as-is"
         );
         let loaded = crate::runtime::store::FsRunStore::new(&run_dir)
             .load_call_log()
             .unwrap()
             .unwrap();
         assert_eq!(
-            loaded.len(),
-            3,
-            "the union must still see the appended tail"
+            loaded.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the loader sees the rewritten prefix plus the appended tail"
         );
+
+        // A legacy run dir (checkpoint.json written by an older build) still
+        // loads via the union — checkpoint order wins for the seqs it knows,
+        // exactly as before — and the next compaction removes the superseded
+        // artifact, upgrading the dir to the single-copy layout.
+        std::fs::write(
+            run_dir.join("checkpoint.json"),
+            serde_json::to_vec_pretty(&vec![
+                record(1, "prompt"),
+                record(2, "input"),
+                record(3, "tool"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = crate::runtime::store::FsRunStore::new(&run_dir)
+            .load_call_log()
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.len(), 3, "the legacy layout still loads");
+        resumed_persister
+            .persist(&resumed, CheckpointWrite::Compact)
+            .unwrap();
+        assert!(
+            !run_dir.join("checkpoint.json").exists(),
+            "compaction must remove the superseded legacy checkpoint"
+        );
+        assert_eq!(journal_lines(&run_dir), 3);
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -516,8 +516,13 @@ fn complete_persisted_pending_host_operation(
             completed_at,
         },
     };
+    // A delivery is an out-of-band compaction point: the value just resolved
+    // has no journal record yet (the synthetic resume record lands during the
+    // re-run), so it stays inline; previously-journaled values re-fold to
+    // their references against the run's current journal.
+    let journal = store.load_call_log()?.unwrap_or_default();
     crate::runtime::snapshot::SnapshotStore::with_store(run_base.join(run_id), store.clone())
-        .compact_host_promises(&records)?;
+        .compact_host_promises(&records, &journal)?;
     store.delete_blob(PENDING_HOST_OPERATION_FILE)?;
     Ok(Some(pending))
 }
@@ -560,8 +565,9 @@ fn complete_persisted_host_promise_record(
             completed_at,
         },
     };
+    let journal = store.load_call_log()?.unwrap_or_default();
     crate::runtime::snapshot::SnapshotStore::with_store(run_base.join(run_id), store.clone())
-        .compact_host_promises(&records)?;
+        .compact_host_promises(&records, &journal)?;
     Ok(())
 }
 
