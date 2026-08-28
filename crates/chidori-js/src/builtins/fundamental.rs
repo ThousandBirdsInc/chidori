@@ -1286,6 +1286,12 @@ fn install_object_extra(vm: &mut Vm) {
     vm.define_method(&ctor, "hasOwn", 2, |vm, _t, args| {
         let o = vm.to_object(&arg(args, 0))?;
         let key = vm.to_property_key(&arg(args, 1))?;
+        // A Proxy dispatches [[GetOwnProperty]] (the trap, or the target's
+        // own property when there is none) — same as hasOwnProperty above.
+        if vm.is_proxy(&o) {
+            let desc = vm.proxy_get_own_descriptor(&o, &key)?;
+            return Ok(Value::Bool(matches!(desc, Value::Object(_))));
+        }
         Ok(Value::Bool(own_property_exists(&o, &key)))
     });
 }

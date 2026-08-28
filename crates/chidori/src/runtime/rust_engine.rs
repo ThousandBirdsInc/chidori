@@ -1446,6 +1446,18 @@ pub(crate) fn build_sync_native_dispatch(
 const PROCESS_EVENTS_JS: &str = r#"
 (function () {
     const proc = globalThis.process;
+    // Node's `process` and `globalThis` answer Object.prototype.toString with
+    // their own tags ('[object process]' / '[object global]'); assert's
+    // deep-equality relies on that to tell a copied lookalike from the real
+    // thing. Non-enumerable, so Object.keys copies never carry it over.
+    if (typeof Symbol === "function" && Symbol.toStringTag) {
+        Object.defineProperty(proc, Symbol.toStringTag, {
+            value: "process", enumerable: false, writable: false, configurable: true,
+        });
+        Object.defineProperty(globalThis, Symbol.toStringTag, {
+            value: "global", enumerable: false, writable: false, configurable: true,
+        });
+    }
     const events = Object.create(null);
     const listOf = function (name) {
         const key = String(name);
@@ -1506,20 +1518,63 @@ const PROCESS_EVENTS_JS: &str = r#"
     };
     proc.addListener = proc.on;
     proc.removeListener = proc.off;
-    // Node semantics: emitWarning normalizes to an Error-like (name = type,
-    // optional code) and dispatches a 'warning' event on the next tick;
-    // without listeners it degrades to console.warn, like Node's default
-    // stderr print.
-    proc.emitWarning = function (warning, type, code) {
+    // Node's emitWarning (lib/internal/process/warning.js): the options-bag
+    // and ctor overloads, string validation with Node's coded TypeErrors,
+    // and 'warning' dispatch on the next tick — degrading to console.warn
+    // without listeners, like Node's default stderr print.
+    function warnArgType(name, expected, value) {
+        let received;
+        if (value === null || value === undefined) received = String(value);
+        else if (typeof value === "function") received = "function " + value.name;
+        else if (typeof value === "object") {
+            received = value.constructor && value.constructor.name
+                ? "an instance of " + value.constructor.name
+                : "[Object: null prototype] {}";
+        } else {
+            let inspected = typeof value === "string" ? "'" + value + "'" : String(value);
+            if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+            received = "type " + typeof value + " (" + inspected + ")";
+        }
+        const err = new TypeError(
+            'The "' + name + '" argument must be ' + expected + ". Received " + received);
+        err.code = "ERR_INVALID_ARG_TYPE";
+        return err;
+    }
+    proc.emitWarning = function (warning, type, code, ctor) {
+        let detail;
+        if (type !== null && typeof type === "object" && !Array.isArray(type)) {
+            ctor = type.ctor;
+            code = type.code;
+            if (typeof type.detail === "string") detail = type.detail;
+            type = type.type || "Warning";
+        } else if (typeof type === "function") {
+            ctor = type;
+            code = undefined;
+            type = "Warning";
+        }
+        if (type !== undefined && typeof type !== "string") {
+            throw warnArgType("type", "of type string", type);
+        }
+        if (typeof code === "function") {
+            ctor = code;
+            code = undefined;
+        } else if (code !== undefined && typeof code !== "string") {
+            throw warnArgType("code", "of type string", code);
+        }
         let w;
-        if (warning instanceof Error) {
+        if (typeof warning === "string") {
+            w = new Error(warning);
+            w.name = String(type || "Warning");
+            if (code !== undefined) w.code = code;
+            if (detail !== undefined) w.detail = detail;
+            if (typeof Error.captureStackTrace === "function") {
+                Error.captureStackTrace(w, ctor || proc.emitWarning);
+            }
+        } else if (warning instanceof Error) {
             w = warning;
         } else {
-            w = new Error(String(warning));
-            w.name = typeof type === "string" && type.length > 0 ? type : "Warning";
+            throw warnArgType("warning", "an instance of Error or of type string", warning);
         }
-        if (typeof type === "string" && !(warning instanceof Error)) w.name = type;
-        if (code !== undefined && w.code === undefined) w.code = code;
         Promise.resolve().then(() => {
             if (proc.listenerCount("warning") > 0) {
                 proc.emit("warning", w);

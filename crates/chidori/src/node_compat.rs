@@ -134,6 +134,11 @@ const __common = {
     },
     skip(message) { throw { __chidori_skip: String(message || "skipped") }; },
     printSkipMessage() {},
+    // Child processes are outside what the chidori runtime grants; a test
+    // reaching for them records as an honest skip, same as fixtures used to.
+    spawnPromisified() {
+        throw { __chidori_skip: "requires Node test-suite facility 'spawnPromisified' (child processes)" };
+    },
     expectsError(settings) {
         const expected = settings || {};
         // Returns true on match: Node's assert.throws treats a validator
@@ -196,6 +201,9 @@ const __common = {
     },
     allowGlobals() {},
     platformTimeout(t) { return t; },
+    // chidori's Buffer carries the 32-bit kMaxLength bound, so tests gated on
+    // 64-bit-sized allocations skip exactly as they would on a 32-bit host.
+    skipIf32Bits() { throw { __chidori_skip: "requires 64-bit-sized Buffer allocations (chidori kMaxLength is the 32-bit bound)" }; },
     busyLoop() {},
     // Mirrors Node's test/common/index.js helper (which mirrors the runtime's
     // ERR_INVALID_ARG_TYPE message tail) — several vendored tests build their
@@ -255,6 +263,38 @@ const __common = {
         }
     },
 };
+// `test/common/fixtures` and `test/common/tmpdir`, over the harness VFS. The
+// runner seeds every file vendored under `tests/node_compat/fixtures/` at
+// `/test/fixtures/...` (mirroring Node's checkout layout, the same way Bun
+// vendors `test/fixtures` alongside its copy of the suite), so `fixtures.path`
+// hands back paths that the fs shim can actually open.
+function __joinPath(base, args) {
+    let out = base;
+    for (const part of args) {
+        const p = String(part);
+        if (p.startsWith("/")) { out += p; } else { out += "/" + p; }
+    }
+    return out.replace(/\/+/g, "/");
+}
+const __fixtures = {
+    fixturesDir: "/test/fixtures",
+    path(...args) { return __joinPath("/test/fixtures", args); },
+    readSync(args, enc) {
+        const parts = Array.isArray(args) ? args : [args];
+        return __builtins["fs"].readFileSync(__joinPath("/test/fixtures", parts), enc);
+    },
+    readKey(name, enc) {
+        return __builtins["fs"].readFileSync(__joinPath("/test/fixtures/keys", [name]), enc);
+    },
+};
+const __tmpdir = {
+    path: "/tmp/node-compat-tmpdir",
+    refresh() {
+        const fs = __builtins["fs"];
+        try { fs.rmSync(__tmpdir.path, { recursive: true, force: true }); } catch {}
+        fs.mkdirSync(__tmpdir.path, { recursive: true });
+    },
+};
 "#;
 
 /// Extract the string arguments of every `require('...')` in the source.
@@ -289,6 +329,10 @@ pub fn wrap_node_test(source: &str, file_name: &str) -> String {
     let mut builtins: BTreeSet<String> = BTreeSet::new();
     builtins.insert("buffer".to_string());
     builtins.insert("url".to_string());
+    // The fixtures/tmpdir emulation reads and writes through the fs shim.
+    if source.contains("common/fixtures") || source.contains("common/tmpdir") {
+        builtins.insert("fs".to_string());
+    }
     for spec in required_specifiers(source) {
         let name = spec.strip_prefix("node:").unwrap_or(&spec);
         if NODE_BUILTIN_ALLOWLIST.contains(&name) {
@@ -318,23 +362,75 @@ function require(name) {
     if (key === "../common" || key.endsWith("/common") || key === "../common/index.js") {
         return __common;
     }
+    if (key === "../common/fixtures" || key.endsWith("/common/fixtures")) {
+        return __fixtures;
+    }
+    if (key === "../common/tmpdir" || key.endsWith("/common/tmpdir")) {
+        return __tmpdir;
+    }
     if (key.indexOf("common/") !== -1) {
-        // fixtures, tmpdir, … — host suite facilities the harness cannot
-        // emulate; the runner records the test as skipped.
+        // Remaining host suite facilities (child processes, inspector, …)
+        // the harness cannot emulate; the runner records the test as skipped.
         throw { __chidori_skip: "requires Node test-suite facility '" + name + "'" };
     }
     // Node internals the vendored tests reach for under --expose-internals.
     // Only the exact members the suite dereferences, mapped onto chidori's
     // own machinery (the Deno node_compat approach).
     if (key === "internal/event_target") {
-        return { kEvents: globalThis.__chidori_kEvents || Symbol.for("chidori.kEvents") };
+        return {
+            kEvents: globalThis.__chidori_kEvents || Symbol.for("chidori.kEvents"),
+            // The weak-listener marker: the EventTarget shim holds all
+            // listeners strongly, so the symbol only needs to exist.
+            kWeakHandler: Symbol.for("chidori.kWeakHandler"),
+        };
     }
     if (key === "internal/util") {
         return { customPromisifyArgs: Symbol.for("nodejs.util.promisify.customArgs") };
     }
+    if (key === "internal/errors") {
+        // Only the shape the vendored tests dereference: coded error
+        // constructors under `codes`, constructible with no arguments.
+        function coded(name, Base) {
+            const ctor = function (...args) {
+                const err = new Base(name + (args.length ? ": " + args.join(", ") : ""));
+                err.code = name;
+                return err;
+            };
+            Object.defineProperty(ctor, "name", { value: name, configurable: true });
+            return ctor;
+        }
+        return {
+            codes: {
+                ERR_OUT_OF_RANGE: coded("ERR_OUT_OF_RANGE", RangeError),
+                ERR_INVALID_ARG_TYPE: coded("ERR_INVALID_ARG_TYPE", TypeError),
+                ERR_INVALID_ARG_VALUE: coded("ERR_INVALID_ARG_VALUE", TypeError),
+            },
+        };
+    }
     if (key === "internal/test/binding") {
         return {
             internalBinding(binding) {
+                if (binding === "buffer") {
+                    // The raw fill binding's start/end range checks — the only
+                    // members the vendored buffer tests poke at directly.
+                    function bindingRange(value, name, max) {
+                        if (typeof value !== "number" || value < 0 || value > max ||
+                            Math.floor(value) !== value) {
+                            const err = new RangeError(
+                                'The value of "' + name + '" is out of range. Received ' + String(value));
+                            err.code = "ERR_OUT_OF_RANGE";
+                            throw err;
+                        }
+                        return value;
+                    }
+                    return {
+                        fill(buf, value, start, end, encoding) {
+                            bindingRange(start, "start", buf.length);
+                            bindingRange(end, "end", buf.length);
+                            return buf.fill(value, start, end, encoding);
+                        },
+                    };
+                }
                 if (binding === "js_stream") {
                     // The suite only uses JSStream to obtain an "external"
                     // (host-opaque) value; chidori has no V8 externals, so a
@@ -394,7 +490,10 @@ export async function agent() {
         }
         // Node runs 'exit' listeners as the process leaves; tests assert final
         // state in them. The process global's emit is a real registry.
+        // `process._exiting` is flipped first, exactly as Node's shutdown path
+        // does — APIs like assert.CallTracker.calls() branch on it.
         if (globalThis.process && typeof globalThis.process.emit === "function") {
+            globalThis.process._exiting = true;
             globalThis.process.emit("exit", 0);
         }
         __common.__verify();
@@ -418,6 +517,28 @@ fn first_line(message: &str) -> String {
     if out.len() < line.len() {
         out.push('…');
     }
+    out
+}
+
+/// Read every file under `dir` (recursively) as `(relative_path, bytes)`.
+/// Missing dir is fine — the fixture set is optional and grows on demand.
+fn load_fixtures(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else if let (Ok(rel), Ok(bytes)) = (path.strip_prefix(root), std::fs::read(&path)) {
+                out.push((rel.to_string_lossy().replace('\\', "/"), bytes));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
     out
 }
 
@@ -455,6 +576,11 @@ pub fn run_suite(suite_dir: &Path) -> Vec<Outcome> {
         })
         .collect();
     files.sort();
+
+    // Fixture files vendored under `tests/node_compat/fixtures/` (see
+    // `scripts/vendor-node-compat-tests.sh`), loaded once and seeded into each
+    // test's VFS at `/test/fixtures/...`.
+    let fixtures = load_fixtures(&suite_dir.parent().unwrap_or(suite_dir).join("fixtures"));
 
     let tokio_rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime"));
     let scratch =
@@ -494,6 +620,15 @@ pub fn run_suite(suite_dir: &Path) -> Vec<Outcome> {
             &format!("/test/parallel/{file}"),
             source.clone().into_bytes(),
         );
+        // Seed vendored fixture files at Node's checkout layout so the
+        // `common/fixtures` emulation resolves the same paths the tests name.
+        for (rel, bytes) in &fixtures {
+            let vfs_path = format!("/test/fixtures/{rel}");
+            if let Some(dir) = std::path::Path::new(&vfs_path).parent() {
+                let _ = ctx.vfs_mkdir(&dir.to_string_lossy(), true);
+            }
+            let _ = ctx.vfs_write(&vfs_path, bytes.clone());
+        }
         let backend = HostBindingBackend::for_runtime(
             ctx,
             Arc::new(ProviderRegistry::new()),
@@ -529,11 +664,17 @@ pub fn run_suite(suite_dir: &Path) -> Vec<Outcome> {
                     detail: Some("harness: unexpected agent result shape".to_string()),
                 },
             },
-            Err(err) => Outcome {
-                file,
-                status: Status::Fail,
-                detail: Some(first_line(&format!("{err:#}"))),
-            },
+            Err(err) => {
+                // The gate and report keep the one-line summary; the full
+                // chain goes to stderr so a failing run is debuggable without
+                // re-running under a filter.
+                eprintln!("node-compat[error] {file}:\n{err:#}");
+                Outcome {
+                    file,
+                    status: Status::Fail,
+                    detail: Some(first_line(&format!("{err:#}"))),
+                }
+            }
         };
         eprintln!(
             "node-compat: {} {} {}",
@@ -563,6 +704,7 @@ fn module_of(file: &str) -> &'static str {
         ("test-querystring", "querystring"),
         ("test-punycode", "punycode"),
         ("test-path", "path"),
+        ("test-whatwg-url", "url"),
         ("test-url", "url"),
         ("test-buffer", "buffer"),
         ("test-zlib", "zlib"),
@@ -617,8 +759,10 @@ pub fn render_report(outcomes: &[Outcome], node_version: &str) -> String {
         out,
         "**{passed}/{total} passing** ({failed} failing, {skipped} skipped). \
          A test passes only if every assertion in the vendored Node test holds \
-         under chidori's engine and builtin shims; skips are tests needing Node \
-         test-suite facilities (fixtures, tmpdir) the harness does not emulate."
+         under chidori's engine and builtin shims; skips are tests needing \
+         facilities the harness does not provide (child processes, the WPT \
+         runner, 64-bit-sized Buffer allocations — `common/fixtures` and \
+         `common/tmpdir` are emulated over the VFS)."
     );
     out.push('\n');
     let _ = writeln!(out, "| Module | Pass | Fail | Skip | Rate |");
@@ -683,7 +827,9 @@ only materializes stack frames on the throw-unwind path (`record_unwind_frame`),
 so no caller position exists at message-construction time; eager capture would \
 have to thread a shadow call stack through all three interpreter tiers' call \
 dispatch. Everything before those checks — including the full `createErrDiff` \
-Myers-diff message format — passes.
+Myers-diff message format — passes. (Bun's runtime does not implement this \
+either — its vendored copy of `test-assert.js` comments the generated-message \
+checks out; chidori keeps the test unmodified and tracks the gap here.)
 ";
 
 #[cfg(test)]

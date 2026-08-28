@@ -1963,6 +1963,11 @@ pub enum IterKind {
 pub struct IterState {
     pub target: Option<JsObject>,
     pub string: Option<JsString>,
+    /// Lazily-built UTF-16 view of `string` for `StringChars` stepping.
+    /// Strings are immutable, so this is a pure cache: without it every
+    /// `next()` re-converts the whole string and iteration goes quadratic.
+    /// Not snapshotted — a decoded iterator rebuilds it on first step.
+    pub string_units: Option<std::rc::Rc<Vec<u16>>>,
     pub index: usize,
     pub kind: IterKind,
     pub done: bool,
