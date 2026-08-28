@@ -2438,6 +2438,7 @@ impl<'a> Decoder<'a> {
                     None => None,
                 },
                 string: it.string.as_ref().map(|s| self.jsstring(s)),
+                string_units: None,
                 index: it.index as usize,
                 kind: iter_kind_of(it.kind)?,
                 done: it.done,
