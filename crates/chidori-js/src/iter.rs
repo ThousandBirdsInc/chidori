@@ -215,6 +215,7 @@ impl Vm {
             Internal::Iterator(IterState {
                 target,
                 string,
+                string_units: None,
                 index: 0,
                 kind,
                 done: false,
@@ -319,9 +320,13 @@ impl Vm {
                     IterKind::StringChars => {
                         // `index` is a UTF-16 code-unit offset; each step yields
                         // one code point (combining a surrogate pair), preserving
-                        // lone surrogates as a single one-unit string.
-                        let s = st.string.clone().unwrap_or_else(|| JsString::new(""));
-                        let units = s.to_utf16_vec();
+                        // lone surrogates as a single one-unit string. The
+                        // UTF-16 view is built once and cached on the state.
+                        if st.string_units.is_none() {
+                            let s = st.string.clone().unwrap_or_else(|| JsString::new(""));
+                            st.string_units = Some(std::rc::Rc::new(s.to_utf16_vec()));
+                        }
+                        let units = st.string_units.clone().unwrap();
                         if idx < units.len() {
                             let end = crate::value::next_code_point_boundary(&units, idx);
                             st.index = end;

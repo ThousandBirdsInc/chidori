@@ -1061,24 +1061,28 @@ pub(crate) const TEXT_ENCODING_POLYFILL: &str = r#"
             get encoding() { return "utf-8"; }
             encode(str) {
                 str = String(str === undefined ? "" : str);
+                // Iterate by code point (the string iterator is a linear
+                // walk) instead of charCodeAt(i), which re-scans the UTF-8
+                // representation from the start on every non-ASCII access —
+                // quadratic on large strings. Lone surrogates encode as
+                // U+FFFD, per WHATWG.
                 const out = [];
-                for (let i = 0; i < str.length; i++) {
-                    let c = str.charCodeAt(i);
-                    if (c < 0x80) {
-                        out.push(c);
-                    } else if (c < 0x800) {
-                        out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
-                    } else if (c >= 0xd800 && c <= 0xdbff) {
-                        const c2 = str.charCodeAt(++i);
-                        const cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+                for (const ch of str) {
+                    let cp = ch.codePointAt(0);
+                    if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
+                    if (cp < 0x80) {
+                        out.push(cp);
+                    } else if (cp < 0x800) {
+                        out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+                    } else if (cp < 0x10000) {
+                        out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+                    } else {
                         out.push(
                             0xf0 | (cp >> 18),
                             0x80 | ((cp >> 12) & 0x3f),
                             0x80 | ((cp >> 6) & 0x3f),
                             0x80 | (cp & 0x3f)
                         );
-                    } else {
-                        out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
                     }
                 }
                 return new Uint8Array(out);
