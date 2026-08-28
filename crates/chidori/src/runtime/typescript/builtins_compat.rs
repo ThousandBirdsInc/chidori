@@ -1676,6 +1676,16 @@ Object.setPrototypeOf(Stream, EventEmitter);
 Stream.prototype.pipe = function pipe(dest, options) {
     const src = this;
     const end = !options || options.end !== false;
+    // Piping a readable whose 'end' has already fired still ends the
+    // destination (Node re-schedules the end handling for late pipes).
+    const rst = src._readableState;
+    if (rst && rst.endEmitted) {
+        queueMicrotask(() => {
+            if (end && typeof dest.end === "function") dest.end();
+        });
+        dest.emit("pipe", src);
+        return dest;
+    }
     function onData(chunk) { dest.write(chunk); }
     src.on("data", onData);
     src.once("end", function () {
@@ -1721,6 +1731,31 @@ function scheduleReadable(stream) {
         maybeEmitEnd(stream);
     });
 }
+function bufferedLength(st) {
+    if (st.objectMode) return st.buffer.length;
+    let total = 0;
+    for (const c of st.buffer) total += typeof c === "string" ? c.length : c.length || 0;
+    return total;
+}
+// Node's maybeReadMore: while paused and under the high-water mark, keep
+// asking _read for data so the buffer actually fills to the mark instead of
+// stopping after the first push.
+function maybeReadMore(stream) {
+    const st = stream._readableState;
+    if (st.readMoreScheduled) return;
+    st.readMoreScheduled = true;
+    queueMicrotask(() => {
+        st.readMoreScheduled = false;
+        while (!st.ended && !st.destroyed && !st.reading && st.flowing !== true &&
+               bufferedLength(st) < st.highWaterMark) {
+            const before = st.buffer.length;
+            st.reading = true;
+            try { stream._read(st.highWaterMark); } catch (err) { stream.destroy(err); return; }
+            st.reading = false;
+            if (st.buffer.length === before) break;
+        }
+    });
+}
 function flow(stream) {
     const st = stream._readableState;
     if (st.flowScheduled) return;
@@ -1753,6 +1788,7 @@ class Readable extends Stream {
             reading: false,
             flowScheduled: false,
             readableScheduled: false,
+            readMoreScheduled: false,
             objectMode: !!(opts.objectMode || opts.readableObjectMode),
             encoding: opts.encoding || null,
             highWaterMark: typeof opts.highWaterMark === "number" ? opts.highWaterMark : 16384,
@@ -1787,14 +1823,23 @@ class Readable extends Stream {
         if (!st.objectMode && typeof chunk === "string" && encoding && encoding !== "utf8" && encoding !== "utf-8") {
             chunk = Buffer.from(chunk, encoding);
         }
+        // Node skips zero-length chunks outside object mode — they must not
+        // enter the buffer (or reset the reading state).
+        if (!st.objectMode && chunk && typeof chunk.length === "number" && chunk.length === 0) {
+            if (st.flowing) flow(this);
+            else scheduleReadable(this);
+            return st.buffer.length < st.highWaterMark;
+        }
         st.buffer.push(chunk);
         if (st.flowing) flow(this);
-        else scheduleReadable(this);
+        else { scheduleReadable(this); maybeReadMore(this); }
         return st.buffer.length < st.highWaterMark;
     }
     unshift(chunk) {
         if (chunk === null || chunk === undefined) return;
-        this._readableState.buffer.unshift(chunk);
+        const st = this._readableState;
+        if (!st.objectMode && typeof chunk.length === "number" && chunk.length === 0) return;
+        st.buffer.unshift(chunk);
     }
     read(size) {
         const st = this._readableState;
@@ -1812,8 +1857,36 @@ class Readable extends Stream {
             return null;
         }
         let chunk;
-        if (st.objectMode || st.buffer.length === 1 || (size !== undefined && size !== null)) {
+        if (st.objectMode) {
             chunk = st.buffer.shift();
+        } else if (size !== undefined && size !== null) {
+            // Node's howMuchToRead: with fewer than `size` bytes buffered and
+            // the stream not ended, a sized read returns null and waits.
+            const total = bufferedLength(st);
+            if (total < size && !st.ended) return null;
+            const want = Math.min(size, total);
+            const parts = [];
+            let got = 0;
+            while (got < want) {
+                let c = st.buffer.shift();
+                const isStr = typeof c === "string";
+                const len = c.length;
+                if (got + len > want) {
+                    const keep = want - got;
+                    st.buffer.unshift(isStr ? c.slice(keep) : c.subarray(keep));
+                    c = isStr ? c.slice(0, keep) : c.subarray(0, keep);
+                }
+                parts.push(c);
+                got += c.length;
+            }
+            if (parts.length === 1) {
+                chunk = parts[0];
+            } else {
+                let allStrings = true;
+                for (const c of parts) if (typeof c !== "string") { allStrings = false; break; }
+                chunk = allStrings ? parts.join("")
+                    : Buffer.concat(parts.map((c) => (typeof c === "string" ? Buffer.from(c) : Buffer.from(c))));
+            }
         } else {
             // Non-object mode, unsized read: drain the whole buffer as one
             // chunk, joining strings (or concatenating Buffers), like Node's
@@ -1858,6 +1931,8 @@ class Readable extends Stream {
     get destroyed() { return this._readableState.destroyed; }
     get readableEnded() { return this._readableState.endEmitted; }
     get readableObjectMode() { return this._readableState.objectMode; }
+    get readableBuffer() { return this._readableState.buffer; }
+    get readableLength() { return bufferedLength(this._readableState); }
     [Symbol.asyncIterator]() {
         const stream = this;
         const iterator = {
@@ -1932,20 +2007,27 @@ function initWritableState(stream, opts) {
         finished: false,
         finishScheduled: false,
         destroyed: false,
+        errored: false,
         pending: 0,
         length: 0,
         needDrain: false,
+        corked: 0,
+        corkBuffer: [],
         highWaterMark: writableHighWaterMark(opts),
         objectMode: !!(opts.objectMode || opts.writableObjectMode),
     };
     stream.writable = true;
     if (typeof opts.write === "function") stream._write = opts.write;
+    if (typeof opts.writev === "function") stream._writev = opts.writev;
     if (typeof opts.final === "function") stream._final = opts.final;
     if (typeof opts.destroy === "function" && !stream._destroy) stream._destroy = opts.destroy;
 }
 function maybeFinish(stream) {
     const st = stream._writableState;
-    if (!st.ended || st.finishScheduled || st.pending > 0 || st.destroyed) return;
+    if (!st.ended || st.finishScheduled || st.pending > 0 || st.destroyed || st.errored ||
+        st.corked > 0 || st.corkBuffer.length > 0) {
+        return;
+    }
     st.finishScheduled = true;
     const emitFinish = function () {
         st.finished = true;
@@ -1955,23 +2037,77 @@ function maybeFinish(stream) {
             if (!rst || rst.endEmitted) queueMicrotask(() => stream.emit("close"));
         });
     };
-    if (typeof stream._final === "function") {
-        stream._final(function (err) {
-            if (err) { queueMicrotask(() => stream.emit("error", err)); return; }
+    stream.emit("prefinish");
+    const finalFn = typeof stream._chidoriFinal === "function" ? stream._chidoriFinal : stream._final;
+    if (typeof finalFn === "function") {
+        finalFn.call(stream, function (err) {
+            if (err) { st.errored = true; queueMicrotask(() => stream.emit("error", err)); return; }
             emitFinish();
         });
     } else {
         emitFinish();
     }
 }
+// Flush the chunks buffered while corked: through one _writev call when the
+// stream provides one and holds several chunks, else chunk-by-chunk _write.
+function flushCorked(stream) {
+    const st = stream._writableState;
+    const entries = st.corkBuffer.splice(0, st.corkBuffer.length);
+    if (entries.length === 0) {
+        maybeFinish(stream);
+        return;
+    }
+    if (typeof stream._writev === "function" && entries.length > 1) {
+        const chunks = entries.map((e) => ({ chunk: e.chunk, encoding: e.encoding }));
+        let settled = false;
+        stream._writev(chunks, function (err) {
+            if (settled) return;
+            settled = true;
+            // Settle every buffered entry exactly once; the shared error (if
+            // any) reaches the 'error' event through the first one only.
+            for (let i = 0; i < entries.length; i++) {
+                entries[i].done(i === 0 ? err : null);
+            }
+        });
+        return;
+    }
+    for (const entry of entries) {
+        stream._write(entry.chunk, entry.encoding, entry.done);
+    }
+}
 const writableMethods = {
     _write(chunk, encoding, callback) {
-        callback(new Error("The _write() method is not implemented"));
+        // Node's default: route through _writev when one exists, otherwise
+        // this is a synchronous coded throw — not an emitted error.
+        if (typeof this._writev === "function") {
+            this._writev([{ chunk, encoding }], callback);
+            return;
+        }
+        const err = new Error("The _write() method is not implemented");
+        err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+        throw err;
     },
     write(chunk, encoding, callback) {
         if (typeof encoding === "function") { callback = encoding; encoding = null; }
         const st = this._writableState;
         const self = this;
+        // Node's validChunk: both throws are synchronous and never touch the
+        // 'error' event.
+        if (chunk === null) {
+            const err = new TypeError("May not write null values to stream");
+            err.code = "ERR_STREAM_NULL_VALUES";
+            throw err;
+        }
+        if (!st.objectMode && typeof chunk !== "string" && !ArrayBuffer.isView(chunk)) {
+            const err = new TypeError(
+                'The "chunk" argument must be of type string or an instance of Buffer or Uint8Array. ' +
+                "Received " + (chunk === undefined ? "undefined" :
+                    typeof chunk === "object" && chunk !== null
+                        ? "an instance of " + ((chunk.constructor && chunk.constructor.name) || "Object")
+                        : "type " + typeof chunk + " (" + String(chunk) + ")"));
+            err.code = "ERR_INVALID_ARG_TYPE";
+            throw err;
+        }
         if (st.ended) {
             const err = new Error("write after end");
             if (callback) queueMicrotask(() => callback(err));
@@ -1987,7 +2123,10 @@ const writableMethods = {
             settled = true;
             st.pending--;
             st.length -= len;
-            if (err) queueMicrotask(() => self.emit("error", err));
+            if (err) {
+                st.errored = true;
+                queueMicrotask(() => self.emit("error", err));
+            }
             if (callback) queueMicrotask(() => callback(err || null));
             // Everything this stream had buffered has moved on: tell a writer
             // that got `false` back that it may resume.
@@ -1997,31 +2136,50 @@ const writableMethods = {
             }
             maybeFinish(self);
         };
-        try {
+        if (st.corked > 0) {
+            // Buffered until uncork()/end(); flushed through _writev when the
+            // stream has one and more than one chunk accumulated.
+            st.corkBuffer.push({ chunk, encoding: encoding || "utf8", done });
+        } else {
+            // A synchronous throw out of _write propagates to the caller,
+            // exactly as Node's doWrite does; async failures come back
+            // through the callback.
             this._write(chunk, encoding || "utf8", done);
-        } catch (err) {
-            done(err);
         }
-        // Honest backpressure: `false` once the still-unflushed length reaches
-        // the high-water mark (a transform holding its callback keeps its
-        // chunk counted), and a 'drain' follows when that length reaches zero.
         const ret = st.length < st.highWaterMark;
         if (!ret) st.needDrain = true;
         return ret;
+    },
+    cork() {
+        this._writableState.corked++;
+    },
+    uncork() {
+        const st = this._writableState;
+        if (st.corked > 0) {
+            st.corked--;
+            if (st.corked === 0) flushCorked(this);
+        }
     },
     end(chunk, encoding, callback) {
         if (typeof chunk === "function") { callback = chunk; chunk = undefined; encoding = undefined; }
         else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
         if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
         const st = this._writableState;
+        // Node: end() pops every cork level before sealing the stream.
+        if (st.corked > 0) {
+            st.corked = 1;
+            this.uncork();
+        }
         st.ended = true;
         this.writable = false;
-        if (callback) this.once("finish", callback);
+        // Node runs the end() callback ahead of ordinary 'finish' listeners.
+        if (callback) {
+            if (typeof this.prependOnceListener === "function") this.prependOnceListener("finish", callback);
+            else this.once("finish", callback);
+        }
         maybeFinish(this);
         return this;
     },
-    cork() {},
-    uncork() {},
     setDefaultEncoding() { return this; },
 };
 
@@ -2071,7 +2229,13 @@ class Transform extends Duplex {
         if (typeof opts.transform === "function") this._transform = opts.transform;
         if (typeof opts.flush === "function") this._flush = opts.flush;
     }
-    _transform(chunk, encoding, callback) { callback(null, chunk); }
+    _transform(chunk, encoding, callback) {
+        // Node's default is a synchronous coded throw, reached through
+        // write()/end() with no transform supplied.
+        const err = new Error("The _transform() method is not implemented");
+        err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+        throw err;
+    }
 }
 Transform.prototype._write = function (chunk, encoding, callback) {
     const self = this;
@@ -2101,11 +2265,9 @@ Transform.prototype._write = function (chunk, encoding, callback) {
             self._transformCallback = callback;
         }
     };
-    try {
-        this._transform(chunk, encoding, after);
-    } catch (err) {
-        if (!called) { called = true; callback(err); }
-    }
+    // A synchronous throw out of _transform propagates to the write()/end()
+    // caller, as in Node.
+    this._transform(chunk, encoding, after);
 };
 Transform.prototype._read = function () {
     // A reader took a chunk: release the write callback the transform parked.
@@ -2115,22 +2277,38 @@ Transform.prototype._read = function () {
         callback(null);
     }
 };
-Transform.prototype._final = function (callback) {
+// Completion for transforms: the user's final (when supplied via options,
+// living at `_final` so identity checks hold) runs first, then _flush, then
+// the readable side is ended. maybeFinish routes here instead of `_final`.
+Transform.prototype._chidoriFinal = function (callback) {
     const self = this;
-    const done = function (err, data) {
-        if (err) return callback(err);
-        if (data !== undefined && data !== null) self.push(data);
-        self.push(null);
-        callback(null);
+    const runFlush = function () {
+        const done = function (err, data) {
+            if (err) return callback(err);
+            if (data !== undefined && data !== null) self.push(data);
+            self.push(null);
+            callback(null);
+        };
+        if (typeof self._flush === "function") {
+            try { self._flush(done); } catch (err) { callback(err); }
+        } else {
+            done(null);
+        }
     };
-    if (typeof this._flush === "function") {
-        try { this._flush(done); } catch (err) { callback(err); }
+    const userFinal = this._final;
+    if (typeof userFinal === "function") {
+        userFinal.call(this, function (err) {
+            if (err) return callback(err);
+            runFlush();
+        });
     } else {
-        done(null);
+        runFlush();
     }
 };
 
-class PassThrough extends Transform {}
+class PassThrough extends Transform {
+    _transform(chunk, encoding, callback) { callback(null, chunk); }
+}
 
 function isWritableLike(stream) {
     return stream && typeof stream.write === "function" && stream.readable !== true;
@@ -3072,13 +3250,22 @@ const constants = Object.freeze({
     Z_MIN_MEMLEVEL: 1, Z_MAX_MEMLEVEL: 9, Z_DEFAULT_MEMLEVEL: 8,
     Z_MIN_LEVEL: -1, Z_MAX_LEVEL: 9, Z_DEFAULT_LEVEL: -1,
     BROTLI_OPERATION_PROCESS: 0, BROTLI_OPERATION_FLUSH: 1,
-    BROTLI_OPERATION_FINISH: 2,
+    BROTLI_OPERATION_FINISH: 2, BROTLI_OPERATION_EMIT_METADATA: 3,
     BROTLI_PARAM_MODE: 0, BROTLI_PARAM_QUALITY: 1, BROTLI_PARAM_LGWIN: 2,
-    BROTLI_PARAM_LGBLOCK: 3, BROTLI_PARAM_SIZE_HINT: 5,
+    BROTLI_PARAM_LGBLOCK: 3,
+    BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING: 4,
+    BROTLI_PARAM_SIZE_HINT: 5, BROTLI_PARAM_LARGE_WINDOW: 6,
+    BROTLI_PARAM_NPOSTFIX: 7, BROTLI_PARAM_NDIRECT: 8,
+    BROTLI_PARAM_STREAM_OFFSET: 9,
+    BROTLI_DECODER_PARAM_DISABLE_RING_BUFFER_REALLOCATION: 0,
+    BROTLI_DECODER_PARAM_LARGE_WINDOW: 1,
     BROTLI_MODE_GENERIC: 0, BROTLI_MODE_TEXT: 1, BROTLI_MODE_FONT: 2,
+    BROTLI_DEFAULT_MODE: 0,
     BROTLI_MIN_QUALITY: 0, BROTLI_MAX_QUALITY: 11,
     BROTLI_DEFAULT_QUALITY: 11, BROTLI_DEFAULT_WINDOW: 22,
     BROTLI_MIN_WINDOW_BITS: 10, BROTLI_MAX_WINDOW_BITS: 24,
+    BROTLI_LARGE_MAX_WINDOW_BITS: 30,
+    BROTLI_MIN_INPUT_BLOCK_BITS: 16, BROTLI_MAX_INPUT_BLOCK_BITS: 24,
 });
 
 // --- Option validation ---------------------------------------------------
@@ -3101,18 +3288,20 @@ const DECOMPRESSORS = {
 function isBinary(value) {
     return ArrayBuffer.isView(value) || value instanceof ArrayBuffer;
 }
-// The chunkSize / flush bounds every zlib and brotli stream shares.
-function validateBaseOptions(opts) {
+// The chunkSize / flush bounds every zlib and brotli stream shares. The flush
+// range differs by family: zlib flushes run Z_NO_FLUSH..Z_BLOCK, brotli's run
+// BROTLI_OPERATION_PROCESS..BROTLI_OPERATION_EMIT_METADATA.
+function validateBaseOptions(opts, maxFlush, finishDefault) {
     if (!opts || typeof opts !== "object") return;
     if (opts.chunkSize !== undefined && checkFiniteNumber(opts.chunkSize, "options.chunkSize") &&
         opts.chunkSize < constants.Z_MIN_CHUNK) {
         throw outOfRange("options.chunkSize", ">= " + constants.Z_MIN_CHUNK, opts.chunkSize);
     }
-    checkRange(opts.flush, "options.flush", constants.Z_NO_FLUSH, constants.Z_BLOCK, constants.Z_NO_FLUSH);
-    checkRange(opts.finishFlush, "options.finishFlush", constants.Z_NO_FLUSH, constants.Z_BLOCK, constants.Z_FINISH);
+    checkRange(opts.flush, "options.flush", 0, maxFlush, 0);
+    checkRange(opts.finishFlush, "options.finishFlush", 0, maxFlush, finishDefault);
 }
 function validateZlibOptions(op, opts) {
-    validateBaseOptions(opts);
+    validateBaseOptions(opts, constants.Z_BLOCK, constants.Z_FINISH);
     if (!opts || typeof opts !== "object") return;
     // windowBits 0 is legal on the decompressing side — it means "read the
     // window size out of the stream header".
@@ -3132,22 +3321,55 @@ function validateZlibOptions(op, opts) {
             "an instance of Buffer, TypedArray, DataView, or ArrayBuffer", opts.dictionary);
     }
 }
-function validateBrotliOptions(opts) {
-    validateBaseOptions(opts);
+// Mirrors Node's `Brotli` constructor (lib/zlib.js; same shape as Bun's Rust
+// port): keys are validated into a params array — a non-canonical or repeated
+// numeric key (`'00'` next to `'0'`) is ERR_BROTLI_INVALID_PARAM — and value
+// errors that the native encoder/decoder would reject at init time surface as
+// ERR_ZLIB_INITIALIZATION_FAILED.
+const kMaxBrotliParam = 9;
+function brotliInitFailed() {
+    return coded(new Error("Initialization failed"), "ERR_ZLIB_INITIALIZATION_FAILED");
+}
+function validateBrotliOptions(op, opts) {
+    validateBaseOptions(opts, constants.BROTLI_OPERATION_EMIT_METADATA,
+        constants.BROTLI_OPERATION_FINISH);
     if (!opts || typeof opts !== "object" || !opts.params) return;
     if (typeof opts.params !== "object") {
         throw invalidArgType("options.params", "of type object", opts.params);
     }
-    for (const key of Object.keys(opts.params)) {
-        const index = Number(key);
-        if (!isFinite(index) || index < 0 || index > constants.BROTLI_PARAM_SIZE_HINT) {
-            throw coded(new RangeError("The brotli parameter " + key + " is invalid"),
+    const seen = [];
+    for (const origKey of Object.keys(opts.params)) {
+        const key = +origKey;
+        if (Number.isNaN(key) || key < 0 || key > kMaxBrotliParam || seen[key] !== undefined) {
+            throw coded(new RangeError(origKey + " is not a valid Brotli parameter"),
                 "ERR_BROTLI_INVALID_PARAM");
         }
-        const value = opts.params[key];
+        let value = opts.params[origKey];
         if (typeof value !== "number" && typeof value !== "boolean") {
             throw invalidArgType("options.params[key]", "of type number", value);
         }
+        value = Number(value);
+        seen[key] = value;
+        // What BrotliEncoderSetParameter / BrotliDecoderSetParameter reject.
+        if (op === "brotliDecompress") {
+            // Decoder params: DISABLE_RING_BUFFER_REALLOCATION (0) and
+            // LARGE_WINDOW (1), both boolean.
+            if (key > 1 || (value !== 0 && value !== 1)) throw brotliInitFailed();
+            continue;
+        }
+        const bad =
+            (key === constants.BROTLI_PARAM_MODE && (value < 0 || value > 2)) ||
+            (key === constants.BROTLI_PARAM_QUALITY &&
+                (value < constants.BROTLI_MIN_QUALITY || value > constants.BROTLI_MAX_QUALITY)) ||
+            (key === constants.BROTLI_PARAM_LGWIN &&
+                (value < constants.BROTLI_MIN_WINDOW_BITS || value > constants.BROTLI_LARGE_MAX_WINDOW_BITS)) ||
+            (key === constants.BROTLI_PARAM_LGBLOCK && value !== 0 &&
+                (value < constants.BROTLI_MIN_INPUT_BLOCK_BITS || value > constants.BROTLI_MAX_INPUT_BLOCK_BITS)) ||
+            (key === constants.BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING &&
+                value !== 0 && value !== 1) ||
+            (key === constants.BROTLI_PARAM_LARGE_WINDOW && value !== 0 && value !== 1) ||
+            (key === constants.BROTLI_PARAM_NPOSTFIX && (value < 0 || value > 3));
+        if (bad) throw brotliInitFailed();
     }
 }
 
@@ -3179,7 +3401,7 @@ function inputBytes(data, options, op) {
         throw invalidArgType("buffer",
             "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", data);
     }
-    if (BROTLI_OPS[op]) validateBrotliOptions(options);
+    if (BROTLI_OPS[op]) validateBrotliOptions(op, options);
     else validateZlibOptions(op, options);
     return bytes;
 }
@@ -3219,14 +3441,44 @@ function asyncCodec(op) {
 // the codec class, so `zlib.Deflate() instanceof zlib.Deflate` holds and the
 // full stream surface comes along. Chunks are buffered and coded at flush:
 // output for a complete stream is identical to the one-shot form.
+// Real zlib fails a bad stream as soon as the header bytes arrive, without
+// waiting for end() — reproduce that for the decompressors by checking magic
+// bytes incrementally (gzip 1f 8b; zlib CMF/FLG; unzip accepts either).
+function headerError() {
+    const err = coded(new Error("incorrect header check"), "Z_DATA_ERROR");
+    err.errno = -3;
+    return err;
+}
+function badDecompressHeader(op, first, second, haveTwo) {
+    const gzipOk = first === 0x1f && (!haveTwo || second === 0x8b);
+    const zlibOk = (first & 0x0f) === 8 && (!haveTwo || ((first << 8) | second) % 31 === 0);
+    if (op === "gunzip") return !gzipOk;
+    if (op === "inflate") return !zlibOk;
+    if (op === "unzip") return !(gzipOk || zlibOk);
+    return false;
+}
 function codecHandlers(op, options) {
     const chunks = [];
+    let headerBytes = [];
     return {
         transform(chunk, encoding, callback) {
             const bytes = toBytes(chunk);
             if (bytes === null) {
                 return callback(invalidArgType("chunk",
                     "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", chunk));
+            }
+            if (headerBytes !== null && DECOMPRESSORS[op]) {
+                for (let i = 0; i < bytes.length && headerBytes.length < 2; i++) {
+                    headerBytes.push(bytes[i]);
+                }
+                if (headerBytes.length > 0) {
+                    const haveTwo = headerBytes.length >= 2;
+                    if (badDecompressHeader(op, headerBytes[0], headerBytes[1], haveTwo)) {
+                        this._closed = true;
+                        return callback(headerError());
+                    }
+                    if (haveTwo) headerBytes = null;
+                }
             }
             chunks.push(bytes);
             callback(null);
@@ -3235,6 +3487,7 @@ function codecHandlers(op, options) {
             try {
                 callback(null, runCodec(op, concatBytes(chunks), options));
             } catch (err) {
+                this._closed = true;
                 callback(err);
             }
         },
@@ -3243,19 +3496,26 @@ function codecHandlers(op, options) {
 function defineCodecClass(name, op) {
     const Ctor = function (options) {
         if (!(this instanceof Ctor)) return new Ctor(options);
-        if (BROTLI_OPS[op]) validateBrotliOptions(options);
+        if (BROTLI_OPS[op]) validateBrotliOptions(op, options);
         else validateZlibOptions(op, options);
         const stream = new Transform(Object.assign({}, options, codecHandlers(op, options)));
         Object.setPrototypeOf(stream, Ctor.prototype);
         stream._codecOp = op;
         stream._codecOptions = options;
         stream.bytesWritten = 0;
+        stream._closed = false;
         return stream;
     };
     Ctor.prototype = Object.create(Transform.prototype);
     Object.defineProperty(Ctor.prototype, "constructor", {
         value: Ctor, enumerable: false, writable: true, configurable: true,
     });
+    Ctor.prototype.close = function (callback) {
+        this._closed = true;
+        if (callback) queueMicrotask(callback);
+        const self = this;
+        queueMicrotask(() => self.emit("close"));
+    };
     Object.defineProperty(Ctor, "name", { value: name, configurable: true });
     return Ctor;
 }
