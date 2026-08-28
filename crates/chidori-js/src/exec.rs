@@ -1076,6 +1076,48 @@ impl Vm {
         let mut poll: u32 = 0;
         let code = &k.code;
         let mut pc = 0usize;
+        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): when enabled and
+        // this kernel compiles (first activation; scalar subset only — see
+        // `crate::jit`), the whole activation runs as native code between the
+        // guard above and the materialization below. The native run leaves
+        // the register window exactly as the interpreter loop would (every
+        // register stored back) and reports where it stopped:
+        // - the index of an `Exit` op: `pc` starts there, so the loop below
+        //   dispatches exactly that `Exit` and the shared write-back / shape
+        //   materialization runs unchanged;
+        // - `INTERRUPTED`: the same latch-and-unwind as an interpreter-tier
+        //   back-edge poll hit (the `branch!` arm), written out inline here.
+        // A kernel that does not compile falls through to the loop at pc 0 —
+        // the tier never has a third outcome.
+        #[cfg(feature = "jit")]
+        if self.jit_enabled {
+            match crate::jit::maybe_run(k, w, interrupt.as_deref()) {
+                None => {}
+                Some(stopped_at) if stopped_at >= 0 => pc = stopped_at as usize,
+                Some(_interrupted) => {
+                    for (r, slot) in k.locals.iter().enumerate() {
+                        if let crate::bytecode::KSlot::Local(l) = slot {
+                            frame.locals[*l as usize] = Value::Number(w[r & KWIN_MASK]);
+                        }
+                    }
+                    for (j, &l) in k.bool_locals.iter().enumerate() {
+                        frame.locals[l as usize] =
+                            Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
+                    }
+                    writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
+                    self.kernel_regs = regs;
+                    objs.clear();
+                    self.kernel_objs = objs;
+                    sstrs.clear();
+                    self.kernel_strs = sstrs;
+                    self.kernel_prop_slots = prop_slots;
+                    callee_bfs.clear();
+                    self.kernel_callees = callee_bfs;
+                    self.op_budget = Some(0);
+                    return Err(self.throw_range("execution interrupted"));
+                }
+            }
+        }
         let (resume_ip, shape) = loop {
             // Latch-and-unwind for ops the translator promised this loop
             // never contains — a TIER BUG, but one that must stay inside the
@@ -1834,6 +1876,44 @@ impl Vm {
         // this function small protects the LTO inlining of the hot paths).
         if !k.uv_writes.is_empty() && uv_write_cells_alias(k, bf) {
             return None;
+        }
+        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): identical
+        // contract to the loop-kernel seam in `run_kernel_op_impl` — the
+        // native run leaves `regs` exactly as `exec_fn_kernel_code` would,
+        // stopping at a `Ret` (whose typed result is constructed from the
+        // same register the interpreter would read) or on an interrupt
+        // (handled exactly like `FnKernelOut::Interrupted`). A kernel that
+        // does not compile falls through to the interpreter unchanged.
+        #[cfg(feature = "jit")]
+        if self.jit_enabled {
+            if let Some(stopped_at) = crate::jit::maybe_run(k, &mut regs, self.interrupt.as_deref())
+            {
+                if stopped_at >= 0 {
+                    let KOp::Ret { src, boolean } = k.code[stopped_at as usize] else {
+                        // Tier bug (the native program can only stop at an op
+                        // it compiled as a terminator, and fn-mode translation
+                        // emits no `Exit`). The kernel is pure and nothing was
+                        // flushed, so declining to the generic call path
+                        // re-runs the function with correct semantics —
+                        // `FnKernelOut::BadOp`'s exact handling.
+                        return None;
+                    };
+                    if !k.uv_writes.is_empty() {
+                        flush_uv_writes(k, bf, &regs);
+                    }
+                    return Some(Ok(if boolean {
+                        Value::Bool(regs[src as usize & KWIN_MASK] != 0.0)
+                    } else {
+                        Value::Number(regs[src as usize & KWIN_MASK])
+                    }));
+                }
+                // Interrupted on a native back-edge poll.
+                if !k.uv_writes.is_empty() {
+                    flush_uv_writes(k, bf, &regs);
+                }
+                self.op_budget = Some(0);
+                return Some(Err(self.throw_range("execution interrupted")));
+            }
         }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;

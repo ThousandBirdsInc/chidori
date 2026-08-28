@@ -982,6 +982,8 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         uses_char_code: x.uses_char_code,
         shapes: shapes.into_boxed_slice(),
         futile: std::cell::Cell::new(0),
+        #[cfg(feature = "jit")]
+        native: crate::jit::NativeCache::new(),
         math_used: std::mem::take(&mut x.math_used).into_boxed_slice(),
         props_used: std::mem::take(&mut x.props_used).into_boxed_slice(),
         callee_slots: std::mem::take(&mut x.callees).into_boxed_slice(),

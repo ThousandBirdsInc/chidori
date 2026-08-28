@@ -337,6 +337,16 @@ is <1% of live agent wall-clock (`interpreter-optimization.md` §11.5).
    whole thing behind the same toggle-equivalence gate the closure-threading
    experiment used.
 
+   **2026-08 update:** built, as an experiment under exactly those
+   constraints — the opt-in `jit` feature and the separate `chidori-js-jit`
+   binary. It compiles the §6.5 typed kernel programs (not bytecode) to
+   native code via `cranelift-jit`, which sidesteps OSR/deopt/frame
+   reconstruction entirely (the kernel tier's entry guard and exit
+   materialization are reused verbatim). Measured 1.6–7× on kernel-bound
+   loops with byte-identical output; every default build stays
+   zero-`unsafe` and cranelift-free. Details, gates, and the honest
+   cost-benefit: [`docs/cranelift-jit.md`](./cranelift-jit.md).
+
 ---
 
 ## 5. Gates (unchanged, per item)

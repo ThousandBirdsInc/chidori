@@ -33,6 +33,12 @@ description: "The closure-threading JIT experiment \u2014 retired; kept as data.
 > what a `forbid(unsafe_code)`-compatible tier could and couldn't be, why the
 > determinism objection is narrower than §2 above states, and the product
 > trigger under which a Cranelift baseline tier would become rational.
+>
+> **2026-08 update:** that Cranelift baseline tier has since been built as an
+> opt-in experiment — the `jit` feature and the separate `chidori-js-jit`
+> binary, compiling the typed kernel programs (not bytecode) to native code.
+> See [`docs/cranelift-jit.md`](./cranelift-jit.md). Every default build
+> remains zero-`unsafe` and cranelift-free.
 
 ---
 

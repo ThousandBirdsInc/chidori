@@ -94,6 +94,7 @@ several document retired or superseded work:
 - [js-performance-roadmap.md](./js-performance-roadmap.md) — profiling data and roadmap
 - [js-object-shapes-design.md](./js-object-shapes-design.md) — hidden-class design (implemented)
 - [jit.md](./jit.md) — closure-threading JIT experiment (**retired**; kept as data)
+- [cranelift-jit.md](./cranelift-jit.md) — Cranelift kernel JIT (**experimental**, opt-in `jit` feature / `chidori-js-jit` binary)
 - [os-isolation-plan.md](./os-isolation-plan.md) — process isolation design
 - [resume-performance.md](./resume-performance.md) — resume cost analysis
 - [dom-runtime-prototype.md](./dom-runtime-prototype.md) — DOM runtime prototype

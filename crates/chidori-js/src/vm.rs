@@ -446,6 +446,14 @@ pub struct Vm {
     /// re-zeroed — stale `f64`s are unreadable (every register is either
     /// loaded at entry or store-before-read by translation proof), and
     /// zero-filling deep recursion windows per outer call was measurable.
+    /// Opt-in switch for the Cranelift kernel JIT (`jit` feature; see
+    /// `crate::jit` and docs/cranelift-jit.md). Default OFF even when the
+    /// feature is compiled in — the tier runs only when an embedder (the
+    /// `chidori-js-jit` binary, the differential tests) flips this. When on,
+    /// eligible kernels execute as native code between the ordinary entry
+    /// guard and exit materialization; everything else is unchanged.
+    #[cfg(feature = "jit")]
+    pub jit_enabled: bool,
     pub(crate) kernel_regs: Vec<f64>,
     /// Scratch cache of the array-base objects for the active kernel (see
     /// `kernel_regs`); cleared after every activation so the pool never
@@ -539,6 +547,8 @@ impl Vm {
             cell_pool: Vec::new(),
             dummy_cell: Rc::new(RefCell::new(Value::Undefined)),
             frame_pool: Vec::new(),
+            #[cfg(feature = "jit")]
+            jit_enabled: false,
             kernel_regs: Vec::new(),
             kernel_objs: Vec::new(),
             kernel_prop_slots: Vec::new(),

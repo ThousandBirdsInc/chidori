@@ -1713,6 +1713,16 @@ pub struct Kernel {
     /// glue code bails on EVERY iteration; the guard+enter+bail cycle would
     /// otherwise be paid per iteration forever).
     pub futile: std::cell::Cell<u8>,
+    /// Cranelift-compiled native code for this kernel (`jit` feature only;
+    /// see `crate::jit`). Empty until the first activation with the tier
+    /// enabled; then `Some(None)` when translation declined (an op outside
+    /// the scalar subset — the kernel stays on the interpreter tier) or
+    /// `Some(Some(_))` with the compiled code. Like `futile` and the inline
+    /// caches, a pure performance side effect: never serialized, never
+    /// observable — the native code computes bit-identical results, and a
+    /// cloned kernel simply compiles again on its own first activation.
+    #[cfg(feature = "jit")]
+    pub native: crate::jit::NativeCache,
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
     /// entry-resolved to raw slot indices. See [`KProp`].
     pub props_used: Box<[KProp]>,
