@@ -82,6 +82,10 @@ pub struct TryHandler {
     /// this handler jumps here (with `v` pushed) instead of completing the
     /// generator, so the loop can call the inner iterator's `return` method.
     pub delegation_return_ip: Option<u32>,
+    /// `Frame::finally_parks` depth when this handler was installed: an
+    /// unwind into this handler discards the parked completions of any inner
+    /// finalizer regions it aborts.
+    pub finally_parks_depth: usize,
 }
 
 /// A single call frame. Self-contained (own operand stack + locals) so that a
@@ -98,6 +102,12 @@ pub struct Frame {
     /// A non-local completion parked while enclosing `finally` blocks run. See
     /// [`Completion`] and `Op::EndFinally`.
     pub pending_completion: Option<Completion>,
+    /// One entry per ACTIVE finalizer region (pushed by `Op::EnterFinally`,
+    /// popped by `Op::EndFinally`): the completion that routed control into
+    /// that finalizer (`None` on the normal path). A stack, because
+    /// finalizers nest — an inner region completing normally must not steal
+    /// an outer region's parked completion.
+    pub finally_parks: Vec<Option<Completion>>,
     /// Set when resuming a suspended frame with a rejection: raised at loop top.
     pub pending_throw: Option<Value>,
     /// Source position of the throw currently unwinding through this frame's
@@ -123,7 +133,10 @@ pub struct Frame {
     /// Completion value for script-level evaluation (eval result).
     pub completion: Value,
     /// for-in enumerator stacks (key lists with cursor).
-    pub enumerators: Vec<(Vec<JsString>, usize)>,
+    /// Active for-in enumerators: (snapshot keys, cursor, target). The
+    /// target lets each step skip keys deleted since the snapshot (spec
+    /// EnumerateObjectProperties never yields a deleted-but-unvisited key).
+    pub enumerators: Vec<(Vec<JsString>, usize, Option<JsObject>)>,
     /// Active `with` scope objects (innermost last). An unqualified identifier
     /// inside a `with` block resolves against these (honoring @@unscopables)
     /// before falling through to the lexical/global binding.
@@ -231,6 +244,16 @@ pub enum RunOutcome {
     BlockedOnHost(u64),
 }
 
+/// One binding of the realm's global declarative environment (script-level
+/// `let`/`const`/`class`). See [`Vm::global_lexicals`].
+pub struct GlobalLexical {
+    /// The live cell — shared with the declaring script's frame, so
+    /// in-script cell stores and cross-script global reads observe one
+    /// binding. `Value::Uninitialized` while in the TDZ.
+    pub cell: std::rc::Rc<RefCell<Value>>,
+    pub is_const: bool,
+}
+
 pub struct Vm {
     pub realm: Realm,
     pub microtasks: VecDeque<Microtask>,
@@ -299,6 +322,19 @@ pub struct Vm {
     /// the chidori module loader); when absent, `import()` rejects with a
     /// TypeError.
     pub dynamic_import: Option<std::rc::Rc<dyn Fn(&mut Vm, &str) -> Result<Value, Value>>>,
+    /// The live module registry, when the host keeps one (the test262 runner,
+    /// module-loading embedders). Async module completion callbacks resolve
+    /// importer keys against this LIVE registry — a snapshot captured when an
+    /// async body started may predate modules a later dynamic `import()`
+    /// linked as waiters.
+    pub module_registry: Option<std::rc::Rc<RefCell<crate::module::ModuleRegistry>>>,
+    /// Spec `[[ModuleAsyncEvaluationCount]]`: orders modules that transition to
+    /// evaluating-async (relative order is observable via ancestor execution).
+    pub(crate) module_async_order: u64,
+    /// Deterministic clock backing `Date.now()` / `new Date()`: no host time is
+    /// ever read (replay stays exact); instead every read advances the counter
+    /// by 1ms, so code polling `Date.now()` for elapsed time makes progress.
+    pub(crate) clock_ms: f64,
     /// Weak handle to every object this VM has allocated (see [`crate::gc`]).
     /// Reference counting cannot reclaim cycles (closure↔cell, promise↔
     /// reaction↔frame, ctor↔prototype); this registry lets `collect_cycles`
@@ -327,6 +363,12 @@ pub struct Vm {
     /// an object reachable only through such a shared cell could be collected
     /// while the host can still reach it.
     pub gc_cell_roots: Vec<std::rc::Rc<RefCell<Value>>>,
+    /// The realm's global *declarative* environment: script-level `let` /
+    /// `const` / `class` bindings, shared across every script this VM runs
+    /// (`$262.evalScript`, successive `eval_script` calls). Keys shadow
+    /// global-object properties for unqualified name resolution; cells start
+    /// `Uninitialized` (TDZ) and are registered in `gc_cell_roots`.
+    pub global_lexicals: std::collections::HashMap<String, GlobalLexical>,
     /// The deterministic prefix a VM image is written against (see
     /// [`crate::image`]): every object, binding cell and symbol that existed
     /// when [`Vm::mark_image_baseline`] ran, numbered so an image can refer to
@@ -478,12 +520,16 @@ impl Vm {
             module_capture: None,
             trace_sink: None,
             dynamic_import: None,
+            module_registry: None,
+            module_async_order: 0,
+            clock_ms: 0.0,
             all_objects: std::cell::RefCell::new(Vec::new()),
             gc_compact_at: std::cell::Cell::new(1 << 12),
             gc_allocs_since_collect: std::cell::Cell::new(0),
             gc_auto_threshold: std::cell::Cell::new(crate::gc::GC_AUTO_FLOOR),
             gc_auto: true,
             gc_cell_roots: Vec::new(),
+            global_lexicals: std::collections::HashMap::new(),
             image_baseline: None,
             image_units: Vec::new(),
             effect_suspend: None,
@@ -969,6 +1015,12 @@ impl Vm {
             }
         }
         *value = Value::str(out);
+    }
+
+    /// The deterministic clock (see `clock_ms`): every read ticks 1ms forward.
+    pub fn now_ms(&mut self) -> f64 {
+        self.clock_ms += 1.0;
+        self.clock_ms
     }
 
     pub fn throw_type(&self, msg: &str) -> Value {
@@ -1498,21 +1550,14 @@ impl Vm {
                     key_display(key)
                 )))
             }
-            // Setting a property on a primitive: throws in strict mode, no-op
-            // otherwise.
-            _ => {
-                if strict {
-                    let ts = self.to_string_lossy(base);
-                    return Err(self.throw_type(&format!(
-                        "Cannot create property '{}' on {} '{}'",
-                        key_display(key),
-                        base.type_of(),
-                        ts
-                    )));
-                }
-                return Ok(false);
-            }
+            // Setting a property on a primitive: the [[Set]] walk runs over
+            // ToObject(base)'s prototype chain — an inherited setter (or
+            // proxy trap) observes the PRIMITIVE receiver — and only the
+            // final create-own-property step fails (strict TypeError, sloppy
+            // no-op), handled after the loop.
+            _ => self.to_object(base)?,
         };
+        let primitive_receiver = !matches!(base, Value::Object(_));
         // TypedArray exotic: integer-index writes coerce per the element kind
         // (ToBigInt for BigInt arrays, ToNumber otherwise) and store the element
         // (out-of-range and non-index numeric keys are ignored after coercion).
@@ -1699,6 +1744,20 @@ impl Vm {
                 }
                 None => break, // own writable data property
             }
+        }
+        // A primitive receiver cannot take an own property (spec
+        // OrdinarySetWithOwnDescriptor step 3.b): strict throws, sloppy no-ops.
+        if primitive_receiver {
+            if strict {
+                let ts = self.to_string_lossy(base);
+                return Err(self.throw_type(&format!(
+                    "Cannot create property '{}' on {} '{}'",
+                    key_display(key),
+                    base.type_of(),
+                    ts
+                )));
+            }
+            return Ok(false);
         }
         // Define / update own data property on the receiver object.
         self.ordinary_define_own(&obj, key, value, strict)
@@ -2039,7 +2098,14 @@ impl Vm {
     /// surfaces (`Object.keys`, spread, `for-in`) already exclude them.
     fn is_internal_slot_key(&self, k: &PropertyKey) -> bool {
         match k {
-            PropertyKey::Str(s) => s.as_str() == crate::typed_array::ARRAY_BUFFER_MAX_SLOT,
+            PropertyKey::Str(s) => matches!(
+                s.as_str(),
+                crate::typed_array::ARRAY_BUFFER_MAX_SLOT
+                    // A RegExp's [[IsRegExp]]/[[Source]]/[[Flags]] slots.
+                    | "[[IsRegExp]]"
+                    | "[[Source]]"
+                    | "[[Flags]]"
+            ),
             PropertyKey::Sym(sym) => {
                 *sym == self.realm.symbol_array_buffer_shared
                     || *sym == self.realm.symbol_disposable_state
@@ -2049,6 +2115,7 @@ impl Vm {
                     || *sym == self.realm.symbol_intl_plural_rules
                     || *sym == self.realm.symbol_intl_number_format
                     || *sym == self.realm.symbol_stack_start
+                    || *sym == self.realm.symbol_eval_vars
             }
         }
     }
@@ -2238,6 +2305,10 @@ impl Vm {
                     None => match &b.internal {
                         Internal::Array(_) if k.array_index().is_some() => true,
                         Internal::StringObj(_) if k.array_index().is_some() => true,
+                        Internal::TypedArray(_) if k.array_index().is_some() => true,
+                        // Module Namespace exports are {enumerable: true}
+                        // data properties.
+                        Internal::ModuleNamespace(ns) => ns.exports.contains_key(s),
                         _ => false,
                     },
                 };
@@ -2277,7 +2348,9 @@ impl Vm {
         // The dynamic-import hook closes over host module state (registries whose
         // records hold realm values); drop it so those cells don't keep cycles.
         self.dynamic_import = None;
+        self.module_registry = None;
         self.gc_cell_roots.clear();
+        self.global_lexicals.clear();
         self.template_cache.clear();
         self.module_capture = None;
 
@@ -2518,20 +2591,38 @@ pub fn string_to_number(s: &str) -> f64 {
         "-Infinity" => return f64::NEG_INFINITY,
         _ => {}
     }
+    // Non-decimal integer literals: accumulate in f64 so arbitrarily long
+    // digit strings round like the spec's mathematical value instead of
+    // failing an i64 parse.
+    let radix_value = |digits: &str, radix: u32| -> f64 {
+        if digits.is_empty() {
+            return f64::NAN;
+        }
+        let mut acc = 0.0f64;
+        for c in digits.chars() {
+            match c.to_digit(radix) {
+                Some(d) => acc = acc * radix as f64 + d as f64,
+                None => return f64::NAN,
+            }
+        }
+        acc
+    };
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return i64::from_str_radix(hex, 16)
-            .map(|n| n as f64)
-            .unwrap_or(f64::NAN);
+        return radix_value(hex, 16);
     }
     if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        return i64::from_str_radix(oct, 8)
-            .map(|n| n as f64)
-            .unwrap_or(f64::NAN);
+        return radix_value(oct, 8);
     }
     if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        return i64::from_str_radix(bin, 2)
-            .map(|n| n as f64)
-            .unwrap_or(f64::NAN);
+        return radix_value(bin, 2);
+    }
+    // Rust's f64 parser accepts forms the StrNumericLiteral grammar does not
+    // ("inf", "infinity" in any case, "nan"); only decimal digits, sign, dot,
+    // and exponent markers may reach it.
+    if t.bytes()
+        .any(|b| !matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E'))
+    {
+        return f64::NAN;
     }
     t.parse::<f64>().unwrap_or(f64::NAN)
 }

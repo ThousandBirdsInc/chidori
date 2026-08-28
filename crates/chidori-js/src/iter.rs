@@ -302,6 +302,9 @@ impl Vm {
             Done,
             Value(Value),
         }
+        // An own accessor shadowing an array index: its getter is user code,
+        // so it runs OUTSIDE the iterator borrow (set in the array arm below).
+        let mut pending_get: Option<(JsObject, usize, IterKind)> = None;
         let out = {
             let mut b = it.borrow_mut();
             let st = match &mut b.internal {
@@ -354,12 +357,26 @@ impl Vm {
                                         // (a sparse tail); a reified `props`
                                         // entry shadows the dense slot.
                                         let len = tb.array_length() as usize;
-                                        let shadow = if tb.own_is_empty() {
+                                        // An own ACCESSOR at the index must run
+                                        // its getter (Get(arr, idx) per spec).
+                                        let shadow_prop = if tb.own_is_empty() {
                                             None
                                         } else {
                                             tb.own_get(&PropertyKey::from_index(idx as u32))
-                                                .and_then(|p| p.value().cloned())
+                                                .cloned()
                                         };
+                                        if idx < len
+                                            && matches!(
+                                                &shadow_prop,
+                                                Some(Property {
+                                                    kind: PropertyKind::Accessor { .. },
+                                                    ..
+                                                })
+                                            )
+                                        {
+                                            pending_get = Some((t.clone(), idx, kind));
+                                        }
+                                        let shadow = shadow_prop.and_then(|p| p.value().cloned());
                                         let v = if idx >= len {
                                             None
                                         } else if let Some(v) = shadow {
@@ -432,7 +449,15 @@ impl Vm {
         };
         Ok(match out {
             Out::Done => None,
-            Out::Value(v) => Some(v),
+            Out::Value(v) => {
+                if let Some((target, idx, kind)) = pending_get {
+                    let got = self
+                        .get_prop(&Value::Object(target), &PropertyKey::from_index(idx as u32))?;
+                    Some(self.iter_entry(kind, idx, got))
+                } else {
+                    Some(v)
+                }
+            }
         })
     }
 
@@ -557,6 +582,9 @@ impl Vm {
                 };
                 continue;
             }
+            // A namespace level's per-key [[GetOwnProperty]] throws on a TDZ
+            // export before any key is yielded.
+            crate::builtins::fundamental::ns_tdz_check_all(self, &o)?;
             for k in self.enumerable_own_string_keys(&o) {
                 if seen.insert(k.clone()) {
                     out.push(k);

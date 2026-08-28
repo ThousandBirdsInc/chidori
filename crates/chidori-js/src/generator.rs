@@ -24,30 +24,6 @@ impl Vm {
         new_target: Value,
     ) -> Result<Value, Value> {
         let is_async = bf.proto.kind.is_async();
-        // The generator object's [[Prototype]] is the function's own `.prototype`
-        // (an object whose own proto is %Generator%), falling back to %Generator%
-        // itself (spec EvaluateGeneratorBody / OrdinaryCreateFromConstructor).
-        let proto = {
-            let own = func_obj.borrow();
-            match own.own_get(&PropertyKey::str("prototype")) {
-                Some(Property {
-                    kind:
-                        PropertyKind::Data {
-                            value: Value::Object(p),
-                            ..
-                        },
-                    ..
-                }) => p.clone(),
-                _ => {
-                    drop(own);
-                    if is_async {
-                        self.realm.async_generator_proto.clone()
-                    } else {
-                        self.realm.generator_proto.clone()
-                    }
-                }
-            }
-        };
         let uses_arguments = bf.proto.uses_arguments;
         let mut frame = self.make_frame(bf, this, args, new_target);
         // `func_obj` only feeds `arguments.callee` (see `call_bytecode_vec`).
@@ -79,6 +55,32 @@ impl Vm {
             Flow::Return(_) => {
                 self.trace_exit(token, false);
                 GeneratorState::Completed
+            }
+        };
+        // The generator object is created AFTER FunctionDeclarationInstantiation
+        // (a parameter default that reassigns `fn.prototype` is observed): its
+        // [[Prototype]] is the function's own `.prototype` — an object whose own
+        // proto is %Generator% — falling back to %Generator% itself (spec
+        // EvaluateGeneratorBody / OrdinaryCreateFromConstructor).
+        let proto = {
+            let own = func_obj.borrow();
+            match own.own_get(&PropertyKey::str("prototype")) {
+                Some(Property {
+                    kind:
+                        PropertyKind::Data {
+                            value: Value::Object(p),
+                            ..
+                        },
+                    ..
+                }) => p.clone(),
+                _ => {
+                    drop(own);
+                    if is_async {
+                        self.realm.async_generator_proto.clone()
+                    } else {
+                        self.realm.generator_proto.clone()
+                    }
+                }
             }
         };
         let gen = self.alloc(ObjectData::new(
@@ -331,12 +333,14 @@ impl Vm {
             Flow::Suspend(s) => match s.kind {
                 SuspendKind::Yield(y) => {
                     self.trace_suspend(token);
-                    // AsyncGeneratorYield: the operand is `Await`ed before the
-                    // generator actually suspends. A yielded thenable that
-                    // fulfills produces the iterator result with the *awaited*
-                    // value; one that rejects is thrown back into the generator
-                    // at the yield point (so `yield Promise.reject(e)` with no
-                    // local handler rejects this `next()` and closes the gen).
+                    // Plain `yield` in an async generator Awaits its operand
+                    // before the generator actually suspends. A yielded
+                    // thenable that fulfills produces the iterator result
+                    // with the *awaited* value; one that rejects is thrown
+                    // back into the generator at the yield point (so `yield
+                    // Promise.reject(e)` with no local handler rejects this
+                    // `next()` and closes the gen). (`yield*` forwards
+                    // without the Await — see the YieldStar arm below.)
                     let mut frame = s.frame;
                     let target = match self.promise_resolve_intrinsic(y) {
                         Ok(t) => t,
@@ -381,6 +385,19 @@ impl Vm {
                     });
                     self.promise_then(&target, Value::Object(on_f), Value::Object(on_r));
                 }
+                SuspendKind::YieldStar(y) => {
+                    // `yield*` in an async generator forwards the inner
+                    // iterator's value WITHOUT the extra Await (TC39
+                    // normative change 2819): the request's promise resolves
+                    // with CreateIterResultObject(value, false) directly, so
+                    // a thenable yielded by a manually-implemented async
+                    // iterator arrives unwrapped.
+                    self.trace_suspend(token);
+                    self.set_gen_state(gobj, GeneratorState::SuspendedYield(s.frame));
+                    let r = self.make_iter_result(y, false);
+                    self.resolve_promise(result, r);
+                    self.agen_complete_step(gobj);
+                }
                 SuspendKind::Await(awaited) => {
                     // Internal await: resume the frame when `awaited` settles,
                     // then keep driving the SAME result promise. The trace token
@@ -423,10 +440,10 @@ impl Vm {
                     });
                     self.promise_then(&target, Value::Object(on_f), Value::Object(on_r));
                 }
-                SuspendKind::YieldStar(_) | SuspendKind::GeneratorStart => {
+                SuspendKind::GeneratorStart => {
                     self.trace_exit(token, true);
                     self.set_gen_state(gobj, GeneratorState::Completed);
-                    let e = self.throw_type("internal: yield* not desugared");
+                    let e = self.throw_type("internal: generator start resurfaced");
                     self.reject_promise(result, e);
                     self.agen_complete_step(gobj);
                 }
@@ -523,11 +540,19 @@ impl Vm {
                     self.set_gen_state(&gobj, GeneratorState::SuspendedYield(s.frame));
                     Ok(self.make_iter_result(y, false))
                 }
-                SuspendKind::YieldStar(_) | SuspendKind::GeneratorStart => {
-                    // Desugared / consumed earlier; should not occur here.
+                SuspendKind::YieldStar(res) => {
+                    // `yield*` forwards the inner iterator's RESULT OBJECT to
+                    // the caller verbatim (spec GeneratorYield(innerResult)):
+                    // no fresh {value, done} wrapper, no `.value` read.
+                    self.trace_suspend(token);
+                    self.set_gen_state(&gobj, GeneratorState::SuspendedYield(s.frame));
+                    Ok(res)
+                }
+                SuspendKind::GeneratorStart => {
+                    // Consumed earlier; should not occur here.
                     self.trace_exit(token, true);
                     self.set_gen_state(&gobj, GeneratorState::Completed);
-                    Err(self.throw_type("internal: yield* not desugared"))
+                    Err(self.throw_type("internal: generator start resurfaced"))
                 }
                 SuspendKind::Await(_) => {
                     // A sync generator cannot await.

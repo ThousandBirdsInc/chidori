@@ -496,6 +496,9 @@ fn trace_object(
                 f(t);
             }
         }
+        Internal::RegExpStringIterator(st) => {
+            trace_value(&st.matcher, f);
+        }
         Internal::IteratorHelper(h) => {
             trace_value(&h.iter, f);
             trace_value(&h.next, f);
@@ -682,6 +685,12 @@ fn trace_frame(fr: &Frame, seen_cells: &mut HashSet<usize>, f: &mut dyn FnMut(&J
             Completion::Jump { .. } => {}
         }
     }
+    for c in fr.finally_parks.iter().flatten() {
+        match c {
+            Completion::Return(v) | Completion::Throw(v) => trace_value(v, f),
+            Completion::Jump { .. } => {}
+        }
+    }
     if let Some(v) = &fr.pending_throw {
         trace_value(v, f);
     }
@@ -693,5 +702,10 @@ fn trace_frame(fr: &Frame, seen_cells: &mut HashSet<usize>, f: &mut dyn FnMut(&J
     }
     if let Some(o) = &fr.eval_vars {
         f(o);
+    }
+    for (_, _, target) in &fr.enumerators {
+        if let Some(o) = target {
+            f(o);
+        }
     }
 }

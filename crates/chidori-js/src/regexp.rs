@@ -331,10 +331,19 @@ struct Parser<'a> {
     named_backref_targets: Vec<Vec<usize>>,
     /// Whether the `u`/`v` flag is set (affects `\p`, strict escapes).
     unicode: bool,
+    /// The pattern contains a named capture group (`(?<name>`), prescanned:
+    /// Annex B parses `\k` as a named backreference only then (or in unicode
+    /// mode); otherwise it is an identity escape.
+    has_named_groups: bool,
 }
 
 impl<'a> Parser<'a> {
     fn new(src: &'a [char], unicode: bool) -> Parser<'a> {
+        // Prescan for `(?<` not followed by `=`/`!` (those are lookbehinds).
+        let has_named_groups = src
+            .windows(3)
+            .enumerate()
+            .any(|(i, w)| w == ['(', '?', '<'] && !matches!(src.get(i + 3), Some('=') | Some('!')));
         Parser {
             src,
             pos: 0,
@@ -344,6 +353,7 @@ impl<'a> Parser<'a> {
             pending_named_backrefs: Vec::new(),
             named_backref_targets: Vec::new(),
             unicode,
+            has_named_groups,
         }
     }
 
@@ -1126,14 +1136,19 @@ impl<'a> Parser<'a> {
                 }
             }
             'k' => {
-                // Named backreference `\k<name>`.
+                // Named backreference `\k<name>`. Per Annex B, `\k` is only a
+                // named backreference when the pattern is in unicode mode or
+                // contains at least one named capture group; otherwise it is
+                // an identity escape for the letter `k` (so `/\k<x>/` matches
+                // the literal text "k<x>").
                 self.pos += 1;
-                if self.peek() != Some('<') {
-                    if self.unicode {
-                        return Err("Invalid \\k escape".to_string());
-                    }
-                    // Annex B: `\k` not followed by `<` is an identity escape.
+                if !self.unicode && !self.has_named_groups {
                     return Ok(Node::Char('k' as u32));
+                }
+                if self.peek() != Some('<') {
+                    // With named groups present (or in unicode mode), a bare
+                    // `\k` is a SyntaxError — it must be `\k<name>`.
+                    return Err("Invalid \\k escape".to_string());
                 }
                 self.pos += 1; // consume '<'
                 let name = self.parse_group_name()?;

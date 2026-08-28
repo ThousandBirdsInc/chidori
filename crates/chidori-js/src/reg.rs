@@ -533,6 +533,9 @@ pub enum ROp {
         target: u32,
         boundary: u32,
     },
+    /// Start of a finalizer landing pad: park the routed-in completion for
+    /// this region (mirror of `Op::EnterFinally`).
+    EnterFinally,
     /// End of a `finally` body: resume a parked completion, or fall through
     /// on the normal path (mirror of `Op::EndFinally`).
     EndFinally,
@@ -726,7 +729,11 @@ fn effect(op: &Op) -> Option<(u32, u32)> {
         | CmpLocalConstBranchFalse { .. }
         | CmpLocalConstBranchTrue { .. } => (0, 0),
         JumpIfFalsyPeek(_) | JumpIfTruthyPeek(_) | JumpIfNullishPeek(_) => (0, 0),
-        PushTryHandler { .. } | PopTryHandler | CompletionJump { .. } | EndFinally => (0, 0),
+        PushTryHandler { .. }
+        | PopTryHandler
+        | CompletionJump { .. }
+        | EnterFinally
+        | EndFinally => (0, 0),
         IteratorClose => (1, 0),
         GetIterator | ForInEnumerate => (1, 1),
         IteratorNext => (0, 1),
@@ -2306,6 +2313,10 @@ impl Emitter<'_> {
                     boundary: *boundary,
                 });
                 return Some((false, 1));
+            }
+            EnterFinally => {
+                self.flush_all();
+                self.push_op(ROp::EnterFinally);
             }
             EndFinally => {
                 // A parked completion may leave through handlers; the normal

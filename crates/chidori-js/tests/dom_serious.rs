@@ -52,8 +52,8 @@ fn three_level_app(engine: &mut Engine) -> chidori_js::dom::DomHandle {
         .eval(
             r#"
             globalThis.hits = [];
-            const outer = document.createElement('div'); outer.id = 'outer';
-            const inner = document.createElement('button'); inner.id = 'inner';
+            var outer = document.createElement('div'); outer.id = 'outer';
+            var inner = document.createElement('button'); inner.id = 'inner';
             outer.appendChild(inner);
             document.body.appendChild(outer);
         "#,
@@ -69,8 +69,8 @@ fn capture_target_bubble_ordering() {
     engine
         .eval(
             r#"
-            const outer = document.getElementById('outer');
-            const inner = document.getElementById('inner');
+            var outer = document.getElementById('outer');
+            var inner = document.getElementById('inner');
             outer.addEventListener('click', () => hits.push('outer-capture'), true);
             outer.addEventListener('click', () => hits.push('outer-bubble'));
             inner.addEventListener('click', () => hits.push('inner-capture'), { capture: true });
@@ -96,8 +96,8 @@ fn stop_propagation_halts_bubble() {
     engine
         .eval(
             r#"
-            const outer = document.getElementById('outer');
-            const inner = document.getElementById('inner');
+            var outer = document.getElementById('outer');
+            var inner = document.getElementById('inner');
             outer.addEventListener('click', () => hits.push('outer-capture'), true);
             outer.addEventListener('click', () => hits.push('outer-bubble'));
             inner.addEventListener('click', (e) => { hits.push('inner'); e.stopPropagation(); });
@@ -120,7 +120,7 @@ fn stop_immediate_propagation_halts_remaining_listeners() {
     engine
         .eval(
             r#"
-            const inner = document.getElementById('inner');
+            var inner = document.getElementById('inner');
             inner.addEventListener('click', (e) => { hits.push('first'); e.stopImmediatePropagation(); });
             inner.addEventListener('click', () => hits.push('second'));
         "#,
@@ -139,7 +139,7 @@ fn prevent_default_is_reported() {
     engine
         .eval(
             r#"
-            const inner = document.getElementById('inner');
+            var inner = document.getElementById('inner');
             inner.addEventListener('click', (e) => { e.preventDefault(); });
         "#,
         )
@@ -161,7 +161,7 @@ fn once_listener_fires_a_single_time() {
     engine
         .eval(
             r#"
-            const inner = document.getElementById('inner');
+            var inner = document.getElementById('inner');
             inner.addEventListener('click', () => hits.push('x'), { once: true });
         "#,
         )
@@ -181,7 +181,7 @@ fn remove_event_listener_works() {
     engine
         .eval(
             r#"
-            const inner = document.getElementById('inner');
+            var inner = document.getElementById('inner');
             globalThis.h = () => hits.push('x');
             inner.addEventListener('click', globalThis.h);
             inner.removeEventListener('click', globalThis.h);
@@ -201,7 +201,7 @@ fn js_side_dispatch_event_returns_not_cancelled() {
     let out = eval_str(
         &mut engine,
         r#"
-        const inner = document.getElementById('inner');
+        var inner = document.getElementById('inner');
         inner.addEventListener('click', (e) => e.preventDefault());
         const ev = { type: 'click', detail: {}, bubbles: true, cancelable: true };
         inner.dispatchEvent(ev);   // -> false because preventDefault was called

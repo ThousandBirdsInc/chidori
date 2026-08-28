@@ -123,8 +123,10 @@ fn count_ops(proto: &FuncProto, pred: fn(&Op) -> bool) -> usize {
 #[test]
 fn localization_actually_fires_and_bails() {
     // A plain counting loop localizes fully: no cell ops remain anywhere.
+    // (Block-scoped: a SCRIPT-toplevel `let` is a global lexical binding —
+    // a stable shared cell other scripts resolve — so it never localizes.)
     let p = compile_script_passes(
-        "let s = 0; for (let i = 0; i < 10; i++) { s += i; } console.log(s);",
+        "{ let s = 0; for (let i = 0; i < 10; i++) { s += i; } console.log(s); }",
         true,
         true,
     )

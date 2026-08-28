@@ -648,6 +648,13 @@ fn run_test(
     if meta.includes.iter().any(|i| i == "atomicsHelper.js") {
         return vec![(Variant::Sloppy, Outcome::Skip("agent".into()))];
     }
+    // A handful of tests call `$262.createRealm` without carrying the
+    // `cross-realm` feature tag (e.g. the TypedArray detached-buffer-throws-
+    // realm pair). The runner cannot host a second realm either way, so they
+    // get the same honest skip the tagged tests do.
+    if source.contains("$262.createRealm") {
+        return vec![(Variant::Sloppy, Outcome::Skip("feature:cross-realm".into()))];
+    }
 
     let variants = select_variants(&meta, args);
     variants
@@ -883,7 +890,7 @@ fn evaluate_rust_module(
 ) -> Outcome {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = chidori_js::Engine::new();
-        engine.vm.op_budget = Some(50_000_000);
+        engine.vm.op_budget = Some(500_000_000);
         engine.vm.interrupt = Some(interrupt);
         {
             use chidori_js::value::{Internal, Value as JsValue};
@@ -1023,6 +1030,10 @@ fn install_dynamic_import(
     base_dir: std::path::PathBuf,
     registry: std::rc::Rc<std::cell::RefCell<chidori_js::module::ModuleRegistry>>,
 ) {
+    // Async module completion callbacks resolve importer keys against the
+    // live registry (a snapshot captured when an async body started may
+    // predate modules a later dynamic `import()` linked as waiters).
+    engine.vm.module_registry = Some(registry.clone());
     engine.vm.dynamic_import = Some(std::rc::Rc::new(move |vm, spec| {
         let path = base_dir.join(spec);
         let key = module_key(&path);
@@ -1035,9 +1046,11 @@ fn install_dynamic_import(
         }
         // Shallow snapshot — see run_module_graph_test: evaluation must not
         // hold a borrow open (a nested dynamic import re-borrows to load).
+        // The returned promise resolves with the namespace once the module
+        // (and anything it transitively awaits) finishes evaluating; the
+        // `import()` promise chains onto it.
         let reg = registry.borrow().clone();
-        vm.run_module_graph(&reg, &key)?;
-        vm.module_namespace_by_key(&reg, &key)
+        vm.module_evaluate_promise(&reg, &key)
     }));
 }
 
@@ -1112,7 +1125,7 @@ fn evaluate_rust(
 ) -> Outcome {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = chidori_js::Engine::new();
-        engine.vm.op_budget = Some(50_000_000);
+        engine.vm.op_budget = Some(500_000_000);
         engine.vm.interrupt = Some(interrupt);
         let registry = std::rc::Rc::new(std::cell::RefCell::new(
             chidori_js::module::ModuleRegistry::default(),

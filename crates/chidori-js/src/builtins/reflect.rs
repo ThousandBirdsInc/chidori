@@ -132,6 +132,7 @@ pub fn install(vm: &mut Vm) {
                 return vm.proxy_get_own_descriptor(&target, &key);
             }
             super::materialize_lazy_for_key(vm, &target, &key);
+            crate::builtins::fundamental::ns_tdz_check(vm, &target, &key)?;
             let prop = own_property_descriptor(&target, &key);
             match prop {
                 None => Ok(Value::Undefined),
@@ -156,8 +157,9 @@ pub fn install(vm: &mut Vm) {
         if vm.is_proxy(&target) {
             return Ok(Value::Bool(vm.proxy_prevent_extensions(&target)?));
         }
-        target.borrow_mut().extensible = false;
-        Ok(Value::Bool(true))
+        Ok(Value::Bool(
+            super::fundamental::ordinary_prevent_extensions(&target),
+        ))
     });
 
     // Reflect.apply(target, thisArgument, argumentsList)
@@ -190,9 +192,20 @@ pub fn install(vm: &mut Vm) {
         vm.construct(&target, &list, &new_target)
     });
 
-    // Reflect[Symbol.toStringTag] = "Reflect" (non-enumerable).
+    // Reflect[Symbol.toStringTag] = "Reflect" (non-writable, non-enumerable,
+    // configurable — the namespace-object tag shape).
     let tag = vm.realm.symbol_to_string_tag.clone();
-    vm.define_value_sym(&reflect, tag, Value::str("Reflect"));
+    reflect.borrow_mut().own_insert(
+        PropertyKey::Sym(tag),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::str("Reflect"),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
+    );
 
     // Install as the (non-enumerable, writable, configurable) global `Reflect`.
     let global = vm.realm.global.clone();
@@ -431,6 +444,9 @@ pub(crate) fn reflect_set(
         };
         return vm.proxy_define_property(&robj, key, dv);
     }
+    // Receiver.[[GetOwnProperty]]: a module-namespace receiver reads the
+    // export's live binding, throwing on an uninitialized (TDZ) one.
+    crate::builtins::fundamental::ns_tdz_check(vm, &robj, key)?;
     match own_property_descriptor(&robj, key) {
         Some(p) => match &p.kind {
             PropertyKind::Accessor { .. } => Ok(false),

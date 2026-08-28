@@ -83,7 +83,11 @@ fn is_dynamic_resolution(op: &Op) -> bool {
             | Op::PushWithScope
             | Op::PopWithScope
             | Op::DirectEval { .. }
+            | Op::DirectEvalSpread { .. }
             | Op::InitEvalVars
+            // Global lexicals alias frame cells into the realm registry;
+            // localizing those cells into registers would sever the alias.
+            | Op::DeclareGlobalLex { .. }
     )
 }
 

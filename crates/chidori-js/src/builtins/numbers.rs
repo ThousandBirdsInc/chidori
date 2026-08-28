@@ -109,6 +109,10 @@ fn install_number(vm: &mut Vm) {
             matches!(arg(args, 0), Value::Number(n) if n.is_nan()),
         ))
     });
+    // Number.parseInt / Number.parseFloat are the SAME function objects as
+    // the globals (spec: "the initial value ... is %parseInt%"). The globals
+    // section installs later, so it copies these two onto the global object
+    // rather than defining fresh functions.
     vm.define_method(&ctor, "parseFloat", 1, |vm, _t, args| {
         let s = vm.to_js_string(&arg(args, 0))?;
         Ok(Value::Number(super::parse_float(s.as_str())))
@@ -345,6 +349,44 @@ fn round_decimal(x: f64, frac: usize) -> String {
     }
 }
 
+/// Round `x` (positive, finite) to `sig` significant decimal digits, ties away
+/// from zero on the exact binary value — the spec's "if there are two such n,
+/// pick the larger n" for toExponential/toPrecision, where Rust's formatter
+/// would round ties to even (`(25).toExponential(0)` must be `3e+1`, not
+/// `2e+1`). Returns the digit string (length `sig`) and the power-of-ten
+/// exponent of its first digit.
+fn round_decimal_digits(x: f64, sig: usize) -> (String, i32) {
+    debug_assert!(x > 0.0 && x.is_finite() && (1..=101).contains(&sig));
+    // 766 fraction digits prints the full exact decimal expansion of any f64
+    // (at most 767 significant digits), zero-padded beyond it.
+    let exact = format!("{x:.766e}");
+    let (mant, exp) = exact.split_once('e').expect("e-format");
+    let mut e: i32 = exp.parse().expect("exponent");
+    let mut digits: Vec<u8> = mant.bytes().filter(|b| b.is_ascii_digit()).collect();
+    let mut carry = digits.get(sig).is_some_and(|&d| d >= b'5');
+    digits.truncate(sig);
+    let mut i = digits.len();
+    while carry && i > 0 {
+        i -= 1;
+        if digits[i] == b'9' {
+            digits[i] = b'0';
+        } else {
+            digits[i] += 1;
+            carry = false;
+        }
+    }
+    if carry {
+        // 9.99... rounded up: one more digit ahead, drop the trailing zero.
+        digits.insert(0, b'1');
+        digits.truncate(sig);
+        e += 1;
+    }
+    while digits.len() < sig {
+        digits.push(b'0');
+    }
+    (String::from_utf8(digits).expect("ascii digits"), e)
+}
+
 /// Number::toExponential. `n` is finite. `f` is `Some` for a fixed fraction
 /// count, `None` to use as many digits as needed.
 fn to_exponential_string(n: f64, f: Option<usize>) -> String {
@@ -362,8 +404,13 @@ fn to_exponential_string(n: f64, f: Option<usize>) -> String {
             normalize_exponential(&s)
         }
         Some(d) => {
-            let s = format!("{x:.*e}", d);
-            normalize_exponential(&s)
+            let (digits, e) = round_decimal_digits(x, d + 1);
+            let sign = if e >= 0 { '+' } else { '-' };
+            if d == 0 {
+                format!("{digits}e{sign}{}", e.abs())
+            } else {
+                format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], e.abs())
+            }
         }
     };
     if neg {
@@ -385,16 +432,8 @@ fn to_precision_string(n: f64, prec: usize) -> String {
     }
     let neg = n < 0.0;
     let x = n.abs();
-    // Round to `prec` significant digits via exponential formatting:
-    // `d.dd...e±E` with exactly `prec` significant digits.
-    let formatted = format!("{x:.*e}", prec - 1);
-    let (mantissa, exp_part) = match formatted.split_once('e') {
-        Some(parts) => parts,
-        None => return number_to_string(n),
-    };
-    let e: i32 = exp_part.parse().unwrap_or(0);
-    // Collect the `prec` significant digits (drop the decimal point).
-    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    // Round to `prec` significant digits, spec ties (away from zero).
+    let (digits, e) = round_decimal_digits(x, prec);
     let body = if e < -6 || e >= prec as i32 {
         // Exponential form: d1 "." d2..dp "e" sign |e|.
         let mut m = String::new();
@@ -641,7 +680,14 @@ fn install_math(vm: &mut Vm) {
             return Err(vm.throw_type("Math.sumPrecise requires an iterable"));
         }
         let it = vm.get_iterator(&iterable)?;
-        let mut partials: Vec<f64> = Vec::new();
+        // Exact summation: every finite f64 is an integer multiple of 2^-1074,
+        // so accumulate `mantissa << exponent` in a BigInt scaled by 2^-1074
+        // (at most ~2100 bits plus log2(count)). Two-sum partial arrays break
+        // down when an intermediate sum overflows f64 (e.g. 1e308 + 1e308),
+        // where the exact running total exceeds the float range but the final
+        // result does not.
+        let mut acc = num_bigint::BigInt::from(0u8);
+        let mut any_finite_nonzero = false;
         let mut all_minus_zero = true;
         let mut nan = false;
         let mut pos_inf = false;
@@ -672,24 +718,24 @@ fn install_math(vm: &mut Vm) {
                 neg_inf = true;
                 continue;
             }
-            // Two-sum accumulation into non-overlapping partials.
-            let mut x = n;
-            let mut keep = 0usize;
-            for j in 0..partials.len() {
-                let mut y = partials[j];
-                if x.abs() < y.abs() {
-                    std::mem::swap(&mut x, &mut y);
-                }
-                let hi = x + y;
-                let lo = y - (hi - x);
-                if lo != 0.0 {
-                    partials[keep] = lo;
-                    keep += 1;
-                }
-                x = hi;
+            if n == 0.0 {
+                continue;
             }
-            partials.truncate(keep);
-            partials.push(x);
+            any_finite_nonzero = true;
+            let bits = n.to_bits();
+            let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+            let frac = bits & 0xf_ffff_ffff_ffff;
+            // Value = mantissa * 2^shift * 2^-1074 with integer shift >= 0.
+            let (mantissa, shift) = if raw_exp == 0 {
+                (frac, 0u32) // subnormal: frac * 2^-1074
+            } else {
+                (frac | (1 << 52), (raw_exp - 1) as u32)
+            };
+            let mut term = num_bigint::BigInt::from(mantissa) << shift;
+            if n < 0.0 {
+                term = -term;
+            }
+            acc += term;
         }
         if nan || (pos_inf && neg_inf) {
             return Ok(Value::Number(f64::NAN));
@@ -700,10 +746,10 @@ fn install_math(vm: &mut Vm) {
         if neg_inf {
             return Ok(Value::Number(f64::NEG_INFINITY));
         }
-        if partials.is_empty() {
+        if !any_finite_nonzero {
             return Ok(Value::Number(if all_minus_zero { -0.0 } else { 0.0 }));
         }
-        Ok(Value::Number(partials.iter().sum()))
+        Ok(Value::Number(round_scaled_bigint(&acc)))
     });
 
     // Math[Symbol.toStringTag] = "Math" (non-writable, non-enumerable, configurable).
@@ -792,19 +838,78 @@ pub(crate) fn math_round(n: f64) -> f64 {
     if n.is_nan() || n.is_infinite() || n == 0.0 {
         return n;
     }
-    // (n + 0.5).floor() is correct for positives but mishandles the sign of
-    // results that should be -0, and large-magnitude values where adding 0.5
-    // is exact anyway.
-    if n > 0.0 && n < 0.5 {
+    // At or beyond 2^52 every f64 is already an integer, and `n + 0.5` would
+    // round (e.g. -(2^53 - 1) + 0.5 lands on the even neighbor). Return as-is.
+    if n.abs() >= 4_503_599_627_370_496.0 {
+        return n;
+    }
+    // `n - floor(n)` is exact, so comparing the fraction against 0.5 avoids
+    // the double-rounding of `(n + 0.5).floor()` (0.49999999999999994 + 0.5
+    // ties up to 1.0).
+    let f = n.floor();
+    let r = if n - f >= 0.5 { f + 1.0 } else { f };
+    if r == 0.0 && n < 0.0 {
+        -0.0 // keep the sign: Math.round(-0.3) is -0
+    } else {
+        r
+    }
+}
+
+/// Round an exact integer in units of 2^-1074 (the scale Math.sumPrecise
+/// accumulates at — every finite f64 is such a multiple) to the nearest f64,
+/// ties to even, overflowing to ±Infinity.
+fn round_scaled_bigint(acc: &num_bigint::BigInt) -> f64 {
+    use num_bigint::{BigUint, Sign};
+    use num_traits::ToPrimitive;
+    // 2^e for a normal-range exponent, built from the IEEE bit pattern.
+    fn pow2(e: i64) -> f64 {
+        debug_assert!((-1022..=1023).contains(&e));
+        f64::from_bits(((e + 1023) as u64) << 52)
+    }
+    // m (an exact <= 53-bit integer) * 2^e, split so each step stays exact.
+    fn ldexp53(m: u64, e: i64) -> f64 {
+        let e1 = e / 2;
+        let e2 = e - e1;
+        (m as f64) * pow2(e1) * pow2(e2)
+    }
+    let neg = acc.sign() == Sign::Minus;
+    let mag = acc.magnitude();
+    let bits = mag.bits();
+    let v = if bits == 0 {
+        // Exact cancellation of nonzero addends sums to +0.
         return 0.0;
+    } else if bits <= 53 {
+        // Fits the mantissa exactly (subnormal or small normal).
+        ldexp53(mag.to_u64().expect("<= 53 bits"), -1074)
+    } else {
+        // Keep the top 53 bits; the remainder below decides the rounding.
+        let s = bits - 53;
+        let top: BigUint = mag >> s;
+        let mut m = top.to_u64().expect("53 bits");
+        let rem = mag - (top << s);
+        let halfway: BigUint = BigUint::from(1u8) << (s - 1);
+        if rem > halfway || (rem == halfway && (m & 1) == 1) {
+            m += 1;
+        }
+        let mut s = s as i64;
+        if m == 1 << 53 {
+            m = 1 << 52;
+            s += 1;
+        }
+        // Value = m * 2^(s - 1074) with m in [2^52, 2^53): the leading bit
+        // sits at 2^(52 + s - 1074), past which f64 overflows.
+        let e = s - 1074;
+        if 52 + e > 1023 {
+            f64::INFINITY
+        } else {
+            ldexp53(m, e)
+        }
+    };
+    if neg {
+        -v
+    } else {
+        v
     }
-    if (-0.5..0.0).contains(&n) {
-        // -0 result, preserving sign.
-        return -0.0;
-    }
-    let r = (n + 0.5).floor();
-    // For very large numbers, n + 0.5 == n, so floor(n) == n which is fine.
-    r
 }
 
 /// Math.pow with ECMAScript exponentiation special cases that `f64::powf` does
@@ -1525,15 +1630,63 @@ impl<'a> JsonParser<'a> {
 /// clean RUNS (multi-byte UTF-8 included wholesale; every continuation byte
 /// is ≥ 0x80 and never matches) instead of pushing char by char.
 fn json_quote_into(s: &JsString, out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if !s.is_well_formed() {
+        // Unpaired surrogates cannot appear in JSON text: well-formed
+        // JSON.stringify escapes each as `\udXXX` (a code-unit walk — the
+        // lossy &str view would emit U+FFFD instead).
+        out.push(b'"');
+        let units = s.to_utf16_vec();
+        let mut i = 0usize;
+        while i < units.len() {
+            let u = units[i];
+            i += 1;
+            match u {
+                0xd800..=0xdbff if i < units.len() && (0xdc00..=0xdfff).contains(&units[i]) => {
+                    // A proper pair: emit the astral character itself.
+                    let lo = units[i];
+                    i += 1;
+                    let cp = 0x10000 + (((u as u32) - 0xd800) << 10) + ((lo as u32) - 0xdc00);
+                    let c = char::from_u32(cp).expect("astral code point");
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+                0xd800..=0xdfff => {
+                    out.extend_from_slice(b"\\u");
+                    for shift in [12, 8, 4, 0] {
+                        out.push(HEX[((u >> shift) & 0xf) as usize]);
+                    }
+                }
+                _ => {
+                    let c = char::from_u32(u as u32).expect("non-surrogate BMP unit");
+                    match c {
+                        '"' => out.extend_from_slice(b"\\\""),
+                        '\\' => out.extend_from_slice(b"\\\\"),
+                        '\n' => out.extend_from_slice(b"\\n"),
+                        '\r' => out.extend_from_slice(b"\\r"),
+                        '\t' => out.extend_from_slice(b"\\t"),
+                        '\u{8}' => out.extend_from_slice(b"\\b"),
+                        '\u{c}' => out.extend_from_slice(b"\\f"),
+                        c if (c as u32) < 0x20 => {
+                            out.extend_from_slice(b"\\u00");
+                            out.push(HEX[(c as usize) >> 4]);
+                            out.push(HEX[(c as usize) & 0xf]);
+                        }
+                        c => {
+                            let mut buf = [0u8; 4];
+                            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        out.push(b'"');
+        return;
+    }
     out.push(b'"');
     // Well-formed strings (the inline/heap/rope arms) quote straight from
-    // their raw UTF-8 bytes — no re-validation; a WTF-8 string uses its
-    // stored lossy view, exactly as before.
-    let bytes: &[u8] = if s.is_well_formed() {
-        s.wtf8_bytes()
-    } else {
-        s.as_str().as_bytes()
-    };
+    // their raw UTF-8 bytes — no re-validation.
+    let bytes: &[u8] = s.wtf8_bytes();
     let mut run = 0usize;
     for (i, &c) in bytes.iter().enumerate() {
         if c == b'"' || c == b'\\' || c < 0x20 {

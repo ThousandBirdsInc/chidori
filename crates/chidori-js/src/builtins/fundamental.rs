@@ -187,6 +187,39 @@ fn complete_to_property(d: &PropDesc) -> Property {
 /// Reify an array's exotic own index/length property into a real `Property`
 /// (so it can participate in the ordinary define-own algorithm). Returns the
 /// current descriptor or `None` if absent.
+/// String exotic object: the virtual index/length properties (spec 10.4.3.5
+/// StringGetOwnProperty) that back [[DefineOwnProperty]] validation — a
+/// redefinition of an in-range index must validate against the
+/// non-writable, non-configurable character property, not "absent".
+fn string_exotic_current(b: &ObjectData, key: &PropertyKey) -> Option<Property> {
+    let Internal::StringObj(s) = &b.internal else {
+        return None;
+    };
+    if let Some("length") = key.as_str() {
+        return Some(Property {
+            kind: PropertyKind::Data {
+                value: Value::Number(s.len_utf16() as f64),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: false,
+        });
+    }
+    let idx = key.array_index()? as usize;
+    let units = s.to_utf16_vec();
+    let unit = units.get(idx)?;
+    Some(Property {
+        kind: PropertyKind::Data {
+            value: Value::String(crate::value::JsString::from_code_units(
+                std::slice::from_ref(unit),
+            )),
+            writable: false,
+        },
+        enumerable: true,
+        configurable: false,
+    })
+}
+
 fn array_exotic_current(b: &ObjectData, key: &PropertyKey) -> Option<Property> {
     if let Internal::Array(arr) = &b.internal {
         if let Some("length") = key.as_str() {
@@ -247,6 +280,10 @@ pub(crate) fn define_own_property(
     // accessor redefinition or `writable: false` severs the alias.
     if ok {
         if let Some(idx) = args_index {
+            // When `writable: false` severs the alias WITHOUT a new value,
+            // the stored property must capture the parameter's CURRENT value
+            // (writes via the binding since the define are visible).
+            let mut sync_value: Option<Value> = None;
             let mut b = obj.borrow_mut();
             if let Internal::Arguments(map) = &mut b.internal {
                 if let Some(slot) = map.get_mut(idx as usize) {
@@ -257,8 +294,19 @@ pub(crate) fn define_own_property(
                             *cell.borrow_mut() = v.clone();
                         }
                         if d.writable == Some(false) {
+                            if d.value.is_none() {
+                                sync_value = slot.as_ref().map(|cell| cell.borrow().clone());
+                            }
                             *slot = None;
                         }
+                    }
+                }
+            }
+            if let Some(v) = sync_value {
+                let k = PropertyKey::from_index(idx);
+                if let Some(p) = b.own_get_mut(&k) {
+                    if let PropertyKind::Data { value, .. } = &mut p.kind {
+                        *value = v;
                     }
                 }
             }
@@ -343,7 +391,7 @@ fn define_own_property_inner(
         let b = obj.borrow();
         let cur = match b.own_get(key) {
             Some(p) => Some(p.clone()),
-            None => array_exotic_current(&b, key),
+            None => array_exotic_current(&b, key).or_else(|| string_exotic_current(&b, key)),
         };
         (cur, b.extensible, matches!(b.internal, Internal::Array(_)))
     };
@@ -794,6 +842,7 @@ fn install_object(vm: &mut Vm) {
             let desc = vm.proxy_get_own_descriptor(&o, &key)?;
             return Ok(Value::Bool(matches!(desc, Value::Object(_))));
         }
+        ns_tdz_check(vm, &o, &key)?;
         let has = own_property_exists(&o, &key);
         Ok(Value::Bool(has))
     });
@@ -839,6 +888,7 @@ fn install_object(vm: &mut Vm) {
             }
             return Ok(Value::Bool(false));
         }
+        ns_tdz_check(vm, &o, &key)?;
         let b = o.borrow();
         let e = match b.own_get(&key) {
             Some(p) => p.enumerable,
@@ -852,6 +902,11 @@ fn install_object(vm: &mut Vm) {
                     .array_index()
                     .map(|i| (i as usize) < s.len_utf16())
                     .unwrap_or(false),
+                // Module Namespace exports are {enumerable: true} data props.
+                Internal::ModuleNamespace(ns) => match &key {
+                    PropertyKey::Str(s) => ns.exports.contains_key(s),
+                    PropertyKey::Sym(_) => false,
+                },
                 _ => false,
             },
         };
@@ -955,6 +1010,9 @@ fn install_object(vm: &mut Vm) {
     });
 
     // Object constructor.
+    let ctor_cell: std::rc::Rc<std::cell::OnceCell<JsObject>> =
+        std::rc::Rc::new(std::cell::OnceCell::new());
+    let cc = ctor_cell.clone();
     let ctor = vm.new_native_ctor(
         "Object",
         1,
@@ -966,7 +1024,19 @@ fn install_object(vm: &mut Vm) {
                 Ok(Value::Object(vm.to_object(&v)?))
             }
         },
-        |vm, _this, args| {
+        move |vm, _this, args| {
+            // Spec step 1: when NewTarget is neither undefined nor the Object
+            // constructor itself (a `class X extends Object` super() call, or
+            // Reflect.construct with a different target), the argument is
+            // IGNORED and a fresh ordinary object is created from
+            // NewTarget.prototype.
+            let subclassed = match (&vm.native_new_target, cc.get()) {
+                (Some(Value::Object(nt)), Some(me)) => !nt.same(me),
+                _ => false,
+            };
+            if subclassed {
+                return Ok(Value::Object(vm.new_object()));
+            }
             let v = arg(args, 0);
             if v.is_nullish() {
                 Ok(Value::Object(vm.new_object()))
@@ -975,6 +1045,7 @@ fn install_object(vm: &mut Vm) {
             }
         },
     );
+    let _ = ctor_cell.set(ctor.clone());
     vm.install_ctor("Object", &ctor, &proto);
 
     vm.define_method(&ctor, "keys", 1, |vm, _t, args| {
@@ -1079,15 +1150,17 @@ fn install_object(vm: &mut Vm) {
     });
     vm.define_method(&ctor, "preventExtensions", 1, |vm, _t, args| {
         if let Value::Object(o) = arg(args, 0) {
-            if vm.is_proxy(&o) {
-                // Object.preventExtensions throws if [[PreventExtensions]]
-                // reports failure (e.g. a trap returning false).
-                if !vm.proxy_prevent_extensions(&o)? {
-                    return Err(vm.throw_type("Object.preventExtensions failed"));
-                }
-                return Ok(Value::Object(o));
+            // Object.preventExtensions throws if [[PreventExtensions]]
+            // reports failure (a trap returning false, or a typed array
+            // whose length can still change).
+            let ok = if vm.is_proxy(&o) {
+                vm.proxy_prevent_extensions(&o)?
+            } else {
+                ordinary_prevent_extensions(&o)
+            };
+            if !ok {
+                return Err(vm.throw_type("Object.preventExtensions failed"));
             }
-            o.borrow_mut().extensible = false;
             return Ok(Value::Object(o));
         }
         Ok(arg(args, 0))
@@ -1188,6 +1261,7 @@ fn install_object(vm: &mut Vm) {
             return vm.proxy_get_own_descriptor(&o, &key);
         }
         super::materialize_lazy_for_key(vm, &o, &key);
+        ns_tdz_check(vm, &o, &key)?;
         let prop = own_property_descriptor(&o, &key);
         match prop {
             None => Ok(Value::Undefined),
@@ -1251,10 +1325,22 @@ fn install_object_extra(vm: &mut Vm) {
         let o = vm.to_object(&arg(args, 0))?;
         super::materialize_all_lazy(vm, &o);
         let result = vm.new_object();
-        for key in vm.own_keys(&o) {
-            let prop = own_property_descriptor(&o, &key);
-            if let Some(p) = prop {
-                let desc = descriptor_to_object(vm, &p);
+        // Spec order: one [[OwnPropertyKeys]], then one [[GetOwnProperty]] per
+        // key — both through Proxy traps when `o` is a proxy. A key the
+        // ownKeys trap reported but [[GetOwnProperty]] says is absent is
+        // skipped, not defined as `undefined`.
+        let is_proxy = vm.is_proxy(&o);
+        for key in vm.own_property_keys(&o)? {
+            let desc = if is_proxy {
+                vm.proxy_get_own_descriptor(&o, &key)?
+            } else {
+                ns_tdz_check(vm, &o, &key)?;
+                match own_property_descriptor(&o, &key) {
+                    Some(p) => descriptor_to_object(vm, &p),
+                    None => Value::Undefined,
+                }
+            };
+            if !desc.is_undefined() {
                 result.borrow_mut().own_insert(key, Property::data(desc));
             }
         }
@@ -1292,8 +1378,31 @@ fn install_object_extra(vm: &mut Vm) {
             let desc = vm.proxy_get_own_descriptor(&o, &key)?;
             return Ok(Value::Bool(matches!(desc, Value::Object(_))));
         }
+        ns_tdz_check(vm, &o, &key)?;
         Ok(Value::Bool(own_property_exists(&o, &key)))
     });
+}
+
+/// Ordinary (non-proxy) [[PreventExtensions]]. A typed array that is not
+/// fixed-length — length-tracking, or any view over a resizable buffer —
+/// refuses (spec 10.4.5.2: its index set can still change), so `freeze` /
+/// `seal` / `preventExtensions` on it fail.
+pub(crate) fn ordinary_prevent_extensions(o: &JsObject) -> bool {
+    let refuses = match &o.borrow().internal {
+        Internal::TypedArray(td) => {
+            td.length_tracking
+                || td
+                    .buffer
+                    .borrow()
+                    .own_contains_key(&PropertyKey::str(crate::typed_array::ARRAY_BUFFER_MAX_SLOT))
+        }
+        _ => false,
+    };
+    if refuses {
+        return false;
+    }
+    o.borrow_mut().extensible = false;
+    true
 }
 
 /// SetIntegrityLevel (spec 7.3.16): [[PreventExtensions]] — through Proxy
@@ -1307,8 +1416,7 @@ pub(crate) fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Re
     let ok = if vm.is_proxy(o) {
         vm.proxy_prevent_extensions(o)?
     } else {
-        o.borrow_mut().extensible = false;
-        true
+        ordinary_prevent_extensions(o)
     };
     if !ok {
         return Err(vm.throw_type("preventExtensions trap returned falsish"));
@@ -1614,7 +1722,7 @@ pub(crate) const CTOR_HINT_PRIVATE_ID: u64 = u64::MAX;
 /// OrdinarySetPrototypeOf (spec 10.1.2): rejects (returns false) a no-op-failing
 /// change on a non-extensible object, and rejects prototype cycles. Returns true
 /// on success (and mutates `o`'s prototype).
-fn ordinary_set_prototype_of(vm: &Vm, o: &JsObject, proto: Option<JsObject>) -> bool {
+pub(crate) fn ordinary_set_prototype_of(vm: &Vm, o: &JsObject, proto: Option<JsObject>) -> bool {
     let current = o.borrow().proto.clone();
     let same = match (&proto, &current) {
         (None, None) => true,
@@ -1703,6 +1811,8 @@ pub(crate) fn object_set_prototype_of(
 /// to test enumerability; ordinary objects use the fast direct path.
 fn enumerable_own_strings_dyn(vm: &mut Vm, o: &JsObject) -> Result<Vec<JsString>, Value> {
     if !vm.is_proxy(o) {
+        // A namespace's per-key [[GetOwnProperty]] throws on a TDZ export.
+        ns_tdz_check_all(vm, o)?;
         return Ok(vm.enumerable_own_string_keys(o));
     }
     let keys = vm.own_property_keys(o)?;
@@ -1725,12 +1835,65 @@ fn enumerable_own_strings_dyn(vm: &mut Vm, o: &JsObject) -> Result<Vec<JsString>
     Ok(out)
 }
 
-fn own_property_exists(o: &JsObject, key: &PropertyKey) -> bool {
+/// Module Namespace `[[GetOwnProperty]]` step 4 performs `? O.[[Get]](P, O)`
+/// to read the export's live binding, so merely INSPECTING an uninitialized
+/// (TDZ) export throws a ReferenceError. The infallible own-property helpers
+/// below cannot surface that, so the fallible call sites (HasOwnProperty,
+/// `getOwnPropertyDescriptor(s)`, `propertyIsEnumerable`, OrdinarySet's
+/// receiver step, per-key enumeration) run this first.
+pub(crate) fn ns_tdz_check(vm: &Vm, o: &JsObject, key: &PropertyKey) -> Result<(), Value> {
+    if let PropertyKey::Str(s) = key {
+        if let Internal::ModuleNamespace(ns) = &o.borrow().internal {
+            if let Some(cell) = ns.exports.get(s) {
+                if matches!(*cell.borrow(), Value::Uninitialized) {
+                    return Err(vm.throw_reference(&format!(
+                        "Cannot access '{}' before initialization",
+                        s.as_str()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ns_tdz_check` over every export: enumeration surfaces (`Object.keys`,
+/// for-in) call `[[GetOwnProperty]]` per key, so any uninitialized export
+/// makes the whole enumeration throw.
+pub(crate) fn ns_tdz_check_all(vm: &Vm, o: &JsObject) -> Result<(), Value> {
+    if let Internal::ModuleNamespace(ns) = &o.borrow().internal {
+        for (name, cell) in &ns.exports {
+            if matches!(*cell.borrow(), Value::Uninitialized) {
+                return Err(vm.throw_reference(&format!(
+                    "Cannot access '{}' before initialization",
+                    name.as_str()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn own_property_exists(o: &JsObject, key: &PropertyKey) -> bool {
     let b = o.borrow();
     if b.own_contains_key(key) {
         return true;
     }
     match &b.internal {
+        // Module Namespace [[GetOwnProperty]]: string export names are own
+        // properties (symbols consult the ordinary props above).
+        Internal::ModuleNamespace(ns) => {
+            if let PropertyKey::Str(s) = key {
+                return ns.exports.contains_key(s);
+            }
+            false
+        }
+        Internal::TypedArray(t) => {
+            if let Some(i) = key.array_index() {
+                return (i as usize) < crate::typed_array::ta_eff_length(t);
+            }
+            false
+        }
         Internal::Array(arr) => {
             if let Some("length") = key.as_str() {
                 return true;
@@ -2166,10 +2329,12 @@ fn install_symbol(vm: &mut Vm) {
         0,
         |vm, _this, args| {
             let desc = arg(args, 0);
+            // ToString(description): user coercion runs (and its throws
+            // propagate); a symbol description is itself a TypeError.
             let d = if desc.is_undefined() {
                 None
             } else {
-                Some(vm.to_string_lossy(&desc))
+                Some(vm.to_js_string(&desc)?.as_str().to_string())
             };
             let s = vm.alloc_symbol(d.as_deref());
             Ok(Value::Symbol(s))
@@ -2218,7 +2383,7 @@ fn install_symbol(vm: &mut Vm) {
     }
 
     vm.define_method(&ctor, "for", 1, |vm, _t, args| {
-        let key = vm.to_string_lossy(&arg(args, 0));
+        let key = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
         if let Some(s) = vm.realm.symbol_registry.get(&key) {
             return Ok(Value::Symbol(s.clone()));
         }
@@ -2475,7 +2640,6 @@ fn install_errors(vm: &mut Vm) {
 /// `suppressed` own data properties plus the usual error message/stack.
 fn install_suppressed_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
     let proto = vm.alloc_ordinary(Some(vm.realm.error_proto.clone()));
-    proto.borrow_mut().internal = Internal::Error;
     proto.borrow_mut().own_insert(
         PropertyKey::str("name"),
         Property::builtin(Value::str("SuppressedError")),
@@ -2528,7 +2692,6 @@ fn install_suppressed_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
 /// Install one Error-family constructor + its prototype wiring. Returns the
 /// constructor object.
 fn install_error_kind(vm: &mut Vm, proto: &JsObject, name: &str) -> JsObject {
-    proto.borrow_mut().internal = Internal::Error;
     // name and message are non-enumerable data properties on the prototype.
     proto.borrow_mut().own_insert(
         PropertyKey::str("name"),
@@ -2638,7 +2801,6 @@ fn install_error_stack(vm: &mut Vm, o: &JsObject) {
 /// AggregateError(errors, message [, options]).
 fn install_aggregate_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
     let proto = vm.alloc_ordinary(Some(vm.realm.error_proto.clone()));
-    proto.borrow_mut().internal = Internal::Error;
     proto.borrow_mut().own_insert(
         PropertyKey::str("name"),
         Property::builtin(Value::str("AggregateError")),
@@ -2711,6 +2873,12 @@ impl Vm {
             let t = Value::Object(b.target.clone());
             return self.instance_of_ordinary(obj, &t);
         }
+        // A primitive left operand is false BEFORE `prototype` is read (its
+        // getter must not run, and a primitive `prototype` must not throw).
+        let mut cur = match obj {
+            Value::Object(o) => o.clone(),
+            _ => return Ok(false),
+        };
         let target_proto = self.get_prop(ctor, &PropertyKey::str("prototype"))?;
         let target_proto = match target_proto {
             Value::Object(o) => o,
@@ -2718,10 +2886,6 @@ impl Vm {
         };
         // Walk the chain through [[GetPrototypeOf]] — a proxy anywhere in the
         // chain routes through its trap (and an abrupt trap propagates).
-        let mut cur = match obj {
-            Value::Object(o) => o.clone(),
-            _ => return Ok(false),
-        };
         loop {
             match self.proxy_or_ordinary_get_prototype_of(&cur)? {
                 Value::Object(p) => {
