@@ -231,11 +231,10 @@ constant at the top of a workload file — they're deliberately one-liners.
   illustrative.
 - The workloads were moved from top-level scripts into function bodies when
   the JIT column landed (2026-08), so numbers before/after that point are
-  not comparable. One row got *slower* under chidori from the move and is
-  kept deliberately: `mutual_recursion` — the recursion-family fast tier
-  currently resolves mutual partners through **global** bindings only, so
-  function-scoped mutual recursion runs on the generic call path. That row
-  is the open gap, not a benchmark artifact.
+  not comparable. (The move initially regressed `mutual_recursion` — the
+  family tier then resolved mutual partners through global bindings only —
+  which drove extending the resolver to captured-binding partners; the row
+  now runs the family tiers in both modes.)
 - This measures whole-script subprocess runs, so it captures parse + compile +
   execute, not steady-state JIT throughput. For chidori-js and CPython
   (interpreters) that is representative; for V8/JSC it understates peak

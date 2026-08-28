@@ -81,15 +81,25 @@ compiled subset now covers essentially the whole kernel language:
   runs that activation on the interpreter tier. Closure *instances* may
   differ freely — their upvalue snapshots travel through the register
   buffer.
-- **Self-recursion** (`SelfCall`, self-only families): the kernel compiles
-  to a real native recursive function (plus a standard-signature wrapper),
-  with the interpreter's exact per-call depth guard — exhaustion abandons
-  the pure activation through a context flag that unwinds every native
-  frame, and the generic rerun raises the spec RangeError — and the shared
-  interrupt-poll cadence. Mutual recursion stays on the windowed executor.
+- **Recursion families** (`SelfCall`): a RESOLVED family — the invoked
+  closure plus every partner reached through its recursive call graph, via
+  global bindings or captured (function-scoped) bindings, self and mutual
+  alike — compiles to one native function per member, calling each other
+  directly (plus a standard-signature wrapper), with the interpreter's
+  exact per-call depth guard — exhaustion abandons the pure activation
+  through a context flag that unwinds every native frame, and the generic
+  rerun raises the spec RangeError — and an every-256-calls interrupt poll
+  through the activation context. Member upvalue snapshots load from a
+  per-activation table; the compiled code is keyed to the resolved member
+  protos AND the callee mapping, identity-checked per activation (a
+  reassigned cell or global runs that activation on the windowed executor).
+  `isEven`/`isOdd` defined inside a function and capturing each other — the
+  shape agent helper code actually takes — compiles to two mutually-calling
+  native functions.
 
-Kernels containing anything outside this (cell-writing callees, mutual
-recursion, surviving property ops) decline translation **as a whole** and
+Kernels containing anything outside this (cell-writing callees, surviving
+property ops, mixed-return-type families) decline translation **as a whole**
+and
 keep running on the interpreter tier. There is still no OSR, no deopt, and no
 frame reconstruction anywhere: bail edges jump to the kernel's own `Exit`
 stubs, exactly as the interpreter's fast-path misses do. The native function
@@ -178,6 +188,12 @@ engine's empty-script baseline, byte-identical outputs verified on every row.
 | mixed_helpers (object glue) | 637 ms | 642 ms | 57 ms | 73 ms | 11× | 8.7× |
 | object_literals (5M allocations) | 1499 ms | 1488 ms | 35 ms | 35 ms | 43× | 42× |
 
+Since that table was taken, the recursion-family extension moved
+`mutual_recursion` (function-scoped `isEven`/`isOdd` + captured-binding
+`gcd`, the standalone-suite workload) from ~110× behind Node — it ran the
+generic call path — to ~1.1× on total wall-clock (interpreter tier ~1.7×):
+both engine columns now run the family tiers.
+
 Reading the table honestly, three regimes:
 
 1. **At or beyond Node (7 of 14)** — everything the kernel tier fully
@@ -205,8 +221,8 @@ Reading the table honestly, three regimes:
 - **Per-access exactness checks on dense reads** (regime 2 above): the next
   win is induction-variable typing in the kernel translator so the JIT can
   drop integrality/bounds tests the loop header already proves.
-- **Cell-writing pinned callees and mutual recursion** keep the interpreter
-  tier (per-call cell flushes and cross-kernel native calls respectively).
+- **Cell-writing pinned callees** keep the interpreter tier (per-call cell
+  flushes), as do mixed-return-type recursion families.
 - **Dense direct views are read-only kernels only**; writing kernels reach
   dense arrays through the shim cores (a store can grow/reallocate).
 - **The allocation-bound regime** (3 above) is explicitly out of scope for

@@ -82,6 +82,12 @@ const MAX_KOPS: usize = 2048;
 /// unused — uniform numbering keeps shuffles and merges trivial); `SCRATCH0`
 /// is the shuffle scratch. A final remap compacts the register file.
 const STACK_BASE: u16 = 64;
+/// Provisional [`KOp::SelfCall`] callee ids for UPVALUE-resolved callees
+/// during fn-mode translation: `UPVALUE_CALLEE_BASE + j` marks "the j-th
+/// distinct callee-position upvalue", rebased to the final
+/// `1 + globals.len() + j` numbering once the global list stops growing
+/// (translation discovers globals and upvalues in interleaved order).
+const UPVALUE_CALLEE_BASE: u16 = 0x8000;
 /// Provisional register space for BOOLEAN-typed locals (numeric locals are
 /// `0..BOOL_BASE`, boolean locals `BOOL_BASE..STACK_BASE`); compacted by the
 /// final remap to sit right after the numeric locals.
@@ -444,6 +450,11 @@ struct Xlate<'a> {
     /// own name (mutual recursion) — becomes [`KernelRec::globals`];
     /// `VE::SelfFn(1 + i)` indexes into it.
     rec_globals: Vec<Box<str>>,
+    /// fn mode: UPVALUE indices used in callee position (function-scoped
+    /// self or mutual recursion) — becomes [`KernelRec::upvalues`];
+    /// `VE::SelfFn(UPVALUE_CALLEE_BASE + j)` indexes into it provisionally
+    /// (rebased at kernel finish).
+    rec_upvalues: Vec<u32>,
     /// Locals designated as array bases (phase 2) — empty in phase 1.
     oslot_locals: &'a [u32],
     /// Locals designated as STRING bases (fixpoint-discovered from
@@ -551,6 +562,7 @@ fn translate(
         self_ret_bool,
         self_refs: Vec::new(),
         rec_globals: Vec::new(),
+        rec_upvalues: Vec::new(),
         oslot_locals,
         sslot_locals,
         bool_locals,
@@ -954,12 +966,24 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     // fn mode: recursion descriptor from the recorded self/extern references
     // (`kernelize_function` fills `ret_bool`/`args_used` and verifies the
     // recursive constraints).
-    let rec = if x.self_refs.is_empty() && x.rec_globals.is_empty() {
+    // Rebase provisional upvalue-callee ids now that the global list is
+    // final: `UPVALUE_CALLEE_BASE + j` → `1 + globals.len() + j` (the
+    // numbering [`KOp::SelfCall`] documents).
+    let n_rec_globals = u16::try_from(x.rec_globals.len()).ok()?;
+    for op in x.kops.iter_mut() {
+        if let KOp::SelfCall { callee, .. } = op {
+            if *callee >= UPVALUE_CALLEE_BASE {
+                *callee = 1 + n_rec_globals + (*callee - UPVALUE_CALLEE_BASE);
+            }
+        }
+    }
+    let rec = if x.self_refs.is_empty() && x.rec_globals.is_empty() && x.rec_upvalues.is_empty() {
         None
     } else {
         Some(Box::new(KernelRec {
             self_refs: std::mem::take(&mut x.self_refs).into_boxed_slice(),
             globals: std::mem::take(&mut x.rec_globals).into_boxed_slice(),
+            upvalues: std::mem::take(&mut x.rec_upvalues).into_boxed_slice(),
         }))
     };
     // The executors run registers in fixed [`crate::bytecode::KWIN`]-slot
@@ -2315,20 +2339,32 @@ impl Xlate<'_> {
             // A captured (read-only in-region) numeric upvalue: snapshot.
             // fn mode, CALLEE position (the compiler's plain-call pattern is
             // `LoadUpvalue; LoadUndefined(this); args…; Call`): speculate the
-            // upvalue is the function ITSELF — `const f = n => … f(…)`
-            // captures its own binding. The entry guard verifies the cell
-            // holds the invoked closure; a different callee (a helper fn)
-            // just declines there and the call runs generically. A
-            // mis-speculated NUMERIC upvalue directly followed by
-            // `LoadUndefined` (no such pattern reaches a kernelizable
-            // consumer) only fails translation, never correctness.
+            // upvalue holds a FAMILY CALLEE — the function itself (`const f
+            // = n => … f(…)` captures its own binding) or a function-scoped
+            // mutual-recursion partner (`isEven`/`isOdd` defined inside a
+            // function, capturing each other). WHICH member the cell holds
+            // is the entry resolution's per-activation decision; a cell
+            // holding anything without a compatible kernel just declines
+            // there and the call runs generically. A mis-speculated NUMERIC
+            // upvalue directly followed by `LoadUndefined` (no such pattern
+            // reaches a kernelizable consumer) only fails translation,
+            // never correctness.
             Op::LoadUpvalue(u) => {
                 if self.fn_mode && matches!(self.region.get(i + 1), Some(Op::LoadUndefined)) {
-                    let r = SelfRefKind::Upvalue(*u);
-                    if !self.self_refs.contains(&r) {
-                        self.self_refs.push(r);
-                    }
-                    self.vstack.push(VE::SelfFn(0));
+                    let j = match self.rec_upvalues.iter().position(|x| x == u) {
+                        Some(j) => j,
+                        None => {
+                            // Bounded like rec_globals: a body calling many
+                            // distinct captured functions is not a recursion
+                            // family worth resolving.
+                            if self.rec_upvalues.len() >= 4 {
+                                return None;
+                            }
+                            self.rec_upvalues.push(*u);
+                            self.rec_upvalues.len() - 1
+                        }
+                    };
+                    self.vstack.push(VE::SelfFn(UPVALUE_CALLEE_BASE + j as u16));
                     self.origins.push(None);
                 } else {
                     let src = self.uvreg(*u)?;

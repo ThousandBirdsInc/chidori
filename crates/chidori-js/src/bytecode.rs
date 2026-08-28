@@ -1448,13 +1448,15 @@ pub enum KOp {
     /// registers sit contiguously at `base..`; the callee's `Ret` lands in
     /// `regs[dst]` of the calling window (always a Number — recursive
     /// kernels reject boolean returns). Only emitted when the body's callee
-    /// is `LoadGlobal` of the function's OWN name; the entry guard then
-    /// verifies the referenced bindings still hold the expected closures
-    /// ([`Kernel::rec`]), so a rebound name declines to the generic path.
-    /// `callee` selects the target: 0 = the invoked closure itself
-    /// (self-recursion, whether referenced through its global name or a
-    /// captured binding), `1 + i` = the closure the entry guard resolved for
-    /// [`KernelRec::globals`]`[i]` (mutual recursion). Depth is tracked
+    /// is `LoadGlobal` of the function's OWN name or a callee-position
+    /// captured binding; the entry guard then verifies the referenced
+    /// bindings still hold the expected closures ([`Kernel::rec`]), so a
+    /// rebound name/cell declines to the generic path. `callee` selects the
+    /// target: 0 = the invoked closure itself (via its own global name),
+    /// `1 + i` = the closure resolved for [`KernelRec::globals`]`[i]`
+    /// (global mutual recursion), `1 + globals.len() + j` = the closure the
+    /// cell at [`KernelRec::upvalues`]`[j]` holds (function-scoped self or
+    /// mutual recursion, member-mapped per activation). Depth is tracked
     /// against the interpreter's limit; an overflow ABANDONS the (pure,
     /// side-effect-free) kernel activation and reruns the whole call
     /// generically, which raises the spec RangeError.
@@ -1472,18 +1474,21 @@ pub enum KOp {
 /// generic path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfRefKind {
-    /// `function f() { … f() … }` — via the global binding `f`.
+    /// `function f() { … f() … }` — via the global binding `f`. (A
+    /// captured-cell reference is not a self-REF: callee-position upvalues
+    /// are speculated as family CALLEES — [`KernelRec::upvalues`] — and the
+    /// entry resolution decides per activation whether the cell holds the
+    /// invoked closure itself or a partner.)
     Global(Box<str>),
-    /// `const f = () => … f() …` — via the captured cell at upvalue index.
-    Upvalue(u32),
 }
 
 /// Recursion descriptor for a FUNCTION kernel containing [`KOp::SelfCall`]s.
 /// Present iff the kernel is recursive; such kernels run on the windowed
-/// executor (`Vm::run_fn_kernel_rec`).
+/// executor (`Vm::run_fn_kernel_rec`) or, under the `jit` feature, as
+/// mutually-recursive native functions compiled against the resolved family.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KernelRec {
-    /// Every way the body referenced the invoked function itself.
+    /// Every way the body referenced the invoked function itself by NAME.
     pub self_refs: Box<[SelfRefKind]>,
     /// GLOBAL names of the OTHER functions the body calls recursively
     /// (mutual recursion): [`KOp::SelfCall`] `callee` `1 + i` targets the
@@ -1492,6 +1497,16 @@ pub struct KernelRec {
     /// a compatible recursive-class kernel, closed transitively over the
     /// whole call family.
     pub globals: Box<[Box<str>]>,
+    /// UPVALUE indices the body calls through (function-scoped recursion:
+    /// `const f = () => … f() …` self-capture, and function-scoped MUTUAL
+    /// recursion — `isEven`/`isOdd` defined inside a function capturing each
+    /// other): [`KOp::SelfCall`] `callee` `1 + globals.len() + j` targets
+    /// the closure held by the cell at `upvalues[j]`. Which family member
+    /// that is — the invoked closure itself or a partner — is resolved (and
+    /// re-verified) per activation by the entry guard; the cell must hold a
+    /// plain bytecode closure with a compatible kernel, closed transitively
+    /// over the whole call family.
+    pub upvalues: Box<[u32]>,
 }
 
 /// A numeric register's source: a frame local (read/write), a captured

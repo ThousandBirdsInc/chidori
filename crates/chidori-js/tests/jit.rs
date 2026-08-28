@@ -181,8 +181,21 @@ const CORPUS: &[&str] = &[
     // The depth budget: a too-deep recursion must abandon the native
     // activation and raise the SAME RangeError the generic path does.
     "function down(n) { return n === 0 ? 0 : down(n - 1) + 1; } try { console.log(down(1000000)); } catch (e) { console.log('deep', e instanceof RangeError); }",
-    // Mutual recursion stays on the windowed executor (family > 1).
+    // Function-scoped MUTUAL recursion: the resolver pins the captured
+    // partners into a family, compiled as mutually-calling native functions.
     "function isOdd(n) { return n === 0 ? false : isEvenM(n - 1); } function isEvenM(n) { return n === 0 ? true : isOdd(n - 1); } console.log(isEvenM(30), isOdd(17));",
+    // A three-member family with mixed step sizes (mod-3 classifier).
+    "function m0(n) { return n === 0 ? 0 : m2(n - 1); } function m2(n) { return n === 0 ? 2 : m1(n - 1); } function m1(n) { return n === 0 ? 1 : m0(n - 1); } let s = 0; for (let i = 0; i < 40; i++) { s = s * 3 + m0(i); s %= 1000003; } console.log(s);",
+    // A recursive function calling a captured NON-recursive helper: the
+    // helper joins the family as a plain member.
+    "function stepDown(x) { return x - 2; } function count(n) { return n <= 0 ? 0 : count(stepDown(n)) + 1; } console.log(count(31), count(0));",
+    // FAMILY IDENTITY: the captured callee binding is REASSIGNED between
+    // activations — the per-activation re-verification must decline the
+    // stale family/compiled code and still compute exactly.
+    "let helper = n => n === 0 ? 0 : walk(n - 1) + 1; function walk(n) { return n <= 0 ? 0 : helper(n - 1) + 2; } console.log(walk(9)); helper = n => 100; console.log(walk(9));",
+    // Mixed-return-type family (boolean entry, number partner): must
+    // decline the family tiers and stay exactly right generically.
+    "function evenish(n) { return n === 0 ? true : depth(n - 1) === 0; } function depth(n) { return n === 0 ? 0 : (evenish(n - 1) ? 1 : 2); } console.log(evenish(6), depth(5));",
     // Generator / async frames suspend AROUND kernel regions.
     "function* g() { let s = 0; for (let i = 0; i < 100; i++) { s += i; } yield s; for (let i = 0; i < 10; i++) { s -= i; } yield s; } const it = g(); console.log(it.next().value, it.next().value);",
     "(async () => { await 0; let s = 0; for (let i = 0; i < 50; i++) { s += i * i; } console.log('async', s); })();",
@@ -289,6 +302,39 @@ fn jit_off_by_default() {
     assert!(
         inner.kernels.iter().all(|k| k.native.get().is_none()),
         "the native tier must stay untouched with jit_enabled unset"
+    );
+}
+
+/// Cooperative interrupt inside NATIVE RECURSION: a shallow-but-hot family
+/// (fib with an argument that would run for hours) must still unwind
+/// promptly — the per-call poll counter in the activation context, at the
+/// interpreter's every-256-calls cadence.
+#[test]
+fn jit_recursion_interrupts() {
+    let proto = Rc::new(
+        compile_script(
+            "(function () { function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } fib(60); })();",
+        )
+        .expect("compiles"),
+    );
+    let mut engine = Engine::new();
+    engine.vm.jit_enabled = true;
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    engine.vm.interrupt = Some(flag.clone());
+    let setter = {
+        let flag = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        })
+    };
+    let func = engine.vm.make_closure(proto, Vec::new());
+    let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
+    setter.join().expect("setter thread");
+    let err = res.expect_err("interrupt must unwind the recursion");
+    assert!(
+        engine.vm.error_to_string(&err).contains("interrupted"),
+        "expected the interrupt error"
     );
 }
 

@@ -227,6 +227,11 @@ pub(crate) struct JitCtx {
     /// RECURSIVE kernels: the shared self-call poll counter (the
     /// interrupt-check cadence lives across frames, like the interpreter's).
     pub poll: u64,
+    /// RECURSIVE kernels: the resolved family's flattened upvalue-snapshot
+    /// table (`RecFamily::uv_flat`, member-major) — compiled members load
+    /// their upvalue registers from here at entry, at offsets fixed at
+    /// compile time. Null outside family runs.
+    pub rec_uv: *const f64,
 }
 
 impl JitCtx {
@@ -244,6 +249,7 @@ impl JitCtx {
             depth: 0,
             abandon: 0,
             poll: 0,
+            rec_uv: std::ptr::null(),
         }
     }
 }
@@ -367,6 +373,10 @@ struct Compiled {
     /// against these — a mismatch (the same call site pinning a different
     /// function) runs that activation on the interpreter tier.
     callees: Vec<Rc<crate::bytecode::FuncProto>>,
+    /// FAMILY compilations ([`compile_family`]): the callee map the members
+    /// were compiled against, identity-checked with `callees` per
+    /// activation. Empty otherwise.
+    family_map: Vec<Vec<u8>>,
     /// Slots the compiled code addresses in the register buffer: window 0
     /// plus one KWIN-strided window per inlined callee.
     min_regs: usize,
@@ -485,23 +495,38 @@ pub(crate) fn native_for(k: &Kernel) -> Option<NativeKernel> {
     native_for_loop(k, &[])
 }
 
-/// The compiled form of a SELF-ONLY recursive function kernel (the
-/// `run_fn_kernel_rec` seam), compiling on first use. Recursive kernels are
-/// reached exclusively through the windowed-executor path, so the same
-/// per-kernel cache slot holds this compilation.
-pub(crate) fn native_for_rec(k: &Kernel) -> Option<NativeKernel> {
-    k.native
-        .get_or_init(|| match compile_rec(k) {
-            Some(n) => {
-                STAT_COMPILED.fetch_add(1, Ordering::Relaxed);
-                Some(n)
-            }
-            None => {
-                STAT_DECLINED.fetch_add(1, Ordering::Relaxed);
-                None
-            }
-        })
-        .clone()
+/// The compiled form of a RESOLVED recursion family, entered through
+/// `k0` — the ENTRY member's kernel, whose cache slot holds the
+/// compilation (recursive kernels are reached exclusively through the
+/// windowed-executor path; a family entered through a different member
+/// compiles under THAT member's kernel). Compiled on first use against the
+/// resolving activation's family; a later activation whose resolution
+/// differs — other member closures' protos, or a different callee mapping —
+/// declines to the windowed executor.
+pub(crate) fn native_for_family(k0: &Kernel, fam: &crate::exec::RecFamily) -> Option<NativeKernel> {
+    let native = k0.native.get_or_init(|| match compile_family(fam) {
+        Some(n) => {
+            STAT_COMPILED.fetch_add(1, Ordering::Relaxed);
+            Some(n)
+        }
+        None => {
+            STAT_DECLINED.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    });
+    let nk = native.as_ref()?;
+    if nk.0.callees.len() != fam.funcs.len()
+        || !nk
+            .0
+            .callees
+            .iter()
+            .zip(&fam.funcs)
+            .all(|(p, bf)| Rc::ptr_eq(p, &bf.proto))
+        || nk.0.family_map != fam.callee_map
+    {
+        return None;
+    }
+    Some(nk.clone())
 }
 
 /// Convenience for the FUNCTION-kernel seam (no oslots/sslots by
@@ -807,18 +832,18 @@ fn callee_eligible(ck: &Kernel) -> bool {
             .any(|op| matches!(op, KOp::Exit { .. } | KOp::Ret { boolean: true, .. }))
 }
 
-/// Whether a SELF-ONLY recursive function kernel can compile to a native
-/// recursive function ([`compile_rec`]): no mutual-recursion partners, no
-/// cell writes, a frameless scalar body (function kernels have no
-/// oslots/sslots/props by construction — checked anyway), and every op in
-/// the subset with `SelfCall` allowed (callee 0 only) and `Exit` rejected.
-fn rec_eligible(k: &Kernel) -> bool {
-    k.rec.as_deref().is_some_and(|rec| rec.globals.is_empty())
-        && k.uv_writes.is_empty()
+/// Whether one RESOLVED-FAMILY member's kernel can compile into the
+/// family's native functions ([`compile_family`]): no cell writes, a
+/// frameless scalar body (function kernels have no oslots/sslots/props by
+/// construction — checked anyway), and every op in the subset with
+/// `SelfCall` allowed against the member's `n_callees`-entry callee row and
+/// `Exit` rejected.
+fn rec_member_eligible(k: &Kernel, n_callees: usize) -> bool {
+    k.uv_writes.is_empty()
         && k.oslots.is_empty()
         && k.sslots.is_empty()
         && k.props_used.is_empty()
-        && eligible_inner(k, &[], true)
+        && eligible_inner(k, &[], Some(n_callees))
 }
 
 /// Whether every op in `k` is in the subset this backend compiles, with
@@ -827,16 +852,16 @@ fn rec_eligible(k: &Kernel) -> bool {
 /// aimed at an inlinable resolved callee. A `false` pins the kernel to the
 /// interpreter tier — never an error.
 fn eligible(k: &Kernel, callees: &[(Rc<crate::bytecode::FuncProto>, u32)]) -> bool {
-    eligible_inner(k, callees, false)
+    eligible_inner(k, callees, None)
 }
 
-/// `allow_selfcall` selects the RECURSIVE-body dialect: `SelfCall` (callee
-/// 0) becomes legal and `Exit` illegal (a frameless recursive body has
-/// nothing to exit to).
+/// `rec_callees` selects the RECURSIVE-body dialect: `Some(n)` makes
+/// `SelfCall` legal against an `n`-entry callee row and `Exit` illegal (a
+/// frameless recursive body has nothing to exit to).
 fn eligible_inner(
     k: &Kernel,
     callees: &[(Rc<crate::bytecode::FuncProto>, u32)],
-    allow_selfcall: bool,
+    rec_callees: Option<usize>,
 ) -> bool {
     let n_regs = k.n_regs as usize;
     let len = k.code.len();
@@ -884,15 +909,17 @@ fn eligible_inner(
         KOp::Math2 { kind, dst, a, b } => {
             kind.arity() == 2 && r(dst) && r(a) && r(b) && next_ok(pc, 1)
         }
-        KOp::Exit { .. } => !allow_selfcall,
+        KOp::Exit { .. } => rec_callees.is_none(),
         KOp::Ret { .. } => true,
         KOp::SelfCall {
-            dst, base, callee, ..
+            dst,
+            base,
+            callee,
+            argc,
         } => {
-            allow_selfcall
-                && callee == 0
+            rec_callees.is_some_and(|n| (callee as usize) < n)
                 && r(dst)
-                && (base as usize + k.args_used as usize) <= n_regs
+                && (base as usize + argc as usize) <= n_regs
                 && next_ok(pc, 1)
         }
         KOp::LoadElem {
@@ -1024,25 +1051,42 @@ fn compile(k: &Kernel, callees: &[(Rc<crate::bytecode::FuncProto>, u32)]) -> Opt
         module: Some(module),
         entry,
         callees: callees.iter().map(|(p, _)| p.clone()).collect(),
+        family_map: Vec::new(),
         min_regs: KWIN * (1 + callees.len()),
     })))
 }
 
-/// Compile a SELF-ONLY recursive function kernel ([`rec_eligible`]) into a
-/// real native recursive function plus a standard-signature wrapper:
+/// Compile a RESOLVED recursion family ([`crate::exec::RecFamily`]) into
+/// one native function per member plus a standard-signature wrapper:
 ///
-/// - `rec(args…, upvals…, depth, interrupt, ctx) -> f64` — the body, with
-///   `SelfCall` a direct native call (depth-guarded and interrupt-polled at
-///   the interpreter's exact points; a flagged abandon unwinds every frame
-///   through `ctx.abandon`).
+/// - `rec<j>(args…, depth, interrupt, ctx) -> f64` — member `j`'s body,
+///   with every `SelfCall` a direct native call to the member its callee id
+///   resolved to (depth-guarded and interrupt-polled at the interpreter's
+///   exact points; a flagged abandon unwinds every frame through
+///   `ctx.abandon`). Upvalue registers load from the activation's
+///   `JitCtx::rec_uv` table at compile-fixed offsets.
 /// - `kernel(regs, interrupt, ctx) -> i64` — the exported entry: loads the
-///   pre-guarded window-0 arguments/upvalue snapshots from the register
-///   buffer, calls `rec` with `ctx.depth` (the remaining call-depth budget
-///   the seam computed), and returns `0` with the raw result in
-///   `ctx.scratch`, or [`REC_ABANDONED`] / [`INTERRUPTED`].
-fn compile_rec(k: &Kernel) -> Option<NativeKernel> {
-    if !rec_eligible(k) {
-        return None;
+///   pre-guarded window-0 arguments from the register buffer, calls `rec0`
+///   with `ctx.depth` (the remaining call-depth budget the seam computed),
+///   and returns `0` with the raw result in `ctx.scratch`, or
+///   [`REC_ABANDONED`] / [`INTERRUPTED`].
+///
+/// The compiled code is keyed to the RESOLVED family: member protos and the
+/// callee map are stored on the [`Compiled`] and identity-checked by every
+/// later activation ([`native_for_family`]); a family resolving differently
+/// (a reassigned cell or global) runs that activation on the windowed
+/// executor.
+fn compile_family(fam: &crate::exec::RecFamily) -> Option<NativeKernel> {
+    let n = fam.funcs.len();
+    let kernels: Vec<&Kernel> = fam
+        .funcs
+        .iter()
+        .map(|f| f.proto.fn_kernel.as_ref())
+        .collect::<Option<_>>()?;
+    for (j, k) in kernels.iter().enumerate() {
+        if !rec_member_eligible(k, fam.callee_map[j].len()) {
+            return None;
+        }
     }
     cranelift_native::builder().ok()?;
     let mut builder =
@@ -1052,49 +1096,97 @@ fn compile_rec(k: &Kernel) -> Option<NativeKernel> {
     }
     let mut module = JITModule::new(builder);
     let ptr_ty = module.target_config().pointer_type();
-    // Window slots by role, in the fixed order the signature uses.
-    let mut arg_slots: Vec<(usize, u16)> = Vec::new();
-    let mut upval_slots: Vec<usize> = Vec::new();
-    for (r, slot) in k.locals.iter().enumerate() {
-        match slot {
-            crate::bytecode::KSlot::Arg(a) => arg_slots.push((r, *a as u16)),
-            crate::bytecode::KSlot::Upvalue(_) => upval_slots.push(r),
-            crate::bytecode::KSlot::Local(_) => {}
+    // Per-member window-slot roles, in the fixed orders the signatures and
+    // the upvalue table use (the same `locals` iteration the resolver's
+    // `arg_slots`/`uv_snaps` were built from).
+    let mut arg_slots: Vec<Vec<(usize, u16)>> = Vec::with_capacity(n);
+    let mut upval_slots: Vec<Vec<usize>> = Vec::with_capacity(n);
+    for k in kernels.iter() {
+        let mut aslots = Vec::new();
+        let mut uslots = Vec::new();
+        for (r, slot) in k.locals.iter().enumerate() {
+            match slot {
+                crate::bytecode::KSlot::Arg(a) => aslots.push((r, *a as u16)),
+                crate::bytecode::KSlot::Upvalue(_) => uslots.push(r),
+                crate::bytecode::KSlot::Local(_) => {}
+            }
         }
+        arg_slots.push(aslots);
+        upval_slots.push(uslots);
     }
-    let mut rec_sig = module.make_signature();
-    for _ in 0..arg_slots.len() + upval_slots.len() {
-        rec_sig.params.push(AbiParam::new(types::F64));
+    // The flattened upvalue table's per-member bases (member-major, matching
+    // `RecFamily::uv_flat`).
+    let mut uv_bases = Vec::with_capacity(n);
+    let mut acc = 0usize;
+    for u in upval_slots.iter() {
+        uv_bases.push(acc);
+        acc += u.len();
     }
-    rec_sig.params.push(AbiParam::new(types::I64));
-    rec_sig.params.push(AbiParam::new(ptr_ty));
-    rec_sig.params.push(AbiParam::new(ptr_ty));
-    rec_sig.returns.push(AbiParam::new(types::F64));
-    let rec_id = module
-        .declare_function("rec", Linkage::Local, &rec_sig)
-        .ok()?;
-    let mut sig = module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty));
-    sig.params.push(AbiParam::new(ptr_ty));
-    sig.params.push(AbiParam::new(ptr_ty));
-    sig.returns.push(AbiParam::new(types::I64));
+    let callee_args: Rc<Vec<Vec<u16>>> = Rc::new(
+        arg_slots
+            .iter()
+            .map(|s| s.iter().map(|&(_, a)| a).collect())
+            .collect(),
+    );
+    let mut member_ids = Vec::with_capacity(n);
+    for (j, aslots) in arg_slots.iter().enumerate() {
+        let mut sig = module.make_signature();
+        for _ in 0..aslots.len() {
+            sig.params.push(AbiParam::new(types::F64));
+        }
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(types::F64));
+        member_ids.push(
+            module
+                .declare_function(&format!("rec{j}"), Linkage::Local, &sig)
+                .ok()?,
+        );
+    }
+    let mut wrap_sig = module.make_signature();
+    wrap_sig.params.push(AbiParam::new(ptr_ty));
+    wrap_sig.params.push(AbiParam::new(ptr_ty));
+    wrap_sig.params.push(AbiParam::new(ptr_ty));
+    wrap_sig.returns.push(AbiParam::new(types::I64));
     let wrap_id = module
-        .declare_function("kernel", Linkage::Export, &sig)
+        .declare_function("kernel", Linkage::Export, &wrap_sig)
         .ok()?;
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut mctx = module.make_context();
-    // The recursive body.
-    mctx.func.signature = rec_sig;
-    {
-        let frontend_config = module.target_config();
-        let b = FunctionBuilder::new(&mut mctx.func, &mut fb_ctx);
-        Translator::new_rec(b, &mut module, k, rec_id, &arg_slots, &upval_slots)
+    // Member bodies.
+    for j in 0..n {
+        let mut sig = module.make_signature();
+        for _ in 0..arg_slots[j].len() {
+            sig.params.push(AbiParam::new(types::F64));
+        }
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(types::F64));
+        mctx.func.signature = sig;
+        {
+            let frontend_config = module.target_config();
+            let b = FunctionBuilder::new(&mut mctx.func, &mut fb_ctx);
+            let cmap: Vec<u8> = fam.callee_map[j].clone();
+            Translator::new_family_member(
+                b,
+                &mut module,
+                kernels[j],
+                &member_ids,
+                cmap,
+                callee_args.clone(),
+                &arg_slots[j],
+                &upval_slots[j],
+                uv_bases[j],
+            )
             .translate(frontend_config)?;
+        }
+        module.define_function(member_ids[j], &mut mctx).ok()?;
+        module.clear_context(&mut mctx);
     }
-    module.define_function(rec_id, &mut mctx).ok()?;
-    module.clear_context(&mut mctx);
     // The wrapper.
-    mctx.func.signature = sig;
+    mctx.func.signature = wrap_sig;
     {
         let frontend_config = module.target_config();
         let mut b = FunctionBuilder::new(&mut mctx.func, &mut fb_ctx);
@@ -1105,17 +1197,9 @@ fn compile_rec(k: &Kernel) -> Option<NativeKernel> {
             let p = b.block_params(entry);
             (p[0], p[1], p[2])
         };
-        let rec_ref = module.declare_func_in_func(rec_id, b.func);
-        let mut args = Vec::with_capacity(arg_slots.len() + upval_slots.len() + 3);
-        for &(r, _) in &arg_slots {
-            args.push(b.ins().load(
-                types::F64,
-                MemFlagsData::trusted(),
-                regs_ptr,
-                (8 * r) as i32,
-            ));
-        }
-        for &r in &upval_slots {
+        let rec_ref = module.declare_func_in_func(member_ids[0], b.func);
+        let mut args = Vec::with_capacity(arg_slots[0].len() + 3);
+        for &(r, _) in &arg_slots[0] {
             args.push(b.ins().load(
                 types::F64,
                 MemFlagsData::trusted(),
@@ -1172,7 +1256,8 @@ fn compile_rec(k: &Kernel) -> Option<NativeKernel> {
     Some(NativeKernel(Rc::new(Compiled {
         module: Some(module),
         entry,
-        callees: Vec::new(),
+        callees: fam.funcs.iter().map(|f| f.proto.clone()).collect(),
+        family_map: fam.callee_map.clone(),
         min_regs: KWIN,
     })))
 }
@@ -1253,21 +1338,24 @@ struct InlineCallee {
     var_base: usize,
 }
 
-/// The RECURSIVE-body emission mode (see [`compile_rec`]): the function
-/// being built is the self-callable inner function, not the standard
-/// register-buffer wrapper — `Ret` returns its value directly, and
-/// `SelfCall` becomes a real native call through `self_ref`.
+/// The RECURSIVE-body emission mode (see [`compile_family`]): the function
+/// being built is one member of a resolved recursion family, not the
+/// standard register-buffer wrapper — `Ret` returns its value directly, and
+/// `SelfCall` becomes a real native call to the member its callee id
+/// resolved to.
 #[derive(Clone)]
 struct RecMode {
-    self_ref: FuncRef,
+    /// Every family member's function, importable from this one; a call
+    /// site picks `member_fns[cmap[callee]]`.
+    member_fns: Vec<FuncRef>,
+    /// This member's callee row (`RecFamily::callee_map[j]`).
+    cmap: Vec<u8>,
+    /// Per MEMBER: the kernel-arg index of each of its parameters, in
+    /// signature order — a call to member `t` passes `window[base + a]` for
+    /// each `a` in `callee_args[t]`.
+    callee_args: Rc<Vec<Vec<u16>>>,
     /// This frame's remaining depth budget (an i64 parameter).
     depth: cranelift_codegen::ir::Value,
-    /// The kernel-arg index of each argument parameter, in signature order —
-    /// a self-call passes `window[base + index]` for each.
-    arg_indices: Vec<u16>,
-    /// The upvalue parameters, re-passed verbatim on every self-call (cells
-    /// cannot change during an activation).
-    upval_params: Vec<cranelift_codegen::ir::Value>,
     /// Sets `ctx.abandon = 1` (depth exhausted) and returns 0.0.
     abandon_depth: Block,
     /// Returns 0.0 with `ctx.abandon` already set (post-call unwind).
@@ -1434,32 +1522,62 @@ impl<'a> Translator<'a> {
     /// blocks (depth-abandon, interrupt-abandon, post-call unwind) are
     /// pre-filled here. Signature:
     /// `(args…, upvals…, depth: i64, interrupt: ptr, ctx: ptr) -> f64`.
-    fn new_rec(
+    /// Constructor for one FAMILY MEMBER's body (see [`compile_family`]):
+    /// window registers come from PARAMETERS (this member's consumed
+    /// arguments) and the activation's flattened upvalue-snapshot table
+    /// (`JitCtx::rec_uv`, this member's slice at `uv_flat_base`); locals are
+    /// scratch. Signature: `(args…, depth: i64, interrupt: ptr, ctx: ptr)
+    /// -> f64`. The landing blocks (depth-abandon, interrupt-abandon,
+    /// post-call unwind) are pre-filled here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one-call-site constructor threading the family tables"
+    )]
+    fn new_family_member(
         mut b: FunctionBuilder<'a>,
         module: &'a mut JITModule,
         k: &'a Kernel,
-        rec_id: cranelift_module::FuncId,
+        member_ids: &[cranelift_module::FuncId],
+        cmap: Vec<u8>,
+        callee_args: Rc<Vec<Vec<u16>>>,
         arg_slots: &[(usize, u16)],
         upval_slots: &[usize],
+        uv_flat_base: usize,
     ) -> Self {
-        let self_ref = module.declare_func_in_func(rec_id, b.func);
+        let member_fns: Vec<FuncRef> = member_ids
+            .iter()
+            .map(|id| module.declare_func_in_func(*id, b.func))
+            .collect();
         let ptr_ty = module.target_config().pointer_type();
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let params: Vec<cranelift_codegen::ir::Value> = b.block_params(entry).to_vec();
         let n_args = arg_slots.len();
-        let n_upvals = upval_slots.len();
-        let depth = params[n_args + n_upvals];
-        let int_ptr = params[n_args + n_upvals + 1];
-        let ctx_ptr = params[n_args + n_upvals + 2];
+        let depth = params[n_args];
+        let int_ptr = params[n_args + 1];
+        let ctx_ptr = params[n_args + 2];
         let n_regs = k.n_regs as usize;
         let mut init: Vec<Option<cranelift_codegen::ir::Value>> = vec![None; n_regs];
         for (j, &(r, _)) in arg_slots.iter().enumerate() {
             init[r] = Some(params[j]);
         }
-        for (j, &r) in upval_slots.iter().enumerate() {
-            init[r] = Some(params[n_args + j]);
+        if !upval_slots.is_empty() {
+            let uv_tab = b.ins().load(
+                ptr_ty,
+                MemFlagsData::trusted(),
+                ctx_ptr,
+                std::mem::offset_of!(JitCtx, rec_uv) as i32,
+            );
+            for (j, &r) in upval_slots.iter().enumerate() {
+                let v = b.ins().load(
+                    types::F64,
+                    MemFlagsData::trusted(),
+                    uv_tab,
+                    (8 * (uv_flat_base + j)) as i32,
+                );
+                init[r] = Some(v);
+            }
         }
         let zero = b.ins().f64const(0.0);
         let mut vars = Vec::with_capacity(n_regs);
@@ -1492,8 +1610,6 @@ impl<'a> Translator<'a> {
         b.switch_to_block(ret_zero);
         let z = b.ins().f64const(0.0);
         b.ins().return_(&[z]);
-        let arg_indices = arg_slots.iter().map(|&(_, a)| a).collect();
-        let upval_params = params[n_args..n_args + n_upvals].to_vec();
         Translator {
             b,
             module,
@@ -1503,10 +1619,10 @@ impl<'a> Translator<'a> {
             inline_ret: None,
             callees: Vec::new(),
             rec: Some(RecMode {
-                self_ref,
+                member_fns,
+                cmap,
+                callee_args,
                 depth,
-                arg_indices,
-                upval_params,
                 abandon_depth,
                 ret_zero,
             }),
@@ -2404,21 +2520,18 @@ impl<'a> Translator<'a> {
             } => {
                 self.emit_call_kernel(dst, fslot, base)?;
             }
-            // A direct self-recursive call (recursive bodies only; see
-            // `compile_rec`): the interpreter's per-call depth guard and
-            // shared poll, then a real native call to this very
-            // function, then the abandon-unwind check.
+            // A family call (recursive bodies only; see `compile_family`):
+            // the interpreter's per-call depth guard and shared poll, then a
+            // real native call to the member the callee id resolved to, then
+            // the abandon-unwind check.
             KOp::SelfCall {
                 dst,
                 base,
                 argc: _,
                 callee,
             } => {
-                if callee != 0 {
-                    return None;
-                }
                 let rec = self.rec.clone()?;
-                self.emit_self_call(&rec, dst, base)?;
+                self.emit_self_call(&rec, dst, base, callee)?;
             }
             // Excluded by `eligible`.
             KOp::LoadProp { .. } | KOp::StoreProp { .. } => return None,
@@ -2426,9 +2539,10 @@ impl<'a> Translator<'a> {
         Some(fallthrough)
     }
 
-    /// One self-recursive call site (recursive bodies; see the `SelfCall`
-    /// arm): depth guard → shared poll → native self-call → abandon check.
-    fn emit_self_call(&mut self, rec: &RecMode, dst: u16, base: u16) -> Option<()> {
+    /// One family call site (recursive bodies; see the `SelfCall` arm):
+    /// depth guard → shared poll → native call to the resolved member →
+    /// abandon check.
+    fn emit_self_call(&mut self, rec: &RecMode, dst: u16, base: u16, callee: u16) -> Option<()> {
         // Depth: the interpreter abandons when the NEXT frame would exceed
         // the budget — i.e. when this frame's remaining budget is < 1.
         let depth_ok = self.b.create_block();
@@ -2437,8 +2551,11 @@ impl<'a> Translator<'a> {
             .ins()
             .brif(out_of_depth, rec.abandon_depth, &[], depth_ok, &[]);
         self.b.switch_to_block(depth_ok);
-        // Shared poll counter (ctx-resident so the cadence spans frames,
-        // like the interpreter's activation-wide counter).
+        // Shared per-CALL poll counter (ctx-resident so the every-256-calls
+        // cadence spans frames, like the interpreter's activation-wide
+        // counter — a depth-derived poll would never fire on a shallow-but-
+        // hot recursion). Same cache line as the rest of the ctx; the
+        // store-to-load chain is cheap next to the call itself.
         let poll_off = std::mem::offset_of!(JitCtx, poll) as i32;
         let p = self
             .b
@@ -2460,18 +2577,22 @@ impl<'a> Translator<'a> {
         // intr_block in rec mode sets `abandon = 2` and returns.
         self.b.ins().brif(flag, self.intr_block, &[], call_b, &[]);
         self.b.switch_to_block(call_b);
-        // Arguments from the call site's contiguous registers, upvalues
-        // re-passed, one less depth.
-        let mut call_args = Vec::with_capacity(rec.arg_indices.len() + rec.upval_params.len() + 3);
-        for &a in &rec.arg_indices {
+        // Resolve the callee id through this member's row and pass the
+        // TARGET's consumed arguments from the call site's contiguous
+        // registers, one less depth. (The resolution cross-check proved
+        // every target argument index < the site's argc.)
+        let t = *rec.cmap.get(callee as usize)? as usize;
+        let target_args = rec.callee_args.get(t)?;
+        let mut call_args = Vec::with_capacity(target_args.len() + 3);
+        for &a in target_args.iter() {
             call_args.push(self.get(base + a));
         }
-        call_args.extend_from_slice(&rec.upval_params);
         let next_depth = self.b.ins().iadd_imm_s(rec.depth, -1i64);
         call_args.push(next_depth);
         call_args.push(self.int_ptr);
         call_args.push(self.ctx_ptr);
-        let call = self.b.ins().call(rec.self_ref, &call_args);
+        let target_fn = *rec.member_fns.get(t)?;
+        let call = self.b.ins().call(target_fn, &call_args);
         let ret = self.b.inst_results(call)[0];
         // A flagged abandon/interrupt anywhere below unwinds every frame.
         let ab = self.b.ins().load(

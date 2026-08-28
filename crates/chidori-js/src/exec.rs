@@ -84,27 +84,34 @@ pub(crate) struct RecGlobalCheck {
 /// eviction is only ever a perf event, never observable.
 pub(crate) struct RecFamily {
     /// The family members; `funcs[0]` is the entry closure (cache key).
-    funcs: Vec<Rc<BytecodeFunction>>,
+    pub(crate) funcs: Vec<Rc<BytecodeFunction>>,
     /// `callee_map[j][c]` = `funcs` index for member `j`'s `SelfCall`
-    /// callee `c` (`c = 0` is `j` itself; `c = 1 + i` is `rec.globals[i]`).
-    callee_map: Vec<Vec<u8>>,
+    /// callee `c` (`c = 0` is `j` itself; `c = 1 + i` is `rec.globals[i]`;
+    /// `c = 1 + globals.len() + j2` is `rec.upvalues[j2]`'s resolution).
+    pub(crate) callee_map: Vec<Vec<u8>>,
     /// Per-member register-window size.
     /// Per-member (register, argument index) entry loads.
-    arg_slots: Vec<Vec<(usize, usize)>>,
+    pub(crate) arg_slots: Vec<Vec<(usize, usize)>>,
     /// Per-member (register, upvalue index, snapshot) — the VALUE is
     /// refreshed on every activation (cells can change between calls, never
     /// during one).
     uv_snaps: Vec<Vec<(usize, u32, f64)>>,
+    /// The upvalue snapshots FLATTENED, member-major in `uv_snaps` order —
+    /// the table the `jit` tier's compiled members read their upvalue
+    /// registers from (`JitCtx::rec_uv`); refreshed alongside `uv_snaps`.
+    pub(crate) uv_flat: Vec<f64>,
     /// Every global binding the family's guard depends on.
     global_checks: Vec<RecGlobalCheck>,
-    /// (member, upvalue index) self-references: the cell must hold that
-    /// member's own closure.
-    upval_self_checks: Vec<(u8, u32)>,
+    /// (member, upvalue index, resolved member) upvalue CALLEES: the cell
+    /// at member `m`'s upvalue `u` must hold `funcs[resolved]` — the
+    /// per-activation re-verification of function-scoped self/mutual
+    /// recursion (a reassigned cell declines to the generic path).
+    upval_checks: Vec<(u8, u32, u8)>,
     /// Members whose kernels use `Math` intrinsics (canonicals re-verified
     /// per activation).
     math_members: Vec<u8>,
     /// The family's uniform `Ret` register type.
-    ret_bool: bool,
+    pub(crate) ret_bool: bool,
 }
 
 /// Outcome of a kernel activation attempt for the caller's tier to act on:
@@ -1125,6 +1132,7 @@ impl Vm {
                     depth: 0,
                     abandon: 0,
                     poll: 0,
+                    rec_uv: std::ptr::null(),
                 };
                 native.run(&mut regs, interrupt.as_deref(), &mut ctx)
             });
@@ -1793,9 +1801,11 @@ impl Vm {
     /// `Value`. Entry resolves the recursion FAMILY once:
     ///
     /// - Every [`SelfRefKind`] must hold for its member — a `Global` name
-    ///   must be a plain data property holding that very closure, an
-    ///   `Upvalue` cell must contain it (pointer identity) — so a
-    ///   shadowed/rebound/accessor'd reference declines to the generic path.
+    ///   must be a plain data property holding that very closure — and every
+    ///   UPVALUE callee cell must hold the member it resolved to (pointer
+    ///   identity; self for a self-capture, the partner for function-scoped
+    ///   mutual recursion), so a shadowed/rebound/accessor'd reference
+    ///   declines to the generic path.
     /// - Each [`KernelRec::globals`] name must resolve to a plain sync
     ///   bytecode closure carrying a function kernel, transitively closed
     ///   over the whole family (bounded), with every member's `Ret` type
@@ -1862,20 +1872,22 @@ impl Vm {
             regs[r] = v;
         }
 
-        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): a SELF-ONLY
-        // family (no mutual-recursion partners) compiles to a real native
-        // recursive function (`crate::jit::compile_rec`). Everything the
-        // windowed executor establishes still holds: the family resolution
-        // above verified the self-references, window 0 is loaded with the
-        // guarded arguments and upvalue snapshots, and the native code
+        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): the RESOLVED
+        // family compiles to one native function per member, mutually
+        // calling each other directly (`crate::jit::compile_family`).
+        // Everything the windowed executor establishes still holds: the
+        // resolution above verified every self-reference and callee cell,
+        // window 0 is loaded with the guarded arguments, upvalue snapshots
+        // travel through the family's flattened table, and the native code
         // mirrors the executor's exact per-call depth guard (abandoning
         // into the generic rerun, which raises the spec RangeError) and
         // interrupt-poll placement.
         #[cfg(feature = "jit")]
-        if self.jit_enabled && fam.funcs.len() == 1 {
-            if let Some(native) = crate::jit::native_for_rec(k0) {
+        if self.jit_enabled {
+            if let Some(native) = crate::jit::native_for_family(k0, &fam) {
                 let mut jctx = crate::jit::JitCtx::empty();
                 jctx.depth = self.max_call_depth.saturating_sub(self.call_depth) as i64;
+                jctx.rec_uv = fam.uv_flat.as_ptr();
                 let code = native.run(&mut regs, self.interrupt.as_deref(), &mut jctx);
                 let raw = jctx.scratch;
                 self.kernel_regs = regs;
@@ -2257,14 +2269,14 @@ impl Vm {
                 }
             }
         }
-        for &(m, u) in fam.upval_self_checks.iter() {
+        for &(m, u, target) in fam.upval_checks.iter() {
             let f = &fam.funcs[m as usize];
             let ok = matches!(
                 &*f.upvalues[u as usize].borrow(),
                 Value::Object(o) if matches!(
                     &o.borrow().internal,
                     Internal::Function(FunctionInner::Bytecode(bf2))
-                        if Rc::ptr_eq(bf2, f)
+                        if Rc::ptr_eq(bf2, &fam.funcs[target as usize])
                 )
             );
             if !ok {
@@ -2284,12 +2296,20 @@ impl Vm {
         // Refresh upvalue snapshots: cells can change BETWEEN activations
         // (never during one — kernels contain no calls).
         let RecFamily {
-            funcs, uv_snaps, ..
+            funcs,
+            uv_snaps,
+            uv_flat,
+            ..
         } = fam;
+        let mut flat = 0usize;
         for (f, uvs) in funcs.iter().zip(uv_snaps.iter_mut()) {
             for (_, u, v) in uvs.iter_mut() {
                 match &*f.upvalues[*u as usize].borrow() {
-                    Value::Number(n) => *v = *n,
+                    Value::Number(n) => {
+                        *v = *n;
+                        uv_flat[flat] = *n;
+                        flat += 1;
+                    }
                     _ => return false,
                 }
             }
@@ -2318,7 +2338,7 @@ impl Vm {
         // (c = 0 is j itself; c = 1 + i is j's rec.globals[i]).
         let mut callee_map: Vec<Vec<u8>> = Vec::new();
         let mut global_checks: Vec<RecGlobalCheck> = Vec::new();
-        let mut upval_self_checks: Vec<(u8, u32)> = Vec::new();
+        let mut upval_checks: Vec<(u8, u32, u8)> = Vec::new();
         let mut math_members: Vec<u8> = Vec::new();
         let mut wl = 0usize;
         while wl < funcs.len() {
@@ -2379,21 +2399,6 @@ impl Vm {
                                 _ => return None,
                             }
                         }
-                        crate::bytecode::SelfRefKind::Upvalue(u) => {
-                            let cell = f.upvalues.get(*u as usize)?;
-                            let ok = matches!(
-                                &*cell.borrow(),
-                                Value::Object(o) if matches!(
-                                    &o.borrow().internal,
-                                    Internal::Function(FunctionInner::Bytecode(bf2))
-                                        if Rc::ptr_eq(bf2, &f)
-                                )
-                            );
-                            if !ok {
-                                return None;
-                            }
-                            upval_self_checks.push((wl as u8, *u));
-                        }
                     }
                 }
             }
@@ -2449,6 +2454,38 @@ impl Vm {
                     });
                     cmap.push(u8::try_from(idx).ok()?);
                 }
+                // UPVALUE callees (function-scoped self/mutual recursion):
+                // whatever plain sync bytecode closure with a function
+                // kernel the cell holds joins the family — the member
+                // itself for a self-capture, a partner for `isEven`/`isOdd`
+                // pairs. The (member, upvalue, resolved) triple is
+                // re-verified per activation, so a reassigned cell declines.
+                for &u in rec.upvalues.iter() {
+                    let cell = f.upvalues.get(u as usize)?;
+                    let bf2 = match &*cell.borrow() {
+                        Value::Object(o) => match &o.borrow().internal {
+                            Internal::Function(FunctionInner::Bytecode(bf2))
+                                if !bf2.is_class_ctor
+                                    && !bf2.proto.kind.is_generator()
+                                    && !bf2.proto.kind.is_async() =>
+                            {
+                                bf2.clone()
+                            }
+                            _ => return None,
+                        },
+                        _ => return None,
+                    };
+                    bf2.proto.fn_kernel.as_ref()?;
+                    let idx = match funcs.iter().position(|x| Rc::ptr_eq(x, &bf2)) {
+                        Some(i) => i,
+                        None => {
+                            funcs.push(bf2);
+                            funcs.len() - 1
+                        }
+                    };
+                    upval_checks.push((wl as u8, u, u8::try_from(idx).ok()?));
+                    cmap.push(u8::try_from(idx).ok()?);
+                }
             }
             callee_map.push(cmap);
             wl += 1;
@@ -2480,6 +2517,10 @@ impl Vm {
             arg_slots.push(aslots);
             uv_snaps.push(uvs);
         }
+        let uv_flat: Vec<f64> = uv_snaps
+            .iter()
+            .flat_map(|uvs| uvs.iter().map(|&(_, _, v)| v))
+            .collect();
         for (j, f) in funcs.iter().enumerate() {
             let k = f.proto.fn_kernel.as_ref()?;
             for op in k.code.iter() {
@@ -2497,8 +2538,9 @@ impl Vm {
             callee_map,
             arg_slots,
             uv_snaps,
+            uv_flat,
             global_checks,
-            upval_self_checks,
+            upval_checks,
             math_members,
             ret_bool,
         })

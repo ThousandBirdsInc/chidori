@@ -1,11 +1,10 @@
-// The recursion shape the fast tiers still decline: MUTUAL recursion through
-// function-scoped bindings (isEven/isOdd — the recursion-family executor and
-// the opt-in JIT resolve mutual partners through GLOBAL bindings only), so
-// that pair runs on the generic call path and this row measures the call
-// ceremony extending the family resolution would remove. gcd, by contrast,
-// is SELF-recursion through a `const` binding, which the tiers (and the JIT,
-// as a native recursive function) do take. Deterministic (no RNG) so every
-// runtime computes the same checksum.
+// Function-scoped recursion in both shapes the family tiers resolve:
+// MUTUAL recursion through captured bindings (isEven/isOdd — the resolver
+// pins whatever compatible closure each callee-position cell holds, so the
+// pair becomes a two-member family: windowed on the interpreter, two
+// mutually-calling native functions under the opt-in JIT) and SELF-recursion
+// through a `const` binding (gcd). Deterministic (no RNG) so every runtime
+// computes the same checksum.
 (function () {
   function isEven(n) {
     return n === 0 ? true : isOdd(n - 1);
