@@ -32,6 +32,12 @@ fn run(src: &str, jit: bool) -> (bool, Vec<String>, String) {
     let proto = Rc::new(compile_script(&wrapped).expect("compiles"));
     let mut engine = Engine::new();
     engine.vm.jit_enabled = jit;
+    // The depth-limit corpus entries recurse to the budget, and the generic
+    // rerun's ~per-call interpreter frames are debug-build large; the
+    // default budget (2000) is calibrated for main-thread stacks, not the
+    // test harness's. A smaller budget exercises the identical abandon /
+    // RangeError paths within the corpus thread's stack.
+    engine.vm.max_call_depth = 1000;
     let func = engine.vm.make_closure(proto, Vec::new());
     let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
     let _ = engine.vm.run_jobs_until_blocked();
@@ -148,8 +154,16 @@ const CORPUS: &[&str] = &[
     "const txt = 'kernel'; let s = 0; for (let i = 0; i < txt.length; i++) { s += txt.charCodeAt(i); } console.log(s);",
     "const txt = 'abcdef'; let h = 0; for (let r = 0; r < 5; r++) { for (let i = 0; i < txt.length; i++) { h = (h * 31 + txt.charCodeAt(i)) % 1000000007; } } console.log(h);",
     "const txt = 'xy'; let c = 0; for (let i = -1; i < 4; i++) { const v = txt.charCodeAt(i); c += v === v ? v : 1000; } console.log(c);",
-    // Pinned-callee loops stay on the interpreter tier (CallKernel declines).
+    // Pinned-callee loops: the callee kernel INLINES into the compiled
+    // caller (a global-resolved callee and an oslot-resolved closure).
     "function dbl(x) { return x * 2; } let s = 0; for (let i = 0; i < 100; i++) { s += dbl(i); } console.log(s);",
+    "function adder(n) { return function (x) { return x + n; }; } let f = adder(5); let s = 0; for (let i = 0; i < 200; i++) { s = f(s) - 4; } f = adder(9); for (let i = 0; i < 50; i++) { s = f(s) - 8; } console.log(s);",
+    // Identity guard: the SAME kernel re-activated with a DIFFERENT pinned
+    // callee proto must decline the compiled code (interpreter tier) and
+    // still compute identically; re-pinning the compiled proto re-enters it.
+    "function add1(x) { return x + 1; } function trpl(x) { return x * 3; } function runWith(f, n) { let s = 1; for (let i = 0; i < n; i++) { s = f(s) % 97; } return s; } console.log(runWith(add1, 50), runWith(trpl, 50), runWith(add1, 7));",
+    // A Math-using callee (entry-guard canonicals) inlined into the caller.
+    "function clampP(x) { return Math.min(Math.max(x, -3), 3); } let s = 0; for (let i = -10; i < 10; i++) { s += clampP(i); } console.log(s);",
     // FUNCTION kernels through the frameless call path: plain scalar...
     "function cmp(a, b) { return a - b; } let s = 0; for (let i = 0; i < 50; i++) { s += cmp(i, 25); } console.log(s, [3,1,2].sort(cmp).join(''));",
     "function clamp(x) { return Math.min(Math.max(x, 0), 10); } let s = 0; for (let i = -5; i < 20; i++) { s += clamp(i); } console.log(s);",
@@ -157,8 +171,17 @@ const CORPUS: &[&str] = &[
     "function isEven(n) { return n % 2 === 0; } let c = 0; for (let i = 0; i < 20; i++) { if (isEven(i)) c++; } console.log(c, typeof isEven(2));",
     // ...cell-writing (uv_writes flush on the native path)...
     "function mkAcc() { let total = 0; return function (x) { total += x; return total; }; } const acc = mkAcc(); let last = 0; for (let i = 1; i <= 10; i++) { last = acc(i); } console.log(last);",
-    // ...and recursive (SelfCall declines translation; windowed executor).
+    // ...and recursive: SELF-only recursion compiles to a real native
+    // recursive function (global and captured-binding self-references,
+    // boolean returns, helpers in the body)...
     "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } console.log(fib(20));",
+    "const gcd = (a, b) => b === 0 ? a : gcd(b, a % b); console.log(gcd(1071, 462), gcd(35, 64));",
+    "const isE = n => n === 0 ? true : !isE(n - 1); console.log(isE(10), isE(7));",
+    "function pow2(n) { return n === 0 ? 1 : 2 * pow2(n - 1); } function deep(n) { return n === 0 ? 0 : deep(n - 1) + 1; } console.log(pow2(20), deep(800));",
+    // The depth budget: a too-deep recursion must abandon the native
+    // activation and raise the SAME RangeError the generic path does.
+    "function down(n) { return n === 0 ? 0 : down(n - 1) + 1; } try { console.log(down(1000000)); } catch (e) { console.log('deep', e instanceof RangeError); }",
+    // Mutual recursion stays on the windowed executor (family > 1).
     "function isOdd(n) { return n === 0 ? false : isEvenM(n - 1); } function isEvenM(n) { return n === 0 ? true : isOdd(n - 1); } console.log(isEvenM(30), isOdd(17));",
     // Generator / async frames suspend AROUND kernel regions.
     "function* g() { let s = 0; for (let i = 0; i < 100; i++) { s += i; } yield s; for (let i = 0; i < 10; i++) { s -= i; } yield s; } const it = g(); console.log(it.next().value, it.next().value);",
@@ -170,16 +193,27 @@ const CORPUS: &[&str] = &[
 ];
 
 /// The load-bearing gate: byte-identical observable behavior, tier on vs off.
+/// Runs on a big-stack thread: the depth-limit corpus entry legitimately
+/// recurses to `max_call_depth` (~2000 interpreter frames on the generic
+/// rerun), which is calibrated for main-thread stacks, not the test
+/// harness's smaller worker stacks.
 #[test]
 fn jit_matches_interpreter() {
-    for src in CORPUS {
-        let with_jit = run(src, true);
-        let without = run(src, false);
-        assert_eq!(
-            with_jit, without,
-            "JIT-on and JIT-off behavior diverged for:\n{src}"
-        );
-    }
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(|| {
+            for src in CORPUS {
+                let with_jit = run(src, true);
+                let without = run(src, false);
+                assert_eq!(
+                    with_jit, without,
+                    "JIT-on and JIT-off behavior diverged for:\n{src}"
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("corpus thread");
 }
 
 /// Structural: the corpus actually exercises the native tier — kernels
@@ -206,21 +240,22 @@ fn jit_actually_compiles_and_runs() {
 }
 
 /// Structural: a kernel outside the compiled subset (here a pinned-callee
-/// loop, `KOp::CallKernel`) declines translation — staying on the
+/// loop whose callee WRITES a captured cell — per-call cell flushes belong
+/// to the interpreter tier) declines translation, staying on the
 /// interpreter tier rather than erroring — and still computes correctly.
 #[test]
 fn jit_declines_non_scalar_kernels() {
     let before = chidori_js::jit::stats();
     let (threw, console, _err) = run(
-        "function dbl(x) { return x * 2; } let s = 0; for (let i = 0; i < 200; i++) { s += dbl(i); } console.log(s);",
+        "function mk() { let t = 0; return function (x) { t += x; return t; }; } const acc = mk(); let s = 0; for (let i = 0; i < 100; i++) { s = acc(i); } console.log(s);",
         true,
     );
     assert!(!threw);
-    assert_eq!(console, vec!["39800".to_string()]);
+    assert_eq!(console, vec!["4950".to_string()]);
     let after = chidori_js::jit::stats();
     assert!(
         after.declined > before.declined,
-        "expected the pinned-callee loop kernel to decline JIT translation"
+        "expected the cell-writing pinned-callee kernel to decline JIT translation"
     );
 }
 

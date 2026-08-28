@@ -45,42 +45,72 @@ unboxed `f64` register program. The retired closure-threading experiment
 ([`docs/jit.md`](./jit.md)) showed dispatch alone was never the cost; the
 kernels removed the boxed-`Value` traffic and got the real win in safe Rust.
 What the interpreter still pays on a kernel is the `KOp` dispatch loop itself.
-This tier compiles that away: `src/jit.rs` translates the **scalar subset** of
-`KOp` (moves, constants, arithmetic, comparisons, branches, the fused
-superinstructions, `Math` intrinsics, `Exit`/`Ret`) into one native function
-per kernel via `cranelift-jit`, compiled on the kernel's first activation with
-the tier enabled and cached on the kernel (`Kernel::native`).
+This tier compiles that away: `src/jit.rs` translates kernel programs into
+native functions via `cranelift-jit`, compiled on a kernel's first activation
+with the tier enabled and cached on the kernel (`Kernel::native`). The
+compiled subset now covers essentially the whole kernel language:
 
-A kernel containing anything outside that subset — element access, `.length`,
-pinned `push`/`pop`/`charCodeAt`, pinned-callee calls, recursion — declines
-translation **as a whole** and keeps running on the interpreter tier. That
-choice is load-bearing: with no native↔interpreter transition inside an
-activation there is no OSR, no deopt, and no frame reconstruction — the
-correctness surface the roadmap called "the largest this engine would ever
-take on" is simply not taken on. The native function is a drop-in replacement
-for the dispatch loop *between* the existing entry guard and the existing exit
-materialization:
+- **Scalars**: moves, constants, arithmetic, comparisons, branches, the
+  fused superinstructions, `typeof`-free boolean logic. Only bit-exact IEEE
+  operations are inlined (`+ - * /`, negation, ordered comparisons, `abs`/
+  `floor`/`ceil`/`trunc`/`sqrt`, `Math.min`/`max` via wasm-semantics
+  `fmin`/`fmax`); everything JS-specific — the cold tail of `ToInt32` (the
+  hot `|x| < 2^63` path is one inlined saturating conversion), `%`'s
+  non-integer cases (the integer fast path is inlined with `js_mod`'s exact
+  guards), `**`, `Math.round`/`sign`/`fround`/`imul`'s cores — calls back
+  into the same `number_arith_raw`/`builtins::numbers` functions the
+  interpreter uses.
+- **Elements**: f64 typed arrays read/write raw storage directly in IR
+  (bounds + `dense_index` conditions folded into one unsigned compare
+  against an entry-clamped bound); dense arrays get a read-only direct view
+  (slot tag + payload loads over `Value`'s `#[repr(u8)]` layout, verified by
+  a live self-check) in kernels that provably never store/push/pop.
+  Everything else element-shaped — other typed-array kinds, dense writes,
+  `push`/`pop`, `.length` on non-viewed bases — goes through `extern "C"`
+  shims that call the *same* extracted fast-path cores the interpreter arms
+  use (`kernel_elem_load`/`store`/`len`, `kernel_array_push`/`pop`), with
+  the op's exact bail edge on a miss.
+- **Pinned strings**: `StrLen`/`CharCodeAt` over the entry-hoisted
+  flat-ASCII view — total, no bail, NaN on out-of-range exactly like the
+  interpreter.
+- **Pinned callees** (`CallKernel`): the resolved callee's function kernel
+  is INLINED at each call site — the `adder`-closure-in-a-loop pattern
+  compiles to the same loop V8 would make of it. The code is compiled
+  against the compiling activation's resolved callee protos and every later
+  activation identity-checks its own resolution (`Rc::ptr_eq`); a mismatch
+  runs that activation on the interpreter tier. Closure *instances* may
+  differ freely — their upvalue snapshots travel through the register
+  buffer.
+- **Self-recursion** (`SelfCall`, self-only families): the kernel compiles
+  to a real native recursive function (plus a standard-signature wrapper),
+  with the interpreter's exact per-call depth guard — exhaustion abandons
+  the pure activation through a context flag that unwinds every native
+  frame, and the generic rerun raises the spec RangeError — and the shared
+  interrupt-poll cadence. Mutual recursion stays on the windowed executor.
+
+Kernels containing anything outside this (cell-writing callees, mutual
+recursion, surviving property ops) decline translation **as a whole** and
+keep running on the interpreter tier. There is still no OSR, no deopt, and no
+frame reconstruction anywhere: bail edges jump to the kernel's own `Exit`
+stubs, exactly as the interpreter's fast-path misses do. The native function
+remains a drop-in replacement for the dispatch loop *between* the existing
+entry guard and the existing exit materialization:
 
 - **Entry** — the caller has already run the full activation guard and loaded
-  the register buffer; the native code loads every register from it.
-- **Exit** — the native code stores every register back and returns the index
-  of the `Exit`/`Ret` op it reached (or an interrupt sentinel). The caller
-  then runs the *same* write-back, operand-shape materialization, futility
-  accounting, and return-value construction the interpreter tier runs. (In
-  `run_kernel_op_impl` this is literal: the interpreter loop is entered at the
-  returned `Exit` index, so the exit path is shared instruction-for-
-  instruction.)
-- **Semantics are shared, not re-implemented** — only bit-exact IEEE
-  operations are inlined (`+ - * /`, negation, ordered comparisons, `abs`/
-  `floor`/`ceil`/`trunc`/`sqrt`); `%`, `**`, the `ToInt32` bitwise family,
-  and `Math.round`/`sign`/`fround`/`min`/`max`/`imul` call back into the same
-  `number_arith_raw`/`builtins::numbers` cores the interpreter uses. NaN,
-  `-0`, shift masking, `ToInt32` far outside the i64 range — identical by
-  construction.
+  the register buffer; native code loads every register (and the
+  activation-constant tables: string views, element views, pinned-callee
+  upvalue windows) from it and the per-activation `JitCtx`.
+- **Exit** — native code stores every register back and returns the index
+  of the `Exit`/`Ret` op it reached (or an interrupt/abandon sentinel). The
+  caller then runs the *same* write-back, operand-shape materialization,
+  futility accounting, and return-value construction the interpreter tier
+  runs. (In `run_kernel_op_impl` this is literal: the interpreter loop is
+  entered at the returned `Exit` index, so the exit path is shared
+  instruction-for-instruction.)
 - **Interrupts** — taken backward branches count toward a poll and check the
   cooperative-interrupt flag every 256th take, the interpreter's exact
-  cadence; an observed interrupt unwinds through the same latch (registers
-  written back, `op_budget` zeroed, the same RangeError).
+  cadence; recursive kernels poll on the shared per-activation counter at
+  the interpreter's per-call points.
 
 ## Determinism
 
@@ -109,9 +139,12 @@ ops faster), which is already timing-dependent under the interpreter.
   this feature** (`lib.rs`). Default builds keep the hard `forbid`, so the
   sandbox claim in [`docs/sandbox-model.md`](./sandbox-model.md) is unchanged
   for everything shipped today.
-- All `unsafe` in the crate lives in `src/jit.rs`: three `#[expect]`-scoped
-  blocks — typing the finalized code pointer, calling it, and freeing the
-  module's executable memory on drop.
+- All `unsafe` in the crate lives in `src/jit.rs`, every block
+  `#[expect]`-scoped and commented: typing and calling the finalized code
+  pointers, freeing each module's executable memory on drop, the element
+  shims reconstructing the caller-owned activation tables from the live
+  run's `JitCtx`, and the one-time self-check of `Value`'s `#[repr(u8)]`
+  dense-slot layout.
 - The native code touches exactly two allocations, both owned by the caller
   for the duration of the call: the register buffer (every compiled index is
   validated `< n_regs ≤ KWIN` at translation; the buffer is asserted ≥ `KWIN`
@@ -120,56 +153,78 @@ ops faster), which is already timing-dependent under the interpreter.
 - Cranelift is pure Rust (no C), but it is a full compiler backend with its
   own CVE surface — the reason this stays opt-in.
 
-## Measured (2026-08, this container)
+## Measured (2026-08, this container): vs Node 22 and Bun 1.3
 
-Release build, min-of-5 wall-clock, `chidori-js-jit` vs the same binary with
-`--no-jit` (so kernels, fusion, localization, and the register tier are
-identical on both sides — the delta is purely native-vs-interpreted kernel
-execution). Outputs byte-identical in every run. The usual caveat from
-[`docs/interpreter-optimization.md`](./interpreter-optimization.md) §7.6
-applies (shared cloud hardware, ~10–15 % noise floor) — but these deltas
-clear it comfortably:
+The tier's goal is **Node/Bun-level performance on kernel-shaped code**.
+Cross-engine wall-clock, scaled versions of the repo's canonical workloads
+(`benches/common/workloads.rs`), min-of-3 full-process runs minus each
+engine's empty-script baseline, byte-identical outputs verified on every row.
+`chidori-int` is the identical binary with `--no-jit`:
 
-| workload (hot loop shape) | jit | interp | speedup |
-| --- | ---: | ---: | ---: |
-| `s += i * 2.5 - s * 1e-7` (50M, all-IEEE, fully inlined) | 108 ms | 752 ms | **7.0×** |
-| `s += i % 7 + (i * 3 - 1) / 2` (20M, `%` helper call) | 139 ms | 509 ms | **3.7×** |
-| `Math.sqrt(j) + Math.abs(...)` (5M, inlined intrinsics) | 38 ms | 122 ms | **3.2×** |
-| LCG PRNG `(seed * k + c) >>> 0` (20M, all helper calls) | 864 ms | 1390 ms | **1.6×** |
+| workload | chidori-jit | chidori-int | node 22 | bun 1.3 | jit/node | jit/bun |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fib_recursive (fib 32) | 20 ms | 133 ms | 33 ms | 16 ms | **0.6×** | 1.3× |
+| property_access (20M) | 17 ms | 322 ms | 29 ms | 15 ms | **0.6×** | 1.1× |
+| string_scan (charCodeAt hash) | 101 ms | 317 ms | 164 ms | 243 ms | **0.6×** | **0.4×** |
+| typed_array (Float64Array dot/transform) | 94 ms | 613 ms | 105 ms | 52 ms | **0.9×** | 1.8× |
+| bitwise_prng (50M LCG) | 344 ms | 3927 ms | 310 ms | 479 ms | **1.1×** | **0.7×** |
+| closures (adder in a loop, 20M) | 27 ms | 432 ms | 24 ms | 18 ms | **1.1×** | 1.5× |
+| dense_push (20×2M pushes) | 1142 ms | 1243 ms | 945 ms | 300 ms | **1.2×** | 3.8× |
+| array_sum (push + 20 sum passes) | 313 ms | 832 ms | 114 ms | 86 ms | 2.7× | 3.6× |
+| arith_loop (50M, `%`-heavy) | 243 ms | 922 ms | 84 ms | 74 ms | 2.9× | 3.3× |
+| dense_sum (200M dense reads) | 1331 ms | 3967 ms | 264 ms | 215 ms | 5.0× | 6.2× |
+| array_hof (map/filter/reduce) | 153 ms | 139 ms | 34 ms | 20 ms | 4.5× | 7.8× |
+| string_build (rope `+=`) | 611 ms | 523 ms | 125 ms | 247 ms | 4.9× | 2.5× |
+| mixed_helpers (object glue) | 637 ms | 642 ms | 57 ms | 73 ms | 11× | 8.7× |
+| object_literals (5M allocations) | 1499 ms | 1488 ms | 35 ms | 35 ms | 43× | 42× |
 
-The gradient is the design speaking: the more of the loop that stays in
-inlined IEEE ops, the closer the kernel runs to native arithmetic; helper-call
-density (the bitwise family) sets the current floor. Inlining `ToInt32` in
-Cranelift IR is the obvious next win if PRNG-shaped workloads matter.
+Reading the table honestly, three regimes:
 
-Where this lands in practice is unchanged from the roadmap's honest read: JS
-execution is <1 % of live agent wall-clock, so this buys little for live
-agents — the payoff is compute-heavy steps and the zero-host replay/test
-path. That, and having the measured answer to "what would a real JIT buy?" on
-hand rather than assumed.
+1. **At or beyond Node (7 of 14)** — everything the kernel tier fully
+   compiles: recursion, property loops, string scans, typed arrays, bitwise,
+   inlined closures, pushes. Four rows are *faster than Node*; two are
+   faster than Bun. This is the regime agent compute (checksum loops, PRNGs,
+   tokenizers, numeric kernels, comparators) lives in.
+2. **2–5× (kernel-shaped, known cause)** — dense-array reads and
+   `%`-in-loop shapes pay per-access exactness checks (index integrality,
+   bounds, slot tags) that V8 eliminates with induction-variable and range
+   analysis. Closing this needs typed loop-counter reasoning in the kernel
+   translator (prove `i` integral and bounded by the header check, then
+   drop the per-access tests) — mechanical, deterministic, and the
+   documented next step.
+3. **4–43× (allocation/shape-bound, out of this tier's scope)** —
+   `object_literals`, `mixed_helpers`, `string_build`, `array_hof` spend
+   their time in allocation, property-map traffic, string building, and
+   builtin iteration machinery, not kernel execution (jit ≈ interp on every
+   one). Reaching V8 there means escape analysis, inline allocation, and
+   shape-specialized builtins — a different, much larger project the
+   kernel JIT deliberately does not start.
 
 ## Limitations / next steps
 
-- **Scalar kernels only.** Element/`.length`/string/pinned-callee kernels
-  decline; extending the subset means teaching the translator the bail-exit
-  discipline (registers written back, resume at the access op) — mechanical
-  but a larger unsafe-adjacent surface, so it should be paid for by data.
-- **Loop kernels and plain function kernels only.** The recursive-kernel
-  windowed executor and the prepared-callback path (`exec_prepared_kernel`)
-  keep the interpreter tier.
-- **One `JITModule` per kernel.** Simple ownership (the module dies with the
-  kernel); a shared module would amortize better if kernel counts grow.
-- **Compile cost** is paid on first activation (~ms-scale per kernel). A
-  run-once kernel eats it for nothing; an activation-count threshold is the
-  standard refinement if it shows up.
+- **Per-access exactness checks on dense reads** (regime 2 above): the next
+  win is induction-variable typing in the kernel translator so the JIT can
+  drop integrality/bounds tests the loop header already proves.
+- **Cell-writing pinned callees and mutual recursion** keep the interpreter
+  tier (per-call cell flushes and cross-kernel native calls respectively).
+- **Dense direct views are read-only kernels only**; writing kernels reach
+  dense arrays through the shim cores (a store can grow/reallocate).
+- **The allocation-bound regime** (3 above) is explicitly out of scope for
+  this tier.
+- **One `JITModule` per kernel**; compile cost is paid on first activation
+  (~ms-scale). An activation-count threshold is the standard refinement if
+  run-once kernels show up in profiles.
 
 ## Where things live
 
 - `crates/chidori-js/src/jit.rs` — eligibility, the Cranelift translator, the
   helper shims, the compile-once cache, the three `unsafe` blocks.
-- `crates/chidori-js/src/exec.rs` — the two seams: `run_kernel_op_impl` (loop
-  kernels, stack and register tiers alike) and `run_fn_kernel` (frameless
-  function calls).
+- `crates/chidori-js/src/exec.rs` — the four seams (`run_kernel_op_impl` for
+  loop kernels across the stack and register tiers, `run_fn_kernel` for
+  frameless calls, `run_fn_kernel_rec` for self-recursion,
+  `exec_prepared_kernel` for prepared callbacks) plus the shared element
+  fast-path cores (`kernel_elem_load`/`store`/`len`,
+  `kernel_array_push`/`pop`) both tiers call.
 - `crates/chidori-js/src/bytecode.rs` — `Kernel::native` (the cache slot).
 - `crates/chidori-js/src/vm.rs` — `Vm::jit_enabled`.
 - `crates/chidori-js/src/bin/chidori_js_jit.rs` — the `chidori-js-jit`

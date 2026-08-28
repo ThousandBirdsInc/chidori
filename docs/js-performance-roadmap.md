@@ -342,10 +342,17 @@ is <1% of live agent wall-clock (`interpreter-optimization.md` §11.5).
    binary. It compiles the §6.5 typed kernel programs (not bytecode) to
    native code via `cranelift-jit`, which sidesteps OSR/deopt/frame
    reconstruction entirely (the kernel tier's entry guard and exit
-   materialization are reused verbatim). Measured 1.6–7× on kernel-bound
-   loops with byte-identical output; every default build stays
-   zero-`unsafe` and cranelift-free. Details, gates, and the honest
-   cost-benefit: [`docs/cranelift-jit.md`](./cranelift-jit.md).
+   materialization are reused verbatim), and now covers scalars, elements
+   (direct f64-typed-array and read-only dense views), pinned strings,
+   inlined pinned callees, and native self-recursion. Measured against
+   Node 22 / Bun 1.3 on the cross-engine workload suite: 7 of 14 workloads
+   at or beyond Node (recursion, property loops, string scans, typed
+   arrays, bitwise, inlined closures — several FASTER than Node), the
+   remaining kernel-shaped rows at 2–5× pending induction-variable
+   analysis, and the allocation-bound rows untouched by design. Every
+   default build stays zero-`unsafe` and cranelift-free. Details, the
+   table, and the honest cost-benefit:
+   [`docs/cranelift-jit.md`](./cranelift-jit.md).
 
 ---
 

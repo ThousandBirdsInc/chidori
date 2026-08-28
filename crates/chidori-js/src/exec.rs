@@ -1065,23 +1065,18 @@ impl Vm {
                 }
             }
         }
-        // Masked fixed window: `w` is this kernel's window (first KWIN slots);
-        // `wtail` holds the pinned-callee windows at KWIN strides (CALLEES
-        // only). Every register index is `< n_regs ≤ KWIN` by translation, so
-        // `& KWIN_MASK` is an identity on valid indices that proves the access
-        // in-bounds — the dispatch loop below carries no bounds checks.
-        let (whead, wtail) = regs.split_at_mut(KWIN);
-        let w: &mut [f64; KWIN] = whead.try_into().expect("sized above");
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
-        let code = &k.code;
         let mut pc = 0usize;
         // Cranelift tier (`jit` feature, `Vm::jit_enabled`): when enabled and
-        // this kernel compiles (first activation; scalar subset only — see
-        // `crate::jit`), the whole activation runs as native code between the
-        // guard above and the materialization below. The native run leaves
-        // the register window exactly as the interpreter loop would (every
-        // register stored back) and reports where it stopped:
+        // this kernel compiles (first activation; see `crate::jit` for the
+        // compiled subset — including pinned-callee kernels, compiled against
+        // and identity-checked per activation against the resolved callees),
+        // the whole activation runs as native code between the guard above
+        // and the materialization below. The native run leaves the register
+        // buffer exactly as the interpreter loop would (window 0 stored
+        // back; callee windows are scratch on both tiers) and reports where
+        // it stopped:
         // - the index of an `Exit` op: `pc` starts there, so the loop below
         //   dispatches exactly that `Exit` and the shared write-back / shape
         //   materialization runs unchanged;
@@ -1091,7 +1086,7 @@ impl Vm {
         // the tier never has a third outcome.
         #[cfg(feature = "jit")]
         if self.jit_enabled {
-            let native_exit = crate::jit::native_for(k).map(|native| {
+            let native_exit = crate::jit::native_for_loop(k, &callee_bfs).map(|native| {
                 // Activation tables for the native run, alive exactly across
                 // it: the pinned strings (guard-validated flat ASCII), the
                 // per-oslot direct f64-typed-array views, the object cache
@@ -1127,8 +1122,11 @@ impl Vm {
                         std::ptr::null()
                     },
                     scratch: 0.0,
+                    depth: 0,
+                    abandon: 0,
+                    poll: 0,
                 };
-                native.run(w, interrupt.as_deref(), &mut ctx)
+                native.run(&mut regs, interrupt.as_deref(), &mut ctx)
             });
             match native_exit {
                 None => {}
@@ -1136,14 +1134,14 @@ impl Vm {
                 Some(_interrupted) => {
                     for (r, slot) in k.locals.iter().enumerate() {
                         if let crate::bytecode::KSlot::Local(l) = slot {
-                            frame.locals[*l as usize] = Value::Number(w[r & KWIN_MASK]);
+                            frame.locals[*l as usize] = Value::Number(regs[r & KWIN_MASK]);
                         }
                     }
                     for (j, &l) in k.bool_locals.iter().enumerate() {
                         frame.locals[l as usize] =
-                            Value::Bool(w[(bool_base + j) & KWIN_MASK] != 0.0);
+                            Value::Bool(regs[(bool_base + j) & KWIN_MASK] != 0.0);
                     }
-                    writeback_kernel_props(k, &objs, &prop_slots, &w[..]);
+                    writeback_kernel_props(k, &objs, &prop_slots, &regs);
                     self.kernel_regs = regs;
                     objs.clear();
                     self.kernel_objs = objs;
@@ -1157,6 +1155,14 @@ impl Vm {
                 }
             }
         }
+        // Masked fixed window: `w` is this kernel's window (first KWIN slots);
+        // `wtail` holds the pinned-callee windows at KWIN strides (CALLEES
+        // only). Every register index is `< n_regs ≤ KWIN` by translation, so
+        // `& KWIN_MASK` is an identity on valid indices that proves the access
+        // in-bounds — the dispatch loop below carries no bounds checks.
+        let (whead, wtail) = regs.split_at_mut(KWIN);
+        let w: &mut [f64; KWIN] = whead.try_into().expect("sized above");
+        let code = &k.code;
         let (resume_ip, shape) = loop {
             // Latch-and-unwind for ops the translator promised this loop
             // never contains — a TIER BUG, but one that must stay inside the
@@ -1854,6 +1860,42 @@ impl Vm {
         }
         for &(r, _, v) in &fam.uv_snaps[0] {
             regs[r] = v;
+        }
+
+        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): a SELF-ONLY
+        // family (no mutual-recursion partners) compiles to a real native
+        // recursive function (`crate::jit::compile_rec`). Everything the
+        // windowed executor establishes still holds: the family resolution
+        // above verified the self-references, window 0 is loaded with the
+        // guarded arguments and upvalue snapshots, and the native code
+        // mirrors the executor's exact per-call depth guard (abandoning
+        // into the generic rerun, which raises the spec RangeError) and
+        // interrupt-poll placement.
+        #[cfg(feature = "jit")]
+        if self.jit_enabled && fam.funcs.len() == 1 {
+            if let Some(native) = crate::jit::native_for_rec(k0) {
+                let mut jctx = crate::jit::JitCtx::empty();
+                jctx.depth = self.max_call_depth.saturating_sub(self.call_depth) as i64;
+                let code = native.run(&mut regs, self.interrupt.as_deref(), &mut jctx);
+                let raw = jctx.scratch;
+                self.kernel_regs = regs;
+                self.park_rec_family(fam);
+                return match code {
+                    c if c >= 0 => Some(Ok(if ret_bool {
+                        Value::Bool(raw != 0.0)
+                    } else {
+                        Value::Number(raw)
+                    })),
+                    crate::jit::INTERRUPTED => {
+                        self.op_budget = Some(0);
+                        Some(Err(self.throw_range("execution interrupted")))
+                    }
+                    // REC_ABANDONED: the depth budget ran out — the pure
+                    // activation is discarded and the generic rerun owns
+                    // the spec RangeError.
+                    _ => None,
+                };
+            }
         }
 
         /// How the windowed loop below exited; the single tail then parks
@@ -2564,6 +2606,32 @@ impl Vm {
                     self.op_budget = Some(0);
                     return Some(Err(self.throw_range("execution interrupted")));
                 }
+            }
+        }
+        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): the same
+        // contract as the `run_fn_kernel` seam — the prepared callback's
+        // body runs as native code per call, stopping at a `Ret` (typed
+        // result from the same register) or an interrupt.
+        #[cfg(feature = "jit")]
+        if self.jit_enabled {
+            if let Some(native) = crate::jit::native_for(k) {
+                let mut jctx = crate::jit::JitCtx::empty();
+                let stopped_at = native.run(&mut p.regs, p.interrupt.as_deref(), &mut jctx);
+                if stopped_at >= 0 {
+                    if let KOp::Ret { src, boolean } = k.code[stopped_at as usize] {
+                        return Some(Ok(if boolean {
+                            Value::Bool(p.regs[src as usize & KWIN_MASK] != 0.0)
+                        } else {
+                            Value::Number(p.regs[src as usize & KWIN_MASK])
+                        }));
+                    }
+                    // Tier bug (`FnKernelOut::BadOp`'s handling): the kernel
+                    // is pure, so decline to the generic call path.
+                    return None;
+                }
+                // Interrupted on a native back-edge poll.
+                self.op_budget = Some(0);
+                return Some(Err(self.throw_range("execution interrupted")));
             }
         }
         match exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll) {

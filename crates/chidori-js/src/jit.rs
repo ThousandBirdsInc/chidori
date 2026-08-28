@@ -68,9 +68,13 @@
 //! feature (see `lib.rs`); every `unsafe` block in the crate lives in this
 //! file, each individually `#[expect]`-scoped and commented:
 //!
-//! 1. transmuting the finalized code pointer to a typed function pointer,
-//! 2. calling that pointer in [`NativeKernel::run`],
-//! 3. freeing the module's executable memory on drop.
+//! 1. transmuting the finalized code pointers to typed function pointers,
+//! 2. calling them in [`NativeKernel::run`],
+//! 3. freeing each module's executable memory on drop,
+//! 4. the element shims reconstructing the caller-owned activation tables
+//!    from the [`JitCtx`] the live native run was invoked with,
+//! 5. the one-time [`dense_layout_ok`] self-check of `Value`'s `#[repr(u8)]`
+//!    layout contract.
 //!
 //! The native code itself touches exactly two allocations, both owned by the
 //! caller for the duration of the call: the `f64` register buffer (every
@@ -95,8 +99,13 @@ use crate::exec::{number_arith_raw, ArithKind};
 
 /// Return code of a native kernel run: the cooperative interrupt latched on a
 /// back-edge poll. Any non-negative return is the code index of the
-/// `Exit`/`Ret` op the program reached.
+/// `Exit`/`Ret` op the program reached (for a recursive kernel, success is
+/// `0` with the result in `JitCtx::scratch`).
 pub(crate) const INTERRUPTED: i64 = -1;
+/// Return code of a native RECURSIVE kernel run: the depth budget ran out —
+/// the (pure) activation is abandoned and the caller re-runs generically,
+/// which raises the spec RangeError from the exact frame it belongs to.
+pub(crate) const REC_ABANDONED: i64 = -2;
 
 /// The compiled signature:
 /// `(regs: *mut f64, interrupt: *const u8, ctx: *mut JitCtx) -> i64`.
@@ -204,8 +213,20 @@ pub(crate) struct JitCtx {
     /// (null unless the kernel uses push/pop).
     pub array_proto: *const crate::value::JsObject,
     /// Helper out-param: element loads / lengths / push results land here
-    /// when the shim reports success.
+    /// when the shim reports success — and a recursive kernel's result on a
+    /// `0` return.
     pub scratch: f64,
+    /// RECURSIVE kernels: the remaining call-depth budget
+    /// (`max_call_depth - call_depth`), decremented down the native
+    /// recursion; a self-call with none left flags `abandon = 1`.
+    pub depth: i64,
+    /// RECURSIVE kernels: 0 = running; 1 = depth budget exhausted; 2 = the
+    /// cooperative interrupt latched. Set deep in the recursion and checked
+    /// after every self-call, unwinding every native frame immediately.
+    pub abandon: u64,
+    /// RECURSIVE kernels: the shared self-call poll counter (the
+    /// interrupt-check cadence lives across frames, like the interpreter's).
+    pub poll: u64,
 }
 
 impl JitCtx {
@@ -220,6 +241,9 @@ impl JitCtx {
             ta: std::ptr::null(),
             array_proto: std::ptr::null(),
             scratch: 0.0,
+            depth: 0,
+            abandon: 0,
+            poll: 0,
         }
     }
 }
@@ -337,6 +361,15 @@ struct Compiled {
     /// out for `free_memory(self)`.
     module: Option<JITModule>,
     entry: NativeFn,
+    /// The pinned-callee protos this code inlined (empty for kernels with no
+    /// `CallKernel`): compiled against the COMPILING activation's resolved
+    /// callees, so every later activation identity-checks its own resolution
+    /// against these — a mismatch (the same call site pinning a different
+    /// function) runs that activation on the interpreter tier.
+    callees: Vec<Rc<crate::bytecode::FuncProto>>,
+    /// Slots the compiled code addresses in the register buffer: window 0
+    /// plus one KWIN-strided window per inlined callee.
+    min_regs: usize,
 }
 
 impl Drop for Compiled {
@@ -371,9 +404,13 @@ impl NativeKernel {
         interrupt: Option<&AtomicBool>,
         ctx: &mut JitCtx,
     ) -> i64 {
-        // The compiled code indexes `regs` up to `n_regs - 1`, which
-        // translation bounded by KWIN; both callers pass KWIN-sized windows.
-        assert!(regs.len() >= KWIN, "kernel register window under-sized");
+        // The compiled code indexes window 0 (bounded by KWIN at
+        // translation) plus one KWIN-strided window per inlined callee —
+        // exactly the buffer the interpreter tier sizes for the same kernel.
+        assert!(
+            regs.len() >= self.0.min_regs,
+            "kernel register buffer under-sized"
+        );
         let flag: &AtomicBool = interrupt.unwrap_or(&NO_INTERRUPT);
         STAT_RUNS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `entry` was compiled for exactly the signature `NativeFn`
@@ -397,13 +434,64 @@ impl NativeKernel {
     }
 }
 
-/// The compiled form of `k`, compiling it on first use. `None` = this
-/// kernel is not JIT-eligible (or the host ISA is unsupported) — the caller
-/// proceeds on the interpreter tier. The caller then builds the activation's
+/// The compiled form of `k`, compiling it on first use against the resolved
+/// pinned callees of the compiling activation (`callee_bfs` — empty for
+/// kernels without `CallKernel`). `None` = the kernel is not JIT-eligible,
+/// the host ISA is unsupported, or THIS activation resolved different
+/// callees than the code was compiled against — the caller proceeds on the
+/// interpreter tier. On `Some`, the caller builds the activation's
 /// [`JitCtx`] and invokes [`NativeKernel::run`].
+pub(crate) fn native_for_loop(
+    k: &Kernel,
+    callee_bfs: &[(Rc<crate::value::BytecodeFunction>, u32)],
+) -> Option<NativeKernel> {
+    let native = k.native.get_or_init(|| {
+        let specs: Vec<(Rc<crate::bytecode::FuncProto>, u32)> = callee_bfs
+            .iter()
+            .map(|(bf, wb)| (bf.proto.clone(), *wb))
+            .collect();
+        match compile(k, &specs) {
+            Some(n) => {
+                STAT_COMPILED.fetch_add(1, Ordering::Relaxed);
+                Some(n)
+            }
+            None => {
+                STAT_DECLINED.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    });
+    let nk = native.as_ref()?;
+    // Identity guard: this activation's resolved callees must be the very
+    // protos the code inlined (closure INSTANCES may differ — their upvalue
+    // snapshots live in the register buffer — but the compiled bodies must
+    // match exactly).
+    if nk.0.callees.len() != callee_bfs.len()
+        || !nk
+            .0
+            .callees
+            .iter()
+            .zip(callee_bfs)
+            .all(|(compiled, (bf, _))| Rc::ptr_eq(compiled, &bf.proto))
+    {
+        return None;
+    }
+    Some(nk.clone())
+}
+
+/// [`native_for_loop`] for contexts with no pinned callees (the function-
+/// kernel seam; function kernels contain no `CallKernel` by construction).
 pub(crate) fn native_for(k: &Kernel) -> Option<NativeKernel> {
+    native_for_loop(k, &[])
+}
+
+/// The compiled form of a SELF-ONLY recursive function kernel (the
+/// `run_fn_kernel_rec` seam), compiling on first use. Recursive kernels are
+/// reached exclusively through the windowed-executor path, so the same
+/// per-kernel cache slot holds this compilation.
+pub(crate) fn native_for_rec(k: &Kernel) -> Option<NativeKernel> {
     k.native
-        .get_or_init(|| match compile(k) {
+        .get_or_init(|| match compile_rec(k) {
             Some(n) => {
                 STAT_COMPILED.fetch_add(1, Ordering::Relaxed);
                 Some(n)
@@ -704,11 +792,52 @@ fn cmp_cc(cmp: CmpOp) -> FloatCC {
 // Eligibility
 // ---------------------------------------------------------------------------
 
-/// Whether every op in `k` is in the scalar subset this backend compiles,
-/// with every register index `< n_regs`, every branch target in range, and
-/// every fall-through / fused skip landing on a real op. A `false` pins the
-/// kernel to the interpreter tier — never an error.
-fn eligible(k: &Kernel) -> bool {
+/// Whether a pinned callee's function kernel can be INLINED at its
+/// `CallKernel` sites: the compiled subset minus `Exit` (a frameless callee
+/// has nothing to exit to), non-recursive, cell-write-free (per-call cell
+/// flushes are the interpreter tier's), and boolean-return-free (the caller
+/// guard already requires Number returns; checked again here).
+fn callee_eligible(ck: &Kernel) -> bool {
+    ck.rec.is_none()
+        && ck.uv_writes.is_empty()
+        && eligible(ck, &[])
+        && !ck
+            .code
+            .iter()
+            .any(|op| matches!(op, KOp::Exit { .. } | KOp::Ret { boolean: true, .. }))
+}
+
+/// Whether a SELF-ONLY recursive function kernel can compile to a native
+/// recursive function ([`compile_rec`]): no mutual-recursion partners, no
+/// cell writes, a frameless scalar body (function kernels have no
+/// oslots/sslots/props by construction — checked anyway), and every op in
+/// the subset with `SelfCall` allowed (callee 0 only) and `Exit` rejected.
+fn rec_eligible(k: &Kernel) -> bool {
+    k.rec.as_deref().is_some_and(|rec| rec.globals.is_empty())
+        && k.uv_writes.is_empty()
+        && k.oslots.is_empty()
+        && k.sslots.is_empty()
+        && k.props_used.is_empty()
+        && eligible_inner(k, &[], true)
+}
+
+/// Whether every op in `k` is in the subset this backend compiles, with
+/// every register index `< n_regs`, every branch target in range, every
+/// fall-through / fused skip landing on a real op, and every `CallKernel`
+/// aimed at an inlinable resolved callee. A `false` pins the kernel to the
+/// interpreter tier — never an error.
+fn eligible(k: &Kernel, callees: &[(Rc<crate::bytecode::FuncProto>, u32)]) -> bool {
+    eligible_inner(k, callees, false)
+}
+
+/// `allow_selfcall` selects the RECURSIVE-body dialect: `SelfCall` (callee
+/// 0) becomes legal and `Exit` illegal (a frameless recursive body has
+/// nothing to exit to).
+fn eligible_inner(
+    k: &Kernel,
+    callees: &[(Rc<crate::bytecode::FuncProto>, u32)],
+    allow_selfcall: bool,
+) -> bool {
     let n_regs = k.n_regs as usize;
     let len = k.code.len();
     if n_regs > KWIN || len == 0 {
@@ -755,7 +884,17 @@ fn eligible(k: &Kernel) -> bool {
         KOp::Math2 { kind, dst, a, b } => {
             kind.arity() == 2 && r(dst) && r(a) && r(b) && next_ok(pc, 1)
         }
-        KOp::Exit { .. } | KOp::Ret { .. } => true,
+        KOp::Exit { .. } => !allow_selfcall,
+        KOp::Ret { .. } => true,
+        KOp::SelfCall {
+            dst, base, callee, ..
+        } => {
+            allow_selfcall
+                && callee == 0
+                && r(dst)
+                && (base as usize + k.args_used as usize) <= n_regs
+                && next_ok(pc, 1)
+        }
         KOp::LoadElem {
             dst,
             obj,
@@ -806,14 +945,25 @@ fn eligible(k: &Kernel) -> bool {
         KOp::ArrayPop { obj, dst, bail } => o(obj) && r(dst) && t(bail) && next_ok(pc, 1),
         KOp::StrLen { dst, str } => r(dst) && st(str) && next_ok(pc, 1),
         KOp::CharCodeAt { dst, str, idx } => r(dst) && st(str) && r(idx) && next_ok(pc, 1),
+        KOp::CallKernel {
+            dst,
+            fslot,
+            base,
+            argc,
+        } => {
+            r(dst)
+                && next_ok(pc, 1)
+                && (base as usize + argc as usize) <= n_regs
+                && callees
+                    .get(fslot as usize)
+                    .and_then(|(proto, _)| proto.fn_kernel.as_ref())
+                    .is_some_and(callee_eligible)
+        }
         // Outside the compiled subset: localized property ops (rewritten
         // away at kernel build — surviving ones are the tier bug the
-        // interpreter arm reports), pinned-callee calls, and recursion.
-        // The whole kernel stays on the interpreter tier.
-        KOp::LoadProp { .. }
-        | KOp::StoreProp { .. }
-        | KOp::CallKernel { .. }
-        | KOp::SelfCall { .. } => false,
+        // interpreter arm reports). The whole kernel stays on the
+        // interpreter tier.
+        KOp::LoadProp { .. } | KOp::StoreProp { .. } => false,
     })
 }
 
@@ -821,10 +971,17 @@ fn eligible(k: &Kernel) -> bool {
 // Translation
 // ---------------------------------------------------------------------------
 
-/// Compile `k` to native code, or `None` when it is not eligible or the host
-/// ISA is unsupported. Pure: reads only the kernel's code.
-fn compile(k: &Kernel) -> Option<NativeKernel> {
-    if !eligible(k) {
+/// Compile `k` to native code against the resolved pinned callees, or
+/// `None` when it is not eligible or the host ISA is unsupported. Pure:
+/// reads only the kernel's (and inlined callee kernels') code.
+fn compile(k: &Kernel, callees: &[(Rc<crate::bytecode::FuncProto>, u32)]) -> Option<NativeKernel> {
+    if !eligible(k, callees) {
+        return None;
+    }
+    // A kernel with pinned-callee slots must be compiled against exactly its
+    // resolved callees (an activation with a declined callee resolution
+    // never reaches compile with a short list, but stay defensive).
+    if callees.len() != k.callee_slots.len() {
         return None;
     }
     // Probe host support up front: `JITBuilder::with_flags` panics on an
@@ -851,7 +1008,7 @@ fn compile(k: &Kernel) -> Option<NativeKernel> {
     {
         let frontend_config = module.target_config();
         let builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        Translator::new(builder, &mut module, k).translate(frontend_config)?;
+        Translator::new(builder, &mut module, k, callees).translate(frontend_config)?;
     }
     module.define_function(func_id, &mut ctx).ok()?;
     module.clear_context(&mut ctx);
@@ -866,6 +1023,157 @@ fn compile(k: &Kernel) -> Option<NativeKernel> {
     Some(NativeKernel(Rc::new(Compiled {
         module: Some(module),
         entry,
+        callees: callees.iter().map(|(p, _)| p.clone()).collect(),
+        min_regs: KWIN * (1 + callees.len()),
+    })))
+}
+
+/// Compile a SELF-ONLY recursive function kernel ([`rec_eligible`]) into a
+/// real native recursive function plus a standard-signature wrapper:
+///
+/// - `rec(args…, upvals…, depth, interrupt, ctx) -> f64` — the body, with
+///   `SelfCall` a direct native call (depth-guarded and interrupt-polled at
+///   the interpreter's exact points; a flagged abandon unwinds every frame
+///   through `ctx.abandon`).
+/// - `kernel(regs, interrupt, ctx) -> i64` — the exported entry: loads the
+///   pre-guarded window-0 arguments/upvalue snapshots from the register
+///   buffer, calls `rec` with `ctx.depth` (the remaining call-depth budget
+///   the seam computed), and returns `0` with the raw result in
+///   `ctx.scratch`, or [`REC_ABANDONED`] / [`INTERRUPTED`].
+fn compile_rec(k: &Kernel) -> Option<NativeKernel> {
+    if !rec_eligible(k) {
+        return None;
+    }
+    cranelift_native::builder().ok()?;
+    let mut builder =
+        JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names()).ok()?;
+    for (name, addr, _, _) in helper_table() {
+        builder.symbol(name, addr);
+    }
+    let mut module = JITModule::new(builder);
+    let ptr_ty = module.target_config().pointer_type();
+    // Window slots by role, in the fixed order the signature uses.
+    let mut arg_slots: Vec<(usize, u16)> = Vec::new();
+    let mut upval_slots: Vec<usize> = Vec::new();
+    for (r, slot) in k.locals.iter().enumerate() {
+        match slot {
+            crate::bytecode::KSlot::Arg(a) => arg_slots.push((r, *a as u16)),
+            crate::bytecode::KSlot::Upvalue(_) => upval_slots.push(r),
+            crate::bytecode::KSlot::Local(_) => {}
+        }
+    }
+    let mut rec_sig = module.make_signature();
+    for _ in 0..arg_slots.len() + upval_slots.len() {
+        rec_sig.params.push(AbiParam::new(types::F64));
+    }
+    rec_sig.params.push(AbiParam::new(types::I64));
+    rec_sig.params.push(AbiParam::new(ptr_ty));
+    rec_sig.params.push(AbiParam::new(ptr_ty));
+    rec_sig.returns.push(AbiParam::new(types::F64));
+    let rec_id = module
+        .declare_function("rec", Linkage::Local, &rec_sig)
+        .ok()?;
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.returns.push(AbiParam::new(types::I64));
+    let wrap_id = module
+        .declare_function("kernel", Linkage::Export, &sig)
+        .ok()?;
+    let mut fb_ctx = FunctionBuilderContext::new();
+    let mut mctx = module.make_context();
+    // The recursive body.
+    mctx.func.signature = rec_sig;
+    {
+        let frontend_config = module.target_config();
+        let b = FunctionBuilder::new(&mut mctx.func, &mut fb_ctx);
+        Translator::new_rec(b, &mut module, k, rec_id, &arg_slots, &upval_slots)
+            .translate(frontend_config)?;
+    }
+    module.define_function(rec_id, &mut mctx).ok()?;
+    module.clear_context(&mut mctx);
+    // The wrapper.
+    mctx.func.signature = sig;
+    {
+        let frontend_config = module.target_config();
+        let mut b = FunctionBuilder::new(&mut mctx.func, &mut fb_ctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let (regs_ptr, int_ptr, ctx_ptr) = {
+            let p = b.block_params(entry);
+            (p[0], p[1], p[2])
+        };
+        let rec_ref = module.declare_func_in_func(rec_id, b.func);
+        let mut args = Vec::with_capacity(arg_slots.len() + upval_slots.len() + 3);
+        for &(r, _) in &arg_slots {
+            args.push(b.ins().load(
+                types::F64,
+                MemFlagsData::trusted(),
+                regs_ptr,
+                (8 * r) as i32,
+            ));
+        }
+        for &r in &upval_slots {
+            args.push(b.ins().load(
+                types::F64,
+                MemFlagsData::trusted(),
+                regs_ptr,
+                (8 * r) as i32,
+            ));
+        }
+        let depth = b.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            ctx_ptr,
+            std::mem::offset_of!(JitCtx, depth) as i32,
+        );
+        args.push(depth);
+        args.push(int_ptr);
+        args.push(ctx_ptr);
+        let call = b.ins().call(rec_ref, &args);
+        let ret = b.inst_results(call)[0];
+        let ab = b.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            ctx_ptr,
+            std::mem::offset_of!(JitCtx, abandon) as i32,
+        );
+        let ok_b = b.create_block();
+        let fail_b = b.create_block();
+        b.ins().brif(ab, fail_b, &[], ok_b, &[]);
+        b.switch_to_block(ok_b);
+        b.ins().store(
+            MemFlagsData::trusted(),
+            ret,
+            ctx_ptr,
+            std::mem::offset_of!(JitCtx, scratch) as i32,
+        );
+        let zero = b.ins().iconst(types::I64, 0);
+        b.ins().return_(&[zero]);
+        b.switch_to_block(fail_b);
+        let is_intr = b.ins().icmp_imm_s(IntCC::Equal, ab, 2);
+        let intr_code = b.ins().iconst(types::I64, INTERRUPTED);
+        let aband_code = b.ins().iconst(types::I64, REC_ABANDONED);
+        let code = b.ins().select(is_intr, intr_code, aband_code);
+        b.ins().return_(&[code]);
+        b.seal_all_blocks();
+        b.finalize(frontend_config);
+    }
+    module.define_function(wrap_id, &mut mctx).ok()?;
+    module.clear_context(&mut mctx);
+    module.finalize_definitions().ok()?;
+    let code = module.get_finalized_function(wrap_id);
+    // SAFETY: as in `compile` — the wrapper was defined with exactly
+    // `NativeFn`'s signature.
+    #[expect(unsafe_code, reason = "type the finalized JIT entry point")]
+    let entry: NativeFn = unsafe { std::mem::transmute(code) };
+    Some(NativeKernel(Rc::new(Compiled {
+        module: Some(module),
+        entry,
+        callees: Vec::new(),
+        min_regs: KWIN,
     })))
 }
 
@@ -889,8 +1197,22 @@ struct Translator<'a> {
     b: FunctionBuilder<'a>,
     module: &'a mut JITModule,
     k: &'a Kernel,
-    /// One block per code index (the op's single entry point).
-    blocks: Vec<Block>,
+    /// One block per code index of the code currently being emitted (the
+    /// op's single entry point): the top-level kernel's blocks in
+    /// `translate`, swapped for a fresh per-site set while a pinned callee
+    /// kernel is being inlined (`emit_call_kernel`).
+    cur_blocks: Vec<Block>,
+    /// Register-file base the u16 op indices resolve against: 0 for the
+    /// top-level kernel, the callee's variable window during inlining.
+    reg_base: usize,
+    /// `Some(cont)` while inlining a callee: `Ret` jumps here with its value
+    /// instead of exiting the function.
+    inline_ret: Option<Block>,
+    /// The pinned callees this kernel is being compiled against (resolved at
+    /// the compiling activation; later activations identity-check them).
+    callees: Vec<InlineCallee>,
+    /// `Some` while building a recursive body (see [`RecMode`]).
+    rec: Option<RecMode>,
     /// Shared epilogue: stores every register back and returns its i64 param.
     exit_block: Block,
     /// Interrupt landing: routes to `exit_block` with [`INTERRUPTED`].
@@ -920,8 +1242,45 @@ struct Translator<'a> {
     pending_backedges: Vec<(Block, usize)>,
 }
 
+/// One pinned callee prepared for inlining: the proto whose `fn_kernel` is
+/// inlined at every `CallKernel` site targeting it, the base of its variable
+/// window in `Translator::vars`, and the base of its f64 slot window in the
+/// caller's register buffer (where the entry guard put its upvalue
+/// snapshot).
+#[derive(Clone)]
+struct InlineCallee {
+    proto: Rc<crate::bytecode::FuncProto>,
+    var_base: usize,
+}
+
+/// The RECURSIVE-body emission mode (see [`compile_rec`]): the function
+/// being built is the self-callable inner function, not the standard
+/// register-buffer wrapper — `Ret` returns its value directly, and
+/// `SelfCall` becomes a real native call through `self_ref`.
+#[derive(Clone)]
+struct RecMode {
+    self_ref: FuncRef,
+    /// This frame's remaining depth budget (an i64 parameter).
+    depth: cranelift_codegen::ir::Value,
+    /// The kernel-arg index of each argument parameter, in signature order —
+    /// a self-call passes `window[base + index]` for each.
+    arg_indices: Vec<u16>,
+    /// The upvalue parameters, re-passed verbatim on every self-call (cells
+    /// cannot change during an activation).
+    upval_params: Vec<cranelift_codegen::ir::Value>,
+    /// Sets `ctx.abandon = 1` (depth exhausted) and returns 0.0.
+    abandon_depth: Block,
+    /// Returns 0.0 with `ctx.abandon` already set (post-call unwind).
+    ret_zero: Block,
+}
+
 impl<'a> Translator<'a> {
-    fn new(mut b: FunctionBuilder<'a>, module: &'a mut JITModule, k: &'a Kernel) -> Self {
+    fn new(
+        mut b: FunctionBuilder<'a>,
+        module: &'a mut JITModule,
+        k: &'a Kernel,
+        callee_specs: &[(Rc<crate::bytecode::FuncProto>, u32)],
+    ) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
@@ -942,6 +1301,41 @@ impl<'a> Translator<'a> {
             );
             b.def_var(var, v);
             vars.push(var);
+        }
+        // Callee variable windows: one F64 variable per callee kernel
+        // register. Upvalue slots load their once-per-activation snapshot
+        // from the caller's register buffer (where the entry guard put it);
+        // Arg slots are assigned at each call site; Local slots are pure
+        // scratch (translation proved store-before-read), defined here only
+        // so every use is dominated.
+        let mut callees = Vec::with_capacity(callee_specs.len());
+        for (proto, win_base) in callee_specs {
+            let ck = proto.fn_kernel.as_ref().expect("checked by eligibility");
+            let var_base = vars.len();
+            for (r, slot) in ck.locals.iter().enumerate() {
+                let var = b.declare_var(types::F64);
+                let v = match slot {
+                    crate::bytecode::KSlot::Upvalue(_) => b.ins().load(
+                        types::F64,
+                        MemFlagsData::trusted(),
+                        regs_ptr,
+                        (8 * (*win_base as usize + r)) as i32,
+                    ),
+                    _ => b.ins().f64const(0.0),
+                };
+                b.def_var(var, v);
+                vars.push(var);
+            }
+            for _ in ck.locals.len()..ck.n_regs as usize {
+                let var = b.declare_var(types::F64);
+                let v = b.ins().f64const(0.0);
+                b.def_var(var, v);
+                vars.push(var);
+            }
+            callees.push(InlineCallee {
+                proto: proto.clone(),
+                var_base,
+            });
         }
         let poll = b.declare_var(types::I32);
         let zero = b.ins().iconst(types::I32, 0);
@@ -1013,7 +1407,11 @@ impl<'a> Translator<'a> {
             b,
             module,
             k,
-            blocks,
+            cur_blocks: blocks,
+            reg_base: 0,
+            inline_ret: None,
+            callees,
+            rec: None,
             exit_block,
             intr_block,
             vars,
@@ -1024,6 +1422,107 @@ impl<'a> Translator<'a> {
             ptr_ty,
             ta_views,
             sviews,
+            helpers: HashMap::new(),
+            pending_backedges: Vec::new(),
+        }
+    }
+
+    /// Constructor for a RECURSIVE body (see [`compile_rec`]): the function
+    /// under construction is the self-callable inner function — window
+    /// registers come from PARAMETERS (arguments, then upvalue snapshots;
+    /// locals are scratch) rather than the register buffer, and the landing
+    /// blocks (depth-abandon, interrupt-abandon, post-call unwind) are
+    /// pre-filled here. Signature:
+    /// `(args…, upvals…, depth: i64, interrupt: ptr, ctx: ptr) -> f64`.
+    fn new_rec(
+        mut b: FunctionBuilder<'a>,
+        module: &'a mut JITModule,
+        k: &'a Kernel,
+        rec_id: cranelift_module::FuncId,
+        arg_slots: &[(usize, u16)],
+        upval_slots: &[usize],
+    ) -> Self {
+        let self_ref = module.declare_func_in_func(rec_id, b.func);
+        let ptr_ty = module.target_config().pointer_type();
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let params: Vec<cranelift_codegen::ir::Value> = b.block_params(entry).to_vec();
+        let n_args = arg_slots.len();
+        let n_upvals = upval_slots.len();
+        let depth = params[n_args + n_upvals];
+        let int_ptr = params[n_args + n_upvals + 1];
+        let ctx_ptr = params[n_args + n_upvals + 2];
+        let n_regs = k.n_regs as usize;
+        let mut init: Vec<Option<cranelift_codegen::ir::Value>> = vec![None; n_regs];
+        for (j, &(r, _)) in arg_slots.iter().enumerate() {
+            init[r] = Some(params[j]);
+        }
+        for (j, &r) in upval_slots.iter().enumerate() {
+            init[r] = Some(params[n_args + j]);
+        }
+        let zero = b.ins().f64const(0.0);
+        let mut vars = Vec::with_capacity(n_regs);
+        for slot_init in init {
+            let var = b.declare_var(types::F64);
+            b.def_var(var, slot_init.unwrap_or(zero));
+            vars.push(var);
+        }
+        let poll = b.declare_var(types::I32);
+        let z32 = b.ins().iconst(types::I32, 0);
+        b.def_var(poll, z32);
+        let blocks: Vec<Block> = (0..k.code.len()).map(|_| b.create_block()).collect();
+        let abandon_depth = b.create_block();
+        let abandon_intr = b.create_block();
+        let ret_zero = b.create_block();
+        b.ins().jump(blocks[0], &[]);
+        let abandon_off = std::mem::offset_of!(JitCtx, abandon) as i32;
+        b.switch_to_block(abandon_depth);
+        let one = b.ins().iconst(types::I64, 1);
+        b.ins()
+            .store(MemFlagsData::trusted(), one, ctx_ptr, abandon_off);
+        let z = b.ins().f64const(0.0);
+        b.ins().return_(&[z]);
+        b.switch_to_block(abandon_intr);
+        let two = b.ins().iconst(types::I64, 2);
+        b.ins()
+            .store(MemFlagsData::trusted(), two, ctx_ptr, abandon_off);
+        let z = b.ins().f64const(0.0);
+        b.ins().return_(&[z]);
+        b.switch_to_block(ret_zero);
+        let z = b.ins().f64const(0.0);
+        b.ins().return_(&[z]);
+        let arg_indices = arg_slots.iter().map(|&(_, a)| a).collect();
+        let upval_params = params[n_args..n_args + n_upvals].to_vec();
+        Translator {
+            b,
+            module,
+            k,
+            cur_blocks: blocks,
+            reg_base: 0,
+            inline_ret: None,
+            callees: Vec::new(),
+            rec: Some(RecMode {
+                self_ref,
+                depth,
+                arg_indices,
+                upval_params,
+                abandon_depth,
+                ret_zero,
+            }),
+            // Unused in rec mode: `Exit` is rejected by eligibility, and no
+            // register-buffer loads exist — but the fields must hold FILLED
+            // blocks / live values.
+            exit_block: ret_zero,
+            intr_block: abandon_intr,
+            vars,
+            poll,
+            regs_ptr: ctx_ptr,
+            int_ptr,
+            ctx_ptr,
+            ptr_ty,
+            ta_views: Vec::new(),
+            sviews: Vec::new(),
             helpers: HashMap::new(),
             pending_backedges: Vec::new(),
         }
@@ -1090,11 +1589,11 @@ impl<'a> Translator<'a> {
     }
 
     fn get(&mut self, r: u16) -> cranelift_codegen::ir::Value {
-        self.b.use_var(self.vars[r as usize])
+        self.b.use_var(self.vars[self.reg_base + r as usize])
     }
 
     fn set(&mut self, r: u16, v: cranelift_codegen::ir::Value) {
-        self.b.def_var(self.vars[r as usize], v);
+        self.b.def_var(self.vars[self.reg_base + r as usize], v);
     }
 
     /// ToInt32 as native code. The `|x| < 2^63` fast path is one saturating
@@ -1475,7 +1974,7 @@ impl<'a> Translator<'a> {
     /// every 256th check the interrupt byte) before reaching the target.
     fn dest(&mut self, pc: usize, target: usize) -> Block {
         if target > pc {
-            return self.blocks[target];
+            return self.cur_blocks[target];
         }
         let tramp = self.b.create_block();
         self.pending_backedges.push((tramp, target));
@@ -1496,7 +1995,7 @@ impl<'a> Translator<'a> {
             // 255 of 256 times: straight to the target.
             self.b
                 .ins()
-                .brif(masked, self.blocks[target], &[], check, &[]);
+                .brif(masked, self.cur_blocks[target], &[], check, &[]);
             self.b.switch_to_block(check);
             let flag = self
                 .b
@@ -1504,7 +2003,7 @@ impl<'a> Translator<'a> {
                 .load(types::I8, MemFlagsData::trusted(), self.int_ptr, 0);
             self.b
                 .ins()
-                .brif(flag, self.intr_block, &[], self.blocks[target], &[]);
+                .brif(flag, self.intr_block, &[], self.cur_blocks[target], &[]);
         }
     }
 
@@ -1512,355 +2011,532 @@ impl<'a> Translator<'a> {
         mut self,
         frontend_config: cranelift_codegen::isa::TargetFrontendConfig,
     ) -> Option<()> {
-        let code = &self.k.code;
-        for pc in 0..code.len() {
-            self.b.switch_to_block(self.blocks[pc]);
-            // Fall-through skip (1, or 2 past a fused op's landing pad);
-            // `None` = the op placed its own terminator.
-            let mut fallthrough = Some(1usize);
-            match code[pc] {
-                KOp::Mov { dst, src } => {
-                    let v = self.get(src);
-                    self.set(dst, v);
-                }
-                KOp::Const { dst, k } => {
-                    let v = self.b.ins().f64const(k);
-                    self.set(dst, v);
-                }
-                KOp::Add { dst, a, b } => {
-                    let (x, y) = (self.get(a), self.get(b));
-                    let v = self.b.ins().fadd(x, y);
-                    self.set(dst, v);
-                }
-                KOp::AddK { dst, a, k } => {
-                    let x = self.get(a);
-                    let kk = self.b.ins().f64const(k);
-                    let v = self.b.ins().fadd(x, kk);
-                    self.set(dst, v);
-                }
-                KOp::Arith { kind, dst, a, b } => {
-                    let (x, y) = (self.get(a), self.get(b));
-                    let v = self.arith(kind, x, y, None)?;
-                    self.set(dst, v);
-                }
-                KOp::ArithK { kind, dst, a, k } => {
-                    let x = self.get(a);
-                    let kk = self.b.ins().f64const(k);
-                    let v = self.arith(kind, x, kk, Some(k))?;
-                    self.set(dst, v);
-                }
-                KOp::Neg { dst, src } => {
-                    let x = self.get(src);
-                    let v = self.b.ins().fneg(x);
-                    self.set(dst, v);
-                }
-                KOp::BitNot { dst, src } => {
-                    let x = self.get(src);
-                    let ix = self.toint32(x)?;
-                    let nx = self.b.ins().bnot(ix);
-                    let v = self.i32_to_f64(nx);
-                    self.set(dst, v);
-                }
-                KOp::Mov2 { d1, s1, d2, s2 } => {
-                    let v1 = self.get(s1);
-                    self.set(d1, v1);
-                    let v2 = self.get(s2);
-                    self.set(d2, v2);
-                    fallthrough = Some(2);
-                }
-                KOp::ArithAdd {
-                    kind,
-                    dst,
-                    a,
-                    b,
-                    d2,
-                    a2,
-                    b2,
-                } => {
-                    let (x, y) = (self.get(a), self.get(b));
-                    let v = self.arith(kind, x, y, None)?;
-                    self.set(dst, v);
-                    let (x2, y2) = (self.get(a2), self.get(b2));
-                    let v2 = self.b.ins().fadd(x2, y2);
-                    self.set(d2, v2);
-                    fallthrough = Some(2);
-                }
-                KOp::ArithKAdd {
-                    kind,
-                    dst,
-                    a,
-                    k,
-                    d2,
-                    a2,
-                    b2,
-                } => {
-                    let x = self.get(a);
-                    let kk = self.b.ins().f64const(k);
-                    let v = self.arith(kind, x, kk, Some(k))?;
-                    self.set(dst, v);
-                    let (x2, y2) = (self.get(a2), self.get(b2));
-                    let v2 = self.b.ins().fadd(x2, y2);
-                    self.set(d2, v2);
-                    fallthrough = Some(2);
-                }
-                KOp::AddKBr { dst, a, k, target } => {
-                    let x = self.get(a);
-                    let kk = self.b.ins().f64const(k);
-                    let v = self.b.ins().fadd(x, kk);
-                    self.set(dst, v);
-                    let d = self.dest(pc, target as usize);
-                    self.b.ins().jump(d, &[]);
-                    fallthrough = None;
-                }
-                KOp::Br { target } => {
-                    let d = self.dest(pc, target as usize);
-                    self.b.ins().jump(d, &[]);
-                    fallthrough = None;
-                }
-                KOp::BrCmp {
-                    cmp,
-                    a,
-                    b,
-                    if_true,
-                    target,
-                } => {
-                    let (x, y) = (self.get(a), self.get(b));
-                    let c = self.b.ins().fcmp(cmp_cc(cmp), x, y);
-                    self.branch_on(c, if_true, pc, target as usize);
-                    fallthrough = None;
-                }
-                KOp::BrCmpK {
-                    cmp,
-                    a,
-                    k,
-                    if_true,
-                    target,
-                } => {
-                    let x = self.get(a);
-                    let kk = self.b.ins().f64const(k);
-                    let c = self.b.ins().fcmp(cmp_cc(cmp), x, kk);
-                    self.branch_on(c, if_true, pc, target as usize);
-                    fallthrough = None;
-                }
-                KOp::BrFalsy { src, target } => {
-                    let x = self.get(src);
-                    let c = self.truthy(x);
-                    self.branch_on(c, false, pc, target as usize);
-                    fallthrough = None;
-                }
-                KOp::BrTruthy { src, target } => {
-                    let x = self.get(src);
-                    let c = self.truthy(x);
-                    self.branch_on(c, true, pc, target as usize);
-                    fallthrough = None;
-                }
-                KOp::CmpSet { cmp, dst, a, b } => {
-                    let (x, y) = (self.get(a), self.get(b));
-                    let c = self.b.ins().fcmp(cmp_cc(cmp), x, y);
-                    let one = self.b.ins().f64const(1.0);
-                    let zero = self.b.ins().f64const(0.0);
-                    let v = self.b.ins().select(c, one, zero);
-                    self.set(dst, v);
-                }
-                KOp::BoolNot { dst, src } => {
-                    let x = self.get(src);
-                    let c = self.truthy(x);
-                    let one = self.b.ins().f64const(1.0);
-                    let zero = self.b.ins().f64const(0.0);
-                    let v = self.b.ins().select(c, zero, one);
-                    self.set(dst, v);
-                }
-                KOp::Math1 { kind, dst, src } => {
-                    let x = self.get(src);
-                    let v = match kind {
-                        KMath::Abs => self.b.ins().fabs(x),
-                        KMath::Floor => self.b.ins().floor(x),
-                        KMath::Ceil => self.b.ins().ceil(x),
-                        KMath::Trunc => self.b.ins().trunc(x),
-                        KMath::Sqrt => self.b.ins().sqrt(x),
-                        KMath::Round => self.call1("cjit_round", x)?,
-                        KMath::Sign => self.call1("cjit_sign", x)?,
-                        KMath::Fround => self.call1("cjit_fround", x)?,
-                        // Binary kinds are excluded by `eligible` (arity 1).
-                        KMath::Min2 | KMath::Max2 | KMath::Pow2 | KMath::Imul2 => return None,
-                    };
-                    self.set(dst, v);
-                }
-                KOp::Math2 { kind, dst, a, b } => {
-                    let (x, y) = (self.get(a), self.get(b));
-                    let v = match kind {
-                        // Cranelift fmin/fmax carry wasm's semantics — NaN
-                        // poisons, -0 < +0 — which are exactly the
-                        // `math_min2`/`math_max2` cores' rules.
-                        KMath::Min2 => self.b.ins().fmin(x, y),
-                        KMath::Max2 => self.b.ins().fmax(x, y),
-                        // `**`'s spec special cases live in `math_pow`.
-                        KMath::Pow2 => self.call2("cjit_pow2", x, y)?,
-                        KMath::Imul2 => {
-                            let (ix, iy) = (self.toint32(x)?, self.toint32(y)?);
-                            let r = self.b.ins().imul(ix, iy);
-                            self.i32_to_f64(r)
-                        }
-                        // Unary kinds are excluded by `eligible` (arity 2).
-                        _ => return None,
-                    };
-                    self.set(dst, v);
-                }
-                KOp::Exit { .. } | KOp::Ret { .. } => {
-                    let pcv = self.b.ins().iconst(types::I64, pc as i64);
-                    self.b.ins().jump(self.exit_block, &[pcv.into()]);
-                    fallthrough = None;
-                }
-                KOp::LoadElem {
-                    dst,
-                    obj,
-                    idx,
-                    bail,
-                } => {
-                    let i = self.get(idx);
-                    let v = self.emit_elem_load(pc, obj, i, bail)?;
-                    self.set(dst, v);
-                }
-                KOp::StoreElem {
-                    obj,
-                    idx,
-                    val,
-                    bail,
-                } => {
-                    let (i, v) = (self.get(idx), self.get(val));
-                    self.emit_elem_store(pc, obj, i, v, bail)?;
-                }
-                // Fused `s += a[i]` / `a[i] <op> …`: the element load's exact
-                // semantics (and bail edge), then the arithmetic tail, then
-                // the 2-slot skip past the landing pad.
-                KOp::LoadElemAdd {
-                    dst,
-                    obj,
-                    idx,
-                    bail,
-                    d2,
-                    a2,
-                    b2,
-                } => {
-                    let i = self.get(idx);
-                    let v = self.emit_elem_load(pc, obj, i, bail)?;
-                    self.set(dst, v);
-                    let (x2, y2) = (self.get(a2), self.get(b2));
-                    let v2 = self.b.ins().fadd(x2, y2);
-                    self.set(d2, v2);
-                    fallthrough = Some(2);
-                }
-                KOp::LoadElemArith {
-                    dst,
-                    obj,
-                    idx,
-                    bail,
-                    kind,
-                    d2,
-                    a2,
-                    b2,
-                } => {
-                    let i = self.get(idx);
-                    let v = self.emit_elem_load(pc, obj, i, bail)?;
-                    self.set(dst, v);
-                    let (x2, y2) = (self.get(a2), self.get(b2));
-                    let v2 = self.arith(kind, x2, y2, None)?;
-                    self.set(d2, v2);
-                    fallthrough = Some(2);
-                }
-                KOp::LoadLen { dst, obj, bail } => {
-                    let v = self.emit_len(pc, obj, bail)?;
-                    self.set(dst, v);
-                }
-                // Fused `i < a.length` header: LoadLen's semantics (and bail
-                // edge), then BrCmp's compare-and-branch, then the 2-slot
-                // fall-through past the landing pad.
-                KOp::LenBrCmp {
-                    dst,
-                    obj,
-                    bail,
-                    cmp,
-                    a,
-                    b,
-                    if_true,
-                    target,
-                } => {
-                    let v = self.emit_len(pc, obj, bail)?;
-                    self.set(dst, v);
-                    let (x, y) = (self.get(a), self.get(b));
-                    let c = self.b.ins().fcmp(cmp_cc(cmp), x, y);
-                    let taken = self.dest(pc, target as usize);
-                    let fall = self.blocks[pc + 2];
-                    if if_true {
-                        self.b.ins().brif(c, taken, &[], fall, &[]);
-                    } else {
-                        self.b.ins().brif(c, fall, &[], taken, &[]);
-                    }
-                    fallthrough = None;
-                }
-                KOp::ArrayPush {
-                    obj,
-                    val,
-                    dst,
-                    bail,
-                } => {
-                    let v = self.get(val);
-                    let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
-                    let args = [self.ctx_ptr, oslot, v];
-                    self.emit_shim_to_dst(pc, "cjit_array_push", &args, dst, bail)?;
-                }
-                KOp::ArrayPop { obj, dst, bail } => {
-                    let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
-                    let args = [self.ctx_ptr, oslot];
-                    self.emit_shim_to_dst(pc, "cjit_array_pop", &args, dst, bail)?;
-                }
-                // Pinned-string reads: TOTAL over the entry-hoisted view
-                // (flat ASCII, immutable) — no bail exists, mirroring the
-                // interpreter arms exactly (saturating index conversion:
-                // NaN→0, truncate; out-of-range yields NaN).
-                KOp::StrLen { dst, str } => {
-                    let (_, slen) = self.sviews[str as usize];
-                    let v = self.b.ins().fcvt_from_sint(types::F64, slen);
-                    self.set(dst, v);
-                }
-                KOp::CharCodeAt { dst, str, idx } => {
-                    let (sptr, slen) = self.sviews[str as usize];
-                    let i = self.get(idx);
-                    let p = self.b.ins().fcvt_to_sint_sat(types::I64, i);
-                    let nonneg = self
-                        .b
-                        .ins()
-                        .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, p, 0);
-                    let in_bounds = self.b.ins().icmp(IntCC::SignedLessThan, p, slen);
-                    let ok = self.b.ins().band(nonneg, in_bounds);
-                    let load_b = self.b.create_block();
-                    let oob_b = self.b.create_block();
-                    let join = self.b.create_block();
-                    let res = self.b.append_block_param(join, types::F64);
-                    self.b.ins().brif(ok, load_b, &[], oob_b, &[]);
-                    self.b.switch_to_block(load_b);
-                    let addr = self.b.ins().iadd(sptr, p);
-                    let byte = self.b.ins().load(types::I8, MemFlagsData::new(), addr, 0);
-                    let wide = self.b.ins().uextend(types::I32, byte);
-                    let v = self.b.ins().fcvt_from_sint(types::F64, wide);
-                    self.b.ins().jump(join, &[v.into()]);
-                    self.b.switch_to_block(oob_b);
-                    let nan = self.b.ins().f64const(f64::NAN);
-                    self.b.ins().jump(join, &[nan.into()]);
-                    self.b.switch_to_block(join);
-                    self.set(dst, res);
-                }
-                // Excluded by `eligible`.
-                KOp::LoadProp { .. }
-                | KOp::StoreProp { .. }
-                | KOp::CallKernel { .. }
-                | KOp::SelfCall { .. } => return None,
-            }
-            if let Some(skip) = fallthrough {
-                let next = self.blocks[pc + skip];
+        let k = self.k;
+        let code: &[KOp] = &k.code;
+        for (pc, &op) in code.iter().enumerate() {
+            let block = self.cur_blocks[pc];
+            self.b.switch_to_block(block);
+            if let Some(skip) = self.emit_op(op, pc)? {
+                let next = self.cur_blocks[pc + skip];
                 self.b.ins().jump(next, &[]);
             }
             self.flush_backedges();
+        }
+        self.finish(frontend_config)
+    }
+
+    /// Emit one op into the current block. Returns the fall-through skip
+    /// (1, or 2 past a fused op's landing pad), `Some(None)` when the op
+    /// placed its own terminator, or `None` to decline the whole
+    /// translation. Shared between the top-level kernel and inlined callee
+    /// kernels (`emit_call_kernel` swaps `cur_blocks`/`reg_base`/
+    /// `inline_ret` around it).
+    fn emit_op(&mut self, op: KOp, pc: usize) -> Option<Option<usize>> {
+        let mut fallthrough = Some(1usize);
+        match op {
+            KOp::Mov { dst, src } => {
+                let v = self.get(src);
+                self.set(dst, v);
+            }
+            KOp::Const { dst, k } => {
+                let v = self.b.ins().f64const(k);
+                self.set(dst, v);
+            }
+            KOp::Add { dst, a, b } => {
+                let (x, y) = (self.get(a), self.get(b));
+                let v = self.b.ins().fadd(x, y);
+                self.set(dst, v);
+            }
+            KOp::AddK { dst, a, k } => {
+                let x = self.get(a);
+                let kk = self.b.ins().f64const(k);
+                let v = self.b.ins().fadd(x, kk);
+                self.set(dst, v);
+            }
+            KOp::Arith { kind, dst, a, b } => {
+                let (x, y) = (self.get(a), self.get(b));
+                let v = self.arith(kind, x, y, None)?;
+                self.set(dst, v);
+            }
+            KOp::ArithK { kind, dst, a, k } => {
+                let x = self.get(a);
+                let kk = self.b.ins().f64const(k);
+                let v = self.arith(kind, x, kk, Some(k))?;
+                self.set(dst, v);
+            }
+            KOp::Neg { dst, src } => {
+                let x = self.get(src);
+                let v = self.b.ins().fneg(x);
+                self.set(dst, v);
+            }
+            KOp::BitNot { dst, src } => {
+                let x = self.get(src);
+                let ix = self.toint32(x)?;
+                let nx = self.b.ins().bnot(ix);
+                let v = self.i32_to_f64(nx);
+                self.set(dst, v);
+            }
+            KOp::Mov2 { d1, s1, d2, s2 } => {
+                let v1 = self.get(s1);
+                self.set(d1, v1);
+                let v2 = self.get(s2);
+                self.set(d2, v2);
+                fallthrough = Some(2);
+            }
+            KOp::ArithAdd {
+                kind,
+                dst,
+                a,
+                b,
+                d2,
+                a2,
+                b2,
+            } => {
+                let (x, y) = (self.get(a), self.get(b));
+                let v = self.arith(kind, x, y, None)?;
+                self.set(dst, v);
+                let (x2, y2) = (self.get(a2), self.get(b2));
+                let v2 = self.b.ins().fadd(x2, y2);
+                self.set(d2, v2);
+                fallthrough = Some(2);
+            }
+            KOp::ArithKAdd {
+                kind,
+                dst,
+                a,
+                k,
+                d2,
+                a2,
+                b2,
+            } => {
+                let x = self.get(a);
+                let kk = self.b.ins().f64const(k);
+                let v = self.arith(kind, x, kk, Some(k))?;
+                self.set(dst, v);
+                let (x2, y2) = (self.get(a2), self.get(b2));
+                let v2 = self.b.ins().fadd(x2, y2);
+                self.set(d2, v2);
+                fallthrough = Some(2);
+            }
+            KOp::AddKBr { dst, a, k, target } => {
+                let x = self.get(a);
+                let kk = self.b.ins().f64const(k);
+                let v = self.b.ins().fadd(x, kk);
+                self.set(dst, v);
+                let d = self.dest(pc, target as usize);
+                self.b.ins().jump(d, &[]);
+                fallthrough = None;
+            }
+            KOp::Br { target } => {
+                let d = self.dest(pc, target as usize);
+                self.b.ins().jump(d, &[]);
+                fallthrough = None;
+            }
+            KOp::BrCmp {
+                cmp,
+                a,
+                b,
+                if_true,
+                target,
+            } => {
+                let (x, y) = (self.get(a), self.get(b));
+                let c = self.b.ins().fcmp(cmp_cc(cmp), x, y);
+                self.branch_on(c, if_true, pc, target as usize);
+                fallthrough = None;
+            }
+            KOp::BrCmpK {
+                cmp,
+                a,
+                k,
+                if_true,
+                target,
+            } => {
+                let x = self.get(a);
+                let kk = self.b.ins().f64const(k);
+                let c = self.b.ins().fcmp(cmp_cc(cmp), x, kk);
+                self.branch_on(c, if_true, pc, target as usize);
+                fallthrough = None;
+            }
+            KOp::BrFalsy { src, target } => {
+                let x = self.get(src);
+                let c = self.truthy(x);
+                self.branch_on(c, false, pc, target as usize);
+                fallthrough = None;
+            }
+            KOp::BrTruthy { src, target } => {
+                let x = self.get(src);
+                let c = self.truthy(x);
+                self.branch_on(c, true, pc, target as usize);
+                fallthrough = None;
+            }
+            KOp::CmpSet { cmp, dst, a, b } => {
+                let (x, y) = (self.get(a), self.get(b));
+                let c = self.b.ins().fcmp(cmp_cc(cmp), x, y);
+                let one = self.b.ins().f64const(1.0);
+                let zero = self.b.ins().f64const(0.0);
+                let v = self.b.ins().select(c, one, zero);
+                self.set(dst, v);
+            }
+            KOp::BoolNot { dst, src } => {
+                let x = self.get(src);
+                let c = self.truthy(x);
+                let one = self.b.ins().f64const(1.0);
+                let zero = self.b.ins().f64const(0.0);
+                let v = self.b.ins().select(c, zero, one);
+                self.set(dst, v);
+            }
+            KOp::Math1 { kind, dst, src } => {
+                let x = self.get(src);
+                let v = match kind {
+                    KMath::Abs => self.b.ins().fabs(x),
+                    KMath::Floor => self.b.ins().floor(x),
+                    KMath::Ceil => self.b.ins().ceil(x),
+                    KMath::Trunc => self.b.ins().trunc(x),
+                    KMath::Sqrt => self.b.ins().sqrt(x),
+                    KMath::Round => self.call1("cjit_round", x)?,
+                    KMath::Sign => self.call1("cjit_sign", x)?,
+                    KMath::Fround => self.call1("cjit_fround", x)?,
+                    // Binary kinds are excluded by `eligible` (arity 1).
+                    KMath::Min2 | KMath::Max2 | KMath::Pow2 | KMath::Imul2 => return None,
+                };
+                self.set(dst, v);
+            }
+            KOp::Math2 { kind, dst, a, b } => {
+                let (x, y) = (self.get(a), self.get(b));
+                let v = match kind {
+                    // Cranelift fmin/fmax carry wasm's semantics — NaN
+                    // poisons, -0 < +0 — which are exactly the
+                    // `math_min2`/`math_max2` cores' rules.
+                    KMath::Min2 => self.b.ins().fmin(x, y),
+                    KMath::Max2 => self.b.ins().fmax(x, y),
+                    // `**`'s spec special cases live in `math_pow`.
+                    KMath::Pow2 => self.call2("cjit_pow2", x, y)?,
+                    KMath::Imul2 => {
+                        let (ix, iy) = (self.toint32(x)?, self.toint32(y)?);
+                        let r = self.b.ins().imul(ix, iy);
+                        self.i32_to_f64(r)
+                    }
+                    // Unary kinds are excluded by `eligible` (arity 2).
+                    _ => return None,
+                };
+                self.set(dst, v);
+            }
+            KOp::Exit { .. } => {
+                // Top-level only (callee eligibility rejects `Exit`).
+                if self.inline_ret.is_some() {
+                    return None;
+                }
+                let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                self.b.ins().jump(self.exit_block, &[pcv.into()]);
+                fallthrough = None;
+            }
+            KOp::Ret { src, .. } => {
+                fallthrough = None;
+                if let Some(cont) = self.inline_ret {
+                    // Inlined callee: the return value flows to the call
+                    // site's continuation (Number-only — boolean-
+                    // returning callees are rejected by the activation
+                    // guard the compiled code runs under).
+                    let v = self.get(src);
+                    self.b.ins().jump(cont, &[v.into()]);
+                } else if self.rec.is_some() {
+                    // Recursive body: a real native return (raw f64 —
+                    // booleans travel as 0.0/1.0; the seam constructs
+                    // the typed result from the family's `ret_bool`).
+                    let v = self.get(src);
+                    self.b.ins().return_(&[v]);
+                } else {
+                    // Top-level (function kernels): exit at this op's
+                    // index; the caller constructs the typed result.
+                    let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                    self.b.ins().jump(self.exit_block, &[pcv.into()]);
+                }
+            }
+            KOp::LoadElem {
+                dst,
+                obj,
+                idx,
+                bail,
+            } => {
+                let i = self.get(idx);
+                let v = self.emit_elem_load(pc, obj, i, bail)?;
+                self.set(dst, v);
+            }
+            KOp::StoreElem {
+                obj,
+                idx,
+                val,
+                bail,
+            } => {
+                let (i, v) = (self.get(idx), self.get(val));
+                self.emit_elem_store(pc, obj, i, v, bail)?;
+            }
+            // Fused `s += a[i]` / `a[i] <op> …`: the element load's exact
+            // semantics (and bail edge), then the arithmetic tail, then
+            // the 2-slot skip past the landing pad.
+            KOp::LoadElemAdd {
+                dst,
+                obj,
+                idx,
+                bail,
+                d2,
+                a2,
+                b2,
+            } => {
+                let i = self.get(idx);
+                let v = self.emit_elem_load(pc, obj, i, bail)?;
+                self.set(dst, v);
+                let (x2, y2) = (self.get(a2), self.get(b2));
+                let v2 = self.b.ins().fadd(x2, y2);
+                self.set(d2, v2);
+                fallthrough = Some(2);
+            }
+            KOp::LoadElemArith {
+                dst,
+                obj,
+                idx,
+                bail,
+                kind,
+                d2,
+                a2,
+                b2,
+            } => {
+                let i = self.get(idx);
+                let v = self.emit_elem_load(pc, obj, i, bail)?;
+                self.set(dst, v);
+                let (x2, y2) = (self.get(a2), self.get(b2));
+                let v2 = self.arith(kind, x2, y2, None)?;
+                self.set(d2, v2);
+                fallthrough = Some(2);
+            }
+            KOp::LoadLen { dst, obj, bail } => {
+                let v = self.emit_len(pc, obj, bail)?;
+                self.set(dst, v);
+            }
+            // Fused `i < a.length` header: LoadLen's semantics (and bail
+            // edge), then BrCmp's compare-and-branch, then the 2-slot
+            // fall-through past the landing pad.
+            KOp::LenBrCmp {
+                dst,
+                obj,
+                bail,
+                cmp,
+                a,
+                b,
+                if_true,
+                target,
+            } => {
+                let v = self.emit_len(pc, obj, bail)?;
+                self.set(dst, v);
+                let (x, y) = (self.get(a), self.get(b));
+                let c = self.b.ins().fcmp(cmp_cc(cmp), x, y);
+                let taken = self.dest(pc, target as usize);
+                let fall = self.cur_blocks[pc + 2];
+                if if_true {
+                    self.b.ins().brif(c, taken, &[], fall, &[]);
+                } else {
+                    self.b.ins().brif(c, fall, &[], taken, &[]);
+                }
+                fallthrough = None;
+            }
+            KOp::ArrayPush {
+                obj,
+                val,
+                dst,
+                bail,
+            } => {
+                let v = self.get(val);
+                let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
+                let args = [self.ctx_ptr, oslot, v];
+                self.emit_shim_to_dst(pc, "cjit_array_push", &args, dst, bail)?;
+            }
+            KOp::ArrayPop { obj, dst, bail } => {
+                let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
+                let args = [self.ctx_ptr, oslot];
+                self.emit_shim_to_dst(pc, "cjit_array_pop", &args, dst, bail)?;
+            }
+            // Pinned-string reads: TOTAL over the entry-hoisted view
+            // (flat ASCII, immutable) — no bail exists, mirroring the
+            // interpreter arms exactly (saturating index conversion:
+            // NaN→0, truncate; out-of-range yields NaN).
+            KOp::StrLen { dst, str } => {
+                let (_, slen) = self.sviews[str as usize];
+                let v = self.b.ins().fcvt_from_sint(types::F64, slen);
+                self.set(dst, v);
+            }
+            KOp::CharCodeAt { dst, str, idx } => {
+                let (sptr, slen) = self.sviews[str as usize];
+                let i = self.get(idx);
+                let p = self.b.ins().fcvt_to_sint_sat(types::I64, i);
+                let nonneg = self
+                    .b
+                    .ins()
+                    .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, p, 0);
+                let in_bounds = self.b.ins().icmp(IntCC::SignedLessThan, p, slen);
+                let ok = self.b.ins().band(nonneg, in_bounds);
+                let load_b = self.b.create_block();
+                let oob_b = self.b.create_block();
+                let join = self.b.create_block();
+                let res = self.b.append_block_param(join, types::F64);
+                self.b.ins().brif(ok, load_b, &[], oob_b, &[]);
+                self.b.switch_to_block(load_b);
+                let addr = self.b.ins().iadd(sptr, p);
+                let byte = self.b.ins().load(types::I8, MemFlagsData::new(), addr, 0);
+                let wide = self.b.ins().uextend(types::I32, byte);
+                let v = self.b.ins().fcvt_from_sint(types::F64, wide);
+                self.b.ins().jump(join, &[v.into()]);
+                self.b.switch_to_block(oob_b);
+                let nan = self.b.ins().f64const(f64::NAN);
+                self.b.ins().jump(join, &[nan.into()]);
+                self.b.switch_to_block(join);
+                self.set(dst, res);
+            }
+            // A pinned-callee call: copy the arguments into the
+            // callee's variable window and run its kernel INLINE — the
+            // callee identity is an activation constant the compiled
+            // code's users re-verify, so the inlined body is exactly the
+            // kernel the interpreter's `run_callee_window` would run.
+            KOp::CallKernel {
+                dst,
+                fslot,
+                base,
+                argc: _,
+            } => {
+                self.emit_call_kernel(dst, fslot, base)?;
+            }
+            // A direct self-recursive call (recursive bodies only; see
+            // `compile_rec`): the interpreter's per-call depth guard and
+            // shared poll, then a real native call to this very
+            // function, then the abandon-unwind check.
+            KOp::SelfCall {
+                dst,
+                base,
+                argc: _,
+                callee,
+            } => {
+                if callee != 0 {
+                    return None;
+                }
+                let rec = self.rec.clone()?;
+                self.emit_self_call(&rec, dst, base)?;
+            }
+            // Excluded by `eligible`.
+            KOp::LoadProp { .. } | KOp::StoreProp { .. } => return None,
+        }
+        Some(fallthrough)
+    }
+
+    /// One self-recursive call site (recursive bodies; see the `SelfCall`
+    /// arm): depth guard → shared poll → native self-call → abandon check.
+    fn emit_self_call(&mut self, rec: &RecMode, dst: u16, base: u16) -> Option<()> {
+        // Depth: the interpreter abandons when the NEXT frame would exceed
+        // the budget — i.e. when this frame's remaining budget is < 1.
+        let depth_ok = self.b.create_block();
+        let out_of_depth = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, rec.depth, 1);
+        self.b
+            .ins()
+            .brif(out_of_depth, rec.abandon_depth, &[], depth_ok, &[]);
+        self.b.switch_to_block(depth_ok);
+        // Shared poll counter (ctx-resident so the cadence spans frames,
+        // like the interpreter's activation-wide counter).
+        let poll_off = std::mem::offset_of!(JitCtx, poll) as i32;
+        let p = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), self.ctx_ptr, poll_off);
+        let p2 = self.b.ins().iadd_imm_u(p, 1i64);
+        self.b
+            .ins()
+            .store(MemFlagsData::trusted(), p2, self.ctx_ptr, poll_off);
+        let masked = self.b.ins().band_imm_u(p2, 0xFFi64);
+        let check = self.b.create_block();
+        let call_b = self.b.create_block();
+        self.b.ins().brif(masked, call_b, &[], check, &[]);
+        self.b.switch_to_block(check);
+        let flag = self
+            .b
+            .ins()
+            .load(types::I8, MemFlagsData::trusted(), self.int_ptr, 0);
+        // intr_block in rec mode sets `abandon = 2` and returns.
+        self.b.ins().brif(flag, self.intr_block, &[], call_b, &[]);
+        self.b.switch_to_block(call_b);
+        // Arguments from the call site's contiguous registers, upvalues
+        // re-passed, one less depth.
+        let mut call_args = Vec::with_capacity(rec.arg_indices.len() + rec.upval_params.len() + 3);
+        for &a in &rec.arg_indices {
+            call_args.push(self.get(base + a));
+        }
+        call_args.extend_from_slice(&rec.upval_params);
+        let next_depth = self.b.ins().iadd_imm_s(rec.depth, -1i64);
+        call_args.push(next_depth);
+        call_args.push(self.int_ptr);
+        call_args.push(self.ctx_ptr);
+        let call = self.b.ins().call(rec.self_ref, &call_args);
+        let ret = self.b.inst_results(call)[0];
+        // A flagged abandon/interrupt anywhere below unwinds every frame.
+        let ab = self.b.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            self.ctx_ptr,
+            std::mem::offset_of!(JitCtx, abandon) as i32,
+        );
+        let cont = self.b.create_block();
+        self.b.ins().brif(ab, rec.ret_zero, &[], cont, &[]);
+        self.b.switch_to_block(cont);
+        self.set(dst, ret);
+        Some(())
+    }
+
+    /// Inline one pinned-callee call site (see the `CallKernel` arm).
+    fn emit_call_kernel(&mut self, dst: u16, fslot: u16, base: u16) -> Option<()> {
+        let callee = self.callees.get(fslot as usize)?.clone();
+        let ck = callee.proto.fn_kernel.as_ref()?;
+        // Per-call argument copy — exactly the interpreter's window setup.
+        for (r, slot) in ck.locals.iter().enumerate() {
+            if let crate::bytecode::KSlot::Arg(a) = slot {
+                let v = self.get(base + *a as u16);
+                let var = self.vars[callee.var_base + r];
+                self.b.def_var(var, v);
+            }
+        }
+        // Swap in the callee's emission context and lay its body down at
+        // this site; every `Ret` jumps to `cont` with the return value.
+        let cont = self.b.create_block();
+        let ret = self.b.append_block_param(cont, types::F64);
+        let saved_blocks = std::mem::replace(
+            &mut self.cur_blocks,
+            (0..ck.code.len()).map(|_| self.b.create_block()).collect(),
+        );
+        let saved_base = std::mem::replace(&mut self.reg_base, callee.var_base);
+        let saved_ret = self.inline_ret.replace(cont);
+        let first = self.cur_blocks[0];
+        self.b.ins().jump(first, &[]);
+        for (pc2, &op) in ck.code.iter().enumerate() {
+            let block = self.cur_blocks[pc2];
+            self.b.switch_to_block(block);
+            if let Some(skip) = self.emit_op(op, pc2)? {
+                let next = self.cur_blocks[pc2 + skip];
+                self.b.ins().jump(next, &[]);
+            }
+            self.flush_backedges();
+        }
+        self.cur_blocks = saved_blocks;
+        self.reg_base = saved_base;
+        self.inline_ret = saved_ret;
+        self.b.switch_to_block(cont);
+        self.set(dst, ret);
+        Some(())
+    }
+
+    fn finish(
+        mut self,
+        frontend_config: cranelift_codegen::isa::TargetFrontendConfig,
+    ) -> Option<()> {
+        // Recursive bodies pre-filled their landing blocks in `new_rec`.
+        if self.rec.is_some() {
+            self.b.seal_all_blocks();
+            self.b.finalize(frontend_config);
+            return Some(());
         }
         // Interrupt landing: exit with the sentinel (registers still stored —
         // the caller's latch-and-unwind reads them, like an interpreter poll
@@ -1893,7 +2569,7 @@ impl<'a> Translator<'a> {
         target: usize,
     ) {
         let taken = self.dest(pc, target);
-        let fall = self.blocks[pc + 1];
+        let fall = self.cur_blocks[pc + 1];
         if if_true {
             self.b.ins().brif(cond, taken, &[], fall, &[]);
         } else {
