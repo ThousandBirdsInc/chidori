@@ -113,12 +113,42 @@ const CORPUS: &[&str] = &[
     // entry/exit slot load/write-back is the caller's, shared with the JIT).
     "const o = { v: 0, w: 100 }; for (let i = 0; i < 50; i++) { o.v += i; o.w -= i; } console.log(o.v, o.w);",
     "const p = { hi: 0 }; let s = 0; for (let i = 0; i < 30; i++) { p.hi = p.hi + i; s += p.hi; } console.log(s, p.hi);",
-    // DECLINED kernels (element access, strings, pinned callees): the
-    // interpreter tier owns them; results must be identical anyway.
+    // Dense-array element kernels (now compiled: reads/writes through the
+    // shared fast-path core, bail edges on every miss).
     "const a = [1,2,3,4,5]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } console.log(s);",
     "const a = [5,4,3,2,1]; for (let i = 0; i < a.length; i++) { a[i] += i; } console.log(a.join(','));",
-    "let s = 0; const txt = 'kernel'; for (let i = 0; i < txt.length; i++) { s += txt.charCodeAt(i); } console.log(s);",
+    "const x = [1,2,3,4], y = [10,20,30,40]; let d = 0; for (let i = 0; i < x.length; i++) { d += x[i] * y[i]; } console.log(d);",
+    // Aliased bases: writes through one visible through the other.
+    "const a = [1,2,3]; const b = a; let s = 0; for (let i = 0; i < a.length; i++) { b[i] = a[i] + 1; s += a[i]; } console.log(s, a.join(','));",
+    // Holes (prototype consult), OOB reads, fractional indices, non-Number
+    // elements: per-access bails must land identically.
+    "Array.prototype[1] = 99; const a = [1,,3]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } delete Array.prototype[1]; console.log(s);",
+    "const a = [1,,3]; for (let i = 0; i < a.length; i++) { a[i] = (a[i] || 0) + 1; } console.log(a.join(','), 1 in a);",
+    "const a = [1,2]; let s = 0; for (let i = 0; i < 4; i++) { s += a[i] === undefined ? 100 : a[i]; } console.log(s);",
+    "const a = [1,'x',3]; let s = ''; for (let i = 0; i < a.length; i++) { s += a[i]; } console.log(s);",
+    "const a = [1,2,3]; a[1.5] = 7; let s = 0; for (let i = 0; i < 3; i += 0.5) { s += a[i] || 0; } console.log(s, a['1.5']);",
+    // Store-side creation: hole fill and exact append (growth mid-loop).
+    "const a = [0]; for (let i = 0; i < 20; i++) { a[a.length] = i; } console.log(a.length, a[20]);",
+    // push/pop kernels (receiver re-checked per op).
     "const arr = []; for (let i = 0; i < 10; i++) { arr.push(i * i); } console.log(arr.length, arr[9]);",
+    "const arr = [1,2,3,4,5]; let s = 0; for (let i = 0; i < 5; i++) { s = s * 10 + arr.pop(); } console.log(s, arr.length);",
+    // Float64Array: the DIRECT-view path (in-bounds reads/writes) and its
+    // bail edges (OOB, fractional index), plus a dot product and an
+    // in-place transform over two views.
+    "const t = new Float64Array(8); for (let i = 0; i < 8; i++) { t[i] = i * 1.5; } let s = 0; for (let i = 0; i < 8; i++) { s += t[i]; } console.log(s, t[7]);",
+    "const a = new Float64Array(16), b = new Float64Array(16); for (let i = 0; i < 16; i++) { a[i] = i % 5; b[i] = i % 3; } let d = 0; for (let i = 0; i < a.length; i++) { d += a[i] * b[i]; } for (let i = 0; i < a.length; i++) { a[i] = (a[i] + b[i]) % 4; } console.log(d, a.join(','));",
+    "const t = new Float64Array(4); let s = 0; for (let i = 0; i < 6; i++) { s += t[i] === undefined ? 100 : t[i]; t[i] = i; } console.log(s, t.join(','));",
+    "const t = new Float64Array(4); t[0] = 1; let s = 0; for (let i = 0; i < 2; i += 0.5) { s += t[i] || 0; } console.log(s);",
+    // NaN/-0 round-trip through typed storage, and Infinity.
+    "const t = new Float64Array(3); t[0] = -0; t[1] = NaN; t[2] = Infinity; let c = 0; for (let i = 0; i < 3; i++) { const v = t[i]; if (Object.is(v, -0)) c += 1; if (v !== v) c += 10; if (v === Infinity) c += 100; } console.log(c);",
+    // Int32Array: helper path (per-kind encode/decode) with wrapping stores.
+    "const t = new Int32Array(6); for (let i = 0; i < 6; i++) { t[i] = i * 1e9; } let s = 0; for (let i = 0; i < t.length; i++) { s += t[i]; } console.log(s, t.join(','));",
+    // Pinned-string kernels (StrLen/CharCodeAt — total, no bail): the
+    // tokenizer hash idiom, plus NaN/OOB index handling.
+    "const txt = 'kernel'; let s = 0; for (let i = 0; i < txt.length; i++) { s += txt.charCodeAt(i); } console.log(s);",
+    "const txt = 'abcdef'; let h = 0; for (let r = 0; r < 5; r++) { for (let i = 0; i < txt.length; i++) { h = (h * 31 + txt.charCodeAt(i)) % 1000000007; } } console.log(h);",
+    "const txt = 'xy'; let c = 0; for (let i = -1; i < 4; i++) { const v = txt.charCodeAt(i); c += v === v ? v : 1000; } console.log(c);",
+    // Pinned-callee loops stay on the interpreter tier (CallKernel declines).
     "function dbl(x) { return x * 2; } let s = 0; for (let i = 0; i < 100; i++) { s += dbl(i); } console.log(s);",
     // FUNCTION kernels through the frameless call path: plain scalar...
     "function cmp(a, b) { return a - b; } let s = 0; for (let i = 0; i < 50; i++) { s += cmp(i, 25); } console.log(s, [3,1,2].sort(cmp).join(''));",
@@ -175,21 +205,22 @@ fn jit_actually_compiles_and_runs() {
     );
 }
 
-/// Structural: an element-access kernel declines translation (stays on the
-/// interpreter tier) rather than erroring — and still computes correctly.
+/// Structural: a kernel outside the compiled subset (here a pinned-callee
+/// loop, `KOp::CallKernel`) declines translation — staying on the
+/// interpreter tier rather than erroring — and still computes correctly.
 #[test]
 fn jit_declines_non_scalar_kernels() {
     let before = chidori_js::jit::stats();
     let (threw, console, _err) = run(
-        "const a = [1,2,3,4]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } console.log(s);",
+        "function dbl(x) { return x * 2; } let s = 0; for (let i = 0; i < 200; i++) { s += dbl(i); } console.log(s);",
         true,
     );
     assert!(!threw);
-    assert_eq!(console, vec!["10".to_string()]);
+    assert_eq!(console, vec!["39800".to_string()]);
     let after = chidori_js::jit::stats();
     assert!(
         after.declined > before.declined,
-        "expected the element-access kernel to decline JIT translation"
+        "expected the pinned-callee loop kernel to decline JIT translation"
     );
 }
 

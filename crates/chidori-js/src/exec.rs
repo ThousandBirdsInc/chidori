@@ -1091,7 +1091,46 @@ impl Vm {
         // the tier never has a third outcome.
         #[cfg(feature = "jit")]
         if self.jit_enabled {
-            match crate::jit::maybe_run(k, w, interrupt.as_deref()) {
+            let native_exit = crate::jit::native_for(k).map(|native| {
+                // Activation tables for the native run, alive exactly across
+                // it: the pinned strings (guard-validated flat ASCII), the
+                // per-oslot direct f64-typed-array views, the object cache
+                // the element shims index, and the canonical Array.prototype
+                // for the push receiver check.
+                let sstr_tab: Vec<crate::jit::SStr> = sstrs
+                    .iter()
+                    .map(|st| {
+                        let f = st.flatten_utf8().expect("entry-guarded flat ASCII");
+                        crate::jit::SStr {
+                            ptr: f.as_ptr(),
+                            len: f.len() as u64,
+                        }
+                    })
+                    .collect();
+                // Dense direct views only for kernels that provably never
+                // change any array's length or contents (no element stores,
+                // no push/pop) — then a dense array's storage pointer and
+                // length hold for the whole activation.
+                let allow_dense = !k.stores_elems && !k.uses_array_push && !k.uses_array_pop;
+                let ta_tab: Vec<crate::jit::ElemView> = objs
+                    .iter()
+                    .map(|o| crate::jit::elem_view(o, allow_dense))
+                    .collect();
+                let mut ctx = crate::jit::JitCtx {
+                    sstr: sstr_tab.as_ptr(),
+                    objs: objs.as_ptr(),
+                    n_objs: objs.len() as u64,
+                    ta: ta_tab.as_ptr(),
+                    array_proto: if k.uses_array_push || k.uses_array_pop {
+                        &self.realm.array_proto
+                    } else {
+                        std::ptr::null()
+                    },
+                    scratch: 0.0,
+                };
+                native.run(w, interrupt.as_deref(), &mut ctx)
+            });
+            match native_exit {
                 None => {}
                 Some(stopped_at) if stopped_at >= 0 => pc = stopped_at as usize,
                 Some(_interrupted) => {
@@ -1247,50 +1286,18 @@ impl Vm {
                         branch!(target)
                     }
                 }
-                // Dense element read: full fast-path re-check, else bail to
-                // the generic op (the `bail` target is an Exit stub).
+                // Dense element read: full fast-path re-check (shared core,
+                // see [`kernel_elem_load`]), else bail to the generic op
+                // (the `bail` target is an Exit stub).
                 KOp::LoadElem {
                     dst,
                     obj,
                     idx,
                     bail,
-                } => {
-                    let i = w[idx as usize & KWIN_MASK];
-                    let mut ok = false;
-                    if let Some(iu) = dense_index(i) {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                if let Some(Value::Number(n)) = arr.get(iu) {
-                                    w[dst as usize & KWIN_MASK] = *n;
-                                    ok = true;
-                                }
-                            }
-                            // Numeric typed arrays: a valid-index [[Get]]
-                            // reads element storage directly — own props and
-                            // the prototype chain are never consulted, so no
-                            // props/proto check is needed. OOB (incl.
-                            // detached / shrunk-view) bails to the generic
-                            // path, which owns the `undefined` absorption.
-                            Internal::TypedArray(t)
-                                if !t.kind.is_bigint()
-                                    && iu < crate::typed_array::ta_eff_length(t) =>
-                            {
-                                let off = t.byte_offset + iu * t.kind.bytes();
-                                let buf = t.buffer.borrow();
-                                if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
-                                    w[dst as usize & KWIN_MASK] =
-                                        crate::typed_array::decode(bytes, off, t.kind);
-                                    ok = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
-                    }
-                }
+                } => match kernel_elem_load(&objs, obj as usize, w[idx as usize & KWIN_MASK]) {
+                    Some(n) => w[dst as usize & KWIN_MASK] = n,
+                    None => branch!(bail),
+                },
                 // Pinned-native push: append + new length, in-kernel. The
                 // entry guard proved the canonical method still resolves
                 // and (stores_elems) that no proto can intercept element
@@ -1302,51 +1309,23 @@ impl Vm {
                     val,
                     dst,
                     bail,
-                } => {
-                    let mut ok = false;
-                    {
-                        let mut b = objs[obj as usize].borrow_mut();
-                        if b.own_is_empty()
-                            && b.extensible
-                            && b.proto
-                                .as_ref()
-                                .is_some_and(|p| p.ptr_eq(&self.realm.array_proto))
-                        {
-                            if let Internal::Array(arr) = &mut b.internal {
-                                if arr.len() < crate::value::MAX_DENSE_ARRAY {
-                                    arr.push(Value::Number(w[val as usize & KWIN_MASK]));
-                                    w[dst as usize & KWIN_MASK] = arr.len() as f64;
-                                    ok = true;
-                                }
-                            }
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
-                    }
-                }
+                } => match kernel_array_push(
+                    &objs,
+                    obj as usize,
+                    &self.realm.array_proto,
+                    w[val as usize & KWIN_MASK],
+                ) {
+                    Some(len) => w[dst as usize & KWIN_MASK] = len,
+                    None => branch!(bail),
+                },
                 // Pinned-native pop: remove + yield the last element when it
                 // is a plain Number. An empty array (undefined result), a
                 // trailing hole (prototype consult), or a non-Number element
                 // re-runs the generic Call via the bail.
-                KOp::ArrayPop { obj, dst, bail } => {
-                    let mut ok = false;
-                    {
-                        let mut b = objs[obj as usize].borrow_mut();
-                        if b.own_is_empty() && b.extensible {
-                            if let Internal::Array(arr) = &mut b.internal {
-                                if let Some(Value::Number(n)) = arr.last() {
-                                    w[dst as usize & KWIN_MASK] = *n;
-                                    arr.pop();
-                                    ok = true;
-                                }
-                            }
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
-                    }
-                }
+                KOp::ArrayPop { obj, dst, bail } => match kernel_array_pop(&objs, obj as usize) {
+                    Some(n) => w[dst as usize & KWIN_MASK] = n,
+                    None => branch!(bail),
+                },
                 // Dense element write: in-place overwrite (exactly the
                 // `Op::SetPropDynamic` fast-path conditions), an in-bounds
                 // HOLE fill, or an exact one-past-the-end APPEND. Filling and
@@ -1362,66 +1341,12 @@ impl Vm {
                     val,
                     bail,
                 } => {
-                    let i = w[idx as usize & KWIN_MASK];
-                    let mut ok = false;
-                    if let Some(iu) = dense_index(i) {
-                        let mut b = objs[obj as usize].borrow_mut();
-                        let extensible = b.extensible;
-                        let props_empty = b.own_is_empty();
-                        match &mut b.internal {
-                            Internal::Array(arr) if props_empty => {
-                                match arr.get_mut(iu) {
-                                    Some(slot) if !matches!(slot, Value::Hole) => {
-                                        *slot = Value::Number(w[val as usize & KWIN_MASK]);
-                                        ok = true;
-                                    }
-                                    Some(slot) => {
-                                        // In-bounds hole: creation.
-                                        if extensible {
-                                            *slot = Value::Number(w[val as usize & KWIN_MASK]);
-                                            ok = true;
-                                        }
-                                    }
-                                    None => {
-                                        // Exact append (no hole gap).
-                                        if extensible
-                                            && iu == arr.len()
-                                            && iu < crate::value::MAX_DENSE_ARRAY
-                                        {
-                                            arr.push(Value::Number(w[val as usize & KWIN_MASK]));
-                                            ok = true;
-                                        }
-                                    }
-                                }
-                            }
-                            // Numeric typed arrays: a valid-index [[Set]]
-                            // writes element storage directly, no props/proto
-                            // consult; the register already holds the
-                            // ToNumber'd value, and `encode` applies the same
-                            // per-kind conversion (f32 rounding, ToInt32-class
-                            // wrapping) as the builtin write path. OOB — a
-                            // silent no-op per spec — bails to the generic
-                            // path, which owns that behavior.
-                            Internal::TypedArray(t)
-                                if !t.kind.is_bigint()
-                                    && iu < crate::typed_array::ta_eff_length(t) =>
-                            {
-                                let off = t.byte_offset + iu * t.kind.bytes();
-                                let kind = t.kind;
-                                let mut buf = t.buffer.borrow_mut();
-                                if let Internal::ArrayBuffer(Some(bytes)) = &mut buf.internal {
-                                    crate::typed_array::encode(
-                                        bytes,
-                                        off,
-                                        kind,
-                                        w[val as usize & KWIN_MASK],
-                                    );
-                                    ok = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    let ok = kernel_elem_store(
+                        &objs,
+                        obj as usize,
+                        w[idx as usize & KWIN_MASK],
+                        w[val as usize & KWIN_MASK],
+                    );
                     if !ok {
                         branch!(bail)
                     }
@@ -1453,30 +1378,10 @@ impl Vm {
                 // accessor resolution for typed-array bases; the length
                 // itself cannot change mid-activation — resize/detach require
                 // calls, which kernel regions exclude), else bail.
-                KOp::LoadLen { dst, obj, bail } => {
-                    let mut ok = false;
-                    {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                w[dst as usize & KWIN_MASK] = arr.len() as f64;
-                                ok = true;
-                            }
-                            // Any kind — a BigInt-element array's `.length`
-                            // is the same plain count (its ELEMENT accesses
-                            // are what bail).
-                            Internal::TypedArray(t) => {
-                                w[dst as usize & KWIN_MASK] =
-                                    crate::typed_array::ta_eff_length(t) as f64;
-                                ok = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
-                    }
-                }
+                KOp::LoadLen { dst, obj, bail } => match kernel_elem_len(&objs, obj as usize) {
+                    Some(len) => w[dst as usize & KWIN_MASK] = len,
+                    None => branch!(bail),
+                },
                 // Prop LOCALIZATION rewrote every LoadProp/StoreProp into a
                 // register Mov at kernel build; the slots live only in the
                 // entry load and the exit/unwind write-back now.
@@ -1539,24 +1444,9 @@ impl Vm {
                     if_true,
                     target,
                 } => {
-                    let mut ok = false;
-                    {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                w[dst as usize & KWIN_MASK] = arr.len() as f64;
-                                ok = true;
-                            }
-                            Internal::TypedArray(t) => {
-                                w[dst as usize & KWIN_MASK] =
-                                    crate::typed_array::ta_eff_length(t) as f64;
-                                ok = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
+                    match kernel_elem_len(&objs, obj as usize) {
+                        Some(len) => w[dst as usize & KWIN_MASK] = len,
+                        None => branch!(bail),
                     }
                     if knum_cmp(cmp, w[a as usize & KWIN_MASK], w[b as usize & KWIN_MASK])
                         == if_true
@@ -1576,34 +1466,9 @@ impl Vm {
                     a2,
                     b2,
                 } => {
-                    let i = w[idx as usize & KWIN_MASK];
-                    let mut ok = false;
-                    if let Some(iu) = dense_index(i) {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                if let Some(Value::Number(n)) = arr.get(iu) {
-                                    w[dst as usize & KWIN_MASK] = *n;
-                                    ok = true;
-                                }
-                            }
-                            Internal::TypedArray(t)
-                                if !t.kind.is_bigint()
-                                    && iu < crate::typed_array::ta_eff_length(t) =>
-                            {
-                                let off = t.byte_offset + iu * t.kind.bytes();
-                                let buf = t.buffer.borrow();
-                                if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
-                                    w[dst as usize & KWIN_MASK] =
-                                        crate::typed_array::decode(bytes, off, t.kind);
-                                    ok = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
+                    match kernel_elem_load(&objs, obj as usize, w[idx as usize & KWIN_MASK]) {
+                        Some(n) => w[dst as usize & KWIN_MASK] = n,
+                        None => branch!(bail),
                     }
                     w[d2 as usize & KWIN_MASK] =
                         w[a2 as usize & KWIN_MASK] + w[b2 as usize & KWIN_MASK];
@@ -1621,34 +1486,9 @@ impl Vm {
                     a2,
                     b2,
                 } => {
-                    let i = w[idx as usize & KWIN_MASK];
-                    let mut ok = false;
-                    if let Some(iu) = dense_index(i) {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                if let Some(Value::Number(n)) = arr.get(iu) {
-                                    w[dst as usize & KWIN_MASK] = *n;
-                                    ok = true;
-                                }
-                            }
-                            Internal::TypedArray(t)
-                                if !t.kind.is_bigint()
-                                    && iu < crate::typed_array::ta_eff_length(t) =>
-                            {
-                                let off = t.byte_offset + iu * t.kind.bytes();
-                                let buf = t.buffer.borrow();
-                                if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
-                                    w[dst as usize & KWIN_MASK] =
-                                        crate::typed_array::decode(bytes, off, t.kind);
-                                    ok = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
+                    match kernel_elem_load(&objs, obj as usize, w[idx as usize & KWIN_MASK]) {
+                        Some(n) => w[dst as usize & KWIN_MASK] = n,
+                        None => branch!(bail),
                     }
                     w[d2 as usize & KWIN_MASK] = number_arith_raw(
                         w[a2 as usize & KWIN_MASK],
@@ -8604,6 +8444,153 @@ fn dense_index(i: f64) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// The kernel tier's element/length/push/pop fast paths, shared VERBATIM by
+/// the interpreter's dispatch arms (`LoadElem`/`LoadElemAdd`/`LoadElemArith`,
+/// `StoreElem`, `LoadLen`/`LenBrCmp`, `ArrayPush`/`ArrayPop`) and — under the
+/// `jit` feature — the native tier's element helper shims (`crate::jit`), so
+/// a native element access is the interpreter's own code by construction.
+/// `None`/`false` = the fast path does not apply: the caller takes the op's
+/// bail edge and the generic interpreter performs the exact spec semantics.
+///
+/// Dense element read: unshadowed dense array in bounds holding a non-hole
+/// `Number`, or a valid-index non-BigInt typed-array element (a valid-index
+/// [[Get]] reads element storage directly — own props and the prototype
+/// chain are never consulted).
+#[inline]
+pub(crate) fn kernel_elem_load(objs: &[JsObject], obj: usize, i: f64) -> Option<f64> {
+    let iu = dense_index(i)?;
+    let b = objs[obj].borrow();
+    match &b.internal {
+        Internal::Array(arr) if b.own_is_empty() => match arr.get(iu) {
+            Some(Value::Number(n)) => Some(*n),
+            _ => None,
+        },
+        Internal::TypedArray(t)
+            if !t.kind.is_bigint() && iu < crate::typed_array::ta_eff_length(t) =>
+        {
+            let off = t.byte_offset + iu * t.kind.bytes();
+            let buf = t.buffer.borrow();
+            match &buf.internal {
+                Internal::ArrayBuffer(Some(bytes)) => {
+                    Some(crate::typed_array::decode(bytes, off, t.kind))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Dense element write: in-place overwrite (exactly the `Op::SetPropDynamic`
+/// fast-path conditions), an in-bounds HOLE fill, or an exact one-past-the-
+/// end APPEND (both require extensibility and the dense bound — see the
+/// interpreter arm's comment), or a valid-index non-BigInt typed-array write
+/// (`encode` applies the per-kind conversion). `false` = bail.
+#[inline]
+pub(crate) fn kernel_elem_store(objs: &[JsObject], obj: usize, i: f64, val: f64) -> bool {
+    let Some(iu) = dense_index(i) else {
+        return false;
+    };
+    let mut b = objs[obj].borrow_mut();
+    let extensible = b.extensible;
+    let props_empty = b.own_is_empty();
+    match &mut b.internal {
+        Internal::Array(arr) if props_empty => match arr.get_mut(iu) {
+            Some(slot) if !matches!(slot, Value::Hole) => {
+                *slot = Value::Number(val);
+                true
+            }
+            Some(slot) => {
+                // In-bounds hole: creation.
+                if extensible {
+                    *slot = Value::Number(val);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                // Exact append (no hole gap).
+                if extensible && iu == arr.len() && iu < crate::value::MAX_DENSE_ARRAY {
+                    arr.push(Value::Number(val));
+                    true
+                } else {
+                    false
+                }
+            }
+        },
+        Internal::TypedArray(t)
+            if !t.kind.is_bigint() && iu < crate::typed_array::ta_eff_length(t) =>
+        {
+            let off = t.byte_offset + iu * t.kind.bytes();
+            let kind = t.kind;
+            let mut buf = t.buffer.borrow_mut();
+            match &mut buf.internal {
+                Internal::ArrayBuffer(Some(bytes)) => {
+                    crate::typed_array::encode(bytes, off, kind, val);
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `.length` fast path: dense array length (unshadowed only) or typed-array
+/// effective length (any kind — the entry guard verified the canonical
+/// accessor resolution for typed-array bases). `None` = bail.
+#[inline]
+pub(crate) fn kernel_elem_len(objs: &[JsObject], obj: usize) -> Option<f64> {
+    let b = objs[obj].borrow();
+    match &b.internal {
+        Internal::Array(arr) if b.own_is_empty() => Some(arr.len() as f64),
+        Internal::TypedArray(t) => Some(crate::typed_array::ta_eff_length(t) as f64),
+        _ => None,
+    }
+}
+
+/// Pinned-native `Array.prototype.push` (receiver conditions re-checked per
+/// push — see the `KOp::ArrayPush` docs): appends and returns the new
+/// length, or `None` = bail to the generic `Call`.
+#[inline]
+pub(crate) fn kernel_array_push(
+    objs: &[JsObject],
+    obj: usize,
+    array_proto: &JsObject,
+    val: f64,
+) -> Option<f64> {
+    let mut b = objs[obj].borrow_mut();
+    if b.own_is_empty() && b.extensible && b.proto.as_ref().is_some_and(|p| p.ptr_eq(array_proto)) {
+        if let Internal::Array(arr) = &mut b.internal {
+            if arr.len() < crate::value::MAX_DENSE_ARRAY {
+                arr.push(Value::Number(val));
+                return Some(arr.len() as f64);
+            }
+        }
+    }
+    None
+}
+
+/// Pinned-native `Array.prototype.pop`: removes and returns the last element
+/// when it is a plain `Number` (an empty array's `undefined` result and a
+/// trailing hole's prototype consult belong to the generic path). `None` =
+/// bail.
+#[inline]
+pub(crate) fn kernel_array_pop(objs: &[JsObject], obj: usize) -> Option<f64> {
+    let mut b = objs[obj].borrow_mut();
+    if b.own_is_empty() && b.extensible {
+        if let Internal::Array(arr) = &mut b.internal {
+            if let Some(Value::Number(n)) = arr.last() {
+                let n = *n;
+                arr.pop();
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn js_mod(a: f64, b: f64) -> f64 {

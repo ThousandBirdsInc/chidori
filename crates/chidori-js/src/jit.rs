@@ -84,7 +84,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use cranelift_codegen::ir::condcodes::FloatCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{types, AbiParam, Block, FuncRef, InstBuilder, MemFlagsData};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -98,12 +98,190 @@ use crate::exec::{number_arith_raw, ArithKind};
 /// `Exit`/`Ret` op the program reached.
 pub(crate) const INTERRUPTED: i64 = -1;
 
-/// The compiled signature: `(regs: *mut f64, interrupt: *const u8) -> i64`.
+/// The compiled signature:
+/// `(regs: *mut f64, interrupt: *const u8, ctx: *mut JitCtx) -> i64`.
 /// `regs` is the caller's kernel register window (≥ [`KWIN`] slots);
 /// `interrupt` points at the one-byte cooperative-interrupt flag (a shared
 /// never-set `false` when the VM has none installed, so the compiled code
-/// needs no null check).
-type NativeFn = unsafe extern "C" fn(*mut f64, *const u8) -> i64;
+/// needs no null check); `ctx` carries the activation tables ([`JitCtx`]).
+type NativeFn = unsafe extern "C" fn(*mut f64, *const u8, *mut JitCtx) -> i64;
+
+/// One pinned flat-ASCII string base (per kernel sslot): the byte pointer
+/// and length the entry guard validated. Strings are immutable and pinned
+/// for the activation, so compiled code hoists these at entry and reads
+/// bytes directly (`StrLen`/`CharCodeAt` are total — no bail exists).
+#[repr(C)]
+pub(crate) struct SStr {
+    pub ptr: *const u8,
+    pub len: u64,
+}
+
+/// A DIRECT element view over the base pinned in an oslot, when one exists —
+/// every field an activation constant (resizes, detaches, element-kind and
+/// property-map changes, and — for the dense form, granted only to kernels
+/// with no element stores — length changes all require calls, which kernel
+/// regions exclude):
+///
+/// - [`ElemView::TA_F64`]: an f64 typed array; `ptr` is raw element storage
+///   (`buffer bytes + byte_offset`), `len` the effective element count. An
+///   element access is a plain 8-byte little-endian load/store — exactly
+///   `decode`/`encode` for `TAKind::F64`.
+/// - [`ElemView::DENSE`]: an unshadowed dense array in a kernel that
+///   provably performs no element store/push/pop; `ptr` is the `Vec<Value>`
+///   storage, `len` its length. A read checks the slot's `#[repr(u8)]` tag
+///   ([`Value::JIT_NUMBER_TAG`]) and loads the f64 payload — a non-`Number`
+///   slot (hole included) takes the op's bail edge, exactly like the
+///   interpreter's fast-path miss. Granted only after
+///   [`dense_layout_ok`]'s live layout self-check.
+/// - [`ElemView::NONE`] (`kind == 0`): no direct view — the access goes
+///   through the helper shims, which re-run the interpreter's own fast-path
+///   core per access.
+#[repr(C)]
+pub(crate) struct ElemView {
+    pub ptr: *mut u8,
+    pub len: u64,
+    pub kind: u64,
+}
+
+impl ElemView {
+    pub(crate) const NONE: u64 = 0;
+    pub(crate) const TA_F64: u64 = 1;
+    pub(crate) const DENSE: u64 = 2;
+
+    fn none() -> ElemView {
+        ElemView {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            kind: ElemView::NONE,
+        }
+    }
+}
+
+/// One-time self-check of the `#[repr(u8)]` dense-slot contract
+/// ([`Value::JIT_NUMBER_TAG`] / [`Value::JIT_NUMBER_PAYLOAD_OFFSET`])
+/// against a live value: belt-and-braces under the guaranteed RFC 2195
+/// layout — if it ever failed, dense views are simply never granted and
+/// every dense access takes the helper shims.
+fn dense_layout_ok() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        let magic = f64::from_bits(0x0123_4567_89AB_CDEF);
+        let probe = crate::value::Value::Number(magic);
+        let base = (&probe as *const crate::value::Value).cast::<u8>();
+        // SAFETY: reading the tag byte and the payload bytes of the live
+        // `Number` variant — both initialized for this variant (padding
+        // bytes between them are never read).
+        #[expect(unsafe_code, reason = "verify the dense-slot layout contract")]
+        let (tag, payload) = unsafe {
+            (
+                base.read(),
+                base.add(crate::value::Value::JIT_NUMBER_PAYLOAD_OFFSET)
+                    .cast::<f64>()
+                    .read_unaligned(),
+            )
+        };
+        tag == crate::value::Value::JIT_NUMBER_TAG && payload.to_bits() == magic.to_bits()
+    })
+}
+
+/// Per-activation context handed to compiled kernels as their third
+/// parameter. Built on the caller's stack around each native run; every
+/// pointer is valid for exactly the duration of the call (the caller keeps
+/// the owning `JsString`s/`JsObject`s alive across it).
+#[repr(C)]
+pub(crate) struct JitCtx {
+    /// Pinned string table, one [`SStr`] per kernel sslot (null iff none).
+    pub sstr: *const SStr,
+    /// The activation's pinned object bases (the caller's `objs` cache),
+    /// one per kernel oslot — the element helper shims index this.
+    pub objs: *const crate::value::JsObject,
+    pub n_objs: u64,
+    /// Direct element views, one [`ElemView`] per oslot (null iff no
+    /// oslots).
+    pub ta: *const ElemView,
+    /// The realm's canonical `Array.prototype`, for the push receiver check
+    /// (null unless the kernel uses push/pop).
+    pub array_proto: *const crate::value::JsObject,
+    /// Helper out-param: element loads / lengths / push results land here
+    /// when the shim reports success.
+    pub scratch: f64,
+}
+
+impl JitCtx {
+    /// The empty context for kernels with no oslots/sslots (every function
+    /// kernel): eligibility guarantees compiled code never dereferences the
+    /// tables.
+    pub(crate) fn empty() -> JitCtx {
+        JitCtx {
+            sstr: std::ptr::null(),
+            objs: std::ptr::null(),
+            n_objs: 0,
+            ta: std::ptr::null(),
+            array_proto: std::ptr::null(),
+            scratch: 0.0,
+        }
+    }
+}
+
+/// Build the direct-view table entry for one pinned oslot object (see
+/// [`ElemView`]). `allow_dense` = the kernel provably performs no element
+/// store/push/pop, so a dense array's storage pointer and length are
+/// activation constants.
+pub(crate) fn elem_view(o: &crate::value::JsObject, allow_dense: bool) -> ElemView {
+    if !cfg!(target_endian = "little") {
+        return ElemView::none();
+    }
+    {
+        let b = o.borrow();
+        match &b.internal {
+            crate::value::Internal::Array(arr) if allow_dense && b.own_is_empty() => {
+                if dense_layout_ok() {
+                    // Read-only raw view over the Vec<Value> storage: derived
+                    // from a shared borrow, read (never written) by native
+                    // code while the caller's `objs` cache keeps the array
+                    // alive and nothing can reallocate it (no in-kernel
+                    // stores by the `allow_dense` grant, no calls at all).
+                    return ElemView {
+                        ptr: arr.as_ptr() as *mut u8,
+                        len: arr.len() as u64,
+                        kind: ElemView::DENSE,
+                    };
+                }
+                return ElemView::none();
+            }
+            crate::value::Internal::TypedArray(t)
+                if matches!(t.kind, crate::value::TAKind::F64) =>
+            {
+                // Fall through below (needs the buffer borrow_mut, which
+                // this object borrow must not overlap for aliased views).
+            }
+            _ => return ElemView::none(),
+        }
+    }
+    let b = o.borrow();
+    let crate::value::Internal::TypedArray(t) = &b.internal else {
+        return ElemView::none();
+    };
+    let len = crate::typed_array::ta_eff_length(t);
+    if len == 0 {
+        return ElemView::none();
+    }
+    let byte_offset = t.byte_offset;
+    let mut buf = t.buffer.borrow_mut();
+    let crate::value::Internal::ArrayBuffer(Some(bytes)) = &mut buf.internal else {
+        return ElemView::none();
+    };
+    // The raw pointer is used only while the caller's `objs` cache keeps the
+    // buffer alive and nothing else can run (kernel regions contain no
+    // calls); the `RefMut` is dropped before the native call, so no Rust
+    // reference aliases the accesses.
+    ElemView {
+        ptr: bytes[byte_offset..].as_mut_ptr(),
+        len: len as u64,
+        kind: ElemView::TA_F64,
+    }
+}
 
 /// Polled by compiled code when the VM has no interrupt flag installed.
 /// Private and never written, so the load always sees `false`.
@@ -114,6 +292,7 @@ static NO_INTERRUPT: AtomicBool = AtomicBool::new(false);
 static STAT_COMPILED: AtomicU64 = AtomicU64::new(0);
 static STAT_DECLINED: AtomicU64 = AtomicU64::new(0);
 static STAT_RUNS: AtomicU64 = AtomicU64::new(0);
+static STAT_ELEM_SHIM: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide tier counters (see [`stats`]).
 #[derive(Clone, Copy, Debug)]
@@ -125,6 +304,9 @@ pub struct JitStats {
     pub declined: u64,
     /// Native kernel activations executed.
     pub native_runs: u64,
+    /// Element accesses that took a helper shim (no direct view) — the
+    /// observability handle for "is this loop on the raw path?".
+    pub elem_shim_calls: u64,
 }
 
 /// Snapshot the process-wide tier counters.
@@ -133,6 +315,7 @@ pub fn stats() -> JitStats {
         compiled: STAT_COMPILED.load(Ordering::Relaxed),
         declined: STAT_DECLINED.load(Ordering::Relaxed),
         native_runs: STAT_RUNS.load(Ordering::Relaxed),
+        elem_shim_calls: STAT_ELEM_SHIM.load(Ordering::Relaxed),
     }
 }
 
@@ -182,7 +365,12 @@ impl NativeKernel {
     /// window). Returns the code index of the `Exit`/`Ret` reached, or
     /// [`INTERRUPTED`]; either way every register has been stored back to
     /// `regs`, exactly as the interpreter tier's loop would have left them.
-    pub(crate) fn run(&self, regs: &mut [f64], interrupt: Option<&AtomicBool>) -> i64 {
+    pub(crate) fn run(
+        &self,
+        regs: &mut [f64],
+        interrupt: Option<&AtomicBool>,
+        ctx: &mut JitCtx,
+    ) -> i64 {
         // The compiled code indexes `regs` up to `n_regs - 1`, which
         // translation bounded by KWIN; both callers pass KWIN-sized windows.
         assert!(regs.len() >= KWIN, "kernel register window under-sized");
@@ -192,37 +380,52 @@ impl NativeKernel {
         // from a verified Cranelift function; the module owning its memory is
         // alive (`self.0.module`). It reads/writes only `regs[0..n_regs]`
         // (indices validated `< n_regs ≤ KWIN` at translation; the buffer is
-        // ≥ KWIN slots, asserted above) and loads the single byte at `flag`
+        // ≥ KWIN slots, asserted above), loads the single byte at `flag`
         // (an `AtomicBool` is one byte with the same layout as `u8`; the
-        // relaxed racy read matches the interpreter's `Relaxed` poll).
+        // relaxed racy read matches the interpreter's `Relaxed` poll), and
+        // touches `ctx`'s tables, whose every pointer the caller keeps valid
+        // for the duration of this call, sized one entry per oslot/sslot of
+        // the kernel this code was compiled from.
         #[expect(unsafe_code, reason = "call into JIT-compiled kernel code")]
         unsafe {
-            (self.0.entry)(regs.as_mut_ptr(), flag as *const AtomicBool as *const u8)
+            (self.0.entry)(
+                regs.as_mut_ptr(),
+                flag as *const AtomicBool as *const u8,
+                ctx as *mut JitCtx,
+            )
         }
     }
 }
 
-/// Run kernel `k` natively over `regs` if it compiles (compiling it on first
-/// use). `None` = this kernel is not JIT-eligible (or the host ISA is
-/// unsupported) — the caller proceeds on the interpreter tier. `Some(code)`
-/// = the kernel ran natively to completion; `code` is the index of the
-/// `Exit`/`Ret` op reached, or [`INTERRUPTED`].
+/// The compiled form of `k`, compiling it on first use. `None` = this
+/// kernel is not JIT-eligible (or the host ISA is unsupported) — the caller
+/// proceeds on the interpreter tier. The caller then builds the activation's
+/// [`JitCtx`] and invokes [`NativeKernel::run`].
+pub(crate) fn native_for(k: &Kernel) -> Option<NativeKernel> {
+    k.native
+        .get_or_init(|| match compile(k) {
+            Some(n) => {
+                STAT_COMPILED.fetch_add(1, Ordering::Relaxed);
+                Some(n)
+            }
+            None => {
+                STAT_DECLINED.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        })
+        .clone()
+}
+
+/// Convenience for the FUNCTION-kernel seam (no oslots/sslots by
+/// construction): compile-or-fetch and run with the empty context.
 pub(crate) fn maybe_run(
     k: &Kernel,
     regs: &mut [f64],
     interrupt: Option<&AtomicBool>,
 ) -> Option<i64> {
-    let native = k.native.get_or_init(|| match compile(k) {
-        Some(n) => {
-            STAT_COMPILED.fetch_add(1, Ordering::Relaxed);
-            Some(n)
-        }
-        None => {
-            STAT_DECLINED.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    });
-    native.as_ref().map(|n| n.run(regs, interrupt))
+    let native = native_for(k)?;
+    let mut ctx = JitCtx::empty();
+    Some(native.run(regs, interrupt, &mut ctx))
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +462,14 @@ extern "C" fn h_ushr(a: f64, b: f64) -> f64 {
 extern "C" fn h_bitnot(x: f64) -> f64 {
     !crate::vm::to_int32(x) as f64
 }
+/// Cold tail of the inlined ToInt32 (see `Translator::toint32`): NaN, ±Inf,
+/// and magnitudes at or beyond 2^63, where a saturating i64 conversion's low
+/// 32 bits diverge from the spec's mod-2^32. Returns the exact int32 value
+/// as an f64 (always in [-2^31, 2^31), so the caller's conversion back is
+/// exact).
+extern "C" fn h_toint32(x: f64) -> f64 {
+    crate::vm::to_int32(x) as f64
+}
 extern "C" fn h_round(x: f64) -> f64 {
     crate::builtins::numbers::math_round(x)
 }
@@ -278,52 +489,200 @@ extern "C" fn h_imul2(a: f64, b: f64) -> f64 {
     crate::builtins::numbers::math_imul2(a, b)
 }
 
+// ---- element shims: the interpreter's own fast-path cores, reached from
+// native code through the activation's [`JitCtx`]. Each returns 1 for
+// success (result, where there is one, in `ctx.scratch`) and 0 for "take the
+// op's bail edge". The `unsafe` here is one pattern repeated: reconstruct
+// the caller's context and object table from the raw pointers it built
+// immediately around the native run — valid for exactly that call, sized
+// one entry per kernel oslot (`oslot` itself validated at translation).
+
+/// # Safety
+/// `ctx` must be the [`JitCtx`] the active native run was invoked with (see
+/// [`NativeKernel::run`]'s safety comment).
+#[expect(unsafe_code, reason = "the element shims' shared context contract")]
+unsafe fn ctx_parts<'a>(ctx: *mut JitCtx) -> (&'a mut JitCtx, &'a [crate::value::JsObject]) {
+    // SAFETY: per the function contract — the caller's stack-built context
+    // and its object table, alive across the native call this shim serves.
+    // The slice does not overlap `ctx` itself.
+    #[expect(unsafe_code, reason = "reconstruct the activation's tables")]
+    unsafe {
+        let objs = if (*ctx).objs.is_null() {
+            &[]
+        } else {
+            std::slice::from_raw_parts((*ctx).objs, (*ctx).n_objs as usize)
+        };
+        (&mut *ctx, objs)
+    }
+}
+
+extern "C" fn h_elem_load(ctx: *mut JitCtx, oslot: i64, idx: f64) -> i8 {
+    STAT_ELEM_SHIM.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: shim invoked only from a live native run (see `ctx_parts`).
+    #[expect(unsafe_code, reason = "element shim over the activation tables")]
+    let (ctx, objs) = unsafe { ctx_parts(ctx) };
+    match crate::exec::kernel_elem_load(objs, oslot as usize, idx) {
+        Some(n) => {
+            ctx.scratch = n;
+            1
+        }
+        None => 0,
+    }
+}
+
+extern "C" fn h_elem_store(ctx: *mut JitCtx, oslot: i64, idx: f64, val: f64) -> i8 {
+    // SAFETY: as `h_elem_load`.
+    #[expect(unsafe_code, reason = "element shim over the activation tables")]
+    let (_, objs) = unsafe { ctx_parts(ctx) };
+    i8::from(crate::exec::kernel_elem_store(
+        objs,
+        oslot as usize,
+        idx,
+        val,
+    ))
+}
+
+extern "C" fn h_elem_len(ctx: *mut JitCtx, oslot: i64) -> i8 {
+    // SAFETY: as `h_elem_load`.
+    #[expect(unsafe_code, reason = "element shim over the activation tables")]
+    let (ctx, objs) = unsafe { ctx_parts(ctx) };
+    match crate::exec::kernel_elem_len(objs, oslot as usize) {
+        Some(n) => {
+            ctx.scratch = n;
+            1
+        }
+        None => 0,
+    }
+}
+
+extern "C" fn h_array_push(ctx: *mut JitCtx, oslot: i64, val: f64) -> i8 {
+    // SAFETY: as `h_elem_load`; `array_proto` is set (to the realm's
+    // canonical, which outlives the call) whenever the kernel contains a
+    // push — null-checked anyway, declining into the bail edge.
+    #[expect(unsafe_code, reason = "element shim over the activation tables")]
+    let (ctx, objs, proto) = unsafe {
+        let (c, o) = ctx_parts(ctx);
+        if c.array_proto.is_null() {
+            return 0;
+        }
+        let p = &*c.array_proto;
+        (c, o, p)
+    };
+    match crate::exec::kernel_array_push(objs, oslot as usize, proto, val) {
+        Some(len) => {
+            ctx.scratch = len;
+            1
+        }
+        None => 0,
+    }
+}
+
+extern "C" fn h_array_pop(ctx: *mut JitCtx, oslot: i64) -> i8 {
+    // SAFETY: as `h_elem_load`.
+    #[expect(unsafe_code, reason = "element shim over the activation tables")]
+    let (ctx, objs) = unsafe { ctx_parts(ctx) };
+    match crate::exec::kernel_array_pop(objs, oslot as usize) {
+        Some(n) => {
+            ctx.scratch = n;
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Parameter/return atoms of a helper shim's C ABI.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Abi {
+    F64,
+    I64,
+    I8,
+    Ptr,
+}
+
 type Shim1 = extern "C" fn(f64) -> f64;
 type Shim2 = extern "C" fn(f64, f64) -> f64;
 
-/// `(symbol name, address, arity)` for every registered helper. Names are
-/// namespaced to keep the JIT symbol table from ever shadowing a real symbol.
-fn helper_table() -> [(&'static str, *const u8, u8); 16] {
+/// `(symbol name, address, params, return)` for every registered helper.
+/// Names are namespaced to keep the JIT symbol table from ever shadowing a
+/// real symbol.
+fn helper_table() -> [(&'static str, *const u8, &'static [Abi], Abi); 22] {
     fn p1(f: Shim1) -> *const u8 {
         f as usize as *const u8
     }
     fn p2(f: Shim2) -> *const u8 {
         f as usize as *const u8
     }
+    const F1: &[Abi] = &[Abi::F64];
+    const F2: &[Abi] = &[Abi::F64, Abi::F64];
+    const ELEM2: &[Abi] = &[Abi::Ptr, Abi::I64];
+    const ELEM3: &[Abi] = &[Abi::Ptr, Abi::I64, Abi::F64];
+    const ELEM4: &[Abi] = &[Abi::Ptr, Abi::I64, Abi::F64, Abi::F64];
     [
-        ("cjit_mod", p2(h_mod), 2),
-        ("cjit_pow", p2(h_pow), 2),
-        ("cjit_bitand", p2(h_bitand), 2),
-        ("cjit_bitor", p2(h_bitor), 2),
-        ("cjit_bitxor", p2(h_bitxor), 2),
-        ("cjit_shl", p2(h_shl), 2),
-        ("cjit_shr", p2(h_shr), 2),
-        ("cjit_ushr", p2(h_ushr), 2),
-        ("cjit_bitnot", p1(h_bitnot), 1),
-        ("cjit_round", p1(h_round), 1),
-        ("cjit_sign", p1(h_sign), 1),
-        ("cjit_fround", p1(h_fround), 1),
-        ("cjit_min2", p2(h_min2), 2),
-        ("cjit_max2", p2(h_max2), 2),
-        ("cjit_pow2", p2(h_pow), 2),
-        ("cjit_imul2", p2(h_imul2), 2),
+        ("cjit_mod", p2(h_mod), F2, Abi::F64),
+        ("cjit_pow", p2(h_pow), F2, Abi::F64),
+        ("cjit_bitand", p2(h_bitand), F2, Abi::F64),
+        ("cjit_bitor", p2(h_bitor), F2, Abi::F64),
+        ("cjit_bitxor", p2(h_bitxor), F2, Abi::F64),
+        ("cjit_shl", p2(h_shl), F2, Abi::F64),
+        ("cjit_shr", p2(h_shr), F2, Abi::F64),
+        ("cjit_ushr", p2(h_ushr), F2, Abi::F64),
+        ("cjit_bitnot", p1(h_bitnot), F1, Abi::F64),
+        ("cjit_round", p1(h_round), F1, Abi::F64),
+        ("cjit_sign", p1(h_sign), F1, Abi::F64),
+        ("cjit_fround", p1(h_fround), F1, Abi::F64),
+        ("cjit_min2", p2(h_min2), F2, Abi::F64),
+        ("cjit_max2", p2(h_max2), F2, Abi::F64),
+        ("cjit_pow2", p2(h_pow), F2, Abi::F64),
+        ("cjit_imul2", p2(h_imul2), F2, Abi::F64),
+        ("cjit_toint32", p1(h_toint32), F1, Abi::F64),
+        (
+            "cjit_elem_load",
+            h_elem_load as extern "C" fn(*mut JitCtx, i64, f64) -> i8 as usize as *const u8,
+            ELEM3,
+            Abi::I8,
+        ),
+        (
+            "cjit_elem_store",
+            h_elem_store as extern "C" fn(*mut JitCtx, i64, f64, f64) -> i8 as usize as *const u8,
+            ELEM4,
+            Abi::I8,
+        ),
+        (
+            "cjit_elem_len",
+            h_elem_len as extern "C" fn(*mut JitCtx, i64) -> i8 as usize as *const u8,
+            ELEM2,
+            Abi::I8,
+        ),
+        (
+            "cjit_array_push",
+            h_array_push as extern "C" fn(*mut JitCtx, i64, f64) -> i8 as usize as *const u8,
+            ELEM3,
+            Abi::I8,
+        ),
+        (
+            "cjit_array_pop",
+            h_array_pop as extern "C" fn(*mut JitCtx, i64) -> i8 as usize as *const u8,
+            ELEM2,
+            Abi::I8,
+        ),
     ]
 }
 
-/// Helper symbol for an [`ArithKind`] that is not inlined, or `None` for the
-/// four bit-exact IEEE kinds emitted as native instructions.
-fn arith_helper(kind: ArithKind) -> Option<&'static str> {
-    match kind {
-        ArithKind::Sub | ArithKind::Mul | ArithKind::Div => None,
-        ArithKind::Mod => Some("cjit_mod"),
-        ArithKind::Pow => Some("cjit_pow"),
-        ArithKind::BitAnd => Some("cjit_bitand"),
-        ArithKind::BitOr => Some("cjit_bitor"),
-        ArithKind::BitXor => Some("cjit_bitxor"),
-        ArithKind::Shl => Some("cjit_shl"),
-        ArithKind::Shr => Some("cjit_shr"),
-        ArithKind::UShr => Some("cjit_ushr"),
-    }
+/// `2^63` — the magnitude bound under which `fcvt_to_sint_sat.i64` +
+/// truncation computes ToInt32's mod-2^32 exactly (see
+/// [`Translator::toint32`]).
+const TOINT32_FAST_BOUND: f64 = 9_223_372_036_854_775_808.0;
+/// `2^53` — the integer-exactness bound of the interpreter's `js_mod` fast
+/// path, mirrored by [`Translator::emit_mod`].
+const MOD_FAST_BOUND: f64 = 9_007_199_254_740_992.0;
+
+/// Whether `%` by the compile-time constant `k` can take the inlined integer
+/// path unconditionally on the right operand: integral, within the exact-i64
+/// bound, nonzero — the `bi` half of `js_mod`'s fast-path guard, decided at
+/// translation instead of per iteration.
+fn mod_const_rhs(k: f64) -> Option<i64> {
+    let ki = k as i64;
+    (ki as f64 == k && k.abs() <= MOD_FAST_BOUND && ki != 0).then_some(ki)
 }
 
 /// JS numeric comparison ([`knum_cmp`](crate::exec) semantics) as a Cranelift
@@ -357,6 +716,8 @@ fn eligible(k: &Kernel) -> bool {
     }
     let r = |i: u16| (i as usize) < n_regs;
     let t = |i: u16| (i as usize) < len;
+    let o = |i: u16| (i as usize) < k.oslots.len();
+    let st = |i: u16| (i as usize) < k.sslots.len();
     // `skip` past a fused op's landing pad must land on a real op; plain ops
     // must have a fall-through successor unless they are terminators.
     let next_ok = |pc: usize, skip: usize| pc + skip < len;
@@ -395,20 +756,61 @@ fn eligible(k: &Kernel) -> bool {
             kind.arity() == 2 && r(dst) && r(a) && r(b) && next_ok(pc, 1)
         }
         KOp::Exit { .. } | KOp::Ret { .. } => true,
-        // Outside the scalar subset: element/length/property access, pinned
-        // string reads, pinned push/pop, pinned-callee and recursive calls.
+        KOp::LoadElem {
+            dst,
+            obj,
+            idx,
+            bail,
+        } => r(dst) && o(obj) && r(idx) && t(bail) && next_ok(pc, 1),
+        KOp::StoreElem {
+            obj,
+            idx,
+            val,
+            bail,
+        } => o(obj) && r(idx) && r(val) && t(bail) && next_ok(pc, 1),
+        KOp::LoadElemAdd {
+            dst,
+            obj,
+            idx,
+            bail,
+            d2,
+            a2,
+            b2,
+        } => r(dst) && o(obj) && r(idx) && t(bail) && r(d2) && r(a2) && r(b2) && next_ok(pc, 2),
+        KOp::LoadElemArith {
+            dst,
+            obj,
+            idx,
+            bail,
+            d2,
+            a2,
+            b2,
+            ..
+        } => r(dst) && o(obj) && r(idx) && t(bail) && r(d2) && r(a2) && r(b2) && next_ok(pc, 2),
+        KOp::LoadLen { dst, obj, bail } => r(dst) && o(obj) && t(bail) && next_ok(pc, 1),
+        KOp::LenBrCmp {
+            dst,
+            obj,
+            bail,
+            a,
+            b,
+            target,
+            ..
+        } => r(dst) && o(obj) && t(bail) && r(a) && r(b) && t(target) && next_ok(pc, 2),
+        KOp::ArrayPush {
+            obj,
+            val,
+            dst,
+            bail,
+        } => o(obj) && r(val) && r(dst) && t(bail) && next_ok(pc, 1),
+        KOp::ArrayPop { obj, dst, bail } => o(obj) && r(dst) && t(bail) && next_ok(pc, 1),
+        KOp::StrLen { dst, str } => r(dst) && st(str) && next_ok(pc, 1),
+        KOp::CharCodeAt { dst, str, idx } => r(dst) && st(str) && r(idx) && next_ok(pc, 1),
+        // Outside the compiled subset: localized property ops (rewritten
+        // away at kernel build — surviving ones are the tier bug the
+        // interpreter arm reports), pinned-callee calls, and recursion.
         // The whole kernel stays on the interpreter tier.
-        KOp::LoadElem { .. }
-        | KOp::StoreElem { .. }
-        | KOp::LoadElemAdd { .. }
-        | KOp::LoadElemArith { .. }
-        | KOp::LoadLen { .. }
-        | KOp::LenBrCmp { .. }
-        | KOp::ArrayPush { .. }
-        | KOp::ArrayPop { .. }
-        | KOp::StrLen { .. }
-        | KOp::CharCodeAt { .. }
-        | KOp::LoadProp { .. }
+        KOp::LoadProp { .. }
         | KOp::StoreProp { .. }
         | KOp::CallKernel { .. }
         | KOp::SelfCall { .. } => false,
@@ -430,12 +832,13 @@ fn compile(k: &Kernel) -> Option<NativeKernel> {
     cranelift_native::builder().ok()?;
     let mut builder =
         JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names()).ok()?;
-    for (name, addr, _) in helper_table() {
+    for (name, addr, _, _) in helper_table() {
         builder.symbol(name, addr);
     }
     let mut module = JITModule::new(builder);
     let ptr_ty = module.target_config().pointer_type();
     let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));
     sig.params.push(AbiParam::new(ptr_ty));
     sig.params.push(AbiParam::new(ptr_ty));
     sig.returns.push(AbiParam::new(types::I64));
@@ -466,6 +869,22 @@ fn compile(k: &Kernel) -> Option<NativeKernel> {
     })))
 }
 
+/// One oslot's entry-hoisted direct-view state (see `Translator::ta_views`).
+#[derive(Clone, Copy)]
+struct OslotView {
+    ptr: cranelift_codegen::ir::Value,
+    /// The element count as an f64 (`.length` reads).
+    len_f64: cranelift_codegen::ir::Value,
+    /// `umin(len, 2^32 - 1)`: a single unsigned `index < bound` compare is
+    /// then `dense_index`'s full range condition (negative indices wrap to
+    /// huge unsigned values and fail it too).
+    bound: cranelift_codegen::ir::Value,
+    /// `kind == TA_F64` / `kind == DENSE` / `kind != NONE`, as i8 tests.
+    is_ta: cranelift_codegen::ir::Value,
+    is_dense: cranelift_codegen::ir::Value,
+    is_direct: cranelift_codegen::ir::Value,
+}
+
 struct Translator<'a> {
     b: FunctionBuilder<'a>,
     module: &'a mut JITModule,
@@ -482,6 +901,18 @@ struct Translator<'a> {
     poll: Variable,
     regs_ptr: cranelift_codegen::ir::Value,
     int_ptr: cranelift_codegen::ir::Value,
+    ctx_ptr: cranelift_codegen::ir::Value,
+    ptr_ty: cranelift_codegen::ir::Type,
+    /// Per-oslot direct element view, hoisted from the [`JitCtx`] table at
+    /// entry — all activation constants, including the derived values every
+    /// element access needs (the f64 length for `.length` reads, the
+    /// index bound clamped to `dense_index`'s 2^32-1 ceiling, and the kind
+    /// tests), so the per-access sequence pays none of it. Kind
+    /// [`ElemView::NONE`] routes that oslot's element ops to the helper
+    /// shims.
+    ta_views: Vec<OslotView>,
+    /// Per-sslot pinned-string view (byte ptr, length), hoisted at entry.
+    sviews: Vec<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)>,
     /// Lazily imported helper functions, by symbol name.
     helpers: HashMap<&'static str, FuncRef>,
     /// Back-edge trampolines created while emitting the current op, filled
@@ -494,10 +925,11 @@ impl<'a> Translator<'a> {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
-        let (regs_ptr, int_ptr) = {
+        let (regs_ptr, int_ptr, ctx_ptr) = {
             let params = b.block_params(entry);
-            (params[0], params[1])
+            (params[0], params[1], params[2])
         };
+        let ptr_ty = module.target_config().pointer_type();
         let n_regs = k.n_regs as usize;
         let mut vars = Vec::with_capacity(n_regs);
         for r in 0..n_regs {
@@ -514,6 +946,64 @@ impl<'a> Translator<'a> {
         let poll = b.declare_var(types::I32);
         let zero = b.ins().iconst(types::I32, 0);
         b.def_var(poll, zero);
+        // Hoist the activation-constant tables: per-oslot direct-view
+        // (ptr, len) pairs and per-sslot pinned-string (ptr, len) pairs.
+        // Both are immutable for the whole activation (see [`TaView`] /
+        // [`SStr`]), so entry loads suffice.
+        let mut ta_views = Vec::with_capacity(k.oslots.len());
+        if !k.oslots.is_empty() {
+            let tab = b.ins().load(
+                ptr_ty,
+                MemFlagsData::trusted(),
+                ctx_ptr,
+                std::mem::offset_of!(JitCtx, ta) as i32,
+            );
+            for i in 0..k.oslots.len() {
+                let base = (i * std::mem::size_of::<ElemView>()) as i32;
+                let ptr = b.ins().load(ptr_ty, MemFlagsData::trusted(), tab, base);
+                let len = b
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), tab, base + 8);
+                let kind = b
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), tab, base + 16);
+                let len_f64 = b.ins().fcvt_from_sint(types::F64, len);
+                let ceiling = b.ins().iconst(types::I64, 4_294_967_295);
+                let bound = b.ins().umin(len, ceiling);
+                let is_ta = b
+                    .ins()
+                    .icmp_imm_s(IntCC::Equal, kind, ElemView::TA_F64 as i64);
+                let is_dense = b
+                    .ins()
+                    .icmp_imm_s(IntCC::Equal, kind, ElemView::DENSE as i64);
+                let is_direct = b.ins().icmp_imm_s(IntCC::NotEqual, kind, 0);
+                ta_views.push(OslotView {
+                    ptr,
+                    len_f64,
+                    bound,
+                    is_ta,
+                    is_dense,
+                    is_direct,
+                });
+            }
+        }
+        let mut sviews = Vec::with_capacity(k.sslots.len());
+        if !k.sslots.is_empty() {
+            let tab = b.ins().load(
+                ptr_ty,
+                MemFlagsData::trusted(),
+                ctx_ptr,
+                std::mem::offset_of!(JitCtx, sstr) as i32,
+            );
+            for i in 0..k.sslots.len() {
+                let base = (i * std::mem::size_of::<SStr>()) as i32;
+                let ptr = b.ins().load(ptr_ty, MemFlagsData::trusted(), tab, base);
+                let len = b
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), tab, base + 8);
+                sviews.push((ptr, len));
+            }
+        }
         let blocks: Vec<Block> = (0..k.code.len()).map(|_| b.create_block()).collect();
         let exit_block = b.create_block();
         b.append_block_param(exit_block, types::I64);
@@ -530,8 +1020,21 @@ impl<'a> Translator<'a> {
             poll,
             regs_ptr,
             int_ptr,
+            ctx_ptr,
+            ptr_ty,
+            ta_views,
+            sviews,
             helpers: HashMap::new(),
             pending_backedges: Vec::new(),
+        }
+    }
+
+    fn abi_ty(&self, a: Abi) -> cranelift_codegen::ir::Type {
+        match a {
+            Abi::F64 => types::F64,
+            Abi::I64 => types::I64,
+            Abi::I8 => types::I8,
+            Abi::Ptr => self.ptr_ty,
         }
     }
 
@@ -539,12 +1042,12 @@ impl<'a> Translator<'a> {
         if let Some(&f) = self.helpers.get(name) {
             return Some(f);
         }
-        let (_, _, arity) = helper_table().into_iter().find(|(n, _, _)| *n == name)?;
+        let (_, _, params, ret) = helper_table().into_iter().find(|(n, _, _, _)| *n == name)?;
         let mut sig = self.module.make_signature();
-        for _ in 0..arity {
-            sig.params.push(AbiParam::new(types::F64));
+        for p in params {
+            sig.params.push(AbiParam::new(self.abi_ty(*p)));
         }
-        sig.returns.push(AbiParam::new(types::F64));
+        sig.returns.push(AbiParam::new(self.abi_ty(ret)));
         let id = self
             .module
             .declare_function(name, Linkage::Import, &sig)
@@ -552,6 +1055,17 @@ impl<'a> Translator<'a> {
         let f = self.module.declare_func_in_func(id, self.b.func);
         self.helpers.insert(name, f);
         Some(f)
+    }
+
+    /// Call a registered helper with explicit arguments (the element shims).
+    fn callh(
+        &mut self,
+        name: &'static str,
+        args: &[cranelift_codegen::ir::Value],
+    ) -> Option<cranelift_codegen::ir::Value> {
+        let f = self.helper(name)?;
+        let call = self.b.ins().call(f, args);
+        Some(self.b.inst_results(call)[0])
     }
 
     fn call1(
@@ -583,21 +1097,173 @@ impl<'a> Translator<'a> {
         self.b.def_var(self.vars[r as usize], v);
     }
 
-    /// `regs[a] <kind> regs-value b` with the interpreter's exact semantics:
-    /// IEEE kinds inline, everything else through the shared helper.
+    /// ToInt32 as native code. The `|x| < 2^63` fast path is one saturating
+    /// i64 conversion + truncation: within that range the conversion is the
+    /// exact `trunc(x)`, whose low 32 bits ARE ToInt32's mod-2^32 result.
+    /// Outside it — NaN, ±Inf, |x| ≥ 2^63, where saturation's low bits
+    /// diverge — the cold path calls the shared `to_int32` core (returning
+    /// the exact int32 as an f64 in [-2^31, 2^31), so converting back is
+    /// exact). `fabs(NaN) < bound` is false, routing NaN to the cold path.
+    fn toint32(&mut self, x: cranelift_codegen::ir::Value) -> Option<cranelift_codegen::ir::Value> {
+        let bound = self.b.ins().f64const(TOINT32_FAST_BOUND);
+        let ax = self.b.ins().fabs(x);
+        let in_range = self.b.ins().fcmp(FloatCC::LessThan, ax, bound);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, types::I32);
+        self.b.ins().brif(in_range, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        let wide = self.b.ins().fcvt_to_sint_sat(types::I64, x);
+        let narrow = self.b.ins().ireduce(types::I32, wide);
+        self.b.ins().jump(join, &[narrow.into()]);
+        self.b.switch_to_block(slow);
+        let f = self.call1("cjit_toint32", x)?;
+        let wide2 = self.b.ins().fcvt_to_sint_sat(types::I64, f);
+        let narrow2 = self.b.ins().ireduce(types::I32, wide2);
+        self.b.ins().jump(join, &[narrow2.into()]);
+        self.b.switch_to_block(join);
+        Some(res)
+    }
+
+    /// An i32 back to the f64 register world.
+    fn i32_to_f64(&mut self, v: cranelift_codegen::ir::Value) -> cranelift_codegen::ir::Value {
+        self.b.ins().fcvt_from_sint(types::F64, v)
+    }
+
+    /// JS `%` with `js_mod`'s exact fast/slow split. The inlined path fires
+    /// under `js_mod`'s own integer guard — both operands round-trip through
+    /// i64, both within ±2^53, divisor nonzero (checked at translation when
+    /// the divisor is a constant) — and computes `srem` with the identical
+    /// `-0`-carries-the-dividend's-sign fix. Everything else calls the shared
+    /// `js_mod` core, so NaN/Inf/zero/fractional cases are the interpreter's
+    /// own code.
+    fn emit_mod(
+        &mut self,
+        a: cranelift_codegen::ir::Value,
+        b: cranelift_codegen::ir::Value,
+        bk: Option<f64>,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        // A constant divisor outside the integer fast path (fractional, 0,
+        // huge) can never take it: skip the guard entirely.
+        if let Some(k) = bk {
+            if mod_const_rhs(k).is_none() {
+                return self.call2("cjit_mod", a, b);
+            }
+        }
+        let bound = self.b.ins().f64const(MOD_FAST_BOUND);
+        let ai = self.b.ins().fcvt_to_sint_sat(types::I64, a);
+        let fa = self.b.ins().fcvt_from_sint(types::F64, ai);
+        let a_int = self.b.ins().fcmp(FloatCC::Equal, fa, a);
+        let aa = self.b.ins().fabs(a);
+        let a_small = self.b.ins().fcmp(FloatCC::LessThanOrEqual, aa, bound);
+        let mut ok = self.b.ins().band(a_int, a_small);
+        let bi = match bk.and_then(mod_const_rhs) {
+            Some(ki) => self.b.ins().iconst(types::I64, ki),
+            None => {
+                let bi = self.b.ins().fcvt_to_sint_sat(types::I64, b);
+                let fb = self.b.ins().fcvt_from_sint(types::F64, bi);
+                let b_int = self.b.ins().fcmp(FloatCC::Equal, fb, b);
+                let ab = self.b.ins().fabs(b);
+                let b_small = self.b.ins().fcmp(FloatCC::LessThanOrEqual, ab, bound);
+                let b_nonzero = self.b.ins().icmp_imm_s(IntCC::NotEqual, bi, 0);
+                ok = self.b.ins().band(ok, b_int);
+                ok = self.b.ins().band(ok, b_small);
+                ok = self.b.ins().band(ok, b_nonzero);
+                bi
+            }
+        };
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, types::F64);
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        // No trap: |operands| ≤ 2^53 and divisor ≠ 0 by the guard.
+        let r = self.b.ins().srem(ai, bi);
+        let rz = self.b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+        let fr = self.b.ins().fcvt_from_sint(types::F64, r);
+        let zero = self.b.ins().f64const(0.0);
+        let signed_zero = self.b.ins().fcopysign(zero, a);
+        let picked = self.b.ins().select(rz, signed_zero, fr);
+        self.b.ins().jump(join, &[picked.into()]);
+        self.b.switch_to_block(slow);
+        let h = self.call2("cjit_mod", a, b)?;
+        self.b.ins().jump(join, &[h.into()]);
+        self.b.switch_to_block(join);
+        Some(res)
+    }
+
+    /// `regs[a] <kind> b` with the interpreter's exact semantics. `bk` is
+    /// `b`'s compile-time constant when the op is a K-variant, letting the
+    /// ToInt32/guard work fold at translation. IEEE kinds and the whole
+    /// ToInt32 bitwise family are native instructions; `%` inlines its
+    /// integer fast path; `**` keeps the shared `math_pow` core (its spec
+    /// special cases are not IEEE).
     fn arith(
         &mut self,
         kind: ArithKind,
         a: cranelift_codegen::ir::Value,
         b: cranelift_codegen::ir::Value,
+        bk: Option<f64>,
     ) -> Option<cranelift_codegen::ir::Value> {
+        // The right operand as int32: folded when constant.
+        macro_rules! b32 {
+            () => {
+                match bk {
+                    Some(k) => {
+                        let ki = crate::vm::to_int32(k);
+                        self.b.ins().iconst(types::I32, i64::from(ki))
+                    }
+                    None => self.toint32(b)?,
+                }
+            };
+        }
         Some(match kind {
             ArithKind::Sub => self.b.ins().fsub(a, b),
             ArithKind::Mul => self.b.ins().fmul(a, b),
             ArithKind::Div => self.b.ins().fdiv(a, b),
-            _ => {
-                let name = arith_helper(kind).expect("non-IEEE kind has a helper");
-                self.call2(name, a, b)?
+            ArithKind::Mod => self.emit_mod(a, b, bk)?,
+            ArithKind::Pow => self.call2("cjit_pow", a, b)?,
+            ArithKind::BitAnd => {
+                let (ia, ib) = (self.toint32(a)?, b32!());
+                let r = self.b.ins().band(ia, ib);
+                self.i32_to_f64(r)
+            }
+            ArithKind::BitOr => {
+                let (ia, ib) = (self.toint32(a)?, b32!());
+                let r = self.b.ins().bor(ia, ib);
+                self.i32_to_f64(r)
+            }
+            ArithKind::BitXor => {
+                let (ia, ib) = (self.toint32(a)?, b32!());
+                let r = self.b.ins().bxor(ia, ib);
+                self.i32_to_f64(r)
+            }
+            // Shift counts: `ToUint32(rhs) & 31` — the same low 5 bits as
+            // `ToInt32(rhs) & 31`, and Cranelift additionally masks the
+            // count to the type width, so the band is belt-and-braces.
+            ArithKind::Shl => {
+                let (ia, ib) = (self.toint32(a)?, b32!());
+                let cnt = self.b.ins().band_imm_u(ib, 31i64);
+                let r = self.b.ins().ishl(ia, cnt);
+                self.i32_to_f64(r)
+            }
+            ArithKind::Shr => {
+                let (ia, ib) = (self.toint32(a)?, b32!());
+                let cnt = self.b.ins().band_imm_u(ib, 31i64);
+                let r = self.b.ins().sshr(ia, cnt);
+                self.i32_to_f64(r)
+            }
+            // `>>>` interprets the shifted lhs as unsigned: ToUint32(lhs)
+            // has the same 32 bits as ToInt32(lhs), so shift logically and
+            // zero-extend before the float conversion.
+            ArithKind::UShr => {
+                let (ia, ib) = (self.toint32(a)?, b32!());
+                let cnt = self.b.ins().band_imm_u(ib, 31i64);
+                let r = self.b.ins().ushr(ia, cnt);
+                let wide = self.b.ins().uextend(types::I64, r);
+                self.b.ins().fcvt_from_sint(types::F64, wide)
             }
         })
     }
@@ -607,6 +1273,200 @@ impl<'a> Translator<'a> {
     fn truthy(&mut self, x: cranelift_codegen::ir::Value) -> cranelift_codegen::ir::Value {
         let zero = self.b.ins().f64const(0.0);
         self.b.ins().fcmp(FloatCC::OrderedNotEqual, x, zero)
+    }
+
+    /// Element READ (`KOp::LoadElem` semantics): direct 8-byte load for an
+    /// f64-typed-array view, the interpreter's shared fast-path core through
+    /// the helper shim for everything else; any fast-path failure jumps to
+    /// the op's bail edge (an Exit stub), exactly like the interpreter arm.
+    fn emit_elem_load(
+        &mut self,
+        pc: usize,
+        obj: u16,
+        idx: cranelift_codegen::ir::Value,
+        bail: u16,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        let view = self.ta_views[obj as usize];
+        let bail_b = self.dest(pc, bail as usize);
+        let ta_b = self.b.create_block();
+        let chk_dense = self.b.create_block();
+        let dense_b = self.b.create_block();
+        let helper = self.b.create_block();
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, types::F64);
+        self.b.ins().brif(view.is_ta, ta_b, &[], chk_dense, &[]);
+        self.b.switch_to_block(chk_dense);
+        self.b.ins().brif(view.is_dense, dense_b, &[], helper, &[]);
+        // f64 typed array: bounds-checked 8-byte load.
+        self.b.switch_to_block(ta_b);
+        let (ok, ii) = self.elem_index_ok(idx, view.bound);
+        let load_b = self.b.create_block();
+        self.b.ins().brif(ok, load_b, &[], bail_b, &[]);
+        self.b.switch_to_block(load_b);
+        let eight = self.b.ins().iconst(types::I64, 8);
+        let off = self.b.ins().imul(ii, eight);
+        let addr = self.b.ins().iadd(view.ptr, off);
+        let v = self.b.ins().load(types::F64, MemFlagsData::new(), addr, 0);
+        self.b.ins().jump(join, &[v.into()]);
+        // Dense array (read-only kernels): bounds check, then the slot's
+        // repr(u8) tag must be `Number` (a hole or any other variant bails,
+        // exactly like the interpreter's fast-path miss), then the payload.
+        self.b.switch_to_block(dense_b);
+        let (ok, ii) = self.elem_index_ok(idx, view.bound);
+        let tag_b = self.b.create_block();
+        self.b.ins().brif(ok, tag_b, &[], bail_b, &[]);
+        self.b.switch_to_block(tag_b);
+        let stride = self.b.ins().iconst(
+            types::I64,
+            std::mem::size_of::<crate::value::Value>() as i64,
+        );
+        let off = self.b.ins().imul(ii, stride);
+        let slot = self.b.ins().iadd(view.ptr, off);
+        let tag = self
+            .b
+            .ins()
+            .load(types::I8, MemFlagsData::trusted(), slot, 0);
+        let is_num = self.b.ins().icmp_imm_s(
+            IntCC::Equal,
+            tag,
+            i64::from(crate::value::Value::JIT_NUMBER_TAG),
+        );
+        let payload_b = self.b.create_block();
+        self.b.ins().brif(is_num, payload_b, &[], bail_b, &[]);
+        self.b.switch_to_block(payload_b);
+        let v = self.b.ins().load(
+            types::F64,
+            MemFlagsData::trusted(),
+            slot,
+            crate::value::Value::JIT_NUMBER_PAYLOAD_OFFSET as i32,
+        );
+        self.b.ins().jump(join, &[v.into()]);
+        // Everything else: the interpreter's shared core through the shim.
+        self.b.switch_to_block(helper);
+        let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
+        let st = self.callh("cjit_elem_load", &[self.ctx_ptr, oslot, idx])?;
+        let ok_b = self.b.create_block();
+        self.b.ins().brif(st, ok_b, &[], bail_b, &[]);
+        self.b.switch_to_block(ok_b);
+        let v = self.scratch();
+        self.b.ins().jump(join, &[v.into()]);
+        self.b.switch_to_block(join);
+        Some(res)
+    }
+
+    /// Element WRITE (`KOp::StoreElem` semantics): direct store on an f64
+    /// view (in-place only — the view's length is fixed, so an append is out
+    /// of bounds and bails, exactly as a typed array's OOB store must), the
+    /// shared core via the shim otherwise.
+    fn emit_elem_store(
+        &mut self,
+        pc: usize,
+        obj: u16,
+        idx: cranelift_codegen::ir::Value,
+        val: cranelift_codegen::ir::Value,
+        bail: u16,
+    ) -> Option<()> {
+        // A dense view is never granted to a kernel containing stores, so
+        // the direct arm here is the f64 typed array only.
+        let view = self.ta_views[obj as usize];
+        let bail_b = self.dest(pc, bail as usize);
+        let direct = self.b.create_block();
+        let helper = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.ins().brif(view.is_ta, direct, &[], helper, &[]);
+        self.b.switch_to_block(direct);
+        let (ok, ii) = self.elem_index_ok(idx, view.bound);
+        let store_b = self.b.create_block();
+        self.b.ins().brif(ok, store_b, &[], bail_b, &[]);
+        self.b.switch_to_block(store_b);
+        let eight = self.b.ins().iconst(types::I64, 8);
+        let off = self.b.ins().imul(ii, eight);
+        let addr = self.b.ins().iadd(view.ptr, off);
+        self.b.ins().store(MemFlagsData::new(), val, addr, 0);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(helper);
+        let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
+        let st = self.callh("cjit_elem_store", &[self.ctx_ptr, oslot, idx, val])?;
+        self.b.ins().brif(st, join, &[], bail_b, &[]);
+        self.b.switch_to_block(join);
+        Some(())
+    }
+
+    /// The shared index test of the direct element paths — `dense_index`'s
+    /// exact conditions (integral, `0 ≤ i < 2^32-1`) plus the view bound —
+    /// returning the test and the index as an i64. Two conditions total:
+    /// the f64 round-trip proves integrality (NaN fails it — saturation
+    /// gives 0, and `0.0 == NaN` is false), and one UNSIGNED compare
+    /// against the entry-clamped bound covers non-negativity, the length,
+    /// and the 2^32-1 ceiling at once (a negative index wraps to a huge
+    /// unsigned value).
+    fn elem_index_ok(
+        &mut self,
+        idx: cranelift_codegen::ir::Value,
+        bound: cranelift_codegen::ir::Value,
+    ) -> (cranelift_codegen::ir::Value, cranelift_codegen::ir::Value) {
+        let ii = self.b.ins().fcvt_to_sint_sat(types::I64, idx);
+        let fi = self.b.ins().fcvt_from_sint(types::F64, ii);
+        let integral = self.b.ins().fcmp(FloatCC::Equal, fi, idx);
+        let in_bounds = self.b.ins().icmp(IntCC::UnsignedLessThan, ii, bound);
+        let ok = self.b.ins().band(integral, in_bounds);
+        (ok, ii)
+    }
+
+    /// `.length` (`KOp::LoadLen` semantics): the view length directly, the
+    /// shared core via the shim otherwise; failure bails.
+    fn emit_len(&mut self, pc: usize, obj: u16, bail: u16) -> Option<cranelift_codegen::ir::Value> {
+        let view = self.ta_views[obj as usize];
+        let bail_b = self.dest(pc, bail as usize);
+        let direct = self.b.create_block();
+        let helper = self.b.create_block();
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, types::F64);
+        self.b.ins().brif(view.is_direct, direct, &[], helper, &[]);
+        self.b.switch_to_block(direct);
+        let v = view.len_f64;
+        self.b.ins().jump(join, &[v.into()]);
+        self.b.switch_to_block(helper);
+        let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
+        let st = self.callh("cjit_elem_len", &[self.ctx_ptr, oslot])?;
+        let ok_b = self.b.create_block();
+        self.b.ins().brif(st, ok_b, &[], bail_b, &[]);
+        self.b.switch_to_block(ok_b);
+        let v = self.scratch();
+        self.b.ins().jump(join, &[v.into()]);
+        self.b.switch_to_block(join);
+        Some(res)
+    }
+
+    /// Read the helper out-param.
+    fn scratch(&mut self) -> cranelift_codegen::ir::Value {
+        self.b.ins().load(
+            types::F64,
+            MemFlagsData::trusted(),
+            self.ctx_ptr,
+            std::mem::offset_of!(JitCtx, scratch) as i32,
+        )
+    }
+
+    /// A status-returning shim whose success value lands in `dst` via
+    /// `ctx.scratch` and whose failure takes the bail edge (`ArrayPush`/
+    /// `ArrayPop`).
+    fn emit_shim_to_dst(
+        &mut self,
+        pc: usize,
+        name: &'static str,
+        args: &[cranelift_codegen::ir::Value],
+        dst: u16,
+        bail: u16,
+    ) -> Option<()> {
+        let bail_b = self.dest(pc, bail as usize);
+        let st = self.callh(name, args)?;
+        let ok_b = self.b.create_block();
+        self.b.ins().brif(st, ok_b, &[], bail_b, &[]);
+        self.b.switch_to_block(ok_b);
+        let v = self.scratch();
+        self.set(dst, v);
+        Some(())
     }
 
     /// The block a branch from `pc` to `target` should jump to: the target's
@@ -680,13 +1540,13 @@ impl<'a> Translator<'a> {
                 }
                 KOp::Arith { kind, dst, a, b } => {
                     let (x, y) = (self.get(a), self.get(b));
-                    let v = self.arith(kind, x, y)?;
+                    let v = self.arith(kind, x, y, None)?;
                     self.set(dst, v);
                 }
                 KOp::ArithK { kind, dst, a, k } => {
                     let x = self.get(a);
                     let kk = self.b.ins().f64const(k);
-                    let v = self.arith(kind, x, kk)?;
+                    let v = self.arith(kind, x, kk, Some(k))?;
                     self.set(dst, v);
                 }
                 KOp::Neg { dst, src } => {
@@ -696,7 +1556,9 @@ impl<'a> Translator<'a> {
                 }
                 KOp::BitNot { dst, src } => {
                     let x = self.get(src);
-                    let v = self.call1("cjit_bitnot", x)?;
+                    let ix = self.toint32(x)?;
+                    let nx = self.b.ins().bnot(ix);
+                    let v = self.i32_to_f64(nx);
                     self.set(dst, v);
                 }
                 KOp::Mov2 { d1, s1, d2, s2 } => {
@@ -716,7 +1578,7 @@ impl<'a> Translator<'a> {
                     b2,
                 } => {
                     let (x, y) = (self.get(a), self.get(b));
-                    let v = self.arith(kind, x, y)?;
+                    let v = self.arith(kind, x, y, None)?;
                     self.set(dst, v);
                     let (x2, y2) = (self.get(a2), self.get(b2));
                     let v2 = self.b.ins().fadd(x2, y2);
@@ -734,7 +1596,7 @@ impl<'a> Translator<'a> {
                 } => {
                     let x = self.get(a);
                     let kk = self.b.ins().f64const(k);
-                    let v = self.arith(kind, x, kk)?;
+                    let v = self.arith(kind, x, kk, Some(k))?;
                     self.set(dst, v);
                     let (x2, y2) = (self.get(a2), self.get(b2));
                     let v2 = self.b.ins().fadd(x2, y2);
@@ -826,15 +1688,22 @@ impl<'a> Translator<'a> {
                 }
                 KOp::Math2 { kind, dst, a, b } => {
                     let (x, y) = (self.get(a), self.get(b));
-                    let name = match kind {
-                        KMath::Min2 => "cjit_min2",
-                        KMath::Max2 => "cjit_max2",
-                        KMath::Pow2 => "cjit_pow2",
-                        KMath::Imul2 => "cjit_imul2",
+                    let v = match kind {
+                        // Cranelift fmin/fmax carry wasm's semantics — NaN
+                        // poisons, -0 < +0 — which are exactly the
+                        // `math_min2`/`math_max2` cores' rules.
+                        KMath::Min2 => self.b.ins().fmin(x, y),
+                        KMath::Max2 => self.b.ins().fmax(x, y),
+                        // `**`'s spec special cases live in `math_pow`.
+                        KMath::Pow2 => self.call2("cjit_pow2", x, y)?,
+                        KMath::Imul2 => {
+                            let (ix, iy) = (self.toint32(x)?, self.toint32(y)?);
+                            let r = self.b.ins().imul(ix, iy);
+                            self.i32_to_f64(r)
+                        }
                         // Unary kinds are excluded by `eligible` (arity 2).
                         _ => return None,
                     };
-                    let v = self.call2(name, x, y)?;
                     self.set(dst, v);
                 }
                 KOp::Exit { .. } | KOp::Ret { .. } => {
@@ -842,18 +1711,147 @@ impl<'a> Translator<'a> {
                     self.b.ins().jump(self.exit_block, &[pcv.into()]);
                     fallthrough = None;
                 }
+                KOp::LoadElem {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                } => {
+                    let i = self.get(idx);
+                    let v = self.emit_elem_load(pc, obj, i, bail)?;
+                    self.set(dst, v);
+                }
+                KOp::StoreElem {
+                    obj,
+                    idx,
+                    val,
+                    bail,
+                } => {
+                    let (i, v) = (self.get(idx), self.get(val));
+                    self.emit_elem_store(pc, obj, i, v, bail)?;
+                }
+                // Fused `s += a[i]` / `a[i] <op> …`: the element load's exact
+                // semantics (and bail edge), then the arithmetic tail, then
+                // the 2-slot skip past the landing pad.
+                KOp::LoadElemAdd {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                    d2,
+                    a2,
+                    b2,
+                } => {
+                    let i = self.get(idx);
+                    let v = self.emit_elem_load(pc, obj, i, bail)?;
+                    self.set(dst, v);
+                    let (x2, y2) = (self.get(a2), self.get(b2));
+                    let v2 = self.b.ins().fadd(x2, y2);
+                    self.set(d2, v2);
+                    fallthrough = Some(2);
+                }
+                KOp::LoadElemArith {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                    kind,
+                    d2,
+                    a2,
+                    b2,
+                } => {
+                    let i = self.get(idx);
+                    let v = self.emit_elem_load(pc, obj, i, bail)?;
+                    self.set(dst, v);
+                    let (x2, y2) = (self.get(a2), self.get(b2));
+                    let v2 = self.arith(kind, x2, y2, None)?;
+                    self.set(d2, v2);
+                    fallthrough = Some(2);
+                }
+                KOp::LoadLen { dst, obj, bail } => {
+                    let v = self.emit_len(pc, obj, bail)?;
+                    self.set(dst, v);
+                }
+                // Fused `i < a.length` header: LoadLen's semantics (and bail
+                // edge), then BrCmp's compare-and-branch, then the 2-slot
+                // fall-through past the landing pad.
+                KOp::LenBrCmp {
+                    dst,
+                    obj,
+                    bail,
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    let v = self.emit_len(pc, obj, bail)?;
+                    self.set(dst, v);
+                    let (x, y) = (self.get(a), self.get(b));
+                    let c = self.b.ins().fcmp(cmp_cc(cmp), x, y);
+                    let taken = self.dest(pc, target as usize);
+                    let fall = self.blocks[pc + 2];
+                    if if_true {
+                        self.b.ins().brif(c, taken, &[], fall, &[]);
+                    } else {
+                        self.b.ins().brif(c, fall, &[], taken, &[]);
+                    }
+                    fallthrough = None;
+                }
+                KOp::ArrayPush {
+                    obj,
+                    val,
+                    dst,
+                    bail,
+                } => {
+                    let v = self.get(val);
+                    let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
+                    let args = [self.ctx_ptr, oslot, v];
+                    self.emit_shim_to_dst(pc, "cjit_array_push", &args, dst, bail)?;
+                }
+                KOp::ArrayPop { obj, dst, bail } => {
+                    let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
+                    let args = [self.ctx_ptr, oslot];
+                    self.emit_shim_to_dst(pc, "cjit_array_pop", &args, dst, bail)?;
+                }
+                // Pinned-string reads: TOTAL over the entry-hoisted view
+                // (flat ASCII, immutable) — no bail exists, mirroring the
+                // interpreter arms exactly (saturating index conversion:
+                // NaN→0, truncate; out-of-range yields NaN).
+                KOp::StrLen { dst, str } => {
+                    let (_, slen) = self.sviews[str as usize];
+                    let v = self.b.ins().fcvt_from_sint(types::F64, slen);
+                    self.set(dst, v);
+                }
+                KOp::CharCodeAt { dst, str, idx } => {
+                    let (sptr, slen) = self.sviews[str as usize];
+                    let i = self.get(idx);
+                    let p = self.b.ins().fcvt_to_sint_sat(types::I64, i);
+                    let nonneg = self
+                        .b
+                        .ins()
+                        .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, p, 0);
+                    let in_bounds = self.b.ins().icmp(IntCC::SignedLessThan, p, slen);
+                    let ok = self.b.ins().band(nonneg, in_bounds);
+                    let load_b = self.b.create_block();
+                    let oob_b = self.b.create_block();
+                    let join = self.b.create_block();
+                    let res = self.b.append_block_param(join, types::F64);
+                    self.b.ins().brif(ok, load_b, &[], oob_b, &[]);
+                    self.b.switch_to_block(load_b);
+                    let addr = self.b.ins().iadd(sptr, p);
+                    let byte = self.b.ins().load(types::I8, MemFlagsData::new(), addr, 0);
+                    let wide = self.b.ins().uextend(types::I32, byte);
+                    let v = self.b.ins().fcvt_from_sint(types::F64, wide);
+                    self.b.ins().jump(join, &[v.into()]);
+                    self.b.switch_to_block(oob_b);
+                    let nan = self.b.ins().f64const(f64::NAN);
+                    self.b.ins().jump(join, &[nan.into()]);
+                    self.b.switch_to_block(join);
+                    self.set(dst, res);
+                }
                 // Excluded by `eligible`.
-                KOp::LoadElem { .. }
-                | KOp::StoreElem { .. }
-                | KOp::LoadElemAdd { .. }
-                | KOp::LoadElemArith { .. }
-                | KOp::LoadLen { .. }
-                | KOp::LenBrCmp { .. }
-                | KOp::ArrayPush { .. }
-                | KOp::ArrayPop { .. }
-                | KOp::StrLen { .. }
-                | KOp::CharCodeAt { .. }
-                | KOp::LoadProp { .. }
+                KOp::LoadProp { .. }
                 | KOp::StoreProp { .. }
                 | KOp::CallKernel { .. }
                 | KOp::SelfCall { .. } => return None,

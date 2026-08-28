@@ -589,26 +589,51 @@ impl fmt::Debug for JsObject {
 
 /// A JS value. `Clone` is cheap for all variants (scalars or `Rc` bumps).
 #[derive(Clone)]
+// The primitive representation (RFC 2195: tag byte + union of C-laid-out
+// variant structs) pins the layout the `jit` feature's dense-element fast
+// path reads: the tag at byte 0 (`Value::JIT_NUMBER_TAG`) and a `Number`'s
+// f64 payload at its natural alignment (`Value::JIT_NUMBER_PAYLOAD_OFFSET`).
+// Same 24-byte size as the default representation measured here; the only
+// cost is `Option<Value>`'s spare-tag niche (24 → 32 bytes), which appears
+// in scalar positions only, never in bulk storage. Discriminants are
+// explicit so the JIT contract cannot drift under variant reordering.
+#[repr(u8)]
 pub enum Value {
-    Undefined,
-    Null,
-    Bool(bool),
-    Number(f64),
-    String(JsString),
-    Symbol(JsSymbol),
-    Object(JsObject),
+    Undefined = 0,
+    Null = 1,
+    Bool(bool) = 2,
+    Number(f64) = 3,
+    String(JsString) = 4,
+    Symbol(JsSymbol) = 5,
+    Object(JsObject) = 6,
     /// The BigInt primitive (arbitrary precision).
-    BigInt(Rc<BigInt>),
+    BigInt(Rc<BigInt>) = 7,
     /// Temporal Dead Zone marker: the value stored in a `let`/`const`/`class`
     /// cell after hoisting but before its initializer runs. Reading it (via
     /// `LoadCell`/`LoadUpvalue`) throws a `ReferenceError`; it never escapes into
     /// user-observable positions.
-    Uninitialized,
+    Uninitialized = 8,
     /// Array hole (elision): the slot in a dense `Internal::Array` for a missing
     /// index, e.g. index 1 of `[0, , 2]`. `HasProperty` is false at a hole and
     /// the iteration/own-key machinery skips it; reading it yields `undefined`
     /// (via the prototype chain). It never escapes into user-observable values.
-    Hole,
+    Hole = 9,
+}
+
+impl Value {
+    /// The `jit` tier's raw dense-element contract (see `crate::jit`): the
+    /// `#[repr(u8)]` tag value of [`Value::Number`], read by compiled code
+    /// to test a dense slot before loading its payload. Must match the
+    /// explicit discriminant above; `crate::jit::dense_layout_ok` verifies
+    /// the whole contract against a live value before any compiled code
+    /// relies on it.
+    #[cfg(feature = "jit")]
+    pub(crate) const JIT_NUMBER_TAG: u8 = 3;
+    /// Byte offset of a [`Value::Number`]'s f64 payload under `#[repr(u8)]`
+    /// (the variant struct is `{ tag: u8, payload: f64 }` with C layout, so
+    /// the payload sits at the f64's natural alignment).
+    #[cfg(feature = "jit")]
+    pub(crate) const JIT_NUMBER_PAYLOAD_OFFSET: usize = 8;
 }
 
 impl fmt::Debug for Value {
