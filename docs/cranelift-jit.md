@@ -91,6 +91,28 @@ compiled subset now covers essentially the whole kernel language:
   runs that activation on the interpreter tier. Closure *instances* may
   differ freely — their upvalue snapshots travel through the register
   buffer.
+- **Batch array HOFs** (`map`/`filter`/`forEach`/`reduce`/`some`/`every`/
+  `find`/`findIndex`): when the receiver is a dense array or numeric typed
+  array and the callback is a pure function kernel, the builtin runs the
+  WHOLE loop as one native activation — a fixed synthetic loop kernel per
+  mode (`jit::batch_kernel`)
+  with the callback inlined at its standard pinned-callee slot, cached per
+  callback kernel and identity-checked per activation like any other
+  pinned callee. `map` writes results straight into the hole-filled
+  species array's slots (a writable dense view granted only here — tag +
+  payload stores over the `#[repr(u8)]` layout); `filter` pushes kept
+  elements through the shared push core; `reduce` threads a Number
+  accumulator in a register. Soundness rests on one property: no user code
+  runs between batch elements, so the per-call re-checks of the prepared
+  path (canonical `Math`, all-Number upvalues) hold once for the whole run
+  — the sort specialization's argument. Any element the kernel cannot
+  handle (a hole, a non-Number, a shadowed base) bails before completing
+  its op and the builtin's generic loop resumes at that exact index; the
+  search modes exit through a dedicated FOUND edge at the hit index;
+  boolean-returning predicates are admitted wherever the result only feeds
+  a truthiness branch (`filter`, `forEach`, and the searches — never
+  `map`/`reduce`, whose results materialize), and the interrupt is polled
+  on the loop back-edge at the interpreter's cadence.
 - **Recursion families** (`SelfCall`): a RESOLVED family — the invoked
   closure plus every partner reached through its recursive call graph, via
   global bindings or captured (function-scoped) bindings, self and mutual
@@ -173,58 +195,57 @@ ops faster), which is already timing-dependent under the interpreter.
 - Cranelift is pure Rust (no C), but it is a full compiler backend with its
   own CVE surface — the reason this stays opt-in.
 
-## Measured (2026-08, this container): vs Node 22 and Bun 1.3
+## Measured (2026-08-28, this container): vs Node 22 and Bun 1.3
 
 The tier's goal is **Node/Bun-level performance on kernel-shaped code**.
-Cross-engine wall-clock, scaled versions of the repo's canonical workloads
-(`benches/common/workloads.rs`), min-of-3 full-process runs minus each
-engine's empty-script baseline, byte-identical outputs verified on every row.
-`chidori-int` is the identical binary with `--no-jit`:
+The numbers below are the standalone cross-engine suite
+(`crates/chidori-js/benchmarks/run.mjs`, the CI perf-table workloads):
+execution-only wall-clock (subprocess median minus each engine's
+empty-script startup baseline), identical `RESULT=` checksums verified on
+every row. `chidori-int` is the identical engine with the tier off:
 
-| workload | chidori-jit | chidori-int | node 22 | bun 1.3 | jit/node | jit/bun |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| fib_recursive (fib 32) | 20 ms | 133 ms | 33 ms | 16 ms | **0.6×** | 1.3× |
-| property_access (20M) | 17 ms | 322 ms | 29 ms | 15 ms | **0.6×** | 1.1× |
-| string_scan (charCodeAt hash) | 101 ms | 317 ms | 164 ms | 243 ms | **0.6×** | **0.4×** |
-| typed_array (Float64Array dot/transform) | 94 ms | 613 ms | 105 ms | 52 ms | **0.9×** | 1.8× |
-| bitwise_prng (50M LCG) | 344 ms | 3927 ms | 310 ms | 479 ms | **1.1×** | **0.7×** |
-| closures (adder in a loop, 20M) | 27 ms | 432 ms | 24 ms | 18 ms | **1.1×** | 1.5× |
-| dense_push (20×2M pushes) | 1142 ms | 1243 ms | 945 ms | 300 ms | **1.2×** | 3.8× |
-| array_sum (push + 20 sum passes) | 313 ms | 832 ms | 114 ms | 86 ms | 2.7× | 3.6× |
-| arith_loop (50M, `%`-heavy) | 243 ms | 922 ms | 84 ms | 74 ms | 2.9× | 3.3× |
-| dense_sum (200M dense reads) | 1331 ms | 3967 ms | 264 ms | 215 ms | 5.0× | 6.2× |
-| array_hof (map/filter/reduce) | 153 ms | 139 ms | 34 ms | 20 ms | 4.5× | 7.8× |
-| string_build (rope `+=`) | 611 ms | 523 ms | 125 ms | 247 ms | 4.9× | 2.5× |
-| mixed_helpers (object glue) | 637 ms | 642 ms | 57 ms | 73 ms | 11× | 8.7× |
-| object_literals (5M allocations) | 1499 ms | 1488 ms | 35 ms | 35 ms | 43× | 42× |
-
-Since that table was taken, the recursion-family extension moved
-`mutual_recursion` (function-scoped `isEven`/`isOdd` + captured-binding
-`gcd`, the standalone-suite workload) from ~110× behind Node — it ran the
-generic call path — to ~1.1× on total wall-clock (interpreter tier ~1.7×):
-both engine columns now run the family tiers.
+| workload | chidori-jit | chidori-int | node 22 | bun 1.3 | jit/node |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| arith_loop (`%`-heavy) | 7.0 ms | 31.6 ms | 8.8 ms | 9.1 ms | **0.8×** |
+| closures (adder in a loop) | 4.6 ms | 31.3 ms | 4.3 ms | 8.1 ms | **1.1×** |
+| fib_recursive (fib 30) | 14.0 ms | 91.2 ms | 22.2 ms | 11.2 ms | **0.6×** |
+| typed_array (all-kinds dot/transform/mix) | 18.5 ms | 46.8 ms | 34.5 ms | 15.2 ms | **0.5×** |
+| array_hof (map/filter/reduce chain) | 30.3 ms | 53.7 ms | 31.6 ms | 24.4 ms | **1.0×** |
+| array_push_sum | 26.3 ms | 40.0 ms | 22.1 ms | 24.0 ms | 1.2× |
+| array_sum | 112.9 ms | 182.6 ms | 74.2 ms | 103.8 ms | 1.5× |
+| sort (comparator kernels) | 182.9 ms | 215.5 ms | 152.8 ms | 126.2 ms | 1.2× |
+| string_scan (charCodeAt hash) | 13.9 ms | 15.2 ms | 10.5 ms | 6.6 ms | 1.3× |
+| checksum (Adler-32 / Uint8Array) | 195.0 ms | 361.8 ms | 64.0 ms | 57.0 ms | 3.0× |
+| property_access | 2.9 ms | 16.9 ms | ~0.7 ms | 4.5 ms | — |
+| mutual_recursion (family tiers) | 40.8 ms | 108.8 ms | 9.0 ms | 5.3 ms | 4.5× |
+| string_build (rope `+=`) | 10.9 ms | 10.6 ms | 9.5 ms | 4.5 ms | 1.1× |
+| json_roundtrip | 163.1 ms | 155.6 ms | 51.1 ms | 39.9 ms | 3.2× |
+| mixed_helpers (object glue) | 276.4 ms | 281.6 ms | 31.2 ms | 32.6 ms | 8.9× |
 
 Reading the table honestly, three regimes:
 
-1. **At or beyond Node (7 of 14)** — everything the kernel tier fully
-   compiles: recursion, property loops, string scans, typed arrays, bitwise,
-   inlined closures, pushes. Four rows are *faster than Node*; two are
-   faster than Bun. This is the regime agent compute (checksum loops, PRNGs,
-   tokenizers, numeric kernels, comparators) lives in.
-2. **2–5× (kernel-shaped, known cause)** — dense-array reads and
-   `%`-in-loop shapes pay per-access exactness checks (index integrality,
-   bounds, slot tags) that V8 eliminates with induction-variable and range
-   analysis. Closing this needs typed loop-counter reasoning in the kernel
-   translator (prove `i` integral and bounded by the header check, then
-   drop the per-access tests) — mechanical, deterministic, and the
-   documented next step.
-3. **4–43× (allocation/shape-bound, out of this tier's scope)** —
-   `object_literals`, `mixed_helpers`, `string_build`, `array_hof` spend
-   their time in allocation, property-map traffic, string building, and
-   builtin iteration machinery, not kernel execution (jit ≈ interp on every
-   one). Reaching V8 there means escape analysis, inline allocation, and
-   shape-specialized builtins — a different, much larger project the
-   kernel JIT deliberately does not start.
+1. **At or beyond Node (half the suite)** — everything the kernel tier
+   fully compiles: arithmetic, recursion, closures, typed arrays of every
+   numeric kind, and now the array-HOF chain (`map`/`filter`/`reduce` as
+   native batches — that row was 4.5× behind before batching). Several
+   rows are *faster than Node*; `typed_array` and `fib` by ~2×. This is
+   the regime agent compute (numeric kernels, tokenizers, comparators,
+   per-element callbacks) lives in.
+2. **1.2–4.5× (kernel-shaped, known causes)** — `checksum` and
+   `array_sum`-style rows keep loop values in f64 registers and pay
+   float↔int conversion plus per-access exactness checks (index
+   integrality, bounds, slot tags) that V8 eliminates with int-typed
+   induction variables and range analysis; `mutual_recursion`'s family
+   calls still carry per-call snapshot traffic. Closing these needs
+   int-typed loop-counter reasoning in the kernel translator — mechanical,
+   deterministic, and the documented next step.
+3. **3–9× (allocation/shape-bound, out of this tier's scope)** —
+   `json_roundtrip`, `mixed_helpers`, `string_build` spend their time in
+   allocation, property-map traffic, and string building, not kernel
+   execution (jit ≈ interp on each). Reaching V8 there means escape
+   analysis, inline allocation, and shape-specialized builtins — a
+   different, much larger project the kernel JIT deliberately does not
+   start.
 
 ## Limitations / next steps
 
@@ -234,7 +255,10 @@ Reading the table honestly, three regimes:
 - **Cell-writing pinned callees** keep the interpreter tier (per-call cell
   flushes), as do mixed-return-type recursion families.
 - **Dense direct views are read-only kernels only**; writing kernels reach
-  dense arrays through the shim cores (a store can grow/reallocate).
+  dense arrays through the shim cores (a store can grow/reallocate). The
+  one exception is driver-granted: the batch `map` output view, whose
+  target is a freshly created hole-filled array nothing else can reach and
+  no push can move.
 - **The allocation-bound regime** (3 above) is explicitly out of scope for
   this tier.
 - **One `JITModule` per kernel**; compile cost is paid on first activation
@@ -245,12 +269,14 @@ Reading the table honestly, three regimes:
 
 - `crates/chidori-js/src/jit.rs` — eligibility, the Cranelift translator, the
   helper shims, the compile-once cache, the three `unsafe` blocks.
-- `crates/chidori-js/src/exec.rs` — the four seams (`run_kernel_op_impl` for
+- `crates/chidori-js/src/exec.rs` — the five seams (`run_kernel_op_impl` for
   loop kernels across the stack and register tiers, `run_fn_kernel` for
   frameless calls, `run_fn_kernel_rec` for self-recursion,
-  `exec_prepared_kernel` for prepared callbacks) plus the shared element
-  fast-path cores (`kernel_elem_load`/`store`/`len`,
-  `kernel_array_push`/`pop`) both tiers call.
+  `exec_prepared_kernel` for prepared callbacks, `hof_batch` for the batch
+  array HOFs) plus the shared element fast-path cores
+  (`kernel_elem_load`/`store`/`len`, `kernel_array_push`/`pop`) both tiers
+  call. `builtins/array.rs` calls the batch seam from `forEach`/`map`/
+  `filter`/`reduce`.
 - `crates/chidori-js/src/bytecode.rs` — `Kernel::native` (the cache slot).
 - `crates/chidori-js/src/vm.rs` — `Vm::jit_enabled`.
 - `crates/chidori-js/src/bin/chidori_js_jit.rs` — the `chidori-js-jit`

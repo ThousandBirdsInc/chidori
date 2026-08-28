@@ -170,6 +170,15 @@ impl ElemView {
     pub(crate) const TA_I32: u64 = 8;
     pub(crate) const TA_U32: u64 = 9;
     pub(crate) const TA_F32: u64 = 10;
+    /// WRITABLE dense-array view — granted ONLY by the batch HOF driver
+    /// (`Vm::hof_batch`) over the freshly-created, hole-filled `map` output
+    /// array, which nothing else can reach mid-batch. A store writes the
+    /// slot's `#[repr(u8)]` tag ([`Value::JIT_NUMBER_TAG`]) and f64 payload
+    /// directly — overwriting a `Hole` (no drop needed, no heap payload)
+    /// with a `Number`, exactly what the interpreter-core write would
+    /// produce. Never granted by [`elem_view`]; reads and every other view
+    /// kind treat it as "no direct arm" and take the shims.
+    pub(crate) const DENSE_W: u64 = 11;
 
     /// The view-kind code for a typed array's element kind — `None` for the
     /// BigInt kinds, which never get a direct view (their elements are not
@@ -190,7 +199,7 @@ impl ElemView {
         })
     }
 
-    fn none() -> ElemView {
+    pub(crate) fn none() -> ElemView {
         ElemView {
             ptr: std::ptr::null_mut(),
             len: 0,
@@ -216,7 +225,7 @@ fn ta_code_bytes(code: u64) -> Option<i64> {
 /// against a live value: belt-and-braces under the guaranteed RFC 2195
 /// layout — if it ever failed, dense views are simply never granted and
 /// every dense access takes the helper shims.
-fn dense_layout_ok() -> bool {
+pub(crate) fn dense_layout_ok() -> bool {
     use std::sync::OnceLock;
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
@@ -425,6 +434,304 @@ pub fn stats() -> JitStats {
 /// `Some(Some(_))` for compiled code.
 pub type NativeCache = OnceCell<Option<NativeKernel>>;
 
+/// Per-function-kernel cache of the synthetic BATCH kernels built AROUND it
+/// (`Kernel::batch`, on the CALLBACK's kernel): one slot per [`BatchMode`].
+/// Each cached instance is the mode's fixed program ([`batch_kernel`]); what
+/// makes it per-callback is its own `native` cache, whose compiled code
+/// inlines and identity-checks exactly this callback's proto. Like `native`,
+/// a pure performance side effect: never serialized, never observable.
+pub type BatchCache = [OnceCell<Rc<Kernel>>; BATCH_MODE_COUNT];
+
+/// Number of [`BatchMode`] variants (the `BatchCache` arity).
+pub const BATCH_MODE_COUNT: usize = 7;
+
+/// Which array HOF loop a synthetic batch kernel drives (see
+/// [`batch_kernel`] and `Vm::hof_batch`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatchMode {
+    /// `forEach`: call `cb(v, i)` per element, no output.
+    ForEach = 0,
+    /// `map`: call `cb(v, i)`, write the result to output slot `i`
+    /// (a [`ElemView::DENSE_W`] direct write into the hole-filled result).
+    Map = 1,
+    /// `filter`: call `cb(v, i)`, push `v` onto the output when truthy.
+    Filter = 2,
+    /// `reduce`: `acc = cb(acc, v, i)` per element.
+    Reduce = 3,
+    /// `some`: call `cb(v, i)`, exit FOUND on the first truthy result.
+    Some = 4,
+    /// `every`: call `cb(v, i)`, exit FOUND on the first FALSY result (the
+    /// counterexample).
+    Every = 5,
+    /// `find`/`findIndex`: as `Some` — the caller turns the found index
+    /// into the element or the index. (Both spec loops visit holes via
+    /// `Get`; a hole bails the element load, and the generic loop resumes
+    /// there with the exact hole semantics.)
+    Find = 6,
+}
+
+impl BatchMode {
+    pub(crate) fn idx(self) -> usize {
+        self as usize
+    }
+    /// Whether the callback's result only ever feeds a truthiness branch or
+    /// is discarded — the modes that admit boolean-returning callbacks
+    /// (see [`callee_eligible`]).
+    pub(crate) fn bool_ret_ok(self) -> bool {
+        matches!(
+            self,
+            BatchMode::ForEach
+                | BatchMode::Filter
+                | BatchMode::Some
+                | BatchMode::Every
+                | BatchMode::Find
+        )
+    }
+    /// Number of oslots the mode's kernel binds: input only, or input +
+    /// output.
+    pub(crate) fn n_oslots(self) -> usize {
+        match self {
+            BatchMode::Map | BatchMode::Filter => 2,
+            _ => 1,
+        }
+    }
+    /// Arguments each `CallKernel` site passes — the highest argument index
+    /// a batchable callback may consume is `argc - 1`.
+    pub(crate) fn argc(self) -> u16 {
+        match self {
+            BatchMode::Reduce => 3,
+            _ => 2,
+        }
+    }
+    /// The code index of the mode's COMPLETION `Exit` (loop ran to the
+    /// end); every `Exit` that is neither this nor [`Self::found_pc`] is a
+    /// bail, resuming the generic loop at the current index.
+    pub(crate) fn done_pc(self) -> usize {
+        match self {
+            BatchMode::ForEach => 5,
+            BatchMode::Map => 6,
+            BatchMode::Filter => 7,
+            BatchMode::Reduce => 6,
+            BatchMode::Some | BatchMode::Every | BatchMode::Find => 6,
+        }
+    }
+    /// EARLY-EXIT modes: the `Exit` taken when the search hit (`some`'s
+    /// truthy, `every`'s falsy, `find`'s truthy) at the current index.
+    pub(crate) fn found_pc(self) -> Option<usize> {
+        match self {
+            BatchMode::Some | BatchMode::Every | BatchMode::Find => Some(8),
+            _ => None,
+        }
+    }
+}
+
+/// Batch-kernel register layout (window 0): the loop index, the length
+/// bound, a push-result scratch, the call result, the accumulator
+/// (`reduce`), then the contiguous argument window at [`BREG_ARGS`].
+pub(crate) const BREG_I: u16 = 0;
+pub(crate) const BREG_LEN: u16 = 1;
+const BREG_SCRATCH: u16 = 2;
+const BREG_RES: u16 = 3;
+pub(crate) const BREG_ACC: u16 = 4;
+const BREG_ARGS: u16 = 5;
+
+/// Build the synthetic loop kernel that runs one array HOF entirely as
+/// native code: `while (i < len) { v = input[i] (bail: not a clean dense/
+/// typed-array element); r = cb(...); <mode's consume>; i += 1 }`. The
+/// program is fixed per mode — the callback binds through the standard
+/// pinned-callee slot (`CallKernel` fslot 0), compiled against and
+/// identity-checked per activation like any other pinned callee — and is
+/// only ever run NATIVELY by `Vm::hof_batch` (never by the interpreter
+/// loop, whose exit materialization needs a frame): the driver maps each
+/// `Exit` index to "done" or "resume the generic loop at `regs[BREG_I]`".
+/// Every bail happens BEFORE its op completes, and batchable callbacks are
+/// pure register programs, so the generic redo of the current index — which
+/// may re-run the callback — is unobservable (same result, no side
+/// effects).
+pub(crate) fn batch_kernel(mode: BatchMode) -> Kernel {
+    use crate::bytecode::{KCallee, KCalleeSrc, Op};
+    let exit = |_: usize| KOp::Exit {
+        resume_ip: 0,
+        shape: 0,
+    };
+    let header = KOp::BrCmp {
+        cmp: CmpOp::Lt,
+        a: BREG_I,
+        b: BREG_LEN,
+        if_true: false,
+        target: mode.done_pc() as u16,
+    };
+    let call = KOp::CallKernel {
+        dst: match mode {
+            BatchMode::Reduce => BREG_ACC,
+            _ => BREG_RES,
+        },
+        fslot: 0,
+        base: BREG_ARGS,
+        argc: mode.argc(),
+    };
+    let next = |back_target: u16| KOp::AddKBr {
+        dst: BREG_I,
+        a: BREG_I,
+        k: 1.0,
+        target: back_target,
+    };
+    let code: Vec<KOp> = match mode {
+        BatchMode::ForEach => vec![
+            header,
+            KOp::LoadElem {
+                dst: BREG_ARGS,
+                obj: 0,
+                idx: BREG_I,
+                bail: 6,
+            },
+            KOp::Mov {
+                dst: BREG_ARGS + 1,
+                src: BREG_I,
+            },
+            call,
+            next(0),
+            exit(5), // done
+            exit(6), // element bail
+        ],
+        BatchMode::Map => vec![
+            header,
+            KOp::LoadElem {
+                dst: BREG_ARGS,
+                obj: 0,
+                idx: BREG_I,
+                bail: 7,
+            },
+            KOp::Mov {
+                dst: BREG_ARGS + 1,
+                src: BREG_I,
+            },
+            call,
+            KOp::StoreElem {
+                obj: 1,
+                idx: BREG_I,
+                val: BREG_RES,
+                bail: 8,
+            },
+            next(0),
+            exit(6), // done
+            exit(7), // element bail
+            exit(8), // output-store bail
+        ],
+        BatchMode::Filter => vec![
+            header,
+            KOp::LoadElem {
+                dst: BREG_ARGS,
+                obj: 0,
+                idx: BREG_I,
+                bail: 8,
+            },
+            KOp::Mov {
+                dst: BREG_ARGS + 1,
+                src: BREG_I,
+            },
+            call,
+            KOp::BrFalsy {
+                src: BREG_RES,
+                target: 6,
+            },
+            KOp::ArrayPush {
+                obj: 1,
+                val: BREG_ARGS,
+                dst: BREG_SCRATCH,
+                bail: 9,
+            },
+            next(0),
+            exit(7), // done
+            exit(8), // element bail
+            exit(9), // push bail
+        ],
+        BatchMode::Reduce => vec![
+            header,
+            KOp::LoadElem {
+                dst: BREG_ARGS + 1,
+                obj: 0,
+                idx: BREG_I,
+                bail: 7,
+            },
+            KOp::Mov {
+                dst: BREG_ARGS,
+                src: BREG_ACC,
+            },
+            KOp::Mov {
+                dst: BREG_ARGS + 2,
+                src: BREG_I,
+            },
+            call,
+            next(0),
+            exit(6), // done
+            exit(7), // element bail
+        ],
+        BatchMode::Some | BatchMode::Every | BatchMode::Find => vec![
+            header,
+            KOp::LoadElem {
+                dst: BREG_ARGS,
+                obj: 0,
+                idx: BREG_I,
+                bail: 7,
+            },
+            KOp::Mov {
+                dst: BREG_ARGS + 1,
+                src: BREG_I,
+            },
+            call,
+            // `every` searches for the first FALSY result; the others for
+            // the first truthy one.
+            if mode == BatchMode::Every {
+                KOp::BrFalsy {
+                    src: BREG_RES,
+                    target: 8,
+                }
+            } else {
+                KOp::BrTruthy {
+                    src: BREG_RES,
+                    target: 8,
+                }
+            },
+            next(0),
+            exit(6), // done: exhausted without a hit
+            exit(7), // element bail
+            exit(8), // FOUND at regs[BREG_I]
+        ],
+    };
+    Kernel {
+        code: code.into_boxed_slice(),
+        locals: Box::new([]),
+        bool_locals: Box::new([]),
+        // Frame-local indices are meaningless here (the driver builds the
+        // object table directly); only the slot COUNT matters to
+        // translation.
+        oslots: vec![0u32; mode.n_oslots()].into_boxed_slice(),
+        sslots: Box::new([]),
+        uses_char_code: false,
+        shapes: Box::new([Box::new([]) as Box<[crate::bytecode::KShapeSlot]>]),
+        futile: std::cell::Cell::new(0),
+        native: NativeCache::new(),
+        batch: BatchCache::default(),
+        math_used: Box::new([]),
+        props_used: Box::new([]),
+        callee_slots: Box::new([KCallee {
+            source: KCalleeSrc::Oslot(0),
+            min_argc: mode.argc(),
+        }]),
+        n_regs: BREG_ARGS + mode.argc(),
+        rec: None,
+        ret_bool: false,
+        args_used: 0,
+        uv_writes: Box::new([]),
+        stores_elems: matches!(mode, BatchMode::Map),
+        loads_len: false,
+        uses_array_push: matches!(mode, BatchMode::Filter),
+        uses_array_pop: false,
+        fallback: Box::new(Op::Nop),
+    }
+}
+
 /// A kernel's compiled native code plus the [`JITModule`] that owns the
 /// executable memory backing it. Cheaply cloneable (`Rc`); the memory is
 /// freed when the last clone drops, and the function pointer is only
@@ -564,6 +871,46 @@ pub(crate) fn native_for_loop(
 /// kernel seam; function kernels contain no `CallKernel` by construction).
 pub(crate) fn native_for(k: &Kernel) -> Option<NativeKernel> {
     native_for_loop(k, &[], &[])
+}
+
+/// The compiled form of a synthetic BATCH kernel (see [`batch_kernel`] and
+/// `Vm::hof_batch`): [`native_for_loop`]'s compile-or-fetch and per-
+/// activation callee identity guard, with the batch dialect's boolean-
+/// returning-callee relaxation where the mode tolerates it.
+pub(crate) fn native_for_batch(
+    k: &Kernel,
+    callee_bfs: &[(Rc<crate::value::BytecodeFunction>, u32)],
+    elem_kinds: &[u64],
+    bool_ret_callees: bool,
+) -> Option<NativeKernel> {
+    let native = k.native.get_or_init(|| {
+        let specs: Vec<(Rc<crate::bytecode::FuncProto>, u32)> = callee_bfs
+            .iter()
+            .map(|(bf, wb)| (bf.proto.clone(), *wb))
+            .collect();
+        match compile_inner(k, &specs, elem_kinds, bool_ret_callees) {
+            Some(n) => {
+                STAT_COMPILED.fetch_add(1, Ordering::Relaxed);
+                Some(n)
+            }
+            None => {
+                STAT_DECLINED.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    });
+    let nk = native.as_ref()?;
+    if nk.0.callees.len() != callee_bfs.len()
+        || !nk
+            .0
+            .callees
+            .iter()
+            .zip(callee_bfs)
+            .all(|(compiled, (bf, _))| Rc::ptr_eq(compiled, &bf.proto))
+    {
+        return None;
+    }
+    Some(nk.clone())
 }
 
 /// The compiled form of a RESOLVED recursion family, entered through
@@ -894,14 +1241,20 @@ fn cmp_cc(cmp: CmpOp) -> FloatCC {
 /// has nothing to exit to), non-recursive, cell-write-free (per-call cell
 /// flushes are the interpreter tier's), and boolean-return-free (the caller
 /// guard already requires Number returns; checked again here).
-fn callee_eligible(ck: &Kernel) -> bool {
+/// `bool_ret_ok` relaxes the last rule for BATCH kernels whose call result
+/// only ever feeds a truthiness branch (`filter`'s predicate, `forEach`'s
+/// discarded result): a boolean `Ret` lands as its exact 0.0/1.0 register
+/// value, whose truthiness IS `ToBoolean` of the Bool — the result is never
+/// materialized as a `Value`, so the type difference cannot be observed.
+fn callee_eligible(ck: &Kernel, bool_ret_ok: bool) -> bool {
     ck.rec.is_none()
         && ck.uv_writes.is_empty()
         && eligible(ck, &[])
-        && !ck
-            .code
-            .iter()
-            .any(|op| matches!(op, KOp::Exit { .. } | KOp::Ret { boolean: true, .. }))
+        && !ck.code.iter().any(|op| match op {
+            KOp::Exit { .. } => true,
+            KOp::Ret { boolean: true, .. } => !bool_ret_ok,
+            _ => false,
+        })
 }
 
 /// Whether one RESOLVED-FAMILY member's kernel can compile into the
@@ -915,7 +1268,7 @@ fn rec_member_eligible(k: &Kernel, n_callees: usize) -> bool {
         && k.oslots.is_empty()
         && k.sslots.is_empty()
         && k.props_used.is_empty()
-        && eligible_inner(k, &[], Some(n_callees))
+        && eligible_inner(k, &[], Some(n_callees), false)
 }
 
 /// Whether every op in `k` is in the subset this backend compiles, with
@@ -924,16 +1277,19 @@ fn rec_member_eligible(k: &Kernel, n_callees: usize) -> bool {
 /// aimed at an inlinable resolved callee. A `false` pins the kernel to the
 /// interpreter tier — never an error.
 fn eligible(k: &Kernel, callees: &[(Rc<crate::bytecode::FuncProto>, u32)]) -> bool {
-    eligible_inner(k, callees, None)
+    eligible_inner(k, callees, None, false)
 }
 
 /// `rec_callees` selects the RECURSIVE-body dialect: `Some(n)` makes
 /// `SelfCall` legal against an `n`-entry callee row and `Exit` illegal (a
-/// frameless recursive body has nothing to exit to).
+/// frameless recursive body has nothing to exit to). `bool_ret_callees`
+/// admits boolean-returning callees (see [`callee_eligible`]) — BATCH
+/// kernels only.
 fn eligible_inner(
     k: &Kernel,
     callees: &[(Rc<crate::bytecode::FuncProto>, u32)],
     rec_callees: Option<usize>,
+    bool_ret_callees: bool,
 ) -> bool {
     let n_regs = k.n_regs as usize;
     let len = k.code.len();
@@ -1056,7 +1412,7 @@ fn eligible_inner(
                 && callees
                     .get(fslot as usize)
                     .and_then(|(proto, _)| proto.fn_kernel.as_ref())
-                    .is_some_and(callee_eligible)
+                    .is_some_and(|ck| callee_eligible(ck, bool_ret_callees))
         }
         // Outside the compiled subset: localized property ops (rewritten
         // away at kernel build — surviving ones are the tier bug the
@@ -1078,7 +1434,19 @@ fn compile(
     callees: &[(Rc<crate::bytecode::FuncProto>, u32)],
     elem_kinds: &[u64],
 ) -> Option<NativeKernel> {
-    if !eligible(k, callees) {
+    compile_inner(k, callees, elem_kinds, false)
+}
+
+/// [`compile`] with the batch dialect's boolean-returning-callee relaxation
+/// (see [`callee_eligible`]) — only the synthetic batch kernels, whose call
+/// results provably never materialize, pass `true`.
+fn compile_inner(
+    k: &Kernel,
+    callees: &[(Rc<crate::bytecode::FuncProto>, u32)],
+    elem_kinds: &[u64],
+    bool_ret_callees: bool,
+) -> Option<NativeKernel> {
+    if !eligible_inner(k, callees, None, bool_ret_callees) {
         return None;
     }
     // A kernel with pinned-callee slots must be compiled against exactly its
@@ -2087,7 +2455,9 @@ impl<'a> Translator<'a> {
         let bail_b = self.dest(pc, bail as usize);
         let helper = self.b.create_block();
         let join = self.b.create_block();
-        if ta_code_bytes(view.baked).is_some() && view.baked != ElemView::TA_U8C {
+        let direct_ok = (ta_code_bytes(view.baked).is_some() && view.baked != ElemView::TA_U8C)
+            || view.baked == ElemView::DENSE_W;
+        if direct_ok {
             let direct = self.b.create_block();
             self.b.ins().brif(view.is_ta, direct, &[], helper, &[]);
             self.b.switch_to_block(direct);
@@ -2095,7 +2465,29 @@ impl<'a> Translator<'a> {
             let store_b = self.b.create_block();
             self.b.ins().brif(ok, store_b, &[], bail_b, &[]);
             self.b.switch_to_block(store_b);
-            self.ta_store(view, ii, val);
+            if view.baked == ElemView::DENSE_W {
+                // Writable dense slot (batch `map` output): tag byte +
+                // payload, the `Value::Number` layout the read path checks.
+                let stride = self.b.ins().iconst(
+                    types::I64,
+                    std::mem::size_of::<crate::value::Value>() as i64,
+                );
+                let off = self.b.ins().imul(ii, stride);
+                let slot = self.b.ins().iadd(view.ptr, off);
+                let tag = self.b.ins().iconst(
+                    types::I64,
+                    i64::from(crate::value::Value::JIT_NUMBER_TAG),
+                );
+                self.b.ins().istore8(MemFlagsData::trusted(), tag, slot, 0);
+                self.b.ins().store(
+                    MemFlagsData::trusted(),
+                    val,
+                    slot,
+                    crate::value::Value::JIT_NUMBER_PAYLOAD_OFFSET as i32,
+                );
+            } else {
+                self.ta_store(view, ii, val);
+            }
             self.b.ins().jump(join, &[]);
         } else {
             self.b.ins().jump(helper, &[]);

@@ -841,8 +841,23 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "forEach", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
+        // Cranelift batch tier (`jit` feature): run the whole loop as one
+        // native activation; a bail resumes the generic loop below at the
+        // bailed index. See `Vm::hof_batch`.
+        #[cfg(feature = "jit")]
+        match vm.hof_batch(crate::jit::BatchMode::ForEach, &ov, None, len, 0.0, 0.0, &cb) {
+            Some(crate::exec::HofBatchOut::Done(_)) => return Ok(Value::Undefined),
+            Some(
+                crate::exec::HofBatchOut::Resume { index, .. }
+                | crate::exec::HofBatchOut::Found { index },
+            ) => k = index,
+            Some(crate::exec::HofBatchOut::Interrupted) => {
+                return Err(vm.throw_range("execution interrupted"))
+            }
+            None => {}
+        }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {
@@ -863,8 +878,23 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // Result via ArraySpeciesCreate; holes map to holes (the callback is not
         // invoked for an absent index and that output slot stays absent).
         let a = array_species_create(vm, &ov, len)?;
-        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
+        // Cranelift batch tier: the mapped values write straight into the
+        // hole-filled result's slots; a bail resumes below at the bailed
+        // index with the prefix already in place. See `Vm::hof_batch`.
+        #[cfg(feature = "jit")]
+        match vm.hof_batch(crate::jit::BatchMode::Map, &ov, Some(&a), len, 0.0, 0.0, &cb) {
+            Some(crate::exec::HofBatchOut::Done(_)) => return Ok(a),
+            Some(
+                crate::exec::HofBatchOut::Resume { index, .. }
+                | crate::exec::HofBatchOut::Found { index },
+            ) => k = index,
+            Some(crate::exec::HofBatchOut::Interrupted) => {
+                return Err(vm.throw_range("execution interrupted"))
+            }
+            None => {}
+        }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {
@@ -884,9 +914,31 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "filter", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
         let a = array_species_create(vm, &ov, 0.0)?;
-        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut to = 0.0;
         let mut k = 0.0;
+        // Cranelift batch tier: kept elements push through the shared push
+        // core; on a bail `to` is the compacted prefix length (the result's
+        // current dense length). See `Vm::hof_batch`.
+        #[cfg(feature = "jit")]
+        match vm.hof_batch(crate::jit::BatchMode::Filter, &ov, Some(&a), len, 0.0, 0.0, &cb) {
+            Some(crate::exec::HofBatchOut::Done(_)) => return Ok(a),
+            Some(
+                crate::exec::HofBatchOut::Resume { index, .. }
+                | crate::exec::HofBatchOut::Found { index },
+            ) => {
+                k = index;
+                if let Value::Object(o) = &a {
+                    if let Internal::Array(vec) = &o.borrow().internal {
+                        to = vec.len() as f64;
+                    }
+                }
+            }
+            Some(crate::exec::HofBatchOut::Interrupted) => {
+                return Err(vm.throw_range("execution interrupted"))
+            }
+            None => {}
+        }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {
@@ -909,8 +961,23 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "find", 1, |vm, this, args| {
         // `find` visits every index via Get (holes read as undefined).
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
+        // Cranelift batch tier: a hole bails the element load, so the
+        // generic loop below performs the exact visit-holes-as-undefined
+        // semantics from the bailed index. See `Vm::hof_batch`.
+        #[cfg(feature = "jit")]
+        match vm.hof_batch(crate::jit::BatchMode::Find, &ov, None, len, 0.0, 0.0, &cb) {
+            Some(crate::exec::HofBatchOut::Done(_)) => return Ok(Value::Undefined),
+            Some(crate::exec::HofBatchOut::Found { index }) => {
+                return vm.get_prop(&ov, &elem_key(index))
+            }
+            Some(crate::exec::HofBatchOut::Resume { index, .. }) => k = index,
+            Some(crate::exec::HofBatchOut::Interrupted) => {
+                return Err(vm.throw_range("execution interrupted"))
+            }
+            None => {}
+        }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         while k < len {
             vm.native_tick()?;
             let v = vm.get_prop(&ov, &elem_key(k))?;
@@ -930,8 +997,21 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "findIndex", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
+        // Cranelift batch tier: as `find`, returning the index.
+        #[cfg(feature = "jit")]
+        match vm.hof_batch(crate::jit::BatchMode::Find, &ov, None, len, 0.0, 0.0, &cb) {
+            Some(crate::exec::HofBatchOut::Done(_)) => return Ok(Value::Number(-1.0)),
+            Some(crate::exec::HofBatchOut::Found { index }) => {
+                return Ok(Value::Number(index))
+            }
+            Some(crate::exec::HofBatchOut::Resume { index, .. }) => k = index,
+            Some(crate::exec::HofBatchOut::Interrupted) => {
+                return Err(vm.throw_range("execution interrupted"))
+            }
+            None => {}
+        }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         while k < len {
             vm.native_tick()?;
             let v = vm.get_prop(&ov, &elem_key(k))?;
@@ -993,8 +1073,20 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "some", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
+        // Cranelift batch tier: search natively; FOUND is the first truthy
+        // result. See `Vm::hof_batch`.
+        #[cfg(feature = "jit")]
+        match vm.hof_batch(crate::jit::BatchMode::Some, &ov, None, len, 0.0, 0.0, &cb) {
+            Some(crate::exec::HofBatchOut::Done(_)) => return Ok(Value::Bool(false)),
+            Some(crate::exec::HofBatchOut::Found { .. }) => return Ok(Value::Bool(true)),
+            Some(crate::exec::HofBatchOut::Resume { index, .. }) => k = index,
+            Some(crate::exec::HofBatchOut::Interrupted) => {
+                return Err(vm.throw_range("execution interrupted"))
+            }
+            None => {}
+        }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {
@@ -1015,8 +1107,20 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "every", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
+        // Cranelift batch tier: FOUND is the first FALSY result (the
+        // counterexample). See `Vm::hof_batch`.
+        #[cfg(feature = "jit")]
+        match vm.hof_batch(crate::jit::BatchMode::Every, &ov, None, len, 0.0, 0.0, &cb) {
+            Some(crate::exec::HofBatchOut::Done(_)) => return Ok(Value::Bool(true)),
+            Some(crate::exec::HofBatchOut::Found { .. }) => return Ok(Value::Bool(false)),
+            Some(crate::exec::HofBatchOut::Resume { index, .. }) => k = index,
+            Some(crate::exec::HofBatchOut::Interrupted) => {
+                return Err(vm.throw_range("execution interrupted"))
+            }
+            None => {}
+        }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {
@@ -1056,8 +1160,28 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
                 }
             }
         }
-        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut acc = acc;
+        // Cranelift batch tier: a Number accumulator threads through the
+        // native loop; a bail resumes below with the current accumulator.
+        // See `Vm::hof_batch`.
+        #[cfg(feature = "jit")]
+        if let Value::Number(seed) = acc {
+            match vm.hof_batch(crate::jit::BatchMode::Reduce, &ov, None, len, k, seed, &cb) {
+                Some(crate::exec::HofBatchOut::Done(n)) => return Ok(Value::Number(n)),
+                Some(crate::exec::HofBatchOut::Resume { index, acc: n }) => {
+                    k = index;
+                    acc = Value::Number(n);
+                }
+                // Structurally impossible (reduce has no found exit); the
+                // generic loop simply redoes everything from the seed.
+                Some(crate::exec::HofBatchOut::Found { .. }) => {}
+                Some(crate::exec::HofBatchOut::Interrupted) => {
+                    return Err(vm.throw_range("execution interrupted"))
+                }
+                None => {}
+            }
+        }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {

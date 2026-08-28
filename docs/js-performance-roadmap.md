@@ -343,8 +343,12 @@ is <1% of live agent wall-clock (`interpreter-optimization.md` §11.5).
    native code via `cranelift-jit`, which sidesteps OSR/deopt/frame
    reconstruction entirely (the kernel tier's entry guard and exit
    materialization are reused verbatim), and now covers scalars, elements
-   (direct f64-typed-array and read-only dense views), pinned strings,
-   inlined pinned callees, and native self-recursion. Measured against
+   (direct views for EVERY numeric typed-array kind plus read-only dense
+   views), pinned strings, inlined pinned callees, native recursion
+   families (self and mutual, global- and function-scoped), and batch
+   array HOFs (`map`/`filter`/`forEach`/`reduce`/`some`/`every`/`find`/
+   `findIndex` run as one native loop with the callback kernel inlined).
+   Measured against
    Node 22 / Bun 1.3 on the cross-engine workload suite: 7 of 14 workloads
    at or beyond Node (recursion, property loops, string scans, typed
    arrays, bitwise, inlined closures — several FASTER than Node), the

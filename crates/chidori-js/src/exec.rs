@@ -27,6 +27,25 @@ fn peek_plain_bytecode(v: &Value) -> Option<Rc<BytecodeFunction>> {
     None
 }
 
+/// Outcome of one array-HOF batch run ([`Vm::hof_batch`], `jit` feature):
+/// the whole loop completed natively, or it bailed at `index` and the
+/// caller's generic loop resumes there, or the cooperative interrupt
+/// latched (the op budget is already zeroed; the caller raises the
+/// standard RangeError).
+#[cfg(feature = "jit")]
+pub(crate) enum HofBatchOut {
+    /// Ran to the end. Carries the final accumulator (`reduce`; 0.0
+    /// otherwise).
+    Done(f64),
+    /// Bailed before finishing: resume the generic loop at `index` with
+    /// `acc` (the output array already holds everything before `index`).
+    Resume { index: f64, acc: f64 },
+    /// EARLY-EXIT modes (`some`/`every`/`find`): the search hit at `index`.
+    Found { index: f64 },
+    /// The cooperative interrupt latched mid-batch.
+    Interrupted,
+}
+
 /// A callback prepared once per native higher-order invocation — the
 /// invocation-invariant slice of the `run_fn_kernel` entry guard plus the
 /// register buffer, hoisted out of the per-element call. Built by
@@ -2697,6 +2716,201 @@ impl Vm {
             // generically with correct semantics.
             FnKernelOut::BadOp => None,
         }
+    }
+
+    /// Run one array-HOF loop (`forEach`/`map`/`filter`/`reduce`) as a
+    /// single native BATCH — the mode's synthetic loop kernel
+    /// ([`crate::jit::batch_kernel`]) with the callback's function kernel
+    /// inlined at its `CallKernel` site — instead of one prepared call per
+    /// element. `None` = the batch is unavailable (tier off, callback or
+    /// receiver outside the batchable shape, compile declined); the caller
+    /// runs its existing generic loop from `start` unchanged.
+    ///
+    /// Soundness rests on one property: NO USER CODE RUNS BETWEEN BATCH
+    /// ELEMENTS. The callback is a pure register program (no calls, no cell
+    /// writes — `prepare_kernel_callback`'s conditions), and everything
+    /// else in the loop is engine code, so the entry checks that
+    /// `exec_prepared_kernel` must re-verify per call (canonical `Math`,
+    /// all-`Number` upvalues, no op budget) hold for the whole run — the
+    /// same argument as [`Vm::prime_prepared_cmp`]. Any element the kernel
+    /// cannot handle (a hole, a non-`Number`, an out-of-window index) bails
+    /// BEFORE completing its op, and the caller's generic loop resumes at
+    /// that index; a bail after the element's callback ran (`filter`'s
+    /// push, `map`'s output store — both practically unreachable) re-runs
+    /// only that one PURE call, which is unobservable. The interrupt is
+    /// polled on the loop back-edge at the interpreter's cadence.
+    ///
+    /// `output` (map/filter) must be the freshly species-created result
+    /// array, validated here to be the default-species shape: a plain
+    /// unshadowed dense array on the canonical prototype — `map`'s all
+    /// holes at exactly `len` (its slots take direct tag+payload writes),
+    /// `filter`'s empty (its pushes append through the shared push core).
+    /// Nothing can reach either mid-batch, and the end state is exactly
+    /// what the generic loop leaves.
+    #[cfg(feature = "jit")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one seam shared by four builtins, each passing its own state"
+    )]
+    pub(crate) fn hof_batch(
+        &mut self,
+        mode: crate::jit::BatchMode,
+        input: &Value,
+        output: Option<&Value>,
+        len: f64,
+        start: f64,
+        acc0: f64,
+        cb: &Value,
+    ) -> Option<HofBatchOut> {
+        use crate::jit::{BatchMode as BM, ElemView};
+        if !self.jit_enabled {
+            return None;
+        }
+        let Value::Object(in_obj) = input else {
+            return None;
+        };
+        // The input must be a base the element path serves: a dense
+        // unshadowed array or a numeric typed array. Anything else would
+        // bail at `start` and make the batch pure overhead.
+        let in_kind = crate::jit::elem_kind_code(in_obj, true);
+        if in_kind == ElemView::NONE {
+            return None;
+        }
+        let prep = self.prepare_kernel_callback(cb)?;
+        let bf = prep.bf;
+        let ck = bf.proto.fn_kernel.as_ref().expect("prepared");
+        if ck.args_used > u32::from(mode.argc()) {
+            return None;
+        }
+        if !ck.math_used.is_empty() && !self.kernel_math_ok(&ck.math_used) {
+            return None;
+        }
+        // Output shape validation (see the doc comment above).
+        let mut out_kind = ElemView::NONE;
+        if let Some(out) = output {
+            let Value::Object(o) = out else { return None };
+            let b = o.borrow();
+            if !b.own_is_empty()
+                || !b.extensible
+                || !b
+                    .proto
+                    .as_ref()
+                    .is_some_and(|p| p.ptr_eq(&self.realm.array_proto))
+            {
+                return None;
+            }
+            let Internal::Array(vec) = &b.internal else {
+                return None;
+            };
+            match mode {
+                BM::Map => {
+                    if vec.len() as f64 != len
+                        || !vec.iter().all(|v| matches!(v, Value::Hole))
+                        || !crate::jit::dense_layout_ok()
+                    {
+                        return None;
+                    }
+                    out_kind = ElemView::DENSE_W;
+                }
+                BM::Filter if !vec.is_empty() => return None,
+                _ => {}
+            }
+        }
+        // The mode's synthetic kernel for THIS callback (cached on the
+        // callback's kernel so its compiled code — which inlines and
+        // identity-checks exactly this proto — is found again).
+        let bk = ck.batch[mode.idx()]
+            .get_or_init(|| Rc::new(crate::jit::batch_kernel(mode)))
+            .clone();
+        let callee_bfs = [(bf.clone(), KWIN as u32)];
+        let elem_kinds = [in_kind, out_kind];
+        let native = crate::jit::native_for_batch(
+            &bk,
+            &callee_bfs,
+            &elem_kinds[..mode.n_oslots()],
+            mode.bool_ret_ok(),
+        )?;
+        // Register buffer: batch window 0, then the callback's window with
+        // its once-per-batch upvalue snapshot (all-Number, like every
+        // pinned-callee path).
+        let mut regs = vec![0.0f64; 2 * KWIN];
+        regs[crate::jit::BREG_I as usize] = start;
+        regs[crate::jit::BREG_LEN as usize] = len;
+        regs[crate::jit::BREG_ACC as usize] = acc0;
+        for (r, slot) in ck.locals.iter().enumerate() {
+            if let crate::bytecode::KSlot::Upvalue(u) = slot {
+                match &*bf.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => regs[KWIN + r] = *n,
+                    _ => return None,
+                }
+            }
+        }
+        // Activation tables, alive exactly across the native run. The input
+        // view is granted its dense form even though the kernel pushes /
+        // stores elements: those ops target ONLY the output oslot (fixed in
+        // the synthetic program), which is a different, freshly-created
+        // array — so the input's storage cannot move mid-batch.
+        let objs: Vec<crate::value::JsObject> = match output {
+            Some(Value::Object(o)) => vec![in_obj.clone(), o.clone()],
+            _ => vec![in_obj.clone()],
+        };
+        let mut ta_tab: Vec<ElemView> = Vec::with_capacity(2);
+        ta_tab.push(crate::jit::elem_view(in_obj, true));
+        if objs.len() == 2 {
+            if out_kind == ElemView::DENSE_W {
+                let mut b = objs[1].borrow_mut();
+                let Internal::Array(vec) = &mut b.internal else {
+                    return None;
+                };
+                // Raw view over the hole-filled result storage: written
+                // (never read) by native code while `objs` keeps the array
+                // alive; no push targets it, so it never reallocates. The
+                // `RefMut` drops before the native call.
+                ta_tab.push(ElemView {
+                    ptr: vec.as_mut_ptr() as *mut u8,
+                    len: vec.len() as u64,
+                    kind: ElemView::DENSE_W,
+                });
+            } else {
+                ta_tab.push(ElemView::none());
+            }
+        }
+        let interrupt = self.interrupt.clone();
+        let mut ctx = crate::jit::JitCtx {
+            sstr: std::ptr::null(),
+            objs: objs.as_ptr(),
+            n_objs: objs.len() as u64,
+            ta: ta_tab.as_ptr(),
+            array_proto: if matches!(mode, BM::Filter) {
+                &self.realm.array_proto
+            } else {
+                std::ptr::null()
+            },
+            scratch: 0.0,
+            depth: 0,
+            abandon: 0,
+            poll: 0,
+            rec_uv: std::ptr::null(),
+        };
+        let code = native.run(&mut regs, interrupt.as_deref(), &mut ctx);
+        if code < 0 {
+            // Same latch-and-unwind as an interpreter-tier poll hit; the
+            // caller raises the standard RangeError.
+            self.op_budget = Some(0);
+            return Some(HofBatchOut::Interrupted);
+        }
+        if code as usize == mode.done_pc() {
+            return Some(HofBatchOut::Done(regs[crate::jit::BREG_ACC as usize]));
+        }
+        if mode.found_pc() == Some(code as usize) {
+            return Some(HofBatchOut::Found {
+                index: regs[crate::jit::BREG_I as usize],
+            });
+        }
+        Some(HofBatchOut::Resume {
+            index: regs[crate::jit::BREG_I as usize],
+            acc: regs[crate::jit::BREG_ACC as usize],
+        })
     }
 
     /// Verify the guards `exec_prepared_kernel` re-checks per call — no op

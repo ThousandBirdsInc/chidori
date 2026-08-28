@@ -176,6 +176,47 @@ const CORPUS: &[&str] = &[
     // Two views of DIFFERENT kinds over one buffer in one kernel (aliased
     // element storage, distinct baked sequences per oslot).
     "const buf = new ArrayBuffer(16); const i32 = new Int32Array(buf); const u8 = new Uint8Array(buf); for (let i = 0; i < 4; i++) { i32[i] = i * 100000 + 7; } let s = 0; for (let i = 0; i < 16; i++) { s = s * 31 + u8[i]; } console.log(s % 1000000007, i32.join(','));",
+    // BATCH HOFs (map/filter/forEach/reduce as one native loop; see
+    // `Vm::hof_batch`): the clean dense paths first — value-only and
+    // index-consuming callbacks, boolean and numeric filter predicates,
+    // reduce with and without an initial value, and the benchmark's chain.
+    "const a = []; for (let i = 0; i < 500; i++) a.push(i); console.log(a.map(x => x * 2 + 1)[321], a.map((x, i) => x - i).length);",
+    "const a = []; for (let i = 0; i < 500; i++) a.push(i % 13); const evens = a.filter(x => (x & 1) === 0); const big = a.filter(x => x - 6 > 0 === true); console.log(evens.length, big.length, evens[7], big[3]);",
+    "const a = []; for (let i = 0; i < 300; i++) a.push(i); console.log(a.reduce((p, c) => p + c, 0), a.reduce((p, c) => p + c), a.reduce((p, c, i) => p + c * (i % 3), 5));",
+    "const a = []; for (let i = 0; i < 400; i++) a.push(i); console.log(a.map(x => x * x).filter(x => x % 2 === 0).reduce((p, c) => p + c, 0));",
+    "const a = [2, 4, 6, 8]; a.forEach(x => x * 2); console.log(a.reduce((p, c) => p * 10 + c, 0));",
+    // Batch guards and bails: a hole mid-array, a non-Number mid-array, a
+    // shadowed input, and a non-Number accumulator — every one resumes or
+    // declines into the generic loop with identical results.
+    "const a = [1, 2, , 4, 5]; console.log(a.map(x => x * 3).join(','), a.filter(x => x > 1).join(','), a.reduce((p, c) => p + c, 0));",
+    "const a = [1, 2, 'x', 4, 5]; console.log(a.map(x => x + 1).join(','), a.filter(x => x >= 2).length, a.reduce((p, c) => p + c, 0));",
+    "const a = [1, 2, 3]; a.tag = 7; console.log(a.map(x => x * 2).join(','), a.reduce((p, c) => p + c, 100));",
+    "const a = [1, 2, 3]; console.log(a.reduce((p, c) => p + c, 'seed:'), a.reduce((p, c) => p + String(c), ''));",
+    // Batchable callbacks with captured state: an all-Number upvalue batches
+    // (snapshot semantics), a cell-WRITING callback must decline to the
+    // generic per-element path (its writes are per-call observable).
+    "function scaler(k) { return x => x * k; } const a = [1, 2, 3, 4]; console.log(a.map(scaler(3)).join(','), a.map(scaler(0.5)).join(','));",
+    "let total = 0; const a = [1, 2, 3, 4]; a.forEach(x => { total += x; }); console.log(total);",
+    // The SAME callback through several tiers: called directly (fn-kernel
+    // path), then as a map batch, then as a filter batch (per-mode caches).
+    "const half = x => x / 2; console.log(half(9), [2, 4, 6].map(half).join(','), [1, 2, 3, 4].filter(x => half(x) >= 1).length);",
+    // Math intrinsics inside a batched callback (canonical-Math entry check).
+    "const a = [-3.7, 1.2, 9.9, -0.5]; console.log(a.map(x => Math.abs(Math.floor(x))).join(','), a.reduce((p, c) => Math.max(p, c), -Infinity));",
+    // Array.prototype HOFs over a TYPED-ARRAY receiver (the input view is a
+    // typed-array kind; the output is still a plain array).
+    "const t = new Float64Array(5); for (let i = 0; i < 5; i++) t[i] = i * 1.5; console.log(Array.prototype.map.call(t, x => x + 1).join(','), Array.prototype.reduce.call(t, (p, c) => p + c, 0));",
+    "const t = new Int32Array(6); for (let i = 0; i < 6; i++) t[i] = i * 1e9; console.log(Array.prototype.filter.call(t, x => x > 0).join(','));",
+    // A species subclass makes the output non-canonical: the batch declines
+    // and the generic loop produces the subclass result.
+    "class B extends Array {} const b = B.from([1, 2, 3]); const m = b.map(x => x * 2); console.log(m instanceof B, m.join(','));",
+    // Empty arrays and single elements through every mode.
+    "const e = []; console.log(e.map(x => x).length, e.filter(x => x).length, [7].map(x => x + 1).join(''), [7].reduce((p, c) => p + c, 1));",
+    // The EARLY-EXIT batches (some/every/find/findIndex): hits at the
+    // start, middle, and end, misses, and a hole before the hit (the bail
+    // resumes the generic visit-holes semantics).
+    "const a = []; for (let i = 0; i < 200; i++) a.push(i); console.log(a.some(x => x > 150), a.some(x => x < 0), a.every(x => x >= 0), a.every(x => x !== 137), a.find(x => x * 2 === 62), a.findIndex(x => x > 198), a.findIndex(x => x > 500));",
+    "const a = [5, , 7, 8]; console.log(a.some(x => x === undefined), a.find(x => x === undefined), a.findIndex(x => x === 7), a.every(x => x !== 8));",
+    "const a = [1, 2, 3]; console.log(a.some(x => x + 1 === 3) === true, a.every(x => x % 1 === 0), [].some(x => true), [].every(x => false));",
     // Pinned-string kernels (StrLen/CharCodeAt — total, no bail): the
     // tokenizer hash idiom, plus NaN/OOB index handling.
     "const txt = 'kernel'; let s = 0; for (let i = 0; i < txt.length; i++) { s += txt.charCodeAt(i); } console.log(s);",
@@ -389,6 +430,39 @@ fn jit_loop_interrupts() {
     let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
     setter.join().expect("setter thread");
     let err = res.expect_err("interrupt must unwind the loop");
+    assert!(
+        engine.vm.error_to_string(&err).contains("interrupted"),
+        "expected the interrupt error"
+    );
+}
+
+/// Cooperative interrupt through a BATCH HOF: `reduce` over a huge dense
+/// array runs as one native activation, repeated forever — the batch loop's
+/// back-edge poll must observe the flag and unwind with the standard
+/// RangeError.
+#[test]
+fn jit_hof_batch_interrupts() {
+    let proto = Rc::new(
+        compile_script(
+            "(function () { const a = new Array(100000); for (let i = 0; i < a.length; i++) { a[i] = i % 7; } for (;;) { a.reduce(function (p, c) { return (p + c) % 1000000007; }, 0); } })();",
+        )
+        .expect("compiles"),
+    );
+    let mut engine = Engine::new();
+    engine.vm.jit_enabled = true;
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    engine.vm.interrupt = Some(flag.clone());
+    let setter = {
+        let flag = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        })
+    };
+    let func = engine.vm.make_closure(proto, Vec::new());
+    let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
+    setter.join().expect("setter thread");
+    let err = res.expect_err("interrupt must unwind the batch");
     assert!(
         engine.vm.error_to_string(&err).contains("interrupted"),
         "expected the interrupt error"

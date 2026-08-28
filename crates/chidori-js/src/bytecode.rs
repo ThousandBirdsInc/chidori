@@ -1738,6 +1738,13 @@ pub struct Kernel {
     /// cloned kernel simply compiles again on its own first activation.
     #[cfg(feature = "jit")]
     pub native: crate::jit::NativeCache,
+    /// Synthetic BATCH kernels built around this FUNCTION kernel by the
+    /// array-HOF batch driver (`jit` feature; see `crate::jit::BatchCache`),
+    /// one per batch mode, each carrying its own `native` cache compiled
+    /// against exactly this kernel's proto. Empty for loop kernels and any
+    /// function kernel never used as a batchable callback.
+    #[cfg(feature = "jit")]
+    pub batch: crate::jit::BatchCache,
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
     /// entry-resolved to raw slot indices. See [`KProp`].
     pub props_used: Box<[KProp]>,
