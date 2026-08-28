@@ -1,24 +1,27 @@
 # chidori-js cross-runtime benchmarks
 
-A suite that runs the **same workloads** under four runtimes and compares
+A suite that runs the **same workloads** under five runtimes and compares
 wall-clock execution time and peak memory (max RSS):
 
-| runtime    | what it is                                                            |
-| ---------- | --------------------------------------------------------------------- |
-| `chidori`  | the pure-Rust `chidori-js` engine (via the `run` example binary)      |
-| `node`     | Node.js (V8)                                                          |
-| `bun`      | Bun (JavaScriptCore)                                                  |
-| `cpython`  | CPython (`python3`), running each workload's hand-ported `.py` twin   |
+| runtime       | what it is                                                            |
+| ------------- | --------------------------------------------------------------------- |
+| `chidori`     | the pure-Rust `chidori-js` engine (via the `run` example binary)      |
+| `chidori-jit` | the same engine with its opt-in Cranelift kernel JIT enabled (the `chidori-js-jit` binary, `--features jit`; [docs/cranelift-jit.md](../../../docs/cranelift-jit.md)) |
+| `node`        | Node.js (V8)                                                          |
+| `bun`         | Bun (JavaScriptCore)                                                  |
+| `cpython`     | CPython (`python3`), running each workload's hand-ported `.py` twin   |
 
-The three JS runtimes execute the identical `.js` file. CPython executes a
+The JS runtimes all execute the identical `.js` file. CPython executes a
 line-by-line Python port of the same workload (`workloads/<name>.py`) that
 must print the **same `RESULT=` value** — see
 [Adding a workload](#adding-a-workload). Node and Bun answer "how far are we
-from the JITs people ship?"; CPython answers the like-for-like question "is
-chidori-js in the right ballpark *for an interpreter*?" — it's the
-reference-grade bytecode interpreter with the same execution model
-(no JIT), so it is the fairest available yardstick for interpreter-tier
-performance.
+from the JITs people ship?"; the `chidori-jit` column answers "how far does
+our own opt-in kernel JIT close that gap?" (its results are
+differential-tested byte-identical to the interpreter's); CPython answers
+the like-for-like question "is chidori-js in the right ballpark *for an
+interpreter*?" — it's the reference-grade bytecode interpreter with the same
+execution model (no JIT), so it is the fairest available yardstick for
+interpreter-tier performance.
 
 This sits alongside two in-process benchmarks over the same workload corpus:
 the [`benches/execution.rs`](../benches/execution.rs) criterion
@@ -28,7 +31,7 @@ interpret / realm setup), and [`benches/memory.rs`](../benches/memory.rs)
 utilization (realm footprint, per-run peak/churn/retained, leak check) via a
 tracking allocator. **This** suite answers the different question "how does
 chidori-js compare to the JITs people actually ship?" by running each workload
-as a standalone script under all three runtimes.
+as a standalone script under all the runtimes.
 
 ## Quick start
 
@@ -45,20 +48,22 @@ node crates/chidori-js/benchmarks/run.mjs --filter fib --runs 15 --json out.json
 
 Node.js is required to run the harness. Bun and CPython are optional — if
 `bun` (or `python3`/`python`) isn't on `PATH` that runtime is skipped with a
-warning. The chidori binary is built automatically
-unless you pass `--no-build` (and point at a prebuilt binary via `--chidori-bin`
-or `$CHIDORI_RUN_BIN`).
+warning. The chidori binaries (the `run` example, and `chidori-js-jit` for
+the JIT column) are built automatically unless you pass `--no-build` (and
+point at prebuilt binaries via `--chidori-bin`/`$CHIDORI_RUN_BIN` and
+`--chidori-jit-bin`/`$CHIDORI_JIT_BIN`; under `--no-build` a missing JIT
+binary skips that column rather than failing).
 
 ## What it reports
 
 ```
 Execution-only time (subprocess wall-clock minus startup baseline)
-Startup baselines: chidori 3.4ms  node 33.8ms  bun 9.8ms  cpython 17.8ms
+Startup baselines: chidori 3.8ms  chidori-jit 3.6ms  node 29.5ms  bun 10.8ms  cpython 10.0ms
 
-workload             chidori         node          bun      cpython    fastest
--------------------------------------------------------------------------------
-arith_loop       727.1ms 167.0x   7.2ms 1.6x        4.4ms  156.7ms 35.6x        bun
-fib_recursive    2.15s 228.4x  11.8ms 1.3x        9.4ms  136.7ms 14.5x        bun
+workload          chidori  chidori-jit         node          bun      cpython      fastest
+------------------------------------------------------------------------------------------
+arith_loop     19.3ms 4.5x       4.3ms   8.4ms 2.0x   6.5ms 1.5x  49.6ms 11.6x  chidori-jit
+fib_recursive  48.7ms 5.4x       9.0ms  15.6ms 1.7x   9.3ms 1.0x  97.2ms 10.8x  chidori-jit
 ...
 ```
 
@@ -188,11 +193,21 @@ constant at the top of a workload file — they're deliberately one-liners.
 
 1. Drop a `<name>.js` in `workloads/`. It must run on Node, Bun, and chidori-js
    (the engine is a growing subset of ES — stick to widely-supported syntax and
-   the built-ins chidori-js implements).
+   the built-ins chidori-js implements). **Wrap the whole body in an IIFE**
+   (`(function () { … })();`), like the existing workloads and the in-process
+   corpus (`benches/common/workloads.rs`): top-level `let`/`const` compile to
+   global-lexical cells in chidori-js, which the typed kernel tiers (and the
+   opt-in JIT) never accelerate — function bodies are both the representative
+   shape (agent code runs inside functions) and the one every tier can engage
+   on.
 2. End it with `console.log("RESULT=" + <deterministic value>)` so the harness
    can cross-check correctness. Avoid `Date.now()`, `Math.random()`, or anything
    else that varies between runs or runtimes in the reported value.
-3. Add the `<name>.py` twin: the same algorithm, ported line-for-line, ending
+3. Add the `<name>.py` twin: the same algorithm, ported line-for-line,
+   wrapped in a `def main(): …` / `main()` pair for the same
+   function-vs-global reason (module-global access is CPython's slow path
+   too — like-for-like; note a mutated closed-over variable needs
+   `nonlocal`, as in `sort.py`), ending
    with `print("RESULT=" + str(<value>))`. Watch the two classic
    cross-language traps:
    - **Number formatting** — JS prints integer-valued doubles without a
@@ -214,6 +229,13 @@ constant at the top of a workload file — they're deliberately one-liners.
 - Absolute numbers are machine-, load-, and version-dependent; treat them as
   ratios on a quiet machine, not as a leaderboard. The sample table above is
   illustrative.
+- The workloads were moved from top-level scripts into function bodies when
+  the JIT column landed (2026-08), so numbers before/after that point are
+  not comparable. One row got *slower* under chidori from the move and is
+  kept deliberately: `mutual_recursion` — the recursion-family fast tier
+  currently resolves mutual partners through **global** bindings only, so
+  function-scoped mutual recursion runs on the generic call path. That row
+  is the open gap, not a benchmark artifact.
 - This measures whole-script subprocess runs, so it captures parse + compile +
   execute, not steady-state JIT throughput. For chidori-js and CPython
   (interpreters) that is representative; for V8/JSC it understates peak

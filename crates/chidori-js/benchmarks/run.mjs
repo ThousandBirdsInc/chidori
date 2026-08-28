@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 // Cross-runtime benchmark harness for the chidori-js JavaScript engine.
 //
-// Runs each workload in `workloads/` as a standalone script under chidori-js,
-// Node.js, Bun, and CPython, measuring subprocess wall-clock time and peak
-// memory (max RSS). The same `.js` file is fed to the three JS runtimes;
-// CPython runs the workload's hand-ported `.py` twin. Every workload prints a
-// single `RESULT=...` line, so the harness can confirm all runtimes —
-// including the cross-language port — agree before trusting the numbers (a
-// fast-but-wrong engine is not a faster engine).
+// Runs each workload in `workloads/` as a standalone script under chidori-js
+// (interpreter), chidori-js with its opt-in Cranelift kernel JIT
+// (docs/cranelift-jit.md), Node.js, Bun, and CPython, measuring subprocess
+// wall-clock time and peak memory (max RSS). The same `.js` file is fed to
+// the JS runtimes; CPython runs the workload's hand-ported `.py` twin. Every
+// workload prints a single `RESULT=...` line, so the harness can confirm all
+// runtimes — including the cross-language port — agree before trusting the
+// numbers (a fast-but-wrong engine is not a faster engine).
 //
 // Each runtime pays a fixed process-startup cost (binary load + realm setup).
 // We measure that separately with `workloads/startup.js` and subtract it to
@@ -20,9 +21,11 @@
 //   --runs N            timed runs per workload (default 5)
 //   --warmup N          untimed warmup runs per workload (default 1)
 //   --filter SUBSTR     only run workloads whose name contains SUBSTR
-//   --runtimes LIST     comma-separated subset of {chidori,node,bun,cpython}
+//   --runtimes LIST     comma-separated subset of
+//                       {chidori,chidori-jit,node,bun,cpython}
 //   --chidori-bin PATH  path to the chidori `run` example binary
-//   --no-build          do not `cargo build` the chidori binary first
+//   --chidori-jit-bin PATH  path to the `chidori-js-jit` binary
+//   --no-build          do not `cargo build` the chidori binaries first
 //   --json PATH         also write the full results as JSON to PATH
 //   --markdown PATH     also write a Markdown report to PATH (used by CI)
 //   --mem-runs N        memory-measured runs per workload (default 3)
@@ -32,6 +35,7 @@
 //
 // Environment:
 //   CHIDORI_RUN_BIN     same as --chidori-bin
+//   CHIDORI_JIT_BIN     same as --chidori-jit-bin
 
 import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -55,6 +59,7 @@ function parseArgs(argv) {
     filter: null,
     runtimes: null,
     chidoriBin: process.env.CHIDORI_RUN_BIN || null,
+    chidoriJitBin: process.env.CHIDORI_JIT_BIN || null,
     build: true,
     json: null,
     markdown: null,
@@ -70,6 +75,7 @@ function parseArgs(argv) {
       case "--filter": opts.filter = next(); break;
       case "--runtimes": opts.runtimes = next().split(",").map((s) => s.trim()).filter(Boolean); break;
       case "--chidori-bin": opts.chidoriBin = next(); break;
+      case "--chidori-jit-bin": opts.chidoriJitBin = next(); break;
       case "--no-build": opts.build = false; break;
       case "--json": opts.json = next(); break;
       case "--markdown": opts.markdown = next(); break;
@@ -101,9 +107,10 @@ function printHelp() {
       "  --runs N            timed runs per workload (default 5)",
       "  --warmup N          untimed warmup runs per workload (default 1)",
       "  --filter SUBSTR     only run workloads whose name contains SUBSTR",
-      "  --runtimes LIST     comma-separated subset of {chidori,node,bun,cpython}",
+      "  --runtimes LIST     comma-separated subset of {chidori,chidori-jit,node,bun,cpython}",
       "  --chidori-bin PATH  path to the chidori `run` example binary",
-      "  --no-build          do not cargo build the chidori binary first",
+      "  --chidori-jit-bin PATH  path to the `chidori-js-jit` binary",
+      "  --no-build          do not cargo build the chidori binaries first",
       "  --json PATH         also write the full results as JSON to PATH",
       "  --markdown PATH     also write a Markdown report to PATH (used by CI)",
       "  --mem-runs N        memory-measured runs per workload (default 3)",
@@ -155,14 +162,44 @@ function resolveChidoriBin(opts) {
   return builtPath;
 }
 
+// Build the `chidori-js-jit` binary (the opt-in Cranelift kernel-JIT entry
+// point, `--features jit`; docs/cranelift-jit.md) and return its path. Same
+// CLI contract as the `run` example — a JS file as argv[1] — with the tier
+// enabled by default. Unlike the interpreter binary, a missing binary under
+// --no-build skips the column (with a warning) instead of failing the suite:
+// the mode is opt-in and its build pulls the Cranelift backend.
+function resolveChidoriJitBin(opts) {
+  if (opts.chidoriJitBin) {
+    if (!existsSync(opts.chidoriJitBin)) {
+      throw new Error(`chidori-js-jit binary not found: ${opts.chidoriJitBin}`);
+    }
+    return opts.chidoriJitBin;
+  }
+  const builtPath = join(REPO_ROOT, "target", "release", "chidori-js-jit");
+  if (opts.build) {
+    process.stderr.write("building chidori-js-jit binary (release, --features jit)... ");
+    execFileSync(
+      "cargo",
+      ["build", "--release", "-q", "-p", "chidori-js", "--features", "jit", "--bin", "chidori-js-jit"],
+      { cwd: REPO_ROOT, stdio: ["ignore", "ignore", "inherit"] },
+    );
+    process.stderr.write("done\n");
+  }
+  return existsSync(builtPath) ? builtPath : null;
+}
+
 function discoverRuntimes(opts) {
-  const names = opts.runtimes ?? ["chidori", "node", "bun", "cpython"];
+  const names = opts.runtimes ?? ["chidori", "chidori-jit", "node", "bun", "cpython"];
   // Resolve each requested runtime lazily so excluding chidori doesn't force a
   // Rust build, and a missing optional runtime (bun, cpython) is skipped, not
   // fatal. `ext` selects the workload file: the JS runtimes share the same
   // `.js` source; cpython runs the workload's hand-ported `.py` twin.
   const resolvers = {
     chidori: () => ({ name: "chidori", cmd: resolveChidoriBin(opts), args: [], ext: ".js" }),
+    "chidori-jit": () => {
+      const bin = resolveChidoriJitBin(opts);
+      return bin ? { name: "chidori-jit", cmd: bin, args: [], ext: ".js" } : null;
+    },
     node: () => ({ name: "node", cmd: process.execPath, args: [], ext: ".js" }),
     bun: () => {
       const bun = whichSync("bun");
@@ -473,7 +510,13 @@ const MARKDOWN_MARKER = "<!-- chidori-js-benchmarks -->";
 // Render the results as a Markdown report (used for the PR comment).
 function renderMarkdown(workloads, runtimes, baselines, opts, mem) {
   const rtNames = runtimes.map((r) => r.name);
-  const RT_LABELS = { chidori: "chidori-js", node: "Node.js", bun: "Bun", cpython: "CPython" };
+  const RT_LABELS = {
+    chidori: "chidori-js",
+    "chidori-jit": "chidori-js (JIT)",
+    node: "Node.js",
+    bun: "Bun",
+    cpython: "CPython",
+  };
   const rtLabels = rtNames.map((n) => `**${RT_LABELS[n] ?? n}**`);
   const lines = [];
   lines.push(MARKDOWN_MARKER);
@@ -546,11 +589,20 @@ function renderMarkdown(workloads, runtimes, baselines, opts, mem) {
     lines.push("");
   }
 
+  const jitNote = rtNames.includes("chidori-jit")
+    ? "The chidori-js (JIT) column is the same engine with its opt-in " +
+      "Cranelift kernel JIT enabled (`--features jit`, the `chidori-js-jit` " +
+      "binary; docs/cranelift-jit.md) — differential-tested byte-identical " +
+      "to the interpreter, and the column to read against Node/Bun for " +
+      "kernel-shaped compute. "
+    : "";
   lines.push(
     "<sub>Numbers are machine- and load-dependent (shared CI runner) — read them " +
-      "as ratios, not absolutes. chidori-js is an interpreter, so it trails the " +
-      "V8/JSC JITs on compute but starts far faster and in far less memory; " +
-      "CPython (also an interpreter) is the like-for-like reference point. " +
+      "as ratios, not absolutes. chidori-js (the default build) is an " +
+      "interpreter, so it trails the V8/JSC JITs on compute but starts far " +
+      "faster and in far less memory; CPython (also an interpreter) is its " +
+      "like-for-like reference point. " +
+      jitNote +
       "A ⚠️ marks a workload whose result disagreed across runtimes.</sub>",
   );
   return lines.join("\n") + "\n";

@@ -12,22 +12,26 @@
 #   JS `(x, y) => x - y` comparator requests. The comparator-call overhead the
 #   JS side measures has no idiomatic CPython equivalent (cmp_to_key would
 #   measure its wrapper, not the sort).
-N = 50_000
-ROUNDS = 6
-seed = 123456789
+def main():
+    N = 50_000
+    ROUNDS = 6
+    seed = 123456789
 
 
-def rnd():
-    global seed
-    seed = int(seed * 1103515245.0 + 12345.0) % 4294967296
-    return seed
+    def rnd():
+        nonlocal seed
+        seed = int(seed * 1103515245.0 + 12345.0) % 4294967296
+        return seed
 
 
-checksum = 0
-for r in range(ROUNDS):
-    a = [0] * N
-    for i in range(N):
-        a[i] = rnd()
-    a.sort()
-    checksum = (checksum + a[0] + a[N - 1] + a[N >> 1]) % 4294967296
-print("RESULT=" + str(checksum))
+    checksum = 0
+    for r in range(ROUNDS):
+        a = [0] * N
+        for i in range(N):
+            a[i] = rnd()
+        a.sort()
+        checksum = (checksum + a[0] + a[N - 1] + a[N >> 1]) % 4294967296
+    print("RESULT=" + str(checksum))
+
+
+main()
