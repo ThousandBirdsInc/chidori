@@ -170,6 +170,14 @@ impl ElemView {
     pub(crate) const TA_I32: u64 = 8;
     pub(crate) const TA_U32: u64 = 9;
     pub(crate) const TA_F32: u64 = 10;
+    /// A dense view whose grant SCANNED the storage and found every slot a
+    /// `Number` (no holes): reads skip the per-access tag check entirely —
+    /// one bounds compare, one payload load. Granted under exactly the
+    /// [`ElemView::DENSE`] conditions (read-only kernels, so the scan's
+    /// finding holds for the whole activation); a dirty scan falls back to
+    /// the tag-checked `DENSE` view. The scan is O(len) once per
+    /// activation, repaid by the first pass over the array.
+    pub(crate) const DENSE_NUM: u64 = 12;
     /// WRITABLE dense-array view — granted ONLY by the batch HOF driver
     /// (`Vm::hof_batch`) over the freshly-created, hole-filled `map` output
     /// array, which nothing else can reach mid-batch. A store writes the
@@ -326,10 +334,19 @@ pub(crate) fn elem_view(o: &crate::value::JsObject, allow_dense: bool) -> ElemVi
                     // code while the caller's `objs` cache keeps the array
                     // alive and nothing can reallocate it (no in-kernel
                     // stores by the `allow_dense` grant, no calls at all).
+                    // A one-pass scan upgrades an all-Number array to the
+                    // tag-check-free view.
+                    let all_num = arr
+                        .iter()
+                        .all(|v| matches!(v, crate::value::Value::Number(_)));
                     return ElemView {
                         ptr: arr.as_ptr() as *mut u8,
                         len: arr.len() as u64,
-                        kind: ElemView::DENSE,
+                        kind: if all_num {
+                            ElemView::DENSE_NUM
+                        } else {
+                            ElemView::DENSE
+                        },
                     };
                 }
                 return ElemView::none();
@@ -1419,7 +1436,12 @@ fn eligible_inner(
         } => o(obj) && r(val) && r(dst) && t(bail) && next_ok(pc, 1),
         KOp::ArrayPop { obj, dst, bail } => o(obj) && r(dst) && t(bail) && next_ok(pc, 1),
         KOp::StrLen { dst, str } => r(dst) && st(str) && next_ok(pc, 1),
-        KOp::CharCodeAt { dst, str, idx } => r(dst) && st(str) && r(idx) && next_ok(pc, 1),
+        KOp::CharCodeAt {
+            dst,
+            str,
+            idx,
+            bail,
+        } => r(dst) && st(str) && r(idx) && t(bail) && next_ok(pc, 1),
         KOp::CallKernel {
             dst,
             fslot,
@@ -1770,6 +1792,9 @@ struct OslotView {
     /// for this oslot.
     is_ta: cranelift_codegen::ir::Value,
     is_dense: cranelift_codegen::ir::Value,
+    /// `kind == DENSE_NUM`: the pre-scanned all-Number dense view (reads
+    /// skip the tag check).
+    is_dnum: cranelift_codegen::ir::Value,
     is_direct: cranelift_codegen::ir::Value,
     /// The compiling activation's [`ElemView`] kind code for this oslot: the
     /// ONE typed-array kind this code carries a direct load/store sequence
@@ -1975,7 +2000,7 @@ impl<'a> Translator<'a> {
                 // Later activations pinning any other kind fail `is_ta` and
                 // take the helper shims.
                 let baked = elem_kinds.get(i).copied().unwrap_or(ElemView::NONE);
-                let is_ta = if baked != ElemView::NONE && baked != ElemView::DENSE {
+                let is_ta = if ta_code_bytes(baked).is_some() || baked == ElemView::DENSE_W {
                     b.ins().icmp_imm_s(IntCC::Equal, kind, baked as i64)
                 } else {
                     b.ins().iconst(types::I8, 0)
@@ -1983,6 +2008,9 @@ impl<'a> Translator<'a> {
                 let is_dense = b
                     .ins()
                     .icmp_imm_s(IntCC::Equal, kind, ElemView::DENSE as i64);
+                let is_dnum = b
+                    .ins()
+                    .icmp_imm_s(IntCC::Equal, kind, ElemView::DENSE_NUM as i64);
                 let is_direct = b.ins().icmp_imm_s(IntCC::NotEqual, kind, 0);
                 ta_views.push(OslotView {
                     ptr,
@@ -1991,6 +2019,7 @@ impl<'a> Translator<'a> {
                     bound,
                     is_ta,
                     is_dense,
+                    is_dnum,
                     is_direct,
                     baked,
                 });
@@ -2576,6 +2605,8 @@ impl<'a> Translator<'a> {
         let bail_b = self.dest(pc, bail as usize);
         let chk_dense = self.b.create_block();
         let dense_b = self.b.create_block();
+        let chk_dnum = self.b.create_block();
+        let dnum_b = self.b.create_block();
         let helper = self.b.create_block();
         let join = self.b.create_block();
         let res = self.b.append_block_param(join, types::F64);
@@ -2596,7 +2627,29 @@ impl<'a> Translator<'a> {
         } else {
             self.b.ins().jump(chk_dense, &[]);
         }
+        // Pre-scanned all-Number dense view: one bounds compare, one
+        // payload load — the grant's scan already proved every slot's tag.
         self.b.switch_to_block(chk_dense);
+        self.b.ins().brif(view.is_dnum, dnum_b, &[], chk_dnum, &[]);
+        self.b.switch_to_block(dnum_b);
+        let (ok, ii) = self.elem_index(idx_reg, view.bound);
+        let num_b = self.b.create_block();
+        self.b.ins().brif(ok, num_b, &[], bail_b, &[]);
+        self.b.switch_to_block(num_b);
+        let stride_n = self.b.ins().iconst(
+            types::I64,
+            std::mem::size_of::<crate::value::Value>() as i64,
+        );
+        let off_n = self.b.ins().imul(ii, stride_n);
+        let slot_n = self.b.ins().iadd(view.ptr, off_n);
+        let vn = self.b.ins().load(
+            types::F64,
+            MemFlagsData::trusted(),
+            slot_n,
+            crate::value::Value::JIT_NUMBER_PAYLOAD_OFFSET as i32,
+        );
+        self.b.ins().jump(join, &[vn.into()]);
+        self.b.switch_to_block(chk_dnum);
         self.b.ins().brif(view.is_dense, dense_b, &[], helper, &[]);
         // Dense array (read-only kernels): bounds check, then the slot's
         // repr(u8) tag must be `Number` (a hole or any other variant bails,
@@ -3716,11 +3769,37 @@ impl<'a> Translator<'a> {
             // NaN→0, truncate; out-of-range yields NaN).
             KOp::StrLen { dst, str } => {
                 let (_, slen) = self.sviews[str as usize];
-                let v = self.b.ins().fcvt_from_sint(types::F64, slen);
-                self.set(dst, v);
+                if self.is_int(dst) {
+                    self.set_int(dst, slen);
+                } else {
+                    let v = self.b.ins().fcvt_from_sint(types::F64, slen);
+                    self.set(dst, v);
+                }
             }
-            KOp::CharCodeAt { dst, str, idx } => {
+            KOp::CharCodeAt {
+                dst,
+                str,
+                idx,
+                bail,
+            } => {
                 let (sptr, slen) = self.sviews[str as usize];
+                if self.is_int(dst) && self.is_int(idx) {
+                    // INT body: an out-of-range index would need the NaN an
+                    // i64 register cannot hold — bail instead (the generic
+                    // rerun computes it); in-range is one unsigned compare
+                    // and a byte load (ASCII: code == byte).
+                    let bail_b = self.dest(pc, bail as usize);
+                    let ii = self.get_int(idx);
+                    let ok = self.b.ins().icmp(IntCC::UnsignedLessThan, ii, slen);
+                    let load_b = self.b.create_block();
+                    self.b.ins().brif(ok, load_b, &[], bail_b, &[]);
+                    self.b.switch_to_block(load_b);
+                    let addr = self.b.ins().iadd(sptr, ii);
+                    let byte = self.b.ins().load(types::I8, MemFlagsData::new(), addr, 0);
+                    let wide = self.b.ins().uextend(types::I64, byte);
+                    self.set_int(dst, wide);
+                    return Some(fallthrough);
+                }
                 let i = self.get(idx);
                 let p = self.b.ins().fcvt_to_sint_sat(types::I64, i);
                 let nonneg = self

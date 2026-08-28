@@ -79,6 +79,11 @@ pub struct Shape {
     /// is O(n²) index churn for a singleton builder (realm setup measured
     /// it); a shape that is looked up twice is stable enough to pay for.
     index_armed: std::cell::Cell<bool>,
+    /// Cached "no key of this shape is `toJSON`" — a shape is immutable, so
+    /// the answer never changes. Lets `JSON.stringify` skip the per-node
+    /// `toJSON` [[Get]] (a miss on plain objects is unobservable) with two
+    /// cell reads per level instead of a chain of key comparisons.
+    lacks_to_json: OnceCell<bool>,
 }
 
 impl std::fmt::Debug for Shape {
@@ -97,6 +102,7 @@ impl Shape {
             transitions: RefCell::new(Transitions::None),
             index: OnceCell::new(),
             index_armed: std::cell::Cell::new(false),
+            lacks_to_json: OnceCell::new(),
         })
     }
 
@@ -149,6 +155,14 @@ impl Shape {
             cur = cur.parent.as_deref().expect("checked");
         }
         None
+    }
+
+    /// Whether NO key of this shape is `"toJSON"` (cached; see the field
+    /// doc). The first call per shape pays one ordinary lookup.
+    pub fn lacks_to_json(&self) -> bool {
+        *self
+            .lacks_to_json
+            .get_or_init(|| self.lookup(&PropertyKey::str("toJSON")).is_none())
     }
 
     /// The key stored at slot `i`, if in range. O(len - i) parent hops —
@@ -223,6 +237,7 @@ impl Shape {
             transitions: RefCell::new(Transitions::None),
             index: OnceCell::new(),
             index_armed: std::cell::Cell::new(false),
+            lacks_to_json: OnceCell::new(),
         });
         let weak = Rc::downgrade(&child);
         match &mut *tr {

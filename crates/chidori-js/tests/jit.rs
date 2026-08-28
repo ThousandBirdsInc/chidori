@@ -237,6 +237,12 @@ const CORPUS: &[&str] = &[
     "let s = 0; for (let i = 10; i > 0; i--) { s = (s + i) % 23; } console.log(s);",
     "let i = 0; let s = 0; while (true) { i += 1; s = (s + i) % 11; if (i >= 25) break; } console.log(s, i);",
     "const u = new Uint16Array(16); for (let i = 0; i < 16; i++) u[i] = i * 4097; let m = 0; for (let i = 0; i < u.length; i++) { m = (m ^ u[i]) % 251; } console.log(m, u[15]);",
+    // INT-typed charCodeAt: the counter-indexed hash chain runs on i64
+    // (in-range codes are ints; the out-of-range NaN case BAILS to the
+    // generic rerun — covered by the past-the-end and negative reads).
+    "const txt = 'kernel-hash'; let h = 7; for (let i = 0; i < txt.length; i++) { h = (h * 31 + txt.charCodeAt(i)) % 1000003; } console.log(h);",
+    "const txt = 'abc'; let s = 0; for (let i = 0; i < 5; i++) { const c = txt.charCodeAt(i); s += c === c ? c : 1000; } console.log(s);",
+    "const txt = 'xyz'; let s = 0; for (let i = -2; i < 3; i++) { const c = txt.charCodeAt(i); s += c === c ? c : 500; } console.log(s);",
     // Pinned-string kernels (StrLen/CharCodeAt — total, no bail): the
     // tokenizer hash idiom, plus NaN/OOB index handling.
     "const txt = 'kernel'; let s = 0; for (let i = 0; i < txt.length; i++) { s += txt.charCodeAt(i); } console.log(s);",
@@ -337,6 +343,31 @@ fn jit_actually_compiles_and_runs() {
     assert!(
         after.native_runs > before.native_runs,
         "expected at least one native kernel activation"
+    );
+}
+
+/// Structural: the pinned-string hash loop — `charCodeAt` under a
+/// `s.length` header — COMPILES (it once declined silently when the
+/// `CharCodeAt` bail edge was missing from a target-remap pass, and the
+/// differential corpus cannot see a decline: the interpreter fallback is
+/// equally correct, just slow).
+#[test]
+fn jit_compiles_string_hash_kernels() {
+    let before = chidori_js::jit::stats();
+    let (threw, console, _err) = run(
+        "const txt = 'structural-hash'; let h = 0; for (let r = 0; r < 40; r++) { for (let i = 0; i < txt.length; i++) { h = (h * 31 + txt.charCodeAt(i)) % 1000000007; } } console.log(h);",
+        true,
+    );
+    assert!(!threw);
+    assert_eq!(console, vec!["594202341".to_string()]);
+    let after = chidori_js::jit::stats();
+    assert!(
+        after.compiled > before.compiled,
+        "expected the charCodeAt hash kernel to compile natively"
+    );
+    assert!(
+        after.int_typed > before.int_typed,
+        "expected the hash kernel to carry an int-typed body"
     );
 }
 

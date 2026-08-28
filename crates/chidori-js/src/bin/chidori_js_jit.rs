@@ -15,6 +15,12 @@
 
 use chidori_js::Engine;
 
+// Same opt-in as `examples/run.rs` (see the `mimalloc` feature comment in
+// Cargo.toml): a faster global allocator for the allocation-heavy rows.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let mut jit = true;
     let mut show_stats = false;

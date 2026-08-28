@@ -155,13 +155,29 @@ fn inline_from_wf_bytes(a: &[u8], b: &[u8]) -> Repr {
 }
 
 /// The `&str` view of an inline buffer. Inline strings are only ever built
-/// from `&str` slices, so the check cannot fail — and on ≤[`INLINE_CAP`]
-/// bytes the re-validation is a handful of instructions, which
-/// `#![forbid(unsafe_code)]` makes the right trade. Byte-level consumers
+/// from `&str` slices (or bytes copied out of existing well-formed
+/// `JsString`s), so the check cannot fail. The default build re-validates —
+/// on ≤[`INLINE_CAP`] bytes that is a handful of instructions, which
+/// `#![forbid(unsafe_code)]` makes the right trade — but under the `jit`
+/// feature (where the crate already carries audited `unsafe`) the
+/// re-validation is skipped: `as_str` on inline strings is hot enough that
+/// the checks showed up at ~3% of JSON round-trips. Byte-level consumers
 /// (equality, hashing, JSON quoting, concat assembly) go through
 /// `wtf8_bytes` instead and skip it entirely.
 fn inline_str(buf: &[u8; INLINE_CAP], meta: u8) -> &str {
-    std::str::from_utf8(&buf[..inline_len(meta)]).expect("inline string holds valid UTF-8")
+    let bytes = &buf[..inline_len(meta)];
+    #[cfg(feature = "jit")]
+    {
+        // SAFETY: every `Repr::Inline` constructor copies its bytes from a
+        // `&str` or from existing well-formed `JsString` storage, and
+        // `meta`'s length was set from that same slice.
+        #[expect(unsafe_code, reason = "inline strings are valid UTF-8 by construction")]
+        return unsafe { std::str::from_utf8_unchecked(bytes) };
+    }
+    #[cfg(not(feature = "jit"))]
+    {
+        std::str::from_utf8(bytes).expect("inline string holds valid UTF-8")
+    }
 }
 
 impl Rope {
@@ -1496,6 +1512,17 @@ impl ObjectData {
     }
 
     /// `true` when the ordinary own-property storage is empty — the guard
+    /// Whether this object's own storage provably lacks a `toJSON` key —
+    /// `Shaped` answers from the shape's immutable cache, `Dict` does one
+    /// hash probe. (The JSON stringifier's per-node fast path.)
+    #[inline]
+    pub fn own_lacks_to_json(&self) -> bool {
+        match &self.props {
+            PropStorage::Dict(m) => m.get(&PropertyKey::str("toJSON")).is_none(),
+            PropStorage::Shaped { shape, .. } => shape.lacks_to_json(),
+        }
+    }
+
     /// every dense-array/exotic fast path checks ("nothing reified can
     /// shadow").
     #[inline]

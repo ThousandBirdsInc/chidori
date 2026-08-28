@@ -1283,12 +1283,21 @@ pub enum KOp {
     /// length is an activation constant.
     StrLen { dst: u16, str: u16 },
     /// `regs[dst] = charCodeAt(regs[idx])` over the pinned ASCII string in
-    /// string slot `str`. TOTAL (no bail): the index conversion
-    /// (ToIntegerOrInfinity — NaN→0, truncate toward zero, saturating) and
-    /// the out-of-range NaN result are computed exactly in-kernel; the entry
-    /// guard proved the receiver a flat ASCII string (unit == byte) and the
-    /// canonical `String.prototype.charCodeAt` resolution.
-    CharCodeAt { dst: u16, str: u16, idx: u16 },
+    /// string slot `str`. TOTAL on the interpreter tier (no bail is ever
+    /// taken there): the index conversion (ToIntegerOrInfinity — NaN→0,
+    /// truncate toward zero, saturating) and the out-of-range NaN result
+    /// are computed exactly in-kernel; the entry guard proved the receiver
+    /// a flat ASCII string (unit == byte) and the canonical
+    /// `String.prototype.charCodeAt` resolution. `bail` exists for the
+    /// JIT's INT-typed bodies, where an out-of-range index cannot produce
+    /// the NaN an i64 register has no representation for — it resumes the
+    /// generic interpreter at the call, which computes that NaN.
+    CharCodeAt {
+        dst: u16,
+        str: u16,
+        idx: u16,
+        bail: u16,
+    },
     /// SUPERINSTRUCTION: `LoadElem` followed by `Arith` — the
     /// `d += a[i] * b[i]` dot-product shape's second load feeding its
     /// multiply (which the `(Arith, Add)` fusion then folds separately).

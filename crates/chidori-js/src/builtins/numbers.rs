@@ -998,7 +998,6 @@ fn install_json(vm: &mut Vm) {
             bytes: s.as_str().as_bytes(),
             pos: 0,
             src: s.as_str(),
-            keys: Default::default(),
             shape_paths: Vec::new(),
             depth: 0,
         };
@@ -1231,17 +1230,6 @@ struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
     src: &'a str,
-    /// Distinct object keys seen so far, interned by SOURCE SLICE: the
-    /// dominant JSON shape — an array of same-structure records — repeats
-    /// each key once per record, and the naive path paid two allocations
-    /// per occurrence (the parsed `String`, then its `Rc<str>` copy inside
-    /// `PropertyKey::str`). A hit here is one `Rc` bump. Escaped keys (rare)
-    /// take the general string parser uninterned.
-    keys: std::collections::HashMap<
-        &'a str,
-        PropertyKey,
-        std::hash::BuildHasherDefault<crate::fxhash::FxHasher>,
-    >,
     /// Record-shape cursor (docs/js-object-shapes-design.md §3.3): per
     /// object-nesting depth, the shape chain (first key → leaf) of the last
     /// COMPLETED object at that depth. The dominant JSON input — an array of
@@ -1332,6 +1320,22 @@ impl<'a> JsonParser<'a> {
             }
         }
         self.pos = i;
+        // Small pure-integer literals — the dominant JSON number shape —
+        // convert exactly by accumulation (≤ 15 digits < 2^53), skipping the
+        // general dec2flt machinery.
+        let digits = &b[start..i];
+        let (neg, digs) = match digits.split_first() {
+            Some((b'-', rest)) => (true, rest),
+            _ => (false, digits),
+        };
+        if !digs.is_empty() && digs.len() <= 15 && digs.iter().all(|c| c.is_ascii_digit()) {
+            let mut v: i64 = 0;
+            for &c in digs {
+                v = v * 10 + i64::from(c - b'0');
+            }
+            let f = if neg { -(v as f64) } else { v as f64 };
+            return Ok(Value::Number(f));
+        }
         self.src[start..i]
             .parse::<f64>()
             .map(Value::Number)
@@ -1486,9 +1490,10 @@ impl<'a> JsonParser<'a> {
                 b'"' => {
                     let s = &self.src[start..i];
                     self.pos = i + 1;
-                    if let Some(k) = self.keys.get(s) {
-                        return Ok(k.clone());
-                    }
+                    // The cross-parse cache alone: a borrowed-`&str` probe is
+                    // one hash either way, and a per-parse side table costs
+                    // more to build than it saves (its rehash showed up in
+                    // round-trip profiles).
                     let k = if let Some(k) = vm.json_keys.get(s) {
                         k.clone()
                     } else {
@@ -1501,7 +1506,6 @@ impl<'a> JsonParser<'a> {
                         vm.json_keys.insert(s.into(), k.clone());
                         k
                     };
-                    self.keys.insert(s, k.clone());
                     return Ok(k);
                 }
                 b'\\' | 0x00..=0x1f => break,
@@ -1714,6 +1718,161 @@ fn json_quote_into(s: &JsString, out: &mut Vec<u8>) {
 }
 
 /// SerializeJSONProperty: stringify `holder[key]` APPENDED to `out`,
+/// COMPACT-MODE fast serializer for plain data subtrees: no replacer, no
+/// allowlist, no indent, and — checked per node — only ordinary objects and
+/// unshadowed hole-free dense arrays whose prototype chains provably lack
+/// `toJSON`, with data-only own properties. Under those conditions the
+/// spec's per-member [[Get]]s are plain slot reads with no observable
+/// effects, so the subtree serializes straight off the object storage: no
+/// per-member property lookup, no key re-get, no user code can run (which
+/// is also what makes holding shared borrows across the recursion safe).
+/// `Ok(None)` = something outside the shape appeared — the caller restores
+/// `out`/`seen` and re-runs the generic path, whose re-reads observe
+/// nothing new (nothing ran in between).
+fn json_fast_value(
+    vm: &mut Vm,
+    value: &Value,
+    state: &mut StringifyState,
+    out: &mut Vec<u8>,
+) -> Result<Option<bool>, Value> {
+    Ok(match value {
+        Value::Undefined | Value::Uninitialized | Value::Hole | Value::Symbol(_) => Some(false),
+        Value::BigInt(_) => {
+            return Err(vm.throw_type("Do not know how to serialize a BigInt"));
+        }
+        Value::Null => {
+            out.extend_from_slice(b"null");
+            Some(true)
+        }
+        Value::Bool(b) => {
+            out.extend_from_slice(if *b {
+                b"true".as_slice()
+            } else {
+                b"false".as_slice()
+            });
+            Some(true)
+        }
+        Value::Number(n) => {
+            if n.is_finite() {
+                crate::vm::push_number_bytes(*n, out);
+            } else {
+                out.extend_from_slice(b"null");
+            }
+            Some(true)
+        }
+        Value::String(s) => {
+            json_quote_into(s, out);
+            Some(true)
+        }
+        Value::Object(o) => {
+            let mark = out.len();
+            let seen_mark = state.seen.len();
+            let id = o.ptr_id();
+            if state.seen.contains(&id) {
+                return Err(vm.throw_type("Converting circular structure to JSON"));
+            }
+            if !chain_lacks_to_json(o) {
+                return Ok(None);
+            }
+            state.seen.push(id);
+            let b = o.borrow();
+            let done = 'node: {
+                match &b.internal {
+                    Internal::Array(arr) if b.own_is_empty() => {
+                        out.push(b'[');
+                        for (i, v) in arr.iter().enumerate() {
+                            if i > 0 {
+                                out.push(b',');
+                            }
+                            if matches!(v, Value::Hole) {
+                                // A hole's [[Get]] consults the prototype
+                                // chain — outside this path's shape.
+                                break 'node None;
+                            }
+                            match json_fast_value(vm, v, state, out)? {
+                                Some(true) => {}
+                                Some(false) => out.extend_from_slice(b"null"),
+                                None => break 'node None,
+                            }
+                        }
+                        out.push(b']');
+                        Some(true)
+                    }
+                    Internal::Ordinary if !b.is_callable() => {
+                        out.push(b'{');
+                        let mut first = true;
+                        for (k, p) in b.own_iter() {
+                            let PropertyKey::Str(ks) = k else {
+                                continue; // symbol keys are skipped
+                            };
+                            if !p.enumerable {
+                                continue;
+                            }
+                            let PropertyKind::Data { value: pv, .. } = &p.kind else {
+                                break 'node None; // an accessor could run code
+                            };
+                            let member_mark = out.len();
+                            if !first {
+                                out.push(b',');
+                            }
+                            json_quote_into(ks, out);
+                            out.push(b':');
+                            match json_fast_value(vm, pv, state, out)? {
+                                Some(true) => first = false,
+                                Some(false) => out.truncate(member_mark),
+                                None => break 'node None,
+                            }
+                        }
+                        out.push(b'}');
+                        Some(true)
+                    }
+                    _ => None,
+                }
+            };
+            drop(b);
+            match done {
+                Some(d) => {
+                    state.seen.pop();
+                    Some(d)
+                }
+                None => {
+                    out.truncate(mark);
+                    state.seen.truncate(seen_mark);
+                    return Ok(None);
+                }
+            }
+        }
+    })
+}
+
+/// Fast "no `toJSON` anywhere on the prototype chain" test for plain data
+/// objects: every level must be an ordinary or dense-array object (ordinary
+/// [[Get]] for a string key, no interceptors) whose own storage provably
+/// lacks the key. `false` means "could not prove it" — the caller then
+/// performs the real [[Get]]; the skip is sound exactly because a miss on
+/// such a chain has no observable effect.
+fn chain_lacks_to_json(o: &JsObject) -> bool {
+    let mut cur = o.clone();
+    for _ in 0..8 {
+        let b = cur.borrow();
+        if !matches!(b.internal, Internal::Ordinary | Internal::Array(_)) {
+            return false;
+        }
+        if !b.own_lacks_to_json() {
+            return false;
+        }
+        match &b.proto {
+            None => return true,
+            Some(p) => {
+                let p = p.clone();
+                drop(b);
+                cur = p;
+            }
+        }
+    }
+    false
+}
+
 /// applying toJSON and the function replacer (which both observe `key`).
 /// Returns `false` when the value is to be omitted (undefined / function /
 /// symbol after transforms) — the caller then truncates whatever prefix it
@@ -1732,12 +1891,21 @@ fn json_stringify(
     let mut value = vm.get_prop(holder, &PropertyKey::Str(key.clone()))?;
 
     // toJSON: looked up for an Object OR a BigInt value (spec
-    // SerializeJSONProperty step 2), called with the value as `this`.
+    // SerializeJSONProperty step 2), called with the value as `this`. Plain
+    // data chains provably lacking the key skip the [[Get]] — a miss there
+    // has no observable effect, and the per-shape cache proves absence in
+    // two cell reads per level.
     if matches!(&value, Value::Object(_) | Value::BigInt(_)) {
-        let to_json = vm.get_prop(&value, &PropertyKey::str("toJSON"))?;
-        if vm.is_callable(&to_json) {
-            let this = value.clone();
-            value = vm.call(to_json, this, &[Value::String(key.clone())])?;
+        let skip = match &value {
+            Value::Object(o) => chain_lacks_to_json(o),
+            _ => false,
+        };
+        if !skip {
+            let to_json = vm.get_prop(&value, &PropertyKey::str("toJSON"))?;
+            if vm.is_callable(&to_json) {
+                let this = value.clone();
+                value = vm.call(to_json, this, &[Value::String(key.clone())])?;
+            }
         }
     }
 
@@ -1818,6 +1986,14 @@ fn json_stringify(
         Value::Object(o) => {
             if o.borrow().is_callable() {
                 return Ok(false);
+            }
+            // Compact plain subtrees serialize straight off the storage
+            // (see `json_fast_value`); anything outside that shape falls
+            // through to the generic walk below with `out` untouched.
+            if state.rep_fn.is_none() && state.rep_list.is_none() && state.indent.is_empty() {
+                if let Some(done) = json_fast_value(vm, &value, state, out)? {
+                    return Ok(done);
+                }
             }
             let id = o.ptr_id();
             if state.seen.contains(&id) {

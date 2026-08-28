@@ -137,6 +137,14 @@ pub(crate) struct RecFamily {
     math_members: Vec<u8>,
     /// The family's uniform `Ret` register type.
     pub(crate) ret_bool: bool,
+    /// The family's compiled native code, cached after the first
+    /// `native_for_family` success: the code was compiled against exactly
+    /// this family's members and callee map (which travel together with it
+    /// through the park/take cache), so later calls skip the per-call
+    /// identity re-checks entirely — `validate_rec_family` already
+    /// re-verifies every dynamic fact.
+    #[cfg(feature = "jit")]
+    pub(crate) native: Option<crate::jit::NativeKernel>,
 }
 
 /// Outcome of a kernel activation attempt for the caller's tier to act on:
@@ -684,10 +692,13 @@ impl Vm {
         // resolution. Checked before any pooled state is taken; the strings
         // themselves are cached below alongside the object bases.
         for &l in k.sslots.iter() {
+            // The length cap backs the JIT's int-typed `StrLen` range
+            // (`jit_ty::LEN_HI`); no allocatable string comes near it.
             let ok = matches!(
                 &frame.locals[l as usize],
                 Value::String(st)
-                    if matches!(st.flatten_utf8(), Some(f) if f.len() == st.len_utf16())
+                    if matches!(st.flatten_utf8(), Some(f) if f.len() == st.len_utf16()
+                        && (f.len() as u64) < (1u64 << 48))
             );
             if !ok {
                 {
@@ -1554,7 +1565,9 @@ impl Vm {
                 KOp::StrLen { dst, str } => {
                     w[dst as usize & KWIN_MASK] = sstrs[str as usize].len_utf16() as f64;
                 }
-                KOp::CharCodeAt { dst, str, idx } => {
+                KOp::CharCodeAt {
+                    dst, str, idx, ..
+                } => {
                     let i = w[idx as usize & KWIN_MASK];
                     let bytes = sstrs[str as usize]
                         .flatten_utf8()
@@ -1873,7 +1886,8 @@ impl Vm {
         let k0 = bf.proto.fn_kernel.as_ref()?;
         k0.rec.as_deref()?;
 
-        let fam = match self.take_rec_family(bf) {
+        #[cfg_attr(not(feature = "jit"), expect(unused_mut))]
+        let mut fam = match self.take_rec_family(bf) {
             Some(f) => f,
             None => self.build_rec_family(bf)?,
         };
@@ -1919,7 +1933,14 @@ impl Vm {
         // interrupt-poll placement.
         #[cfg(feature = "jit")]
         if self.jit_enabled {
-            if let Some(native) = crate::jit::native_for_family(k0, &fam) {
+            // Resolve-and-cache: the compiled code travels WITH the family
+            // through the park/take cache (it was compiled against exactly
+            // these members and this callee map), so a cache hit skips the
+            // per-call identity re-checks.
+            if fam.native.is_none() {
+                fam.native = crate::jit::native_for_family(k0, &fam);
+            }
+            if let Some(native) = fam.native.clone() {
                 let mut jctx = crate::jit::JitCtx::empty();
                 jctx.depth = self.max_call_depth.saturating_sub(self.call_depth) as i64;
                 jctx.rec_uv = fam.uv_flat.as_ptr();
@@ -2264,7 +2285,7 @@ impl Vm {
     /// (miss, or a dynamic check failed — the entry is dropped and the
     /// caller re-resolves, which is the uncached path and may itself
     /// decline).
-    fn take_rec_family(&mut self, bf: &Rc<BytecodeFunction>) -> Option<RecFamily> {
+    fn take_rec_family(&mut self, bf: &Rc<BytecodeFunction>) -> Option<Box<RecFamily>> {
         let i = self
             .rec_families
             .iter()
@@ -2354,7 +2375,7 @@ impl Vm {
 
     /// Park a family back in the cache (MRU at the tail, bounded). Eviction
     /// only ever costs the evicted entry a re-resolution on its next call.
-    fn park_rec_family(&mut self, fam: RecFamily) {
+    fn park_rec_family(&mut self, fam: Box<RecFamily>) {
         const REC_FAMILY_CACHE_CAP: usize = 8;
         if self.rec_families.len() >= REC_FAMILY_CACHE_CAP {
             self.rec_families.remove(0);
@@ -2366,7 +2387,7 @@ impl Vm {
     /// (`funcs[0]` = `bf`), recording the identity checks a cache hit will
     /// re-verify. `None` = the family declines kernelization (this
     /// activation runs generically); nothing is cached on decline.
-    fn build_rec_family(&self, bf: &Rc<BytecodeFunction>) -> Option<RecFamily> {
+    fn build_rec_family(&self, bf: &Rc<BytecodeFunction>) -> Option<Box<RecFamily>> {
         let ret_bool = bf.proto.fn_kernel.as_ref()?.ret_bool;
         let mut funcs: Vec<Rc<BytecodeFunction>> = vec![bf.clone()];
         // callee_map[j][c] = funcs index for member j's SelfCall callee c
@@ -2568,7 +2589,7 @@ impl Vm {
                 }
             }
         }
-        Some(RecFamily {
+        Some(Box::new(RecFamily {
             funcs,
             callee_map,
             arg_slots,
@@ -2578,7 +2599,9 @@ impl Vm {
             upval_checks,
             math_members,
             ret_bool,
-        })
+            #[cfg(feature = "jit")]
+            native: None,
+        }))
     }
 
     /// Prepare a callback for REPEATED calls from a native higher-order

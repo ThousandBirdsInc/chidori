@@ -470,7 +470,14 @@ pub struct Vm {
     /// and walks member code, which dominated shallow recursions when paid
     /// per outer call. Bounded; validated per activation; a pure perf cache
     /// (hit vs miss is unobservable).
-    pub(crate) rec_families: Vec<crate::exec::RecFamily>,
+    /// Boxed so the per-call take/park moves a pointer, not the fat struct
+    /// (`take_rec_family` swap-removes and re-pushes one entry per outer
+    /// recursive call — that move was measurable on shallow-hot recursion).
+    #[expect(
+        clippy::vec_box,
+        reason = "entries are moved OUT and back per call; boxing keeps that a pointer move"
+    )]
+    pub(crate) rec_families: Vec<Box<crate::exec::RecFamily>>,
     /// Pooled (caller, return-pc, dst, window) stack for
     /// `run_fn_kernel_rec`; parked empty.
     pub(crate) rec_calls: Vec<(u8, u16, u16, u32)>,

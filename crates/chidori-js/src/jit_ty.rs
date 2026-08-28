@@ -179,7 +179,8 @@ fn successors(op: &KOp, pc: usize) -> Vec<(usize, Option<bool>)> {
         | KOp::StoreElem { bail, .. }
         | KOp::ArrayPush { bail, .. }
         | KOp::ArrayPop { bail, .. }
-        | KOp::LoadLen { bail, .. } => vec![(p1, None), (bail as usize, None)],
+        | KOp::LoadLen { bail, .. }
+        | KOp::CharCodeAt { bail, .. } => vec![(p1, None), (bail as usize, None)],
         KOp::LoadElemAdd { bail, .. } | KOp::LoadElemArith { bail, .. } => {
             vec![(p2, None), (bail as usize, None)]
         }
@@ -581,9 +582,22 @@ fn eval_op(op: &KOp, pc: usize, cx: &Ctx, demand_pos: &mut Option<u16>) -> Vec<(
         KOp::LoadLen { dst, .. } | KOp::LenBrCmp { dst, .. } => {
             vec![(dst, Some(Range::new(0.0, LEN_HI)))]
         }
-        KOp::StrLen { dst, .. }
-        | KOp::CharCodeAt { dst, .. }
-        | KOp::CallKernel { dst, .. }
+        // Pinned strings are guard-validated flat ASCII: an in-range code
+        // unit is an integer in [0, 127], and the INT body bails on the
+        // out-of-range NaN case. Typed only over an Int index (the loop-
+        // counter hash shape) — a float index keeps the total float path.
+        KOp::CharCodeAt { dst, idx, .. } => {
+            let r = if cx.int(idx) {
+                Some(Range::new(0.0, 127.0))
+            } else {
+                None
+            };
+            vec![(dst, r)]
+        }
+        // Pinned strings are entry-capped below 2^48 code units (the sslot
+        // guard), so the length is an in-band integer.
+        KOp::StrLen { dst, .. } => vec![(dst, Some(Range::new(0.0, LEN_HI)))],
+        KOp::CallKernel { dst, .. }
         | KOp::SelfCall { dst, .. }
         | KOp::ArrayPush { dst, .. }
         | KOp::ArrayPop { dst, .. } => vec![(dst, None)],

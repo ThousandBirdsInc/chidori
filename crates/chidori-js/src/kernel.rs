@@ -1053,7 +1053,8 @@ fn map_targets(op: &mut KOp, mut f: impl FnMut(u16) -> u16) {
         | KOp::LoadElemAdd { bail, .. }
         | KOp::LoadElemArith { bail, .. }
         | KOp::ArrayPush { bail, .. }
-        | KOp::ArrayPop { bail, .. } => *bail = f(*bail),
+        | KOp::ArrayPop { bail, .. }
+        | KOp::CharCodeAt { bail, .. } => *bail = f(*bail),
         KOp::LenBrCmp { bail, target, .. } => {
             *bail = f(*bail);
             *target = f(*target);
@@ -1693,9 +1694,12 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
                 succ[i] = (true, Some(*bail));
             }
             KOp::StrLen { dst, .. } => defs[i] = bit(*dst),
-            KOp::CharCodeAt { dst, idx, .. } => {
+            KOp::CharCodeAt { dst, idx, bail, .. } => {
                 uses[i] = bit(*idx);
                 defs[i] = bit(*dst);
+                // Total on this tier, but the JIT's int body may take the
+                // bail edge — the analyses must see it as a successor.
+                succ[i] = (true, Some(*bail));
             }
             KOp::ArrayPush { dst, val, bail, .. } => {
                 uses[i] = bit(*val);
@@ -1812,7 +1816,8 @@ fn patch(kops: &mut [KOp], kidx: usize, pc: u16) {
         | KOp::StoreElem { bail, .. }
         | KOp::LoadLen { bail, .. }
         | KOp::ArrayPush { bail, .. }
-        | KOp::ArrayPop { bail, .. } => *bail = pc,
+        | KOp::ArrayPop { bail, .. }
+        | KOp::CharCodeAt { bail, .. } => *bail = pc,
         _ => unreachable!("patching a non-branch kop"),
     }
 }
@@ -2971,11 +2976,19 @@ impl Xlate<'_> {
                         return None;
                     }
                     let idx = self.top_num_reg(0)?;
+                    let shape = self.vstack.clone();
                     self.pop()?; // arg
                     self.pop()?; // this (the string)
                     self.pop()?; // fn
                     let dst = self.push_num()?;
-                    self.kops.push(K::CharCodeAt { dst, str: sl, idx });
+                    let kidx = self.kops.len();
+                    self.kops.push(K::CharCodeAt {
+                        dst,
+                        str: sl,
+                        idx,
+                        bail: u16::MAX,
+                    });
+                    self.exits.push((kidx, self.base_ip + i as u32, shape));
                     return Some(());
                 }
                 // `a.push(x)`: the compiler's method-call pattern
