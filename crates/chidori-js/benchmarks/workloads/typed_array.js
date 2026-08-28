@@ -1,10 +1,9 @@
 // Typed-array element traffic — the numeric-buffer class (DSP, embeddings,
 // image/audio scratch): fill, sum, dot product, and in-place transform over
 // Float64Array plus an Int32Array bit-mix pass. Mirrors array_sum.js but on
-// typed arrays, which the typed loop kernels do NOT yet accept as a base
-// (element access only translates for dense `Internal::Array`), so this runs
-// on the generic interpreter path today. Deterministic fill (no RNG) so every
-// runtime computes the same checksum.
+// typed arrays. The typed loop kernels pin the arrays and, under the JIT,
+// every numeric element kind reads/writes as direct machine loads/stores.
+// Deterministic fill (no RNG) so every runtime computes the same checksum.
 (function () {
   const N = 50_000;
   const ROUNDS = 4;

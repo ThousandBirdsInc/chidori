@@ -60,16 +60,26 @@ compiled subset now covers essentially the whole kernel language:
   guards), `**`, `Math.round`/`sign`/`fround`/`imul`'s cores — calls back
   into the same `number_arith_raw`/`builtins::numbers` functions the
   interpreter uses.
-- **Elements**: f64 typed arrays read/write raw storage directly in IR
-  (bounds + `dense_index` conditions folded into one unsigned compare
-  against an entry-clamped bound); dense arrays get a read-only direct view
-  (slot tag + payload loads over `Value`'s `#[repr(u8)]` layout, verified by
-  a live self-check) in kernels that provably never store/push/pop.
-  Everything else element-shaped — other typed-array kinds, dense writes,
-  `push`/`pop`, `.length` on non-viewed bases — goes through `extern "C"`
-  shims that call the *same* extracted fast-path cores the interpreter arms
-  use (`kernel_elem_load`/`store`/`len`, `kernel_array_push`/`pop`), with
-  the op's exact bail edge on a miss.
+- **Elements**: every numeric typed-array kind (i8/u8/u8-clamped/i16/u16/
+  i32/u32/f32/f64) reads and writes raw storage directly in IR — a
+  little-endian load/store at the element width plus the kind's exact
+  `decode`/`encode` conversion (integer stores inline the codec's
+  `to_int`-plus-wrapping-cast as one saturating conversion, a finiteness
+  select, and a narrow store; f32 is an exact IEEE demote/promote; the
+  clamped kind reads directly but stores through the shim, its clamp not
+  being a wrap). Bounds + `dense_index` conditions fold into one unsigned
+  compare against an entry-clamped bound. Each compiled kernel carries the
+  direct sequence for the ONE kind the compiling activation pinned per
+  oslot (baked at translation); an activation pinning a different kind
+  fails that one-compare guard and takes the shims — no new decline, no
+  recompile. Dense arrays get a read-only direct view (slot tag + payload
+  loads over `Value`'s `#[repr(u8)]` layout, verified by a live self-check)
+  in kernels that provably never store/push/pop. Everything else
+  element-shaped — BigInt64/BigUint64 arrays, dense writes, `push`/`pop`,
+  `.length` on non-viewed bases — goes through `extern "C"` shims that call
+  the *same* extracted fast-path cores the interpreter arms use
+  (`kernel_elem_load`/`store`/`len`, `kernel_array_push`/`pop`), with the
+  op's exact bail edge on a miss.
 - **Pinned strings**: `StrLen`/`CharCodeAt` over the entry-hoisted
   flat-ASCII view — total, no bail, NaN on out-of-range exactly like the
   interpreter.

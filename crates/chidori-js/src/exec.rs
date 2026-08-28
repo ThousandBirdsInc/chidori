@@ -1093,10 +1093,24 @@ impl Vm {
         // the tier never has a third outcome.
         #[cfg(feature = "jit")]
         if self.jit_enabled {
-            let native_exit = crate::jit::native_for_loop(k, &callee_bfs).map(|native| {
+            // Dense direct views only for kernels that provably never
+            // change any array's length or contents (no element stores,
+            // no push/pop) — then a dense array's storage pointer and
+            // length hold for the whole activation.
+            let allow_dense = !k.stores_elems && !k.uses_array_push && !k.uses_array_pop;
+            // The per-oslot element-view kinds of THIS activation: on the
+            // compiling (first) activation these are baked into the code as
+            // the one direct typed-array sequence per oslot; later
+            // activations guard against them at run time.
+            let elem_kinds: Vec<u64> = objs
+                .iter()
+                .map(|o| crate::jit::elem_kind_code(o, allow_dense))
+                .collect();
+            let native_exit = crate::jit::native_for_loop(k, &callee_bfs, &elem_kinds).map(|native| {
                 // Activation tables for the native run, alive exactly across
                 // it: the pinned strings (guard-validated flat ASCII), the
-                // per-oslot direct f64-typed-array views, the object cache
+                // per-oslot direct element views (numeric typed arrays of
+                // any kind; dense arrays when granted), the object cache
                 // the element shims index, and the canonical Array.prototype
                 // for the push receiver check.
                 let sstr_tab: Vec<crate::jit::SStr> = sstrs
@@ -1109,11 +1123,6 @@ impl Vm {
                         }
                     })
                     .collect();
-                // Dense direct views only for kernels that provably never
-                // change any array's length or contents (no element stores,
-                // no push/pop) — then a dense array's storage pointer and
-                // length hold for the whole activation.
-                let allow_dense = !k.stores_elems && !k.uses_array_push && !k.uses_array_pop;
                 let ta_tab: Vec<crate::jit::ElemView> = objs
                     .iter()
                     .map(|o| crate::jit::elem_view(o, allow_dense))

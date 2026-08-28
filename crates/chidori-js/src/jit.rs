@@ -131,10 +131,16 @@ pub(crate) struct SStr {
 /// with no element stores — length changes all require calls, which kernel
 /// regions exclude):
 ///
-/// - [`ElemView::TA_F64`]: an f64 typed array; `ptr` is raw element storage
-///   (`buffer bytes + byte_offset`), `len` the effective element count. An
-///   element access is a plain 8-byte little-endian load/store — exactly
-///   `decode`/`encode` for `TAKind::F64`.
+/// - [`ElemView::TA_F64`] / the other `TA_*` kinds: a numeric typed array;
+///   `ptr` is raw element storage (`buffer bytes + byte_offset`), `len` the
+///   effective element count. An element access is a little-endian
+///   load/store at the kind's width plus the kind's conversion — exactly
+///   `decode`/`encode` for that `TAKind`. Compiled code carries the direct
+///   sequence for ONE kind per oslot (the compiling activation's, baked at
+///   translation); an activation pinning a different kind fails the baked
+///   kind-equality test and takes the helper shims. `TA_U8C`
+///   (Uint8ClampedArray) reads directly (identical to `TA_U8`) but always
+///   stores through the shim (the clamp is not wraparound).
 /// - [`ElemView::DENSE`]: an unshadowed dense array in a kernel that
 ///   provably performs no element store/push/pop; `ptr` is the `Vec<Value>`
 ///   storage, `len` its length. A read checks the slot's `#[repr(u8)]` tag
@@ -156,6 +162,33 @@ impl ElemView {
     pub(crate) const NONE: u64 = 0;
     pub(crate) const TA_F64: u64 = 1;
     pub(crate) const DENSE: u64 = 2;
+    pub(crate) const TA_I8: u64 = 3;
+    pub(crate) const TA_U8: u64 = 4;
+    pub(crate) const TA_U8C: u64 = 5;
+    pub(crate) const TA_I16: u64 = 6;
+    pub(crate) const TA_U16: u64 = 7;
+    pub(crate) const TA_I32: u64 = 8;
+    pub(crate) const TA_U32: u64 = 9;
+    pub(crate) const TA_F32: u64 = 10;
+
+    /// The view-kind code for a typed array's element kind — `None` for the
+    /// BigInt kinds, which never get a direct view (their elements are not
+    /// f64-representable).
+    pub(crate) fn ta_code(kind: crate::value::TAKind) -> Option<u64> {
+        use crate::value::TAKind;
+        Some(match kind {
+            TAKind::I8 => ElemView::TA_I8,
+            TAKind::U8 => ElemView::TA_U8,
+            TAKind::U8Clamped => ElemView::TA_U8C,
+            TAKind::I16 => ElemView::TA_I16,
+            TAKind::U16 => ElemView::TA_U16,
+            TAKind::I32 => ElemView::TA_I32,
+            TAKind::U32 => ElemView::TA_U32,
+            TAKind::F32 => ElemView::TA_F32,
+            TAKind::F64 => ElemView::TA_F64,
+            TAKind::I64 | TAKind::U64 => return None,
+        })
+    }
 
     fn none() -> ElemView {
         ElemView {
@@ -163,6 +196,18 @@ impl ElemView {
             len: 0,
             kind: ElemView::NONE,
         }
+    }
+}
+
+/// Element width of a typed-array view-kind code — `None` for `NONE`/`DENSE`
+/// (i.e. "is this a typed-array code" and its byte size in one).
+fn ta_code_bytes(code: u64) -> Option<i64> {
+    match code {
+        ElemView::TA_I8 | ElemView::TA_U8 | ElemView::TA_U8C => Some(1),
+        ElemView::TA_I16 | ElemView::TA_U16 => Some(2),
+        ElemView::TA_I32 | ElemView::TA_U32 | ElemView::TA_F32 => Some(4),
+        ElemView::TA_F64 => Some(8),
+        _ => None,
     }
 }
 
@@ -280,9 +325,7 @@ pub(crate) fn elem_view(o: &crate::value::JsObject, allow_dense: bool) -> ElemVi
                 }
                 return ElemView::none();
             }
-            crate::value::Internal::TypedArray(t)
-                if matches!(t.kind, crate::value::TAKind::F64) =>
-            {
+            crate::value::Internal::TypedArray(t) if ElemView::ta_code(t.kind).is_some() => {
                 // Fall through below (needs the buffer borrow_mut, which
                 // this object borrow must not overlap for aliased views).
             }
@@ -291,6 +334,9 @@ pub(crate) fn elem_view(o: &crate::value::JsObject, allow_dense: bool) -> ElemVi
     }
     let b = o.borrow();
     let crate::value::Internal::TypedArray(t) = &b.internal else {
+        return ElemView::none();
+    };
+    let Some(code) = ElemView::ta_code(t.kind) else {
         return ElemView::none();
     };
     let len = crate::typed_array::ta_eff_length(t);
@@ -309,7 +355,31 @@ pub(crate) fn elem_view(o: &crate::value::JsObject, allow_dense: bool) -> ElemVi
     ElemView {
         ptr: bytes[byte_offset..].as_mut_ptr(),
         len: len as u64,
-        kind: ElemView::TA_F64,
+        kind: code,
+    }
+}
+
+/// The view-kind code `elem_view` would grant `o` — without materializing
+/// the view (no buffer borrow, no pointers). Used at compile time to bake
+/// the compiling activation's per-oslot element kind into the generated
+/// code (see [`OslotView`]).
+pub(crate) fn elem_kind_code(o: &crate::value::JsObject, allow_dense: bool) -> u64 {
+    if !cfg!(target_endian = "little") {
+        return ElemView::NONE;
+    }
+    let b = o.borrow();
+    match &b.internal {
+        crate::value::Internal::Array(_) if allow_dense && b.own_is_empty() => {
+            if dense_layout_ok() {
+                ElemView::DENSE
+            } else {
+                ElemView::NONE
+            }
+        }
+        crate::value::Internal::TypedArray(t) => {
+            ElemView::ta_code(t.kind).unwrap_or(ElemView::NONE)
+        }
+        _ => ElemView::NONE,
     }
 }
 
@@ -454,13 +524,14 @@ impl NativeKernel {
 pub(crate) fn native_for_loop(
     k: &Kernel,
     callee_bfs: &[(Rc<crate::value::BytecodeFunction>, u32)],
+    elem_kinds: &[u64],
 ) -> Option<NativeKernel> {
     let native = k.native.get_or_init(|| {
         let specs: Vec<(Rc<crate::bytecode::FuncProto>, u32)> = callee_bfs
             .iter()
             .map(|(bf, wb)| (bf.proto.clone(), *wb))
             .collect();
-        match compile(k, &specs) {
+        match compile(k, &specs, elem_kinds) {
             Some(n) => {
                 STAT_COMPILED.fetch_add(1, Ordering::Relaxed);
                 Some(n)
@@ -492,7 +563,7 @@ pub(crate) fn native_for_loop(
 /// [`native_for_loop`] for contexts with no pinned callees (the function-
 /// kernel seam; function kernels contain no `CallKernel` by construction).
 pub(crate) fn native_for(k: &Kernel) -> Option<NativeKernel> {
-    native_for_loop(k, &[])
+    native_for_loop(k, &[], &[])
 }
 
 /// The compiled form of a RESOLVED recursion family, entered through
@@ -644,6 +715,7 @@ extern "C" fn h_elem_load(ctx: *mut JitCtx, oslot: i64, idx: f64) -> i8 {
 }
 
 extern "C" fn h_elem_store(ctx: *mut JitCtx, oslot: i64, idx: f64, val: f64) -> i8 {
+    STAT_ELEM_SHIM.fetch_add(1, Ordering::Relaxed);
     // SAFETY: as `h_elem_load`.
     #[expect(unsafe_code, reason = "element shim over the activation tables")]
     let (_, objs) = unsafe { ctx_parts(ctx) };
@@ -1001,7 +1073,11 @@ fn eligible_inner(
 /// Compile `k` to native code against the resolved pinned callees, or
 /// `None` when it is not eligible or the host ISA is unsupported. Pure:
 /// reads only the kernel's (and inlined callee kernels') code.
-fn compile(k: &Kernel, callees: &[(Rc<crate::bytecode::FuncProto>, u32)]) -> Option<NativeKernel> {
+fn compile(
+    k: &Kernel,
+    callees: &[(Rc<crate::bytecode::FuncProto>, u32)],
+    elem_kinds: &[u64],
+) -> Option<NativeKernel> {
     if !eligible(k, callees) {
         return None;
     }
@@ -1035,7 +1111,7 @@ fn compile(k: &Kernel, callees: &[(Rc<crate::bytecode::FuncProto>, u32)]) -> Opt
     {
         let frontend_config = module.target_config();
         let builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        Translator::new(builder, &mut module, k, callees).translate(frontend_config)?;
+        Translator::new(builder, &mut module, k, callees, elem_kinds).translate(frontend_config)?;
     }
     module.define_function(func_id, &mut ctx).ok()?;
     module.clear_context(&mut ctx);
@@ -1272,10 +1348,17 @@ struct OslotView {
     /// then `dense_index`'s full range condition (negative indices wrap to
     /// huge unsigned values and fail it too).
     bound: cranelift_codegen::ir::Value,
-    /// `kind == TA_F64` / `kind == DENSE` / `kind != NONE`, as i8 tests.
+    /// `kind == baked` / `kind == DENSE` / `kind != NONE`, as i8 tests.
+    /// `is_ta` compares against the BAKED typed-array kind code (below) —
+    /// constant false when the compiling activation had no typed-array view
+    /// for this oslot.
     is_ta: cranelift_codegen::ir::Value,
     is_dense: cranelift_codegen::ir::Value,
     is_direct: cranelift_codegen::ir::Value,
+    /// The compiling activation's [`ElemView`] kind code for this oslot: the
+    /// ONE typed-array kind this code carries a direct load/store sequence
+    /// for. `NONE`/`DENSE` = no baked typed-array arm.
+    baked: u64,
 }
 
 struct Translator<'a> {
@@ -1368,6 +1451,7 @@ impl<'a> Translator<'a> {
         module: &'a mut JITModule,
         k: &'a Kernel,
         callee_specs: &[(Rc<crate::bytecode::FuncProto>, u32)],
+        elem_kinds: &[u64],
     ) -> Self {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -1452,9 +1536,16 @@ impl<'a> Translator<'a> {
                 let len_f64 = b.ins().fcvt_from_sint(types::F64, len);
                 let ceiling = b.ins().iconst(types::I64, 4_294_967_295);
                 let bound = b.ins().umin(len, ceiling);
-                let is_ta = b
-                    .ins()
-                    .icmp_imm_s(IntCC::Equal, kind, ElemView::TA_F64 as i64);
+                // The one typed-array kind this oslot's direct sequences are
+                // emitted for: the compiling activation's (`elem_kinds`).
+                // Later activations pinning any other kind fail `is_ta` and
+                // take the helper shims.
+                let baked = elem_kinds.get(i).copied().unwrap_or(ElemView::NONE);
+                let is_ta = if baked != ElemView::NONE && baked != ElemView::DENSE {
+                    b.ins().icmp_imm_s(IntCC::Equal, kind, baked as i64)
+                } else {
+                    b.ins().iconst(types::I8, 0)
+                };
                 let is_dense = b
                     .ins()
                     .icmp_imm_s(IntCC::Equal, kind, ElemView::DENSE as i64);
@@ -1466,6 +1557,7 @@ impl<'a> Translator<'a> {
                     is_ta,
                     is_dense,
                     is_direct,
+                    baked,
                 });
             }
         }
@@ -1890,10 +1982,12 @@ impl<'a> Translator<'a> {
         self.b.ins().fcmp(FloatCC::OrderedNotEqual, x, zero)
     }
 
-    /// Element READ (`KOp::LoadElem` semantics): direct 8-byte load for an
-    /// f64-typed-array view, the interpreter's shared fast-path core through
-    /// the helper shim for everything else; any fast-path failure jumps to
-    /// the op's bail edge (an Exit stub), exactly like the interpreter arm.
+    /// Element READ (`KOp::LoadElem` semantics): a direct bounds-checked
+    /// load-and-convert for a typed-array view of the BAKED kind (see
+    /// [`OslotView::baked`]), the interpreter's shared fast-path core
+    /// through the helper shim for everything else; any fast-path failure
+    /// jumps to the op's bail edge (an Exit stub), exactly like the
+    /// interpreter arm.
     fn emit_elem_load(
         &mut self,
         pc: usize,
@@ -1903,26 +1997,30 @@ impl<'a> Translator<'a> {
     ) -> Option<cranelift_codegen::ir::Value> {
         let view = self.ta_views[obj as usize];
         let bail_b = self.dest(pc, bail as usize);
-        let ta_b = self.b.create_block();
         let chk_dense = self.b.create_block();
         let dense_b = self.b.create_block();
         let helper = self.b.create_block();
         let join = self.b.create_block();
         let res = self.b.append_block_param(join, types::F64);
-        self.b.ins().brif(view.is_ta, ta_b, &[], chk_dense, &[]);
+        // Baked typed array: bounds-checked load at the kind's width, then
+        // the kind's exact `decode` conversion. Emitted only when the
+        // compiling activation had a typed-array view (otherwise `is_ta` is
+        // constant false and the arm would be dead weight).
+        if ta_code_bytes(view.baked).is_some() {
+            let ta_b = self.b.create_block();
+            self.b.ins().brif(view.is_ta, ta_b, &[], chk_dense, &[]);
+            self.b.switch_to_block(ta_b);
+            let (ok, ii) = self.elem_index_ok(idx, view.bound);
+            let load_b = self.b.create_block();
+            self.b.ins().brif(ok, load_b, &[], bail_b, &[]);
+            self.b.switch_to_block(load_b);
+            let v = self.ta_load(view, ii);
+            self.b.ins().jump(join, &[v.into()]);
+        } else {
+            self.b.ins().jump(chk_dense, &[]);
+        }
         self.b.switch_to_block(chk_dense);
         self.b.ins().brif(view.is_dense, dense_b, &[], helper, &[]);
-        // f64 typed array: bounds-checked 8-byte load.
-        self.b.switch_to_block(ta_b);
-        let (ok, ii) = self.elem_index_ok(idx, view.bound);
-        let load_b = self.b.create_block();
-        self.b.ins().brif(ok, load_b, &[], bail_b, &[]);
-        self.b.switch_to_block(load_b);
-        let eight = self.b.ins().iconst(types::I64, 8);
-        let off = self.b.ins().imul(ii, eight);
-        let addr = self.b.ins().iadd(view.ptr, off);
-        let v = self.b.ins().load(types::F64, MemFlagsData::new(), addr, 0);
-        self.b.ins().jump(join, &[v.into()]);
         // Dense array (read-only kernels): bounds check, then the slot's
         // repr(u8) tag must be `Number` (a hole or any other variant bails,
         // exactly like the interpreter's fast-path miss), then the payload.
@@ -1969,10 +2067,12 @@ impl<'a> Translator<'a> {
         Some(res)
     }
 
-    /// Element WRITE (`KOp::StoreElem` semantics): direct store on an f64
-    /// view (in-place only — the view's length is fixed, so an append is out
-    /// of bounds and bails, exactly as a typed array's OOB store must), the
-    /// shared core via the shim otherwise.
+    /// Element WRITE (`KOp::StoreElem` semantics): direct convert-and-store
+    /// on a typed-array view of the baked kind (in-place only — the view's
+    /// length is fixed, so an append is out of bounds and bails, exactly as
+    /// a typed array's OOB store must), the shared core via the shim
+    /// otherwise. `Uint8ClampedArray` has no direct store arm (its clamp is
+    /// not the integer kinds' wraparound): its stores always take the shim.
     fn emit_elem_store(
         &mut self,
         pc: usize,
@@ -1982,29 +2082,122 @@ impl<'a> Translator<'a> {
         bail: u16,
     ) -> Option<()> {
         // A dense view is never granted to a kernel containing stores, so
-        // the direct arm here is the f64 typed array only.
+        // the direct arm here is the baked typed-array kind only.
         let view = self.ta_views[obj as usize];
         let bail_b = self.dest(pc, bail as usize);
-        let direct = self.b.create_block();
         let helper = self.b.create_block();
         let join = self.b.create_block();
-        self.b.ins().brif(view.is_ta, direct, &[], helper, &[]);
-        self.b.switch_to_block(direct);
-        let (ok, ii) = self.elem_index_ok(idx, view.bound);
-        let store_b = self.b.create_block();
-        self.b.ins().brif(ok, store_b, &[], bail_b, &[]);
-        self.b.switch_to_block(store_b);
-        let eight = self.b.ins().iconst(types::I64, 8);
-        let off = self.b.ins().imul(ii, eight);
-        let addr = self.b.ins().iadd(view.ptr, off);
-        self.b.ins().store(MemFlagsData::new(), val, addr, 0);
-        self.b.ins().jump(join, &[]);
+        if ta_code_bytes(view.baked).is_some() && view.baked != ElemView::TA_U8C {
+            let direct = self.b.create_block();
+            self.b.ins().brif(view.is_ta, direct, &[], helper, &[]);
+            self.b.switch_to_block(direct);
+            let (ok, ii) = self.elem_index_ok(idx, view.bound);
+            let store_b = self.b.create_block();
+            self.b.ins().brif(ok, store_b, &[], bail_b, &[]);
+            self.b.switch_to_block(store_b);
+            self.ta_store(view, ii, val);
+            self.b.ins().jump(join, &[]);
+        } else {
+            self.b.ins().jump(helper, &[]);
+        }
         self.b.switch_to_block(helper);
         let oslot = self.b.ins().iconst(types::I64, i64::from(obj));
         let st = self.callh("cjit_elem_store", &[self.ctx_ptr, oslot, idx, val])?;
         self.b.ins().brif(st, join, &[], bail_b, &[]);
         self.b.switch_to_block(join);
         Some(())
+    }
+
+    /// The address of baked-kind element `ii` of `view`'s storage.
+    fn ta_addr(
+        &mut self,
+        view: OslotView,
+        ii: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let size = ta_code_bytes(view.baked).expect("caller checked baked TA kind");
+        let size_v = self.b.ins().iconst(types::I64, size);
+        let off = self.b.ins().imul(ii, size_v);
+        self.b.ins().iadd(view.ptr, off)
+    }
+
+    /// The baked kind's exact `decode`: a little-endian load at the element
+    /// width, sign-/zero-extended per kind, converted to f64 (every element
+    /// value is exactly representable — the widest integer kind is 32-bit,
+    /// and f32 promotes exactly).
+    fn ta_load(
+        &mut self,
+        view: OslotView,
+        ii: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let addr = self.ta_addr(view, ii);
+        let mf = MemFlagsData::new();
+        match view.baked {
+            ElemView::TA_F64 => self.b.ins().load(types::F64, mf, addr, 0),
+            ElemView::TA_F32 => {
+                let f = self.b.ins().load(types::F32, mf, addr, 0);
+                self.b.ins().fpromote(types::F64, f)
+            }
+            _ => {
+                let x = match view.baked {
+                    ElemView::TA_I8 => self.b.ins().sload8(types::I64, mf, addr, 0),
+                    ElemView::TA_U8 | ElemView::TA_U8C => {
+                        self.b.ins().uload8(types::I64, mf, addr, 0)
+                    }
+                    ElemView::TA_I16 => self.b.ins().sload16(types::I64, mf, addr, 0),
+                    ElemView::TA_U16 => self.b.ins().uload16(types::I64, mf, addr, 0),
+                    ElemView::TA_I32 => self.b.ins().sload32(mf, addr, 0),
+                    _ => self.b.ins().uload32(mf, addr, 0), // TA_U32
+                };
+                self.b.ins().fcvt_from_sint(types::F64, x)
+            }
+        }
+    }
+
+    /// The baked kind's exact `encode`: f64 stores the value, f32 demotes
+    /// (IEEE round-to-nearest — exactly `v as f32`), and the integer kinds
+    /// inline `to_int` + the wrapping element cast — non-finite to 0
+    /// (`fcvt_to_sint_sat` gives NaN 0 already; the finiteness select fixes
+    /// ±Inf, which it would saturate), otherwise truncate-and-saturate to
+    /// i64 exactly like `t as i64`, then store the low bytes (`istore8/16/
+    /// 32` — the `as i8`/`as u8`/… wrap).
+    fn ta_store(
+        &mut self,
+        view: OslotView,
+        ii: cranelift_codegen::ir::Value,
+        val: cranelift_codegen::ir::Value,
+    ) {
+        let addr = self.ta_addr(view, ii);
+        let mf = MemFlagsData::new();
+        match view.baked {
+            ElemView::TA_F64 => {
+                self.b.ins().store(mf, val, addr, 0);
+            }
+            ElemView::TA_F32 => {
+                let f = self.b.ins().fdemote(types::F32, val);
+                self.b.ins().store(mf, f, addr, 0);
+            }
+            _ => {
+                let sat = self.b.ins().fcvt_to_sint_sat(types::I64, val);
+                let d = self.b.ins().fsub(val, val);
+                let zero_f = self.b.ins().f64const(0.0);
+                let finite = self.b.ins().fcmp(FloatCC::Equal, d, zero_f);
+                let zero_i = self.b.ins().iconst(types::I64, 0);
+                let t = self.b.ins().select(finite, sat, zero_i);
+                match view.baked {
+                    ElemView::TA_I8 | ElemView::TA_U8 => {
+                        self.b.ins().istore8(mf, t, addr, 0);
+                    }
+                    ElemView::TA_I16 | ElemView::TA_U16 => {
+                        self.b.ins().istore16(mf, t, addr, 0);
+                    }
+                    _ => {
+                        // TA_I32 / TA_U32 (TA_U8C never reaches here — no
+                        // direct store arm is emitted for it).
+                        self.b.ins().istore32(mf, t, addr, 0);
+                    }
+                }
+            }
+        }
     }
 
     /// The shared index test of the direct element paths — `dense_index`'s

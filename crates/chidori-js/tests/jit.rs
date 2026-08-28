@@ -147,8 +147,35 @@ const CORPUS: &[&str] = &[
     "const t = new Float64Array(4); t[0] = 1; let s = 0; for (let i = 0; i < 2; i += 0.5) { s += t[i] || 0; } console.log(s);",
     // NaN/-0 round-trip through typed storage, and Infinity.
     "const t = new Float64Array(3); t[0] = -0; t[1] = NaN; t[2] = Infinity; let c = 0; for (let i = 0; i < 3; i++) { const v = t[i]; if (Object.is(v, -0)) c += 1; if (v !== v) c += 10; if (v === Infinity) c += 100; } console.log(c);",
-    // Int32Array: helper path (per-kind encode/decode) with wrapping stores.
+    // Int32Array: the DIRECT per-kind path with wrapping stores.
     "const t = new Int32Array(6); for (let i = 0; i < 6; i++) { t[i] = i * 1e9; } let s = 0; for (let i = 0; i < t.length; i++) { s += t[i]; } console.log(s, t.join(','));",
+    // Every direct numeric kind: fill with values past the kind's range so
+    // the store conversion (trunc + wraparound / f32 rounding) is exercised,
+    // then read back and sum. One line per kind keeps failures attributable.
+    "const t = new Int8Array(8); for (let i = 0; i < 8; i++) { t[i] = i * 50 - 175.7; } let s = 0; for (let i = 0; i < 8; i++) { s += t[i]; } console.log(s, t.join(','));",
+    "const t = new Uint8Array(8); for (let i = 0; i < 8; i++) { t[i] = i * 100 - 150.5; } let s = 0; for (let i = 0; i < 8; i++) { s += t[i]; } console.log(s, t.join(','));",
+    "const t = new Int16Array(8); for (let i = 0; i < 8; i++) { t[i] = i * 20000 - 50000.3; } let s = 0; for (let i = 0; i < 8; i++) { s += t[i]; } console.log(s, t.join(','));",
+    "const t = new Uint16Array(8); for (let i = 0; i < 8; i++) { t[i] = i * 30000 - 40000.9; } let s = 0; for (let i = 0; i < 8; i++) { s += t[i]; } console.log(s, t.join(','));",
+    "const t = new Uint32Array(8); for (let i = 0; i < 8; i++) { t[i] = i * 3e9 - 5e9; } let s = 0; for (let i = 0; i < 8; i++) { s += t[i]; } console.log(s, t.join(','));",
+    "const t = new Float32Array(8); for (let i = 0; i < 8; i++) { t[i] = i * 0.1 + 1e-8; } let s = 0; for (let i = 0; i < 8; i++) { s += t[i]; } console.log(s, t.join(','));",
+    // Uint8ClampedArray: direct reads, but stores must take the shim (the
+    // clamp — NaN→0, round-half-to-even, saturate — is not wraparound).
+    "const t = new Uint8ClampedArray(8); for (let i = 0; i < 8; i++) { t[i] = i * 100 - 150.5; } let s = 0; for (let i = 0; i < 8; i++) { s += t[i]; } console.log(s, t.join(','));",
+    "const t = new Uint8ClampedArray(4); t[0] = 0.5; t[1] = 1.5; t[2] = 2.5; t[3] = 300; let s = 0; for (let i = 0; i < 4; i++) { s = s * 1000 + t[i]; } console.log(s);",
+    // The integer-store edges through the direct path: NaN and ±Infinity
+    // encode as 0; huge-but-finite magnitudes hit the engine's i64
+    // saturation before the element wrap.
+    "const src = [NaN, Infinity, -Infinity, 1e300, -1e300, 2147483647.9, -2147483648.5, 4294967296]; const t = new Int32Array(8); const u = new Uint8Array(8); for (let i = 0; i < 8; i++) { t[i] = src[i]; u[i] = src[i]; } console.log(t.join(','), u.join(','));",
+    // An Int32Array bit-mix loop (direct loads/stores + inlined ToInt32).
+    "const t = new Int32Array(16); t[0] = 12345; for (let i = 1; i < 16; i++) { t[i] = (t[i-1] * 1103515245 + 12345) & 0x7fffffff; } let h = 0; for (let i = 0; i < 16; i++) { h = (h ^ t[i]) >>> 1; } console.log(h, t[15]);",
+    // KIND-MISMATCH reactivation: the same function's kernel first compiles
+    // against Int32Array (baking i32 sequences), then runs over a
+    // Float64Array and a plain array — both must fail the baked-kind guard
+    // and stay correct through the helper path.
+    "function sumInto(t) { let s = 0; for (let i = 0; i < t.length; i++) { t[i] = i * 2.5; s += t[i]; } return s; } const a = sumInto(new Int32Array(6)); const b = sumInto(new Float64Array(6)); const c = sumInto([0, 0, 0, 0, 0, 0]); console.log(a, b, c);",
+    // Two views of DIFFERENT kinds over one buffer in one kernel (aliased
+    // element storage, distinct baked sequences per oslot).
+    "const buf = new ArrayBuffer(16); const i32 = new Int32Array(buf); const u8 = new Uint8Array(buf); for (let i = 0; i < 4; i++) { i32[i] = i * 100000 + 7; } let s = 0; for (let i = 0; i < 16; i++) { s = s * 31 + u8[i]; } console.log(s % 1000000007, i32.join(','));",
     // Pinned-string kernels (StrLen/CharCodeAt — total, no bail): the
     // tokenizer hash idiom, plus NaN/OOB index handling.
     "const txt = 'kernel'; let s = 0; for (let i = 0; i < txt.length; i++) { s += txt.charCodeAt(i); } console.log(s);",
