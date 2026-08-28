@@ -198,7 +198,9 @@ fn fusion_actually_fires() {
         "expected a captured counter's loop test to fuse into CmpCellConstBranchFalse"
     );
     // A bottom-tested loop fuses its back-edge into CmpLocalConstBranchTrue.
-    let dw = compile_script_opts("let i = 0; do { i++; } while (i < 5);", true).unwrap();
+    // (Block-scoped: a SCRIPT-toplevel `let` is a global lexical binding —
+    // a stable shared cell other scripts resolve — so it never localizes.)
+    let dw = compile_script_opts("{ let i = 0; do { i++; } while (i < 5); }", true).unwrap();
     assert!(
         count_ops(&dw, |op| matches!(op, Op::CmpLocalConstBranchTrue { .. })) >= 1,
         "expected the do/while back-edge to fuse into CmpLocalConstBranchTrue"

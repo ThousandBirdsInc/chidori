@@ -159,9 +159,15 @@ fn init_weak_entries(
 }
 
 /// A value that "can be held weakly": an object or a (non-registered) symbol.
-/// Anything else is an invalid WeakMap/WeakSet key/value → TypeError.
-fn can_be_held_weakly(v: &Value) -> bool {
-    matches!(v, Value::Object(_) | Value::Symbol(_))
+/// A symbol in the global registry (`Symbol.for`) is reachable forever, so it
+/// is rejected. Anything else is an invalid WeakMap/WeakSet key/value →
+/// TypeError.
+fn can_be_held_weakly(vm: &Vm, v: &Value) -> bool {
+    match v {
+        Value::Object(_) => true,
+        Value::Symbol(s) => !vm.realm.symbol_registry.values().any(|r| r == s),
+        _ => false,
+    }
 }
 
 fn weakmap_this(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
@@ -200,7 +206,7 @@ fn install_weakmap(vm: &mut Vm) {
     vm.define_method(&proto, "set", 2, |vm, this, args| {
         let o = weakmap_this(vm, &this)?;
         let k = arg(args, 0);
-        if !can_be_held_weakly(&k) {
+        if !can_be_held_weakly(vm, &k) {
             return Err(vm.throw_type("Invalid value used as weak map key"));
         }
         if let Internal::WeakMap(m) = &mut o.borrow_mut().internal {
@@ -261,7 +267,7 @@ fn install_weakset(vm: &mut Vm) {
     vm.define_method(&proto, "add", 1, |vm, this, args| {
         let o = weakset_this(vm, &this)?;
         let v = arg(args, 0);
-        if !can_be_held_weakly(&v) {
+        if !can_be_held_weakly(vm, &v) {
             return Err(vm.throw_type("Invalid value used in weak set"));
         }
         if let Internal::WeakSet(s) = &mut o.borrow_mut().internal {
@@ -395,21 +401,36 @@ fn install_map(vm: &mut Vm) {
         }
         let this_arg = arg(args, 1);
         // LIVE iteration (no snapshot): entries added during the walk are
-        // visited; a deleted-then-re-added entry moves to the end and is
-        // visited again — same index discipline as the builtin iterators.
-        let mut i = 0usize;
+        // visited, and a deleted-then-re-added entry moves to the end and is
+        // visited AGAIN (it is a fresh entry in the spec's list). The storage
+        // compacts on delete, so a plain numeric cursor would drift: instead
+        // the cursor is re-derived each step from the most recent visited
+        // entry that still sits at (or before) the position it was visited at
+        // — one whose index grew was deleted and re-added, i.e. it no longer
+        // marks the frontier.
+        let mut visited: Vec<(MapKey, usize)> = Vec::new();
         loop {
             let entry = {
                 if let Internal::Map(m) = &o.borrow().internal {
-                    m.get_index(i).map(|(k, v)| (k.0.clone(), v.clone()))
+                    let mut next = 0usize;
+                    for (k, at) in visited.iter().rev() {
+                        if let Some(idx) = m.get_index_of(k) {
+                            if idx <= *at {
+                                next = idx + 1;
+                                break;
+                            }
+                        }
+                    }
+                    m.get_index(next).map(|(k, v)| (k.clone(), v.clone(), next))
                 } else {
                     None
                 }
             };
             match entry {
-                Some((k, v)) => {
-                    vm.call(cb.clone(), this_arg.clone(), &[v, k, this.clone()])?;
-                    i += 1;
+                Some((k, v, at)) => {
+                    let kv = k.0.clone();
+                    visited.push((k, at));
+                    vm.call(cb.clone(), this_arg.clone(), &[v, kv, this.clone()])?;
                 }
                 None => break,
             }
@@ -510,20 +531,31 @@ fn install_set(vm: &mut Vm) {
             return Err(vm.throw_type("Set.prototype.forEach callback is not a function"));
         }
         let this_arg = arg(args, 1);
-        // LIVE iteration (no snapshot) — see Map.prototype.forEach above.
-        let mut i = 0usize;
+        // LIVE iteration with the re-derived cursor — see Map.prototype.forEach
+        // above for why a plain numeric index would drift on delete/re-add.
+        let mut visited: Vec<(MapKey, usize)> = Vec::new();
         loop {
             let entry = {
                 if let Internal::Set(s) = &o.borrow().internal {
-                    s.get_index(i).map(|(k, _)| k.0.clone())
+                    let mut next = 0usize;
+                    for (k, at) in visited.iter().rev() {
+                        if let Some(idx) = s.get_index_of(k) {
+                            if idx <= *at {
+                                next = idx + 1;
+                                break;
+                            }
+                        }
+                    }
+                    s.get_index(next).map(|(k, _)| (k.clone(), next))
                 } else {
                     None
                 }
             };
             match entry {
-                Some(v) => {
+                Some((k, at)) => {
+                    let v = k.0.clone();
+                    visited.push((k, at));
                     vm.call(cb.clone(), this_arg.clone(), &[v.clone(), v, this.clone()])?;
-                    i += 1;
                 }
                 None => break,
             }
@@ -630,22 +662,45 @@ fn install_set(vm: &mut Vm) {
         Ok(new_set(vm, result))
     });
     vm.define_method(&proto, "symmetricDifference", 1, |vm, this, args| {
-        set_this(vm, &this)?;
+        let o = set_this(vm, &this)?;
         let record = get_set_record(vm, &arg(args, 0))?;
-        let this_keys = set_keys_snapshot(vm, &this)?;
-        // Start from a copy of `this`, then iterate `other.keys()` (never calls
-        // `other.has`): an element in both is removed, one only in `other` added.
-        let mut result = this_keys;
-        let other_keys = record.keys_to_vec(vm)?;
-        for k in other_keys {
+        // Start from a copy of `this`, then iterate `other.keys()` (never
+        // calls `other.has`). Membership is decided against the LIVE receiver
+        // per step, not the snapshot: `keys()`'s iterator may mutate `this`,
+        // and an element removed from `this` mid-iteration stays in the
+        // result (it is only deleted when present in BOTH).
+        let mut result = set_keys_snapshot(vm, &this)?;
+        let it = vm.call(record.keys.clone(), record.obj.clone(), &[])?;
+        if !matches!(it, Value::Object(_)) {
+            return Err(vm.throw_type("set-like keys() did not return an object"));
+        }
+        let next = vm.get_prop(&it, &crate::names::key_next())?;
+        loop {
+            vm.native_tick()?;
+            let res = vm.call(next.clone(), it.clone(), &[])?;
+            if !matches!(res, Value::Object(_)) {
+                return Err(vm.throw_type("iterator result is not an object"));
+            }
+            let done = vm.get_prop(&res, &crate::names::key_done())?;
+            if vm.to_boolean(&done) {
+                break;
+            }
+            let k = vm.get_prop(&res, &crate::names::key_value())?;
             let k = if matches!(&k, Value::Number(n) if *n == 0.0) {
                 Value::Number(0.0) // canonicalize -0 → +0
             } else {
                 k
             };
-            if let Some(pos) = result.iter().position(|e| same_value_zero(e, &k)) {
-                result.remove(pos);
-            } else {
+            let in_result = result.iter().position(|e| same_value_zero(e, &k));
+            let in_this = matches!(
+                &o.borrow().internal,
+                Internal::Set(s) if s.contains_key(&MapKey(k.clone()))
+            );
+            if in_this {
+                if let Some(pos) = in_result {
+                    result.remove(pos);
+                }
+            } else if in_result.is_none() {
                 result.push(k);
             }
         }

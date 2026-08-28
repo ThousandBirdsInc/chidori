@@ -401,17 +401,36 @@ pub enum EvalSlot {
     Upvalue(u32),
 }
 
+/// The declared-name lists a script's `Op::GlobalDeclChecks` validates.
+#[derive(Debug)]
+pub struct GlobalDecls {
+    /// Script-level `let`/`const`/`class` names.
+    pub lex_names: Vec<String>,
+    /// Script-level `var`/`function` names.
+    pub var_names: Vec<String>,
+}
+
 /// One caller binding visible at a direct-`eval` call site.
 #[derive(Clone, Debug)]
 pub struct EvalBinding {
     pub name: String,
     pub slot: EvalSlot,
-    /// let/const/class (a sloppy eval `var` of the same name is a SyntaxError).
+    /// let/const/class (a sloppy eval `var` of the same name is a SyntaxError —
+    /// but only when the binding is in the eval caller's own scope chain up to
+    /// its variable environment, see `own_scope`).
     pub is_lexical: bool,
     pub is_const: bool,
     /// A formal parameter (an eval var-declared `arguments` colliding with a
     /// parameter named `arguments` is a SyntaxError).
     pub is_param: bool,
+    /// The binding lives in the eval caller's OWN variable-scope chain (its
+    /// function context, or a block within it). EvalDeclarationInstantiation
+    /// only consults that chain: a same-named binding in an enclosing function
+    /// neither satisfies a `var` redeclaration nor collides with it.
+    pub own_scope: bool,
+    /// A named function expression's immutable self-binding: assignment from
+    /// the eval body is ignored in sloppy code, a TypeError in strict code.
+    pub is_fn_name: bool,
 }
 
 /// The kind of a private class element, resolved lexically at compile time.
@@ -616,6 +635,47 @@ pub enum Op {
         name: u32,
         deletable: bool,
     },
+    /// GlobalDeclarationInstantiation's collision checks, run atomically at
+    /// script entry BEFORE any binding is created: a lexical name colliding
+    /// with an existing global lexical or a restricted (non-configurable own)
+    /// global property, or a var name colliding with a global lexical, is a
+    /// SyntaxError — and the script then creates no bindings at all.
+    GlobalDeclChecks(std::rc::Rc<GlobalDecls>),
+    /// Create a script-level `let`/`const`/`class` binding in the realm's
+    /// global declarative environment: the frame cell at `cell` (starting in
+    /// TDZ) is registered under `name` so every later script resolves the
+    /// same live binding. The cell must be marked stable.
+    DeclareGlobalLex {
+        cell: u32,
+        name: u32,
+        is_const: bool,
+    },
+    /// Strict-mode `name = rhs` on an unresolved (global) reference: the spec
+    /// captures the reference's resolvability BEFORE the right-hand side runs
+    /// (an RHS that creates the property cannot rescue the reference), but the
+    /// ReferenceError itself is PutValue's — thrown only after the RHS
+    /// evaluated without an abrupt completion. `[] -> [resolvable]` (const
+    /// index of name); pair with [`Op::GlobalRefThrow`] after the RHS.
+    GlobalRefCheck(u32),
+    /// As [`Op::GlobalRefCheck`], but `[base] -> [resolvable]`: pops the
+    /// with-aware resolved base (from `ResolveNameBase`); an object base means
+    /// the name resolved on a with-object and is always resolvable.
+    GlobalRefCheckBase(u32),
+    /// PutValue's unresolvable-reference throw: `[resolvable, rhs] -> [rhs]`,
+    /// throwing ReferenceError (const index of name) when the pre-RHS
+    /// resolvability flag is false.
+    GlobalRefThrow(u32),
+    /// `[obj] -> [proto]`: the object's live [[Prototype]] (through a Proxy
+    /// trap when applicable) — `super()`'s GetSuperConstructor.
+    GetProtoOf,
+    /// First op of every finalizer landing pad: move the completion that
+    /// routed control here (if any) from the hand-off slot onto the frame's
+    /// finalizer-region stack. `Op::EndFinally` pops the region.
+    EnterFinally,
+    /// `[base] -> [this]`: WithBaseObject for a bare-identifier call under
+    /// `with`/eval scoping — a real with-object becomes the call's `this`;
+    /// an eval-vars scope object or unresolved base yields `undefined`.
+    WithBaseThis,
     /// Throw ReferenceError if the named global is not defined (TDZ-ish for
     /// `typeof`-safe reads we use LoadGlobalOrUndefined instead).
     LoadGlobalTypeof(u32),
@@ -684,6 +744,12 @@ pub enum Op {
     /// the scope snapshot `FuncProto::eval_scopes[scope]` and runs with the
     /// caller's `this`/`new.target`/with-chain (spec PerformEval); any other
     /// callee gets an ordinary call.
+    /// As [`Op::DirectEval`] but the arguments were built as a spread
+    /// array: `[callee, argsArray] -> [result]`. `eval(...list)` is still a
+    /// DIRECT eval (the spec keys on the callee, not the argument form).
+    DirectEvalSpread {
+        scope: u32,
+    },
     DirectEval {
         argc: u32,
         scope: u32,

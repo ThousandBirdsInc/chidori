@@ -516,23 +516,17 @@ fn install_globals(vm: &mut Vm) {
     }
     vm.define_value(&global, "console", Value::Object(console));
 
-    // parseInt / parseFloat / isNaN / isFinite.
-    vm.define_method(&global, "parseInt", 2, |vm, _t, args| {
-        let s = vm.to_js_string(&arg(args, 0))?;
-        let radix = {
-            let r = arg(args, 1);
-            if r.is_undefined() {
-                0
-            } else {
-                vm.to_int32(&r)?
-            }
-        };
-        Ok(Value::Number(parse_int(s.as_str(), radix)))
-    });
-    vm.define_method(&global, "parseFloat", 1, |vm, _t, args| {
-        let s = vm.to_js_string(&arg(args, 0))?;
-        Ok(Value::Number(parse_float(s.as_str())))
-    });
+    // parseInt / parseFloat / isNaN / isFinite. The global parseInt and
+    // parseFloat are the same function objects as Number.parseInt and
+    // Number.parseFloat (installed by the numbers section), per spec.
+    for name in ["parseInt", "parseFloat"] {
+        let f = vm
+            .get_prop(&Value::Object(global.clone()), &PropertyKey::str("Number"))
+            .ok()
+            .and_then(|n| vm.get_prop(&n, &PropertyKey::str(name)).ok())
+            .unwrap_or(Value::Undefined);
+        vm.define_value(&global, name, f);
+    }
     vm.define_method(&global, "isNaN", 1, |vm, _t, args| {
         let n = vm.to_number(&arg(args, 0))?;
         Ok(Value::Bool(n.is_nan()))
@@ -543,17 +537,22 @@ fn install_globals(vm: &mut Vm) {
     });
 
     // URI handling: encodeURI / decodeURI / encodeURIComponent /
-    // decodeURIComponent. Percent-encoding operates on the UTF-8 bytes of the
-    // string (Rust strings are already valid UTF-8, so lone surrogates cannot
-    // occur). Malformed decode input throws a generic Error (the realm has no
-    // URIError intrinsic).
+    // decodeURIComponent. Both directions walk UTF-16 code units so unpaired
+    // surrogates are observed (and rejected with a URIError) rather than
+    // pre-lossied to U+FFFD by a &str view.
     vm.define_method(&global, "encodeURI", 1, |vm, _t, args| {
         let s = vm.to_js_string(&arg(args, 0))?;
-        Ok(Value::str(uri_encode(s.as_str(), URI_UNESCAPED_URI)))
+        match uri_encode_units(&s.to_utf16_vec(), URI_UNESCAPED_URI) {
+            Ok(out) => Ok(Value::str(out)),
+            Err(msg) => Err(vm.make_error(crate::vm::ErrorKind::Uri, msg)),
+        }
     });
     vm.define_method(&global, "encodeURIComponent", 1, |vm, _t, args| {
         let s = vm.to_js_string(&arg(args, 0))?;
-        Ok(Value::str(uri_encode(s.as_str(), URI_UNESCAPED_COMPONENT)))
+        match uri_encode_units(&s.to_utf16_vec(), URI_UNESCAPED_COMPONENT) {
+            Ok(out) => Ok(Value::str(out)),
+            Err(msg) => Err(vm.make_error(crate::vm::ErrorKind::Uri, msg)),
+        }
     });
     vm.define_method(&global, "decodeURI", 1, |vm, _t, args| {
         let s = vm.to_js_string(&arg(args, 0))?;
@@ -717,20 +716,21 @@ pub(crate) fn parse_int(s: &str, mut radix: i32) -> f64 {
         }
         i += 1;
     }
-    if radix == 0 {
-        radix = 10;
+    if radix != 0 && !(2..=36).contains(&radix) {
+        return f64::NAN;
     }
-    if radix == 16 || radix == 0 {
-        if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i + 1] | 32) == b'x' {
-            i += 2;
-            radix = 16;
-        }
-    } else if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i + 1] | 32) == b'x' && radix == 16
+    // A "0x"/"0X" prefix selects hex when the radix is 16 or unspecified —
+    // the prefix check must run before the radix defaults to 10.
+    if (radix == 0 || radix == 16)
+        && i + 1 < bytes.len()
+        && bytes[i] == b'0'
+        && (bytes[i + 1] | 32) == b'x'
     {
         i += 2;
+        radix = 16;
     }
-    if !(2..=36).contains(&radix) {
-        return f64::NAN;
+    if radix == 0 {
+        radix = 10;
     }
     let start = i;
     let mut acc = 0.0;
@@ -814,18 +814,44 @@ fn uri_is_unreserved(b: u8, extra: &str) -> bool {
     b.is_ascii_alphanumeric() || extra.as_bytes().contains(&b)
 }
 
-fn uri_encode(s: &str, unescaped: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        if uri_is_unreserved(b, unescaped) {
-            out.push(b as char);
-        } else {
+/// Spec `Encode`: walks UTF-16 code units so an unpaired surrogate is seen
+/// and rejected with a URIError (a lossy `&str` view would have already
+/// replaced it with U+FFFD and encoded that instead).
+fn uri_encode_units(units: &[u16], unescaped: &str) -> Result<String, &'static str> {
+    let mut out = String::with_capacity(units.len());
+    let push_escaped = |out: &mut String, buf: &[u8]| {
+        for &b in buf {
             out.push('%');
             out.push(hex_upper(b >> 4));
             out.push(hex_upper(b & 0xf));
         }
+    };
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if u < 0x80 && uri_is_unreserved(u as u8, unescaped) {
+            out.push(u as u8 as char);
+            i += 1;
+            continue;
+        }
+        let cp = if (0xdc00..=0xdfff).contains(&u) {
+            return Err("URI malformed"); // lone low surrogate
+        } else if (0xd800..=0xdbff).contains(&u) {
+            let lo = *units.get(i + 1).ok_or("URI malformed")?;
+            if !(0xdc00..=0xdfff).contains(&lo) {
+                return Err("URI malformed"); // high surrogate without a low
+            }
+            i += 2;
+            0x10000 + (((u as u32) - 0xd800) << 10) + ((lo as u32) - 0xdc00)
+        } else {
+            i += 1;
+            u as u32
+        };
+        let c = char::from_u32(cp).ok_or("URI malformed")?;
+        let mut buf = [0u8; 4];
+        push_escaped(&mut out, c.encode_utf8(&mut buf).as_bytes());
     }
-    out
+    Ok(out)
 }
 
 fn hex_upper(nibble: u8) -> char {

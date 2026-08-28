@@ -204,10 +204,6 @@ fn str_this(vm: &mut Vm, this: &Value) -> Result<String, Value> {
     }
 }
 
-fn chars(s: &str) -> Vec<char> {
-    s.chars().collect()
-}
-
 /// `this` as a `JsString`, preserving lone surrogates (unlike `str_this`, whose
 /// `String` is the lossy U+FFFD view). RequireObjectCoercible + ToString.
 fn jsstr_this(vm: &mut Vm, this: &Value) -> Result<JsString, Value> {
@@ -859,10 +855,13 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
 }
 
 fn pad(vm: &mut Vm, this: &Value, args: &[Value], start: bool) -> Result<Value, Value> {
-    let s: Vec<char> = chars(&str_this(vm, this)?);
+    // Lengths are UTF-16 code units: truncating the filler may split a
+    // surrogate pair, leaving a lone surrogate in the result — per spec.
+    let s = str_this_preserving(vm, this)?;
+    let units = s.to_utf16_vec();
     let target = vm.to_length(&arg(args, 0))?;
-    if s.len() >= target {
-        return Ok(Value::str(s.into_iter().collect::<String>()));
+    if units.len() >= target {
+        return Ok(Value::String(s));
     }
     if target > crate::value::MAX_STRING_LEN {
         return Err(vm.throw_range("Invalid string length"));
@@ -870,25 +869,25 @@ fn pad(vm: &mut Vm, this: &Value, args: &[Value], start: bool) -> Result<Value, 
     let filler = {
         let f = arg(args, 1);
         if f.is_undefined() {
-            " ".to_string()
+            vec![b' ' as u16]
         } else {
-            vm.to_js_string(&f)?.as_str().to_string()
+            vm.to_js_string(&f)?.to_utf16_vec()
         }
     };
     if filler.is_empty() {
-        return Ok(Value::str(s.into_iter().collect::<String>()));
+        return Ok(Value::String(s));
     }
-    let pad_len = target - s.len();
-    let fill_chars: Vec<char> = filler.chars().collect();
-    let pad: String = (0..pad_len)
-        .map(|i| fill_chars[i % fill_chars.len()])
-        .collect();
-    let base: String = s.into_iter().collect();
-    Ok(Value::str(if start {
-        format!("{pad}{base}")
+    let pad_len = target - units.len();
+    let pad: Vec<u16> = (0..pad_len).map(|i| filler[i % filler.len()]).collect();
+    let mut out = Vec::with_capacity(target);
+    if start {
+        out.extend_from_slice(&pad);
+        out.extend_from_slice(&units);
     } else {
-        format!("{base}{pad}")
-    }))
+        out.extend_from_slice(&units);
+        out.extend_from_slice(&pad);
+    }
+    Ok(Value::String(crate::value::JsString::from_code_units(&out)))
 }
 
 fn replace_impl(vm: &mut Vm, this: &Value, args: &[Value], all: bool) -> Result<Value, Value> {

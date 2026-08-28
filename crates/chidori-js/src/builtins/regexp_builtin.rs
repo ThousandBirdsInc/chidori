@@ -25,6 +25,7 @@ use crate::vm::Vm;
 
 pub fn install(vm: &mut Vm) {
     let proto = vm.realm.regexp_proto.clone();
+    install_regexp_string_iterator_proto(vm);
 
     // RegExp(pattern, flags?) / RegExp(regexpObj[, flags]).
     // The call form has the spec's identity short-circuit (22.2.4.1 step 2):
@@ -692,28 +693,65 @@ fn make_regexp_string_iterator(
     global: bool,
     unicode: bool,
 ) -> Value {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    let proto = vm.realm.iterator_proto.clone();
+    let proto = vm.realm.regexp_string_iterator_proto.clone();
     let iter = vm.new_object_proto(Some(proto));
-    // (matcher, S, global, unicode, done)
-    let state: Rc<RefCell<(Value, JsString, bool, bool, bool)>> =
-        Rc::new(RefCell::new((matcher, s.clone(), global, unicode, false)));
-    let next = vm.new_native("next", 0, move |vm, _this, _a| {
+    iter.borrow_mut().internal =
+        Internal::RegExpStringIterator(Box::new(crate::value::RegExpStringIterData {
+            matcher,
+            string: s.clone(),
+            global,
+            unicode,
+            done: false,
+        }));
+    Value::Object(iter)
+}
+
+/// Install the %RegExpStringIteratorPrototype% shape: `next` plus the
+/// spec-mandated Symbol.toStringTag, chaining to %IteratorPrototype%
+/// (wired in realm setup).
+fn install_regexp_string_iterator_proto(vm: &mut Vm) {
+    let proto = vm.realm.regexp_string_iterator_proto.clone();
+    vm.define_method(&proto, "next", 0, |vm, this, _a| {
+        let it = match &this {
+            Value::Object(o)
+                if matches!(o.borrow().internal, Internal::RegExpStringIterator(_)) =>
+            {
+                o.clone()
+            }
+            _ => {
+                return Err(vm.throw_type(
+                    "%RegExpStringIteratorPrototype%.next called on incompatible receiver",
+                ))
+            }
+        };
         let (matcher, s, global, unicode, done) = {
-            let st = state.borrow();
-            (st.0.clone(), st.1.clone(), st.2, st.3, st.4)
+            let b = it.borrow();
+            let Internal::RegExpStringIterator(st) = &b.internal else {
+                unreachable!("brand-checked above");
+            };
+            (
+                st.matcher.clone(),
+                st.string.clone(),
+                st.global,
+                st.unicode,
+                st.done,
+            )
+        };
+        let mark_done = |it: &JsObject| {
+            if let Internal::RegExpStringIterator(st) = &mut it.borrow_mut().internal {
+                st.done = true;
+            }
         };
         if done {
             return Ok(vm.make_iter_result(Value::Undefined, true));
         }
         let result = regexp_exec_abstract(vm, &matcher, &s)?;
         if result.is_null() {
-            state.borrow_mut().4 = true;
+            mark_done(&it);
             return Ok(vm.make_iter_result(Value::Undefined, true));
         }
         if !global {
-            state.borrow_mut().4 = true;
+            mark_done(&it);
             return Ok(vm.make_iter_result(result, false));
         }
         let m0 = vm.get_prop(&result, &PropertyKey::from_index(0))?;
@@ -730,11 +768,20 @@ fn make_regexp_string_iterator(
         }
         Ok(vm.make_iter_result(result, false))
     });
-    iter.borrow_mut().own_insert(
-        PropertyKey::str("next"),
-        Property::builtin(Value::Object(next)),
+    // [Symbol.toStringTag] = "RegExp String Iterator" (non-writable,
+    // non-enumerable, configurable).
+    let tag = vm.realm.symbol_to_string_tag.clone();
+    proto.borrow_mut().own_insert(
+        PropertyKey::Sym(tag),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::str("RegExp String Iterator"),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
     );
-    Value::Object(iter)
 }
 
 /// Generic `RegExp.prototype[@@replace]` (spec 22.2.6.11): honors a user

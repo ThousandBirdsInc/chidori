@@ -36,23 +36,25 @@ pub fn install(vm: &mut Vm) {
         |vm, _t, _args| {
             // Abstract-class check: `new Iterator()` (new.target whose
             // prototype IS %Iterator.prototype%) throws; a subclass or
-            // Reflect.construct target creates an ordinary object whose
-            // prototype construct_inner then rewires from new.target.
+            // Reflect.construct target creates an ordinary object with the
+            // new.target's prototype (taking the stash marks the prototype as
+            // handled here, so construct_inner leaves it alone).
             let nt = vm.native_new_target.take();
+            let mut proto = vm.realm.iterator_proto.clone();
             if let Some(nt) = &nt {
                 let p = vm.get_prop(nt, &PropertyKey::str("prototype"))?;
-                if let Value::Object(po) = &p {
+                if let Value::Object(po) = p {
                     if po.ptr_eq(&vm.realm.iterator_proto) {
                         return Err(
                             vm.throw_type("Abstract class Iterator not directly constructable")
                         );
                     }
+                    proto = po;
                 }
             }
-            Ok(Value::Object(vm.alloc(ObjectData::new(
-                Some(vm.realm.iterator_proto.clone()),
-                Internal::Ordinary,
-            ))))
+            Ok(Value::Object(
+                vm.alloc(ObjectData::new(Some(proto), Internal::Ordinary)),
+            ))
         },
     );
     // Iterator.prototype (non-writable, non-enumerable, non-configurable).

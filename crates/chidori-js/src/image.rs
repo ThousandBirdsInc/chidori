@@ -379,6 +379,7 @@ fn well_known_symbols(vm: &Vm) -> Vec<JsSymbol> {
         r.symbol_intl_plural_rules.clone(),
         r.symbol_intl_number_format.clone(),
         r.symbol_stack_start.clone(),
+        r.symbol_eval_vars.clone(),
     ]
 }
 
@@ -487,13 +488,24 @@ fn walk_frame(f: &Frame, b: &mut Baseline, q: &mut VecDeque<JsObject>) {
             Completion::Jump { .. } => {}
         }
     }
+    for c in f.finally_parks.iter().flatten() {
+        match c {
+            Completion::Return(v) | Completion::Throw(v) => walk_value(v, b, q),
+            Completion::Jump { .. } => {}
+        }
+    }
     for scope in &f.dispose_scopes {
         for (a, d) in scope {
             walk_value(a, b, q);
             walk_value(d, b, q);
         }
     }
-    for o in f.with_scope.iter().chain(f.eval_vars.iter()) {
+    for o in f
+        .with_scope
+        .iter()
+        .chain(f.eval_vars.iter())
+        .chain(f.enumerators.iter().filter_map(|(_, _, t)| t.as_ref()))
+    {
         if intern_object(b, o) {
             q.push_back(o.clone());
         }
@@ -759,6 +771,7 @@ fn internal_tag(i: &Internal) -> u8 {
         Internal::ModuleNamespace(_) => 22,
         Internal::Temporal(_) => 23,
         Internal::IteratorHelper(_) => 24,
+        Internal::RegExpStringIterator(_) => 25,
     }
 }
 
@@ -861,6 +874,8 @@ pub struct HandlerImg {
     priv_env: Option<u32>,
     delegation: bool,
     delegation_return_ip: Option<u32>,
+    #[serde(default)]
+    finally_parks_depth: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -881,6 +896,8 @@ pub struct FrameImg {
     new_target: VImg,
     handlers: Vec<HandlerImg>,
     pending_completion: Option<CompletionImg>,
+    #[serde(default)]
+    finally_parks: Vec<Option<CompletionImg>>,
     pending_throw: Option<VImg>,
     unwind_pos: Option<u32>,
     pending_return: Option<VImg>,
@@ -888,7 +905,7 @@ pub struct FrameImg {
     func_obj: Option<ORef>,
     dispose_scopes: Vec<Vec<(VImg, VImg)>>,
     completion: VImg,
-    enumerators: Vec<(Vec<KeyStrImg>, u64)>,
+    enumerators: Vec<(Vec<KeyStrImg>, u64, Option<ORef>)>,
     with_scope: Vec<ORef>,
     skip_delegation_throw: bool,
     eval_vars: Option<ORef>,
@@ -1440,6 +1457,9 @@ impl<'a> Encoder<'a> {
                     "an Iterator helper (map/filter/take/drop/flatMap) is live in the heap",
                 )
             }
+            Internal::RegExpStringIterator(_) => {
+                return unsupported("a RegExp String Iterator (matchAll) is live in the heap")
+            }
         })
     }
 
@@ -1543,6 +1563,7 @@ impl<'a> Encoder<'a> {
                 priv_env: h.priv_env.as_ref().map(|e| self.penv_ref(e)),
                 delegation: h.delegation,
                 delegation_return_ip: h.delegation_return_ip,
+                finally_parks_depth: h.finally_parks_depth as u64,
             })
             .collect::<Vec<_>>();
         let pending_completion = match &f.pending_completion {
@@ -1553,6 +1574,21 @@ impl<'a> Encoder<'a> {
                 boundary: *boundary,
             }),
             None => None,
+        };
+        let finally_parks = {
+            let mut out = Vec::with_capacity(f.finally_parks.len());
+            for p in &f.finally_parks {
+                out.push(match p {
+                    Some(Completion::Return(v)) => Some(CompletionImg::Return(self.value(v)?)),
+                    Some(Completion::Throw(v)) => Some(CompletionImg::Throw(self.value(v)?)),
+                    Some(Completion::Jump { target, boundary }) => Some(CompletionImg::Jump {
+                        target: *target,
+                        boundary: *boundary,
+                    }),
+                    None => None,
+                });
+            }
+            out
         };
         let pending_throw = match &f.pending_throw {
             Some(v) => Some(self.value(v)?),
@@ -1579,7 +1615,13 @@ impl<'a> Encoder<'a> {
         let enumerators = f
             .enumerators
             .iter()
-            .map(|(keys, cursor)| (keys.iter().map(str_img).collect(), *cursor as u64))
+            .map(|(keys, cursor, target)| {
+                (
+                    keys.iter().map(str_img).collect(),
+                    *cursor as u64,
+                    target.as_ref().map(|o| self.obj_ref(o)),
+                )
+            })
             .collect();
         let with_scope = f
             .with_scope
@@ -1599,6 +1641,7 @@ impl<'a> Encoder<'a> {
             new_target,
             handlers,
             pending_completion,
+            finally_parks,
             pending_throw,
             unwind_pos: f.unwind_pos,
             pending_return,
@@ -2213,6 +2256,7 @@ impl<'a> Decoder<'a> {
                 },
                 delegation: h.delegation,
                 delegation_return_ip: h.delegation_return_ip,
+                finally_parks_depth: h.finally_parks_depth as usize,
             });
         }
         let pending_completion = match &img.pending_completion {
@@ -2250,6 +2294,21 @@ impl<'a> Decoder<'a> {
             new_target: self.value(&img.new_target)?,
             handlers,
             pending_completion,
+            finally_parks: {
+                let mut out = Vec::with_capacity(img.finally_parks.len());
+                for pimg in &img.finally_parks {
+                    out.push(match pimg {
+                        Some(CompletionImg::Return(v)) => Some(Completion::Return(self.value(v)?)),
+                        Some(CompletionImg::Throw(v)) => Some(Completion::Throw(self.value(v)?)),
+                        Some(CompletionImg::Jump { target, boundary }) => Some(Completion::Jump {
+                            target: *target,
+                            boundary: *boundary,
+                        }),
+                        None => None,
+                    });
+                }
+                out
+            },
             pending_throw: match &img.pending_throw {
                 Some(v) => Some(self.value(v)?),
                 None => None,
@@ -2266,16 +2325,21 @@ impl<'a> Decoder<'a> {
             },
             dispose_scopes,
             completion: self.value(&img.completion)?,
-            enumerators: img
-                .enumerators
-                .iter()
-                .map(|(keys, cursor)| {
-                    (
+            enumerators: {
+                let mut out = Vec::with_capacity(img.enumerators.len());
+                for (keys, cursor, target) in &img.enumerators {
+                    let t = match target {
+                        Some(o) => Some(self.obj(o)?),
+                        None => None,
+                    };
+                    out.push((
                         keys.iter().map(|k| self.jsstring(k)).collect(),
                         *cursor as usize,
-                    )
-                })
-                .collect(),
+                        t,
+                    ));
+                }
+                out
+            },
             with_scope,
             trace_token: None,
             skip_delegation_throw: img.skip_delegation_throw,

@@ -82,6 +82,11 @@ pub struct CompiledModule {
     /// Detected by the presence of `Op::Await` in the module proto's own code —
     /// nested async functions compile to separate protos, so this is exact.
     pub has_tla: bool,
+    /// Hoisted top-level function declarations (`export default function`
+    /// included) as `(cell index, Const::Func index)`. The linker initializes
+    /// these at LINK time (spec InitializeEnvironment), so a cyclic importer
+    /// that evaluates first can already call them.
+    pub hoisted_funcs: Vec<(u32, u32)>,
 }
 
 /// Link/evaluation status of a module record (a subset of the spec's states).
@@ -90,6 +95,9 @@ pub enum ModuleStatus {
     Unlinked,
     Linked,
     Evaluating,
+    /// Started (or waiting to start) an async (top-level-await) evaluation
+    /// that has not settled yet — spec ~evaluating-async~.
+    EvaluatingAsync,
     Evaluated,
 }
 
@@ -105,6 +113,29 @@ pub struct ModuleRecord {
     pub status: ModuleStatus,
     /// The module namespace exotic object (built lazily for `import * as ns`).
     pub namespace: Option<Value>,
+    /// Spec `[[EvaluationError]]`: the error a (sync or async) evaluation threw,
+    /// cached so re-importing an errored module rejects with the same error.
+    pub eval_error: Option<Value>,
+    /// Spec `[[PendingAsyncDependencies]]`: dependencies still evaluating-async.
+    pub pending_async_deps: usize,
+    /// Spec `[[AsyncEvaluationOrder]]`: assigned when the module transitions to
+    /// evaluating-async; orders the ancestor exec list on fulfillment.
+    pub async_order: Option<u64>,
+    /// Spec `[[AsyncParentModules]]`: importers (registry keys) whose execution
+    /// waits on this module. A parent appears once per async dependency edge.
+    pub waiters: Vec<String>,
+    /// Promises to settle when this module leaves evaluating-async (the entry's
+    /// evaluation promise and any dynamic `import()` of an in-flight module),
+    /// each tagged with the registry key whose NAMESPACE resolves it — an
+    /// `import()` of a non-root cycle member parks its promise on the cycle
+    /// root but must still resolve with the requested module's namespace.
+    pub completion_promises: Vec<(crate::value::JsObject, String)>,
+    /// Spec `[[DFSIndex]]` / `[[DFSAncestorIndex]]` (Tarjan SCC bookkeeping
+    /// during evaluation) and `[[CycleRoot]]`: the root of this module's
+    /// strongly-connected component — importers of any cycle member wait on
+    /// the root, and the whole component finishes together.
+    pub dfs_ancestor: usize,
+    pub cycle_root: Option<String>,
 }
 
 impl ModuleRecord {
@@ -115,6 +146,13 @@ impl ModuleRecord {
             cells: Vec::new(),
             status: ModuleStatus::Unlinked,
             namespace: None,
+            eval_error: None,
+            pending_async_deps: 0,
+            async_order: None,
+            waiters: Vec::new(),
+            completion_promises: Vec::new(),
+            dfs_ancestor: 0,
+            cycle_root: None,
         }
     }
 }
@@ -145,6 +183,36 @@ impl Vm {
         registry: &ModuleRegistry,
         entry_key: &str,
     ) -> Result<Value, Value> {
+        self.link_module_graph(registry, entry_key)?;
+        // Phase 3: evaluate in dependency post-order (async-aware). The
+        // synchronous contract here (embedder entrypoints, the test harness)
+        // drives jobs to quiescence when the entry is still evaluating-async
+        // and reports the entry's rejection as the thrown error.
+        self.eval_modules(registry, entry_key)?;
+        let rec = self.get_module(registry, entry_key)?;
+        if rec.borrow().status == ModuleStatus::EvaluatingAsync {
+            let p = self.new_promise();
+            rec.borrow_mut()
+                .completion_promises
+                .push((p.clone(), entry_key.to_string()));
+            let _ = self.run_jobs_until_blocked();
+            if let PromiseState::Rejected(e) = self.promise_state(&p) {
+                return Err(e);
+            }
+        } else if let Some(e) = rec.borrow().eval_error.clone() {
+            return Err(e);
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// Phases 1–2.6 of `run_module_graph`: allocate stable cells, wire imports,
+    /// validate indirect exports, create hoisted functions and `import.meta`.
+    /// Idempotent for already-linked (or evaluating/evaluated) subgraphs.
+    fn link_module_graph(
+        &mut self,
+        registry: &ModuleRegistry,
+        entry_key: &str,
+    ) -> Result<(), Value> {
         // Phase 1: allocate cells for every reachable module.
         let mut order: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
@@ -168,9 +236,115 @@ impl Vm {
                 }
             }
         }
-        // Phase 3: evaluate in dependency post-order.
-        self.eval_modules(registry, entry_key, &mut HashSet::new())?;
-        Ok(Value::Undefined)
+        // Phase 2.6 (spec InitializeEnvironment step 35): hoisted function
+        // declarations are created at LINK time, so a cyclic importer whose
+        // body evaluates first can already call them. The body's own hoist
+        // pass re-initializes the same (stable) cells at evaluation.
+        for key in &order {
+            let rec = self.get_module(registry, key)?;
+            // Only freshly-linked modules: re-creating hoisted closures for a
+            // module that already started evaluating would reset live bindings.
+            if rec.borrow().status != ModuleStatus::Linked {
+                continue;
+            }
+            let (hoisted, consts) = {
+                let b = rec.borrow();
+                (b.compiled.hoisted_funcs.clone(), b.compiled.proto.clone())
+            };
+            for (cell_idx, const_idx) in &hoisted {
+                let proto = match consts.consts.get(*const_idx as usize) {
+                    Some(crate::bytecode::Const::Func(p)) => p.clone(),
+                    _ => continue,
+                };
+                let upvalues: Vec<Rc<RefCell<Value>>> = {
+                    let b = rec.borrow();
+                    proto
+                        .upvalues
+                        .iter()
+                        .map(|src| match src {
+                            crate::bytecode::UpvalueSource::ParentCell(i) => {
+                                b.cells[*i as usize].clone()
+                            }
+                            // A module top-level function has no grandparent
+                            // frame; unreachable by construction.
+                            crate::bytecode::UpvalueSource::ParentUpvalue(_) => {
+                                Rc::new(RefCell::new(Value::Undefined))
+                            }
+                        })
+                        .collect()
+                };
+                let f = self.make_closure(proto, upvalues);
+                let cell = rec.borrow().cells[*cell_idx as usize].clone();
+                *cell.borrow_mut() = Value::Object(f);
+            }
+            // `import.meta`: one ordinary null-prototype object per module
+            // (spec 13.3.12.1 + HostGetImportMetaProperties default), created
+            // once and shared by every `import.meta` in the module.
+            let meta_cell = {
+                let b = rec.borrow();
+                b.compiled
+                    .cell_of_name
+                    .get("%importmeta")
+                    .map(|i| b.cells[*i as usize].clone())
+            };
+            if let Some(cell) = meta_cell {
+                if matches!(*cell.borrow(), Value::Uninitialized) {
+                    let meta = self.new_object();
+                    meta.borrow_mut().proto = None;
+                    *cell.borrow_mut() = Value::Object(meta);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate for a dynamic `import()`: link, then return a promise that
+    /// resolves with the module's namespace once evaluation completes
+    /// (immediately for an already-evaluated module, later for a module that
+    /// is — or transitively waits on — an in-flight top-level-await body) and
+    /// rejects with the module's (possibly cached) evaluation error.
+    pub fn module_evaluate_promise(
+        &mut self,
+        registry: &ModuleRegistry,
+        key: &str,
+    ) -> Result<Value, Value> {
+        self.link_module_graph(registry, key)?;
+        let p = self.new_promise();
+        let rec = self.get_module(registry, key)?;
+        let mut status = rec.borrow().status;
+        if matches!(status, ModuleStatus::Unlinked | ModuleStatus::Linked) {
+            if let Err(e) = self.eval_modules(registry, key) {
+                self.reject_promise(&p, e);
+                return Ok(Value::Object(p));
+            }
+            status = rec.borrow().status;
+        }
+        match status {
+            ModuleStatus::EvaluatingAsync => {
+                // Spec Evaluate() on an evaluating-async module returns its
+                // CYCLE ROOT's capability; the promise still resolves with
+                // the REQUESTED module's namespace (the tag).
+                let root_key = rec.borrow().cycle_root.clone();
+                let park = match root_key {
+                    Some(rk) if rk != key => self.get_module(registry, &rk)?,
+                    _ => rec.clone(),
+                };
+                park.borrow_mut()
+                    .completion_promises
+                    .push((p.clone(), key.to_string()));
+            }
+            _ => {
+                let err = rec.borrow().eval_error.clone();
+                match err {
+                    Some(e) => self.reject_promise(&p, e),
+                    None => {
+                        let ns = self.module_namespace(registry, &rec)?;
+                        self.resolve_promise(&p, ns);
+                    }
+                }
+            }
+        }
+        Ok(Value::Object(p))
     }
 
     fn get_module(
@@ -282,43 +456,165 @@ impl Vm {
     }
 
     /// Phase 3: evaluate `key`'s dependencies, then its body, exactly once.
-    fn eval_modules(
+    /// Spec Evaluate() steps 5–9 around InnerModuleEvaluation: on an abrupt
+    /// completion, every module still on the DFS stack records the error
+    /// (status evaluated + `[[EvaluationError]]`).
+    fn eval_modules(&mut self, registry: &ModuleRegistry, key: &str) -> Result<(), Value> {
+        let mut stack: Vec<String> = Vec::new();
+        match self.inner_module_evaluation(registry, key, &mut stack, 0) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                for k in stack {
+                    if let Ok(rec) = self.get_module(registry, &k) {
+                        let _ = self.module_eval_failed(&rec, e.clone());
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Spec InnerModuleEvaluation. Bodies execute depth-first post-order; a
+    /// module with top-level await starts its async body WITHOUT blocking
+    /// siblings, and a module with an async dependency (its cycle root, for
+    /// an already-popped component) defers its own execution, registering as
+    /// a waiter (spec `[[AsyncParentModules]]`). Strongly-connected
+    /// components are detected with the spec's DFS-index bookkeeping so every
+    /// member learns its `[[CycleRoot]]`.
+    fn inner_module_evaluation(
         &mut self,
         registry: &ModuleRegistry,
         key: &str,
-        done: &mut HashSet<String>,
-    ) -> Result<(), Value> {
-        if !done.insert(key.to_string()) {
-            return Ok(());
-        }
+        stack: &mut Vec<String>,
+        mut index: usize,
+    ) -> Result<usize, Value> {
         let rec = self.get_module(registry, key)?;
-        // Already evaluated by an earlier graph run (e.g. a repeated dynamic
-        // `import()` of the same specifier): evaluate-once, like the spec's
-        // Evaluated-state short-circuit. Its dependencies are Evaluated too.
-        if rec.borrow().status == ModuleStatus::Evaluated {
-            return Ok(());
-        }
-        let (requested, resolved) = {
-            let b = rec.borrow();
-            (b.compiled.requested.clone(), b.resolved.clone())
-        };
-        for req in &requested {
-            if let Some(dep_key) = resolved.get(req) {
-                self.eval_modules(registry, dep_key, done)?;
+        match rec.borrow().status {
+            // Evaluate-once: a repeated import re-throws the cached error.
+            ModuleStatus::Evaluated => {
+                return match rec.borrow().eval_error.clone() {
+                    Some(e) => Err(e),
+                    None => Ok(index),
+                };
             }
+            // In-flight async component (the importer counts its cycle root as
+            // pending below) or a member already on the current DFS stack.
+            ModuleStatus::EvaluatingAsync | ModuleStatus::Evaluating => return Ok(index),
+            _ => {}
         }
-        // Run the body with the module's pre-allocated (import-wired) cells. Its
-        // stable top-level cells mutate in place, so the wired bindings stay live.
-        let (proto, cells, has_tla) = {
+        let my_index = index;
+        {
+            let mut b = rec.borrow_mut();
+            b.status = ModuleStatus::Evaluating;
+            b.dfs_ancestor = my_index;
+        }
+        index += 1;
+        stack.push(key.to_string());
+        let (requested, resolved, has_tla) = {
             let b = rec.borrow();
             (
-                b.compiled.proto.clone(),
-                b.cells.clone(),
+                b.compiled.requested.clone(),
+                b.resolved.clone(),
                 b.compiled.has_tla,
             )
         };
+        let mut pending = 0usize;
+        for req in &requested {
+            let dep_key = match resolved.get(req) {
+                Some(k) => k.clone(),
+                None => continue,
+            };
+            index = self.inner_module_evaluation(registry, &dep_key, stack, index)?;
+            let dep = self.get_module(registry, &dep_key)?;
+            let dep_status = dep.borrow().status;
+            // For a member of an already-finished component, the module to
+            // wait on (and whose error to inherit) is its CYCLE ROOT.
+            let required = if dep_status == ModuleStatus::Evaluating {
+                let da = dep.borrow().dfs_ancestor;
+                let mut b = rec.borrow_mut();
+                b.dfs_ancestor = b.dfs_ancestor.min(da);
+                dep.clone()
+            } else {
+                let root_key = dep.borrow().cycle_root.clone();
+                let root = match root_key {
+                    Some(rk) if rk != dep_key => self.get_module(registry, &rk)?,
+                    _ => dep.clone(),
+                };
+                let err = root.borrow().eval_error.clone();
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                root
+            };
+            // Spec 11.c.v: an async-evaluating requirement (a same-cycle
+            // member that already started its TLA body included) makes this
+            // module pending on it.
+            let is_async = {
+                let b = required.borrow();
+                b.async_order.is_some() && b.status != ModuleStatus::Evaluated
+            };
+            if is_async {
+                pending += 1;
+                required.borrow_mut().waiters.push(key.to_string());
+            }
+        }
+        rec.borrow_mut().pending_async_deps = pending;
+        if pending > 0 || has_tla {
+            // Stamp the global async-evaluation order (spec
+            // IncrementModuleAsyncEvaluationCount).
+            self.module_async_order += 1;
+            rec.borrow_mut().async_order = Some(self.module_async_order);
+        }
+        if pending == 0 {
+            if has_tla {
+                self.execute_async_module(registry, key);
+            } else {
+                self.run_module_body(&rec)?;
+            }
+        }
+        // SCC pop: this module is its component's root — every member popped
+        // here learns the root and its settled-or-async status.
+        if rec.borrow().dfs_ancestor == my_index {
+            while let Some(ckey) = stack.pop() {
+                if let Ok(c) = self.get_module(registry, &ckey) {
+                    let mut b = c.borrow_mut();
+                    b.cycle_root = Some(key.to_string());
+                    b.status = if b.async_order.is_some() {
+                        ModuleStatus::EvaluatingAsync
+                    } else {
+                        ModuleStatus::Evaluated
+                    };
+                }
+                if ckey == key {
+                    break;
+                }
+            }
+        }
+        Ok(index)
+    }
+
+    /// Run a module body synchronously with its pre-allocated (import-wired)
+    /// cells. The stable top-level cells mutate in place, keeping the wired
+    /// bindings live.
+    fn run_module_body(&mut self, rec: &Rc<RefCell<ModuleRecord>>) -> Result<(), Value> {
+        let frame = self.module_frame(rec);
+        match self.run_frame(frame) {
+            Flow::Return(_) => Ok(()),
+            Flow::Throw(e) => Err(e),
+            Flow::Suspend(_) => {
+                // A non-TLA body should never suspend; surface defensively.
+                Err(self.throw_type("module body suspended unexpectedly"))
+            }
+        }
+    }
+
+    fn module_frame(&mut self, rec: &Rc<RefCell<ModuleRecord>>) -> Box<crate::vm::Frame> {
+        let (proto, cells) = {
+            let b = rec.borrow();
+            (b.compiled.proto.clone(), b.cells.clone())
+        };
         let bf = Rc::new(BytecodeFunction {
-            proto: proto.clone(),
+            proto,
             upvalues: Vec::new(),
             home_object: None,
             is_class_ctor: false,
@@ -327,28 +623,186 @@ impl Vm {
         });
         let mut frame = self.make_frame(bf, Value::Undefined, &[], Value::Undefined);
         frame.cells = cells;
-        rec.borrow_mut().status = ModuleStatus::Evaluated;
-        if has_tla {
-            // Top-level await: evaluate the body as an async function and drive its
-            // evaluation promise to settlement (the test harness model is run-to-
-            // quiescence). A rejection is the module's top-level-await failure.
-            let promise = self.start_async(frame);
-            let _ = self.run_jobs_until_blocked();
-            if let Value::Object(p) = &promise {
-                if let PromiseState::Rejected(e) = self.promise_state(p) {
-                    return Err(e);
+        frame
+    }
+
+    /// Record a module's evaluation error (spec `[[EvaluationError]]`), mark it
+    /// evaluated, reject its completion promises, and hand the error back.
+    fn module_eval_failed(&mut self, rec: &Rc<RefCell<ModuleRecord>>, e: Value) -> Value {
+        let promises = {
+            let mut b = rec.borrow_mut();
+            if b.eval_error.is_none() {
+                b.eval_error = Some(e.clone());
+            }
+            b.status = ModuleStatus::Evaluated;
+            std::mem::take(&mut b.completion_promises)
+        };
+        for (p, _) in promises {
+            self.reject_promise(&p, e.clone());
+        }
+        e
+    }
+
+    /// Mark a module evaluated and resolve its completion promises with its
+    /// namespace object.
+    fn module_eval_done(&mut self, registry: &ModuleRegistry, rec: &Rc<RefCell<ModuleRecord>>) {
+        let promises = {
+            let mut b = rec.borrow_mut();
+            b.status = ModuleStatus::Evaluated;
+            std::mem::take(&mut b.completion_promises)
+        };
+        for (p, ns_key) in promises {
+            let ns = self
+                .module_namespace_by_key(registry, &ns_key)
+                .unwrap_or(Value::Undefined);
+            self.resolve_promise(&p, ns);
+        }
+    }
+
+    /// Spec ExecuteAsyncModule: start the TLA body as an async function and
+    /// attach callbacks that resume the module graph on settlement. The
+    /// callbacks prefer the host's LIVE registry (`Vm::module_registry`) so
+    /// waiters linked by later dynamic imports resolve; the captured snapshot
+    /// is the fallback (its records are shared `Rc`s either way).
+    fn execute_async_module(&mut self, registry: &ModuleRegistry, key: &str) {
+        let rec = match self.get_module(registry, key) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let frame = self.module_frame(&rec);
+        let promise = self.start_async(frame);
+        let p = match promise {
+            Value::Object(p) => p,
+            _ => return,
+        };
+        let snap = registry.clone();
+        let k = key.to_string();
+        let on_f = self.new_native("", 0, move |vm: &mut Vm, _t, _a: &[Value]| {
+            let reg = match vm.module_registry.as_ref() {
+                Some(r) => r.borrow().clone(),
+                None => snap.clone(),
+            };
+            vm.async_module_fulfilled(&reg, &k);
+            Ok(Value::Undefined)
+        });
+        let snap2 = registry.clone();
+        let k2 = key.to_string();
+        let on_r = self.new_native("", 1, move |vm: &mut Vm, _t, args: &[Value]| {
+            let e = args.first().cloned().unwrap_or(Value::Undefined);
+            let reg = match vm.module_registry.as_ref() {
+                Some(r) => r.borrow().clone(),
+                None => snap2.clone(),
+            };
+            vm.async_module_rejected(&reg, &k2, e);
+            Ok(Value::Undefined)
+        });
+        self.promise_then(&p, Value::Object(on_f), Value::Object(on_r));
+    }
+
+    /// Spec AsyncModuleExecutionFulfilled: mark this module done, settle its
+    /// completion promises, then execute every ancestor whose pending count
+    /// reached zero — in async-evaluation order (leaf to root).
+    fn async_module_fulfilled(&mut self, registry: &ModuleRegistry, key: &str) {
+        let rec = match self.get_module(registry, key) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if rec.borrow().eval_error.is_some() {
+            return; // already rejected through a dependency's failure
+        }
+        self.module_eval_done(registry, &rec);
+        let mut exec_list: Vec<String> = Vec::new();
+        self.gather_available_ancestors(registry, key, &mut exec_list);
+        let mut sorted: Vec<(u64, String)> = exec_list
+            .into_iter()
+            .filter_map(|k| {
+                let order = self
+                    .get_module(registry, &k)
+                    .ok()
+                    .and_then(|r| r.borrow().async_order);
+                order.map(|o| (o, k))
+            })
+            .collect();
+        sorted.sort_by_key(|(o, _)| *o);
+        for (_, wkey) in sorted {
+            let w = match self.get_module(registry, &wkey) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            // Rejected while this batch ran (a dependency's rejection
+            // propagated): spec skips it here.
+            if w.borrow().eval_error.is_some() {
+                continue;
+            }
+            if w.borrow().compiled.has_tla {
+                self.execute_async_module(registry, &wkey);
+            } else {
+                match self.run_module_body(&w) {
+                    Ok(()) => self.module_eval_done(registry, &w),
+                    Err(e) => self.async_module_rejected(registry, &wkey, e),
                 }
             }
-            Ok(())
-        } else {
-            match self.run_frame(frame) {
-                Flow::Return(_) => Ok(()),
-                Flow::Throw(e) => Err(e),
-                Flow::Suspend(_) => {
-                    // A non-TLA body should never suspend; surface defensively.
-                    Err(self.throw_type("module body suspended unexpectedly"))
+        }
+    }
+
+    /// Spec GatherAvailableAncestors: decrement each waiter's pending count;
+    /// a waiter reaching zero joins the exec list, and — when it has no TLA of
+    /// its own (it will run synchronously in this batch) — its own waiters are
+    /// gathered transitively.
+    fn gather_available_ancestors(
+        &mut self,
+        registry: &ModuleRegistry,
+        key: &str,
+        exec_list: &mut Vec<String>,
+    ) {
+        let rec = match self.get_module(registry, key) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let waiters = rec.borrow().waiters.clone();
+        for wkey in waiters {
+            let w = match self.get_module(registry, &wkey) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let (ready, has_tla) = {
+                let mut b = w.borrow_mut();
+                if b.eval_error.is_some()
+                    || b.status == ModuleStatus::Evaluated
+                    || exec_list.contains(&wkey)
+                {
+                    continue;
                 }
+                b.pending_async_deps = b.pending_async_deps.saturating_sub(1);
+                (b.pending_async_deps == 0, b.compiled.has_tla)
+            };
+            if !ready {
+                continue;
             }
+            exec_list.push(wkey.clone());
+            if !has_tla {
+                self.gather_available_ancestors(registry, &wkey, exec_list);
+            }
+        }
+    }
+
+    /// Spec AsyncModuleExecutionRejected: cache the error, reject completion
+    /// promises, and propagate to every waiting importer.
+    fn async_module_rejected(&mut self, registry: &ModuleRegistry, key: &str, e: Value) {
+        let rec = match self.get_module(registry, key) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        {
+            let b = rec.borrow();
+            if b.eval_error.is_some() || b.status == ModuleStatus::Evaluated {
+                return; // already settled
+            }
+        }
+        let e = self.module_eval_failed(&rec, e);
+        let waiters = rec.borrow().waiters.clone();
+        for wkey in waiters {
+            self.async_module_rejected(registry, &wkey, e.clone());
         }
     }
 
@@ -389,25 +843,33 @@ impl Vm {
                             .find(|i| &i.local_name == local_name)
                             .cloned();
                         if let Some(imp) = imp {
-                            let through = match &imp.import_name {
-                                ImportName::Named(n) => Some(n.clone()),
-                                ImportName::Default => Some("default".to_string()),
-                                // `import * as ns` then `export {ns}`: the
-                                // namespace itself is the binding (below).
-                                ImportName::Namespace => None,
-                            };
-                            if let Some(n) = through {
-                                let dep_key = resolved
-                                    .get(&imp.module_request)
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        self.throw_syntax(&format!(
-                                            "Cannot resolve '{}'",
-                                            imp.module_request
-                                        ))
-                                    })?;
-                                let dep = self.get_module(registry, &dep_key)?;
-                                return self.resolve_export_cell(registry, &dep, &n, seen);
+                            let dep_key =
+                                resolved.get(&imp.module_request).cloned().ok_or_else(|| {
+                                    self.throw_syntax(&format!(
+                                        "Cannot resolve '{}'",
+                                        imp.module_request
+                                    ))
+                                })?;
+                            let dep = self.get_module(registry, &dep_key)?;
+                            match &imp.import_name {
+                                ImportName::Named(n) => {
+                                    let n = n.clone();
+                                    return self.resolve_export_cell(registry, &dep, &n, seen);
+                                }
+                                ImportName::Default => {
+                                    return self
+                                        .resolve_export_cell(registry, &dep, "default", seen);
+                                }
+                                // `import * as ns` then `export {ns}` is spec
+                                // ParseModule's namespace re-export: the binding
+                                // IS the dependency's namespace object, so two
+                                // stars re-exporting namespaces of the same
+                                // module resolve unambiguously (identity is the
+                                // namespace object, not this module's cell).
+                                ImportName::Namespace => {
+                                    let ns = self.module_namespace(registry, &dep)?;
+                                    return Ok(Rc::new(RefCell::new(ns)));
+                                }
                             }
                         }
                         let idx = *module

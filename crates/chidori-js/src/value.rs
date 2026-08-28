@@ -1738,6 +1738,7 @@ impl ObjectData {
             Internal::ModuleNamespace(_) => "Module",
             Internal::Temporal(_) => "Temporal",
             Internal::IteratorHelper(_) => "Object",
+            Internal::RegExpStringIterator(_) => "Object",
         }
     }
 }
@@ -1797,6 +1798,22 @@ pub enum Internal {
     /// result) or an `Iterator.from` wrapper: a generator-like object driving
     /// an underlying iterator record through one transformation.
     IteratorHelper(Box<IteratorHelperData>),
+    /// A RegExp String Iterator (`String.prototype.matchAll` /
+    /// `RegExp.prototype[@@matchAll]` result). The brand
+    /// %RegExpStringIteratorPrototype%.next checks for.
+    RegExpStringIterator(Box<RegExpStringIterData>),
+}
+
+/// State backing an `Internal::RegExpStringIterator` object (spec
+/// CreateRegExpStringIterator's internal slots).
+pub struct RegExpStringIterData {
+    /// The matcher object ([[IteratingRegExp]]).
+    pub matcher: Value,
+    /// The subject string ([[IteratedString]]).
+    pub string: JsString,
+    pub global: bool,
+    pub unicode: bool,
+    pub done: bool,
 }
 
 /// State backing an `Internal::IteratorHelper` object.

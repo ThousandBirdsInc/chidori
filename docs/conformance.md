@@ -47,7 +47,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 40556  fail 208  skip 6527  =>  99.49% of executed
+  pass 40758  fail 4  skip 6529  =>  99.99% of executed
 ```
 
 ## Current result
@@ -57,16 +57,23 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 40,556 | 208 | 6,527 | **99.49%** |
+| chidori pure-Rust engine, bare context | 40,758 | 4 | 6,529 | **99.99%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
 
-Recently promoted out of the skip list (implemented and now held to
-account): iterator helpers, `Array.fromAsync`, `Uint8Array` base64/hex, and
-duplicate named capture groups. `built-ins/RegExp`, `built-ins/Promise`,
-`built-ins/Function`, `built-ins/Array`, `built-ins/TypedArray`, and the
-whole iterator/async-iterator surface each pass 100% of executed tests.
+Every executed directory except `language/literals/regexp` passes 100%:
+all of `built-ins/*` (RegExp, Promise, Function, Array, TypedArray, Proxy,
+the whole iterator/async-iterator surface, …) and all of `language/*`
+including the once-hard clusters — module namespaces and their TDZ
+internals, top-level-await evaluation ordering (spec
+`[[AsyncEvaluationOrder]]`/`[[CycleRoot]]` semantics), dynamic `import()`
+(errored-module caching, in-flight-module waiting), `import.meta`,
+global/eval lexical bindings, `with`-statement bindings, mapped arguments,
+and destructuring/relational evaluation order. Recently promoted out of the
+skip list (implemented and now held to account): iterator helpers,
+`Array.fromAsync`, `Uint8Array` base64/hex, and duplicate named capture
+groups.
 
 ## What is measured, and why "bare context"
 
@@ -154,7 +161,10 @@ engines lack. The list lives in `UNSUPPORTED_FEATURES` in
 `import-attributes`, `WeakRef`/`FinalizationRegistry`), plus `intl402/`
 (skipped unless `--intl`), Temporal-tagged tests (skipped unless
 `--temporal`), and the agent (`CanBlock`, and the
-`atomicsHelper.js` multi-agent harness) tests. When the engine grows to cover a
+`atomicsHelper.js` multi-agent harness) tests. A handful of tests call
+`$262.createRealm` without carrying the `cross-realm` feature tag; the
+runner detects the call in source and gives them the same honest skip as
+the tagged tests (a second realm cannot be hosted either way). When the engine grows to cover a
 skipped feature, delete its entry and the suite starts holding it to account.
 
 `SharedArrayBuffer` and `Atomics` **are** implemented (their feature tags are
@@ -238,7 +248,8 @@ Each type covers its constructor, accessors, arithmetic (`add`/`subtract`/
 `toLocaleString` with their rounding/calendar/offset display options, and
 `from`. `Duration.round`/`total`/`compare` honor a PlainDate `relativeTo`.
 `Temporal.Now` reads the system clock — the one real-clock surface in the
-bare conformance context (`Date` stays frozen there by engine policy); the
+bare conformance context (`Date` never reads the host clock there by engine
+policy: it ticks a deterministic monotonic counter, 1ms per read); the
 durable runtime captures time as an effect at a higher layer.
 
 The residual failures are concentrated in `ZonedDateTime`'s full property-bag
@@ -268,66 +279,45 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the **208** the committed
-baseline records — the table below and the headline number come from the same
-`test262-expectations.json`). The counts shift as engine work lands —
-refresh from a `--json` report before targeting:
+The committed baseline records **4** residual failures, all in one cluster
+(the table and the headline number come from the same
+`test262-expectations.json`):
 
 | area | nature |
 |---|---|
-| `built-ins/RegExp` | `v`-flag set operations (`unicodeSets`); `\p{...}` property-of-strings; `prototype` long tail |
-| `language/expressions` | dynamic-`import()` semantics and the last class/eval corners |
-| `language/statements` | labelled/eval interplay and remaining class corners |
-| `built-ins/Object` | sparse indices beyond the dense cap; descriptor corners |
-| `language/module-code` | namespace internals, hoisted default-function exports, TLA ordering |
-| `language/eval-code` | eval-created global binding attributes, lexical/var collisions |
-| `built-ins/Array` | sparse indices beyond the dense cap |
-| `built-ins/String` | full Unicode case folding (`fold` is a simple-fold approximation) |
-| `built-ins/TypedArray` | `subarray`/`set` corners on resizable buffers |
-| `language/global-code` | global lexical/var binding interactions |
-| `language/literals/regexp` | `eval("/"+fromCharCode(cu)+"/").source` round-trip — a UTF-8 (oxc) front-end limit; `String.fromCharCode` stays lossy without regex-/eval-source byte-span fidelity |
-| `built-ins/ArrayBuffer` | resizable-buffer `slice`/transfer corners |
+| `language/literals/regexp` (`S7.8.5_A1.1_T2`, `A1.4_T2`, `A2.1_T2`, `A2.4_T2`) | `eval("/" + String.fromCharCode(cu) + "/").source` must round-trip every code unit, LONE SURROGATES included. The engine's source pipeline is UTF-8 (`&str` into the oxc parser), so an unpaired surrogate in eval'd source text becomes U+FFFD before the parser ever sees it. Fixing this needs a WTF-8 source path through the front end — an architectural change, deliberately deferred. String VALUES are unaffected (`JsString` is WTF-8 and round-trips surrogates); only surrogates in *source text fed to `eval`* are lossy. |
 
-Each failure is individually identifiable from a `--json` report, so the
-clusters can be picked off as engine work warrants.
+Each failure is individually identifiable from a `--json` report.
 
 ## What the deviations mean for determinism and replay
 
 The question a durability adopter actually asks is not "how many Test262
 failures" but "can a deviation desynchronize a recorded run". Classified
-against the committed baseline's 208 failures:
+against the committed baseline's 4 failures:
 
 - **Every remaining deviation is *stable*: the engine produces the same
   (spec-divergent) result on every execution of the same program.** There is
-  no randomness or environment dependence in any failing cluster. Within one
+  no randomness or environment dependence in the failing cluster. Within one
   engine build, record and replay therefore see byte-identical behavior —
   a spec deviation cannot, by itself, perturb a journal. This is not an
   assertion but a **CI-enforced invariant**: `scripts/test262.sh --stability`
   re-runs every baseline-failing test three times (`test262-runner
   --repeat 3`) and fails on any outcome that varies between runs; the
   `stability` job in `.github/workflows/test262.yml` runs it beside the
-  sharded gate. (Measured at the current baseline: 208 tests × 3 runs,
-  0 unstable. The gated surface also carries no ambient nondeterminism to
-  leak into a result — `Date` is frozen and `Math.random()` is seeded per
-  VM, by engine policy; the one real-clock surface, `Temporal.Now`, is
-  opt-in and outside the committed baseline.)
-- **Evaluation-order clusters** (compound-assignment reference order,
-  relational-operator coercion order, `yield`/generator corners — ~50 tests)
-  deviate in *which order* observable operations happen, deterministically.
-  If agent code routes such an observation through a host effect, the
-  journal records the order the engine actually used, and replay reproduces
-  it. The exposure is **cross-build replay**: a journal recorded on an
-  engine where the order was wrong, replayed on a build where it was fixed,
-  diverges — and fails **loudly** at the first divergent call
-  (`try_replay_checked` compares function + arguments), never silently.
-- **Module/`eval` clusters** (dynamic `import()` semantics, TLA ordering,
-  namespace internals, `eval`/`with`/mapped-`arguments` — ~60 tests) sit on
-  surfaces durable agents largely cannot reach: transpilation rejects
-  dynamic `import()` in project files outright, and `eval`-heavy code fails
-  before determinism is at stake.
-- **Value-shape clusters** (RegExp `v`-flag, Unicode case folding, sparse
-  indices past the dense cap, resizable-buffer corners) produce wrong-but-
-  fixed values; the record/replay argument above applies unchanged.
+  sharded gate. (The gated surface also carries no ambient nondeterminism to
+  leak into a result — `Date` reads a deterministic monotonic counter that
+  advances 1ms per read (never the host clock, so the same program sees the
+  same readings on every run while elapsed-time polling still terminates)
+  and `Math.random()` is seeded per VM, by engine policy; the one real-clock
+  surface, `Temporal.Now`, is opt-in and outside the committed baseline.)
+- **The one failing cluster is a value-shape deviation**: a lone surrogate
+  in `eval`'d *source text* reaches the parser as U+FFFD (see [Remaining
+  gaps](#remaining-gaps)), producing a wrong-but-fixed `source` string. The
+  record/replay argument above applies unchanged; the exposure is
+  **cross-build replay** — a journal recorded on a build with the deviation,
+  replayed on a build that fixed it, diverges and fails **loudly** at the
+  first divergent call (`try_replay_checked` compares function + arguments),
+  never silently.
 
 Separately from Test262: the engine's *optimization tiers* are the one place
 an execution-order perturbation could differ between two executions of the

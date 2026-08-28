@@ -742,12 +742,12 @@ pub fn install(vm: &mut Vm) {
         "Date",
         7,
         // [[Call]] (without `new`) -> returns a date string for "now".
-        |_vm, _this, _args| Ok(Value::str(to_full_string(0.0))),
+        |vm, _this, _args| Ok(Value::str(to_full_string(vm.now_ms()))),
         // [[Construct]] (`new Date(...)`).
         |vm, _this, args| {
             let ms = if args.is_empty() {
-                // No host clock: fixed epoch.
-                0.0
+                // No host clock: the deterministic monotonic counter.
+                vm.now_ms()
             } else if args.len() == 1 {
                 let v = arg(args, 0);
                 // new Date(dateObject) copies its time value.
@@ -782,9 +782,10 @@ pub fn install(vm: &mut Vm) {
     vm.install_ctor("Date", &ctor, &proto);
 
     // ----- static methods -----
-    vm.define_method(&ctor, "now", 0, |_vm, _t, _a| {
-        // No host clock: fixed epoch.
-        Ok(Value::Number(0.0))
+    vm.define_method(&ctor, "now", 0, |vm, _t, _a| {
+        // No host clock: a deterministic monotonic counter (see `Vm::now_ms`),
+        // so time-polling loops observe progress while replay stays exact.
+        Ok(Value::Number(vm.now_ms()))
     });
     vm.define_method(&ctor, "parse", 1, |vm, _t, args| {
         let s = vm.to_js_string(&arg(args, 0))?;

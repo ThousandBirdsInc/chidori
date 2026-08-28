@@ -638,7 +638,7 @@ fn canonical_loop_gets_a_kernel() {
         n
     }
     let proto =
-        compile_script("let s = 0; for (let i = 0; i < 10; i++) { s += i * 2 - (i % 3); } s;")
+        compile_script("{ let s = 0; for (let i = 0; i < 10; i++) { s += i * 2 - (i % 3); } s; }")
             .expect("compiles");
     assert!(
         count_kernels(&proto) >= 1,
@@ -787,7 +787,7 @@ fn global_callee_loops_get_kernels() {
         n
     }
     // The sort workload's fill loop: a cell-writing global callee.
-    let src = "let seed = 1; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; } const a = new Array(10); for (let i = 0; i < 10; i++) a[i] = rnd(); console.log(a[9]);";
+    let src = "{ let seed = 1; function rnd() { seed = (seed * 1103515245 + 12345) >>> 0; return seed; } const a = new Array(10); for (let i = 0; i < 10; i++) a[i] = rnd(); console.log(a[9]); }";
     let proto = compile_script(src).expect("compiles");
     assert!(
         kernels_in(&proto) >= 1,
@@ -956,7 +956,7 @@ fn property_loops_get_kernels() {
         n
     }
     let proto = compile_script(
-        "const o = { a: 0, b: 0, c: 0 }; for (let i = 0; i < 10; i++) { o.a = i; o.b = o.a + 1; o.c = o.b + o.a; } o.c;",
+        "{ const o = { a: 0, b: 0, c: 0 }; for (let i = 0; i < 10; i++) { o.a = i; o.b = o.a + 1; o.c = o.b + o.a; } o.c; }",
     )
     .expect("compiles");
     assert!(count(&proto) >= 1, "property get/set loop must kernelize");
@@ -976,8 +976,8 @@ fn closure_call_loops_get_kernels() {
         n
     }
     for src in [
-        "function adder(n) { return function (x) { return x + n; }; } const f = adder(5); let s = 0; for (let i = 0; i < 10; i++) s = f(s) - 4; s;",
-        "const inc = x => x + 1; const dbl = x => x * 2; let s = 0; for (let i = 0; i < 10; i++) { s = dbl(inc(s)); } s;",
+        "{ function adder(n) { return function (x) { return x + n; }; } const f = adder(5); let s = 0; for (let i = 0; i < 10; i++) s = f(s) - 4; s; }",
+        "{ const inc = x => x + 1; const dbl = x => x * 2; let s = 0; for (let i = 0; i < 10; i++) { s = dbl(inc(s)); } s; }",
     ] {
         let proto = compile_script(src).expect("compiles");
         assert!(

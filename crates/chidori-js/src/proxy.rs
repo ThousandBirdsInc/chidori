@@ -465,23 +465,16 @@ impl Vm {
                 if matches!(target.borrow().internal, Internal::Proxy(_)) {
                     return self.proxy_set_prototype_of(&target, proto);
                 }
-                if !target.borrow().extensible {
-                    // A non-extensible target's prototype is fixed: succeed only if
-                    // the value matches the current prototype.
-                    let current = target
-                        .borrow()
-                        .proto
-                        .clone()
-                        .map(Value::Object)
-                        .unwrap_or(Value::Null);
-                    return Ok(same_value(&proto, &current));
-                }
+                // OrdinarySetPrototypeOf on the target: same-value fast path,
+                // extensibility, immutable-prototype exotics, and the
+                // prototype-chain cycle check all apply.
                 let p = match &proto {
                     Value::Object(po) => Some(po.clone()),
                     _ => None,
                 };
-                target.borrow_mut().proto = p;
-                Ok(true)
+                Ok(crate::builtins::fundamental::ordinary_set_prototype_of(
+                    self, &target, p,
+                ))
             }
             Some(trap) => {
                 let r = self.call(
@@ -543,8 +536,9 @@ impl Vm {
                 if matches!(target.borrow().internal, Internal::Proxy(_)) {
                     return self.proxy_prevent_extensions(&target);
                 }
-                target.borrow_mut().extensible = false;
-                Ok(true)
+                Ok(crate::builtins::fundamental::ordinary_prevent_extensions(
+                    &target,
+                ))
             }
             Some(trap) => {
                 let r = self.call(

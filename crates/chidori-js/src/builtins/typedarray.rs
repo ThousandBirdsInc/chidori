@@ -155,34 +155,49 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
     let proto = vm.realm.array_buffer_proto.clone();
 
     let construct = |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
-        let len = byte_length_arg(vm, &arg(args, 0))?;
-        let buf = vm.new_array_buffer(len);
+        let len = to_index_arg(vm, &arg(args, 0))?;
         // Optional `{ maxByteLength }` makes the buffer resizable.
-        match arg(args, 1) {
-            Value::Undefined => {}
+        // GetArrayBufferMaxByteLengthOption: a non-object `options` is
+        // ignored (the buffer is non-resizable), not a TypeError.
+        let max = match arg(args, 1) {
             Value::Object(opts) => {
                 let mbl = vm.get_prop(&Value::Object(opts), &PropertyKey::str("maxByteLength"))?;
-                if !mbl.is_undefined() {
-                    let max = byte_length_arg(vm, &mbl)?;
-                    if len > max {
-                        return Err(vm.throw_range("ArrayBuffer length exceeds maxByteLength"));
-                    }
-                    buf.borrow_mut().own_insert(
-                        PropertyKey::str(AB_MAX),
-                        Property {
-                            kind: PropertyKind::Data {
-                                value: Value::Number(max as f64),
-                                writable: false,
-                            },
-                            enumerable: false,
-                            configurable: false,
-                        },
-                    );
+                if mbl.is_undefined() {
+                    None
+                } else {
+                    Some(to_index_arg(vm, &mbl)?)
                 }
             }
-            // GetArrayBufferMaxByteLengthOption: a non-object `options` is
-            // ignored (the buffer is non-resizable), not a TypeError.
-            _ => {}
+            _ => None,
+        };
+        if let Some(max) = max {
+            if len > max {
+                return Err(vm.throw_range("ArrayBuffer length exceeds maxByteLength"));
+            }
+        }
+        // AllocateArrayBuffer: OrdinaryCreateFromConstructor runs BEFORE the
+        // data block is allocated — a throwing `new.target.prototype` getter
+        // wins over an allocation-size RangeError.
+        let proto = resolve_ctor_proto(vm, vm.realm.array_buffer_proto.clone())?;
+        if len > crate::value::MAX_DENSE_ARRAY
+            || max.is_some_and(|m| m > crate::value::MAX_DENSE_ARRAY)
+        {
+            return Err(vm.throw_range("ArrayBuffer allocation exceeds engine limit"));
+        }
+        let buf = vm.new_array_buffer(len);
+        buf.borrow_mut().proto = Some(proto);
+        if let Some(max) = max {
+            buf.borrow_mut().own_insert(
+                PropertyKey::str(AB_MAX),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Number(max as f64),
+                        writable: false,
+                    },
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
         }
         Ok(Value::Object(buf))
     };
@@ -411,10 +426,18 @@ fn install_shared_array_buffer(vm: &mut Vm, species: &JsSymbol) {
     let proto = vm.realm.shared_array_buffer_proto.clone();
 
     let construct = |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
-        let len = byte_length_arg(vm, &arg(args, 0))?;
+        let len = to_index_arg(vm, &arg(args, 0))?;
         // Optional `{ maxByteLength }` makes the buffer growable.
         let max = max_byte_length_option(vm, &arg(args, 1), len)?;
-        Ok(Value::Object(vm.new_shared_array_buffer(len, max)))
+        // OrdinaryCreateFromConstructor runs before the data block is
+        // allocated (see the ArrayBuffer constructor).
+        let proto = resolve_ctor_proto(vm, vm.realm.shared_array_buffer_proto.clone())?;
+        if len > crate::value::MAX_DENSE_ARRAY {
+            return Err(vm.throw_range("SharedArrayBuffer allocation exceeds engine limit"));
+        }
+        let buf = vm.new_shared_array_buffer(len, max);
+        buf.borrow_mut().proto = Some(proto);
+        Ok(Value::Object(buf))
     };
     let ctor = vm.new_native_ctor(
         "SharedArrayBuffer",
@@ -566,7 +589,10 @@ fn install_shared_array_buffer(vm: &mut Vm, species: &JsSymbol) {
 }
 
 /// ToIndex-ish coercion for a byte length / count, with the dense-allocation cap.
-fn byte_length_arg(vm: &mut Vm, v: &Value) -> Result<usize, Value> {
+/// Spec `ToIndex`: RangeError for negative, non-integral-after-truncation, or
+/// 2^53-and-larger values, but no engine allocation limit — that check belongs
+/// to the data-block allocation step, which runs later than ToIndex does.
+fn to_index_arg(vm: &mut Vm, v: &Value) -> Result<usize, Value> {
     let n = to_integer_or_infinity(vm, v)?;
     if n < 0.0 || n.is_infinite() {
         return Err(vm.throw_range("Invalid array buffer length"));
@@ -575,10 +601,35 @@ fn byte_length_arg(vm: &mut Vm, v: &Value) -> Result<usize, Value> {
     if (len as f64) != n {
         return Err(vm.throw_range("Invalid array buffer length"));
     }
+    Ok(len)
+}
+
+fn byte_length_arg(vm: &mut Vm, v: &Value) -> Result<usize, Value> {
+    let len = to_index_arg(vm, v)?;
     if len > crate::value::MAX_DENSE_ARRAY {
         return Err(vm.throw_range("ArrayBuffer allocation exceeds engine limit"));
     }
     Ok(len)
+}
+
+/// GetPrototypeFromConstructor performed INSIDE a builtin constructor at the
+/// spec's point in its algorithm (e.g. before a data block is allocated, or
+/// after argument coercion but before final revalidation). Consumes the
+/// stashed `new.target`, which tells `construct_inner` the prototype has been
+/// applied and must not be re-read afterwards. A non-object `prototype` (or a
+/// plain `new Ctor()` where new.target has no override) falls back to
+/// `fallback`.
+fn resolve_ctor_proto(vm: &mut Vm, fallback: JsObject) -> Result<JsObject, Value> {
+    match vm.native_new_target.take() {
+        Some(nt @ Value::Object(_)) => {
+            let p = vm.get_prop(&nt, &PropertyKey::str("prototype"))?;
+            Ok(match p {
+                Value::Object(o) => o,
+                _ => fallback,
+            })
+        }
+        _ => Ok(fallback),
+    }
 }
 
 // =========================================================================
@@ -2194,8 +2245,19 @@ fn install_data_view(vm: &mut Vm) {
             }
             (l, false)
         };
+        // OrdinaryCreateFromConstructor may run user code (a `prototype`
+        // getter on new.target) that detaches or resizes the buffer — the
+        // spec revalidates afterwards, before the instance escapes.
+        let proto = resolve_ctor_proto(vm, vm.realm.data_view_proto.clone())?;
+        if matches!(buffer.borrow().internal, Internal::ArrayBuffer(None)) {
+            return Err(vm.throw_type("Cannot construct a DataView on a detached ArrayBuffer"));
+        }
+        let buf_len = buffer_byte_length(&buffer);
+        if byte_offset > buf_len || (!length_tracking && byte_offset + byte_length > buf_len) {
+            return Err(vm.throw_range("Invalid DataView length"));
+        }
         let dv = vm.alloc(ObjectData::new(
-            Some(vm.realm.data_view_proto.clone()),
+            Some(proto),
             Internal::DataView(DataViewData {
                 buffer,
                 byte_offset,

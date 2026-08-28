@@ -3059,6 +3059,7 @@ impl Vm {
         frame.new_target = Value::Undefined;
         frame.handlers.clear();
         frame.pending_completion = None;
+        frame.finally_parks.clear();
         frame.pending_throw = None;
         frame.pending_return = None;
         frame.unwind_pos = None;
@@ -3147,6 +3148,7 @@ impl Vm {
                 new_target: Value::Undefined,
                 handlers: Vec::new(),
                 pending_completion: None,
+                finally_parks: Vec::new(),
                 pending_throw: None,
                 unwind_pos: None,
                 pending_return: None,
@@ -3278,11 +3280,19 @@ impl Vm {
             }
             Disp::Native(c) => {
                 // Stash new.target for hooks that need it (the abstract
-                // `Iterator` constructor); overwritten per native construct.
+                // `Iterator` constructor, and builtins that must read
+                // `new.target.prototype` at their spec-mandated point);
+                // overwritten per native construct. A builtin that `take()`s
+                // the stash has done GetPrototypeFromConstructor itself, so
+                // the post-hoc fix below must not read `prototype` again.
                 self.native_new_target = Some(new_target.clone());
                 let r = c(self, Value::Undefined, args);
+                let proto_handled = self.native_new_target.is_none();
                 self.native_new_target = None;
                 let r = r?;
+                if proto_handled {
+                    return Ok(r);
+                }
                 // GetPrototypeFromConstructor: when constructed via a different
                 // new.target (a subclass `super()` or Reflect.construct), the
                 // fresh instance's [[Prototype]] comes from new_target.prototype
@@ -3668,14 +3678,29 @@ impl Vm {
                     ));
                 }
                 if let Some(b) = desc.bindings.iter().find(|b| &b.name == name) {
-                    if b.is_lexical {
+                    // Only bindings in the eval caller's OWN variable-scope
+                    // chain participate in EvalDeclarationInstantiation: a
+                    // lexical one collides, a var/param one absorbs the
+                    // declaration (writes hit the live cell). A same-named
+                    // binding in an enclosing function does neither — the
+                    // eval still creates a fresh var in the caller's scope.
+                    if b.own_scope {
+                        if b.is_lexical {
+                            return Err(self.throw_syntax(&format!(
+                                "Identifier '{name}' has already been declared"
+                            )));
+                        }
+                        continue;
+                    }
+                }
+                if desc.is_global_var_scope {
+                    // EvalDeclarationInstantiation: an eval var may not shadow
+                    // a global lexical binding.
+                    if self.global_lexicals.contains_key(name) {
                         return Err(self.throw_syntax(&format!(
                             "Identifier '{name}' has already been declared"
                         )));
                     }
-                    continue; // visible var/param: writes hit the live cell
-                }
-                if desc.is_global_var_scope {
                     // CanDeclareGlobalVar: a fresh global binding requires an
                     // extensible global object.
                     let g = self.realm.global.clone();
@@ -3703,6 +3728,7 @@ impl Vm {
                         None => {
                             let o =
                                 self.alloc(crate::value::ObjectData::new(None, Internal::Ordinary));
+                            self.mark_eval_vars_scope(&o);
                             frame.with_scope.insert(0, o.clone());
                             frame.eval_vars = Some(o.clone());
                             o
@@ -3788,6 +3814,9 @@ impl Vm {
             // Restore the private-environment chain (a class definition that
             // threw mid-evaluation must not leak its private scope).
             frame.priv_env = h.priv_env.clone();
+            // Abort any finalizer regions inner to this handler: their parked
+            // completions are superseded by `comp`.
+            frame.finally_parks.truncate(h.finally_parks_depth);
             if let Completion::Throw(err) = &comp {
                 if let Some(catch_ip) = h.catch_ip {
                     if !(skip_delegation && h.delegation) {
@@ -4224,6 +4253,20 @@ impl Vm {
         name: JsString,
         ic: Option<&crate::bytecode::IcEntry>,
     ) -> Result<Value, Value> {
+        // Global lexicals (script-level let/const/class) shadow global-object
+        // properties. The emptiness check keeps the hot path one branch.
+        if !self.global_lexicals.is_empty() {
+            if let Some(lex) = self.global_lexicals.get(name.as_str()) {
+                let v = lex.cell.borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference(&format!(
+                        "Cannot access '{}' before initialization",
+                        name.as_str()
+                    )));
+                }
+                return Ok(v);
+            }
+        }
         let g = self.realm.global.clone();
         // Inline cache (key-verified slot hint; see `FuncProto::ic`):
         // after the first resolution, a global read — above all a
@@ -4286,6 +4329,24 @@ impl Vm {
         v: Value,
         strict: bool,
     ) -> Result<(), Value> {
+        // Global lexicals shadow the global object: TDZ before initialization,
+        // TypeError on const reassignment, plain cell write otherwise.
+        if !self.global_lexicals.is_empty() {
+            if let Some(lex) = self.global_lexicals.get(name.as_str()) {
+                if matches!(*lex.cell.borrow(), Value::Uninitialized) {
+                    return Err(self.throw_reference(&format!(
+                        "Cannot access '{}' before initialization",
+                        name.as_str()
+                    )));
+                }
+                if lex.is_const {
+                    return Err(self.throw_type("Assignment to constant variable."));
+                }
+                let cell = lex.cell.clone();
+                *cell.borrow_mut() = v;
+                return Ok(());
+            }
+        }
         let g = self.realm.global.clone();
         let key = PropertyKey::Str(name.clone());
         // A bare assignment to a name bound nowhere is an unresolvable
@@ -4360,7 +4421,56 @@ impl Vm {
     }
 
     /// `Op::DeclareGlobal` / `ROp::DeclareGlobal` body.
+    /// `Op::GlobalDeclChecks` body: GlobalDeclarationInstantiation's collision
+    /// checks, all of them before any binding is created (a failing script
+    /// leaves the global environment untouched).
+    pub(crate) fn global_decl_checks(
+        &mut self,
+        decls: &crate::bytecode::GlobalDecls,
+    ) -> Result<(), Value> {
+        let g = self.realm.global.clone();
+        for name in &decls.lex_names {
+            if self.global_lexicals.contains_key(name) {
+                return Err(
+                    self.throw_syntax(&format!("Identifier '{name}' has already been declared"))
+                );
+            }
+            // HasRestrictedGlobalProperty: an existing NON-configurable own
+            // property of the global object (e.g. `undefined`, or a
+            // script-created `var`) may not be shadowed by a lexical.
+            let restricted = matches!(
+                g.borrow().own_get(&PropertyKey::str(name)),
+                Some(Property {
+                    configurable: false,
+                    ..
+                })
+            );
+            if restricted {
+                return Err(
+                    self.throw_syntax(&format!("Identifier '{name}' has already been declared"))
+                );
+            }
+        }
+        for name in &decls.var_names {
+            if self.global_lexicals.contains_key(name) {
+                return Err(
+                    self.throw_syntax(&format!("Identifier '{name}' has already been declared"))
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn declare_global(&mut self, name: JsString, deletable: bool) -> Result<(), Value> {
+        // A global var/function may not shadow a global lexical binding
+        // (GlobalDeclarationInstantiation / EvalDeclarationInstantiation both
+        // check HasLexicalDeclaration first).
+        if !self.global_lexicals.is_empty() && self.global_lexicals.contains_key(name.as_str()) {
+            return Err(self.throw_syntax(&format!(
+                "Identifier '{}' has already been declared",
+                name.as_str()
+            )));
+        }
         let g = self.realm.global.clone();
         let key = PropertyKey::Str(name.clone());
         let (present, extensible) = {
@@ -4755,21 +4865,54 @@ impl Vm {
         v: &Value,
     ) -> Result<Value, Value> {
         let keys = self.for_in_keys(v)?;
-        frame.enumerators.push((keys, 0));
+        let target = match v {
+            Value::Object(o) => Some(o.clone()),
+            _ => None,
+        };
+        frame.enumerators.push((keys, 0, target));
         Ok(Value::Number((frame.enumerators.len() - 1) as f64))
     }
 
-    /// `Op::ForInNext` / `ROp::ForInNext` body: `(key, has_next)`.
-    pub(crate) fn for_in_next(frame: &mut Frame) -> (Value, Value) {
+    /// `Op::ForInNext` / `ROp::ForInNext` body: `(key, has_next)`. A key
+    /// deleted (from both the object and its prototype chain) since the
+    /// snapshot is skipped, per EnumerateObjectProperties.
+    pub(crate) fn for_in_next(&self, frame: &mut Frame) -> (Value, Value) {
         let idx = frame.enumerators.len() - 1;
-        let (keys, cursor) = &mut frame.enumerators[idx];
-        if *cursor < keys.len() {
+        let (keys, cursor, target) = &mut frame.enumerators[idx];
+        while *cursor < keys.len() {
             let k = keys[*cursor].clone();
             *cursor += 1;
-            (Value::String(k), Value::Bool(true))
-        } else {
-            (Value::Undefined, Value::Bool(false))
+            let live = match target {
+                Some(t) => {
+                    // Exotic own keys (dense array indices, string/typed-array
+                    // elements) live in `internal`, not `props` — walk the
+                    // chain with the exotic-aware existence check. A Proxy
+                    // level ends the walk as "live": its presence check is the
+                    // trap, which this infallible path must not re-enter (the
+                    // snapshot already consulted it).
+                    let key = PropertyKey::Str(k.clone());
+                    let mut cur = t.clone();
+                    loop {
+                        if matches!(cur.borrow().internal, crate::value::Internal::Proxy(_)) {
+                            break true;
+                        }
+                        if crate::builtins::fundamental::own_property_exists(&cur, &key) {
+                            break true;
+                        }
+                        let proto = cur.borrow().proto.clone();
+                        match proto {
+                            Some(p) => cur = p,
+                            None => break false,
+                        }
+                    }
+                }
+                None => true,
+            };
+            if live {
+                return (Value::String(k), Value::Bool(true));
+            }
         }
+        (Value::Undefined, Value::Bool(false))
     }
 
     fn const_name(&self, frame: &Frame, idx: u32) -> JsString {
@@ -5326,6 +5469,7 @@ impl Vm {
                         priv_env: frame.priv_env.clone(),
                         delegation: false,
                         delegation_return_ip: None,
+                        finally_parks_depth: frame.finally_parks.len(),
                     });
                 }
                 ROp::PopTryHandler => {
@@ -5337,10 +5481,14 @@ impl Vm {
                         boundary: *boundary,
                     });
                 }
+                ROp::EnterFinally => {
+                    let parked = frame.pending_completion.take();
+                    frame.finally_parks.push(parked);
+                }
                 ROp::EndFinally => {
-                    // Resume a parked non-local completion; the normal path
-                    // (finalizer ran with nothing parked) falls through.
-                    if let Some(c) = frame.pending_completion.take() {
+                    // Resume this REGION's parked non-local completion; the
+                    // normal path (nothing parked) falls through.
+                    if let Some(c) = frame.finally_parks.pop().flatten() {
                         complete!(c);
                     }
                 }
@@ -5396,6 +5544,7 @@ impl Vm {
             // translation — but kept for exactness).
             frame.with_scope.truncate(h.with_depth);
             frame.priv_env = h.priv_env.clone();
+            frame.finally_parks.truncate(h.finally_parks_depth);
             if let Completion::Throw(err) = &comp {
                 if let Some(catch_ip) = h.catch_ip {
                     frame.locals[base] = err.clone();
@@ -5706,7 +5855,7 @@ impl Vm {
                 wr!(*dst, idx);
             }
             ROp::ForInNext { dst } => {
-                let (k, more) = Self::for_in_next(frame);
+                let (k, more) = self.for_in_next(frame);
                 wr!(*dst, k);
                 wr!(*dst + 1, more);
             }
@@ -5719,7 +5868,8 @@ impl Vm {
                 // result is a TypeError.
                 let it = rd!(*it);
                 let completion_is_throw =
-                    matches!(frame.pending_completion, Some(Completion::Throw(_)));
+                    matches!(frame.finally_parks.last(), Some(Some(Completion::Throw(_))))
+                        || matches!(frame.pending_completion, Some(Completion::Throw(_)));
                 let ret = match self.get_prop(&it, &crate::names::key_return()) {
                     Ok(r) => r,
                     Err(e) => {
@@ -5752,7 +5902,7 @@ impl Vm {
                 }
             }
             ROp::ForInPop => {
-                if let Some((keys, _)) = frame.enumerators.pop() {
+                if let Some((keys, ..)) = frame.enumerators.pop() {
                     self.park_forin_vec(keys);
                 }
             }
@@ -6302,26 +6452,26 @@ impl Vm {
             Op::Lt => {
                 let b = pop!();
                 let a = pop!();
-                let r = self.less_than(&a, &b)?;
-                push!(Value::Bool(r == Some(true)));
+                let r = self.cmp_values(CmpOp::Lt, &a, &b)?;
+                push!(Value::Bool(r));
             }
             Op::Gt => {
                 let b = pop!();
                 let a = pop!();
-                let r = self.less_than(&b, &a)?;
-                push!(Value::Bool(r == Some(true)));
+                let r = self.cmp_values(CmpOp::Gt, &a, &b)?;
+                push!(Value::Bool(r));
             }
             Op::Le => {
                 let b = pop!();
                 let a = pop!();
-                let r = self.less_than(&b, &a)?;
-                push!(Value::Bool(r == Some(false)));
+                let r = self.cmp_values(CmpOp::Le, &a, &b)?;
+                push!(Value::Bool(r));
             }
             Op::Ge => {
                 let b = pop!();
                 let a = pop!();
-                let r = self.less_than(&a, &b)?;
-                push!(Value::Bool(r == Some(false)));
+                let r = self.cmp_values(CmpOp::Ge, &a, &b)?;
+                push!(Value::Bool(r));
             }
             Op::InstanceOf => {
                 let ctor = pop!();
@@ -6504,6 +6654,7 @@ impl Vm {
                     priv_env: frame.priv_env.clone(),
                     delegation: false,
                     delegation_return_ip: None,
+                    finally_parks_depth: frame.finally_parks.len(),
                 });
             }
             Op::PopTryHandler => {
@@ -6528,12 +6679,12 @@ impl Vm {
                 push!(Value::Bool(done));
             }
             Op::ForInPop => {
-                if let Some((keys, _)) = frame.enumerators.pop() {
+                if let Some((keys, ..)) = frame.enumerators.pop() {
                     self.park_forin_vec(keys);
                 }
             }
             Op::ForInNext => {
-                let (k, more) = Self::for_in_next(frame);
+                let (k, more) = self.for_in_next(frame);
                 push!(k);
                 push!(more);
             }
@@ -6646,6 +6797,21 @@ impl Vm {
 
             Op::LoadGlobalTypeof(i) => {
                 let name = self.const_name(frame, *i);
+                // `typeof` is only forgiving of an UNRESOLVABLE name; a global
+                // lexical still in its TDZ throws like any other read.
+                if !self.global_lexicals.is_empty() {
+                    if let Some(lex) = self.global_lexicals.get(name.as_str()) {
+                        let v = lex.cell.borrow().clone();
+                        if matches!(v, Value::Uninitialized) {
+                            return Err(self.throw_reference(&format!(
+                                "Cannot access '{}' before initialization",
+                                name.as_str()
+                            )));
+                        }
+                        push!(v);
+                        return Ok(Ctl::Next);
+                    }
+                }
                 let key = PropertyKey::Str(name);
                 let g = self.realm.global.clone();
                 let v = self.get_prop(&Value::Object(g), &key)?;
@@ -6654,6 +6820,59 @@ impl Vm {
             Op::DeclareGlobal { name: i, deletable } => {
                 let name = self.const_name(frame, *i);
                 self.declare_global(name, *deletable)?;
+            }
+            Op::GlobalDeclChecks(decls) => {
+                self.global_decl_checks(decls)?;
+            }
+            Op::DeclareGlobalLex {
+                cell,
+                name,
+                is_const,
+            } => {
+                let name = self.const_name(frame, *name);
+                // Fresh TDZ cell, shared: the frame slot and the realm's
+                // global lexical registry hold the SAME Rc, so in-script cell
+                // ops and cross-script global resolution see one binding.
+                let rc = Rc::new(RefCell::new(Value::Uninitialized));
+                frame.cells[*cell as usize] = rc.clone();
+                self.gc_cell_roots.push(rc.clone());
+                self.global_lexicals.insert(
+                    name.as_str().to_string(),
+                    crate::vm::GlobalLexical {
+                        cell: rc,
+                        is_const: *is_const,
+                    },
+                );
+            }
+            Op::GlobalRefCheckBase(i) => {
+                let base = pop!();
+                let resolvable = if matches!(base, Value::Object(_)) {
+                    true
+                } else {
+                    let name = self.const_name(frame, *i);
+                    self.global_lexicals.contains_key(name.as_str()) || {
+                        let g = self.realm.global.clone();
+                        self.has_prop(&Value::Object(g), &PropertyKey::Str(name.clone()))?
+                    }
+                };
+                push!(Value::Bool(resolvable));
+            }
+            Op::GlobalRefCheck(i) => {
+                let name = self.const_name(frame, *i);
+                let resolvable = self.global_lexicals.contains_key(name.as_str()) || {
+                    let g = self.realm.global.clone();
+                    self.has_prop(&Value::Object(g), &PropertyKey::Str(name.clone()))?
+                };
+                push!(Value::Bool(resolvable));
+            }
+            Op::GlobalRefThrow(i) => {
+                let rhs = pop!();
+                let flag = pop!();
+                if matches!(flag, Value::Bool(false)) {
+                    let name = self.const_name(frame, *i);
+                    return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
+                }
+                push!(rhs);
             }
 
             Op::CanDeclareGlobalFunc(i) => {
@@ -6685,6 +6904,12 @@ impl Vm {
                     if self.has_prop(&base, &key)? {
                         let v = self.get_prop(&base, &key)?;
                         push!(v);
+                    } else if frame.func.proto.is_strict {
+                        // Deleted since the with-lookup: strict reads throw.
+                        return Err(self.throw_reference(&format!(
+                            "{} is not defined",
+                            key.as_str().unwrap_or("")
+                        )));
                     } else {
                         push!(Value::Undefined);
                     }
@@ -6698,7 +6923,19 @@ impl Vm {
                 if let Some(obj) = self.with_lookup(frame, &key)? {
                     let v = pop!();
                     let strict = frame.func.proto.is_strict;
-                    self.put_value(&Value::Object(obj), &key, v, strict)?;
+                    // Object Environment Record SetMutableBinding re-checks
+                    // HasProperty (observably — a proxy sees `has` before
+                    // `set`); a strict write to a since-deleted binding
+                    // throws instead of silently re-creating it.
+                    let base = Value::Object(obj);
+                    let still = self.has_prop(&base, &key)?;
+                    if strict && !still {
+                        return Err(self.throw_reference(&format!(
+                            "{} is not defined",
+                            key.as_str().unwrap_or("")
+                        )));
+                    }
+                    self.put_value(&base, &key, v, strict)?;
                 } else {
                     return self.step(frame, &(*fallback).clone());
                 }
@@ -6710,10 +6947,18 @@ impl Vm {
                     let r = self.delete_prop(&Value::Object(obj), &key)?;
                     push!(Value::Bool(r));
                 } else {
-                    // Global Environment Record DeleteBinding: a global-object
-                    // property deletes per its configurability (NaN/undefined/
-                    // var-created globals are non-configurable -> false); an
-                    // unresolvable bare name reports success.
+                    // Global Environment Record DeleteBinding: a lexical
+                    // binding (declarative record) is never deletable; a
+                    // global-object property deletes per its configurability
+                    // (NaN/undefined/var-created globals are non-configurable
+                    // -> false); an unresolvable bare name reports success.
+                    if key
+                        .as_str()
+                        .is_some_and(|s| self.global_lexicals.contains_key(s))
+                    {
+                        push!(Value::Bool(false));
+                        return Ok(Ctl::Next);
+                    }
                     let g = self.realm.global.clone();
                     if self.has_own_or_proto(&g, &key) {
                         let r = self.delete_prop(&Value::Object(g), &key)?;
@@ -6722,6 +6967,32 @@ impl Vm {
                         push!(Value::Bool(true));
                     }
                 }
+            }
+            Op::GetProtoOf => {
+                let v = pop!();
+                let proto = match &v {
+                    Value::Object(o) => self.proxy_or_ordinary_get_prototype_of(o)?,
+                    _ => Value::Undefined,
+                };
+                push!(proto);
+            }
+            Op::WithBaseThis => {
+                // [base] -> [this]: WithBaseObject — a real with-object is the
+                // call's `this`; an eval-vars scope object (a declarative
+                // record in disguise) or an unresolved base is `undefined`.
+                let base = pop!();
+                let this = match &base {
+                    Value::Object(o) => {
+                        let marker = PropertyKey::Sym(self.realm.symbol_eval_vars.clone());
+                        if o.borrow().own_contains_key(&marker) {
+                            Value::Undefined
+                        } else {
+                            base.clone()
+                        }
+                    }
+                    _ => Value::Undefined,
+                };
+                push!(this);
             }
             Op::ResolveNameBase(name) => {
                 let nm = self.const_name(frame, *name);
@@ -6742,6 +7013,11 @@ impl Vm {
                     if self.has_prop(&base, &key)? {
                         let v = self.get_prop(&base, &key)?;
                         push!(v);
+                    } else if frame.func.proto.is_strict {
+                        return Err(self.throw_reference(&format!(
+                            "{} is not defined",
+                            key.as_str().unwrap_or("")
+                        )));
                     } else {
                         push!(Value::Undefined);
                     }
@@ -6756,10 +7032,13 @@ impl Vm {
                     let nm = self.const_name(frame, *name);
                     let key = PropertyKey::Str(nm.clone());
                     let strict = frame.func.proto.is_strict;
-                    // Object Environment Record SetMutableBinding: if the
-                    // binding was deleted since the base was captured, a strict
-                    // write throws ReferenceError (not a silent re-create).
-                    if strict && !self.has_prop(&base, &key)? {
+                    // Object Environment Record SetMutableBinding: HasProperty
+                    // is re-done unconditionally (observable on a proxy env);
+                    // if the binding was deleted since the base was captured, a
+                    // strict write throws ReferenceError (not a silent
+                    // re-create).
+                    let still = self.has_prop(&base, &key)?;
+                    if strict && !still {
                         return Err(
                             self.throw_reference(&format!("{} is not defined", nm.as_str()))
                         );
@@ -7207,11 +7486,15 @@ impl Vm {
                 let resources = frame.dispose_scopes.pop().unwrap_or_default();
                 for (value, method) in resources.into_iter().rev() {
                     if let Err(e) = self.call(method, value, &[]) {
-                        let merged = match frame.pending_completion.take() {
+                        let prev = frame.finally_parks.last_mut().and_then(|s| s.take());
+                        let merged = match prev {
                             Some(Completion::Throw(prev)) => self.make_suppressed_error(e, prev),
                             _ => e,
                         };
-                        frame.pending_completion = Some(Completion::Throw(merged));
+                        match frame.finally_parks.last_mut() {
+                            Some(slot) => *slot = Some(Completion::Throw(merged)),
+                            None => frame.pending_completion = Some(Completion::Throw(merged)),
+                        }
                     }
                 }
             }
@@ -7232,13 +7515,19 @@ impl Vm {
                                 push!(Value::Bool(true));
                             }
                             Err(e) => {
-                                let merged = match frame.pending_completion.take() {
+                                let prev = frame.finally_parks.last_mut().and_then(|s| s.take());
+                                let merged = match prev {
                                     Some(Completion::Throw(prev)) => {
                                         self.make_suppressed_error(e, prev)
                                     }
                                     _ => e,
                                 };
-                                frame.pending_completion = Some(Completion::Throw(merged));
+                                match frame.finally_parks.last_mut() {
+                                    Some(slot) => *slot = Some(Completion::Throw(merged)),
+                                    None => {
+                                        frame.pending_completion = Some(Completion::Throw(merged))
+                                    }
+                                }
                                 push!(Value::Undefined);
                                 push!(Value::Bool(true));
                             }
@@ -7253,11 +7542,15 @@ impl Vm {
             }
             Op::MergeDisposeError => {
                 let e = pop!();
-                let merged = match frame.pending_completion.take() {
+                let prev = frame.finally_parks.last_mut().and_then(|s| s.take());
+                let merged = match prev {
                     Some(Completion::Throw(prev)) => self.make_suppressed_error(e, prev),
                     _ => e,
                 };
-                frame.pending_completion = Some(Completion::Throw(merged));
+                match frame.finally_parks.last_mut() {
+                    Some(slot) => *slot = Some(Completion::Throw(merged)),
+                    None => frame.pending_completion = Some(Completion::Throw(merged)),
+                }
             }
             Op::ClassLinkSuper => {
                 let sup = pop!();
@@ -7381,10 +7674,27 @@ impl Vm {
                 // Null prototype: with-scope lookups HasProperty through the
                 // chain, and Object.prototype names must not shadow globals.
                 let o = self.alloc(crate::value::ObjectData::new(None, Internal::Ordinary));
+                self.mark_eval_vars_scope(&o);
                 // Outermost with-scope: real `with` objects entered later (and
                 // the static fallback for names it doesn't hold) take priority.
                 frame.with_scope.insert(0, o.clone());
                 frame.eval_vars = Some(o);
+            }
+            Op::DirectEvalSpread { scope } => {
+                let args_arr = pop!();
+                let callee = pop!();
+                let args = self.iterate_to_vec(&args_arr)?;
+                let is_intrinsic = match (&callee, &self.realm.eval_fn) {
+                    (Value::Object(o), Some(e)) => o.same(e),
+                    _ => false,
+                };
+                if !is_intrinsic {
+                    let r = self.call(callee, Value::Undefined, &args)?;
+                    push!(r);
+                } else {
+                    let v = self.perform_direct_eval(frame, *scope, args)?;
+                    push!(v);
+                }
             }
             Op::DirectEval { argc, scope } => {
                 let mut args: Vec<Value> = Vec::with_capacity(*argc as usize);
@@ -7415,11 +7725,18 @@ impl Vm {
                     },
                 );
             }
+            Op::EnterFinally => {
+                // Move the routed-in completion (if any) onto this region's
+                // stack entry; the normal path parks None.
+                let parked = frame.pending_completion.take();
+                frame.finally_parks.push(parked);
+            }
             Op::EndFinally => {
-                // If a non-local completion is parked, resume it (run the next
-                // outer finally, or perform the action). Otherwise the finalizer
-                // ran on the normal path: fall through.
-                if let Some(c) = frame.pending_completion.take() {
+                // If a non-local completion is parked FOR THIS REGION, resume
+                // it (run the next outer finally, or perform the action).
+                // Otherwise the finalizer ran on the normal path: fall
+                // through. Outer regions' parked completions stay parked.
+                if let Some(c) = frame.finally_parks.pop().flatten() {
                     return self.do_completion(frame, c);
                 }
             }
@@ -7434,7 +7751,8 @@ impl Vm {
                 // TypeError.
                 let it = pop!();
                 let completion_is_throw =
-                    matches!(frame.pending_completion, Some(Completion::Throw(_)));
+                    matches!(frame.finally_parks.last(), Some(Some(Completion::Throw(_))))
+                        || matches!(frame.pending_completion, Some(Completion::Throw(_)));
                 let ret = match self.get_prop(&it, &crate::names::key_return()) {
                     Ok(r) => r,
                     Err(e) => {
@@ -7505,6 +7823,15 @@ impl Vm {
     /// with-object iff `HasProperty(obj, key)` is true AND it is not excluded by
     /// the object's `@@unscopables` (a name whose @@unscopables entry is truthy
     /// is treated as absent).
+    /// Stamp the engine-internal marker identifying an eval-vars scope
+    /// object (declarative-record emulation): `Op::WithBaseThis` yields
+    /// `undefined` for it where a real with-object becomes the call's `this`.
+    fn mark_eval_vars_scope(&mut self, o: &JsObject) {
+        let sym = self.realm.symbol_eval_vars.clone();
+        o.borrow_mut()
+            .own_insert(PropertyKey::Sym(sym), Property::builtin(Value::Bool(true)));
+    }
+
     fn with_lookup(&mut self, frame: &Frame, key: &PropertyKey) -> Result<Option<JsObject>, Value> {
         // Snapshot the scope objects so we don't borrow `frame` across the
         // `&mut self` calls below.
@@ -8046,11 +8373,11 @@ impl Vm {
                 let nb = self.to_number(b)?;
                 self.loose_equals(a, &Number(nb))?
             }
-            (Object(_), Number(_) | String(_) | Symbol(_)) => {
+            (Object(_), Number(_) | String(_) | Symbol(_) | BigInt(_)) => {
                 let pa = self.to_primitive(a, Hint::Default)?;
                 self.loose_equals(&pa, b)?
             }
-            (Number(_) | String(_) | Symbol(_), Object(_)) => {
+            (Number(_) | String(_) | Symbol(_) | BigInt(_), Object(_)) => {
                 let pb = self.to_primitive(b, Hint::Default)?;
                 self.loose_equals(a, &pb)?
             }
@@ -8068,15 +8395,29 @@ impl Vm {
             CmpOp::Ne => !self.loose_equals(a, b)?,
             CmpOp::StrictEq => self.strict_equals(a, b),
             CmpOp::StrictNe => !self.strict_equals(a, b),
-            CmpOp::Lt => self.less_than(a, b)? == Some(true),
-            CmpOp::Gt => self.less_than(b, a)? == Some(true),
-            CmpOp::Le => self.less_than(b, a)? == Some(false),
-            CmpOp::Ge => self.less_than(a, b)? == Some(false),
+            CmpOp::Lt => self.is_less_than(a, b, true)? == Some(true),
+            CmpOp::Gt => self.is_less_than(b, a, false)? == Some(true),
+            CmpOp::Le => self.is_less_than(b, a, false)? == Some(false),
+            CmpOp::Ge => self.is_less_than(a, b, true)? == Some(false),
         })
     }
 
-    /// Abstract Relational Comparison `a < b`. Returns None for unordered (NaN).
+    /// Abstract Relational Comparison `a < b` with the operands already in
+    /// source order (LeftFirst = true). Returns None for unordered (NaN).
     pub fn less_than(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, Value> {
+        self.is_less_than(a, b, true)
+    }
+
+    /// Spec IsLessThan(x, y, LeftFirst): `left_first` selects which operand's
+    /// ToPrimitive runs first, so `a > b` (which asks IsLessThan(b, a, false))
+    /// still coerces `a` before `b` — coercion side effects always happen in
+    /// source order.
+    pub fn is_less_than(
+        &mut self,
+        a: &Value,
+        b: &Value,
+        left_first: bool,
+    ) -> Result<Option<bool>, Value> {
         // Fast path: Number < Number (loop bounds, sorts). NaN is unordered, so
         // either operand being NaN yields `None` (all of `<`/`>`/`<=`/`>=`
         // become false at the call site), matching the general path below.
@@ -8086,10 +8427,17 @@ impl Vm {
             }
             return Ok(Some(x < y));
         }
-        let pa = self.to_primitive(a, Hint::Number)?;
-        let pb = self.to_primitive(b, Hint::Number)?;
+        let (pa, pb) = if left_first {
+            let pa = self.to_primitive(a, Hint::Number)?;
+            let pb = self.to_primitive(b, Hint::Number)?;
+            (pa, pb)
+        } else {
+            let pb = self.to_primitive(b, Hint::Number)?;
+            let pa = self.to_primitive(a, Hint::Number)?;
+            (pa, pb)
+        };
         if let (Value::String(x), Value::String(y)) = (&pa, &pb) {
-            return Ok(Some(x.as_str() < y.as_str()));
+            return Ok(Some(js_string_lt(x, y)));
         }
         // BigInt comparisons (incl. BigInt vs Number / numeric String).
         match (&pa, &pb) {
@@ -8134,6 +8482,12 @@ impl Vm {
         if !cobj.borrow().is_callable() {
             return Err(self.throw_type("Right-hand side of 'instanceof' is not callable"));
         }
+        // OrdinaryHasInstance: a primitive left operand is false BEFORE the
+        // `prototype` property is read (its getter must not run).
+        let mut cur = match obj {
+            Value::Object(o) => o.clone(),
+            _ => return Ok(false),
+        };
         let target_proto = self.get_prop(ctor, &PropertyKey::str("prototype"))?;
         let target_proto = match target_proto {
             Value::Object(o) => o,
@@ -8141,10 +8495,6 @@ impl Vm {
         };
         // OrdinaryHasInstance walks the chain via [[GetPrototypeOf]], which a
         // proxy in the chain routes through its trap (its own `proto` is None).
-        let mut cur = match obj {
-            Value::Object(o) => o.clone(),
-            _ => return Ok(false),
-        };
         loop {
             let proto = self.proxy_or_ordinary_get_prototype_of(&cur)?;
             match proto {
@@ -8842,7 +9192,9 @@ pub(crate) fn number_arith_raw(x: f64, y: f64, kind: ArithKind) -> f64 {
         ArithKind::Mul => x * y,
         ArithKind::Div => x / y,
         ArithKind::Mod => js_mod(x, y),
-        ArithKind::Pow => x.powf(y),
+        // `**` shares Math.pow's spec special cases (pow(±1, ±Inf) is NaN,
+        // pow(x, ±0) is 1 even for NaN x), which `f64::powf` does not honor.
+        ArithKind::Pow => crate::builtins::numbers::math_pow(x, y),
         ArithKind::BitAnd => (to_int32(x) & to_int32(y)) as f64,
         ArithKind::BitOr => (to_int32(x) | to_int32(y)) as f64,
         ArithKind::BitXor => (to_int32(x) ^ to_int32(y)) as f64,
@@ -8853,6 +9205,14 @@ pub(crate) fn number_arith_raw(x: f64, y: f64, kind: ArithKind) -> f64 {
 }
 
 // ---- BigInt comparison helpers (relational + loose-equality) ----
+
+/// String relational comparison: lexicographic over UTF-16 code units, per
+/// spec. Byte-wise UTF-8 comparison would order by code point instead, which
+/// disagrees once an astral character meets a code unit in U+D800..U+FFFF
+/// (e.g. "\u{10000}" < "￿" holds in code-unit order).
+fn js_string_lt(x: &crate::value::JsString, y: &crate::value::JsString) -> bool {
+    x.code_units().cmp(y.code_units()) == std::cmp::Ordering::Less
+}
 
 fn bigint_eq_f64(x: &num_bigint::BigInt, y: f64) -> bool {
     if !y.is_finite() || y.fract() != 0.0 {
@@ -8865,10 +9225,6 @@ fn bigint_eq_f64(x: &num_bigint::BigInt, y: f64) -> bool {
     }
 }
 
-fn big_to_f64(x: &num_bigint::BigInt) -> f64 {
-    num_traits::ToPrimitive::to_f64(x).unwrap_or(f64::NAN)
-}
-
 fn bigint_eq_str(x: &num_bigint::BigInt, s: &str) -> bool {
     match parse_string_bigint(s) {
         Some(b) => b == *x,
@@ -8877,13 +9233,40 @@ fn bigint_eq_str(x: &num_bigint::BigInt, s: &str) -> bool {
 }
 
 /// `bigint < other` (or `other < bigint` when `bigint_left` is false) against an
-/// f64. Returns None when the f64 is NaN.
+/// f64. Returns None when the f64 is NaN. The comparison is mathematically
+/// exact: converting the BigInt to f64 would round values past 2^53 onto each
+/// other. Split the float into integer part + fractional remainder — both
+/// exact — and compare the integer parts as BigInts.
 fn bigint_cmp_f64(x: &num_bigint::BigInt, y: f64, bigint_left: bool) -> Option<bool> {
+    use std::cmp::Ordering;
     if y.is_nan() {
         return None;
     }
-    let xf = big_to_f64(x);
-    Some(if bigint_left { xf < y } else { y < xf })
+    if y.is_infinite() {
+        // bigint < +inf is true; bigint < -inf is false (and mirrored).
+        let bigint_smaller = y == f64::INFINITY;
+        return Some(if bigint_left {
+            bigint_smaller
+        } else {
+            !bigint_smaller
+        });
+    }
+    let trunc = <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(y.trunc())
+        .expect("finite trunc converts exactly");
+    let frac = y - y.trunc(); // same sign as y, |frac| < 1
+                              // x vs y where y = trunc + frac: integer x differing from trunc decides
+                              // outright; equal integer parts leave the sign of frac to decide.
+    let x_lt_y = match x.cmp(&trunc) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => frac > 0.0,
+    };
+    let y_lt_x = match trunc.cmp(x) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => frac < 0.0,
+    };
+    Some(if bigint_left { x_lt_y } else { y_lt_x })
 }
 
 fn bigint_cmp_str(x: &num_bigint::BigInt, s: &str, bigint_left: bool) -> Option<bool> {
@@ -8912,18 +9295,22 @@ pub fn parse_string_bigint(s: &str) -> Option<num_bigint::BigInt> {
         let lower = b.as_bytes().get(1).map(|c| c.to_ascii_lowercase());
         b.starts_with('0') && matches!(lower, Some(b'x') | Some(b'o') | Some(b'b'))
     };
+    // The digit run handed to num-bigint must be exactly digits of the radix:
+    // its own parser tolerates a leading sign, which would let "++0" or "0x+1"
+    // through the StringToBigInt grammar.
+    let all_digits = |b: &str, radix: u32| !b.is_empty() && b.chars().all(|c| c.is_digit(radix));
     let parsed = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-        if signed {
+        if signed || !all_digits(h, 16) {
             return None;
         }
         BigInt::from_str_radix(h, 16).ok()
     } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
-        if signed {
+        if signed || !all_digits(o, 8) {
             return None;
         }
         BigInt::from_str_radix(o, 8).ok()
     } else if let Some(bny) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
-        if signed {
+        if signed || !all_digits(bny, 2) {
             return None;
         }
         BigInt::from_str_radix(bny, 2).ok()
@@ -8932,6 +9319,9 @@ pub fn parse_string_bigint(s: &str) -> Option<num_bigint::BigInt> {
         // signed form whose body still looks radix-prefixed.
         return None;
     } else {
+        if !all_digits(body, 10) {
+            return None;
+        }
         BigInt::from_str_radix(body, 10).ok()
     }?;
     Some(if neg { -parsed } else { parsed })

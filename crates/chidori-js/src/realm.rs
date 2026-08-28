@@ -103,6 +103,9 @@ pub struct Realm {
     pub string_iterator_proto: JsObject,
     pub map_iterator_proto: JsObject,
     pub set_iterator_proto: JsObject,
+    /// %RegExpStringIteratorPrototype% — the prototype of `matchAll` result
+    /// iterators.
+    pub regexp_string_iterator_proto: JsObject,
     /// %IteratorHelperPrototype% — the prototype of `map`/`filter`/`take`/
     /// `drop`/`flatMap` helper objects.
     pub iterator_helper_proto: JsObject,
@@ -184,6 +187,10 @@ pub struct Realm {
     /// `own_keys`, so an error carrying one is indistinguishable from one that
     /// is not.
     pub symbol_stack_start: JsSymbol,
+    /// Marks a frame's eval-vars scope object: it emulates a *declarative*
+    /// record, so `WithBaseObject` (a bare call's `this` under `with`/eval
+    /// scoping) must yield undefined for it, unlike a real with-object.
+    pub symbol_eval_vars: JsSymbol,
 
     /// Builtin sections installed lazily (see
     /// `builtins::install_lazy_globals`): their global names sit behind
@@ -232,6 +239,7 @@ impl Realm {
             self.string_iterator_proto.clone(),
             self.map_iterator_proto.clone(),
             self.set_iterator_proto.clone(),
+            self.regexp_string_iterator_proto.clone(),
             self.iterator_helper_proto.clone(),
             self.wrap_valid_iterator_proto.clone(),
             self.generator_proto.clone(),
@@ -302,6 +310,7 @@ impl Realm {
             string_iterator_proto: bare(),
             map_iterator_proto: bare(),
             set_iterator_proto: bare(),
+            regexp_string_iterator_proto: bare(),
             iterator_helper_proto: bare(),
             wrap_valid_iterator_proto: bare(),
             generator_proto: bare(),
@@ -343,6 +352,7 @@ impl Realm {
             symbol_async_disposable_state: bare_symbol(21, "[[AsyncDisposableState]]"),
             symbol_sync_iterator_record: bare_symbol(22, "[[SyncIteratorRecord]]"),
             symbol_stack_start: bare_symbol(23, "[[StackStartFn]]"),
+            symbol_eval_vars: bare_symbol(24, "[[EvalVarsScope]]"),
             lazy_sections: Vec::new(),
             symbol_registry: indexmap::IndexMap::new(),
             shape_root: crate::shape::Shape::new_root(),
@@ -404,6 +414,7 @@ pub fn init_realm(vm: &mut Vm) {
         &vm.realm.string_iterator_proto,
         &vm.realm.map_iterator_proto,
         &vm.realm.set_iterator_proto,
+        &vm.realm.regexp_string_iterator_proto,
         &vm.realm.generator_proto,
         &vm.realm.iterator_helper_proto,
         &vm.realm.wrap_valid_iterator_proto,
