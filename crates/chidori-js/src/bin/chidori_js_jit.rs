@@ -50,8 +50,8 @@ fn main() {
     if show_stats {
         let s = chidori_js::jit::stats();
         eprintln!(
-            "jit: {} kernels compiled, {} declined, {} native runs, {} element shim calls",
-            s.compiled, s.declined, s.native_runs, s.elem_shim_calls
+            "jit: {} kernels compiled ({} int-typed), {} declined, {} native runs, {} element shim calls",
+            s.compiled, s.int_typed, s.declined, s.native_runs, s.elem_shim_calls
         );
     }
 }

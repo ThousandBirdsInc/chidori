@@ -39,6 +39,8 @@ pub mod iter;
 /// opt-in `jit` feature (see docs/cranelift-jit.md and the lint note above).
 #[cfg(feature = "jit")]
 pub mod jit;
+#[cfg(feature = "jit")]
+pub(crate) mod jit_ty;
 pub mod journal;
 pub mod jsx;
 pub mod kernel;

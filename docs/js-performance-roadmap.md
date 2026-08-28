@@ -345,10 +345,14 @@ is <1% of live agent wall-clock (`interpreter-optimization.md` §11.5).
    materialization are reused verbatim), and now covers scalars, elements
    (direct views for EVERY numeric typed-array kind plus read-only dense
    views), pinned strings, inlined pinned callees, native recursion
-   families (self and mutual, global- and function-scoped), and batch
+   families (self and mutual, global- and function-scoped), batch
    array HOFs (`map`/`filter`/`forEach`/`reduce`/`some`/`every`/`find`/
-   `findIndex` run as one native loop with the callback kernel inlined).
-   Measured against
+   `findIndex` run as one native loop with the callback kernel inlined),
+   and INT-TYPED registers (the induction-variable/range analysis this
+   section predicted: proven-integer registers run as native i64 in a
+   runtime-checked second body — counters, `%`-bounded accumulators,
+   bitwise chains — with read-only `%` divisors baked to constants for
+   strength-reduced division). Measured against
    Node 22 / Bun 1.3 on the cross-engine workload suite: 7 of 14 workloads
    at or beyond Node (recursion, property loops, string scans, typed
    arrays, bitwise, inlined closures — several FASTER than Node), the

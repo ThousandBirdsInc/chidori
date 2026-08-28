@@ -217,6 +217,26 @@ const CORPUS: &[&str] = &[
     "const a = []; for (let i = 0; i < 200; i++) a.push(i); console.log(a.some(x => x > 150), a.some(x => x < 0), a.every(x => x >= 0), a.every(x => x !== 137), a.find(x => x * 2 === 62), a.findIndex(x => x > 198), a.findIndex(x => x > 500));",
     "const a = [5, , 7, 8]; console.log(a.some(x => x === undefined), a.find(x => x === undefined), a.findIndex(x => x === 7), a.every(x => x !== 8));",
     "const a = [1, 2, 3]; console.log(a.some(x => x + 1 === 3) === true, a.every(x => x % 1 === 0), [].some(x => true), [].every(x => false));",
+    // INT-TYPED register tier (`jit_ty`): the clean shapes first — the
+    // Adler/hash accumulator (register divisor, baked), literal-divisor
+    // mods, bitwise mixes, guarded counters over `<` and `<=`, stride-2
+    // increments — then every fallback edge: fractional/negative/-0 entry
+    // values (float body), a reassigned divisor across calls (the baked
+    // check declines), a zero divisor, near-2^53 magnitudes, signed
+    // element mods, and decrement loops (unguarded, still exact).
+    "const M = 65521; const d = new Uint8Array(64); for (let i = 0; i < 64; i++) d[i] = i * 7 + 3; let a = 1, b = 0; for (let i = 0; i < d.length; i++) { a = (a + d[i]) % M; b = (b + a) % M; } console.log(a, b);",
+    "let h = 7; for (let i = 0; i < 100; i++) { h = (h * 31 + i) % 1000003; } console.log(h);",
+    "let s = 0; for (let i = 0; i <= 20; i += 2) { s = s * 3 % 97 + (i & 5) - (i >>> 1) + Math.min(i, 9) + Math.max(1, i % 4); } console.log(s);",
+    "let a = 0.5; for (let i = 0; i < 10; i++) { a = (a + 1) % 7; } console.log(a);",
+    "let s = -5; for (let i = 0; i < 10; i++) { s = s + 2; } console.log(s);",
+    "let z = -0; let c = 0; for (let i = 0; i < 3; i++) { c += 1; } console.log(Object.is(z, -0), c);",
+    "function chk(m) { let a = 1; for (let i = 0; i < 20; i++) { a = (a + i) % m; } return a; } console.log(chk(7), chk(13), chk(7), chk(0.5), chk(-3));",
+    "function chk0(m) { let a = 1; for (let i = 0; i < 5; i++) { a = (a + i) % m; } return a; } console.log(chk0(7), chk0(0));",
+    "let big = 2 ** 40; for (let i = 0; i < 30; i++) { big = big + 2 ** 40; } console.log(big);",
+    "const t = new Int32Array(8); for (let i = 0; i < 8; i++) t[i] = (i - 4) * 1000; let s = 0; for (let i = 0; i < 8; i++) { s += t[i] % 7; } console.log(s);",
+    "let s = 0; for (let i = 10; i > 0; i--) { s = (s + i) % 23; } console.log(s);",
+    "let i = 0; let s = 0; while (true) { i += 1; s = (s + i) % 11; if (i >= 25) break; } console.log(s, i);",
+    "const u = new Uint16Array(16); for (let i = 0; i < 16; i++) u[i] = i * 4097; let m = 0; for (let i = 0; i < u.length; i++) { m = (m ^ u[i]) % 251; } console.log(m, u[15]);",
     // Pinned-string kernels (StrLen/CharCodeAt — total, no bail): the
     // tokenizer hash idiom, plus NaN/OOB index handling.
     "const txt = 'kernel'; let s = 0; for (let i = 0; i < txt.length; i++) { s += txt.charCodeAt(i); } console.log(s);",

@@ -57,6 +57,12 @@ pub(crate) struct PreparedKernel {
     /// Back-edge interrupt poll counter (cadence spans calls).
     poll: u32,
     interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Compiled form of the callback's kernel, resolved ONCE here instead of
+    /// per call (`jit` feature, tier enabled): the kernel is fixed for the
+    /// prepared handle's lifetime, so the per-activation lookup + identity
+    /// check `native_for` performs per call is invocation-invariant too.
+    #[cfg(feature = "jit")]
+    native: Option<crate::jit::NativeKernel>,
 }
 
 /// Control-flow outcome of a register-mode completion dispatch (the
@@ -1125,7 +1131,8 @@ impl Vm {
                 .iter()
                 .map(|o| crate::jit::elem_kind_code(o, allow_dense))
                 .collect();
-            let native_exit = crate::jit::native_for_loop(k, &callee_bfs, &elem_kinds).map(|native| {
+            let native_exit = crate::jit::native_for_loop(k, &callee_bfs, &elem_kinds, &regs)
+                .map(|native| {
                 // Activation tables for the native run, alive exactly across
                 // it: the pinned strings (guard-validated flat ASCII), the
                 // per-oslot direct element views (numeric typed arrays of
@@ -2618,11 +2625,19 @@ impl Vm {
         if self.call_depth + 1 > self.max_call_depth {
             return None;
         }
+        #[cfg(feature = "jit")]
+        let native = if self.jit_enabled {
+            crate::jit::native_for(bf.proto.fn_kernel.as_ref().expect("checked above"), &[])
+        } else {
+            None
+        };
         Some(PreparedKernel {
             regs: [0.0; KWIN],
             poll: 0,
             interrupt: self.interrupt.clone(),
             bf,
+            #[cfg(feature = "jit")]
+            native,
         })
     }
 
@@ -2684,7 +2699,7 @@ impl Vm {
         // result from the same register) or an interrupt.
         #[cfg(feature = "jit")]
         if self.jit_enabled {
-            if let Some(native) = crate::jit::native_for(k) {
+            if let Some(native) = &p.native {
                 let mut jctx = crate::jit::JitCtx::empty();
                 let stopped_at = native.run(&mut p.regs, p.interrupt.as_deref(), &mut jctx);
                 if stopped_at >= 0 {

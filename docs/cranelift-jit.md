@@ -113,6 +113,26 @@ compiled subset now covers essentially the whole kernel language:
   a truthiness branch (`filter`, `forEach`, and the searches — never
   `map`/`reduce`, whose results materialize), and the interrupt is polled
   on the loop back-edge at the interpreter's cadence.
+- **Int-typed registers** (`jit_ty`): a per-kernel analysis proves
+  registers INTEGER-VALUED and range-bounded — entry-checked accumulators,
+  `%`-re-bounded hash/checksum chains, ToInt32-family results, integer
+  typed-array elements, and loop counters bounded by a dominating
+  `i < len` guard (a small flow-sensitive range dataflow with
+  compare-fact tracking) — and the function then carries TWO bodies: the
+  plain float body, and an int body whose typed registers live in i64
+  (native `iadd`/`imul`/`srem`/`icmp`, single-compare element indexing, raw
+  integer element loads/stores, no per-op float↔int conversions). Runtime
+  entry checks (integral, in-band, nonnegative where required, never `-0`)
+  pick the body once per activation, so an activation whose live values
+  don't fit runs exactly today's float code — nothing regresses. Every
+  admitted operation is one where i64 and IEEE-double semantics provably
+  coincide (sums far below 2^53, products of proven-nonnegative ranges,
+  `%` with nonnegative dividend and positive divisor — and nothing that
+  could produce `-0`, NaN, or a fraction). Read-only `%` divisors bake the
+  compiling activation's VALUE into the check (`const MOD = 65521`
+  becomes a literal), so Cranelift's divide-by-constant strength reduction
+  replaces the hardware `srem` with the multiply sequence V8 uses; a
+  different later value fails the equality and takes the float body.
 - **Recursion families** (`SelfCall`): a RESOLVED family — the invoked
   closure plus every partner reached through its recursive call graph, via
   global bindings or captured (function-scoped) bindings, self and mutual
@@ -206,52 +226,56 @@ every row. `chidori-int` is the identical engine with the tier off:
 
 | workload | chidori-jit | chidori-int | node 22 | bun 1.3 | jit/node |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| arith_loop (`%`-heavy) | 7.0 ms | 31.6 ms | 8.8 ms | 9.1 ms | **0.8×** |
-| closures (adder in a loop) | 4.6 ms | 31.3 ms | 4.3 ms | 8.1 ms | **1.1×** |
-| fib_recursive (fib 30) | 14.0 ms | 91.2 ms | 22.2 ms | 11.2 ms | **0.6×** |
-| typed_array (all-kinds dot/transform/mix) | 18.5 ms | 46.8 ms | 34.5 ms | 15.2 ms | **0.5×** |
-| array_hof (map/filter/reduce chain) | 30.3 ms | 53.7 ms | 31.6 ms | 24.4 ms | **1.0×** |
-| array_push_sum | 26.3 ms | 40.0 ms | 22.1 ms | 24.0 ms | 1.2× |
-| array_sum | 112.9 ms | 182.6 ms | 74.2 ms | 103.8 ms | 1.5× |
-| sort (comparator kernels) | 182.9 ms | 215.5 ms | 152.8 ms | 126.2 ms | 1.2× |
-| string_scan (charCodeAt hash) | 13.9 ms | 15.2 ms | 10.5 ms | 6.6 ms | 1.3× |
-| checksum (Adler-32 / Uint8Array) | 195.0 ms | 361.8 ms | 64.0 ms | 57.0 ms | 3.0× |
-| property_access | 2.9 ms | 16.9 ms | ~0.7 ms | 4.5 ms | — |
-| mutual_recursion (family tiers) | 40.8 ms | 108.8 ms | 9.0 ms | 5.3 ms | 4.5× |
-| string_build (rope `+=`) | 10.9 ms | 10.6 ms | 9.5 ms | 4.5 ms | 1.1× |
-| json_roundtrip | 163.1 ms | 155.6 ms | 51.1 ms | 39.9 ms | 3.2× |
-| mixed_helpers (object glue) | 276.4 ms | 281.6 ms | 31.2 ms | 32.6 ms | 8.9× |
+| checksum (Adler-32 / Uint8Array) | **35.4 ms** | 389.8 ms | 69.9 ms | 59.8 ms | **0.5×** |
+| arith_loop (`%`-heavy) | **6.6 ms** | 34.4 ms | 8.2 ms | 7.0 ms | **0.8×** |
+| property_access | **5.1 ms** | 18.3 ms | 7.1 ms | 6.4 ms | **0.7×** |
+| typed_array (all-kinds dot/transform/mix) | 22.6 ms | 50.7 ms | 27.7 ms | 13.0 ms | **0.8×** |
+| fib_recursive (fib 30) | 13.8 ms | 90.1 ms | 19.7 ms | 9.9 ms | **0.7×** |
+| array_hof (map/filter/reduce chain) | 33.1 ms | 56.8 ms | 44.1 ms | 26.0 ms | **0.8×** |
+| array_push_sum | 29.5 ms | 39.1 ms | 34.3 ms | 28.0 ms | **0.9×** |
+| closures (adder in a loop) | 5.3 ms | 33.4 ms | 8.1 ms | 4.7 ms | **0.7×** |
+| string_build (rope `+=`) | 11.6 ms | 10.9 ms | 10.0 ms | 6.5 ms | 1.2× |
+| sort (comparator kernels) | 184.0 ms | 219.1 ms | 163.8 ms | 126.4 ms | 1.1× |
+| array_sum | 110.7 ms | 195.6 ms | 75.8 ms | 111.3 ms | 1.5× |
+| string_scan (charCodeAt hash) | 14.7 ms | 13.9 ms | 9.6 ms | 6.6 ms | 1.5× |
+| mutual_recursion (family tiers) | 42.1 ms | 109.0 ms | 16.9 ms | 8.6 ms | 2.5× |
+| json_roundtrip | 165.3 ms | 154.4 ms | 49.4 ms | 41.3 ms | 3.3× |
+| mixed_helpers (object glue) | 286.1 ms | 285.0 ms | 30.2 ms | 38.5 ms | 9.5× |
 
 Reading the table honestly, three regimes:
 
-1. **At or beyond Node (half the suite)** — everything the kernel tier
-   fully compiles: arithmetic, recursion, closures, typed arrays of every
-   numeric kind, and now the array-HOF chain (`map`/`filter`/`reduce` as
-   native batches — that row was 4.5× behind before batching). Several
-   rows are *faster than Node*; `typed_array` and `fib` by ~2×. This is
-   the regime agent compute (numeric kernels, tokenizers, comparators,
-   per-element callbacks) lives in.
-2. **1.2–4.5× (kernel-shaped, known causes)** — `checksum` and
-   `array_sum`-style rows keep loop values in f64 registers and pay
-   float↔int conversion plus per-access exactness checks (index
-   integrality, bounds, slot tags) that V8 eliminates with int-typed
-   induction variables and range analysis; `mutual_recursion`'s family
-   calls still carry per-call snapshot traffic. Closing these needs
-   int-typed loop-counter reasoning in the kernel translator — mechanical,
-   deterministic, and the documented next step.
-3. **3–9× (allocation/shape-bound, out of this tier's scope)** —
-   `json_roundtrip`, `mixed_helpers`, `string_build` spend their time in
-   allocation, property-map traffic, and string building, not kernel
-   execution (jit ≈ interp on each). Reaching V8 there means escape
-   analysis, inline allocation, and shape-specialized builtins — a
-   different, much larger project the kernel JIT deliberately does not
-   start.
+1. **At or beyond Node (9 of 15; fastest engine outright on 3)** —
+   everything the kernel tier fully compiles: arithmetic, recursion,
+   closures, typed arrays of every numeric kind, the array-HOF chain (as
+   native batches), and now the integer loops the int-typed register tier
+   targets — `checksum` went from 6.4× behind Node on the interpreter and
+   3.0× behind on the float-only JIT to **2× faster than Node and 1.7×
+   faster than Bun** (native i64 accumulators + a strength-reduced baked
+   divisor). This is the regime agent compute (checksum loops, PRNGs,
+   numeric kernels, per-element callbacks) lives in.
+2. **1.1–2.5× (kernel-shaped, known causes)** — `array_sum` dense reads
+   still pay the slot tag check (irreducible without shape speculation);
+   `string_scan`'s hash chain stays float because `charCodeAt`'s
+   out-of-range NaN has no bail edge; `sort` pays per-comparison call
+   framing; `mutual_recursion`'s family calls carry per-call poll and
+   snapshot traffic.
+3. **3–10× (allocation/shape-bound, out of this tier's scope)** —
+   `json_roundtrip`, `mixed_helpers` spend their time in allocation,
+   property-map traffic, and string building, not kernel execution
+   (jit ≈ interp on each). Reaching V8 there means escape analysis,
+   inline allocation, and shape-specialized builtins — a different, much
+   larger project the kernel JIT deliberately does not start.
 
 ## Limitations / next steps
 
-- **Per-access exactness checks on dense reads** (regime 2 above): the next
-  win is induction-variable typing in the kernel translator so the JIT can
-  drop integrality/bounds tests the loop header already proves.
+- **Induction-variable typing: done** (the int-typed register tier above) —
+  index integrality tests and float↔int conversion traffic are gone from
+  int-provable loops; what dense reads still pay is the slot tag check,
+  which is irreducible without shape assumptions this tier refuses to
+  make. Remaining int-tier gaps: `charCodeAt` results stay float (the
+  out-of-range NaN has no bail edge), function-kernel `Local` scratch and
+  batch kernels are untyped, and `Neg`/`Sign`/non-positive divisors
+  decline to the float body.
 - **Cell-writing pinned callees** keep the interpreter tier (per-call cell
   flushes), as do mixed-return-type recursion families.
 - **Dense direct views are read-only kernels only**; writing kernels reach
@@ -269,6 +293,8 @@ Reading the table honestly, three regimes:
 
 - `crates/chidori-js/src/jit.rs` — eligibility, the Cranelift translator, the
   helper shims, the compile-once cache, the three `unsafe` blocks.
+- `crates/chidori-js/src/jit_ty.rs` — the int-typing analysis (safe code
+  only): flow-sensitive ranges, guard facts, entry checks, divisor bakes.
 - `crates/chidori-js/src/exec.rs` — the five seams (`run_kernel_op_impl` for
   loop kernels across the stack and register tiers, `run_fn_kernel` for
   frameless calls, `run_fn_kernel_rec` for self-recursion,
