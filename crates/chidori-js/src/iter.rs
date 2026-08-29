@@ -633,6 +633,10 @@ impl Vm {
         let mut ints: Vec<u32> = Vec::new();
         let mut slots: Vec<u32> = Vec::new();
         let shape;
+        // Set when the receiver's keys came from its shape's CACHED plan,
+        // where key `i` is slot `i` (see `Shape::forin_plan`): no chain
+        // walk, no per-key index parse, no slot vector.
+        let mut planned = false;
         let proto = {
             let b = obj.borrow();
             // Ordinary receivers only: exotic internals (dense elements,
@@ -641,25 +645,44 @@ impl Vm {
             if !matches!(b.internal, Internal::Ordinary) {
                 return false;
             }
-            // Shaped storage iterates slots in order, so the enumeration
-            // position IS each key's slot index — recorded for the
-            // [`crate::vm::ForInGuard`] that spares `for_in_next` the
-            // per-key liveness walk. Dictionary storage has no shape (no
-            // guard); index-like keys re-order below (guard dropped).
             shape = b.own_shape().cloned();
-            for (i, (k, p)) in b.own_iter().enumerate() {
-                if let PropertyKey::Str(s) = k {
-                    // Internal-slot keys are non-enumerable by contract, so
-                    // `p.enumerable` alone excludes them, as on the generic
-                    // path.
-                    if !p.enumerable {
-                        continue;
+            // Cached-plan path: the shape lists this object's keys in slot
+            // order (it carries no index key), and every slot is
+            // enumerable, so the plan IS the key list. Attributes live per
+            // object, which is why enumerability is re-checked here rather
+            // than baked into the shared plan.
+            let plan = shape
+                .as_ref()
+                .and_then(|sh| sh.forin_plan().cloned())
+                .filter(|_| b.all_own_enumerable());
+            match plan {
+                Some(plan) => {
+                    planned = true;
+                    out.reserve(plan.len());
+                    for k in plan.iter() {
+                        match k {
+                            PropertyKey::Str(s) => out.push(s.clone()),
+                            // `forin_plan` admits string keys only.
+                            PropertyKey::Sym(_) => unreachable!("plan holds string keys"),
+                        }
                     }
-                    match k.array_index() {
-                        Some(idx) => ints.push(idx),
-                        None => {
-                            out.push(s.clone());
-                            slots.push(i as u32);
+                }
+                None => {
+                    for (i, (k, p)) in b.own_iter().enumerate() {
+                        if let PropertyKey::Str(s) = k {
+                            // Internal-slot keys are non-enumerable by
+                            // contract, so `p.enumerable` alone excludes
+                            // them, as on the generic path.
+                            if !p.enumerable {
+                                continue;
+                            }
+                            match k.array_index() {
+                                Some(idx) => ints.push(idx),
+                                None => {
+                                    out.push(s.clone());
+                                    slots.push(i as u32);
+                                }
+                            }
                         }
                     }
                 }
@@ -709,7 +732,11 @@ impl Vm {
         }
         if let Some(shape) = shape {
             if !had_ints {
-                *guard = Some(crate::vm::ForInGuard { shape, slots });
+                *guard = Some(crate::vm::ForInGuard {
+                    shape,
+                    identity: planned,
+                    slots,
+                });
             }
         }
         true

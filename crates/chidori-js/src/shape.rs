@@ -84,6 +84,16 @@ pub struct Shape {
     /// `toJSON` [[Get]] (a miss on plain objects is unobservable) with two
     /// cell reads per level instead of a chain of key comparisons.
     lacks_to_json: OnceCell<bool>,
+    /// Cached for-in key plan: this shape's string keys IN SLOT ORDER, or
+    /// `None` when the shape carries an integer-index key (those enumerate
+    /// first, ascending, so slot order is not enumeration order). A shape
+    /// is immutable, so the list never changes — but ENUMERABILITY lives
+    /// per object (attributes never fork the tree), so a user of this plan
+    /// must first confirm every slot is an enumerable data property
+    /// ([`crate::value::ObjectData::all_own_enumerable`]). Reusing it
+    /// spares each `for-in` the chain walk, the per-key `array_index`
+    /// digit parse, and the plan allocation.
+    forin: OnceCell<Option<Rc<[PropertyKey]>>>,
 }
 
 impl std::fmt::Debug for Shape {
@@ -103,6 +113,7 @@ impl Shape {
             index: OnceCell::new(),
             index_armed: std::cell::Cell::new(false),
             lacks_to_json: OnceCell::new(),
+            forin: OnceCell::new(),
         })
     }
 
@@ -163,6 +174,30 @@ impl Shape {
         *self
             .lacks_to_json
             .get_or_init(|| self.lookup(&PropertyKey::str("toJSON")).is_none())
+    }
+
+    /// This shape's for-in key plan — its string keys in slot order, so
+    /// `plan[i]` is the key at slot `i` — or `None` when an integer-index
+    /// key makes slot order differ from enumeration order. See the field
+    /// doc for the enumerability check every caller still owes.
+    pub fn forin_plan(&self) -> Option<&Rc<[PropertyKey]>> {
+        self.forin
+            .get_or_init(|| {
+                let mut keys: Vec<PropertyKey> = Vec::with_capacity(self.len());
+                let mut cur = self;
+                while cur.parent.is_some() {
+                    // An index key (or a symbol) takes the generic walk.
+                    match &cur.key {
+                        PropertyKey::Str(_) if cur.key.array_index().is_none() => {}
+                        _ => return None,
+                    }
+                    keys.push(cur.key.clone());
+                    cur = cur.parent.as_deref().expect("checked");
+                }
+                keys.reverse();
+                Some(keys.into())
+            })
+            .as_ref()
     }
 
     /// The key stored at slot `i`, if in range. O(len - i) parent hops —
@@ -238,6 +273,7 @@ impl Shape {
             index: OnceCell::new(),
             index_armed: std::cell::Cell::new(false),
             lacks_to_json: OnceCell::new(),
+            forin: OnceCell::new(),
         });
         let weak = Rc::downgrade(&child);
         match &mut *tr {

@@ -1483,6 +1483,19 @@ impl ObjectData {
         }
     }
 
+    /// Whether EVERY own property is enumerable — the per-object half of
+    /// the shape's cached for-in plan (attributes live in the slots, so two
+    /// objects of one shape can differ here). A flag scan over the slots:
+    /// no keys fetched, no chain walk.
+    #[inline]
+    pub fn all_own_enumerable(&self) -> bool {
+        match &self.props {
+            PropStorage::Shaped { slots, .. } => slots.iter().all(|p| p.enumerable),
+            // Dictionary mode has no shape, so no plan to qualify.
+            PropStorage::Dict(_) => false,
+        }
+    }
+
     /// The current shape, when the storage is shaped (`None` in dictionary
     /// mode). Shape identity (`Rc::ptr_eq`) pins the whole key layout — the
     /// basis of the (shape, slot) inline caches (docs §3.3).

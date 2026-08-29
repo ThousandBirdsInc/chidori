@@ -268,16 +268,27 @@ Reading the table honestly, three regimes:
    removed the per-call identity re-checks.
 3. **~9× (`mixed_helpers` — object-shaped straight-line code)** — the one
    row still out of the kernel tier's reach. Interpreter-tier work keeps
-   trimming it (a for-in shape guard that skips the per-key liveness walk
-   and serves the body's `obj[k]` from a verified (object, key, slot)
-   cursor hint, plus a word-compare fast path for inline-string equality,
-   cut another ~9% of its instructions — and ship in the default
-   `forbid(unsafe_code)` binary too), but what remains IS the
-   interpreter: register-dispatch (~28%), `Value` clone/drop traffic
-   (~14%), object literal allocation, and frame setup on tiny call
-   bodies. Reaching V8 there means compiling object-shaped code with
-   shape-guarded property access and escape analysis — the next tier up,
-   not a kernel-JIT extension.
+   trimming it — a for-in shape guard that skips the per-key liveness
+   walk and serves the body's `obj[k]` from a verified (object, key,
+   slot) cursor hint; a per-shape for-in key plan that removes the chain
+   walk, the per-key index parse and the plan allocation; a word-compare
+   fast path for inline-string equality; and consuming dying operands
+   instead of cloning them — together **−13% instructions** on this row,
+   all of it shipping in the default `forbid(unsafe_code)` binary too.
+
+   What remains is the interpreter itself, and it is spread thin rather
+   than pooled behind one fixable hot spot: register dispatch ~31%,
+   `Value` clone/drop ~12%, frame setup/teardown ~8% (≈740 instructions
+   per JS call), cold-op bodies ~5%, constant materialization ~4%,
+   property ICs ~3%. A baseline JIT over the register bytecode was
+   scoped and measured against this profile and **rejected**: it removes
+   dispatch overhead but must still execute every arm body and every
+   helper call, so the honest ceiling is ~10% — not a regime change, for
+   a very large and risky compiler. The costs that actually separate this
+   row from V8 are representational: a 24-byte boxed `Value` with `Rc`
+   refcounting on every move, and a heap frame per call. Closing it means
+   an unboxed/NaN-boxed value model and shape-guarded inline property
+   access — a value-representation project, not a JIT bolt-on.
 
 ## Limitations / next steps
 

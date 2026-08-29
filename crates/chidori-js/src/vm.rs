@@ -172,6 +172,10 @@ pub struct Frame {
 /// the classic `obj[k]` read in the loop body as a direct slot load.
 pub struct ForInGuard {
     pub(crate) shape: Rc<crate::shape::Shape>,
+    /// `true` when the snapshot came from the shape's cached plan, where
+    /// key `i` IS slot `i` — then `slots` stays empty and the enumeration
+    /// costs no per-object allocation at all.
+    pub(crate) identity: bool,
     pub(crate) slots: Vec<u32>,
 }
 

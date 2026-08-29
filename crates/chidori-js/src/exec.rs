@@ -5217,7 +5217,12 @@ impl Vm {
                 let i = *cursor;
                 *cursor += 1;
                 let k = keys[i].clone();
-                if let Some(&slot) = g.slots.get(i) {
+                let slot = if g.identity {
+                    Some(i as u32)
+                } else {
+                    g.slots.get(i).copied()
+                };
+                if let Some(slot) = slot {
                     self.forin_hint.set(Some(crate::vm::ForInHint {
                         obj: t.clone(),
                         shape: g.shape.clone(),
