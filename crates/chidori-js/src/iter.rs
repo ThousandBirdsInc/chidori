@@ -520,12 +520,15 @@ impl Vm {
     /// returned buffer comes from the Vm's `forin_pool` (`ForInPop` parks it
     /// back) — a glue loop for-inning a fresh object per iteration reuses
     /// one allocation instead of a malloc/free per loop entry.
-    pub fn for_in_keys(&mut self, v: &Value) -> Result<Vec<JsString>, Value> {
+    pub fn for_in_keys(
+        &mut self,
+        v: &Value,
+    ) -> Result<(Vec<JsString>, Option<crate::vm::ForInGuard>), Value> {
         let mut out = self.forin_pool.pop().unwrap_or_default();
         debug_assert!(out.is_empty());
         let obj = match v {
             Value::Object(o) => o.clone(),
-            Value::Undefined | Value::Null => return Ok(out),
+            Value::Undefined | Value::Null => return Ok((out, None)),
             _ => self.to_object(v)?,
         };
         // FAST PATH — the overwhelmingly common shape: an ORDINARY receiver
@@ -537,8 +540,9 @@ impl Vm {
         // ~14% of glue-shaped workloads) are skipped entirely. Anything
         // else — proxy, exotic index sources, an enumerable proto key —
         // falls back to the generic walk below, unchanged.
-        if self.for_in_keys_fast(&obj, &mut out) {
-            return Ok(out);
+        let mut guard = None;
+        if self.for_in_keys_fast(&obj, &mut out, &mut guard) {
+            return Ok((out, guard));
         }
         out.clear();
         // Dedup by `JsString` (an insert clones an `Rc`, not the bytes) under
@@ -598,7 +602,7 @@ impl Vm {
             }
             cur = o.borrow().proto.clone();
         }
-        Ok(out)
+        Ok((out, None))
     }
 
     /// Park a for-in enumerator's key buffer back in the pool (cleared —
@@ -620,8 +624,19 @@ impl Vm {
     /// needed. `false` = use the generic walk (the caller clears the
     /// buffer); the split is decided by the same facts that walk reads, so
     /// both produce identical keys where this path applies.
-    fn for_in_keys_fast(&self, obj: &JsObject, out: &mut Vec<JsString>) -> bool {
+    fn for_in_keys_fast(
+        &self,
+        obj: &JsObject,
+        out: &mut Vec<JsString>,
+        guard: &mut Option<crate::vm::ForInGuard>,
+    ) -> bool {
         let mut ints: Vec<u32> = Vec::new();
+        let mut slots: Vec<u32> = Vec::new();
+        let shape;
+        // Set when the receiver's keys came from its shape's CACHED plan,
+        // where key `i` is slot `i` (see `Shape::forin_plan`): no chain
+        // walk, no per-key index parse, no slot vector.
+        let mut planned = false;
         let proto = {
             let b = obj.borrow();
             // Ordinary receivers only: exotic internals (dense elements,
@@ -630,17 +645,45 @@ impl Vm {
             if !matches!(b.internal, Internal::Ordinary) {
                 return false;
             }
-            for (k, p) in b.own_iter() {
-                if let PropertyKey::Str(s) = k {
-                    // Internal-slot keys are non-enumerable by contract, so
-                    // `p.enumerable` alone excludes them, as on the generic
-                    // path.
-                    if !p.enumerable {
-                        continue;
+            shape = b.own_shape().cloned();
+            // Cached-plan path: the shape lists this object's keys in slot
+            // order (it carries no index key), and every slot is
+            // enumerable, so the plan IS the key list. Attributes live per
+            // object, which is why enumerability is re-checked here rather
+            // than baked into the shared plan.
+            let plan = shape
+                .as_ref()
+                .and_then(|sh| sh.forin_plan().cloned())
+                .filter(|_| b.all_own_enumerable());
+            match plan {
+                Some(plan) => {
+                    planned = true;
+                    out.reserve(plan.len());
+                    for k in plan.iter() {
+                        match k {
+                            PropertyKey::Str(s) => out.push(s.clone()),
+                            // `forin_plan` admits string keys only.
+                            PropertyKey::Sym(_) => unreachable!("plan holds string keys"),
+                        }
                     }
-                    match k.array_index() {
-                        Some(i) => ints.push(i),
-                        None => out.push(s.clone()),
+                }
+                None => {
+                    for (i, (k, p)) in b.own_iter().enumerate() {
+                        if let PropertyKey::Str(s) = k {
+                            // Internal-slot keys are non-enumerable by
+                            // contract, so `p.enumerable` alone excludes
+                            // them, as on the generic path.
+                            if !p.enumerable {
+                                continue;
+                            }
+                            match k.array_index() {
+                                Some(idx) => ints.push(idx),
+                                None => {
+                                    out.push(s.clone());
+                                    slots.push(i as u32);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -648,6 +691,7 @@ impl Vm {
         };
         // Index-like keys enumerate first, ascending (map keys are unique,
         // so no dedup); the plain names keep insertion order after them.
+        let had_ints = !ints.is_empty();
         if !ints.is_empty() {
             ints.sort_unstable();
             let mut merged: Vec<JsString> = Vec::with_capacity(ints.len() + out.len());
@@ -679,14 +723,21 @@ impl Vm {
                 }
                 _ => {}
             }
-            for (k, p) in b.own_iter() {
-                if p.enumerable && matches!(k, PropertyKey::Str(_)) {
-                    return false;
-                }
+            if b.has_enumerable_str_prop() {
+                return false;
             }
             let next = b.proto.clone();
             drop(b);
             cur = next;
+        }
+        if let Some(shape) = shape {
+            if !had_ints {
+                *guard = Some(crate::vm::ForInGuard {
+                    shape,
+                    identity: planned,
+                    slots,
+                });
+            }
         }
         true
     }

@@ -133,10 +133,12 @@ pub struct Frame {
     /// Completion value for script-level evaluation (eval result).
     pub completion: Value,
     /// for-in enumerator stacks (key lists with cursor).
-    /// Active for-in enumerators: (snapshot keys, cursor, target). The
+    /// Active for-in enumerators: (snapshot keys, cursor, target, guard). The
     /// target lets each step skip keys deleted since the snapshot (spec
-    /// EnumerateObjectProperties never yields a deleted-but-unvisited key).
-    pub enumerators: Vec<(Vec<JsString>, usize, Option<JsObject>)>,
+    /// EnumerateObjectProperties never yields a deleted-but-unvisited key);
+    /// the guard (when the snapshot resolved every key in the target's own
+    /// shape) turns that per-key liveness walk into one shape-identity check.
+    pub enumerators: Vec<(Vec<JsString>, usize, Option<JsObject>, Option<ForInGuard>)>,
     /// Active `with` scope objects (innermost last). An unqualified identifier
     /// inside a `with` block resolves against these (honoring @@unscopables)
     /// before falling through to the lexical/global binding.
@@ -159,6 +161,36 @@ pub struct Frame {
     /// The active PrivateEnvironment chain: seeded from the closure's captured
     /// chain, pushed/popped by class definitions evaluating in this frame.
     pub priv_env: Option<Rc<crate::value::PrivateEnv>>,
+}
+
+/// Snapshot-time proof that a for-in enumerator's keys all live in the
+/// target's own shape: while the target's shape stays pointer-identical (no
+/// key added — that mints a new shape — and none deleted — that demotes to
+/// dictionary mode), every snapshot key still exists, so `for_in_next` can
+/// skip the per-key prototype-chain liveness walk. `slots[i]` is the
+/// target's slot index for `keys[i]`, feeding the [`ForInHint`] that serves
+/// the classic `obj[k]` read in the loop body as a direct slot load.
+pub struct ForInGuard {
+    pub(crate) shape: Rc<crate::shape::Shape>,
+    /// `true` when the snapshot came from the shape's cached plan, where
+    /// key `i` IS slot `i` — then `slots` stays empty and the enumeration
+    /// costs no per-object allocation at all.
+    pub(crate) identity: bool,
+    pub(crate) slots: Vec<u32>,
+}
+
+/// The most recent guarded `for_in_next` step: object identity, the shape
+/// it had, the key yielded, and that key's slot. `elem_get` consults it so
+/// the `obj[k]` immediately following a for-in step reads the slot directly
+/// — every field is re-verified at use (object pointer, current shape
+/// pointer, key equality, plain data slot), so a stale hint can only miss,
+/// never mis-read. Purely an accelerator: never serialized, cleared when
+/// the enumerator pops.
+pub(crate) struct ForInHint {
+    pub(crate) obj: JsObject,
+    pub(crate) shape: Rc<crate::shape::Shape>,
+    pub(crate) key: JsString,
+    pub(crate) slot: u32,
 }
 
 /// Promise internal state.
@@ -446,6 +478,14 @@ pub struct Vm {
     /// re-zeroed — stale `f64`s are unreadable (every register is either
     /// loaded at entry or store-before-read by translation proof), and
     /// zero-filling deep recursion windows per outer call was measurable.
+    /// Opt-in switch for the Cranelift kernel JIT (`jit` feature; see
+    /// `crate::jit` and docs/cranelift-jit.md). Default OFF even when the
+    /// feature is compiled in — the tier runs only when an embedder (the
+    /// `chidori-js-jit` binary, the differential tests) flips this. When on,
+    /// eligible kernels execute as native code between the ordinary entry
+    /// guard and exit materialization; everything else is unchanged.
+    #[cfg(feature = "jit")]
+    pub jit_enabled: bool,
     pub(crate) kernel_regs: Vec<f64>,
     /// Scratch cache of the array-base objects for the active kernel (see
     /// `kernel_regs`); cleared after every activation so the pool never
@@ -462,7 +502,14 @@ pub struct Vm {
     /// and walks member code, which dominated shallow recursions when paid
     /// per outer call. Bounded; validated per activation; a pure perf cache
     /// (hit vs miss is unobservable).
-    pub(crate) rec_families: Vec<crate::exec::RecFamily>,
+    /// Boxed so the per-call take/park moves a pointer, not the fat struct
+    /// (`take_rec_family` swap-removes and re-pushes one entry per outer
+    /// recursive call — that move was measurable on shallow-hot recursion).
+    #[expect(
+        clippy::vec_box,
+        reason = "entries are moved OUT and back per call; boxing keeps that a pointer move"
+    )]
+    pub(crate) rec_families: Vec<Box<crate::exec::RecFamily>>,
     /// Pooled (caller, return-pc, dst, window) stack for
     /// `run_fn_kernel_rec`; parked empty.
     pub(crate) rec_calls: Vec<(u8, u16, u16, u32)>,
@@ -473,6 +520,11 @@ pub struct Vm {
     /// enumerators without parking — a pool miss, never a stale key). Pure
     /// perf: only the buffer allocation is reused. Bounded.
     pub(crate) forin_pool: Vec<Vec<crate::value::JsString>>,
+    /// The last guarded for-in step's (object, key, slot) — see
+    /// [`ForInHint`]. `Cell` because `for_in_next` publishes it under
+    /// `&self`; fully re-verified at every use, cleared at `ForInPop` and
+    /// before cycle collection.
+    pub(crate) forin_hint: std::cell::Cell<Option<ForInHint>>,
     /// Pinned STRING bases for the active loop-kernel activation (mirrors
     /// `kernel_objs`); cleared after every activation so the pool never
     /// extends a string's lifetime.
@@ -539,6 +591,8 @@ impl Vm {
             cell_pool: Vec::new(),
             dummy_cell: Rc::new(RefCell::new(Value::Undefined)),
             frame_pool: Vec::new(),
+            #[cfg(feature = "jit")]
+            jit_enabled: false,
             kernel_regs: Vec::new(),
             kernel_objs: Vec::new(),
             kernel_prop_slots: Vec::new(),
@@ -546,6 +600,7 @@ impl Vm {
             rec_families: Vec::new(),
             rec_calls: Vec::new(),
             forin_pool: Vec::new(),
+            forin_hint: std::cell::Cell::new(None),
             kernel_strs: Vec::new(),
             json_keys: std::collections::HashMap::default(),
             dummy_bf: Rc::new(BytecodeFunction {

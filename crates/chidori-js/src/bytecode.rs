@@ -1283,12 +1283,21 @@ pub enum KOp {
     /// length is an activation constant.
     StrLen { dst: u16, str: u16 },
     /// `regs[dst] = charCodeAt(regs[idx])` over the pinned ASCII string in
-    /// string slot `str`. TOTAL (no bail): the index conversion
-    /// (ToIntegerOrInfinity — NaN→0, truncate toward zero, saturating) and
-    /// the out-of-range NaN result are computed exactly in-kernel; the entry
-    /// guard proved the receiver a flat ASCII string (unit == byte) and the
-    /// canonical `String.prototype.charCodeAt` resolution.
-    CharCodeAt { dst: u16, str: u16, idx: u16 },
+    /// string slot `str`. TOTAL on the interpreter tier (no bail is ever
+    /// taken there): the index conversion (ToIntegerOrInfinity — NaN→0,
+    /// truncate toward zero, saturating) and the out-of-range NaN result
+    /// are computed exactly in-kernel; the entry guard proved the receiver
+    /// a flat ASCII string (unit == byte) and the canonical
+    /// `String.prototype.charCodeAt` resolution. `bail` exists for the
+    /// JIT's INT-typed bodies, where an out-of-range index cannot produce
+    /// the NaN an i64 register has no representation for — it resumes the
+    /// generic interpreter at the call, which computes that NaN.
+    CharCodeAt {
+        dst: u16,
+        str: u16,
+        idx: u16,
+        bail: u16,
+    },
     /// SUPERINSTRUCTION: `LoadElem` followed by `Arith` — the
     /// `d += a[i] * b[i]` dot-product shape's second load feeding its
     /// multiply (which the `(Arith, Add)` fusion then folds separately).
@@ -1448,13 +1457,15 @@ pub enum KOp {
     /// registers sit contiguously at `base..`; the callee's `Ret` lands in
     /// `regs[dst]` of the calling window (always a Number — recursive
     /// kernels reject boolean returns). Only emitted when the body's callee
-    /// is `LoadGlobal` of the function's OWN name; the entry guard then
-    /// verifies the referenced bindings still hold the expected closures
-    /// ([`Kernel::rec`]), so a rebound name declines to the generic path.
-    /// `callee` selects the target: 0 = the invoked closure itself
-    /// (self-recursion, whether referenced through its global name or a
-    /// captured binding), `1 + i` = the closure the entry guard resolved for
-    /// [`KernelRec::globals`]`[i]` (mutual recursion). Depth is tracked
+    /// is `LoadGlobal` of the function's OWN name or a callee-position
+    /// captured binding; the entry guard then verifies the referenced
+    /// bindings still hold the expected closures ([`Kernel::rec`]), so a
+    /// rebound name/cell declines to the generic path. `callee` selects the
+    /// target: 0 = the invoked closure itself (via its own global name),
+    /// `1 + i` = the closure resolved for [`KernelRec::globals`]`[i]`
+    /// (global mutual recursion), `1 + globals.len() + j` = the closure the
+    /// cell at [`KernelRec::upvalues`]`[j]` holds (function-scoped self or
+    /// mutual recursion, member-mapped per activation). Depth is tracked
     /// against the interpreter's limit; an overflow ABANDONS the (pure,
     /// side-effect-free) kernel activation and reruns the whole call
     /// generically, which raises the spec RangeError.
@@ -1472,18 +1483,21 @@ pub enum KOp {
 /// generic path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfRefKind {
-    /// `function f() { … f() … }` — via the global binding `f`.
+    /// `function f() { … f() … }` — via the global binding `f`. (A
+    /// captured-cell reference is not a self-REF: callee-position upvalues
+    /// are speculated as family CALLEES — [`KernelRec::upvalues`] — and the
+    /// entry resolution decides per activation whether the cell holds the
+    /// invoked closure itself or a partner.)
     Global(Box<str>),
-    /// `const f = () => … f() …` — via the captured cell at upvalue index.
-    Upvalue(u32),
 }
 
 /// Recursion descriptor for a FUNCTION kernel containing [`KOp::SelfCall`]s.
 /// Present iff the kernel is recursive; such kernels run on the windowed
-/// executor (`Vm::run_fn_kernel_rec`).
+/// executor (`Vm::run_fn_kernel_rec`) or, under the `jit` feature, as
+/// mutually-recursive native functions compiled against the resolved family.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KernelRec {
-    /// Every way the body referenced the invoked function itself.
+    /// Every way the body referenced the invoked function itself by NAME.
     pub self_refs: Box<[SelfRefKind]>,
     /// GLOBAL names of the OTHER functions the body calls recursively
     /// (mutual recursion): [`KOp::SelfCall`] `callee` `1 + i` targets the
@@ -1492,6 +1506,16 @@ pub struct KernelRec {
     /// a compatible recursive-class kernel, closed transitively over the
     /// whole call family.
     pub globals: Box<[Box<str>]>,
+    /// UPVALUE indices the body calls through (function-scoped recursion:
+    /// `const f = () => … f() …` self-capture, and function-scoped MUTUAL
+    /// recursion — `isEven`/`isOdd` defined inside a function capturing each
+    /// other): [`KOp::SelfCall`] `callee` `1 + globals.len() + j` targets
+    /// the closure held by the cell at `upvalues[j]`. Which family member
+    /// that is — the invoked closure itself or a partner — is resolved (and
+    /// re-verified) per activation by the entry guard; the cell must hold a
+    /// plain bytecode closure with a compatible kernel, closed transitively
+    /// over the whole call family.
+    pub upvalues: Box<[u32]>,
 }
 
 /// A numeric register's source: a frame local (read/write), a captured
@@ -1713,6 +1737,23 @@ pub struct Kernel {
     /// glue code bails on EVERY iteration; the guard+enter+bail cycle would
     /// otherwise be paid per iteration forever).
     pub futile: std::cell::Cell<u8>,
+    /// Cranelift-compiled native code for this kernel (`jit` feature only;
+    /// see `crate::jit`). Empty until the first activation with the tier
+    /// enabled; then `Some(None)` when translation declined (an op outside
+    /// the scalar subset — the kernel stays on the interpreter tier) or
+    /// `Some(Some(_))` with the compiled code. Like `futile` and the inline
+    /// caches, a pure performance side effect: never serialized, never
+    /// observable — the native code computes bit-identical results, and a
+    /// cloned kernel simply compiles again on its own first activation.
+    #[cfg(feature = "jit")]
+    pub native: crate::jit::NativeCache,
+    /// Synthetic BATCH kernels built around this FUNCTION kernel by the
+    /// array-HOF batch driver (`jit` feature; see `crate::jit::BatchCache`),
+    /// one per batch mode, each carrying its own `native` cache compiled
+    /// against exactly this kernel's proto. Empty for loop kernels and any
+    /// function kernel never used as a batchable callback.
+    #[cfg(feature = "jit")]
+    pub batch: crate::jit::BatchCache,
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
     /// entry-resolved to raw slot indices. See [`KProp`].
     pub props_used: Box<[KProp]>,

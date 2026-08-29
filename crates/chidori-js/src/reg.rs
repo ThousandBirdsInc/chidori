@@ -126,6 +126,20 @@ pub struct RegProto {
     pub kernel_resume: Box<[(u32, u32)]>,
 }
 
+/// Bit set on a SOURCE register-index field when the operand is consumed
+/// from a dying stack temp: the interpreter MOVES the value out
+/// (`mem::take`) instead of cloning it, eliding an `Rc` round-trip per
+/// operand. The translator sets it only via [`Emitter::pop_reg_take`] — a
+/// popped virtual-stack entry whose value lives in its canonical register
+/// (never a `Local`, whose binding survives, and never a `Reg` alias,
+/// whose value is shared with a live lower slot). After a pop that
+/// position's canonical register is dead until a later push writes it
+/// fresh, so the `Undefined` left behind is unobservable. Only fields
+/// their interpreter arm reads through the take-aware `rd!` may carry the
+/// bit; by-reference reads (`Cmp`, the branch tests) never do.
+/// [`translate`] declines the rare function needing >= 0x8000 registers.
+pub const TAKE: u16 = 0x8000;
+
 /// Unary value ops sharing one register shape (`dst = op(src)`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RUnary {
@@ -1323,7 +1337,8 @@ pub fn regify(
         }
     }
     let num_regs = e.max_reg as u32 + 1;
-    if num_regs > u16::MAX as u32 {
+    // The high bit of a register index is the operand-consume marker.
+    if num_regs >= TAKE as u32 {
         return None;
     }
     let ic = (0..e.ics)
@@ -1565,6 +1580,23 @@ impl Emitter<'_> {
         r
     }
 
+    /// [`Self::pop_reg`] for an operand the op CONSUMES (its interpreter
+    /// arm reads the field through the take-aware `rd!`): a dying
+    /// canonical temp comes back tagged with [`TAKE`] so the interpreter
+    /// moves the value instead of cloning. A `Local` (binding survives)
+    /// or `Reg` alias (value shared with a live lower slot) stays a plain
+    /// clone.
+    fn pop_reg_take(&mut self) -> u16 {
+        let pos = self.entries.len() - 1;
+        let take = !matches!(self.entries[pos], Entry::Local(_) | Entry::Reg(_));
+        let r = self.pop_reg();
+        if take {
+            r | TAKE
+        } else {
+            r
+        }
+    }
+
     /// Result register for an op producing at the current top.
     fn dst(&mut self) -> u16 {
         let c = self.canon(self.entries.len());
@@ -1646,7 +1678,7 @@ impl Emitter<'_> {
         } else {
             self.flush_local(l);
         }
-        let src = self.pop_reg();
+        let src = self.pop_reg_take();
         self.push_op(ROp::Mov { dst: l, src });
     }
 
@@ -1719,7 +1751,7 @@ impl Emitter<'_> {
             StoreLocal(i) => self.store_local(*i as u16),
             StoreLocalChecked(i) => {
                 self.flush_local(*i as u16);
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::StoreLocalChecked {
                     local: *i as u16,
                     src,
@@ -1808,15 +1840,15 @@ impl Emitter<'_> {
                 self.entries.push(Entry::K(*konst));
             }
             StoreCell(i) => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::StoreCell { cell: *i, src });
             }
             StoreCellChecked(i) => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::StoreCellChecked { cell: *i, src });
             }
             InitCell(i) => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::InitCell { cell: *i, src });
             }
             InitCellTdz(i) => self.push_op(ROp::InitCellTdz { cell: *i }),
@@ -1875,11 +1907,11 @@ impl Emitter<'_> {
                 self.push_temp();
             }
             StoreUpvalue(i) => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::StoreUpvalue { idx: *i, src });
             }
             StoreUpvalueChecked(i) => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::StoreUpvalueChecked { idx: *i, src });
             }
 
@@ -1891,7 +1923,7 @@ impl Emitter<'_> {
                 self.push_temp();
             }
             StoreGlobal(i) => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::StoreGlobal { name: *i, src });
             }
             LoadGlobalTypeof(i) => {
@@ -1905,7 +1937,7 @@ impl Emitter<'_> {
             }),
             CanDeclareGlobalFunc(i) => self.push_op(ROp::CanDeclareGlobalFunc { name: *i }),
             DefineGlobalFunc { name, deletable } => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::DefineGlobalFunc {
                     name: *name,
                     deletable: *deletable,
@@ -2066,7 +2098,7 @@ impl Emitter<'_> {
                 self.push_temp();
             }
             ArraySpread => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 let pos = self.entries.len() - 1;
                 let arr = self.reg_of(pos);
                 self.push_op(ROp::ArraySpread { arr, src });
@@ -2074,8 +2106,8 @@ impl Emitter<'_> {
             }
             DefineField | DefineMethod | DefineGetter | DefineSetter | DefineMethodGetter
             | DefineMethodSetter => {
-                let val = self.pop_reg();
-                let key = self.pop_reg();
+                let val = self.pop_reg_take();
+                let key = self.pop_reg_take();
                 let pos = self.entries.len() - 1;
                 let obj = self.reg_of(pos);
                 let kind = match op {
@@ -2101,7 +2133,7 @@ impl Emitter<'_> {
                 self.push_op(ROp::SetHomeObject { obj, val });
             }
             ObjectSpread => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 let pos = self.entries.len() - 1;
                 let target = self.reg_of(pos);
                 self.push_op(ROp::ObjectSpread { target, src });
@@ -2114,7 +2146,7 @@ impl Emitter<'_> {
                 }
                 let at = self.canon(base);
                 self.entries.truncate(base);
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 let pos = self.entries.len() - 1;
                 let target = self.reg_of(pos);
                 self.push_op(ROp::CopyDataPropsExcept {
@@ -2125,7 +2157,7 @@ impl Emitter<'_> {
                 });
             }
             GetProp(i) => {
-                let obj = self.pop_reg();
+                let obj = self.pop_reg_take();
                 let dst = self.dst();
                 let ic = self.next_ic();
                 self.push_def(ROp::GetProp {
@@ -2137,8 +2169,8 @@ impl Emitter<'_> {
                 self.push_temp();
             }
             SetProp(i) => {
-                let src = self.pop_reg();
-                let obj = self.pop_reg();
+                let src = self.pop_reg_take();
+                let obj = self.pop_reg_take();
                 let dst = self.dst();
                 let ic = self.next_ic();
                 self.push_def(ROp::SetProp {
@@ -2151,36 +2183,36 @@ impl Emitter<'_> {
                 self.push_temp();
             }
             GetPropDynamic => {
-                let key = self.pop_reg();
-                let obj = self.pop_reg();
+                let key = self.pop_reg_take();
+                let obj = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::GetElem { dst, obj, key });
                 self.push_temp();
             }
             SetPropDynamic => {
-                let src = self.pop_reg();
-                let key = self.pop_reg();
-                let obj = self.pop_reg();
+                let src = self.pop_reg_take();
+                let key = self.pop_reg_take();
+                let obj = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::SetElem { dst, obj, key, src });
                 self.push_temp();
             }
             DeleteProp(i) => {
-                let obj = self.pop_reg();
+                let obj = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::DelProp { dst, obj, name: *i });
                 self.push_temp();
             }
             DeletePropDynamic => {
-                let key = self.pop_reg();
-                let obj = self.pop_reg();
+                let key = self.pop_reg_take();
+                let obj = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::DelElem { dst, obj, key });
                 self.push_temp();
             }
             HasProp => {
-                let obj = self.pop_reg();
-                let key = self.pop_reg();
+                let obj = self.pop_reg_take();
+                let key = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::HasProp { dst, key, obj });
                 self.push_temp();
@@ -2196,7 +2228,7 @@ impl Emitter<'_> {
                 });
             }
             SetProtoFromLiteral => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 let pos = self.entries.len() - 1;
                 let obj = self.reg_of(pos);
                 self.push_op(ROp::SetProtoFromLiteral { obj, src });
@@ -2212,8 +2244,8 @@ impl Emitter<'_> {
                 }
                 let at = self.canon(base);
                 self.entries.truncate(base);
-                let this = if has_this { self.pop_reg() } else { 0 };
-                let func = self.pop_reg();
+                let this = if has_this { self.pop_reg_take() } else { 0 };
+                let func = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::Call {
                     dst,
@@ -2233,7 +2265,7 @@ impl Emitter<'_> {
                 }
                 let at = self.canon(base);
                 self.entries.truncate(base);
-                let ctor = self.pop_reg();
+                let ctor = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::New {
                     dst,
@@ -2244,9 +2276,9 @@ impl Emitter<'_> {
                 self.push_temp();
             }
             CallSpread => {
-                let args = self.pop_reg();
-                let this = self.pop_reg();
-                let func = self.pop_reg();
+                let args = self.pop_reg_take();
+                let this = self.pop_reg_take();
+                let func = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::CallSpread {
                     dst,
@@ -2257,14 +2289,14 @@ impl Emitter<'_> {
                 self.push_temp();
             }
             NewSpread => {
-                let args = self.pop_reg();
-                let ctor = self.pop_reg();
+                let args = self.pop_reg_take();
+                let ctor = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::NewSpread { dst, ctor, args });
                 self.push_temp();
             }
             Return => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::Ret { src });
                 return Some((false, 1));
             }
@@ -2273,7 +2305,7 @@ impl Emitter<'_> {
                 return Some((false, 1));
             }
             Throw => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 self.push_op(ROp::Throw { src });
                 return Some((false, 1));
             }
@@ -2377,8 +2409,8 @@ impl Emitter<'_> {
             Le => self.cmp(CmpOp::Le),
             Ge => self.cmp(CmpOp::Ge),
             InstanceOf => {
-                let b = self.pop_reg();
-                let a = self.pop_reg();
+                let b = self.pop_reg_take();
+                let a = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::InstanceOf { dst, a, b });
                 self.push_temp();
@@ -2526,7 +2558,7 @@ impl Emitter<'_> {
 
             // ---- iteration ----
             GetIterator => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::GetIterator { dst, src });
                 self.push_temp();
@@ -2539,8 +2571,8 @@ impl Emitter<'_> {
                 self.push_temp();
             }
             IteratorStepValue => {
-                let it = self.pop_reg();
-                let next = self.pop_reg();
+                let it = self.pop_reg_take();
+                let next = self.pop_reg_take();
                 let dst = self.dst();
                 self.touch(dst + 1);
                 self.push_op(ROp::IterStepValue { dst, next, it });
@@ -2548,7 +2580,7 @@ impl Emitter<'_> {
                 self.push_temp();
             }
             ForInEnumerate => {
-                let src = self.pop_reg();
+                let src = self.pop_reg_take();
                 let dst = self.dst();
                 self.push_def(ROp::ForInEnumerate { dst, src });
                 self.push_temp();
@@ -2599,14 +2631,14 @@ impl Emitter<'_> {
             let k = *k;
             self.entries.pop();
             self.last_def = None;
-            let a = self.pop_reg();
+            let a = self.pop_reg_take();
             let dst = self.dst();
             self.push_def(ROp::AddK { dst, a, konst: k });
             self.push_temp();
             return;
         }
-        let b = self.pop_reg();
-        let a = self.pop_reg();
+        let b = self.pop_reg_take();
+        let a = self.pop_reg_take();
         let dst = self.dst();
         self.push_def(ROp::Add { dst, a, b });
         self.push_temp();
@@ -2617,7 +2649,7 @@ impl Emitter<'_> {
             let k = *k;
             self.entries.pop();
             self.last_def = None;
-            let a = self.pop_reg();
+            let a = self.pop_reg_take();
             let dst = self.dst();
             self.push_def(ROp::ArithK {
                 kind,
@@ -2628,15 +2660,15 @@ impl Emitter<'_> {
             self.push_temp();
             return;
         }
-        let b = self.pop_reg();
-        let a = self.pop_reg();
+        let b = self.pop_reg_take();
+        let a = self.pop_reg_take();
         let dst = self.dst();
         self.push_def(ROp::Arith { kind, dst, a, b });
         self.push_temp();
     }
 
     fn unary(&mut self, kind: RUnary) {
-        let src = self.pop_reg();
+        let src = self.pop_reg_take();
         let dst = self.dst();
         self.push_def(ROp::Unary { kind, dst, src });
         self.push_temp();

@@ -27,6 +27,25 @@ fn peek_plain_bytecode(v: &Value) -> Option<Rc<BytecodeFunction>> {
     None
 }
 
+/// Outcome of one array-HOF batch run ([`Vm::hof_batch`], `jit` feature):
+/// the whole loop completed natively, or it bailed at `index` and the
+/// caller's generic loop resumes there, or the cooperative interrupt
+/// latched (the op budget is already zeroed; the caller raises the
+/// standard RangeError).
+#[cfg(feature = "jit")]
+pub(crate) enum HofBatchOut {
+    /// Ran to the end. Carries the final accumulator (`reduce`; 0.0
+    /// otherwise).
+    Done(f64),
+    /// Bailed before finishing: resume the generic loop at `index` with
+    /// `acc` (the output array already holds everything before `index`).
+    Resume { index: f64, acc: f64 },
+    /// EARLY-EXIT modes (`some`/`every`/`find`): the search hit at `index`.
+    Found { index: f64 },
+    /// The cooperative interrupt latched mid-batch.
+    Interrupted,
+}
+
 /// A callback prepared once per native higher-order invocation — the
 /// invocation-invariant slice of the `run_fn_kernel` entry guard plus the
 /// register buffer, hoisted out of the per-element call. Built by
@@ -38,6 +57,12 @@ pub(crate) struct PreparedKernel {
     /// Back-edge interrupt poll counter (cadence spans calls).
     poll: u32,
     interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Compiled form of the callback's kernel, resolved ONCE here instead of
+    /// per call (`jit` feature, tier enabled): the kernel is fixed for the
+    /// prepared handle's lifetime, so the per-activation lookup + identity
+    /// check `native_for` performs per call is invocation-invariant too.
+    #[cfg(feature = "jit")]
+    native: Option<crate::jit::NativeKernel>,
 }
 
 /// Control-flow outcome of a register-mode completion dispatch (the
@@ -84,27 +109,42 @@ pub(crate) struct RecGlobalCheck {
 /// eviction is only ever a perf event, never observable.
 pub(crate) struct RecFamily {
     /// The family members; `funcs[0]` is the entry closure (cache key).
-    funcs: Vec<Rc<BytecodeFunction>>,
+    pub(crate) funcs: Vec<Rc<BytecodeFunction>>,
     /// `callee_map[j][c]` = `funcs` index for member `j`'s `SelfCall`
-    /// callee `c` (`c = 0` is `j` itself; `c = 1 + i` is `rec.globals[i]`).
-    callee_map: Vec<Vec<u8>>,
+    /// callee `c` (`c = 0` is `j` itself; `c = 1 + i` is `rec.globals[i]`;
+    /// `c = 1 + globals.len() + j2` is `rec.upvalues[j2]`'s resolution).
+    pub(crate) callee_map: Vec<Vec<u8>>,
     /// Per-member register-window size.
     /// Per-member (register, argument index) entry loads.
-    arg_slots: Vec<Vec<(usize, usize)>>,
+    pub(crate) arg_slots: Vec<Vec<(usize, usize)>>,
     /// Per-member (register, upvalue index, snapshot) — the VALUE is
     /// refreshed on every activation (cells can change between calls, never
     /// during one).
     uv_snaps: Vec<Vec<(usize, u32, f64)>>,
+    /// The upvalue snapshots FLATTENED, member-major in `uv_snaps` order —
+    /// the table the `jit` tier's compiled members read their upvalue
+    /// registers from (`JitCtx::rec_uv`); refreshed alongside `uv_snaps`.
+    pub(crate) uv_flat: Vec<f64>,
     /// Every global binding the family's guard depends on.
     global_checks: Vec<RecGlobalCheck>,
-    /// (member, upvalue index) self-references: the cell must hold that
-    /// member's own closure.
-    upval_self_checks: Vec<(u8, u32)>,
+    /// (member, upvalue index, resolved member) upvalue CALLEES: the cell
+    /// at member `m`'s upvalue `u` must hold `funcs[resolved]` — the
+    /// per-activation re-verification of function-scoped self/mutual
+    /// recursion (a reassigned cell declines to the generic path).
+    upval_checks: Vec<(u8, u32, u8)>,
     /// Members whose kernels use `Math` intrinsics (canonicals re-verified
     /// per activation).
     math_members: Vec<u8>,
     /// The family's uniform `Ret` register type.
-    ret_bool: bool,
+    pub(crate) ret_bool: bool,
+    /// The family's compiled native code, cached after the first
+    /// `native_for_family` success: the code was compiled against exactly
+    /// this family's members and callee map (which travel together with it
+    /// through the park/take cache), so later calls skip the per-call
+    /// identity re-checks entirely — `validate_rec_family` already
+    /// re-verifies every dynamic fact.
+    #[cfg(feature = "jit")]
+    pub(crate) native: Option<crate::jit::NativeKernel>,
 }
 
 /// Outcome of a kernel activation attempt for the caller's tier to act on:
@@ -652,10 +692,13 @@ impl Vm {
         // resolution. Checked before any pooled state is taken; the strings
         // themselves are cached below alongside the object bases.
         for &l in k.sslots.iter() {
+            // The length cap backs the JIT's int-typed `StrLen` range
+            // (`jit_ty::LEN_HI`); no allocatable string comes near it.
             let ok = matches!(
                 &frame.locals[l as usize],
                 Value::String(st)
-                    if matches!(st.flatten_utf8(), Some(f) if f.len() == st.len_utf16())
+                    if matches!(st.flatten_utf8(), Some(f) if f.len() == st.len_utf16()
+                        && (f.len() as u64) < (1u64 << 48))
             );
             if !ok {
                 {
@@ -1065,6 +1108,107 @@ impl Vm {
                 }
             }
         }
+        let interrupt = self.interrupt.clone();
+        let mut poll: u32 = 0;
+        let mut pc = 0usize;
+        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): when enabled and
+        // this kernel compiles (first activation; see `crate::jit` for the
+        // compiled subset — including pinned-callee kernels, compiled against
+        // and identity-checked per activation against the resolved callees),
+        // the whole activation runs as native code between the guard above
+        // and the materialization below. The native run leaves the register
+        // buffer exactly as the interpreter loop would (window 0 stored
+        // back; callee windows are scratch on both tiers) and reports where
+        // it stopped:
+        // - the index of an `Exit` op: `pc` starts there, so the loop below
+        //   dispatches exactly that `Exit` and the shared write-back / shape
+        //   materialization runs unchanged;
+        // - `INTERRUPTED`: the same latch-and-unwind as an interpreter-tier
+        //   back-edge poll hit (the `branch!` arm), written out inline here.
+        // A kernel that does not compile falls through to the loop at pc 0 —
+        // the tier never has a third outcome.
+        #[cfg(feature = "jit")]
+        if self.jit_enabled {
+            // Dense direct views only for kernels that provably never
+            // change any array's length or contents (no element stores,
+            // no push/pop) — then a dense array's storage pointer and
+            // length hold for the whole activation.
+            let allow_dense = !k.stores_elems && !k.uses_array_push && !k.uses_array_pop;
+            // The per-oslot element-view kinds of THIS activation: on the
+            // compiling (first) activation these are baked into the code as
+            // the one direct typed-array sequence per oslot; later
+            // activations guard against them at run time.
+            let elem_kinds: Vec<u64> = objs
+                .iter()
+                .map(|o| crate::jit::elem_kind_code(o, allow_dense))
+                .collect();
+            let native_exit = crate::jit::native_for_loop(k, &callee_bfs, &elem_kinds, &regs)
+                .map(|native| {
+                // Activation tables for the native run, alive exactly across
+                // it: the pinned strings (guard-validated flat ASCII), the
+                // per-oslot direct element views (numeric typed arrays of
+                // any kind; dense arrays when granted), the object cache
+                // the element shims index, and the canonical Array.prototype
+                // for the push receiver check.
+                let sstr_tab: Vec<crate::jit::SStr> = sstrs
+                    .iter()
+                    .map(|st| {
+                        let f = st.flatten_utf8().expect("entry-guarded flat ASCII");
+                        crate::jit::SStr {
+                            ptr: f.as_ptr(),
+                            len: f.len() as u64,
+                        }
+                    })
+                    .collect();
+                let ta_tab: Vec<crate::jit::ElemView> = objs
+                    .iter()
+                    .map(|o| crate::jit::elem_view(o, allow_dense))
+                    .collect();
+                let mut ctx = crate::jit::JitCtx {
+                    sstr: sstr_tab.as_ptr(),
+                    objs: objs.as_ptr(),
+                    n_objs: objs.len() as u64,
+                    ta: ta_tab.as_ptr(),
+                    array_proto: if k.uses_array_push || k.uses_array_pop {
+                        &self.realm.array_proto
+                    } else {
+                        std::ptr::null()
+                    },
+                    scratch: 0.0,
+                    depth: 0,
+                    abandon: 0,
+                    poll: 0,
+                    rec_uv: std::ptr::null(),
+                };
+                native.run(&mut regs, interrupt.as_deref(), &mut ctx)
+            });
+            match native_exit {
+                None => {}
+                Some(stopped_at) if stopped_at >= 0 => pc = stopped_at as usize,
+                Some(_interrupted) => {
+                    for (r, slot) in k.locals.iter().enumerate() {
+                        if let crate::bytecode::KSlot::Local(l) = slot {
+                            frame.locals[*l as usize] = Value::Number(regs[r & KWIN_MASK]);
+                        }
+                    }
+                    for (j, &l) in k.bool_locals.iter().enumerate() {
+                        frame.locals[l as usize] =
+                            Value::Bool(regs[(bool_base + j) & KWIN_MASK] != 0.0);
+                    }
+                    writeback_kernel_props(k, &objs, &prop_slots, &regs);
+                    self.kernel_regs = regs;
+                    objs.clear();
+                    self.kernel_objs = objs;
+                    sstrs.clear();
+                    self.kernel_strs = sstrs;
+                    self.kernel_prop_slots = prop_slots;
+                    callee_bfs.clear();
+                    self.kernel_callees = callee_bfs;
+                    self.op_budget = Some(0);
+                    return Err(self.throw_range("execution interrupted"));
+                }
+            }
+        }
         // Masked fixed window: `w` is this kernel's window (first KWIN slots);
         // `wtail` holds the pinned-callee windows at KWIN strides (CALLEES
         // only). Every register index is `< n_regs ≤ KWIN` by translation, so
@@ -1072,10 +1216,7 @@ impl Vm {
         // in-bounds — the dispatch loop below carries no bounds checks.
         let (whead, wtail) = regs.split_at_mut(KWIN);
         let w: &mut [f64; KWIN] = whead.try_into().expect("sized above");
-        let interrupt = self.interrupt.clone();
-        let mut poll: u32 = 0;
         let code = &k.code;
-        let mut pc = 0usize;
         let (resume_ip, shape) = loop {
             // Latch-and-unwind for ops the translator promised this loop
             // never contains — a TIER BUG, but one that must stay inside the
@@ -1205,50 +1346,18 @@ impl Vm {
                         branch!(target)
                     }
                 }
-                // Dense element read: full fast-path re-check, else bail to
-                // the generic op (the `bail` target is an Exit stub).
+                // Dense element read: full fast-path re-check (shared core,
+                // see [`kernel_elem_load`]), else bail to the generic op
+                // (the `bail` target is an Exit stub).
                 KOp::LoadElem {
                     dst,
                     obj,
                     idx,
                     bail,
-                } => {
-                    let i = w[idx as usize & KWIN_MASK];
-                    let mut ok = false;
-                    if let Some(iu) = dense_index(i) {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                if let Some(Value::Number(n)) = arr.get(iu) {
-                                    w[dst as usize & KWIN_MASK] = *n;
-                                    ok = true;
-                                }
-                            }
-                            // Numeric typed arrays: a valid-index [[Get]]
-                            // reads element storage directly — own props and
-                            // the prototype chain are never consulted, so no
-                            // props/proto check is needed. OOB (incl.
-                            // detached / shrunk-view) bails to the generic
-                            // path, which owns the `undefined` absorption.
-                            Internal::TypedArray(t)
-                                if !t.kind.is_bigint()
-                                    && iu < crate::typed_array::ta_eff_length(t) =>
-                            {
-                                let off = t.byte_offset + iu * t.kind.bytes();
-                                let buf = t.buffer.borrow();
-                                if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
-                                    w[dst as usize & KWIN_MASK] =
-                                        crate::typed_array::decode(bytes, off, t.kind);
-                                    ok = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
-                    }
-                }
+                } => match kernel_elem_load(&objs, obj as usize, w[idx as usize & KWIN_MASK]) {
+                    Some(n) => w[dst as usize & KWIN_MASK] = n,
+                    None => branch!(bail),
+                },
                 // Pinned-native push: append + new length, in-kernel. The
                 // entry guard proved the canonical method still resolves
                 // and (stores_elems) that no proto can intercept element
@@ -1260,51 +1369,23 @@ impl Vm {
                     val,
                     dst,
                     bail,
-                } => {
-                    let mut ok = false;
-                    {
-                        let mut b = objs[obj as usize].borrow_mut();
-                        if b.own_is_empty()
-                            && b.extensible
-                            && b.proto
-                                .as_ref()
-                                .is_some_and(|p| p.ptr_eq(&self.realm.array_proto))
-                        {
-                            if let Internal::Array(arr) = &mut b.internal {
-                                if arr.len() < crate::value::MAX_DENSE_ARRAY {
-                                    arr.push(Value::Number(w[val as usize & KWIN_MASK]));
-                                    w[dst as usize & KWIN_MASK] = arr.len() as f64;
-                                    ok = true;
-                                }
-                            }
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
-                    }
-                }
+                } => match kernel_array_push(
+                    &objs,
+                    obj as usize,
+                    &self.realm.array_proto,
+                    w[val as usize & KWIN_MASK],
+                ) {
+                    Some(len) => w[dst as usize & KWIN_MASK] = len,
+                    None => branch!(bail),
+                },
                 // Pinned-native pop: remove + yield the last element when it
                 // is a plain Number. An empty array (undefined result), a
                 // trailing hole (prototype consult), or a non-Number element
                 // re-runs the generic Call via the bail.
-                KOp::ArrayPop { obj, dst, bail } => {
-                    let mut ok = false;
-                    {
-                        let mut b = objs[obj as usize].borrow_mut();
-                        if b.own_is_empty() && b.extensible {
-                            if let Internal::Array(arr) = &mut b.internal {
-                                if let Some(Value::Number(n)) = arr.last() {
-                                    w[dst as usize & KWIN_MASK] = *n;
-                                    arr.pop();
-                                    ok = true;
-                                }
-                            }
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
-                    }
-                }
+                KOp::ArrayPop { obj, dst, bail } => match kernel_array_pop(&objs, obj as usize) {
+                    Some(n) => w[dst as usize & KWIN_MASK] = n,
+                    None => branch!(bail),
+                },
                 // Dense element write: in-place overwrite (exactly the
                 // `Op::SetPropDynamic` fast-path conditions), an in-bounds
                 // HOLE fill, or an exact one-past-the-end APPEND. Filling and
@@ -1320,66 +1401,12 @@ impl Vm {
                     val,
                     bail,
                 } => {
-                    let i = w[idx as usize & KWIN_MASK];
-                    let mut ok = false;
-                    if let Some(iu) = dense_index(i) {
-                        let mut b = objs[obj as usize].borrow_mut();
-                        let extensible = b.extensible;
-                        let props_empty = b.own_is_empty();
-                        match &mut b.internal {
-                            Internal::Array(arr) if props_empty => {
-                                match arr.get_mut(iu) {
-                                    Some(slot) if !matches!(slot, Value::Hole) => {
-                                        *slot = Value::Number(w[val as usize & KWIN_MASK]);
-                                        ok = true;
-                                    }
-                                    Some(slot) => {
-                                        // In-bounds hole: creation.
-                                        if extensible {
-                                            *slot = Value::Number(w[val as usize & KWIN_MASK]);
-                                            ok = true;
-                                        }
-                                    }
-                                    None => {
-                                        // Exact append (no hole gap).
-                                        if extensible
-                                            && iu == arr.len()
-                                            && iu < crate::value::MAX_DENSE_ARRAY
-                                        {
-                                            arr.push(Value::Number(w[val as usize & KWIN_MASK]));
-                                            ok = true;
-                                        }
-                                    }
-                                }
-                            }
-                            // Numeric typed arrays: a valid-index [[Set]]
-                            // writes element storage directly, no props/proto
-                            // consult; the register already holds the
-                            // ToNumber'd value, and `encode` applies the same
-                            // per-kind conversion (f32 rounding, ToInt32-class
-                            // wrapping) as the builtin write path. OOB — a
-                            // silent no-op per spec — bails to the generic
-                            // path, which owns that behavior.
-                            Internal::TypedArray(t)
-                                if !t.kind.is_bigint()
-                                    && iu < crate::typed_array::ta_eff_length(t) =>
-                            {
-                                let off = t.byte_offset + iu * t.kind.bytes();
-                                let kind = t.kind;
-                                let mut buf = t.buffer.borrow_mut();
-                                if let Internal::ArrayBuffer(Some(bytes)) = &mut buf.internal {
-                                    crate::typed_array::encode(
-                                        bytes,
-                                        off,
-                                        kind,
-                                        w[val as usize & KWIN_MASK],
-                                    );
-                                    ok = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    let ok = kernel_elem_store(
+                        &objs,
+                        obj as usize,
+                        w[idx as usize & KWIN_MASK],
+                        w[val as usize & KWIN_MASK],
+                    );
                     if !ok {
                         branch!(bail)
                     }
@@ -1411,30 +1438,10 @@ impl Vm {
                 // accessor resolution for typed-array bases; the length
                 // itself cannot change mid-activation — resize/detach require
                 // calls, which kernel regions exclude), else bail.
-                KOp::LoadLen { dst, obj, bail } => {
-                    let mut ok = false;
-                    {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                w[dst as usize & KWIN_MASK] = arr.len() as f64;
-                                ok = true;
-                            }
-                            // Any kind — a BigInt-element array's `.length`
-                            // is the same plain count (its ELEMENT accesses
-                            // are what bail).
-                            Internal::TypedArray(t) => {
-                                w[dst as usize & KWIN_MASK] =
-                                    crate::typed_array::ta_eff_length(t) as f64;
-                                ok = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
-                    }
-                }
+                KOp::LoadLen { dst, obj, bail } => match kernel_elem_len(&objs, obj as usize) {
+                    Some(len) => w[dst as usize & KWIN_MASK] = len,
+                    None => branch!(bail),
+                },
                 // Prop LOCALIZATION rewrote every LoadProp/StoreProp into a
                 // register Mov at kernel build; the slots live only in the
                 // entry load and the exit/unwind write-back now.
@@ -1497,24 +1504,9 @@ impl Vm {
                     if_true,
                     target,
                 } => {
-                    let mut ok = false;
-                    {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                w[dst as usize & KWIN_MASK] = arr.len() as f64;
-                                ok = true;
-                            }
-                            Internal::TypedArray(t) => {
-                                w[dst as usize & KWIN_MASK] =
-                                    crate::typed_array::ta_eff_length(t) as f64;
-                                ok = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
+                    match kernel_elem_len(&objs, obj as usize) {
+                        Some(len) => w[dst as usize & KWIN_MASK] = len,
+                        None => branch!(bail),
                     }
                     if knum_cmp(cmp, w[a as usize & KWIN_MASK], w[b as usize & KWIN_MASK])
                         == if_true
@@ -1534,34 +1526,9 @@ impl Vm {
                     a2,
                     b2,
                 } => {
-                    let i = w[idx as usize & KWIN_MASK];
-                    let mut ok = false;
-                    if let Some(iu) = dense_index(i) {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                if let Some(Value::Number(n)) = arr.get(iu) {
-                                    w[dst as usize & KWIN_MASK] = *n;
-                                    ok = true;
-                                }
-                            }
-                            Internal::TypedArray(t)
-                                if !t.kind.is_bigint()
-                                    && iu < crate::typed_array::ta_eff_length(t) =>
-                            {
-                                let off = t.byte_offset + iu * t.kind.bytes();
-                                let buf = t.buffer.borrow();
-                                if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
-                                    w[dst as usize & KWIN_MASK] =
-                                        crate::typed_array::decode(bytes, off, t.kind);
-                                    ok = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
+                    match kernel_elem_load(&objs, obj as usize, w[idx as usize & KWIN_MASK]) {
+                        Some(n) => w[dst as usize & KWIN_MASK] = n,
+                        None => branch!(bail),
                     }
                     w[d2 as usize & KWIN_MASK] =
                         w[a2 as usize & KWIN_MASK] + w[b2 as usize & KWIN_MASK];
@@ -1579,34 +1546,9 @@ impl Vm {
                     a2,
                     b2,
                 } => {
-                    let i = w[idx as usize & KWIN_MASK];
-                    let mut ok = false;
-                    if let Some(iu) = dense_index(i) {
-                        let b = objs[obj as usize].borrow();
-                        match &b.internal {
-                            Internal::Array(arr) if b.own_is_empty() => {
-                                if let Some(Value::Number(n)) = arr.get(iu) {
-                                    w[dst as usize & KWIN_MASK] = *n;
-                                    ok = true;
-                                }
-                            }
-                            Internal::TypedArray(t)
-                                if !t.kind.is_bigint()
-                                    && iu < crate::typed_array::ta_eff_length(t) =>
-                            {
-                                let off = t.byte_offset + iu * t.kind.bytes();
-                                let buf = t.buffer.borrow();
-                                if let Internal::ArrayBuffer(Some(bytes)) = &buf.internal {
-                                    w[dst as usize & KWIN_MASK] =
-                                        crate::typed_array::decode(bytes, off, t.kind);
-                                    ok = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !ok {
-                        branch!(bail)
+                    match kernel_elem_load(&objs, obj as usize, w[idx as usize & KWIN_MASK]) {
+                        Some(n) => w[dst as usize & KWIN_MASK] = n,
+                        None => branch!(bail),
                     }
                     w[d2 as usize & KWIN_MASK] = number_arith_raw(
                         w[a2 as usize & KWIN_MASK],
@@ -1623,7 +1565,9 @@ impl Vm {
                 KOp::StrLen { dst, str } => {
                     w[dst as usize & KWIN_MASK] = sstrs[str as usize].len_utf16() as f64;
                 }
-                KOp::CharCodeAt { dst, str, idx } => {
+                KOp::CharCodeAt {
+                    dst, str, idx, ..
+                } => {
                     let i = w[idx as usize & KWIN_MASK];
                     let bytes = sstrs[str as usize]
                         .flatten_utf8()
@@ -1835,6 +1779,44 @@ impl Vm {
         if !k.uv_writes.is_empty() && uv_write_cells_alias(k, bf) {
             return None;
         }
+        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): identical
+        // contract to the loop-kernel seam in `run_kernel_op_impl` — the
+        // native run leaves `regs` exactly as `exec_fn_kernel_code` would,
+        // stopping at a `Ret` (whose typed result is constructed from the
+        // same register the interpreter would read) or on an interrupt
+        // (handled exactly like `FnKernelOut::Interrupted`). A kernel that
+        // does not compile falls through to the interpreter unchanged.
+        #[cfg(feature = "jit")]
+        if self.jit_enabled {
+            if let Some(stopped_at) = crate::jit::maybe_run(k, &mut regs, self.interrupt.as_deref())
+            {
+                if stopped_at >= 0 {
+                    let KOp::Ret { src, boolean } = k.code[stopped_at as usize] else {
+                        // Tier bug (the native program can only stop at an op
+                        // it compiled as a terminator, and fn-mode translation
+                        // emits no `Exit`). The kernel is pure and nothing was
+                        // flushed, so declining to the generic call path
+                        // re-runs the function with correct semantics —
+                        // `FnKernelOut::BadOp`'s exact handling.
+                        return None;
+                    };
+                    if !k.uv_writes.is_empty() {
+                        flush_uv_writes(k, bf, &regs);
+                    }
+                    return Some(Ok(if boolean {
+                        Value::Bool(regs[src as usize & KWIN_MASK] != 0.0)
+                    } else {
+                        Value::Number(regs[src as usize & KWIN_MASK])
+                    }));
+                }
+                // Interrupted on a native back-edge poll.
+                if !k.uv_writes.is_empty() {
+                    flush_uv_writes(k, bf, &regs);
+                }
+                self.op_budget = Some(0);
+                return Some(Err(self.throw_range("execution interrupted")));
+            }
+        }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
         match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll) {
@@ -1867,9 +1849,11 @@ impl Vm {
     /// `Value`. Entry resolves the recursion FAMILY once:
     ///
     /// - Every [`SelfRefKind`] must hold for its member — a `Global` name
-    ///   must be a plain data property holding that very closure, an
-    ///   `Upvalue` cell must contain it (pointer identity) — so a
-    ///   shadowed/rebound/accessor'd reference declines to the generic path.
+    ///   must be a plain data property holding that very closure — and every
+    ///   UPVALUE callee cell must hold the member it resolved to (pointer
+    ///   identity; self for a self-capture, the partner for function-scoped
+    ///   mutual recursion), so a shadowed/rebound/accessor'd reference
+    ///   declines to the generic path.
     /// - Each [`KernelRec::globals`] name must resolve to a plain sync
     ///   bytecode closure carrying a function kernel, transitively closed
     ///   over the whole family (bounded), with every member's `Ret` type
@@ -1902,7 +1886,8 @@ impl Vm {
         let k0 = bf.proto.fn_kernel.as_ref()?;
         k0.rec.as_deref()?;
 
-        let fam = match self.take_rec_family(bf) {
+        #[cfg_attr(not(feature = "jit"), expect(unused_mut))]
+        let mut fam = match self.take_rec_family(bf) {
             Some(f) => f,
             None => self.build_rec_family(bf)?,
         };
@@ -1934,6 +1919,51 @@ impl Vm {
         }
         for &(r, _, v) in &fam.uv_snaps[0] {
             regs[r] = v;
+        }
+
+        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): the RESOLVED
+        // family compiles to one native function per member, mutually
+        // calling each other directly (`crate::jit::compile_family`).
+        // Everything the windowed executor establishes still holds: the
+        // resolution above verified every self-reference and callee cell,
+        // window 0 is loaded with the guarded arguments, upvalue snapshots
+        // travel through the family's flattened table, and the native code
+        // mirrors the executor's exact per-call depth guard (abandoning
+        // into the generic rerun, which raises the spec RangeError) and
+        // interrupt-poll placement.
+        #[cfg(feature = "jit")]
+        if self.jit_enabled {
+            // Resolve-and-cache: the compiled code travels WITH the family
+            // through the park/take cache (it was compiled against exactly
+            // these members and this callee map), so a cache hit skips the
+            // per-call identity re-checks.
+            if fam.native.is_none() {
+                fam.native = crate::jit::native_for_family(k0, &fam);
+            }
+            if let Some(native) = fam.native.clone() {
+                let mut jctx = crate::jit::JitCtx::empty();
+                jctx.depth = self.max_call_depth.saturating_sub(self.call_depth) as i64;
+                jctx.rec_uv = fam.uv_flat.as_ptr();
+                let code = native.run(&mut regs, self.interrupt.as_deref(), &mut jctx);
+                let raw = jctx.scratch;
+                self.kernel_regs = regs;
+                self.park_rec_family(fam);
+                return match code {
+                    c if c >= 0 => Some(Ok(if ret_bool {
+                        Value::Bool(raw != 0.0)
+                    } else {
+                        Value::Number(raw)
+                    })),
+                    crate::jit::INTERRUPTED => {
+                        self.op_budget = Some(0);
+                        Some(Err(self.throw_range("execution interrupted")))
+                    }
+                    // REC_ABANDONED: the depth budget ran out — the pure
+                    // activation is discarded and the generic rerun owns
+                    // the spec RangeError.
+                    _ => None,
+                };
+            }
         }
 
         /// How the windowed loop below exited; the single tail then parks
@@ -2255,7 +2285,7 @@ impl Vm {
     /// (miss, or a dynamic check failed — the entry is dropped and the
     /// caller re-resolves, which is the uncached path and may itself
     /// decline).
-    fn take_rec_family(&mut self, bf: &Rc<BytecodeFunction>) -> Option<RecFamily> {
+    fn take_rec_family(&mut self, bf: &Rc<BytecodeFunction>) -> Option<Box<RecFamily>> {
         let i = self
             .rec_families
             .iter()
@@ -2295,14 +2325,14 @@ impl Vm {
                 }
             }
         }
-        for &(m, u) in fam.upval_self_checks.iter() {
+        for &(m, u, target) in fam.upval_checks.iter() {
             let f = &fam.funcs[m as usize];
             let ok = matches!(
                 &*f.upvalues[u as usize].borrow(),
                 Value::Object(o) if matches!(
                     &o.borrow().internal,
                     Internal::Function(FunctionInner::Bytecode(bf2))
-                        if Rc::ptr_eq(bf2, f)
+                        if Rc::ptr_eq(bf2, &fam.funcs[target as usize])
                 )
             );
             if !ok {
@@ -2322,12 +2352,20 @@ impl Vm {
         // Refresh upvalue snapshots: cells can change BETWEEN activations
         // (never during one — kernels contain no calls).
         let RecFamily {
-            funcs, uv_snaps, ..
+            funcs,
+            uv_snaps,
+            uv_flat,
+            ..
         } = fam;
+        let mut flat = 0usize;
         for (f, uvs) in funcs.iter().zip(uv_snaps.iter_mut()) {
             for (_, u, v) in uvs.iter_mut() {
                 match &*f.upvalues[*u as usize].borrow() {
-                    Value::Number(n) => *v = *n,
+                    Value::Number(n) => {
+                        *v = *n;
+                        uv_flat[flat] = *n;
+                        flat += 1;
+                    }
                     _ => return false,
                 }
             }
@@ -2337,7 +2375,7 @@ impl Vm {
 
     /// Park a family back in the cache (MRU at the tail, bounded). Eviction
     /// only ever costs the evicted entry a re-resolution on its next call.
-    fn park_rec_family(&mut self, fam: RecFamily) {
+    fn park_rec_family(&mut self, fam: Box<RecFamily>) {
         const REC_FAMILY_CACHE_CAP: usize = 8;
         if self.rec_families.len() >= REC_FAMILY_CACHE_CAP {
             self.rec_families.remove(0);
@@ -2349,14 +2387,14 @@ impl Vm {
     /// (`funcs[0]` = `bf`), recording the identity checks a cache hit will
     /// re-verify. `None` = the family declines kernelization (this
     /// activation runs generically); nothing is cached on decline.
-    fn build_rec_family(&self, bf: &Rc<BytecodeFunction>) -> Option<RecFamily> {
+    fn build_rec_family(&self, bf: &Rc<BytecodeFunction>) -> Option<Box<RecFamily>> {
         let ret_bool = bf.proto.fn_kernel.as_ref()?.ret_bool;
         let mut funcs: Vec<Rc<BytecodeFunction>> = vec![bf.clone()];
         // callee_map[j][c] = funcs index for member j's SelfCall callee c
         // (c = 0 is j itself; c = 1 + i is j's rec.globals[i]).
         let mut callee_map: Vec<Vec<u8>> = Vec::new();
         let mut global_checks: Vec<RecGlobalCheck> = Vec::new();
-        let mut upval_self_checks: Vec<(u8, u32)> = Vec::new();
+        let mut upval_checks: Vec<(u8, u32, u8)> = Vec::new();
         let mut math_members: Vec<u8> = Vec::new();
         let mut wl = 0usize;
         while wl < funcs.len() {
@@ -2417,21 +2455,6 @@ impl Vm {
                                 _ => return None,
                             }
                         }
-                        crate::bytecode::SelfRefKind::Upvalue(u) => {
-                            let cell = f.upvalues.get(*u as usize)?;
-                            let ok = matches!(
-                                &*cell.borrow(),
-                                Value::Object(o) if matches!(
-                                    &o.borrow().internal,
-                                    Internal::Function(FunctionInner::Bytecode(bf2))
-                                        if Rc::ptr_eq(bf2, &f)
-                                )
-                            );
-                            if !ok {
-                                return None;
-                            }
-                            upval_self_checks.push((wl as u8, *u));
-                        }
                     }
                 }
             }
@@ -2487,6 +2510,38 @@ impl Vm {
                     });
                     cmap.push(u8::try_from(idx).ok()?);
                 }
+                // UPVALUE callees (function-scoped self/mutual recursion):
+                // whatever plain sync bytecode closure with a function
+                // kernel the cell holds joins the family — the member
+                // itself for a self-capture, a partner for `isEven`/`isOdd`
+                // pairs. The (member, upvalue, resolved) triple is
+                // re-verified per activation, so a reassigned cell declines.
+                for &u in rec.upvalues.iter() {
+                    let cell = f.upvalues.get(u as usize)?;
+                    let bf2 = match &*cell.borrow() {
+                        Value::Object(o) => match &o.borrow().internal {
+                            Internal::Function(FunctionInner::Bytecode(bf2))
+                                if !bf2.is_class_ctor
+                                    && !bf2.proto.kind.is_generator()
+                                    && !bf2.proto.kind.is_async() =>
+                            {
+                                bf2.clone()
+                            }
+                            _ => return None,
+                        },
+                        _ => return None,
+                    };
+                    bf2.proto.fn_kernel.as_ref()?;
+                    let idx = match funcs.iter().position(|x| Rc::ptr_eq(x, &bf2)) {
+                        Some(i) => i,
+                        None => {
+                            funcs.push(bf2);
+                            funcs.len() - 1
+                        }
+                    };
+                    upval_checks.push((wl as u8, u, u8::try_from(idx).ok()?));
+                    cmap.push(u8::try_from(idx).ok()?);
+                }
             }
             callee_map.push(cmap);
             wl += 1;
@@ -2518,6 +2573,10 @@ impl Vm {
             arg_slots.push(aslots);
             uv_snaps.push(uvs);
         }
+        let uv_flat: Vec<f64> = uv_snaps
+            .iter()
+            .flat_map(|uvs| uvs.iter().map(|&(_, _, v)| v))
+            .collect();
         for (j, f) in funcs.iter().enumerate() {
             let k = f.proto.fn_kernel.as_ref()?;
             for op in k.code.iter() {
@@ -2530,16 +2589,19 @@ impl Vm {
                 }
             }
         }
-        Some(RecFamily {
+        Some(Box::new(RecFamily {
             funcs,
             callee_map,
             arg_slots,
             uv_snaps,
+            uv_flat,
             global_checks,
-            upval_self_checks,
+            upval_checks,
             math_members,
             ret_bool,
-        })
+            #[cfg(feature = "jit")]
+            native: None,
+        }))
     }
 
     /// Prepare a callback for REPEATED calls from a native higher-order
@@ -2586,11 +2648,19 @@ impl Vm {
         if self.call_depth + 1 > self.max_call_depth {
             return None;
         }
+        #[cfg(feature = "jit")]
+        let native = if self.jit_enabled {
+            crate::jit::native_for(bf.proto.fn_kernel.as_ref().expect("checked above"), &[])
+        } else {
+            None
+        };
         Some(PreparedKernel {
             regs: [0.0; KWIN],
             poll: 0,
             interrupt: self.interrupt.clone(),
             bf,
+            #[cfg(feature = "jit")]
+            native,
         })
     }
 
@@ -2646,6 +2716,32 @@ impl Vm {
                 }
             }
         }
+        // Cranelift tier (`jit` feature, `Vm::jit_enabled`): the same
+        // contract as the `run_fn_kernel` seam — the prepared callback's
+        // body runs as native code per call, stopping at a `Ret` (typed
+        // result from the same register) or an interrupt.
+        #[cfg(feature = "jit")]
+        if self.jit_enabled {
+            if let Some(native) = &p.native {
+                let mut jctx = crate::jit::JitCtx::empty();
+                let stopped_at = native.run(&mut p.regs, p.interrupt.as_deref(), &mut jctx);
+                if stopped_at >= 0 {
+                    if let KOp::Ret { src, boolean } = k.code[stopped_at as usize] {
+                        return Some(Ok(if boolean {
+                            Value::Bool(p.regs[src as usize & KWIN_MASK] != 0.0)
+                        } else {
+                            Value::Number(p.regs[src as usize & KWIN_MASK])
+                        }));
+                    }
+                    // Tier bug (`FnKernelOut::BadOp`'s handling): the kernel
+                    // is pure, so decline to the generic call path.
+                    return None;
+                }
+                // Interrupted on a native back-edge poll.
+                self.op_budget = Some(0);
+                return Some(Err(self.throw_range("execution interrupted")));
+            }
+        }
         match exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll) {
             FnKernelOut::Ret(v) => Some(Ok(v)),
             FnKernelOut::Interrupted => {
@@ -2658,6 +2754,201 @@ impl Vm {
             // generically with correct semantics.
             FnKernelOut::BadOp => None,
         }
+    }
+
+    /// Run one array-HOF loop (`forEach`/`map`/`filter`/`reduce`) as a
+    /// single native BATCH — the mode's synthetic loop kernel
+    /// ([`crate::jit::batch_kernel`]) with the callback's function kernel
+    /// inlined at its `CallKernel` site — instead of one prepared call per
+    /// element. `None` = the batch is unavailable (tier off, callback or
+    /// receiver outside the batchable shape, compile declined); the caller
+    /// runs its existing generic loop from `start` unchanged.
+    ///
+    /// Soundness rests on one property: NO USER CODE RUNS BETWEEN BATCH
+    /// ELEMENTS. The callback is a pure register program (no calls, no cell
+    /// writes — `prepare_kernel_callback`'s conditions), and everything
+    /// else in the loop is engine code, so the entry checks that
+    /// `exec_prepared_kernel` must re-verify per call (canonical `Math`,
+    /// all-`Number` upvalues, no op budget) hold for the whole run — the
+    /// same argument as [`Vm::prime_prepared_cmp`]. Any element the kernel
+    /// cannot handle (a hole, a non-`Number`, an out-of-window index) bails
+    /// BEFORE completing its op, and the caller's generic loop resumes at
+    /// that index; a bail after the element's callback ran (`filter`'s
+    /// push, `map`'s output store — both practically unreachable) re-runs
+    /// only that one PURE call, which is unobservable. The interrupt is
+    /// polled on the loop back-edge at the interpreter's cadence.
+    ///
+    /// `output` (map/filter) must be the freshly species-created result
+    /// array, validated here to be the default-species shape: a plain
+    /// unshadowed dense array on the canonical prototype — `map`'s all
+    /// holes at exactly `len` (its slots take direct tag+payload writes),
+    /// `filter`'s empty (its pushes append through the shared push core).
+    /// Nothing can reach either mid-batch, and the end state is exactly
+    /// what the generic loop leaves.
+    #[cfg(feature = "jit")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one seam shared by four builtins, each passing its own state"
+    )]
+    pub(crate) fn hof_batch(
+        &mut self,
+        mode: crate::jit::BatchMode,
+        input: &Value,
+        output: Option<&Value>,
+        len: f64,
+        start: f64,
+        acc0: f64,
+        cb: &Value,
+    ) -> Option<HofBatchOut> {
+        use crate::jit::{BatchMode as BM, ElemView};
+        if !self.jit_enabled {
+            return None;
+        }
+        let Value::Object(in_obj) = input else {
+            return None;
+        };
+        // The input must be a base the element path serves: a dense
+        // unshadowed array or a numeric typed array. Anything else would
+        // bail at `start` and make the batch pure overhead.
+        let in_kind = crate::jit::elem_kind_code(in_obj, true);
+        if in_kind == ElemView::NONE {
+            return None;
+        }
+        let prep = self.prepare_kernel_callback(cb)?;
+        let bf = prep.bf;
+        let ck = bf.proto.fn_kernel.as_ref().expect("prepared");
+        if ck.args_used > u32::from(mode.argc()) {
+            return None;
+        }
+        if !ck.math_used.is_empty() && !self.kernel_math_ok(&ck.math_used) {
+            return None;
+        }
+        // Output shape validation (see the doc comment above).
+        let mut out_kind = ElemView::NONE;
+        if let Some(out) = output {
+            let Value::Object(o) = out else { return None };
+            let b = o.borrow();
+            if !b.own_is_empty()
+                || !b.extensible
+                || !b
+                    .proto
+                    .as_ref()
+                    .is_some_and(|p| p.ptr_eq(&self.realm.array_proto))
+            {
+                return None;
+            }
+            let Internal::Array(vec) = &b.internal else {
+                return None;
+            };
+            match mode {
+                BM::Map => {
+                    if vec.len() as f64 != len
+                        || !vec.iter().all(|v| matches!(v, Value::Hole))
+                        || !crate::jit::dense_layout_ok()
+                    {
+                        return None;
+                    }
+                    out_kind = ElemView::DENSE_W;
+                }
+                BM::Filter if !vec.is_empty() => return None,
+                _ => {}
+            }
+        }
+        // The mode's synthetic kernel for THIS callback (cached on the
+        // callback's kernel so its compiled code — which inlines and
+        // identity-checks exactly this proto — is found again).
+        let bk = ck.batch[mode.idx()]
+            .get_or_init(|| Rc::new(crate::jit::batch_kernel(mode)))
+            .clone();
+        let callee_bfs = [(bf.clone(), KWIN as u32)];
+        let elem_kinds = [in_kind, out_kind];
+        let native = crate::jit::native_for_batch(
+            &bk,
+            &callee_bfs,
+            &elem_kinds[..mode.n_oslots()],
+            mode.bool_ret_ok(),
+        )?;
+        // Register buffer: batch window 0, then the callback's window with
+        // its once-per-batch upvalue snapshot (all-Number, like every
+        // pinned-callee path).
+        let mut regs = vec![0.0f64; 2 * KWIN];
+        regs[crate::jit::BREG_I as usize] = start;
+        regs[crate::jit::BREG_LEN as usize] = len;
+        regs[crate::jit::BREG_ACC as usize] = acc0;
+        for (r, slot) in ck.locals.iter().enumerate() {
+            if let crate::bytecode::KSlot::Upvalue(u) = slot {
+                match &*bf.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => regs[KWIN + r] = *n,
+                    _ => return None,
+                }
+            }
+        }
+        // Activation tables, alive exactly across the native run. The input
+        // view is granted its dense form even though the kernel pushes /
+        // stores elements: those ops target ONLY the output oslot (fixed in
+        // the synthetic program), which is a different, freshly-created
+        // array — so the input's storage cannot move mid-batch.
+        let objs: Vec<crate::value::JsObject> = match output {
+            Some(Value::Object(o)) => vec![in_obj.clone(), o.clone()],
+            _ => vec![in_obj.clone()],
+        };
+        let mut ta_tab: Vec<ElemView> = Vec::with_capacity(2);
+        ta_tab.push(crate::jit::elem_view(in_obj, true));
+        if objs.len() == 2 {
+            if out_kind == ElemView::DENSE_W {
+                let mut b = objs[1].borrow_mut();
+                let Internal::Array(vec) = &mut b.internal else {
+                    return None;
+                };
+                // Raw view over the hole-filled result storage: written
+                // (never read) by native code while `objs` keeps the array
+                // alive; no push targets it, so it never reallocates. The
+                // `RefMut` drops before the native call.
+                ta_tab.push(ElemView {
+                    ptr: vec.as_mut_ptr() as *mut u8,
+                    len: vec.len() as u64,
+                    kind: ElemView::DENSE_W,
+                });
+            } else {
+                ta_tab.push(ElemView::none());
+            }
+        }
+        let interrupt = self.interrupt.clone();
+        let mut ctx = crate::jit::JitCtx {
+            sstr: std::ptr::null(),
+            objs: objs.as_ptr(),
+            n_objs: objs.len() as u64,
+            ta: ta_tab.as_ptr(),
+            array_proto: if matches!(mode, BM::Filter) {
+                &self.realm.array_proto
+            } else {
+                std::ptr::null()
+            },
+            scratch: 0.0,
+            depth: 0,
+            abandon: 0,
+            poll: 0,
+            rec_uv: std::ptr::null(),
+        };
+        let code = native.run(&mut regs, interrupt.as_deref(), &mut ctx);
+        if code < 0 {
+            // Same latch-and-unwind as an interpreter-tier poll hit; the
+            // caller raises the standard RangeError.
+            self.op_budget = Some(0);
+            return Some(HofBatchOut::Interrupted);
+        }
+        if code as usize == mode.done_pc() {
+            return Some(HofBatchOut::Done(regs[crate::jit::BREG_ACC as usize]));
+        }
+        if mode.found_pc() == Some(code as usize) {
+            return Some(HofBatchOut::Found {
+                index: regs[crate::jit::BREG_I as usize],
+            });
+        }
+        Some(HofBatchOut::Resume {
+            index: regs[crate::jit::BREG_I as usize],
+            acc: regs[crate::jit::BREG_ACC as usize],
+        })
     }
 
     /// Verify the guards `exec_prepared_kernel` re-checks per call — no op
@@ -4160,6 +4451,31 @@ impl Vm {
                 }
             }
         }
+        // For-in cursor fast path: `obj[k]` where `k` is the key the last
+        // guarded `for_in_next` step yielded on this very object reads the
+        // recorded slot directly — no ToPropertyKey, no shape walk, no
+        // prototype climb. Every ingredient is re-verified (same object,
+        // shape unchanged since the step, same key, plain data slot), so
+        // the hint can only miss into the generic path, never mis-read; an
+        // own data property's [[Get]] is exactly its slot value.
+        if let (Value::Object(o), Value::String(s)) = (&obj, &key_v) {
+            if let Some(h) = self.forin_hint.take() {
+                if o.ptr_eq(&h.obj) && *s == h.key {
+                    let b = o.borrow();
+                    if b.own_shape().is_some_and(|sh| Rc::ptr_eq(sh, &h.shape)) {
+                        if let Some(PropertyKind::Data { value, .. }) =
+                            b.own_prop_at(h.slot as usize).map(|p| &p.kind)
+                        {
+                            let v = value.clone();
+                            drop(b);
+                            self.forin_hint.set(Some(h));
+                            return Ok(v);
+                        }
+                    }
+                }
+                self.forin_hint.set(Some(h));
+            }
+        }
         // GetValue: RequireObjectCoercible(base) (via ToObject) throws
         // BEFORE ToPropertyKey coerces the key expression's value.
         self.require_object_coercible(&obj, "read properties of")?;
@@ -4864,12 +5180,19 @@ impl Vm {
         frame: &mut Frame,
         v: &Value,
     ) -> Result<Value, Value> {
-        let keys = self.for_in_keys(v)?;
+        // The guard (shape + per-key slots, recorded by the snapshot's own
+        // iteration) proves every key still exists while the target's shape
+        // stays pointer-identical — `for_in_next` then skips the per-key
+        // liveness walk (see [`crate::vm::ForInGuard`]). Only meaningful
+        // when the receiver itself is the enumerated object (a primitive's
+        // wrapper is not the target).
+        let (keys, guard) = self.for_in_keys(v)?;
         let target = match v {
             Value::Object(o) => Some(o.clone()),
             _ => None,
         };
-        frame.enumerators.push((keys, 0, target));
+        let guard = if target.is_some() { guard } else { None };
+        frame.enumerators.push((keys, 0, target, guard));
         Ok(Value::Number((frame.enumerators.len() - 1) as f64))
     }
 
@@ -4878,7 +5201,38 @@ impl Vm {
     /// snapshot is skipped, per EnumerateObjectProperties.
     pub(crate) fn for_in_next(&self, frame: &mut Frame) -> (Value, Value) {
         let idx = frame.enumerators.len() - 1;
-        let (keys, cursor, target) = &mut frame.enumerators[idx];
+        let (keys, cursor, target, guard) = &mut frame.enumerators[idx];
+        // Guarded fast path: while the target's shape is pointer-identical
+        // to the snapshot shape, no key was added or deleted since the
+        // snapshot (adds mint a new shape; deletes demote to dictionary
+        // mode), so the key at the cursor is live without walking the
+        // prototype chain. Publishing the (object, key, slot) hint lets the
+        // loop body's `obj[k]` read the slot directly (see `elem_get`).
+        if let (Some(t), Some(g)) = (&target, &guard) {
+            if *cursor < keys.len()
+                && t.borrow()
+                    .own_shape()
+                    .is_some_and(|s| Rc::ptr_eq(s, &g.shape))
+            {
+                let i = *cursor;
+                *cursor += 1;
+                let k = keys[i].clone();
+                let slot = if g.identity {
+                    Some(i as u32)
+                } else {
+                    g.slots.get(i).copied()
+                };
+                if let Some(slot) = slot {
+                    self.forin_hint.set(Some(crate::vm::ForInHint {
+                        obj: t.clone(),
+                        shape: g.shape.clone(),
+                        key: k.clone(),
+                        slot,
+                    }));
+                }
+                return (Value::String(k), Value::Bool(true));
+            }
+        }
         while *cursor < keys.len() {
             let k = keys[*cursor].clone();
             *cursor += 1;
@@ -5003,10 +5357,23 @@ impl Vm {
             }
             let op = &code[pc];
             pc += 1;
+            // Take-aware operand read: the translator tags a source index
+            // with `reg::TAKE` when the op consumes a dying stack temp —
+            // the value MOVES out (no `Rc` round-trip) and the dead slot
+            // holds `Undefined` until its next definition. Untagged reads
+            // clone as before (locals and shared alias slots).
             macro_rules! rd {
-                ($i:expr) => {
-                    frame.locals[$i as usize].clone()
-                };
+                ($i:expr) => {{
+                    let i = $i as usize;
+                    if i & crate::reg::TAKE as usize != 0 {
+                        std::mem::replace(
+                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        )
+                    } else {
+                        frame.locals[i].clone()
+                    }
+                }};
             }
             macro_rules! wr {
                 ($i:expr, $v:expr) => {
@@ -5426,7 +5793,11 @@ impl Vm {
                     wr!(*dst, v);
                 }
                 ROp::Ret { src } => {
-                    let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
+                    // `rd!` honors the translator's consume marker: `return x`
+                    // of a LOCAL clones (an enclosing `finally` can still read
+                    // `x`), while a dying temp moves out. The unconditional
+                    // replace this fixes cleared locals a `finally` observed.
+                    let v = rd!(*src);
                     // Route through any enclosing `finally` blocks (mirror of
                     // `Op::Return`); the no-handler fast path returns directly.
                     if frame.handlers.is_empty() {
@@ -5442,7 +5813,9 @@ impl Vm {
                     complete!(Completion::Return(v));
                 }
                 ROp::Throw { src } => {
-                    let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
+                    // Same consume-marker discipline as `Ret`: `throw y` of a
+                    // local must leave `y` readable in the `catch`/`finally`.
+                    let v = rd!(*src);
                     complete!(Completion::Throw(v));
                 }
                 // ---- exceptions / completions ----
@@ -5579,9 +5952,17 @@ impl Vm {
     ) -> Result<(), Value> {
         use crate::reg::ROp;
         macro_rules! rd {
-            ($i:expr) => {
-                frame.locals[$i as usize].clone()
-            };
+            ($i:expr) => {{
+                let i = $i as usize;
+                if i & crate::reg::TAKE as usize != 0 {
+                    std::mem::replace(
+                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        )
+                } else {
+                    frame.locals[i].clone()
+                }
+            }};
         }
         macro_rules! wr {
             ($i:expr, $v:expr) => {
@@ -5905,6 +6286,7 @@ impl Vm {
                 if let Some((keys, ..)) = frame.enumerators.pop() {
                     self.park_forin_vec(keys);
                 }
+                self.forin_hint.set(None);
             }
             // Every ROp is either handled above or inline in run_reg_frame's
             // dispatch loop. Reaching here means the register-tier translator
@@ -6682,6 +7064,7 @@ impl Vm {
                 if let Some((keys, ..)) = frame.enumerators.pop() {
                     self.park_forin_vec(keys);
                 }
+                self.forin_hint.set(None);
             }
             Op::ForInNext => {
                 let (k, more) = self.for_in_next(frame);
@@ -8524,6 +8907,153 @@ fn dense_index(i: f64) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// The kernel tier's element/length/push/pop fast paths, shared VERBATIM by
+/// the interpreter's dispatch arms (`LoadElem`/`LoadElemAdd`/`LoadElemArith`,
+/// `StoreElem`, `LoadLen`/`LenBrCmp`, `ArrayPush`/`ArrayPop`) and — under the
+/// `jit` feature — the native tier's element helper shims (`crate::jit`), so
+/// a native element access is the interpreter's own code by construction.
+/// `None`/`false` = the fast path does not apply: the caller takes the op's
+/// bail edge and the generic interpreter performs the exact spec semantics.
+///
+/// Dense element read: unshadowed dense array in bounds holding a non-hole
+/// `Number`, or a valid-index non-BigInt typed-array element (a valid-index
+/// [[Get]] reads element storage directly — own props and the prototype
+/// chain are never consulted).
+#[inline]
+pub(crate) fn kernel_elem_load(objs: &[JsObject], obj: usize, i: f64) -> Option<f64> {
+    let iu = dense_index(i)?;
+    let b = objs[obj].borrow();
+    match &b.internal {
+        Internal::Array(arr) if b.own_is_empty() => match arr.get(iu) {
+            Some(Value::Number(n)) => Some(*n),
+            _ => None,
+        },
+        Internal::TypedArray(t)
+            if !t.kind.is_bigint() && iu < crate::typed_array::ta_eff_length(t) =>
+        {
+            let off = t.byte_offset + iu * t.kind.bytes();
+            let buf = t.buffer.borrow();
+            match &buf.internal {
+                Internal::ArrayBuffer(Some(bytes)) => {
+                    Some(crate::typed_array::decode(bytes, off, t.kind))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Dense element write: in-place overwrite (exactly the `Op::SetPropDynamic`
+/// fast-path conditions), an in-bounds HOLE fill, or an exact one-past-the-
+/// end APPEND (both require extensibility and the dense bound — see the
+/// interpreter arm's comment), or a valid-index non-BigInt typed-array write
+/// (`encode` applies the per-kind conversion). `false` = bail.
+#[inline]
+pub(crate) fn kernel_elem_store(objs: &[JsObject], obj: usize, i: f64, val: f64) -> bool {
+    let Some(iu) = dense_index(i) else {
+        return false;
+    };
+    let mut b = objs[obj].borrow_mut();
+    let extensible = b.extensible;
+    let props_empty = b.own_is_empty();
+    match &mut b.internal {
+        Internal::Array(arr) if props_empty => match arr.get_mut(iu) {
+            Some(slot) if !matches!(slot, Value::Hole) => {
+                *slot = Value::Number(val);
+                true
+            }
+            Some(slot) => {
+                // In-bounds hole: creation.
+                if extensible {
+                    *slot = Value::Number(val);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                // Exact append (no hole gap).
+                if extensible && iu == arr.len() && iu < crate::value::MAX_DENSE_ARRAY {
+                    arr.push(Value::Number(val));
+                    true
+                } else {
+                    false
+                }
+            }
+        },
+        Internal::TypedArray(t)
+            if !t.kind.is_bigint() && iu < crate::typed_array::ta_eff_length(t) =>
+        {
+            let off = t.byte_offset + iu * t.kind.bytes();
+            let kind = t.kind;
+            let mut buf = t.buffer.borrow_mut();
+            match &mut buf.internal {
+                Internal::ArrayBuffer(Some(bytes)) => {
+                    crate::typed_array::encode(bytes, off, kind, val);
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `.length` fast path: dense array length (unshadowed only) or typed-array
+/// effective length (any kind — the entry guard verified the canonical
+/// accessor resolution for typed-array bases). `None` = bail.
+#[inline]
+pub(crate) fn kernel_elem_len(objs: &[JsObject], obj: usize) -> Option<f64> {
+    let b = objs[obj].borrow();
+    match &b.internal {
+        Internal::Array(arr) if b.own_is_empty() => Some(arr.len() as f64),
+        Internal::TypedArray(t) => Some(crate::typed_array::ta_eff_length(t) as f64),
+        _ => None,
+    }
+}
+
+/// Pinned-native `Array.prototype.push` (receiver conditions re-checked per
+/// push — see the `KOp::ArrayPush` docs): appends and returns the new
+/// length, or `None` = bail to the generic `Call`.
+#[inline]
+pub(crate) fn kernel_array_push(
+    objs: &[JsObject],
+    obj: usize,
+    array_proto: &JsObject,
+    val: f64,
+) -> Option<f64> {
+    let mut b = objs[obj].borrow_mut();
+    if b.own_is_empty() && b.extensible && b.proto.as_ref().is_some_and(|p| p.ptr_eq(array_proto)) {
+        if let Internal::Array(arr) = &mut b.internal {
+            if arr.len() < crate::value::MAX_DENSE_ARRAY {
+                arr.push(Value::Number(val));
+                return Some(arr.len() as f64);
+            }
+        }
+    }
+    None
+}
+
+/// Pinned-native `Array.prototype.pop`: removes and returns the last element
+/// when it is a plain `Number` (an empty array's `undefined` result and a
+/// trailing hole's prototype consult belong to the generic path). `None` =
+/// bail.
+#[inline]
+pub(crate) fn kernel_array_pop(objs: &[JsObject], obj: usize) -> Option<f64> {
+    let mut b = objs[obj].borrow_mut();
+    if b.own_is_empty() && b.extensible {
+        if let Internal::Array(arr) = &mut b.internal {
+            if let Some(Value::Number(n)) = arr.last() {
+                let n = *n;
+                arr.pop();
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn js_mod(a: f64, b: f64) -> f64 {

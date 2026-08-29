@@ -155,13 +155,29 @@ fn inline_from_wf_bytes(a: &[u8], b: &[u8]) -> Repr {
 }
 
 /// The `&str` view of an inline buffer. Inline strings are only ever built
-/// from `&str` slices, so the check cannot fail — and on ≤[`INLINE_CAP`]
-/// bytes the re-validation is a handful of instructions, which
-/// `#![forbid(unsafe_code)]` makes the right trade. Byte-level consumers
+/// from `&str` slices (or bytes copied out of existing well-formed
+/// `JsString`s), so the check cannot fail. The default build re-validates —
+/// on ≤[`INLINE_CAP`] bytes that is a handful of instructions, which
+/// `#![forbid(unsafe_code)]` makes the right trade — but under the `jit`
+/// feature (where the crate already carries audited `unsafe`) the
+/// re-validation is skipped: `as_str` on inline strings is hot enough that
+/// the checks showed up at ~3% of JSON round-trips. Byte-level consumers
 /// (equality, hashing, JSON quoting, concat assembly) go through
 /// `wtf8_bytes` instead and skip it entirely.
 fn inline_str(buf: &[u8; INLINE_CAP], meta: u8) -> &str {
-    std::str::from_utf8(&buf[..inline_len(meta)]).expect("inline string holds valid UTF-8")
+    let bytes = &buf[..inline_len(meta)];
+    #[cfg(feature = "jit")]
+    {
+        // SAFETY: every `Repr::Inline` constructor copies its bytes from a
+        // `&str` or from existing well-formed `JsString` storage, and
+        // `meta`'s length was set from that same slice.
+        #[expect(unsafe_code, reason = "inline strings are valid UTF-8 by construction")]
+        return unsafe { std::str::from_utf8_unchecked(bytes) };
+    }
+    #[cfg(not(feature = "jit"))]
+    {
+        std::str::from_utf8(bytes).expect("inline string holds valid UTF-8")
+    }
 }
 
 impl Rope {
@@ -483,9 +499,23 @@ impl PartialEq for JsString {
         // usually compare a clone of the very same allocation. Content equality
         // is unchanged — `ptr_eq` can only confirm, never deny.
         match (&self.0, &other.0) {
+            // Two inline strings compare EXACTLY as fixed-size buffers: every
+            // `Repr::Inline` constructor starts from a zeroed buffer, so the
+            // bytes past `len` are always zero and whole-buffer equality is
+            // content equality (equal bytes force equal `meta` too — the
+            // length and ASCII bit both derive from the bytes). The
+            // constant-size compare inlines to a few wide loads where the
+            // general slice path calls `memcmp` — this pair dominates the
+            // property-key and for-in-key compares of glue code.
+            (Repr::Inline { meta: a, buf: ab }, Repr::Inline { meta: b, buf: bb }) => {
+                a == b && ab == bb
+            }
             (Repr::Utf8(a, _), Repr::Utf8(b, _)) if Rc::ptr_eq(a, b) => true,
             (Repr::Wtf8(a), Repr::Wtf8(b)) if Rc::ptr_eq(a, b) => true,
             (Repr::Rope(a), Repr::Rope(b)) if Rc::ptr_eq(a, b) => true,
+            // Length mismatch decides without touching bytes — and without
+            // flattening a rope operand.
+            _ if self.byte_len() != other.byte_len() => false,
             _ => self.wtf8_bytes() == other.wtf8_bytes(),
         }
     }
@@ -589,26 +619,51 @@ impl fmt::Debug for JsObject {
 
 /// A JS value. `Clone` is cheap for all variants (scalars or `Rc` bumps).
 #[derive(Clone)]
+// The primitive representation (RFC 2195: tag byte + union of C-laid-out
+// variant structs) pins the layout the `jit` feature's dense-element fast
+// path reads: the tag at byte 0 (`Value::JIT_NUMBER_TAG`) and a `Number`'s
+// f64 payload at its natural alignment (`Value::JIT_NUMBER_PAYLOAD_OFFSET`).
+// Same 24-byte size as the default representation measured here; the only
+// cost is `Option<Value>`'s spare-tag niche (24 → 32 bytes), which appears
+// in scalar positions only, never in bulk storage. Discriminants are
+// explicit so the JIT contract cannot drift under variant reordering.
+#[repr(u8)]
 pub enum Value {
-    Undefined,
-    Null,
-    Bool(bool),
-    Number(f64),
-    String(JsString),
-    Symbol(JsSymbol),
-    Object(JsObject),
+    Undefined = 0,
+    Null = 1,
+    Bool(bool) = 2,
+    Number(f64) = 3,
+    String(JsString) = 4,
+    Symbol(JsSymbol) = 5,
+    Object(JsObject) = 6,
     /// The BigInt primitive (arbitrary precision).
-    BigInt(Rc<BigInt>),
+    BigInt(Rc<BigInt>) = 7,
     /// Temporal Dead Zone marker: the value stored in a `let`/`const`/`class`
     /// cell after hoisting but before its initializer runs. Reading it (via
     /// `LoadCell`/`LoadUpvalue`) throws a `ReferenceError`; it never escapes into
     /// user-observable positions.
-    Uninitialized,
+    Uninitialized = 8,
     /// Array hole (elision): the slot in a dense `Internal::Array` for a missing
     /// index, e.g. index 1 of `[0, , 2]`. `HasProperty` is false at a hole and
     /// the iteration/own-key machinery skips it; reading it yields `undefined`
     /// (via the prototype chain). It never escapes into user-observable values.
-    Hole,
+    Hole = 9,
+}
+
+impl Value {
+    /// The `jit` tier's raw dense-element contract (see `crate::jit`): the
+    /// `#[repr(u8)]` tag value of [`Value::Number`], read by compiled code
+    /// to test a dense slot before loading its payload. Must match the
+    /// explicit discriminant above; `crate::jit::dense_layout_ok` verifies
+    /// the whole contract against a live value before any compiled code
+    /// relies on it.
+    #[cfg(feature = "jit")]
+    pub(crate) const JIT_NUMBER_TAG: u8 = 3;
+    /// Byte offset of a [`Value::Number`]'s f64 payload under `#[repr(u8)]`
+    /// (the variant struct is `{ tag: u8, payload: f64 }` with C layout, so
+    /// the payload sits at the f64's natural alignment).
+    #[cfg(feature = "jit")]
+    pub(crate) const JIT_NUMBER_PAYLOAD_OFFSET: usize = 8;
 }
 
 impl fmt::Debug for Value {
@@ -1409,6 +1464,38 @@ impl ObjectData {
         removed
     }
 
+    /// Whether any own property is an enumerable string-keyed one — the
+    /// prototype-level test of the for-in fast path. Checks the slot flags
+    /// FIRST and fetches a key only for an enumerable hit: standard
+    /// prototypes are entirely non-enumerable, and the shaped `own_iter`'s
+    /// per-step `key_at` parent-chain walk (O(len²) hops over
+    /// `Object.prototype`'s dozen properties, every enumerate) is exactly
+    /// what this scan exists to skip.
+    #[inline]
+    pub fn has_enumerable_str_prop(&self) -> bool {
+        match &self.props {
+            PropStorage::Shaped { shape, slots } => slots.iter().enumerate().any(|(i, p)| {
+                p.enumerable && matches!(shape.key_at(i as u32), Some(PropertyKey::Str(_)))
+            }),
+            PropStorage::Dict(m) => m
+                .iter()
+                .any(|(k, p)| p.enumerable && matches!(k, PropertyKey::Str(_))),
+        }
+    }
+
+    /// Whether EVERY own property is enumerable — the per-object half of
+    /// the shape's cached for-in plan (attributes live in the slots, so two
+    /// objects of one shape can differ here). A flag scan over the slots:
+    /// no keys fetched, no chain walk.
+    #[inline]
+    pub fn all_own_enumerable(&self) -> bool {
+        match &self.props {
+            PropStorage::Shaped { slots, .. } => slots.iter().all(|p| p.enumerable),
+            // Dictionary mode has no shape, so no plan to qualify.
+            PropStorage::Dict(_) => false,
+        }
+    }
+
     /// The current shape, when the storage is shaped (`None` in dictionary
     /// mode). Shape identity (`Rc::ptr_eq`) pins the whole key layout — the
     /// basis of the (shape, slot) inline caches (docs §3.3).
@@ -1471,6 +1558,17 @@ impl ObjectData {
     }
 
     /// `true` when the ordinary own-property storage is empty — the guard
+    /// Whether this object's own storage provably lacks a `toJSON` key —
+    /// `Shaped` answers from the shape's immutable cache, `Dict` does one
+    /// hash probe. (The JSON stringifier's per-node fast path.)
+    #[inline]
+    pub fn own_lacks_to_json(&self) -> bool {
+        match &self.props {
+            PropStorage::Dict(m) => m.get(&PropertyKey::str("toJSON")).is_none(),
+            PropStorage::Shaped { shape, .. } => shape.lacks_to_json(),
+        }
+    }
+
     /// every dense-array/exotic fast path checks ("nothing reified can
     /// shadow").
     #[inline]

@@ -9,7 +9,18 @@
 // The engine is the sandbox: memory safety is a security property here, not a
 // style preference (docs/sandbox-model.md). Enforce the zero-`unsafe` claim at
 // compile time rather than by convention.
-#![forbid(unsafe_code)]
+//
+// The ONE exception is the opt-in `jit` feature (docs/cranelift-jit.md): a
+// native-code tier cannot exist without calling through a synthesized
+// function pointer, so that build drops to `deny(unsafe_code)` and `jit.rs`
+// carries the crate's only `unsafe` blocks, each `#[expect]`-scoped and
+// commented: the fn-pointer transmutes and the call through them, the
+// executable-memory free on drop, the element shims' reconstruction of the
+// caller-owned activation tables, and the one-time `Value` layout
+// self-check. Every default build — the library, the CLI, wasm — keeps the
+// hard `forbid`.
+#![cfg_attr(not(feature = "jit"), forbid(unsafe_code))]
+#![cfg_attr(feature = "jit", deny(unsafe_code))]
 
 pub mod builtins;
 pub mod bytecode;
@@ -24,6 +35,12 @@ pub mod generator;
 pub mod host;
 pub mod image;
 pub mod iter;
+/// Cranelift baseline JIT for the typed kernel tier; present only under the
+/// opt-in `jit` feature (see docs/cranelift-jit.md and the lint note above).
+#[cfg(feature = "jit")]
+pub mod jit;
+#[cfg(feature = "jit")]
+pub(crate) mod jit_ty;
 pub mod journal;
 pub mod jsx;
 pub mod kernel;

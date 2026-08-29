@@ -32,6 +32,23 @@ op-histogram = []
 # consumers are unaffected either way: a global allocator only takes effect
 # in a final binary, and this one is only installed in `examples/run.rs`.
 mimalloc = ["dep:mimalloc"]
+# EXPERIMENTAL Cranelift baseline JIT for the typed kernel tier (`src/jit.rs`,
+# docs/cranelift-jit.md). OFF by default, deliberately: enabling it drops the
+# crate-level `forbid(unsafe_code)` to `deny(unsafe_code)` (the native-code
+# call boundary in `jit.rs` needs two audited `unsafe` blocks) and pulls in a
+# full compiler backend. The default build stays byte-identical, zero-unsafe,
+# and cranelift-free — the sandbox-model claim (docs/sandbox-model.md) is
+# unchanged unless you opt in. Even when compiled in, the tier only runs when
+# the embedder sets `Vm::jit_enabled`; the `chidori-js-jit` binary below is
+# the entry point that does. See docs/js-performance-roadmap.md §4 for why
+# this is an experiment, not a default.
+jit = [
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-frontend",
+    "dep:cranelift-codegen",
+    "dep:cranelift-native",
+]
 
 [dependencies]
 # Front end only: we consume the oxc AST and write no lexer/parser of our own.
@@ -70,6 +87,25 @@ temporal_rs = "0.2.3"
 # Optional, off by default (see the `mimalloc` feature above): faster global
 # allocator for the benchmark/`run` binary.
 mimalloc = { version = "0.1", optional = true, default-features = false }
+# The `jit` feature's compiler backend (pure Rust, no C): cranelift-jit maps
+# executable memory and finalizes code, cranelift-frontend provides the SSA
+# builder, cranelift-native probes the host ISA. Versions move in lockstep.
+cranelift-jit = { version = "0.135.1", optional = true }
+cranelift-module = { version = "0.135.1", optional = true }
+cranelift-frontend = { version = "0.135.1", optional = true }
+cranelift-codegen = { version = "0.135.1", optional = true }
+cranelift-native = { version = "0.135.1", optional = true }
+
+# The ALTERNATIVE entry point: the same file-runner as `examples/run.rs`, but
+# built as its own binary with the Cranelift kernel JIT compiled in and
+# enabled (`--no-jit` runs the same build with the tier off, for A/B).
+# `required-features` keeps every default build of the crate — and the
+# forbid(unsafe_code) guarantee that comes with it — untouched: the binary
+# only exists under `cargo build -p chidori-js --features jit`.
+[[bin]]
+name = "chidori-js-jit"
+path = "src/bin/chidori_js_jit.rs"
+required-features = ["jit"]
 
 [dev-dependencies]
 criterion = "0.8"

@@ -1,7 +1,8 @@
 name: JS benchmarks
 
-# Runs the chidori-js cross-runtime benchmark suite (chidori-js vs Node.js vs
-# Bun vs CPython, wall-clock + peak memory) plus the in-process heap-utilization bench
+# Runs the chidori-js cross-runtime benchmark suite (chidori-js interpreter
+# and its opt-in Cranelift kernel-JIT mode vs Node.js vs Bun vs CPython,
+# wall-clock + peak memory) plus the in-process heap-utilization bench
 # (`cargo bench -p chidori-js --bench memory`) on PRs that touch the engine,
 # and posts the results tables as a single sticky comment on the PR (updated
 # in place on each run, not re-posted).
@@ -27,7 +28,7 @@ permissions:
 
 jobs:
   benchmark:
-    name: chidori-js vs Node vs Bun vs CPython
+    name: chidori-js (interp + JIT) vs Node vs Bun vs CPython
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -62,6 +63,13 @@ jobs:
 
       - name: Build chidori-js run example (release)
         run: cargo build --release -p chidori-js --example run
+
+      # The chidori-js (JIT) column: the same engine with the opt-in
+      # Cranelift kernel JIT compiled in and enabled (docs/cranelift-jit.md).
+      # A separate feature build, so it shares the cache key but adds the
+      # cranelift backend on top.
+      - name: Build chidori-js-jit binary (release, --features jit)
+        run: cargo build --release -p chidori-js --features jit --bin chidori-js-jit
 
       # In-process heap numbers (tracking allocator: realm footprint, per-run
       # peak/churn/retained, leak check). Deterministic byte counts, so unlike

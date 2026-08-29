@@ -77,6 +77,29 @@ const CORPUS: &[&str] = &[
     // TDZ in a closure-captured cell (upvalue checked path).
     "try { (() => tz)(); } catch (e) { console.log('cell', e.constructor.name); } let tz = 9; console.log((() => tz)());",
 
+    // ---- operand-consume (TAKE) discipline ----
+    // `return x` of a LOCAL under finally: the local must stay readable in
+    // the finalizer (regression: the register tier's Ret cleared it).
+    "function rf() { let x = 1; try { return x; } finally { console.log('fin', x); } } console.log('ret', rf());",
+    // `throw y` of a local: catch and finally both still read it.
+    "function tf() { let y = 5; try { throw y; } catch (e) { console.log('c', e, y); } finally { console.log('f', y); } return y; } console.log(tf());",
+    // Nested finallys re-reading the returned local at each level.
+    "function nf() { let v = 'k'; try { try { return v; } finally { console.log('inner', v); } } finally { console.log('outer', v); } } console.log(nf());",
+    // Locals as arithmetic operands are NOT consumed: reuse after ops.
+    "let ta = 2, tb = 3; let tc = ta + tb; let td = ta * tb; console.log(ta, tb, tc, td, ta + tb + tc + td);",
+    // An op that throws AFTER its operands were consumed (Symbol coercion
+    // in +) must leave surrounding locals intact for the catch.
+    "let sym = Symbol('s'); let keep = 'ok'; try { console.log(sym + ''); } catch (e) { console.log(e.constructor.name, keep); }",
+    // Consumed temps in property traffic: computed get/set chains where
+    // every obj/key/src is a dying temp.
+    "const bag = { a: 1 }; bag[('k' + 1)] = ('v' + 2); console.log(bag['k' + 1], bag.a + 1);",
+    // Spread/rest paths (ObjectSpread + CopyDataPropsExcept consume src).
+    "const base = { p: 1, q: 2, r: 3 }; const { q, ...rest } = { ...base, s: 4 }; console.log(q, JSON.stringify(rest));",
+    // for-of (IterStepValue consumes next/it clones) then local reuse.
+    "let acc = ''; const src2 = ['a', 'b', 'c']; for (const ch of src2) { acc += ch; } console.log(acc, src2.length);",
+    // instanceof / delete / in operands as dying temps.
+    "class Kls {} const inst = new Kls(); console.log(inst instanceof Kls, ('p' + '') in { p: 1 }, delete ({ z: 1 }).z);",
+
     // ---- property access / inline caches ----
     // Monomorphic own-property get/set loop (IC hits).
     "const po = { a: 0, b: 0 }; for (let i = 0; i < 20; i++) { po.a = i; po.b = po.a + 1; } console.log(po.a, po.b);",
