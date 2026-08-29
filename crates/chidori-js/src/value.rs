@@ -499,9 +499,23 @@ impl PartialEq for JsString {
         // usually compare a clone of the very same allocation. Content equality
         // is unchanged — `ptr_eq` can only confirm, never deny.
         match (&self.0, &other.0) {
+            // Two inline strings compare EXACTLY as fixed-size buffers: every
+            // `Repr::Inline` constructor starts from a zeroed buffer, so the
+            // bytes past `len` are always zero and whole-buffer equality is
+            // content equality (equal bytes force equal `meta` too — the
+            // length and ASCII bit both derive from the bytes). The
+            // constant-size compare inlines to a few wide loads where the
+            // general slice path calls `memcmp` — this pair dominates the
+            // property-key and for-in-key compares of glue code.
+            (Repr::Inline { meta: a, buf: ab }, Repr::Inline { meta: b, buf: bb }) => {
+                a == b && ab == bb
+            }
             (Repr::Utf8(a, _), Repr::Utf8(b, _)) if Rc::ptr_eq(a, b) => true,
             (Repr::Wtf8(a), Repr::Wtf8(b)) if Rc::ptr_eq(a, b) => true,
             (Repr::Rope(a), Repr::Rope(b)) if Rc::ptr_eq(a, b) => true,
+            // Length mismatch decides without touching bytes — and without
+            // flattening a rope operand.
+            _ if self.byte_len() != other.byte_len() => false,
             _ => self.wtf8_bytes() == other.wtf8_bytes(),
         }
     }
@@ -1448,6 +1462,25 @@ impl ObjectData {
             self.has_idx_keys = self.own_keys_iter().any(|k| k.array_index().is_some());
         }
         removed
+    }
+
+    /// Whether any own property is an enumerable string-keyed one — the
+    /// prototype-level test of the for-in fast path. Checks the slot flags
+    /// FIRST and fetches a key only for an enumerable hit: standard
+    /// prototypes are entirely non-enumerable, and the shaped `own_iter`'s
+    /// per-step `key_at` parent-chain walk (O(len²) hops over
+    /// `Object.prototype`'s dozen properties, every enumerate) is exactly
+    /// what this scan exists to skip.
+    #[inline]
+    pub fn has_enumerable_str_prop(&self) -> bool {
+        match &self.props {
+            PropStorage::Shaped { shape, slots } => slots.iter().enumerate().any(|(i, p)| {
+                p.enumerable && matches!(shape.key_at(i as u32), Some(PropertyKey::Str(_)))
+            }),
+            PropStorage::Dict(m) => m
+                .iter()
+                .any(|(k, p)| p.enumerable && matches!(k, PropertyKey::Str(_))),
+        }
     }
 
     /// The current shape, when the storage is shaped (`None` in dictionary

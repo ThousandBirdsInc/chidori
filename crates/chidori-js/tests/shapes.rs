@@ -315,3 +315,126 @@ fn replay_identical_across_engines() {
     assert_eq!(a, b);
     assert!(a.contains("\"label\":\"r24\""), "unexpected output: {a}");
 }
+
+#[test]
+fn for_in_guard_and_cursor_hint_edges() {
+    // The for-in fast path (shape-guarded liveness + the (object, key, slot)
+    // cursor hint serving `o[k]` in the body) must be unobservable. Each
+    // case here breaks one of its ingredients mid-loop.
+
+    // Delete mid-loop (demotes to dictionary): the deleted-but-unvisited key
+    // must be skipped, later keys still enumerate, and `o[k]` still reads
+    // the live values.
+    assert_eq!(
+        run(r#"
+            const o = {a: 1, b: 2, c: 3, d: 4};
+            const seen = [];
+            for (const k in o) {
+                if (k === 'a') delete o.c;
+                seen.push(k + '=' + o[k]);
+            }
+            seen.join()
+        "#),
+        "a=1,b=2,d=4"
+    );
+
+    // Add mid-loop (new shape): snapshot keys keep enumerating (the added
+    // key is not yielded), and reads keep resolving.
+    assert_eq!(
+        run(r#"
+            const o = {a: 1, b: 2};
+            const seen = [];
+            for (const k in o) { o.z = 9; seen.push(k + '=' + o[k]); }
+            seen.join() + '|' + o.z
+        "#),
+        "a=1,b=2|9"
+    );
+
+    // Overwrite mid-loop: the hint carries a SLOT, not a value — `o[k]`
+    // must observe the write that happened after the step.
+    assert_eq!(
+        run(r#"
+            const o = {a: 1, b: 2};
+            const seen = [];
+            for (const k in o) { o[k] = o[k] * 10; seen.push(k + '=' + o[k]); }
+            seen.join()
+        "#),
+        "a=10,b=20"
+    );
+
+    // defineProperty to an accessor mid-loop keeps the SAME shape
+    // (attributes live in slots) — the hint must fall back so the getter
+    // actually runs.
+    assert_eq!(
+        run(r#"
+            const o = {a: 1, b: 2};
+            const seen = [];
+            for (const k in o) {
+                if (k === 'a') {
+                    Object.defineProperty(o, 'b', { get() { return 77; }, enumerable: true });
+                }
+                seen.push(k + '=' + o[k]);
+            }
+            seen.join()
+        "#),
+        "a=1,b=77"
+    );
+
+    // The hint is keyed to ONE object: a same-shaped sibling read with the
+    // same key must not be served from the enumerated object's slots.
+    assert_eq!(
+        run(r#"
+            const o = {a: 1, b: 2};
+            const p = {a: 10, b: 20};
+            const seen = [];
+            for (const k in o) seen.push(o[k] + '/' + p[k]);
+            seen.join()
+        "#),
+        "1/10,2/20"
+    );
+
+    // Nested for-in over the same object: inner enumeration finishing must
+    // not perturb the outer one's reads.
+    assert_eq!(
+        run(r#"
+            const o = {a: 1, b: 2};
+            const seen = [];
+            for (const k in o) {
+                for (const j in o) seen.push(k + j);
+                seen.push(k + '=' + o[k]);
+            }
+            seen.join()
+        "#),
+        "aa,ab,a=1,ba,bb,b=2"
+    );
+
+    // Prototype-contributed keys disable the guard (they are not own):
+    // deletes on the proto mid-loop must still be honored per the spec's
+    // deleted-key skip.
+    assert_eq!(
+        run(r#"
+            const proto = {p: 1, q: 2};
+            const o = Object.create(proto);
+            o.a = 0;
+            const seen = [];
+            for (const k in o) {
+                if (k === 'a') delete proto.q;
+                seen.push(k + '=' + o[k]);
+            }
+            seen.join()
+        "#),
+        "a=0,p=1"
+    );
+
+    // Index-like keys re-order ahead of names (no guard): order and reads
+    // stay correct.
+    assert_eq!(
+        run(r#"
+            const o = {b: 'B', 1: 'one', a: 'A', 0: 'zero'};
+            const seen = [];
+            for (const k in o) seen.push(k + '=' + o[k]);
+            seen.join()
+        "#),
+        "0=zero,1=one,b=B,a=A"
+    );
+}

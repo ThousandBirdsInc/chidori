@@ -4451,6 +4451,31 @@ impl Vm {
                 }
             }
         }
+        // For-in cursor fast path: `obj[k]` where `k` is the key the last
+        // guarded `for_in_next` step yielded on this very object reads the
+        // recorded slot directly — no ToPropertyKey, no shape walk, no
+        // prototype climb. Every ingredient is re-verified (same object,
+        // shape unchanged since the step, same key, plain data slot), so
+        // the hint can only miss into the generic path, never mis-read; an
+        // own data property's [[Get]] is exactly its slot value.
+        if let (Value::Object(o), Value::String(s)) = (&obj, &key_v) {
+            if let Some(h) = self.forin_hint.take() {
+                if o.ptr_eq(&h.obj) && *s == h.key {
+                    let b = o.borrow();
+                    if b.own_shape().is_some_and(|sh| Rc::ptr_eq(sh, &h.shape)) {
+                        if let Some(PropertyKind::Data { value, .. }) =
+                            b.own_prop_at(h.slot as usize).map(|p| &p.kind)
+                        {
+                            let v = value.clone();
+                            drop(b);
+                            self.forin_hint.set(Some(h));
+                            return Ok(v);
+                        }
+                    }
+                }
+                self.forin_hint.set(Some(h));
+            }
+        }
         // GetValue: RequireObjectCoercible(base) (via ToObject) throws
         // BEFORE ToPropertyKey coerces the key expression's value.
         self.require_object_coercible(&obj, "read properties of")?;
@@ -5155,12 +5180,19 @@ impl Vm {
         frame: &mut Frame,
         v: &Value,
     ) -> Result<Value, Value> {
-        let keys = self.for_in_keys(v)?;
+        // The guard (shape + per-key slots, recorded by the snapshot's own
+        // iteration) proves every key still exists while the target's shape
+        // stays pointer-identical — `for_in_next` then skips the per-key
+        // liveness walk (see [`crate::vm::ForInGuard`]). Only meaningful
+        // when the receiver itself is the enumerated object (a primitive's
+        // wrapper is not the target).
+        let (keys, guard) = self.for_in_keys(v)?;
         let target = match v {
             Value::Object(o) => Some(o.clone()),
             _ => None,
         };
-        frame.enumerators.push((keys, 0, target));
+        let guard = if target.is_some() { guard } else { None };
+        frame.enumerators.push((keys, 0, target, guard));
         Ok(Value::Number((frame.enumerators.len() - 1) as f64))
     }
 
@@ -5169,7 +5201,33 @@ impl Vm {
     /// snapshot is skipped, per EnumerateObjectProperties.
     pub(crate) fn for_in_next(&self, frame: &mut Frame) -> (Value, Value) {
         let idx = frame.enumerators.len() - 1;
-        let (keys, cursor, target) = &mut frame.enumerators[idx];
+        let (keys, cursor, target, guard) = &mut frame.enumerators[idx];
+        // Guarded fast path: while the target's shape is pointer-identical
+        // to the snapshot shape, no key was added or deleted since the
+        // snapshot (adds mint a new shape; deletes demote to dictionary
+        // mode), so the key at the cursor is live without walking the
+        // prototype chain. Publishing the (object, key, slot) hint lets the
+        // loop body's `obj[k]` read the slot directly (see `elem_get`).
+        if let (Some(t), Some(g)) = (&target, &guard) {
+            if *cursor < keys.len()
+                && t.borrow()
+                    .own_shape()
+                    .is_some_and(|s| Rc::ptr_eq(s, &g.shape))
+            {
+                let i = *cursor;
+                *cursor += 1;
+                let k = keys[i].clone();
+                if let Some(&slot) = g.slots.get(i) {
+                    self.forin_hint.set(Some(crate::vm::ForInHint {
+                        obj: t.clone(),
+                        shape: g.shape.clone(),
+                        key: k.clone(),
+                        slot,
+                    }));
+                }
+                return (Value::String(k), Value::Bool(true));
+            }
+        }
         while *cursor < keys.len() {
             let k = keys[*cursor].clone();
             *cursor += 1;
@@ -6196,6 +6254,7 @@ impl Vm {
                 if let Some((keys, ..)) = frame.enumerators.pop() {
                     self.park_forin_vec(keys);
                 }
+                self.forin_hint.set(None);
             }
             // Every ROp is either handled above or inline in run_reg_frame's
             // dispatch loop. Reaching here means the register-tier translator
@@ -6973,6 +7032,7 @@ impl Vm {
                 if let Some((keys, ..)) = frame.enumerators.pop() {
                     self.park_forin_vec(keys);
                 }
+                self.forin_hint.set(None);
             }
             Op::ForInNext => {
                 let (k, more) = self.for_in_next(frame);

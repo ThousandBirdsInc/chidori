@@ -133,10 +133,12 @@ pub struct Frame {
     /// Completion value for script-level evaluation (eval result).
     pub completion: Value,
     /// for-in enumerator stacks (key lists with cursor).
-    /// Active for-in enumerators: (snapshot keys, cursor, target). The
+    /// Active for-in enumerators: (snapshot keys, cursor, target, guard). The
     /// target lets each step skip keys deleted since the snapshot (spec
-    /// EnumerateObjectProperties never yields a deleted-but-unvisited key).
-    pub enumerators: Vec<(Vec<JsString>, usize, Option<JsObject>)>,
+    /// EnumerateObjectProperties never yields a deleted-but-unvisited key);
+    /// the guard (when the snapshot resolved every key in the target's own
+    /// shape) turns that per-key liveness walk into one shape-identity check.
+    pub enumerators: Vec<(Vec<JsString>, usize, Option<JsObject>, Option<ForInGuard>)>,
     /// Active `with` scope objects (innermost last). An unqualified identifier
     /// inside a `with` block resolves against these (honoring @@unscopables)
     /// before falling through to the lexical/global binding.
@@ -159,6 +161,32 @@ pub struct Frame {
     /// The active PrivateEnvironment chain: seeded from the closure's captured
     /// chain, pushed/popped by class definitions evaluating in this frame.
     pub priv_env: Option<Rc<crate::value::PrivateEnv>>,
+}
+
+/// Snapshot-time proof that a for-in enumerator's keys all live in the
+/// target's own shape: while the target's shape stays pointer-identical (no
+/// key added — that mints a new shape — and none deleted — that demotes to
+/// dictionary mode), every snapshot key still exists, so `for_in_next` can
+/// skip the per-key prototype-chain liveness walk. `slots[i]` is the
+/// target's slot index for `keys[i]`, feeding the [`ForInHint`] that serves
+/// the classic `obj[k]` read in the loop body as a direct slot load.
+pub struct ForInGuard {
+    pub(crate) shape: Rc<crate::shape::Shape>,
+    pub(crate) slots: Vec<u32>,
+}
+
+/// The most recent guarded `for_in_next` step: object identity, the shape
+/// it had, the key yielded, and that key's slot. `elem_get` consults it so
+/// the `obj[k]` immediately following a for-in step reads the slot directly
+/// — every field is re-verified at use (object pointer, current shape
+/// pointer, key equality, plain data slot), so a stale hint can only miss,
+/// never mis-read. Purely an accelerator: never serialized, cleared when
+/// the enumerator pops.
+pub(crate) struct ForInHint {
+    pub(crate) obj: JsObject,
+    pub(crate) shape: Rc<crate::shape::Shape>,
+    pub(crate) key: JsString,
+    pub(crate) slot: u32,
 }
 
 /// Promise internal state.
@@ -488,6 +516,11 @@ pub struct Vm {
     /// enumerators without parking — a pool miss, never a stale key). Pure
     /// perf: only the buffer allocation is reused. Bounded.
     pub(crate) forin_pool: Vec<Vec<crate::value::JsString>>,
+    /// The last guarded for-in step's (object, key, slot) — see
+    /// [`ForInHint`]. `Cell` because `for_in_next` publishes it under
+    /// `&self`; fully re-verified at every use, cleared at `ForInPop` and
+    /// before cycle collection.
+    pub(crate) forin_hint: std::cell::Cell<Option<ForInHint>>,
     /// Pinned STRING bases for the active loop-kernel activation (mirrors
     /// `kernel_objs`); cleared after every activation so the pool never
     /// extends a string's lifetime.
@@ -563,6 +596,7 @@ impl Vm {
             rec_families: Vec::new(),
             rec_calls: Vec::new(),
             forin_pool: Vec::new(),
+            forin_hint: std::cell::Cell::new(None),
             kernel_strs: Vec::new(),
             json_keys: std::collections::HashMap::default(),
             dummy_bf: Rc::new(BytecodeFunction {

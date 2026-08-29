@@ -131,6 +131,11 @@ impl Vm {
         if self.call_depth > 0 || !self.microtasks.is_empty() {
             return 0;
         }
+        // Drop the for-in cursor hint: it holds a strong object ref the
+        // accounting below does not trace, which would make its target look
+        // externally rooted (safe, but retains garbage). At quiescence no
+        // for-in body is mid-step, so the hint has no value to keep.
+        self.forin_hint.set(None);
         // Snapshot the live registered objects. Each snapshot handle adds one
         // strong count, which the accounting below subtracts back out.
         let live: Vec<JsObject> = {
@@ -703,7 +708,7 @@ fn trace_frame(fr: &Frame, seen_cells: &mut HashSet<usize>, f: &mut dyn FnMut(&J
     if let Some(o) = &fr.eval_vars {
         f(o);
     }
-    for (_, _, target) in &fr.enumerators {
+    for (_, _, target, _) in &fr.enumerators {
         if let Some(o) = target {
             f(o);
         }

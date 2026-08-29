@@ -504,7 +504,7 @@ fn walk_frame(f: &Frame, b: &mut Baseline, q: &mut VecDeque<JsObject>) {
         .with_scope
         .iter()
         .chain(f.eval_vars.iter())
-        .chain(f.enumerators.iter().filter_map(|(_, _, t)| t.as_ref()))
+        .chain(f.enumerators.iter().filter_map(|(_, _, t, _)| t.as_ref()))
     {
         if intern_object(b, o) {
             q.push_back(o.clone());
@@ -1615,7 +1615,7 @@ impl<'a> Encoder<'a> {
         let enumerators = f
             .enumerators
             .iter()
-            .map(|(keys, cursor, target)| {
+            .map(|(keys, cursor, target, _guard)| {
                 (
                     keys.iter().map(str_img).collect(),
                     *cursor as u64,
@@ -2332,10 +2332,15 @@ impl<'a> Decoder<'a> {
                         Some(o) => Some(self.obj(o)?),
                         None => None,
                     };
+                    // The guard is a derived accelerator (see
+                    // `crate::vm::ForInGuard`): not serialized, and `None`
+                    // on restore simply means the liveness walk runs until
+                    // the enumerator ends — results are identical.
                     out.push((
                         keys.iter().map(|k| self.jsstring(k)).collect(),
                         *cursor as usize,
                         t,
+                        None,
                     ));
                 }
                 out
