@@ -266,11 +266,16 @@ Reading the table honestly, three regimes:
    `mutual_recursion`'s remaining gap is per-outer-call family validation
    (~130 ns), after caching the compiled code on the parked family
    removed the per-call identity re-checks.
-3. **9× (`mixed_helpers` — object-shaped straight-line code)** — the one
-   row still out of the kernel tier's reach: its time is register-
-   interpreter dispatch (~26%), `Value` clone/drop traffic (~12%), object
-   literal allocation, and property/shape machinery on tiny call bodies.
-   Reaching V8 there means compiling object-shaped code with
+3. **~9× (`mixed_helpers` — object-shaped straight-line code)** — the one
+   row still out of the kernel tier's reach. Interpreter-tier work keeps
+   trimming it (a for-in shape guard that skips the per-key liveness walk
+   and serves the body's `obj[k]` from a verified (object, key, slot)
+   cursor hint, plus a word-compare fast path for inline-string equality,
+   cut another ~9% of its instructions — and ship in the default
+   `forbid(unsafe_code)` binary too), but what remains IS the
+   interpreter: register-dispatch (~28%), `Value` clone/drop traffic
+   (~14%), object literal allocation, and frame setup on tiny call
+   bodies. Reaching V8 there means compiling object-shaped code with
    shape-guarded property access and escape analysis — the next tier up,
    not a kernel-JIT extension.
 
