@@ -5352,10 +5352,23 @@ impl Vm {
             }
             let op = &code[pc];
             pc += 1;
+            // Take-aware operand read: the translator tags a source index
+            // with `reg::TAKE` when the op consumes a dying stack temp —
+            // the value MOVES out (no `Rc` round-trip) and the dead slot
+            // holds `Undefined` until its next definition. Untagged reads
+            // clone as before (locals and shared alias slots).
             macro_rules! rd {
-                ($i:expr) => {
-                    frame.locals[$i as usize].clone()
-                };
+                ($i:expr) => {{
+                    let i = $i as usize;
+                    if i & crate::reg::TAKE as usize != 0 {
+                        std::mem::replace(
+                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        )
+                    } else {
+                        frame.locals[i].clone()
+                    }
+                }};
             }
             macro_rules! wr {
                 ($i:expr, $v:expr) => {
@@ -5775,7 +5788,11 @@ impl Vm {
                     wr!(*dst, v);
                 }
                 ROp::Ret { src } => {
-                    let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
+                    // `rd!` honors the translator's consume marker: `return x`
+                    // of a LOCAL clones (an enclosing `finally` can still read
+                    // `x`), while a dying temp moves out. The unconditional
+                    // replace this fixes cleared locals a `finally` observed.
+                    let v = rd!(*src);
                     // Route through any enclosing `finally` blocks (mirror of
                     // `Op::Return`); the no-handler fast path returns directly.
                     if frame.handlers.is_empty() {
@@ -5791,7 +5808,9 @@ impl Vm {
                     complete!(Completion::Return(v));
                 }
                 ROp::Throw { src } => {
-                    let v = std::mem::replace(&mut frame.locals[*src as usize], Value::Undefined);
+                    // Same consume-marker discipline as `Ret`: `throw y` of a
+                    // local must leave `y` readable in the `catch`/`finally`.
+                    let v = rd!(*src);
                     complete!(Completion::Throw(v));
                 }
                 // ---- exceptions / completions ----
@@ -5928,9 +5947,17 @@ impl Vm {
     ) -> Result<(), Value> {
         use crate::reg::ROp;
         macro_rules! rd {
-            ($i:expr) => {
-                frame.locals[$i as usize].clone()
-            };
+            ($i:expr) => {{
+                let i = $i as usize;
+                if i & crate::reg::TAKE as usize != 0 {
+                    std::mem::replace(
+                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        )
+                } else {
+                    frame.locals[i].clone()
+                }
+            }};
         }
         macro_rules! wr {
             ($i:expr, $v:expr) => {
