@@ -433,7 +433,12 @@ impl Ctx<'_> {
 /// Evaluate one op's defs under `cx`: `(dst, None)` = the def is not
 /// int-capable (dst must demote); `(dst, Some(range))` = an int def with
 /// that result range.
-fn eval_op(op: &KOp, pc: usize, cx: &Ctx, demand_pos: &mut Option<u16>) -> Vec<(u16, Option<Range>)> {
+fn eval_op(
+    op: &KOp,
+    pc: usize,
+    cx: &Ctx,
+    demand_pos: &mut Option<u16>,
+) -> Vec<(u16, Option<Range>)> {
     match *op {
         KOp::Mov { dst, src } => {
             vec![(dst, if cx.int(src) { Some(cx.rng(src)) } else { None })]
@@ -443,7 +448,14 @@ fn eval_op(op: &KOp, pc: usize, cx: &Ctx, demand_pos: &mut Option<u16>) -> Vec<(
             (d2, if cx.int(s2) { Some(cx.rng(s2)) } else { None }),
         ],
         KOp::Const { dst, k } => {
-            vec![(dst, if int_const(k) { Some(Range::new(k, k)) } else { None })]
+            vec![(
+                dst,
+                if int_const(k) {
+                    Some(Range::new(k, k))
+                } else {
+                    None
+                },
+            )]
         }
         KOp::Add { dst, a, b } => {
             let (ai, ra) = cx.arg(a);
@@ -555,12 +567,20 @@ fn eval_op(op: &KOp, pc: usize, cx: &Ctx, demand_pos: &mut Option<u16>) -> Vec<(
             vec![(dst, elem_kind_range(code))]
         }
         KOp::LoadElemAdd {
-            dst, obj, d2, a2, b2, ..
+            dst,
+            obj,
+            d2,
+            a2,
+            b2,
+            ..
         } => {
             let code = cx.elem_kinds.get(obj as usize).copied().unwrap_or(0);
             let (ai2, ra2) = cx.arg(a2);
             let (bi2, rb2) = cx.arg(b2);
-            vec![(dst, elem_kind_range(code)), (d2, add_range(ai2, ra2, bi2, rb2))]
+            vec![
+                (dst, elem_kind_range(code)),
+                (d2, add_range(ai2, ra2, bi2, rb2)),
+            ]
         }
         KOp::LoadElemArith {
             dst,
@@ -576,7 +596,10 @@ fn eval_op(op: &KOp, pc: usize, cx: &Ctx, demand_pos: &mut Option<u16>) -> Vec<(
             let (bi2, rb2) = cx.arg(b2);
             vec![
                 (dst, elem_kind_range(code)),
-                (d2, arith_range(kind, ai2, ra2, bi2, rb2, Some(b2), demand_pos)),
+                (
+                    d2,
+                    arith_range(kind, ai2, ra2, bi2, rb2, Some(b2), demand_pos),
+                ),
             ]
         }
         KOp::LoadLen { dst, .. } | KOp::LenBrCmp { dst, .. } => {
@@ -779,8 +802,7 @@ pub(crate) fn analyze(k: &Kernel, elem_kinds: &[u64], entry_regs: &[f64]) -> Opt
                         // constant (strength-reducible `srem`); otherwise a
                         // plain ≥ 1 check.
                         let bake = entry_regs.get(d).copied().and_then(|v| {
-                            (v.fract() == 0.0 && (1.0..=ENTRY_HI).contains(&v))
-                                .then_some(v as i64)
+                            (v.fract() == 0.0 && (1.0..=ENTRY_HI).contains(&v)).then_some(v as i64)
                         });
                         checks[d] = match bake {
                             Some(v) => EntryCheck::Exact(v),
@@ -790,9 +812,9 @@ pub(crate) fn analyze(k: &Kernel, elem_kinds: &[u64], entry_regs: &[f64]) -> Opt
                     }
                 }
                 let apply = |d: usize,
-                                 res: Option<Range>,
-                                 work: &mut Vec<Range>,
-                                 demote_now: &mut Vec<u16>| {
+                             res: Option<Range>,
+                             work: &mut Vec<Range>,
+                             demote_now: &mut Vec<u16>| {
                     match res {
                         Some(r0) if r0.is_bottom() => work[d] = Range::BOTTOM,
                         Some(r0) if r0.within_safe() => work[d] = r0,

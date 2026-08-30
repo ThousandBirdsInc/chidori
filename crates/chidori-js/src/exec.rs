@@ -1142,46 +1142,46 @@ impl Vm {
                 .iter()
                 .map(|o| crate::jit::elem_kind_code(o, allow_dense))
                 .collect();
-            let native_exit = crate::jit::native_for_loop(k, &callee_bfs, &elem_kinds, &regs)
-                .map(|native| {
-                // Activation tables for the native run, alive exactly across
-                // it: the pinned strings (guard-validated flat ASCII), the
-                // per-oslot direct element views (numeric typed arrays of
-                // any kind; dense arrays when granted), the object cache
-                // the element shims index, and the canonical Array.prototype
-                // for the push receiver check.
-                let sstr_tab: Vec<crate::jit::SStr> = sstrs
-                    .iter()
-                    .map(|st| {
-                        let f = st.flatten_utf8().expect("entry-guarded flat ASCII");
-                        crate::jit::SStr {
-                            ptr: f.as_ptr(),
-                            len: f.len() as u64,
-                        }
-                    })
-                    .collect();
-                let ta_tab: Vec<crate::jit::ElemView> = objs
-                    .iter()
-                    .map(|o| crate::jit::elem_view(o, allow_dense))
-                    .collect();
-                let mut ctx = crate::jit::JitCtx {
-                    sstr: sstr_tab.as_ptr(),
-                    objs: objs.as_ptr(),
-                    n_objs: objs.len() as u64,
-                    ta: ta_tab.as_ptr(),
-                    array_proto: if k.uses_array_push || k.uses_array_pop {
-                        &self.realm.array_proto
-                    } else {
-                        std::ptr::null()
-                    },
-                    scratch: 0.0,
-                    depth: 0,
-                    abandon: 0,
-                    poll: 0,
-                    rec_uv: std::ptr::null(),
-                };
-                native.run(&mut regs, interrupt.as_deref(), &mut ctx)
-            });
+            let native_exit =
+                crate::jit::native_for_loop(k, &callee_bfs, &elem_kinds, &regs).map(|native| {
+                    // Activation tables for the native run, alive exactly across
+                    // it: the pinned strings (guard-validated flat ASCII), the
+                    // per-oslot direct element views (numeric typed arrays of
+                    // any kind; dense arrays when granted), the object cache
+                    // the element shims index, and the canonical Array.prototype
+                    // for the push receiver check.
+                    let sstr_tab: Vec<crate::jit::SStr> = sstrs
+                        .iter()
+                        .map(|st| {
+                            let f = st.flatten_utf8().expect("entry-guarded flat ASCII");
+                            crate::jit::SStr {
+                                ptr: f.as_ptr(),
+                                len: f.len() as u64,
+                            }
+                        })
+                        .collect();
+                    let ta_tab: Vec<crate::jit::ElemView> = objs
+                        .iter()
+                        .map(|o| crate::jit::elem_view(o, allow_dense))
+                        .collect();
+                    let mut ctx = crate::jit::JitCtx {
+                        sstr: sstr_tab.as_ptr(),
+                        objs: objs.as_ptr(),
+                        n_objs: objs.len() as u64,
+                        ta: ta_tab.as_ptr(),
+                        array_proto: if k.uses_array_push || k.uses_array_pop {
+                            &self.realm.array_proto
+                        } else {
+                            std::ptr::null()
+                        },
+                        scratch: 0.0,
+                        depth: 0,
+                        abandon: 0,
+                        poll: 0,
+                        rec_uv: std::ptr::null(),
+                    };
+                    native.run(&mut regs, interrupt.as_deref(), &mut ctx)
+                });
             match native_exit {
                 None => {}
                 Some(stopped_at) if stopped_at >= 0 => pc = stopped_at as usize,
@@ -1565,9 +1565,7 @@ impl Vm {
                 KOp::StrLen { dst, str } => {
                     w[dst as usize & KWIN_MASK] = sstrs[str as usize].len_utf16() as f64;
                 }
-                KOp::CharCodeAt {
-                    dst, str, idx, ..
-                } => {
+                KOp::CharCodeAt { dst, str, idx, .. } => {
                     let i = w[idx as usize & KWIN_MASK];
                     let bytes = sstrs[str as usize]
                         .flatten_utf8()
@@ -5956,9 +5954,9 @@ impl Vm {
                 let i = $i as usize;
                 if i & crate::reg::TAKE as usize != 0 {
                     std::mem::replace(
-                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
-                            Value::Undefined,
-                        )
+                        &mut frame.locals[i & !(crate::reg::TAKE as usize)],
+                        Value::Undefined,
+                    )
                 } else {
                     frame.locals[i].clone()
                 }

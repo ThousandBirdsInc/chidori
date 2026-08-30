@@ -2491,8 +2491,16 @@ impl Emitter<'_> {
                             // branch would misattribute them across the
                             // edge — the sweep differentials catch it).
                             let unary_idx = self.code.len() - 1;
+                            // The fused-away `Unary` read its operand through
+                            // the take-aware `rd!`, so its `src` may carry
+                            // [`TAKE`]. `TypeofBr` tests by reference and
+                            // indexes the field raw, so the bit is stripped
+                            // here: leaving it on indexed past the register
+                            // file and panicked. Dropping the take only keeps
+                            // the dying temp's value alive until its register
+                            // is rewritten — the branch never needed to own it.
                             let src = match self.code[unary_idx] {
-                                ROp::Unary { src, .. } => src,
+                                ROp::Unary { src, .. } => src & !TAKE,
                                 _ => unreachable!("checked above"),
                             };
                             self.code[unary_idx] = ROp::Charge;

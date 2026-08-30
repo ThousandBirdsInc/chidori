@@ -55,11 +55,21 @@ and neither can pull the unrelated package:
    - `sdk/typescript/package.json` (then `npm install --package-lock-only`
      in `sdk/typescript` to refresh the lock file)
    - `sdk/python/pyproject.toml` (`[project] version`)
+   The internal `chidori-js` crate is **not** on the train — it carries its
+   own `0.x` version — but it must be bumped whenever `crates/chidori-js`
+   changed, and `chidori`'s dependency pin on it updated to match. Publishing
+   `chidori` verifies the packaged crate against the **registry** copy of
+   `chidori-js`, not the path dependency, so a stale `chidori-js` fails the
+   release outright. (This is how v3.8.0 failed: `chidori-js` sat at 0.3.3
+   across a cycle that added new engine APIs, and the crates job died with 20
+   compile errors *after* npm and PyPI had already published.)
+
 2. Sanity-check the train locally:
 
    ```bash
    ./scripts/check-sdk-versions.sh X.Y.Z
    ./scripts/check-npm-drift.sh
+   ./scripts/check-crate-drift.sh
    ```
 
    The second script guards the skip-if-published behavior below: because a
@@ -69,7 +79,10 @@ and neither can pull the unrelated package:
    published 3.6.0 ended up missing the 3.6.0 runtime's `defineTool` types).
    The script fails when the tree drifts from the published tarball of the
    same version; CI runs it on every PR and the release workflow re-checks it
-   before deciding to skip.
+   before deciding to skip. `check-crate-drift.sh` is its crates.io twin for
+   `chidori-js`, and runs in the same two places — but in the release
+   workflow it runs in the `verify` job, *before* any registry is touched, so
+   a stale internal crate can't strand a half-published release.
 
 3. Commit, merge to `main`, then tag and push:
 

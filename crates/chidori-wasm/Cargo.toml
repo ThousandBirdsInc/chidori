@@ -16,7 +16,7 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-chidori-js = { path = "../chidori-js", version = "0.3.3" }
+chidori-js = { path = "../chidori-js", version = "0.4.0" }
 # TypeScript stripping for browser-authored agents, mirroring the native
 # runtime's transpile defaults (crates/chidori/src/runtime/typescript). Same
 # version/features as chidori-js, so this adds no new crates to the build.

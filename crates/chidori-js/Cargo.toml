@@ -1,6 +1,6 @@
 [package]
 name = "chidori-js"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 # oxc relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"

@@ -28,6 +28,14 @@ jobs:
       # every documented CHIDORI_* env var must be read by the code, and every
       # subcommand/flag in docs/cli.md must exist on the binary (nested
       # subcommands included). Reuses the debug binary the test step built.
+      # The crates twin of the TypeScript SDK's published-package drift check
+      # below: if chidori-js's version is already on crates.io, the tree must
+      # match it, or the change needs a version bump. Skipping a drifted
+      # chidori-js breaks the chidori publish, which verifies against the
+      # registry copy rather than the path dependency.
+      - name: Check chidori-js published-crate drift
+        run: ./scripts/check-crate-drift.sh
+
       - name: Docs drift check (env vars, CLI surface)
         run: |
           cargo build

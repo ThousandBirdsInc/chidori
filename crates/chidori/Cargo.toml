@@ -1,6 +1,6 @@
 [package]
 name = "chidori"
-version = "3.8.0"
+version = "3.8.1"
 edition = "2021"
 # oxc relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
@@ -84,7 +84,7 @@ hex = "0.4"
 rand = "0.9"
 
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
-chidori-js = { path = "../chidori-js", version = "0.3.3" }
+chidori-js = { path = "../chidori-js", version = "0.4.0" }
 async-trait = "0.1"
 
 # SQLite session store

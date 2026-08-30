@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "chidori"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "chidori-js"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",

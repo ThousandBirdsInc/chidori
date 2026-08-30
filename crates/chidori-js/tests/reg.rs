@@ -37,6 +37,20 @@ fn run(src: &str, regs: bool) -> (bool, Vec<String>, String) {
 }
 
 const CORPUS: &[&str] = &[
+    // typeof-dispatch over a DYING TEMP (call result), fused to TypeofBr: the
+    // transplanted operand must not keep the take bit. Covers all eight
+    // typeof names, the negated edge, and an operand that outlives the test.
+    // (Wrapped in called functions: only functions get register protos, and
+    // `TypeofBr` needs a BRANCH context — a typeof compare in value position
+    // stays a generic compare — so neither a toplevel nor a value-position
+    // spelling would reach the op under test.)
+    "function id(x) { return x; } function f(v) { if (typeof id(v) === 'number') return 'num'; if (typeof id(v) === 'string') return 'str'; if (typeof id(v) === 'undefined') return 'undef'; if (typeof id(v) === 'boolean') return 'bool'; return 'other'; } console.log([1, 's', undefined, true, {}].map(f).join(','));",
+    "function id(x) { return x; } function f(v) { if (typeof id(v) === 'function') return 'fn'; if (typeof id(v) === 'bigint') return 'big'; if (typeof id(v) === 'symbol') return 'sym'; if (typeof id(v) === 'object') return 'obj'; return 'other'; } console.log([f, 10n, Symbol('x'), null].map(f).join(','));",
+    // Negated edge (br_on_eq inverted) and a ternary branch context.
+    "function id(x) { return x; } function f(v) { return typeof id(v) !== 'string' ? 'not-str' : 'str'; } console.log(f(1), f('a'));",
+    // The taken temp must not be observable as consumed: the same call result
+    // is tested and then used on the taken edge.
+    "function id(x) { return x; } function f(v) { if (typeof id(v) === 'string') return id(v).toUpperCase(); return 'NO'; } console.log(f('keep'), f(1));",
     // ---- virtual-stack shuffles ----
     // Ternaries nested in call arguments (branch joins mid-expression).
     "function f(a, b) { return (a > b ? a : b) + (a < b ? 'x' : 'y'); } console.log(f(1, 2), f(2, 1));",
@@ -513,6 +527,30 @@ fn typeof_branches_fuse() {
         count_ops(&proto, &|op| matches!(op, ROp::TypeofBr { .. })),
         0,
         "non-typeof-name literals must stay generic"
+    );
+    // The operand is a DYING TEMP (a call result), not a local: the
+    // fused-away `Unary` read it through the take-aware `rd!`, so its `src`
+    // carried `TAKE`. `TypeofBr` tests by reference and indexes the field
+    // raw, so the bit must be stripped when it is transplanted — leaving it
+    // on indexed past the register file and panicked at runtime. The shape
+    // above can't catch this: a parameter is a `Local`, never taken.
+    let proto = compile_script_regs(
+        "function h(v) { function id(x) { return x; } if (typeof id(v) === 'number') return 1; return 2; }",
+        true,
+    )
+    .expect("compiles");
+    assert_eq!(
+        count_ops(&proto, &|op| matches!(op, ROp::TypeofBr { .. })),
+        1,
+        "a typeof over a temp operand must still fuse"
+    );
+    assert_eq!(
+        count_ops(&proto, &|op| matches!(
+            op,
+            ROp::TypeofBr { src, .. } if src & chidori_js::reg::TAKE != 0
+        )),
+        0,
+        "TypeofBr.src is read raw, so it must never carry the TAKE bit"
     );
 }
 
