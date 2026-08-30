@@ -410,7 +410,7 @@ dependencies = [
  "opentelemetry_sdk",
  "oxc",
  "oxc_sourcemap",
- "rand 0.9.5",
+ "rand 0.10.2",
  "reqwest 0.12.28",
  "rusqlite",
  "seccompiler",
