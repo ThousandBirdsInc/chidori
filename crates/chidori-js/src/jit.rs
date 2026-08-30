@@ -2366,12 +2366,7 @@ impl<'a> Translator<'a> {
     /// Compare two registers with JS numeric semantics: both `Int` →
     /// signed integer compare (identical to the f64 compare on the same
     /// integer values — no NaN, no `-0` in the Int domain), else float.
-    fn cmp_regs(
-        &mut self,
-        cmp: CmpOp,
-        a: u16,
-        b: u16,
-    ) -> cranelift_codegen::ir::Value {
+    fn cmp_regs(&mut self, cmp: CmpOp, a: u16, b: u16) -> cranelift_codegen::ir::Value {
         if self.is_int(a) && self.is_int(b) {
             let (x, y) = (self.get_int(a), self.get_int(b));
             self.b.ins().icmp(cmp_icc(cmp), x, y)
@@ -2382,12 +2377,7 @@ impl<'a> Translator<'a> {
     }
 
     /// As [`Self::cmp_regs`] with a constant rhs.
-    fn cmp_reg_const(
-        &mut self,
-        cmp: CmpOp,
-        a: u16,
-        k: f64,
-    ) -> cranelift_codegen::ir::Value {
+    fn cmp_reg_const(&mut self, cmp: CmpOp, a: u16, k: f64) -> cranelift_codegen::ir::Value {
         if self.is_int(a) && k.fract() == 0.0 && k.abs() <= 4_503_599_627_370_496.0 {
             let x = self.get_int(a);
             self.b.ins().icmp_imm_s(cmp_icc(cmp), x, k as i64)
@@ -2763,10 +2753,10 @@ impl<'a> Translator<'a> {
                 );
                 let off = self.b.ins().imul(ii, stride);
                 let slot = self.b.ins().iadd(view.ptr, off);
-                let tag = self.b.ins().iconst(
-                    types::I64,
-                    i64::from(crate::value::Value::JIT_NUMBER_TAG),
-                );
+                let tag = self
+                    .b
+                    .ins()
+                    .iconst(types::I64, i64::from(crate::value::Value::JIT_NUMBER_TAG));
                 self.b.ins().istore8(MemFlagsData::trusted(), tag, slot, 0);
                 self.b.ins().store(
                     MemFlagsData::trusted(),
@@ -3212,14 +3202,11 @@ impl<'a> Translator<'a> {
             let rt = self.b.ins().fcvt_from_sint(types::F64, sat);
             let integral = self.b.ins().fcmp(FloatCC::Equal, rt, v);
             // `-0` passes the round-trip (0.0 == -0.0); reject it by bits.
-            let bits = self
+            let bits = self.b.ins().bitcast(types::I64, MemFlagsData::new(), v);
+            let not_nz = self
                 .b
                 .ins()
-                .bitcast(types::I64, MemFlagsData::new(), v);
-            let not_nz =
-                self.b
-                    .ins()
-                    .icmp_imm_s(IntCC::NotEqual, bits, (-0.0f64).to_bits() as i64);
+                .icmp_imm_s(IntCC::NotEqual, bits, (-0.0f64).to_bits() as i64);
             let ok2 = match chk {
                 EntryCheck::NonNeg | EntryCheck::Pos => {
                     let lo = if matches!(chk, EntryCheck::Pos) { 1 } else { 0 };
@@ -3227,10 +3214,10 @@ impl<'a> Translator<'a> {
                         .b
                         .ins()
                         .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, sat, lo);
-                    let hi_ok = self
-                        .b
-                        .ins()
-                        .icmp_imm_s(IntCC::SignedLessThanOrEqual, sat, ENTRY_HI as i64);
+                    let hi_ok =
+                        self.b
+                            .ins()
+                            .icmp_imm_s(IntCC::SignedLessThanOrEqual, sat, ENTRY_HI as i64);
                     self.b.ins().band(lo_ok, hi_ok)
                 }
                 // A baked divisor: exactly the compiling activation's value.

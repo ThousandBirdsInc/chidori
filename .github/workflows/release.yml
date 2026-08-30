@@ -39,6 +39,14 @@ jobs:
             ./scripts/check-sdk-versions.sh
           fi
 
+      # The crates analogue of the npm drift check the npm job runs. A
+      # chidori-js that changed without a version bump is skipped by
+      # publish.sh, and the chidori publish then fails to verify against the
+      # stale registry copy — which is how v3.8.0 died after npm and PyPI had
+      # already published. Catch it here, before anything is published.
+      - name: Check chidori-js has not drifted from crates.io
+        run: ./scripts/check-crate-drift.sh
+
   npm:
     name: Publish TypeScript SDK to npm
     needs: verify

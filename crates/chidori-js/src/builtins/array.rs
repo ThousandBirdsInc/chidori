@@ -846,7 +846,15 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // native activation; a bail resumes the generic loop below at the
         // bailed index. See `Vm::hof_batch`.
         #[cfg(feature = "jit")]
-        match vm.hof_batch(crate::jit::BatchMode::ForEach, &ov, None, len, 0.0, 0.0, &cb) {
+        match vm.hof_batch(
+            crate::jit::BatchMode::ForEach,
+            &ov,
+            None,
+            len,
+            0.0,
+            0.0,
+            &cb,
+        ) {
             Some(crate::exec::HofBatchOut::Done(_)) => return Ok(Value::Undefined),
             Some(
                 crate::exec::HofBatchOut::Resume { index, .. }
@@ -883,7 +891,15 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // hole-filled result's slots; a bail resumes below at the bailed
         // index with the prefix already in place. See `Vm::hof_batch`.
         #[cfg(feature = "jit")]
-        match vm.hof_batch(crate::jit::BatchMode::Map, &ov, Some(&a), len, 0.0, 0.0, &cb) {
+        match vm.hof_batch(
+            crate::jit::BatchMode::Map,
+            &ov,
+            Some(&a),
+            len,
+            0.0,
+            0.0,
+            &cb,
+        ) {
             Some(crate::exec::HofBatchOut::Done(_)) => return Ok(a),
             Some(
                 crate::exec::HofBatchOut::Resume { index, .. }
@@ -920,7 +936,15 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // core; on a bail `to` is the compacted prefix length (the result's
         // current dense length). See `Vm::hof_batch`.
         #[cfg(feature = "jit")]
-        match vm.hof_batch(crate::jit::BatchMode::Filter, &ov, Some(&a), len, 0.0, 0.0, &cb) {
+        match vm.hof_batch(
+            crate::jit::BatchMode::Filter,
+            &ov,
+            Some(&a),
+            len,
+            0.0,
+            0.0,
+            &cb,
+        ) {
             Some(crate::exec::HofBatchOut::Done(_)) => return Ok(a),
             Some(
                 crate::exec::HofBatchOut::Resume { index, .. }
@@ -1002,9 +1026,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         #[cfg(feature = "jit")]
         match vm.hof_batch(crate::jit::BatchMode::Find, &ov, None, len, 0.0, 0.0, &cb) {
             Some(crate::exec::HofBatchOut::Done(_)) => return Ok(Value::Number(-1.0)),
-            Some(crate::exec::HofBatchOut::Found { index }) => {
-                return Ok(Value::Number(index))
-            }
+            Some(crate::exec::HofBatchOut::Found { index }) => return Ok(Value::Number(index)),
             Some(crate::exec::HofBatchOut::Resume { index, .. }) => k = index,
             Some(crate::exec::HofBatchOut::Interrupted) => {
                 return Err(vm.throw_range("execution interrupted"))
