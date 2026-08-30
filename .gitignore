@@ -36,6 +36,9 @@
 **/.chidori/wasm-cache/
 **/.chidori/memory/
 **/.chidori/sessions.sqlite3*
+# The source-history object store (#166); generated alongside the run journal.
+.chidori/history-objects/
+**/.chidori/history-objects/
 # Durable run-store mirror (CHIDORI_RUN_STORE=sqlite) + SQLite sidecars
 .chidori/runs.sqlite3*
 **/.chidori/runs.sqlite3*

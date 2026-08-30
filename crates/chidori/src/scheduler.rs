@@ -28,11 +28,23 @@ use crate::tools::ToolRegistry;
 /// branch worker threads. The interpreter recurses natively with the agent's
 /// JS call depth (`max_call_depth` = 2000 frames), which needs more headroom
 /// than tokio's 2 MiB default; on 64-bit the extra virtual space is only
-/// committed if actually touched. Sized by measurement: a debug build needs
-/// more than 32 MiB for the depth guard to fire its catchable RangeError
-/// before the native stack runs out (release frames are far smaller, but the
-/// reservation is virtual either way, so one generous constant serves both).
-pub const JS_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// committed if actually touched, so one generous constant serves both build
+/// profiles.
+///
+/// Sized by measurement against the DEBUG build, which is the binding
+/// constraint: an unoptimized interpreter frame costs ~35 KiB of native
+/// stack, roughly 10x its release counterpart, because every arm-local in the
+/// big dispatch matches gets its own slot. At 128 MiB the depth guard fires
+/// its catchable RangeError through ~3000 frames — comfortably past the 2000
+/// default — while release clears 16000.
+///
+/// This was 64 MiB, measured when a debug frame still fit the guard's 2000
+/// frames inside 32 MiB. The JIT/register-tier work (#189) grew debug frames
+/// past that line, so 2000 frames no longer fit in 64 MiB and
+/// `default_depth_recursion_throws_not_aborts` began aborting the test
+/// process instead of throwing. Release was never affected — it keeps an 8x
+/// margin — so no shipped binary carried this.
+pub const JS_THREAD_STACK_BYTES: usize = 128 * 1024 * 1024;
 
 /// Build the process's tokio runtime. Exactly `tokio::runtime::Runtime::new()`
 /// plus [`JS_THREAD_STACK_BYTES`]-sized threads: agent JS executes on this
@@ -207,6 +219,33 @@ mod stack_tests {
         assert!(
             outcome.contains("Maximum call stack size exceeded"),
             "expected a catchable RangeError, got: {outcome}"
+        );
+    }
+
+    /// Margin pin. The test above only fails once frames have grown enough to
+    /// blow the guard at the *default* depth — by which point the process is
+    /// already aborting. This asserts the stack clears 1.5x that depth, so
+    /// frame growth shows up here first, as a normal failure, while there is
+    /// still headroom. Raise [`JS_THREAD_STACK_BYTES`] when it trips.
+    #[test]
+    fn depth_guard_keeps_headroom_above_the_default() {
+        const HEADROOM_DEPTH: usize = 3000; // 1.5x the 2000 default
+        let outcome = std::thread::Builder::new()
+            .stack_size(JS_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let mut engine = chidori_js::Engine::new();
+                engine.vm.max_call_depth = HEADROOM_DEPTH;
+                engine
+                    .eval("function f(n){ return f(n + 1); } f(0)")
+                    .err()
+                    .unwrap_or_default()
+            })
+            .expect("spawn JS thread")
+            .join()
+            .expect("thread must return an error, not abort");
+        assert!(
+            outcome.contains("Maximum call stack size exceeded"),
+            "expected a catchable RangeError at {HEADROOM_DEPTH} frames, got: {outcome}"
         );
     }
 }

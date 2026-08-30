@@ -276,7 +276,18 @@ class SessionApiTests(_MockLlmTestCase):
     def test_health(self):
         with urllib.request.urlopen(self.serve.base_url + "/health") as r:
             body = json.loads(r.read())
-        self.assertEqual(body, {"status": "ok"})
+        self.assertEqual(body["status"], "ok")
+        # /health also carries the admission signal an external router uses to
+        # steer runs away from a saturated instance (#183). Assert the fields
+        # rather than the whole body, so adding another signal doesn't break
+        # this the way the exact-equality assertion did.
+        concurrency = body["concurrency"]
+        self.assertIsInstance(concurrency["max_concurrent_sessions"], int)
+        self.assertIsInstance(concurrency["available_run_slots"], int)
+        self.assertLessEqual(
+            concurrency["available_run_slots"],
+            concurrency["max_concurrent_sessions"],
+        )
 
     def test_run_returns_output_with_mock_content(self):
         self.mock.hits = 0

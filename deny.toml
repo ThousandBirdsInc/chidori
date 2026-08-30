@@ -11,12 +11,11 @@ all-features = true
 # here (with a reason) if a fix genuinely can't land yet.
 [advisories]
 yanked = "deny"
-ignore = [
-    # async-std is discontinued but still a transitive dependency of the
-    # pinned opentelemetry_sdk 0.27 (via its rt-tokio feature graph). Drops
-    # out when the opentelemetry stack is upgraded past 0.27.
-    { id = "RUSTSEC-2025-0052", reason = "async-std via opentelemetry_sdk 0.27; revisit on otel upgrade" },
-]
+# RUSTSEC-2025-0052 (async-std, via the pinned opentelemetry_sdk 0.27) was
+# ignored here on the condition "revisit on otel upgrade". #171 upgraded
+# opentelemetry to 0.32, async-std left the graph, and cargo-deny began
+# warning that the advisory no longer matched anything — so the entry is gone.
+ignore = []
 
 [bans]
 # Duplicate crate versions bloat builds and multiply audit surface, but the
