@@ -1,0 +1,148 @@
+1
+00:00:00,500 --> 00:00:01,301
+Meet Chidori.
+
+2
+00:00:01,681 --> 00:00:07,138
+The agent framework where every run is durable, replayable, and resumable, by default.
+
+3
+00:00:08,238 --> 00:00:11,698
+Agents are non-deterministic, expensive, and long-running.
+
+4
+00:00:12,078 --> 00:00:15,433
+A bug shows up three runs deep, and you can't reproduce it.
+
+5
+00:00:15,813 --> 00:00:18,355
+Every debugging cycle re-bills the same tokens.
+
+6
+00:00:18,735 --> 00:00:20,976
+A crash halfway through loses everything.
+
+7
+00:00:21,356 --> 00:00:25,037
+And waiting on a human means keeping a process alive for hours.
+
+8
+00:00:26,437 --> 00:00:32,520
+Most frameworks layer orchestration on top of that chaos. Chidori removes it at the source, with a single boundary.
+
+9
+00:00:32,900 --> 00:00:40,563
+Every side effect, every LLM call, tool call, and HTTP request, flows through the runtime as a recorded host call.
+
+10
+00:00:40,943 --> 00:00:47,061
+The runtime sees everything. So it can log it, cache it, replay it, pause on it, and resume from it.
+
+11
+00:00:48,461 --> 00:00:51,190
+And you write agents as plain, async TypeScript.
+
+12
+00:00:51,570 --> 00:00:54,832
+No graphs. No DSL. No activity definitions.
+
+13
+00:00:55,212 --> 00:00:57,871
+Every await chidori.* is a durable safepoint.
+
+14
+00:00:59,271 --> 00:01:01,209
+Under the hood, it's one Rust binary.
+
+15
+00:01:01,589 --> 00:01:11,667
+Agents run on an embedded, pure Rust JavaScript engine. A bytecode VM with no C and no unsafe code, conformance tested against Test262.
+
+16
+00:01:12,047 --> 00:01:16,842
+Host functions are the only way out to the world, and the call log journals every one of them.
+
+17
+00:01:17,222 --> 00:01:23,840
+Journals can be mirrored to S3, SQLite, or Durable Objects. No Node. No V8. No native bindings.
+
+18
+00:01:25,240 --> 00:01:26,041
+Here's the payoff.
+
+19
+00:01:26,421 --> 00:01:32,516
+Replay any run against its call log, and every prompt and tool call returns its recorded result, instantly.
+
+20
+00:01:32,896 --> 00:01:38,271
+Zero tokens. Byte-identical output. Because the runtime fixes the clock and seeds randomness.
+
+21
+00:01:39,671 --> 00:01:40,925
+Kill the process mid-run,
+
+22
+00:01:41,305 --> 00:01:48,085
+and Chidori resumes exactly where it left off, in a brand new process, by replaying to the pause point and continuing live.
+
+23
+00:01:49,485 --> 00:01:53,444
+Need a human to approve something? chidori.input() suspends the run to disk.
+
+24
+00:01:53,824 --> 00:01:56,564
+No process held open. No threads. No memory.
+
+25
+00:01:56,944 --> 00:02:00,752
+Answer minutes, or days later, and the run picks up right where it stopped.
+
+26
+00:02:02,152 --> 00:02:04,219
+And any recorded run becomes a test.
+
+27
+00:02:04,599 --> 00:02:08,802
+Commit the checkpoint, replay it in CI, and assert the agent hasn't drifted.
+
+28
+00:02:09,182 --> 00:02:13,083
+A full integration test that costs nothing and runs in milliseconds.
+
+29
+00:02:14,483 --> 00:02:15,609
+So how does it compare?
+
+30
+00:02:15,989 --> 00:02:24,313
+Graph frameworks, like LangGraph, give you LLM primitives, but you author node graphs, and durable, zero-cost replay isn't the default.
+
+31
+00:02:24,693 --> 00:02:33,285
+Durable execution engines, like Temporal, survive crashes, but you bring your own LLM layer, and operate a server, workers, and a queue.
+
+32
+00:02:33,665 --> 00:02:36,962
+Chidori gives you both. In plain TypeScript. In one binary.
+
+33
+00:02:38,362 --> 00:02:39,082
+And there's more.
+
+34
+00:02:39,462 --> 00:02:45,278
+Branching runs. Supervised actors. Detached agents that hibernate at zero cost. Multiplayer signals.
+
+35
+00:02:45,658 --> 00:02:52,624
+Structural prompt caching. npm packages without Node. And OpenTelemetry traces that point straight back to a replayable run.
+
+36
+00:02:54,024 --> 00:02:59,272
+Install it with one command, scaffold an agent, and start building agents you can actually debug.
+
+37
+00:02:59,652 --> 00:03:01,846
+Chidori. Checkpoint. Replay. Resume.
+

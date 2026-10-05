@@ -1,0 +1,63 @@
+[
+  {"id": "intro", "pad": 0.6, "segs": [
+    "Meet Chidori.",
+    "The agent framework where every run is durable, replayable, and resumable, by default."
+  ]},
+  {"id": "problem", "segs": [
+    "Agents are non-deterministic, expensive, and long-running.",
+    "A bug shows up three runs deep, and you can't reproduce it.",
+    "Every debugging cycle re-bills the same tokens.",
+    "A crash halfway through loses everything.",
+    "And waiting on a human means keeping a process alive for hours."
+  ]},
+  {"id": "boundary", "segs": [
+    "Most frameworks layer orchestration on top of that chaos. Chidori removes it at the source, with a single boundary.",
+    "Every side effect, every LLM call, tool call, and HTTP request, flows through the runtime as a recorded host call.",
+    "The runtime sees everything. So it can log it, cache it, replay it, pause on it, and resume from it."
+  ]},
+  {"id": "code", "segs": [
+    "And you write agents as plain, async TypeScript.",
+    "No graphs. No D S L. No activity definitions.",
+    "Every await on chidori is a durable safepoint."
+  ]},
+  {"id": "arch", "segs": [
+    "Under the hood, it's one Rust binary.",
+    "Agents run on an embedded, pure Rust JavaScript engine. A bytecode VM with no C and no unsafe code, conformance tested against Test two six two.",
+    "Host functions are the only way out to the world, and the call log journals every one of them.",
+    "Journals can be mirrored to S3, SQLite, or Durable Objects. No Node. No V8. No native bindings."
+  ]},
+  {"id": "replay", "segs": [
+    "Here's the payoff.",
+    "Replay any run against its call log, and every prompt and tool call returns its recorded result, instantly.",
+    "Zero tokens. Byte-identical output. Because the runtime fixes the clock and seeds randomness."
+  ]},
+  {"id": "resume", "segs": [
+    "Kill the process mid-run,",
+    "and Chidori resumes exactly where it left off, in a brand new process, by replaying to the pause point and continuing live."
+  ]},
+  {"id": "human", "segs": [
+    "Need a human to approve something? chidori dot input suspends the run to disk.",
+    "No process held open. No threads. No memory.",
+    "Answer minutes, or days later, and the run picks up right where it stopped."
+  ]},
+  {"id": "test", "segs": [
+    "And any recorded run becomes a test.",
+    "Commit the checkpoint, replay it in C I, and assert the agent hasn't drifted.",
+    "A full integration test that costs nothing and runs in milliseconds."
+  ]},
+  {"id": "compare", "segs": [
+    "So how does it compare?",
+    "Graph frameworks, like Lang Graph, give you L L M primitives, but you author node graphs, and durable, zero-cost replay isn't the default.",
+    "Durable execution engines, like Temporal, survive crashes, but you bring your own L L M layer, and operate a server, workers, and a queue.",
+    "Chidori gives you both. In plain TypeScript. In one binary."
+  ]},
+  {"id": "features", "segs": [
+    "And there's more.",
+    "Branching runs. Supervised actors. Detached agents that hibernate at zero cost. Multiplayer signals.",
+    "Structural prompt caching. N P M packages without Node. And OpenTelemetry traces that point straight back to a replayable run."
+  ]},
+  {"id": "cta", "pad": 2.2, "segs": [
+    "Install it with one command, scaffold an agent, and start building agents you can actually debug.",
+    "Chidori. Checkpoint. Replay. Resume."
+  ]}
+]
