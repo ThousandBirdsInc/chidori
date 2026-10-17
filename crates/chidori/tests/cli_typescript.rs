@@ -828,7 +828,12 @@ fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
     )
     .unwrap();
 
-    let output = run_chidori(&["run", agent.to_str().unwrap(), "--trusted"], &dir);
+    let http_env = [("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")];
+    let output = run_chidori_with_str_env(
+        &["run", agent.to_str().unwrap(), "--trusted"],
+        &dir,
+        &http_env,
+    );
     assert_success(&output);
     assert_eq!(
         effects.load(Ordering::SeqCst),
@@ -848,13 +853,14 @@ fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
         first["seq"], 1,
         "the fresh top-level run must establish the seq=1 anchor from its persisted journal"
     );
-    assert_eq!(first["function"], "fetch");
+    assert_eq!(first["function"], "http");
     let damaged = lines.collect::<Vec<_>>().join("\n") + "\n";
     fs::write(&records_path, damaged).unwrap();
 
-    let output = run_chidori(
+    let output = run_chidori_with_str_env(
         &["resume", agent.to_str().unwrap(), &run_id, "--trusted"],
         &dir,
+        &http_env,
     );
     stopping.store(true, Ordering::Relaxed);
     server.join().unwrap();
@@ -931,7 +937,12 @@ fn cli_resume_rejects_truncated_final_effect_before_live_reexecution() {
     )
     .unwrap();
 
-    let output = run_chidori(&["run", agent.to_str().unwrap(), "--trusted"], &dir);
+    let http_env = [("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")];
+    let output = run_chidori_with_str_env(
+        &["run", agent.to_str().unwrap(), "--trusted"],
+        &dir,
+        &http_env,
+    );
     assert_success(&output);
     assert_eq!(effects.load(Ordering::SeqCst), 3, "fresh run should perform exactly three live effects");
 
@@ -948,14 +959,15 @@ fn cli_resume_rejects_truncated_final_effect_before_live_reexecution() {
         .map(|row| serde_json::from_slice(row).unwrap())
         .collect();
     assert_eq!(rows.len(), 3, "expected one journal row per HTTP effect");
-    assert_eq!(rows[2]["function"], "fetch", "the final row must represent the third effect");
+    assert_eq!(rows[2]["function"], "http", "the final row must represent the third effect");
     assert!(journal.len() > 28, "final row must be longer than the truncation length");
     journal.truncate(journal.len() - 28);
     fs::write(&records_path, journal).unwrap();
 
-    let output = run_chidori(
+    let output = run_chidori_with_str_env(
         &["resume", agent.to_str().unwrap(), &run_id, "--trusted"],
         &dir,
+        &http_env,
     );
     stopping.store(true, Ordering::Relaxed);
     server.join().unwrap();
@@ -1050,7 +1062,7 @@ fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
     assert_eq!(records.len(), 2, "expected prefix and HTTP journal rows");
     assert_eq!(records[0]["seq"], 1);
     assert_eq!(records[1]["seq"], 2);
-    assert_eq!(records[1]["function"], "fetch");
+    assert_eq!(records[1]["function"], "http");
     let http_record = records[1].clone();
 
     // Persist the exact resolved operation for the lost HTTP row. This uses
@@ -1099,7 +1111,6 @@ fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
     server.join().unwrap();
 
     assert_success(&output);
-    assert_eq!(requests.load(Ordering::SeqCst), 1, "resume must serve the resolved promise without a second HTTP request");
     let recovered: Vec<serde_json::Value> = fs::read_to_string(&records_path)
         .unwrap()
         .lines()
@@ -1107,12 +1118,13 @@ fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
         .collect();
     let recovered_http = recovered
         .iter()
-        .find(|record| record["seq"] == 2 && record["function"] == "fetch")
+        .find(|record| record["seq"] == 2 && record["function"] == "http")
         .expect("resume should restore the missing HTTP journal row");
     assert_eq!(
         recovered_http["result"], retained_resolved_value,
         "restored journal row must contain the retained resolved promise value"
     );
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "resume must serve the resolved promise without a second HTTP request");
     fs::remove_dir_all(dir).ok();
 }
 
