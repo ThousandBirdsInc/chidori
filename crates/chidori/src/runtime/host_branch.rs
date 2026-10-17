@@ -756,7 +756,11 @@ fn load_branch_checkpoint(branch_dir: &Path) -> std::result::Result<Vec<CallReco
         return Ok(Vec::new());
     }
     let bytes = std::fs::read(&path).map_err(|err| format!("reading {}: {err}", path.display()))?;
-    serde_json::from_slice(&bytes).map_err(|err| format!("parsing {}: {err}", path.display()))
+    let records: Vec<CallRecord> = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("parsing {}: {err}", path.display()))?;
+    crate::runtime::store::validate_composed_journal(&records)
+        .map_err(|err| format!("validating {}: {err:#}", path.display()))?;
+    Ok(records)
 }
 
 /// Walk `<run dir>/branches/op-*/branch-*/branch.json`, ordered by op then

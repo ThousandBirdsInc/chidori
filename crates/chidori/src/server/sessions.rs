@@ -28,9 +28,9 @@ use super::engine::build_engine;
 use super::hardening::acquire_run_slot;
 use super::{
     complete_persisted_pending_host_operation, install_warm_run, is_supported_agent_filename,
-    is_supported_agent_path, load_persisted_host_promises, load_persisted_vfs,
-    release_warm_run_if_settled, session_view, snapshot_manifest_for_session, store_or_500,
-    warm_resume_enabled, AppState, HostPromiseCompletion,
+    is_supported_agent_path, load_persisted_host_promises, load_persisted_replay_journal,
+    load_persisted_vfs, release_warm_run_if_settled, session_view, snapshot_manifest_for_session,
+    store_or_500, warm_resume_enabled, AppState, HostPromiseCompletion,
 };
 
 // ---------------------------------------------------------------------------
@@ -475,6 +475,21 @@ pub(super) async fn replay_session(
         }
     };
 
+    let call_log = match load_persisted_replay_journal(
+        &state.run_base,
+        original.run_id.as_deref(),
+        &original.call_log,
+    ) {
+        Ok(call_log) => call_log,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading replay journal: {error:#}")})),
+            )
+                .into_response();
+        }
+    };
+
     // A replay executes the agent end-to-end (replayed calls short-circuit,
     // but the interpreter still runs) — same run slot as any other run.
     let _permit = match acquire_run_slot(&state).await {
@@ -483,7 +498,6 @@ pub(super) async fn replay_session(
     };
 
     let input = original.input.clone();
-    let call_log = original.call_log.clone();
     let host_promises =
         match load_persisted_host_promises(&state.run_base, original.run_id.as_deref()) {
             Ok(host_promises) => host_promises,
@@ -497,7 +511,16 @@ pub(super) async fn replay_session(
         };
     let input_clone = input.clone();
     let approvals = original.approvals.clone();
-    let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
+    let vfs = match load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
+        Ok(vfs) => vfs,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading replay snapshot: {error:#}")})),
+            )
+                .into_response();
+        }
+    };
     let replay_run_id = original.run_id.clone();
     let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
@@ -755,7 +778,7 @@ pub(super) async fn get_holdings(
     let run_base = state.run_base.clone();
     let holdings = tokio::task::spawn_blocking(move || {
         let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
-        let _ = factory.hydrate(&run_id);
+        factory.hydrate(&run_id)?;
         let store = factory.store_for(&run_id);
         let run_dir = run_base.join(&run_id);
         let registry_factory = factory.clone();

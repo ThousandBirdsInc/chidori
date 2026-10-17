@@ -8,6 +8,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use anyhow::Context as _;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Json, Response};
@@ -473,7 +474,7 @@ fn complete_persisted_pending_host_operation(
     // Mutations go through the run's store so a configured durable mirror
     // stays in step with the filesystem layout (`docs/durable-storage.md`).
     let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
-    let _ = factory.hydrate(run_id);
+    factory.hydrate(run_id)?;
     let store = factory.store_for(run_id);
     let Some(pending_bytes) = store.get_blob(PENDING_HOST_OPERATION_FILE)? else {
         return Ok(None);
@@ -581,23 +582,57 @@ fn load_persisted_host_promises(
     // Materialize the run dir from the durable mirror first when this machine
     // has never seen the run (the machine-loss recovery path).
     let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
-    let _ = factory.hydrate(run_id);
+    factory.hydrate(run_id)?;
     // Union of the compacted table and any per-op blobs written since the
     // last compaction (`docs/durable-storage.md`).
     crate::runtime::snapshot::load_host_promise_records(factory.store_for(run_id).as_ref())
 }
 
+/// Load and validate the shared replay journal before a session replay starts.
+/// Session records retain a fallback copy for old sessions and synthetic pause
+/// answers; stored rows win for duplicate seqs, while fallback-only rows are
+/// preserved for compatibility.
+pub(super) fn load_persisted_replay_journal(
+    run_base: &FsPath,
+    run_id: Option<&str>,
+    fallback: &[crate::runtime::call_log::CallRecord],
+) -> anyhow::Result<Vec<crate::runtime::call_log::CallRecord>> {
+    let fallback = crate::runtime::store::deduplicate_journal_tail(fallback.to_vec());
+    crate::runtime::store::validate_composed_journal(&fallback)
+        .context("validating session replay journal copy")?;
+    let Some(run_id) = run_id else {
+        return Ok(fallback);
+    };
+    let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
+    factory.hydrate(run_id)?;
+    let Some(mut records) = factory.store_for(run_id).load_call_log()? else {
+        return Ok(fallback);
+    };
+    let known: std::collections::HashSet<u64> = records.iter().map(|record| record.seq).collect();
+    for record in fallback {
+        if !known.contains(&record.seq) {
+            records.push(record);
+        }
+    }
+    records.sort_by_key(|record| record.seq);
+    crate::runtime::store::validate_composed_journal(&records)?;
+    Ok(records)
+}
+
 /// Load the virtual filesystem captured in a run's snapshot manifest so a
 /// resumed run sees the file state it had at suspend. Returns an empty VFS if
 /// the run has no persisted manifest yet (e.g. it never reached a safepoint).
-fn load_persisted_vfs(run_base: &FsPath, run_id: Option<&str>) -> crate::runtime::vfs::Vfs {
+fn load_persisted_vfs(
+    run_base: &FsPath,
+    run_id: Option<&str>,
+) -> anyhow::Result<crate::runtime::vfs::Vfs> {
     let Some(run_id) = run_id else {
-        return crate::runtime::vfs::Vfs::new();
+        return Ok(crate::runtime::vfs::Vfs::new());
     };
-    let _ = crate::runtime::store::RunStoreFactory::shared(run_base).hydrate(run_id);
+    crate::runtime::store::RunStoreFactory::shared(run_base).hydrate(run_id)?;
     match crate::runtime::snapshot::SnapshotStore::new(run_base.join(run_id)).load_manifest() {
-        Ok(manifest) => manifest.vfs,
-        Err(_) => crate::runtime::vfs::Vfs::new(),
+        Ok(manifest) => Ok(manifest.vfs),
+        Err(_) => Ok(crate::runtime::vfs::Vfs::new()),
     }
 }
 
@@ -633,7 +668,7 @@ fn enqueue_signal_to_inbox(
     let lock = state.signal_inbox_lock(run_id);
     let _guard = lock.lock().unwrap();
     let factory = crate::runtime::store::RunStoreFactory::shared(&state.run_base);
-    let _ = factory.hydrate(run_id);
+    factory.hydrate(run_id)?;
     let store = factory.store_for(run_id);
     let mut inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE)? {
         Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),

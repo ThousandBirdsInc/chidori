@@ -494,7 +494,7 @@ impl NativeAgentRunner {
                     prompt: prompt.clone(),
                     details: None,
                 };
-                ctx.begin_host_operation_with_function(
+                ctx.begin_or_resume_host_operation_with_function(
                     seq,
                     PendingHostOperationKind::Input,
                     Some("input".to_string()),
@@ -504,7 +504,7 @@ impl NativeAgentRunner {
                         "name": call.name.clone(),
                         "input": call.input.clone(),
                     }),
-                );
+                )?;
                 return Ok(BatchOutcome::Paused {
                     paused_approval: None,
                     paused_input: Some(NativePendingInput {
@@ -538,7 +538,7 @@ impl NativeAgentRunner {
                             args: call.input.clone(),
                             reason,
                         };
-                        ctx.begin_host_operation_with_function(
+                        ctx.begin_or_resume_host_operation_with_function(
                             seq,
                             PendingHostOperationKind::PolicyApproval,
                             Some("approval".to_string()),
@@ -550,7 +550,7 @@ impl NativeAgentRunner {
                                 "name": call.name.clone(),
                                 "input": call.input.clone(),
                             }),
-                        );
+                        )?;
                         return Ok(BatchOutcome::Paused {
                             paused_approval: Some(NativePendingApproval {
                                 seq,

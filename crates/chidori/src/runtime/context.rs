@@ -1871,6 +1871,21 @@ impl RuntimeContext {
         id
     }
 
+    pub(crate) fn begin_or_resume_host_operation_with_function(
+        &self,
+        seq: u64,
+        kind: PendingHostOperationKind,
+        function: Option<String>,
+        args: serde_json::Value,
+    ) -> anyhow::Result<HostOperationId> {
+        let mut inner = self.inner.lock().unwrap();
+        let id = inner
+            .host_promises
+            .begin_or_resume_pending(seq, kind, function, args)?;
+        persist_host_promise_change(&mut inner, id);
+        Ok(id)
+    }
+
     pub fn run_host_operation_safepoint(&self, id: HostOperationId) -> anyhow::Result<()> {
         let (safepoint, operation) = {
             let inner = self.inner.lock().unwrap();
@@ -2200,9 +2215,10 @@ mod tests {
         let ctx = RuntimeContext::new();
         let run_dir = ctx.enable_persistence(base.clone());
 
-        let id = ctx.begin_host_operation(
+        let id = ctx.begin_host_operation_with_function(
             1,
             PendingHostOperationKind::Prompt,
+            Some("prompt".to_string()),
             serde_json::json!({ "text": "hello" }),
         );
 

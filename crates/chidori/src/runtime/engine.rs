@@ -641,6 +641,11 @@ impl Engine {
     /// Resume under the original run id with durable async host-promise state.
     /// A completed promise can cover the crash window after its result was
     /// persisted but before the corresponding journal append landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the persisted promise records conflict with the
+    /// replay journal or if the resumed agent fails.
     pub fn resume_run_with_host_promises(
         &self,
         path: &Path,
@@ -649,6 +654,10 @@ impl Engine {
         host_promises: Vec<HostPromiseRecord>,
         run_id: &str,
     ) -> Result<RunResult> {
+        crate::runtime::snapshot::validate_host_promise_journal_relationships(
+            &host_promises,
+            &replay_log,
+        )?;
         let ctx = RuntimeContext::with_replay_host_promises_and_vfs(
             replay_log,
             host_promises,
@@ -757,6 +766,11 @@ impl Engine {
     }
 
     /// Streaming twin of [`Engine::resume_run_with_host_promises`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the persisted promise records conflict with the
+    /// replay journal or if the resumed agent fails.
     pub fn resume_run_streaming_with_host_promises(
         &self,
         path: &Path,
@@ -766,6 +780,10 @@ impl Engine {
         run_id: &str,
         sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<RunResult> {
+        crate::runtime::snapshot::validate_host_promise_journal_relationships(
+            &host_promises,
+            &replay_log,
+        )?;
         let ctx = RuntimeContext::with_replay_host_promises_and_vfs(
             replay_log,
             host_promises,
@@ -1630,7 +1648,8 @@ mod tests {
                 1,
                 crate::runtime::snapshot::PendingHostOperationKind::Tool,
                 args,
-            ),
+            )
+            .with_function("tool"),
             state: crate::runtime::snapshot::HostPromiseState::Resolved {
                 value: serde_json::json!({ "value": 42 }),
                 completed_at: chrono::Utc::now(),
@@ -1688,7 +1707,8 @@ mod tests {
                 1,
                 crate::runtime::snapshot::PendingHostOperationKind::Prompt,
                 args,
-            ),
+            )
+            .with_function("prompt"),
             state: crate::runtime::snapshot::HostPromiseState::Resolved {
                 value: serde_json::json!("cached prompt"),
                 completed_at: chrono::Utc::now(),
@@ -1752,7 +1772,8 @@ mod tests {
                 1,
                 crate::runtime::snapshot::PendingHostOperationKind::CallAgent,
                 args,
-            ),
+            )
+            .with_function("call_agent"),
             state: crate::runtime::snapshot::HostPromiseState::Resolved {
                 value: serde_json::json!({ "value": 42 }),
                 completed_at: chrono::Utc::now(),
@@ -2523,7 +2544,8 @@ def agent(value):
                 pending.seq,
                 crate::runtime::snapshot::PendingHostOperationKind::Signal,
                 serde_json::json!({ "name": "review" }),
-            ),
+            )
+            .with_function("signal"),
             state: crate::runtime::snapshot::HostPromiseState::Resolved {
                 value: delivered.clone(),
                 completed_at: chrono::Utc::now(),

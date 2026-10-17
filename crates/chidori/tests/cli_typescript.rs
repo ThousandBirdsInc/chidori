@@ -1842,6 +1842,52 @@ fn cli_resume_rejects_malformed_http_promise_blob_before_live_contact() {
 }
 
 #[test]
+fn cli_resume_rejects_resolved_http_promise_missing_value_before_live_contact() {
+    let server = LocalHttpServer::start();
+    let fixture = create_http_replay_fixture(&server);
+    let mut promise = persist_resolved_http_operation(&fixture);
+    promise["state"]["resolved"]
+        .as_object_mut()
+        .unwrap()
+        .remove("value");
+    store_host_promise_blob(&fixture, 2, &promise);
+    remove_http_journal_row(&fixture);
+
+    let output = resume_http_fixture(&fixture, &[("CHIDORI_REPLAY_LAX", "1")]);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "malformed resolved value must fail before another HTTP contact"
+    );
+    assert_failure(&output);
+    assert_diagnostic_contains(&output, "host_promises/2.json");
+    fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
+fn cli_resume_rejects_resolved_http_promise_missing_function_before_live_contact() {
+    let server = LocalHttpServer::start();
+    let fixture = create_http_replay_fixture(&server);
+    let mut promise = persist_resolved_http_operation(&fixture);
+    promise["operation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("function");
+    store_host_promise_blob(&fixture, 2, &promise);
+    remove_http_journal_row(&fixture);
+
+    let output = resume_http_fixture(&fixture, &[("CHIDORI_REPLAY_LAX", "1")]);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "completed promise without function identity must fail before another HTTP contact"
+    );
+    assert_failure(&output);
+    assert_diagnostic_contains(&output, "no function identity");
+    fs::remove_dir_all(&fixture.dir).ok();
+}
+
+#[test]
 fn cli_resume_does_not_treat_pending_http_operation_as_cached_success() {
     let server = LocalHttpServer::start();
     let fixture = create_http_replay_fixture(&server);

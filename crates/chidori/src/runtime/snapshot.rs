@@ -381,6 +381,50 @@ impl HostPromiseTable {
         id
     }
 
+    pub fn begin_or_resume_pending(
+        &mut self,
+        seq: u64,
+        kind: PendingHostOperationKind,
+        function: Option<String>,
+        args: Value,
+    ) -> Result<HostOperationId> {
+        let at_seq: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| record.operation.seq == seq)
+            .collect();
+        anyhow::ensure!(
+            at_seq.len() <= 1,
+            "corrupt host-promise table: multiple operations are recorded at seq {seq}"
+        );
+        if let Some(record) = at_seq.first() {
+            anyhow::ensure!(
+                matches!(record.state, HostPromiseState::Pending),
+                "completed host operation at seq {seq} was not consumed by replay"
+            );
+            anyhow::ensure!(
+                record.operation.kind == kind,
+                "Replay divergence at seq {seq}: pending host operation kind {:?} does not match {:?}",
+                record.operation.kind,
+                kind
+            );
+            if let (Some(recorded), Some(current)) =
+                (record.operation.function.as_deref(), function.as_deref())
+            {
+                anyhow::ensure!(
+                    recorded == current,
+                    "Replay divergence at seq {seq}: pending host operation function `{recorded}` does not match `{current}`"
+                );
+            }
+            anyhow::ensure!(
+                completed_args_match(&record.operation.args, &args),
+                "Replay divergence at seq {seq}: pending host operation arguments do not match"
+            );
+            return Ok(record.operation.id);
+        }
+        Ok(self.create_with_function(seq, kind, function, args))
+    }
+
     pub fn pending_operation(&self, id: HostOperationId) -> Option<&PendingHostOperation> {
         self.records
             .get(&id.0)
@@ -506,6 +550,7 @@ pub fn load_host_promise_records(
         Some(bytes) => serde_json::from_slice(&bytes).context("parsing host promise table")?,
         None => Vec::new(),
     };
+    validate_host_promise_ids(&records, "host promise table")?;
     let mut tail: Vec<HostPromiseRecord> = Vec::new();
     for key in store.list_blobs()? {
         if !key.starts_with(HOST_PROMISE_EVENTS_PREFIX) {
@@ -514,11 +559,24 @@ pub fn load_host_promise_records(
         let Some(bytes) = store.get_blob(&key)? else {
             continue;
         };
-        tail.push(
-            serde_json::from_slice::<HostPromiseRecord>(&bytes)
-                .with_context(|| format!("parsing durable host-promise record {key}"))?,
+        let record: HostPromiseRecord = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing durable host-promise record {key}"))?;
+        let filename_id = key
+            .strip_prefix(HOST_PROMISE_EVENTS_PREFIX)
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|id| id.parse::<u64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("invalid durable host-promise record key {key}"))?;
+        anyhow::ensure!(
+            record.operation.id.0 == filename_id,
+            "durable host-promise record {key} contains operation id {}",
+            record.operation.id.0
         );
+        tail.push(record);
     }
+    // Multiple event keys that decode to the same operation id have no
+    // unambiguous last-write order, even though ordinary table/blob overlap
+    // is resolved by the documented per-id precedence below.
+    validate_host_promise_ids(&tail, "host promise event blobs")?;
     tail.sort_by_key(|record| record.operation.id.0);
     for record in tail {
         match records
@@ -529,22 +587,23 @@ pub fn load_host_promise_records(
             None => records.push(record),
         }
     }
-    // Rehydrate journal-referenced values (see
-    // [`HostPromiseState::ResolvedInJournal`]): the compaction stored only a
-    // reference for a value byte-identical to the journal record's result, so
-    // consumers — none of which know the dehydrated form — get the full
-    // `Resolved` state back. The journal is loaded once, and only when a
-    // reference is actually present. A dangling reference is a corrupted or
-    // hand-assembled run dir: fail loudly rather than re-executing a side
-    // effect whose recorded value existed.
+    validate_host_promise_records(&records, "composed host promise records")?;
+    // Validate all same-seq relationships against the journal before a
+    // consumer can start replay. A journal-referenced value is rehydrated from
+    // that same loaded log, while an inline per-operation result remains usable
+    // when its append never landed.
+    let journal = if records.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .load_call_log()
+            .context("loading the journal to validate host-promise records")?
+            .unwrap_or_default()
+    };
     if records
         .iter()
         .any(|record| matches!(record.state, HostPromiseState::ResolvedInJournal { .. }))
     {
-        let journal = store
-            .load_call_log()
-            .context("loading the journal to rehydrate host-promise values")?
-            .unwrap_or_default();
         let result_at_seq: std::collections::HashMap<u64, &Value> = journal
             .iter()
             .filter(|record| record.error.is_none())
@@ -569,7 +628,172 @@ pub fn load_host_promise_records(
             }
         }
     }
+    validate_host_promise_journal_relationships(&records, &journal)?;
     Ok(records)
+}
+
+fn validate_host_promise_records(records: &[HostPromiseRecord], source: &str) -> Result<()> {
+    validate_host_promise_ids(records, source)?;
+    let mut seqs = std::collections::HashSet::with_capacity(records.len());
+    for record in records {
+        anyhow::ensure!(
+            record.operation.seq > 0,
+            "{source} contains invalid host operation sequence 0"
+        );
+        anyhow::ensure!(
+            seqs.insert(record.operation.seq),
+            "{source} contains multiple operations at seq {}",
+            record.operation.seq
+        );
+        if let Some(function) = record.operation.function.as_deref() {
+            anyhow::ensure!(
+                !function.trim().is_empty(),
+                "{source} operation {} at seq {} has an empty function name",
+                record.operation.id.0,
+                record.operation.seq
+            );
+            if let Some(expected_kind) = host_promise_kind_for_function(function) {
+                anyhow::ensure!(
+                    record.operation.kind == expected_kind,
+                    "{source} operation {} at seq {} has kind {:?}, inconsistent with function `{function}`",
+                    record.operation.id.0,
+                    record.operation.seq,
+                    record.operation.kind
+                );
+            }
+        }
+        if let HostPromiseState::Rejected { error, .. } = &record.state {
+            anyhow::ensure!(
+                !error.trim().is_empty(),
+                "{source} operation {} at seq {} has an empty rejection error",
+                record.operation.id.0,
+                record.operation.seq
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_host_promise_ids(records: &[HostPromiseRecord], source: &str) -> Result<()> {
+    let mut ids = std::collections::HashSet::with_capacity(records.len());
+    for record in records {
+        anyhow::ensure!(
+            record.operation.id.0 > 0,
+            "{source} contains invalid host operation id 0"
+        );
+        anyhow::ensure!(
+            ids.insert(record.operation.id.0),
+            "{source} contains duplicate host operation id {}",
+            record.operation.id.0
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_host_promise_journal_relationships(
+    records: &[HostPromiseRecord],
+    journal: &[CallRecord],
+) -> Result<()> {
+    validate_host_promise_records(records, "host promise records")?;
+    let calls_by_seq: std::collections::HashMap<_, _> =
+        journal.iter().map(|record| (record.seq, record)).collect();
+    for promise in records {
+        let Some(call) = calls_by_seq.get(&promise.operation.seq) else {
+            anyhow::ensure!(
+                !matches!(promise.state, HostPromiseState::ResolvedInJournal { .. }),
+                "host promise {} at seq {} has a dangling journal value reference",
+                promise.operation.id.0,
+                promise.operation.seq
+            );
+            if !matches!(promise.state, HostPromiseState::Pending) {
+                anyhow::ensure!(
+                    promise.operation.function.is_some(),
+                    "completed host promise {} at seq {} has no function identity for journal-miss recovery",
+                    promise.operation.id.0,
+                    promise.operation.seq
+                );
+            }
+            continue;
+        };
+        let journal_kind = host_promise_kind_for_function(&call.function).ok_or_else(|| {
+            anyhow::anyhow!(
+                "host promise {} at seq {} points to non-host journal function `{}`",
+                promise.operation.id.0,
+                promise.operation.seq,
+                call.function
+            )
+        })?;
+        anyhow::ensure!(
+            promise.operation.kind == journal_kind,
+            "host promise {} at seq {} has kind {:?}, but journal function `{}` has kind {:?}",
+            promise.operation.id.0,
+            promise.operation.seq,
+            promise.operation.kind,
+            call.function,
+            journal_kind
+        );
+        if let Some(function) = promise.operation.function.as_deref() {
+            anyhow::ensure!(
+                function == call.function,
+                "host promise {} at seq {} names function `{function}`, but the journal names `{}`",
+                promise.operation.id.0,
+                promise.operation.seq,
+                call.function
+            );
+        }
+        anyhow::ensure!(
+            completed_args_match(&promise.operation.args, &call.args),
+            "host promise {} at seq {} has arguments that disagree with its journal record",
+            promise.operation.id.0,
+            promise.operation.seq
+        );
+        match &promise.state {
+            HostPromiseState::Pending => anyhow::bail!(
+                "pending host promise {} at seq {} already has a journal record",
+                promise.operation.id.0,
+                promise.operation.seq
+            ),
+            // An intact journal is authoritative during replay. The promise
+            // result is a fallback only when its corresponding journal row is
+            // absent; a stale or conflicting inline value must not shadow the
+            // journal result.
+            HostPromiseState::Resolved { .. } => anyhow::ensure!(
+                call.error.is_none(),
+                "resolved host promise {} at seq {} has a journal error",
+                promise.operation.id.0,
+                promise.operation.seq
+            ),
+            HostPromiseState::ResolvedInJournal { .. } => anyhow::bail!(
+                "host promise {} at seq {} was not rehydrated from its journal result",
+                promise.operation.id.0,
+                promise.operation.seq
+            ),
+            HostPromiseState::Rejected { error, .. } => anyhow::ensure!(
+                call.error.as_deref() == Some(error.as_str()) && call.result.is_null(),
+                "rejected host promise {} at seq {} disagrees with its journal error",
+                promise.operation.id.0,
+                promise.operation.seq
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn host_promise_kind_for_function(function: &str) -> Option<PendingHostOperationKind> {
+    use PendingHostOperationKind as Kind;
+    match function {
+        "prompt" => Some(Kind::Prompt),
+        "input" => Some(Kind::Input),
+        "tool" => Some(Kind::Tool),
+        "call_agent" => Some(Kind::CallAgent),
+        "http" => Some(Kind::Http),
+        "template" => Some(Kind::Template),
+        "memory" => Some(Kind::Memory),
+        "mark" => Some(Kind::Checkpoint),
+        "log" => Some(Kind::Log),
+        "signal" | "poll_signal" | "signal_any" => Some(Kind::Signal),
+        _ => None,
+    }
 }
 
 /// Args comparison for completed-operation replay, ignoring derived request
@@ -1966,9 +2190,40 @@ mod host_promise_union_tests {
                 id,
                 PendingHostOperationKind::Prompt,
                 serde_json::json!({ "n": id }),
-            ),
+            )
+            .with_function("prompt"),
             state,
         }
+    }
+
+    #[test]
+    fn malformed_per_operation_promise_json_fails_with_key_context() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-host-promise-malformed-event-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = FsRunStore::new(&dir);
+        let key = host_promise_blob_key(HostOperationId(2));
+        store.put_blob(&key, b"{not-json").unwrap();
+
+        let error = load_host_promise_records(&store).expect_err("malformed event was skipped");
+        let message = format!("{error:#}");
+        assert!(message.contains(&key), "missing per-op blob key: {message}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn host_promise_records_reject_duplicate_operation_sequences() {
+        let mut second = record(2, HostPromiseState::Pending);
+        second.operation.seq = 1;
+        let error = validate_host_promise_records(
+            &[record(1, HostPromiseState::Pending), second],
+            "test host promise records",
+        )
+        .expect_err("duplicate operation seq accepted");
+        assert!(format!("{error:#}").contains("multiple operations at seq 1"));
     }
 
     /// Pins the per-op blob ∪ compacted table protocol: a per-op blob wins

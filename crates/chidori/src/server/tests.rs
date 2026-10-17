@@ -403,7 +403,8 @@ async fn replay_session_uses_completed_prompt_host_promise_without_provider() {
                     "model": "claude-sonnet-4-6",
                     "type": "progress",
                 }),
-            ),
+            )
+            .with_function("prompt"),
             state: HostPromiseState::Resolved {
                 value: json!("cached prompt"),
                 completed_at: chrono::Utc::now(),
@@ -473,7 +474,8 @@ async fn replay_session_uses_completed_tool_host_promise_without_tool_registry()
                     "name": "missing",
                     "kwargs": { "value": 41 },
                 }),
-            ),
+            )
+            .with_function("tool"),
             state: HostPromiseState::Resolved {
                 value: json!({ "value": 42 }),
                 completed_at: chrono::Utc::now(),
@@ -547,7 +549,8 @@ async fn replay_session_uses_completed_call_agent_host_promise_without_child_fil
                     "path": child_path_string,
                     "input": { "value": 41 },
                 }),
-            ),
+            )
+            .with_function("call_agent"),
             state: HostPromiseState::Resolved {
                 value: json!({ "value": 42 }),
                 completed_at: chrono::Utc::now(),
@@ -612,7 +615,8 @@ async fn resume_session_uses_completed_prompt_host_promise_without_provider() {
         2,
         PendingHostOperationKind::Input,
         json!({ "prompt": "continue?" }),
-    );
+    )
+    .with_function("input");
     std::fs::write(
         run_base.join(run_id).join(PENDING_HOST_OPERATION_FILE),
         serde_json::to_vec_pretty(&pending_input).unwrap(),
@@ -632,7 +636,8 @@ async fn resume_session_uses_completed_prompt_host_promise_without_provider() {
                         "model": "claude-sonnet-4-6",
                         "type": "progress",
                     }),
-                ),
+                )
+                .with_function("prompt"),
                 state: HostPromiseState::Resolved {
                     value: json!("cached prompt"),
                     completed_at: chrono::Utc::now(),
@@ -716,7 +721,8 @@ async fn resume_session_uses_completed_tool_host_promise_without_tool_registry()
         2,
         PendingHostOperationKind::Input,
         json!({ "prompt": "continue?" }),
-    );
+    )
+    .with_function("input");
     std::fs::write(
         run_base.join(run_id).join(PENDING_HOST_OPERATION_FILE),
         serde_json::to_vec_pretty(&pending_input).unwrap(),
@@ -735,7 +741,8 @@ async fn resume_session_uses_completed_tool_host_promise_without_tool_registry()
                         "name": "missing",
                         "kwargs": { "value": 41 },
                     }),
-                ),
+                )
+                .with_function("tool"),
                 state: HostPromiseState::Resolved {
                     value: json!({ "value": 42 }),
                     completed_at: chrono::Utc::now(),
@@ -824,7 +831,8 @@ async fn resume_session_uses_completed_call_agent_host_promise_without_child_fil
         2,
         PendingHostOperationKind::Input,
         json!({ "prompt": "continue?" }),
-    );
+    )
+    .with_function("input");
     std::fs::write(
         run_base.join(run_id).join(PENDING_HOST_OPERATION_FILE),
         serde_json::to_vec_pretty(&pending_input).unwrap(),
@@ -843,7 +851,8 @@ async fn resume_session_uses_completed_call_agent_host_promise_without_child_fil
                         "path": child_path_string,
                         "input": { "value": 41 },
                     }),
-                ),
+                )
+                .with_function("call_agent"),
                 state: HostPromiseState::Resolved {
                     value: json!({ "value": 42 }),
                     completed_at: chrono::Utc::now(),
@@ -1042,7 +1051,8 @@ fn resume_resolves_persisted_pending_input_host_operation() {
         3,
         PendingHostOperationKind::Input,
         json!({ "prompt": "Approve?" }),
-    );
+    )
+    .with_function("input");
     let records = vec![HostPromiseRecord {
         operation: pending.clone(),
         state: HostPromiseState::Pending,
@@ -1145,7 +1155,8 @@ fn resume_rejects_already_completed_persisted_pending_host_operation() {
         3,
         PendingHostOperationKind::Input,
         json!({ "prompt": "Approve?" }),
-    );
+    )
+    .with_function("input");
     let records = vec![HostPromiseRecord {
         operation: pending.clone(),
         state: HostPromiseState::Resolved {

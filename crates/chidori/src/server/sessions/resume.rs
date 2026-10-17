@@ -16,9 +16,10 @@ use super::super::engine::build_engine;
 use super::super::hardening::acquire_run_slot;
 use super::super::{
     acquire_run_lease, complete_persisted_pending_host_operation, enqueue_signal_to_inbox,
-    install_warm_run, load_persisted_host_promises, load_persisted_signal_inbox,
-    load_persisted_vfs, release_warm_run_if_settled, session_view, store_or_500,
-    validate_snapshot_manifest_for_resume, warm_resume_enabled, AppState, HostPromiseCompletion,
+    install_warm_run, load_persisted_host_promises, load_persisted_replay_journal,
+    load_persisted_signal_inbox, load_persisted_vfs, release_warm_run_if_settled, session_view,
+    store_or_500, validate_snapshot_manifest_for_resume, warm_resume_enabled, AppState,
+    HostPromiseCompletion,
 };
 use super::{agent_error_string, apply_run_outcome, arm_signal_timeout, pending_listen_names};
 
@@ -87,6 +88,18 @@ pub(super) async fn complete_pending_and_resume(
     original: StoredSession,
     call_log: Vec<CallRecord>,
 ) -> Response {
+    let call_log =
+        match load_persisted_replay_journal(&state.run_base, original.run_id.as_deref(), &call_log)
+        {
+            Ok(call_log) => call_log,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("loading replay journal: {error:#}")})),
+                )
+                    .into_response();
+            }
+        };
     let input = original.input.clone();
     let host_promises =
         match load_persisted_host_promises(&state.run_base, original.run_id.as_deref()) {
@@ -100,7 +113,16 @@ pub(super) async fn complete_pending_and_resume(
             }
         };
     let approvals = original.approvals.clone();
-    let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
+    let vfs = match load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
+        Ok(vfs) => vfs,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading replay snapshot: {error:#}")})),
+            )
+                .into_response();
+        }
+    };
     let signal_inbox = load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref());
     let resume_run_id = original.run_id.clone();
     let policy_profile = original.policy_profile.clone();
@@ -665,6 +687,21 @@ pub(in crate::server) async fn approve_session(
         }
     };
 
+    original.call_log = match load_persisted_replay_journal(
+        &state.run_base,
+        original.run_id.as_deref(),
+        &original.call_log,
+    ) {
+        Ok(call_log) => call_log,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading replay journal: {error:#}")})),
+            )
+                .into_response();
+        }
+    };
+
     let Some(pending) = original.pending_approval.clone() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -751,7 +788,16 @@ pub(in crate::server) async fn approve_session(
     let approvals = original.approvals.clone();
     let call_log = original.call_log.clone();
     let resume_run_id = original.run_id.clone();
-    let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
+    let vfs = match load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
+        Ok(vfs) => vfs,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading replay snapshot: {error:#}")})),
+            )
+                .into_response();
+        }
+    };
     // Thread the signal mailbox so an approved run that reaches a `signal(name)`
     // listen point drains a queued entry instead of pausing (doc §9, §3).
     let signal_inbox = load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref());

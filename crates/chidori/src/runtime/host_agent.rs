@@ -596,7 +596,9 @@ impl DetachedAgentHub {
             match descriptor.status.as_str() {
                 // Died mid-run: resume-by-replay continues at the frontier.
                 "running" => {
-                    let _ = factory.hydrate(&descriptor.run_id);
+                    factory.hydrate(&descriptor.run_id).map_err(|err| {
+                        format!("hydrating detached-agent journal for {name}: {err:#}")
+                    })?;
                     let entry = self.ensure_entry(&parts_for_entries, &name)?;
                     self.start_thread(entry)?;
                     rearmed += 1;
@@ -604,7 +606,9 @@ impl DetachedAgentHub {
                 // Hibernating: entry re-created; sends and (via the timer
                 // thread) alarm deadlines wake it.
                 "hibernating" => {
-                    let _ = factory.hydrate(&descriptor.run_id);
+                    factory.hydrate(&descriptor.run_id).map_err(|err| {
+                        format!("hydrating detached-agent journal for {name}: {err:#}")
+                    })?;
                     self.ensure_entry(&parts_for_entries, &name)?;
                     rearmed += 1;
                 }
