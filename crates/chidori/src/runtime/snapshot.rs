@@ -381,6 +381,16 @@ impl HostPromiseTable {
         id
     }
 
+    /// Reuses the pending operation at `seq` when its persisted identity still
+    /// matches the operation being resumed; otherwise creates a new pending
+    /// record for this sequence. Reusing the record preserves its operation id
+    /// across the crash-before-effect retry boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if multiple records claim `seq`, an existing record is
+    /// already completed, or its kind, jointly present function name, or args
+    /// differ from the operation being resumed.
     pub fn begin_or_resume_pending(
         &mut self,
         seq: u64,
