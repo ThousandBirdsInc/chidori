@@ -1137,11 +1137,8 @@ fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
         "initial run should perform one live effect"
     );
     let run_id = first_run_id(&dir);
-    let records_path = dir
-        .join(".chidori")
-        .join("runs")
-        .join(&run_id)
-        .join("records.jsonl");
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
     let journal = fs::read_to_string(&records_path).unwrap();
     let mut lines = journal.lines();
     let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
@@ -1177,7 +1174,311 @@ fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
         diagnostic.to_lowercase().contains("corrupt"),
         "expected a corruption diagnostic, got:\n{diagnostic}"
     );
+    assert!(
+        diagnostic.contains(&records_path.display().to_string()),
+        "corruption diagnostic must identify the journal path; got:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("line 1"),
+        "corruption diagnostic must identify 1-based line 1; got:\n{diagnostic}"
+    );
     fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_resume_rejects_out_of_order_non_one_history() {
+    let dir = temp_project("resume-legacy-out-of-order");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("first", {});
+                await chidori.log("second", {});
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori(&["run", agent.to_str().unwrap()], &dir);
+    assert_success(&output);
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
+    let rows: Vec<serde_json::Value> = fs::read_to_string(&records_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(rows.len() >= 2, "fixture must contain at least two records");
+    let mut invalid = rows.clone();
+    // Keep seq 1 as the root anchor so this specifically exercises structural
+    // order validation rather than the fresh-root missing-head guard.
+    invalid[0]["seq"] = serde_json::json!(1);
+    invalid[1]["seq"] = serde_json::json!(0);
+    let mut journal = Vec::new();
+    for row in &invalid {
+        journal.extend(serde_json::to_vec(row).unwrap());
+        journal.push(b'\n');
+    }
+    fs::write(&records_path, &journal).unwrap();
+    fs::write(
+        run_dir.join("checkpoint.json"),
+        serde_json::to_vec_pretty(&invalid).unwrap(),
+    )
+    .unwrap();
+
+    let output = run_chidori(&["resume", agent.to_str().unwrap(), &run_id], &dir);
+    assert_failure(&output);
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.to_lowercase().contains("corrupt"),
+        "out-of-order records must be rejected as journal corruption; output:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(&records_path.display().to_string()),
+        "out-of-order corruption must identify the journal path; output:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("line 2"),
+        "out-of-order corruption must identify 1-based line 2; output:\n{diagnostic}"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_branch_resume_imports_legacy_http_prefix_without_repeating_effect() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = temp_project("branch-resume-legacy-archive");
+    let import_dir = temp_project("branch-resume-legacy-import");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let server_requests = Arc::clone(&requests);
+    let server_stopping = Arc::clone(&stopping);
+    let server = thread::spawn(move || {
+        while !server_stopping.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    server_requests.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("local HTTP server failed: {error}"),
+            }
+        }
+    });
+    struct ServerGuard {
+        stopping: Arc<AtomicBool>,
+        server: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.stopping.store(true, Ordering::Relaxed);
+            if let Some(server) = self.server.take() {
+                server.join().unwrap();
+            }
+        }
+    }
+    let server_guard = ServerGuard {
+        stopping: Arc::clone(&stopping),
+        server: Some(server),
+    };
+
+    let branch_sources = dir.join("branches");
+    fs::create_dir_all(&branch_sources).unwrap();
+    fs::write(
+        branch_sources.join("effect_then_input.ts"),
+        format!(
+            r#"
+                export async function agent(input) {{
+                    const response = await fetch("http://{address}/effect");
+                    const result = await response.json();
+                    const answer = await chidori.input("Pick a color", {{ default: "initial" }});
+                    return {{ result, answer }};
+                }}
+            "#
+        ),
+    )
+    .unwrap();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        format!(
+            r#"
+                export async function agent() {{
+                    const outcomes = await chidori.branch([
+                        {{ label: "effect", source: "{}/branches/effect_then_input.ts", input: {{}} }}
+                    ]);
+                    return {{ outcomes }};
+                }}
+            "#,
+            dir.display()
+        ),
+    )
+    .unwrap();
+
+    let env = [
+        ("CHIDORI_DURABILITY", "effect"),
+        ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
+    ];
+    let output =
+        run_chidori_with_str_env(&["run", agent.to_str().unwrap(), "--trusted"], &dir, &env);
+    assert_success(&output);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "initial branch HTTP effect"
+    );
+
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let run_output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let branch_id = run_output["outcomes"][0]["branchId"].as_str().unwrap();
+    assert_eq!(run_output["outcomes"][0]["status"], "completed");
+    let branch_store = fs::read_dir(run_dir.join("branches"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find_map(|op_dir| {
+            let candidate = op_dir.join("branch-000");
+            candidate.join("branch.json").is_file().then_some(candidate)
+        })
+        .expect("real CLI run must persist its branch store");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(branch_store.join("branch.json")).unwrap()).unwrap();
+    assert_eq!(meta["branch_id"], branch_id);
+    let range_start = meta["sequence_range"]["start"].as_u64().unwrap();
+    let range_end = meta["sequence_range"]["end_exclusive"].as_u64().unwrap();
+    let records: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(branch_store.join("checkpoint.json")).unwrap()).unwrap();
+    assert!(
+        records.len() >= 2,
+        "branch journal must include HTTP and input"
+    );
+    let http = &records[0];
+    assert_eq!(http["function"], "http");
+    assert!(http["seq"].as_u64().unwrap() > 1);
+    assert!(records.iter().all(|record| {
+        let seq = record["seq"].as_u64().unwrap();
+        seq >= range_start && seq < range_end
+    }));
+    let input = records
+        .iter()
+        .find(|record| record["function"] == "input")
+        .expect("default input should leave a persisted input row");
+
+    // Recreate the prior paused archive format from the real child branch:
+    // branch identity/range and pending seq come from branch.json, while the
+    // HTTP result remains its sole checkpoint row.
+    meta["status"] = serde_json::json!("paused");
+    meta["pending_prompt"] = serde_json::json!("Pick a color");
+    meta["pending_input"] = serde_json::json!({
+        "seq": input["seq"],
+        "prompt": "Pick a color",
+    });
+    meta["output"] = serde_json::Value::Null;
+    fs::write(
+        branch_store.join("branch.json"),
+        serde_json::to_vec_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        branch_store.join("checkpoint.json"),
+        serde_json::to_vec_pretty(&vec![http.clone()]).unwrap(),
+    )
+    .unwrap();
+
+    let archive = dir.join("legacy-branch.chidori-run.tar.gz");
+    let output = run_chidori(
+        &[
+            "checkpoint",
+            "export",
+            &run_id,
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+        &dir,
+    );
+    assert_success(&output);
+    let output = run_chidori(
+        &[
+            "checkpoint",
+            "import",
+            archive.to_str().unwrap(),
+            "--dir",
+            import_dir.to_str().unwrap(),
+        ],
+        &dir,
+    );
+    assert_success(&output);
+    let imported_branch = import_dir
+        .join(".chidori")
+        .join("runs")
+        .join(&run_id)
+        .join("branches")
+        .join(branch_store.parent().unwrap().file_name().unwrap())
+        .join("branch-000");
+    let imported_meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(imported_branch.join("branch.json")).unwrap()).unwrap();
+    assert_eq!(imported_meta["sequence_range"]["start"], range_start);
+    assert_eq!(imported_meta["sequence_range"]["end_exclusive"], range_end);
+    assert_eq!(imported_meta["status"], "paused");
+    assert_eq!(imported_meta["pending_input"]["seq"], input["seq"]);
+
+    let output = run_chidori_with_str_env(
+        &[
+            "branch-resume",
+            &run_id,
+            branch_id,
+            "--value",
+            "blue",
+            "--dir",
+            import_dir.to_str().unwrap(),
+            "--trusted",
+        ],
+        &import_dir,
+        &env,
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "branch resume must replay the imported HTTP row before checking command status"
+    );
+    assert_success(&output);
+    let resumed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(resumed["status"], "completed");
+    assert_eq!(resumed["output"]["answer"], "blue");
+    let after: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(imported_branch.join("checkpoint.json")).unwrap())
+            .unwrap();
+    assert!(after.iter().all(|record| {
+        let seq = record["seq"].as_u64().unwrap();
+        seq >= range_start && seq < range_end
+    }));
+    drop(server_guard);
+    fs::remove_dir_all(dir).ok();
+    fs::remove_dir_all(import_dir).ok();
 }
 
 #[test]
