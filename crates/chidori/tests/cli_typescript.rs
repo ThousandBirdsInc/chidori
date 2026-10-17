@@ -859,6 +859,11 @@ fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
     stopping.store(true, Ordering::Relaxed);
     server.join().unwrap();
 
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        1,
+        "corruption must be rejected before replay can execute the deleted live effect"
+    );
     assert_failure(&output);
     let diagnostic = format!(
         "{}{}",
@@ -868,11 +873,6 @@ fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
     assert!(
         diagnostic.to_lowercase().contains("corrupt"),
         "expected a corruption diagnostic, got:\n{diagnostic}"
-    );
-    assert_eq!(
-        effects.load(Ordering::SeqCst),
-        1,
-        "corruption must be rejected before replay can execute the deleted live effect"
     );
     fs::remove_dir_all(dir).ok();
 }
@@ -960,6 +960,11 @@ fn cli_resume_rejects_truncated_final_effect_before_live_reexecution() {
     stopping.store(true, Ordering::Relaxed);
     server.join().unwrap();
 
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        3,
+        "resume must reject the damaged final row before executing the third live effect again"
+    );
     assert_failure(&output);
     let diagnostic = format!(
         "{}{}",
@@ -967,11 +972,6 @@ fn cli_resume_rejects_truncated_final_effect_before_live_reexecution() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(diagnostic.to_lowercase().contains("corrupt"), "expected a corruption diagnostic, got:\n{diagnostic}");
-    assert_eq!(
-        effects.load(Ordering::SeqCst),
-        3,
-        "resume must reject the damaged final row before executing the third live effect again"
-    );
     fs::remove_dir_all(dir).ok();
 }
 
@@ -1083,6 +1083,7 @@ fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
     assert_eq!(persisted_promise["operation"]["kind"], "http");
     assert_eq!(persisted_promise["operation"]["args"], http_record["args"]);
     assert_eq!(persisted_promise["state"]["resolved"]["value"], http_record["result"]);
+    let retained_resolved_value = persisted_promise["state"]["resolved"]["value"].clone();
 
     // Simulate the completion crash window: the resolved promise is durable,
     // but its corresponding call-log row has not yet landed.
@@ -1104,9 +1105,13 @@ fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert!(
-        recovered.iter().any(|record| record["seq"] == 2 && record["function"] == "fetch"),
-        "resume should restore the missing HTTP journal row: {recovered:?}"
+    let recovered_http = recovered
+        .iter()
+        .find(|record| record["seq"] == 2 && record["function"] == "fetch")
+        .expect("resume should restore the missing HTTP journal row");
+    assert_eq!(
+        recovered_http["result"], retained_resolved_value,
+        "restored journal row must contain the retained resolved promise value"
     );
     fs::remove_dir_all(dir).ok();
 }
