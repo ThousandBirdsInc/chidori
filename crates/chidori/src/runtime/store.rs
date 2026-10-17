@@ -2338,7 +2338,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_run_store_ignores_only_an_unterminated_partial_final_append() {
+    fn fs_run_store_rejects_unterminated_partial_final_record() {
         let dir =
             std::env::temp_dir().join(format!("chidori-store-torn-final-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2346,10 +2346,11 @@ mod tests {
         bytes.extend_from_slice(b"\n{\"seq\":");
         std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
 
-        let loaded = FsRunStore::new(&dir).load_call_log().unwrap().unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].seq, 1);
-        assert_eq!(loaded[0].function, "prompt");
+        let result = FsRunStore::new(&dir).load_call_log();
+        assert!(
+            result.is_err(),
+            "unterminated final record was discarded and prior records accepted"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
