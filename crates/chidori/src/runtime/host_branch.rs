@@ -1211,6 +1211,21 @@ mod tests {
         let pending = meta.pending_input.as_ref().unwrap();
         assert_eq!(pending.prompt, "Pick a color");
 
+        // This is a real child context, not a synthetic top-level run. Its
+        // first persisted record belongs to the reserved branch range and is
+        // therefore intentionally nonzero; replay must not apply the fresh
+        // root's seq=1 anchor to this journal.
+        let records = super::load_branch_checkpoint(&branch_dir).unwrap();
+        let first = records
+            .first()
+            .expect("paused branch should have journal records");
+        assert!(
+            first.seq > 1,
+            "branch first seq must be nonzero, got {}",
+            first.seq
+        );
+        assert!(meta.sequence_range.contains(first.seq));
+
         // Resume with a fresh backend (the parent context is history).
         let resume_backend = test_backend(RuntimeContext::new(), Arc::new(ToolRegistry::new()));
         let resumed = super::resume_branch(&resume_backend, &run_dir, &branch_id, "blue").unwrap();

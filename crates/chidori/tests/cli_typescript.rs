@@ -775,6 +775,108 @@ fn cli_resume_refuses_changed_agent_source() {
     fs::remove_dir_all(dir).ok();
 }
 
+#[test]
+fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = temp_project("resume-missing-root-head");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let server_effects = Arc::clone(&effects);
+    let server_stopping = Arc::clone(&stopping);
+    let server = thread::spawn(move || {
+        while !server_stopping.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    server_effects.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("local effect server failed: {error}"),
+            }
+        }
+    });
+
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        format!(
+            r#"
+                export async function agent(input, chidori) {{
+                    await fetch("http://{address}/effect", {{ method: "POST" }});
+                    await chidori.log("after_effect", {{}});
+                    return {{ ok: true }};
+                }}
+            "#
+        ),
+    )
+    .unwrap();
+
+    let output = run_chidori(&["run", agent.to_str().unwrap(), "--trusted"], &dir);
+    assert_success(&output);
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        1,
+        "initial run should perform one live effect"
+    );
+    let run_id = first_run_id(&dir);
+    let records_path = dir
+        .join(".chidori")
+        .join("runs")
+        .join(&run_id)
+        .join("records.jsonl");
+    let journal = fs::read_to_string(&records_path).unwrap();
+    let mut lines = journal.lines();
+    let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(
+        first["seq"], 1,
+        "the fresh top-level run must establish the seq=1 anchor from its persisted journal"
+    );
+    assert_eq!(first["function"], "fetch");
+    let damaged = lines.collect::<Vec<_>>().join("\n") + "\n";
+    fs::write(&records_path, damaged).unwrap();
+
+    let output = run_chidori(
+        &["resume", agent.to_str().unwrap(), &run_id, "--trusted"],
+        &dir,
+    );
+    stopping.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+
+    assert_failure(&output);
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.to_lowercase().contains("corrupt"),
+        "expected a corruption diagnostic, got:\n{diagnostic}"
+    );
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        1,
+        "corruption must be rejected before replay can execute the deleted live effect"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
 fn run_chidori_with_stdin(
     args: &[&str],
     cwd: &Path,
