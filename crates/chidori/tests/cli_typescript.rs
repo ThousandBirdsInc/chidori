@@ -775,6 +775,359 @@ fn cli_resume_refuses_changed_agent_source() {
     fs::remove_dir_all(dir).ok();
 }
 
+#[test]
+fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = temp_project("resume-missing-root-head");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let server_effects = Arc::clone(&effects);
+    let server_stopping = Arc::clone(&stopping);
+    let server = thread::spawn(move || {
+        while !server_stopping.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    server_effects.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("local effect server failed: {error}"),
+            }
+        }
+    });
+
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        format!(
+            r#"
+                export async function agent(input, chidori) {{
+                    await fetch("http://{address}/effect", {{ method: "POST" }});
+                    await chidori.log("after_effect", {{}});
+                    return {{ ok: true }};
+                }}
+            "#
+        ),
+    )
+    .unwrap();
+
+    let http_env = [("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")];
+    let output = run_chidori_with_str_env(
+        &["run", agent.to_str().unwrap(), "--trusted"],
+        &dir,
+        &http_env,
+    );
+    assert_success(&output);
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        1,
+        "initial run should perform one live effect"
+    );
+    let run_id = first_run_id(&dir);
+    let records_path = dir
+        .join(".chidori")
+        .join("runs")
+        .join(&run_id)
+        .join("records.jsonl");
+    let journal = fs::read_to_string(&records_path).unwrap();
+    let mut lines = journal.lines();
+    let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(
+        first["seq"], 1,
+        "the fresh top-level run must establish the seq=1 anchor from its persisted journal"
+    );
+    assert_eq!(first["function"], "http");
+    let damaged = lines.collect::<Vec<_>>().join("\n") + "\n";
+    fs::write(&records_path, damaged).unwrap();
+
+    let output = run_chidori_with_str_env(
+        &["resume", agent.to_str().unwrap(), &run_id, "--trusted"],
+        &dir,
+        &http_env,
+    );
+    stopping.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        1,
+        "corruption must be rejected before replay can execute the deleted live effect"
+    );
+    assert_failure(&output);
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.to_lowercase().contains("corrupt"),
+        "expected a corruption diagnostic, got:\n{diagnostic}"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_resume_rejects_truncated_final_effect_before_live_reexecution() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = temp_project("resume-truncated-final-effect");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let server_effects = Arc::clone(&effects);
+    let server_stopping = Arc::clone(&stopping);
+    let server = thread::spawn(move || {
+        while !server_stopping.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    server_effects.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("local effect server failed: {error}"),
+            }
+        }
+    });
+
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        format!(
+            r#"
+                export async function agent() {{
+                    await fetch("http://{address}/effect/1", {{ method: "POST" }});
+                    await fetch("http://{address}/effect/2", {{ method: "POST" }});
+                    await fetch("http://{address}/effect/3", {{ method: "POST" }});
+                    return {{ completed: true }};
+                }}
+            "#
+        ),
+    )
+    .unwrap();
+
+    let http_env = [("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")];
+    let output = run_chidori_with_str_env(
+        &["run", agent.to_str().unwrap(), "--trusted"],
+        &dir,
+        &http_env,
+    );
+    assert_success(&output);
+    assert_eq!(effects.load(Ordering::SeqCst), 3, "fresh run should perform exactly three live effects");
+
+    let run_id = first_run_id(&dir);
+    let records_path = dir
+        .join(".chidori")
+        .join("runs")
+        .join(&run_id)
+        .join("records.jsonl");
+    let mut journal = fs::read(&records_path).unwrap();
+    let rows: Vec<serde_json::Value> = journal
+        .split(|byte| *byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .map(|row| serde_json::from_slice(row).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 3, "expected one journal row per HTTP effect");
+    assert_eq!(rows[2]["function"], "http", "the final row must represent the third effect");
+    assert!(journal.len() > 28, "final row must be longer than the truncation length");
+    journal.truncate(journal.len() - 28);
+    fs::write(&records_path, journal).unwrap();
+
+    let output = run_chidori_with_str_env(
+        &["resume", agent.to_str().unwrap(), &run_id, "--trusted"],
+        &dir,
+        &http_env,
+    );
+    stopping.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        3,
+        "resume must reject the damaged final row before executing the third live effect again"
+    );
+    assert_failure(&output);
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostic.to_lowercase().contains("corrupt"), "expected a corruption diagnostic, got:\n{diagnostic}");
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = temp_project("resume-resolved-http-promise");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let server_requests = Arc::clone(&requests);
+    let server_stopping = Arc::clone(&stopping);
+    let server = thread::spawn(move || {
+        while !server_stopping.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    server_requests.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("local HTTP server failed: {error}"),
+            }
+        }
+    });
+
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        format!(
+            r#"
+                export async function agent() {{
+                    await chidori.log("prefix", {{}});
+                    const response = await fetch("http://{address}/effect");
+                    return await response.json();
+                }}
+            "#
+        ),
+    )
+    .unwrap();
+    let durability_env = [
+        ("CHIDORI_DURABILITY", "effect"),
+        ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
+    ];
+    let output = run_chidori_with_str_env(
+        &["run", agent.to_str().unwrap(), "--trusted"],
+        &dir,
+        &durability_env,
+    );
+    assert_success(&output);
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "initial run should make one HTTP request");
+
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
+    let journal = fs::read_to_string(&records_path).unwrap();
+    let mut records: Vec<serde_json::Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2, "expected prefix and HTTP journal rows");
+    assert_eq!(records[0]["seq"], 1);
+    assert_eq!(records[1]["seq"], 2);
+    assert_eq!(records[1]["function"], "http");
+    let http_record = records[1].clone();
+
+    // Persist the exact resolved operation for the lost HTTP row. This uses
+    // the documented per-operation blob schema: operation identity, kind,
+    // function and args match the journal row; the inline resolved value is
+    // copied from that row's result.
+    let promise_dir = run_dir.join("host_promises");
+    fs::create_dir_all(&promise_dir).unwrap();
+    let promise_blob = serde_json::json!({
+        "operation": {
+            "id": 2,
+            "seq": http_record["seq"],
+            "kind": "http",
+            "function": http_record["function"],
+            "args": http_record["args"],
+            "created_at": http_record["timestamp"],
+        },
+        "state": {
+            "resolved": {
+                "value": http_record["result"],
+                "completed_at": http_record["timestamp"],
+            }
+        }
+    });
+    let promise_path = promise_dir.join("2.json");
+    fs::write(&promise_path, serde_json::to_vec_pretty(&promise_blob).unwrap()).unwrap();
+    let persisted_promise: serde_json::Value =
+        serde_json::from_slice(&fs::read(&promise_path).unwrap()).unwrap();
+    assert_eq!(persisted_promise["operation"]["seq"], 2);
+    assert_eq!(persisted_promise["operation"]["kind"], "http");
+    assert_eq!(persisted_promise["operation"]["args"], http_record["args"]);
+    assert_eq!(persisted_promise["state"]["resolved"]["value"], http_record["result"]);
+    let retained_resolved_value = persisted_promise["state"]["resolved"]["value"].clone();
+
+    // Simulate the completion crash window: the resolved promise is durable,
+    // but its corresponding call-log row has not yet landed.
+    records.remove(1);
+    fs::write(&records_path, serde_json::to_string(&records[0]).unwrap() + "\n").unwrap();
+
+    let output = run_chidori_with_str_env(
+        &["resume", agent.to_str().unwrap(), &run_id, "--trusted"],
+        &dir,
+        &durability_env,
+    );
+    stopping.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+
+    assert_success(&output);
+    let recovered: Vec<serde_json::Value> = fs::read_to_string(&records_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let recovered_http = recovered
+        .iter()
+        .find(|record| record["seq"] == 2 && record["function"] == "http")
+        .expect("resume should restore the missing HTTP journal row");
+    assert_eq!(
+        recovered_http["result"], retained_resolved_value,
+        "restored journal row must contain the retained resolved promise value"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "resume must serve the resolved promise without a second HTTP request");
+    fs::remove_dir_all(dir).ok();
+}
+
 fn run_chidori_with_stdin(
     args: &[&str],
     cwd: &Path,

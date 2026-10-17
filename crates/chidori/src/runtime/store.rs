@@ -2298,6 +2298,92 @@ mod tests {
     }
 
     #[test]
+    fn fs_run_store_rejects_malformed_interior_jsonl_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-store-malformed-interior-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = serde_json::to_vec(&record(1, "prompt")).unwrap();
+        bytes.extend_from_slice(b"\n{not-json}\n");
+        bytes.extend(serde_json::to_vec(&record(3, "tool")).unwrap());
+        bytes.push(b'\n');
+        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
+
+        let result = FsRunStore::new(&dir).load_call_log();
+        assert!(
+            result.is_err(),
+            "malformed interior JSONL record was discarded"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fs_run_store_rejects_malformed_newline_terminated_final_jsonl_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-store-malformed-final-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = serde_json::to_vec(&record(1, "prompt")).unwrap();
+        bytes.extend_from_slice(b"\n{not-json}\n");
+        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
+
+        let result = FsRunStore::new(&dir).load_call_log();
+        assert!(
+            result.is_err(),
+            "complete malformed final record was discarded"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fs_run_store_rejects_unterminated_partial_final_record() {
+        let dir =
+            std::env::temp_dir().join(format!("chidori-store-torn-final-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = serde_json::to_vec(&record(1, "prompt")).unwrap();
+        bytes.extend_from_slice(b"\n{\"seq\":");
+        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
+
+        let result = FsRunStore::new(&dir).load_call_log();
+        assert!(
+            result.is_err(),
+            "unterminated final record was discarded and prior records accepted"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fs_run_store_accepts_reserved_sequence_gaps_and_replaces_duplicate_tail_seq() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-store-sequence-gaps-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tail = Vec::new();
+        for r in [
+            record(1, "prompt"),
+            record(4, "actor_reserved_range"),
+            record(9, "tool_first"),
+            record(9, "tool_retry"),
+        ] {
+            tail.extend(serde_json::to_vec(&r).unwrap());
+            tail.push(b'\n');
+        }
+        std::fs::write(dir.join(RECORDS_FILE), tail).unwrap();
+
+        let loaded = FsRunStore::new(&dir).load_call_log().unwrap().unwrap();
+        assert_eq!(
+            loaded.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 4, 9],
+            "reserved sequence gaps are valid, and duplicate tail seqs collapse"
+        );
+        assert_eq!(loaded[2].function, "tool_retry");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn fs_run_store_rejects_traversal_keys() {
         let dir = std::env::temp_dir().join(format!("chidori-store-esc-{}", uuid::Uuid::new_v4()));
         let store = FsRunStore::new(&dir);
