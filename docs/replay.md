@@ -58,14 +58,14 @@ Replay is guarded, not best-effort:
   ([Source History](./source-history.md)).
 - **Divergence checks compare arguments, not just names:** a replayed call
   must match the recorded call's function *and* arguments (the derived
-  `request_digest` field is ignored). A completed async host call whose
-  recorded arguments differ from the re-executed call's is a hard divergence
-  error instead of a silent live re-execution of the side effect.
+  `request_digest` field is ignored). In strict/default replay, argument
+  divergence for a completed async host call is a hard error rather than a
+  silent live re-execution of the side effect.
 - **Escape hatch:** `CHIDORI_REPLAY_LAX=1` downgrades argument divergence for a
   call with a journal record to a warning and serves its recorded result.
-  Function-name mismatches remain fatal. For an async host call whose journal
-  row is missing, any mismatch with a durable host-promise completion is still
-  fatal, even with LAX; the completed side effect is never re-executed.
+  Function-name mismatches remain fatal. If the journal row is missing and
+  recovery uses a durable completed host promise, any argument mismatch remains
+  fatal even with LAX; the completed side effect is never re-executed.
 
 `chidori resume` carries the run's own configuration so recovery needs no
 flag archaeology:
