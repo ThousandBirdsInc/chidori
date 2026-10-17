@@ -97,8 +97,9 @@ durably resolved is still recognized on resume if its journal record never
 landed. Recognition requires the recorded
 arguments to match the re-executed call's (ignoring the derived
 `request_digest`); a mismatch is a hard replay-divergence error rather than a
-silent live re-execution (`CHIDORI_REPLAY_LAX=1` restores the old
-tolerate-and-re-execute behavior).
+silent live re-execution. This remains true with
+`CHIDORI_REPLAY_LAX=1`: once the host-promise table records durable completion,
+an argument mismatch refuses replay and cannot trigger a second live effect.
 
 ## Backends
 
