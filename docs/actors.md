@@ -244,6 +244,14 @@ loop either way. Messages consumed by a failed attempt are redelivered under
 `resume` (their consumption is in the replayed journal) but lost under
 `clean`, matching the from-scratch semantics.
 
+This retry policy applies to a valid journal with an in-flight failure
+frontier. A malformed persisted row, including a torn final row discovered
+after a completed run, is corrupted history and refuses replay; it is not
+stripped as a failed call. Separately, an external provider effect interrupted
+before its result is durably recorded may run again. Provider idempotency can
+make that retry safe when available; actor replay does not promise exactly-once
+external effects. See [Replay & Resume](./replay.md#how-replay-works).
+
 ## Supervision trees
 
 Actors spawn actors, forming a supervised hierarchy — a worker pool per

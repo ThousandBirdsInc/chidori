@@ -22,6 +22,22 @@ produce the same outputs.
    checks the journal at its sequence number — a hit returns the recorded
    result instantly, a miss executes live.
 
+The journal must be intact before replay can safely decide where to continue.
+If a persisted `records.jsonl` row is malformed, loading fails closed with the
+journal path and 1-based line number; resume does not treat that row as a
+missing call and execute it live. This applies even when the run had completed
+before the file was damaged: a torn final row is corrupted history, not an
+ordinary crash frontier. For durable object-store records, the corruption
+error identifies the record object's key instead of a JSONL line.
+
+This is separate from the ordinary at-least-once window for external effects.
+If a provider performs an effect but the process stops before its result is
+durably recorded, resume may execute the effect again. Provider idempotency
+can make that retry safe when the provider supports it; the journal alone
+cannot guarantee exactly-once external effects. Durable host-promise records
+preserve a result that was durably resolved before its journal append, but do
+not close the window before that durable resolution.
+
 Replay is guarded, not best-effort:
 
 - **Source verification:** every resume surface (the server's resume/approve

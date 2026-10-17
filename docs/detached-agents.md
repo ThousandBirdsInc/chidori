@@ -249,5 +249,10 @@ chidori serve --port 8080          # no FILE: fleet-only
   approvals inside a detached agent have no interactive counterpart; the
   agent settles as `paused` with the prompt in its status.
 - **At-least-once around crashes.** A crash between an effect and its
-  recording re-executes that effect on wake (the same window every replay
-  system has); recorded effects are exactly-once by replay.
+  durable recording can re-execute that effect on wake. Provider idempotency
+  can make a retry safe when supported, but replay alone does not guarantee
+  exactly-once external effects. If persisted journal history is malformed —
+  including a torn final `records.jsonl` row — resume refuses it with the
+  journal path and line number rather than treating the row as a cache miss.
+  See [Replay & Resume](./replay.md#how-replay-works) and
+  [Durable Storage](./durable-storage.md#the-journal-on-disk-one-append-only-file-compacted-in-place).
