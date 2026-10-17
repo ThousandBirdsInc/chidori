@@ -24,6 +24,17 @@ local linters = new Mapping<String, Step> {
     // for the subjective lints live in `[workspace.lints.clippy]` in the root
     // Cargo.toml, so the hook, CI, and a bare `cargo clippy` all agree.
     ["cargo-clippy"] = Builtins.cargo_clippy
+    // Unit tests on every commit that touches Rust code or the build
+    // manifests (charter rule: run unit tests whenever a commit is made).
+    // `check` gates (hk check / CI-style use); `fix` is what the pre-commit
+    // hook runs and it MUST NOT block the commit on failing tests — it
+    // reports the result and always exits 0 (charter: failing tests must not
+    // prevent the Dev Lead and their subagents from committing).
+    ["cargo-test"] {
+        glob = List("**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml")
+        check = "cargo test --workspace"
+        fix = "cargo test --workspace || true"
+    }
 }
 
 hooks {
