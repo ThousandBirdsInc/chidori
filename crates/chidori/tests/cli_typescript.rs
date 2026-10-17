@@ -1283,6 +1283,11 @@ fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
     remove_http_journal_row(&fixture);
 
     let output = resume_http_fixture(&fixture, &[]);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "resume must serve the persisted resolved promise without a second HTTP request"
+    );
     let recovered = journal_records(&fixture.records_path);
     let recovered_http = recovered
         .iter()
@@ -1291,11 +1296,6 @@ fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
     assert_eq!(
         recovered_http["result"],
         promise["state"]["resolved"]["value"]
-    );
-    assert_eq!(
-        server.request_count(),
-        1,
-        "resume must serve the persisted resolved promise without a second HTTP request"
     );
     assert_success(&output);
     fs::remove_dir_all(&fixture.dir).ok();
