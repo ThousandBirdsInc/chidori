@@ -512,6 +512,7 @@ impl RunStore for BlobRunStore {
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        crate::runtime::store::validate_composed_journal(records)?;
         self.store.put_object(
             &self.run_key(CHECKPOINT_FILE),
             &serde_json::to_vec_pretty(records)?,
@@ -525,11 +526,13 @@ impl RunStore for BlobRunStore {
     }
 
     fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
-        let checkpoint: Option<Vec<CallRecord>> =
-            match self.store.get_object(&self.run_key(CHECKPOINT_FILE))? {
-                Some(bytes) => Some(serde_json::from_slice(&bytes)?),
-                None => None,
-            };
+        let checkpoint_key = self.run_key(CHECKPOINT_FILE);
+        let checkpoint: Option<Vec<CallRecord>> = match self.store.get_object(&checkpoint_key)? {
+            Some(bytes) => Some(serde_json::from_slice(&bytes).with_context(|| {
+                format!("corrupt call journal: parsing checkpoint object {checkpoint_key}")
+            })?),
+            None => None,
+        };
         let (tail_keys, _) = self.store.list(&self.run_key("records/"), None)?;
         // Keys are zero-padded seqs, so lexicographic order is seq order.
         let mut tail_keys = tail_keys;
@@ -537,14 +540,30 @@ impl RunStore for BlobRunStore {
         let mut tail = Vec::with_capacity(tail_keys.len());
         for key in tail_keys {
             if let Some(bytes) = self.store.get_object(&key)? {
-                if let Ok(record) = serde_json::from_slice::<CallRecord>(&bytes) {
-                    tail.push(record);
-                }
+                let record: CallRecord = serde_json::from_slice(&bytes).with_context(|| {
+                    format!("corrupt call journal: parsing record object {key}")
+                })?;
+                let key_seq = key
+                    .rsplit('/')
+                    .next()
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .and_then(|seq| seq.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("corrupt call journal: invalid record object key {key}")
+                    })?;
+                anyhow::ensure!(
+                    record.seq == key_seq,
+                    "corrupt call journal: record object {key} contains seq {}",
+                    record.seq
+                );
+                tail.push(record);
             }
         }
-        Ok(crate::runtime::store::union_checkpoint_and_tail(
-            checkpoint, tail,
-        ))
+        let records = crate::runtime::store::union_checkpoint_and_tail(checkpoint, tail);
+        if let Some(records) = &records {
+            crate::runtime::store::validate_composed_journal(records)?;
+        }
+        Ok(records)
     }
 
     fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -815,6 +834,24 @@ mod tests {
             "run-blob"
         );
         assert_eq!(registry_list(&s3).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn blob_run_store_reports_malformed_record_object_key() {
+        let endpoint = spawn_mock_s3();
+        let s3 = S3BlobStore::for_tests(&endpoint, "chidori-runs", "team-a");
+        let store = BlobRunStore::new(s3.clone(), "run-malformed-object");
+        let key = store.record_key(7);
+        s3.put_object(&key, b"{not-json").unwrap();
+
+        let error = store
+            .load_call_log()
+            .expect_err("blob store accepted a malformed record object");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&key),
+            "missing object key context: {message}"
+        );
     }
 
     #[test]

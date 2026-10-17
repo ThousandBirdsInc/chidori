@@ -2007,7 +2007,7 @@ fn dev_iteration(
     crate::runtime::snapshot::validate_manifest_for_resume(run_base, Some(run_id), file, true)?;
 
     let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
-    let _ = factory.hydrate(run_id);
+    factory.hydrate(run_id)?;
     let mut records = factory
         .store_for(run_id)
         .load_call_log()?
@@ -2390,7 +2390,7 @@ fn cmd_chat(
             // Load through the run store: hydrates from a durable mirror when
             // configured, and unions the last checkpoint with any
             // crash-stranded `records.jsonl` tail — same path as `resume`.
-            let _ = factory.hydrate(session_id);
+            factory.hydrate(session_id)?;
             call_log = factory
                 .store_for(session_id)
                 .load_call_log()?
@@ -2790,11 +2790,18 @@ fn cmd_resume(
     // durable mirror when this machine has never seen the run, and unions the
     // last checkpoint with any crash-stranded `records.jsonl` tail.
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
-    let _ = factory.hydrate(run_id);
-    let mut records = factory
-        .store_for(run_id)
+    factory.hydrate(run_id)?;
+    let store = factory.store_for(run_id);
+    let mut records = store
         .load_call_log()?
         .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+    let records_path = run_dir.join(crate::runtime::store::RECORDS_FILE);
+    anyhow::ensure!(
+        records.first().is_some_and(|record| record.seq == 1),
+        "corrupt top-level run journal {} line 1: expected its first record at seq 1 before replay",
+        records_path.display()
+    );
+    let host_promises = crate::runtime::snapshot::load_host_promise_records(&*store)?;
 
     // `--retry-failed`: first-class repair for a failed run. The trailing
     // failed record(s) — the crash frontier — are stripped with the exact
@@ -2965,11 +2972,20 @@ fn cmd_resume(
     // replayed prefix stays silent. CHIDORI_QUIET=1 opts out.
     let result = match spawn_prompt_progress_listener() {
         Some((event_tx, drain)) => {
-            let result = engine.resume_run_streaming(file, &input_value, records, run_id, event_tx);
+            let result = engine.resume_run_streaming_with_host_promises(
+                file,
+                &input_value,
+                records,
+                host_promises,
+                run_id,
+                event_tx,
+            );
             drain.join().ok();
             result
         }
-        None => engine.resume_run(file, &input_value, records, run_id),
+        None => {
+            engine.resume_run_with_host_promises(file, &input_value, records, host_promises, run_id)
+        }
     };
     let _ =
         crate::runtime::store::release_lease(factory.store_for(run_id).as_ref(), &cli_lease_owner);
@@ -3030,7 +3046,7 @@ fn cmd_holdings(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     let run_dir = run_base.join(run_id);
 
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
-    let _ = factory.hydrate(run_id);
+    factory.hydrate(run_id)?;
     // A holdings report for a run that doesn't exist would read as "holds
     // nothing" — a typo'd id must error, like `trace` and `rollback` do.
     if !run_dir.is_dir() {
@@ -3066,7 +3082,7 @@ fn cmd_rollback(
     let run_base = base_dir.join(".chidori").join("runs");
 
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
-    let _ = factory.hydrate(run_id);
+    factory.hydrate(run_id)?;
     let store = factory.store_for(run_id);
 
     let providers = Arc::new(ProviderRegistry::from_env());
@@ -3724,7 +3740,7 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     let run_dir = run_base.join(run_id);
 
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
-    let _ = factory.hydrate(run_id);
+    factory.hydrate(run_id)?;
     let records = factory
         .store_for(run_id)
         .load_call_log()?

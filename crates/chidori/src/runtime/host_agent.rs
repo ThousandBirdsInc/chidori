@@ -596,7 +596,9 @@ impl DetachedAgentHub {
             match descriptor.status.as_str() {
                 // Died mid-run: resume-by-replay continues at the frontier.
                 "running" => {
-                    let _ = factory.hydrate(&descriptor.run_id);
+                    factory.hydrate(&descriptor.run_id).map_err(|err| {
+                        format!("hydrating detached-agent journal for {name}: {err:#}")
+                    })?;
                     let entry = self.ensure_entry(&parts_for_entries, &name)?;
                     self.start_thread(entry)?;
                     rearmed += 1;
@@ -604,7 +606,9 @@ impl DetachedAgentHub {
                 // Hibernating: entry re-created; sends and (via the timer
                 // thread) alarm deadlines wake it.
                 "hibernating" => {
-                    let _ = factory.hydrate(&descriptor.run_id);
+                    factory.hydrate(&descriptor.run_id).map_err(|err| {
+                        format!("hydrating detached-agent journal for {name}: {err:#}")
+                    })?;
                     self.ensure_entry(&parts_for_entries, &name)?;
                     rearmed += 1;
                 }
@@ -865,7 +869,19 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         // The accumulated journal (empty on first run), plus a synthetic
         // timeout-sentinel record when this wake is an expired alarm/timeout
         // rather than a matching delivery.
-        let mut replay: Vec<CallRecord> = store.load_call_log().ok().flatten().unwrap_or_default();
+        let mut replay: Vec<CallRecord> = match store.load_call_log() {
+            Ok(records) => records.unwrap_or_default(),
+            Err(err) => {
+                settle(
+                    hub,
+                    entry,
+                    "failed",
+                    None,
+                    Some(format!("loading detached-agent journal: {err:#}")),
+                );
+                return;
+            }
+        };
         let inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE) {
             Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
             _ => Vec::new(),
@@ -909,7 +925,19 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         // journal, policy seed, and persistence handle all belong to the
         // agent, not the spawner.
         let host_promises =
-            crate::runtime::snapshot::load_host_promise_records(store.as_ref()).unwrap_or_default();
+            match crate::runtime::snapshot::load_host_promise_records(store.as_ref()) {
+                Ok(records) => records,
+                Err(err) => {
+                    settle(
+                        hub,
+                        entry,
+                        "failed",
+                        None,
+                        Some(format!("loading detached-agent host promises: {err:#}")),
+                    );
+                    return;
+                }
+            };
         let vfs = crate::runtime::snapshot::SnapshotStore::with_store(&run_dir, store.clone())
             .load_manifest()
             .map(|manifest| manifest.vfs)

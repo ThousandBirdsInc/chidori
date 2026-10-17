@@ -19,8 +19,9 @@ use crate::storage::{SessionStatus, StoredSession};
 use super::super::engine::build_engine;
 use super::super::hardening::acquire_run_slot;
 use super::super::{
-    complete_persisted_pending_host_operation, load_persisted_host_promises, load_persisted_vfs,
-    ActiveSession, AppState, HostPromiseCompletion, LiveSignalSession,
+    complete_persisted_pending_host_operation, load_persisted_host_promises,
+    load_persisted_replay_journal, load_persisted_vfs, ActiveSession, AppState,
+    HostPromiseCompletion, LiveSignalSession,
 };
 use super::resume::signal_resolution_record;
 use super::{agent_error_string, apply_run_outcome, validate_policy_profile, CreateSessionRequest};
@@ -393,6 +394,17 @@ fn resume_signal_pause_in_process(
             return false;
         }
     };
+    let mut call_log = match load_persisted_replay_journal(
+        &state.run_base,
+        session.run_id.as_deref(),
+        &session.call_log,
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            let _ = result_tx.send(Err(error.context("loading replay journal")));
+            return true;
+        }
+    };
     let completed = {
         let lock = state.signal_inbox_lock(&run_id);
         let _guard = lock.lock().unwrap();
@@ -403,8 +415,13 @@ fn resume_signal_pause_in_process(
             HostPromiseCompletion::Resolved(value.clone()),
         )
     };
-    let Ok(Some(pending)) = completed else {
-        return false;
+    let pending = match completed {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return false,
+        Err(error) => {
+            let _ = result_tx.send(Err(error.context("completing persisted signal operation")));
+            return true;
+        }
     };
     let resolution = signal_resolution_record(&pending, seq, value);
     // Emit the consumed signal on the live stream. The resumed run replays
@@ -412,11 +429,24 @@ fn resume_signal_pause_in_process(
     // this the one record that carries `{name, payload, from}` — who steered
     // the run — would never reach a dashboard watching the SSE stream.
     let _ = event_tx.send(RuntimeEvent::Call(resolution.clone()));
-    session.call_log.push(resolution);
+    call_log.push(resolution);
+    session.call_log = call_log.clone();
 
-    let host_promises = load_persisted_host_promises(&state.run_base, session.run_id.as_deref())
-        .unwrap_or_default();
-    let vfs = load_persisted_vfs(&state.run_base, session.run_id.as_deref());
+    let host_promises =
+        match load_persisted_host_promises(&state.run_base, session.run_id.as_deref()) {
+            Ok(host_promises) => host_promises,
+            Err(error) => {
+                let _ = result_tx.send(Err(error.context("loading persisted host promises")));
+                return true;
+            }
+        };
+    let vfs = match load_persisted_vfs(&state.run_base, session.run_id.as_deref()) {
+        Ok(vfs) => vfs,
+        Err(error) => {
+            let _ = result_tx.send(Err(error.context("loading replay snapshot")));
+            return true;
+        }
+    };
 
     // Swap the resumed run's context into the live slot while holding it: the
     // delivery endpoint enqueues into whatever context the slot currently
@@ -426,7 +456,7 @@ fn resume_signal_pause_in_process(
         let mut slot = ctx_slot.lock().unwrap();
         let inbox = slot.signal_inbox();
         let ctx = RuntimeContext::with_replay_host_promises_vfs_and_signals(
-            session.call_log.clone(),
+            call_log,
             host_promises,
             vfs,
             inbox,

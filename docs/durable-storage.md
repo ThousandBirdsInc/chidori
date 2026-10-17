@@ -53,11 +53,18 @@ durability) — applied to the journal.
 One artifact per run:
 
 * **`records.jsonl`** — the journal: append-only, one JSON record per line,
-  one host call each. Appending a record costs O(1) bytes. At **compaction
+  one host call each (JSONL means line-delimited JSON). Appending a record
+  costs O(1) bytes. At **compaction
   points** — pause, settle, branch merges, and the first safepoint after a
   resume replay — the whole file is rewritten *atomically* (a sibling temp
-  file renamed into place, so a crash leaves either the previous journal or
-  the new one, never a truncated hybrid). Steady-state per-effect safepoints
+  file renamed into place, so a crash during compaction leaves either the
+  previous journal or the new one, never a truncated hybrid). This atomic
+  replacement does not make an interrupted per-record append reconstructible:
+  if a persisted row is malformed, including a torn final row discovered
+  after a run completed, loading refuses the journal rather than silently
+  dropping the row. Filesystem errors identify `records.jsonl` by path and
+  1-based line number; object-store record errors identify the object key.
+  Steady-state per-effect safepoints
   persist only the manifest + pending artifacts: the O(1) append already made
   the record durable, so rewriting the whole artifact per host call would
   cost O(history²) bytes per run for nothing.
@@ -84,14 +91,15 @@ the run directory once — in the journal — not twice. The loader rehydrates
 references transparently (consumers only ever see `resolved`), the fold
 happens only on an exact-match proof, and the per-op blobs always carry the
 inline value — they are what makes a resolution durable before its journal
-record lands. The
-per-op blob is what keeps the crash-between-resolve-and-record dedup
-guarantee: a resolved effect whose journal record never landed is still
-recognized on resume and not re-executed. Recognition requires the recorded
+record lands. The per-op blob preserves a result across the
+crash-between-resolve-and-journal-append window: an effect whose promise was
+durably resolved is still recognized on resume if its journal record never
+landed. Recognition requires the recorded
 arguments to match the re-executed call's (ignoring the derived
 `request_digest`); a mismatch is a hard replay-divergence error rather than a
-silent live re-execution (`CHIDORI_REPLAY_LAX=1` restores the old
-tolerate-and-re-execute behavior).
+silent live re-execution. This remains true with
+`CHIDORI_REPLAY_LAX=1`: once the host-promise table records durable completion,
+an argument mismatch refuses replay and cannot trigger a second live effect.
 
 ## Backends
 

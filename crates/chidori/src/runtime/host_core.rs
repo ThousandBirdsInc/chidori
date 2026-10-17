@@ -69,9 +69,16 @@ pub fn execute_durable_json_call_at_seq(
         );
     }
 
-    let host_operation = operation_kind.map(|kind| {
-        ctx.begin_host_operation_with_function(seq, kind, Some(function.to_string()), args.clone())
-    });
+    let host_operation = operation_kind
+        .map(|kind| {
+            ctx.begin_or_resume_host_operation_with_function(
+                seq,
+                kind,
+                Some(function.to_string()),
+                args.clone(),
+            )
+        })
+        .transpose()?;
     if let Some(id) = host_operation {
         // The safepoint persists the pending intent and, under
         // CHIDORI_DURABILITY=effect, barriers it durable before the effect
@@ -149,28 +156,50 @@ fn replay_completed_host_operation(
     kind: PendingHostOperationKind,
     args: &Value,
 ) -> Result<Option<Value>> {
-    let Some(record) = ctx.completed_host_operation(seq, kind) else {
+    let at_seq: Vec<_> = ctx
+        .host_promise_records()
+        .into_iter()
+        .filter(|record| record.operation.seq == seq)
+        .collect();
+    let completed: Vec<_> = at_seq
+        .iter()
+        .filter(|record| !matches!(record.state, HostPromiseState::Pending))
+        .collect();
+    if completed.is_empty() {
         return Ok(None);
-    };
+    }
+    anyhow::ensure!(
+        at_seq.len() == 1 && completed.len() == 1,
+        "corrupt host-promise table: multiple operations are recorded at seq {seq}"
+    );
+    let record = (*completed[0]).clone();
+    anyhow::ensure!(
+        record.operation.kind == kind,
+        "Replay divergence at seq {seq}: completed host operation kind {:?} does not match {:?}",
+        record.operation.kind,
+        kind
+    );
+    let recorded_function = record.operation.function.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Replay divergence at seq {seq}: completed host operation has no function identity"
+        )
+    })?;
+    anyhow::ensure!(
+        recorded_function == function,
+        "Replay divergence at seq {seq}: completed host operation function `{recorded_function}` does not match `{function}`"
+    );
 
     // A completed operation exists at this (seq, kind) but was recorded with
     // different arguments: the agent code (or its inputs) changed since the
-    // recording. Historically this silently fell through to a live
-    // re-execution of the side effect — surface it as a divergence instead,
-    // unless the operator explicitly opted into the lax behavior.
+    // recording. A durable completion is evidence that the effect already
+    // finished, so even replay-lax must not turn this mismatch into a second
+    // live effect.
     if !crate::runtime::snapshot::completed_args_match(&record.operation.args, args) {
-        if crate::runtime::context::replay_lax() {
-            tracing::warn!(
-                "replay divergence at seq {seq} tolerated (CHIDORI_REPLAY_LAX=1): completed \
-                 `{function}` was recorded with different arguments; re-executing live"
-            );
-            return Ok(None);
-        }
         anyhow::bail!(
             "Replay divergence at seq {}: completed `{}` was recorded with arguments {} but the \
-             agent now calls it with {}.{} The agent code (or its inputs/configuration) changed \
-             since the checkpoint was saved — re-run without replay to regenerate, or set \
-             CHIDORI_REPLAY_LAX=1 to tolerate argument drift and re-execute the effect live.",
+             agent now calls it with {}.{} The completed effect will not be re-executed; the \
+             agent code (or its inputs/configuration) changed since the checkpoint was saved. \
+             CHIDORI_REPLAY_LAX=1 does not permit re-execution after a durable completion.",
             seq,
             function,
             crate::runtime::context::truncate_json_for_error(&record.operation.args),
@@ -304,12 +333,12 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         return Ok(result);
     }
 
-    let host_operation = ctx.begin_host_operation_with_function(
+    let host_operation = ctx.begin_or_resume_host_operation_with_function(
         seq,
         PendingHostOperationKind::Input,
         Some("input".to_string()),
         normalized.clone(),
-    );
+    )?;
     ctx.run_host_operation_safepoint(host_operation)?;
     match ctx.input_mode() {
         InputMode::Stdin => {
@@ -584,12 +613,12 @@ pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         return Ok(result);
     }
 
-    let host_operation = ctx.begin_host_operation_with_function(
+    let host_operation = ctx.begin_or_resume_host_operation_with_function(
         seq,
         PendingHostOperationKind::Signal,
         Some("signal".to_string()),
         match_args.clone(),
-    );
+    )?;
     ctx.run_host_operation_safepoint(host_operation)?;
 
     if let Some(queued) = ctx.take_queued_signal(&name) {
@@ -666,12 +695,12 @@ pub fn execute_signal_any(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
         return Ok(result);
     }
 
-    let host_operation = ctx.begin_host_operation_with_function(
+    let host_operation = ctx.begin_or_resume_host_operation_with_function(
         seq,
         PendingHostOperationKind::Signal,
         Some("signal_any".to_string()),
         match_args.clone(),
-    );
+    )?;
     ctx.run_host_operation_safepoint(host_operation)?;
 
     if let Some(queued) = ctx.take_queued_signal_any(&names) {
@@ -747,12 +776,12 @@ pub fn execute_poll_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> 
         return Ok(result);
     }
 
-    let host_operation = ctx.begin_host_operation_with_function(
+    let host_operation = ctx.begin_or_resume_host_operation_with_function(
         seq,
         PendingHostOperationKind::Signal,
         Some("poll_signal".to_string()),
         match_args.clone(),
-    );
+    )?;
     ctx.run_host_operation_safepoint(host_operation)?;
 
     let result = match ctx.take_queued_signal(&name) {
@@ -1099,12 +1128,12 @@ fn complete_prompt_from_local_cache(
     args: Value,
     result: Value,
 ) -> Result<()> {
-    let host_operation = ctx.begin_host_operation_with_function(
+    let host_operation = ctx.begin_or_resume_host_operation_with_function(
         seq,
         PendingHostOperationKind::Prompt,
         Some("prompt".to_string()),
         args.clone(),
-    );
+    )?;
     ctx.run_host_operation_safepoint(host_operation)?;
     ctx.resolve_host_operation(host_operation, result.clone())?;
     ctx.record_call(CallRecord {
@@ -1178,12 +1207,12 @@ pub fn execute_prompt_text(
         return Ok(result);
     }
 
-    let host_operation = ctx.begin_host_operation_with_function(
+    let host_operation = ctx.begin_or_resume_host_operation_with_function(
         seq,
         PendingHostOperationKind::Prompt,
         Some("prompt".to_string()),
         args.clone(),
-    );
+    )?;
     ctx.run_host_operation_safepoint(host_operation)?;
     let started = Utc::now();
     let response = send_prompt_request(ctx, providers, tokio_rt, seq, &request, prompt_type)?;
@@ -1273,12 +1302,12 @@ pub fn execute_prompt_response(
         return Ok(cached);
     }
 
-    let host_operation = ctx.begin_host_operation_with_function(
+    let host_operation = ctx.begin_or_resume_host_operation_with_function(
         seq,
         PendingHostOperationKind::Prompt,
         Some("prompt".to_string()),
         args.clone(),
-    );
+    )?;
     ctx.run_host_operation_safepoint(host_operation)?;
     let started = Utc::now();
     let response = send_prompt_request(ctx, providers, tokio_rt, seq, &request, prompt_type)?;
@@ -2281,7 +2310,8 @@ mod tests {
                 1,
                 PendingHostOperationKind::Tool,
                 recorded_args,
-            ),
+            )
+            .with_function("tool"),
             state: HostPromiseState::Resolved {
                 value: json!({ "value": 42 }),
                 completed_at: Utc::now(),
@@ -2325,7 +2355,8 @@ mod tests {
                 1,
                 PendingHostOperationKind::Tool,
                 args.clone(),
-            ),
+            )
+            .with_function("tool"),
             state: HostPromiseState::Resolved {
                 value: json!({ "value": 42 }),
                 completed_at: Utc::now(),
@@ -2354,7 +2385,8 @@ mod tests {
                 1,
                 PendingHostOperationKind::Http,
                 args.clone(),
-            ),
+            )
+            .with_function("http"),
             state: HostPromiseState::Rejected {
                 error: "network failed after persistence".to_string(),
                 completed_at: Utc::now(),
@@ -2456,7 +2488,8 @@ mod tests {
                 1,
                 PendingHostOperationKind::Prompt,
                 args.clone(),
-            ),
+            )
+            .with_function("prompt"),
             state: HostPromiseState::Resolved {
                 value: json!("cached response"),
                 completed_at: Utc::now(),

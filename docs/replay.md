@@ -22,6 +22,22 @@ produce the same outputs.
    checks the journal at its sequence number — a hit returns the recorded
    result instantly, a miss executes live.
 
+The journal must be intact before replay can safely decide where to continue.
+If a persisted `records.jsonl` row is malformed, loading fails closed with the
+journal path and 1-based line number; resume does not treat that row as a
+missing call and execute it live. This applies even when the run had completed
+before the file was damaged: a torn final row is corrupted history, not an
+ordinary crash frontier. For durable object-store records, the corruption
+error identifies the record object's key instead of a JSONL line.
+
+This is separate from the ordinary at-least-once window for external effects.
+If a provider performs an effect but the process stops before its result is
+durably recorded, resume may execute the effect again. Provider idempotency
+can make that retry safe when the provider supports it; the journal alone
+cannot guarantee exactly-once external effects. Durable host-promise records
+preserve a result that was durably resolved before its journal append, but do
+not close the window before that durable resolution.
+
 Replay is guarded, not best-effort:
 
 - **Source verification:** every resume surface (the server's resume/approve
@@ -42,12 +58,14 @@ Replay is guarded, not best-effort:
   ([Source History](./source-history.md)).
 - **Divergence checks compare arguments, not just names:** a replayed call
   must match the recorded call's function *and* arguments (the derived
-  `request_digest` field is ignored). A completed async host call whose
-  recorded arguments differ from the re-executed call's is a hard divergence
-  error instead of a silent live re-execution of the side effect.
-- **Escape hatch:** `CHIDORI_REPLAY_LAX=1` downgrades argument-level
-  divergence to a warning (serving the recorded result / re-executing live,
-  the historical behavior). Function-name mismatches are always fatal.
+  `request_digest` field is ignored). In strict/default replay, argument
+  divergence for a completed async host call is a hard error rather than a
+  silent live re-execution of the side effect.
+- **Escape hatch:** `CHIDORI_REPLAY_LAX=1` downgrades argument divergence for a
+  call with a journal record to a warning and serves its recorded result.
+  Function-name mismatches remain fatal. If the journal row is missing and
+  recovery uses a durable completed host promise, any argument mismatch remains
+  fatal even with LAX; the completed side effect is never re-executed.
 
 `chidori resume` carries the run's own configuration so recovery needs no
 flag archaeology:

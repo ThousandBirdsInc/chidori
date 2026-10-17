@@ -205,6 +205,34 @@ impl FsRunStore {
         Ok(self.run_dir.join(rel))
     }
 
+    fn load_call_log_with_external_completion_check(&self) -> Result<Option<Vec<CallRecord>>> {
+        let checkpoint_path = self.run_dir.join(CHECKPOINT_FILE);
+        let checkpoint: Option<Vec<CallRecord>> = match std::fs::read(&checkpoint_path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parsing {}", checkpoint_path.display()))?,
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {}", checkpoint_path.display()))
+            }
+        };
+        let journal_path = self.run_dir.join(RECORDS_FILE);
+        let tail = match std::fs::read(&journal_path) {
+            Ok(bytes) => parse_jsonl_records(&bytes, &journal_path)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {}", journal_path.display()))
+            }
+        };
+        let records = union_checkpoint_and_tail(checkpoint, tail);
+        if let Some(records) = &records {
+            validate_composed_journal(records)
+                .with_context(|| format!("validating {}", journal_path.display()))?;
+        }
+        Ok(records)
+    }
+
     fn write_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -270,6 +298,7 @@ impl RunStore for FsRunStore {
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        validate_composed_journal(records)?;
         // Single-copy compaction: `records.jsonl` — the journal users read
         // directly and `chidori export` ships — is the ONE full artifact.
         // The rewrite is atomic (tmp + rename), so a crash leaves either the
@@ -299,34 +328,7 @@ impl RunStore for FsRunStore {
     }
 
     fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
-        let checkpoint: Option<Vec<CallRecord>> =
-            match std::fs::read(self.run_dir.join(CHECKPOINT_FILE)) {
-                Ok(bytes) => Some(serde_json::from_slice(&bytes).with_context(|| {
-                    format!("parsing {}", self.run_dir.join(CHECKPOINT_FILE).display())
-                })?),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("reading {}", self.run_dir.join(CHECKPOINT_FILE).display())
-                    })
-                }
-            };
-        let tail: Vec<CallRecord> = match std::fs::read_to_string(self.run_dir.join(RECORDS_FILE)) {
-            Ok(text) => text
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                // A crash can truncate the final line mid-write; drop it and
-                // keep every complete record before it.
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("reading {}", self.run_dir.join(RECORDS_FILE).display())
-                })
-            }
-        };
-        Ok(union_checkpoint_and_tail(checkpoint, tail))
+        self.load_call_log_with_external_completion_check()
     }
 
     fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -409,6 +411,47 @@ impl RunStore for FsRunStore {
     }
 }
 
+/// Validate invariants after checkpoint and append-tail records are composed.
+/// Numeric gaps are valid because actors reserve sequence ranges.
+pub(crate) fn validate_composed_journal(records: &[CallRecord]) -> Result<()> {
+    for (index, pair) in records.windows(2).enumerate() {
+        anyhow::ensure!(
+            pair[0].seq < pair[1].seq,
+            "corrupt call journal: sequence numbers are not strictly increasing at line {} ({} then {})",
+            index + 2,
+            pair[0].seq,
+            pair[1].seq
+        );
+    }
+    Ok(())
+}
+
+/// Parse physical JSONL rows so malformed records cannot disappear through a
+/// filter. Even an unterminated final fragment is damaged persisted history.
+fn parse_jsonl_records(bytes: &[u8], path: &Path) -> Result<Vec<CallRecord>> {
+    let physical_lines: Vec<&[u8]> = bytes.split_inclusive(|byte| *byte == b'\n').collect();
+    let mut records = Vec::with_capacity(physical_lines.len());
+    for (index, physical_line) in physical_lines.iter().enumerate() {
+        let line = physical_line.strip_suffix(b"\n").unwrap_or(physical_line);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice::<CallRecord>(line) {
+            Ok(record) => records.push(record),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "corrupt call journal: parsing {} line {}",
+                        path.display(),
+                        index + 1
+                    )
+                });
+            }
+        }
+    }
+    Ok(records)
+}
+
 /// Union a full checkpoint with the appended tail: checkpoint order wins;
 /// tail records whose seq the checkpoint doesn't know (writes stranded after
 /// the last safepoint by a crash) are appended in seq order.
@@ -449,6 +492,10 @@ fn dedup_keep_last(records: Vec<CallRecord>) -> Vec<CallRecord> {
         }
     }
     deduped
+}
+
+pub(crate) fn deduplicate_journal_tail(records: Vec<CallRecord>) -> Vec<CallRecord> {
+    dedup_keep_last(records)
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +619,7 @@ impl RunStore for SqliteRunStore {
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        validate_composed_journal(records)?;
         let mut conn = self.shared.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
@@ -607,8 +655,19 @@ impl RunStore for SqliteRunStore {
             row.get::<_, String>(0)
         })?;
         let mut records = Vec::new();
-        for row in rows {
-            records.push(serde_json::from_str(&row?)?);
+        for (pos, row) in rows.enumerate() {
+            records.push(serde_json::from_str(&row?).with_context(|| {
+                format!(
+                    "parsing SQLite call journal for run {} row {}",
+                    self.run_id,
+                    pos + 1
+                )
+            })?);
+        }
+        if !records.is_empty() {
+            validate_composed_journal(&records).with_context(|| {
+                format!("validating SQLite call journal for run {}", self.run_id)
+            })?;
         }
         Ok(if records.is_empty() {
             None
@@ -1241,6 +1300,7 @@ impl RunStore for HttpRunStore {
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        validate_composed_journal(records)?;
         self.relay.expect_ok(
             "PUT",
             self.records_url(),
@@ -1253,7 +1313,10 @@ impl RunStore for HttpRunStore {
         match status {
             404 => Ok(None),
             s if (200..300).contains(&s) => {
-                let records: Vec<CallRecord> = serde_json::from_slice(&bytes)?;
+                let records: Vec<CallRecord> = serde_json::from_slice(&bytes)
+                    .context("parsing HTTP run-store call journal")?;
+                validate_composed_journal(&records)
+                    .context("validating HTTP run-store call journal")?;
                 Ok(if records.is_empty() {
                     None
                 } else {
@@ -1427,12 +1490,16 @@ impl RunStore for TeeRunStore {
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        validate_composed_journal(records)?;
         self.primary.write_call_log(records)?;
         self.secondary.write_call_log(records)
     }
 
     fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
-        match self.primary.load_call_log()? {
+        match self
+            .primary
+            .load_call_log_with_external_completion_check()?
+        {
             Some(records) => Ok(Some(records)),
             None => self.secondary.load_call_log(),
         }
@@ -1546,12 +1613,19 @@ impl ScopedRunStore {
 impl RunStore for ScopedRunStore {
     fn append_record(&self, record: &CallRecord) -> Result<()> {
         let mut records = self.load_call_log()?.unwrap_or_default();
-        records.retain(|r| r.seq != record.seq);
-        records.push(record.clone());
+        if let Some(existing) = records
+            .iter_mut()
+            .find(|existing| existing.seq == record.seq)
+        {
+            *existing = record.clone();
+        } else {
+            records.push(record.clone());
+        }
         self.write_call_log(&records)
     }
 
     fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        validate_composed_journal(records)?;
         self.inner.put_blob(
             &self.key(CHECKPOINT_FILE),
             &serde_json::to_vec_pretty(records)?,
@@ -1559,8 +1633,15 @@ impl RunStore for ScopedRunStore {
     }
 
     fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
-        match self.inner.get_blob(&self.key(CHECKPOINT_FILE))? {
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        let key = self.key(CHECKPOINT_FILE);
+        match self.inner.get_blob(&key)? {
+            Some(bytes) => {
+                let records: Vec<CallRecord> = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parsing scoped call journal blob {key}"))?;
+                validate_composed_journal(&records)
+                    .with_context(|| format!("validating scoped call journal blob {key}"))?;
+                Ok(Some(records))
+            }
             None => Ok(None),
         }
     }
@@ -2308,21 +2389,13 @@ mod tests {
         bytes.extend_from_slice(b"\n{not-json}\n");
         bytes.extend(serde_json::to_vec(&record(3, "tool")).unwrap());
         bytes.push(b'\n');
-        let path = dir.join(RECORDS_FILE);
-        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
 
-        let error = FsRunStore::new(&dir)
-            .load_call_log()
-            .expect_err("malformed interior JSONL record was discarded");
-        let diagnostic = format!("{error:#}");
-        assert!(
-            diagnostic.contains(&path.display().to_string()),
-            "missing journal path: {diagnostic}"
-        );
-        assert!(
-            diagnostic.contains("line 2"),
-            "missing 1-based line: {diagnostic}"
-        );
+        let result = FsRunStore::new(&dir).load_call_log();
+        let error = result.expect_err("malformed interior JSONL record was discarded");
+        let message = format!("{error:#}");
+        assert!(message.contains("records.jsonl"), "missing path: {message}");
+        assert!(message.contains("line 2"), "missing line number: {message}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2335,46 +2408,70 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut bytes = serde_json::to_vec(&record(1, "prompt")).unwrap();
         bytes.extend_from_slice(b"\n{not-json}\n");
-        let path = dir.join(RECORDS_FILE);
-        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
 
-        let error = FsRunStore::new(&dir)
-            .load_call_log()
-            .expect_err("complete malformed final record was discarded");
-        let diagnostic = format!("{error:#}");
-        assert!(
-            diagnostic.contains(&path.display().to_string()),
-            "missing journal path: {diagnostic}"
-        );
-        assert!(
-            diagnostic.contains("line 2"),
-            "missing 1-based line: {diagnostic}"
-        );
+        let result = FsRunStore::new(&dir).load_call_log();
+        let error = result.expect_err("complete malformed final record was discarded");
+        let message = format!("{error:#}");
+        assert!(message.contains("records.jsonl"), "missing path: {message}");
+        assert!(message.contains("line 2"), "missing line number: {message}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn fs_run_store_rejects_unterminated_partial_final_record() {
+    fn fs_run_store_rejects_unterminated_partial_final_record_even_for_completed_run() {
         let dir =
             std::env::temp_dir().join(format!("chidori-store-torn-final-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut bytes = serde_json::to_vec(&record(1, "prompt")).unwrap();
         bytes.extend_from_slice(b"\n{\"seq\":");
-        let path = dir.join(RECORDS_FILE);
-        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
+        std::fs::write(dir.join("output.json"), b"{}").unwrap();
 
         let error = FsRunStore::new(&dir)
             .load_call_log()
-            .expect_err("unterminated final record was discarded and prior records accepted");
-        let diagnostic = format!("{error:#}");
-        assert!(
-            diagnostic.contains(&path.display().to_string()),
-            "missing journal path: {diagnostic}"
-        );
-        assert!(
-            diagnostic.contains("line 2"),
-            "missing 1-based line: {diagnostic}"
-        );
+            .expect_err("completed run accepted a torn final record");
+        let message = format!("{error:#}");
+        assert!(message.contains("records.jsonl"), "missing path: {message}");
+        assert!(message.contains("line 2"), "missing line number: {message}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fs_run_store_rejects_unterminated_malformed_final_fragment() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-store-incomplete-torn-final-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = serde_json::to_vec(&record(1, "prompt")).unwrap();
+        bytes.extend_from_slice(b"\n{\"seq\":");
+        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
+
+        let error = FsRunStore::new(&dir)
+            .load_call_log()
+            .expect_err("malformed unterminated final fragment was ignored");
+        let message = format!("{error:#}");
+        assert!(message.contains("records.jsonl"), "missing path: {message}");
+        assert!(message.contains("line 2"), "missing line number: {message}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fs_run_store_accepts_valid_unterminated_final_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-store-valid-unterminated-final-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(RECORDS_FILE),
+            serde_json::to_vec(&record(1, "prompt")).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = FsRunStore::new(&dir).load_call_log().unwrap().unwrap();
+        assert_eq!(loaded.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2428,6 +2525,36 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_load_rejects_non_increasing_sequence_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-store-sqlite-order-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shared = SqliteRunStoreShared::open(&dir.join("runs.sqlite3")).unwrap();
+        {
+            let conn = shared.conn.lock().unwrap();
+            for (pos, seq) in [2, 1].into_iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "run-bad-order",
+                        seq,
+                        pos as i64,
+                        serde_json::to_string(&record(seq, "tool")).unwrap()
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let error = SqliteRunStore::new(shared, "run-bad-order")
+            .load_call_log()
+            .expect_err("SQLite accepted a non-increasing replay order");
+        assert!(format!("{error:#}").contains("strictly increasing"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn tee_run_store_mirrors_and_hydrates() {
         let base = std::env::temp_dir().join(format!("chidori-store-tee-{}", uuid::Uuid::new_v4()));
         let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
@@ -2450,6 +2577,41 @@ mod tests {
         assert!(base.join("run-1").join("signals/inbox.json").is_file());
         // Second hydrate is a no-op (local journal exists).
         assert!(!factory.hydrate("run-1").unwrap());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn hydrate_rejects_corrupt_mirror_before_materializing_run() {
+        let base = std::env::temp_dir().join(format!(
+            "chidori-store-hydrate-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
+        {
+            let conn = shared.conn.lock().unwrap();
+            for (pos, seq) in [4, 1].into_iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "run-corrupt",
+                        seq,
+                        pos as i64,
+                        serde_json::to_string(&record(seq, "tool")).unwrap()
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let factory = RunStoreFactory {
+            run_base: base.clone(),
+            backend: RunStoreBackend::Sqlite(shared),
+        };
+
+        let error = factory
+            .hydrate("run-corrupt")
+            .expect_err("hydration materialized a corrupt effective journal");
+        assert!(format!("{error:#}").contains("strictly increasing"));
+        assert!(!base.join("run-corrupt").exists());
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -2755,6 +2917,89 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(relay.list_runs().unwrap().contains(&"run-http".to_string()));
+    }
+
+    #[test]
+    fn http_load_rejects_non_increasing_sequence_order() {
+        let base = spawn_protocol_server();
+        let store = HttpRunStore::new(HttpRelay::new(base, None), "run-http-order");
+        store.append_record(&record(2, "tool")).unwrap();
+        store.append_record(&record(1, "prompt")).unwrap();
+        store.flush().unwrap();
+
+        let error = store
+            .load_call_log()
+            .expect_err("HTTP store accepted a non-increasing replay order");
+        assert!(format!("{error:#}").contains("strictly increasing"));
+    }
+
+    #[test]
+    fn scoped_load_rejects_malformed_checkpoint_with_blob_key_context() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-store-scoped-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let inner: Arc<dyn RunStore> = Arc::new(FsRunStore::new(&dir));
+        inner
+            .put_blob("branches/op-1/checkpoint.json", b"{not-json")
+            .unwrap();
+        let scoped = ScopedRunStore::new(inner, "branches/op-1");
+
+        let error = scoped
+            .load_call_log()
+            .expect_err("scoped store accepted malformed checkpoint JSON");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("branches/op-1/checkpoint.json"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tee_load_propagates_primary_corruption_instead_of_using_mirror() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-store-tee-corrupt-primary-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(RECORDS_FILE), b"{not-json}\n").unwrap();
+        let shared = SqliteRunStoreShared::open(&dir.join("runs.sqlite3")).unwrap();
+        let mirror = SqliteRunStore::new(shared, "run-tee-corrupt");
+        mirror.write_call_log(&[record(1, "prompt")]).unwrap();
+        let tee = TeeRunStore::new(FsRunStore::new(&dir), Arc::new(mirror));
+
+        let error = tee
+            .load_call_log()
+            .expect_err("tee hid primary corruption behind a valid mirror");
+        assert!(format!("{error:#}").contains("records.jsonl"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tee_propagates_torn_primary_corruption_when_mirror_marks_run_completed() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-store-tee-torn-complete-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = serde_json::to_vec(&record(1, "prompt")).unwrap();
+        bytes.extend_from_slice(b"\n{\"seq\":");
+        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
+
+        let shared = SqliteRunStoreShared::open(&dir.join("runs.sqlite3")).unwrap();
+        let mirror = SqliteRunStore::new(shared, "run-tee-torn");
+        mirror.write_call_log(&[record(1, "prompt")]).unwrap();
+        mirror.put_blob("output.json", b"{}").unwrap();
+        let tee = TeeRunStore::new(FsRunStore::new(&dir), Arc::new(mirror));
+
+        let error = tee
+            .load_call_log()
+            .expect_err("tee hid torn primary corruption behind a completed mirror");
+        let message = format!("{error:#}");
+        assert!(message.contains("records.jsonl"), "missing path: {message}");
+        assert!(message.contains("line 2"), "missing line number: {message}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The compare-and-swap contract every backend must satisfy, whether or
