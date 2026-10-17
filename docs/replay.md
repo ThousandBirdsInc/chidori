@@ -61,12 +61,11 @@ Replay is guarded, not best-effort:
   `request_digest` field is ignored). A completed async host call whose
   recorded arguments differ from the re-executed call's is a hard divergence
   error instead of a silent live re-execution of the side effect.
-- **Escape hatch:** `CHIDORI_REPLAY_LAX=1` downgrades eligible journaled
-  argument divergence to a warning and may tolerate it using the historical
-  recorded-result/live-reexecution behavior. A mismatch against a durably
-  completed host promise remains fatal and never re-executes, even in lax mode:
-  the durable completion establishes that the effect already finished.
-  Function-name mismatches are always fatal.
+- **Escape hatch:** `CHIDORI_REPLAY_LAX=1` downgrades argument divergence for a
+  call with a journal record to a warning and serves its recorded result.
+  Function-name mismatches remain fatal. For an async host call whose journal
+  row is missing, any mismatch with a durable host-promise completion is still
+  fatal, even with LAX; the completed side effect is never re-executed.
 
 `chidori resume` carries the run's own configuration so recovery needs no
 flag archaeology:
