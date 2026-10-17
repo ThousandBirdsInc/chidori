@@ -1225,6 +1225,7 @@ mod tests {
             first.seq
         );
         assert!(meta.sequence_range.contains(first.seq));
+        assert!(records.windows(2).all(|pair| pair[0].seq < pair[1].seq));
 
         // Resume with a fresh backend (the parent context is history).
         let resume_backend = test_backend(RuntimeContext::new(), Arc::new(ToolRegistry::new()));

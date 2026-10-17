@@ -1137,11 +1137,27 @@ fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
         "initial run should perform one live effect"
     );
     let run_id = first_run_id(&dir);
-    let records_path = dir
-        .join(".chidori")
-        .join("runs")
-        .join(&run_id)
-        .join("records.jsonl");
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
+    let manifest_path = run_dir.join("runtime.snapshot.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert!(manifest["branch"].is_null());
+    // Install the agreed provenance marker into this known fresh-root
+    // fixture. The current CLI writer predates the field on origin/main.
+    manifest["journal_origin"] = serde_json::json!({ "kind": "fresh_top_level", "first_seq": 1 });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(
+        manifest["journal_origin"],
+        serde_json::json!({ "kind": "fresh_top_level", "first_seq": 1 }),
+        "fresh-root fixture must persist the marker whose anchor is under test"
+    );
     let journal = fs::read_to_string(&records_path).unwrap();
     let mut lines = journal.lines();
     let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
@@ -1176,6 +1192,181 @@ fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
     assert!(
         diagnostic.to_lowercase().contains("corrupt"),
         "expected a corruption diagnostic, got:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(&records_path.display().to_string()),
+        "corruption diagnostic must identify the journal path; got:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("line 1"),
+        "corruption diagnostic must identify 1-based line 1; got:\n{diagnostic}"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_run_persists_fresh_top_level_journal_origin_marker() {
+    let dir = temp_project("fresh-root-origin-marker");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("fresh root", {});
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori(&["run", agent.to_str().unwrap()], &dir);
+    assert_success(&output);
+    let run_id = first_run_id(&dir);
+    let manifest_path = dir
+        .join(".chidori")
+        .join("runs")
+        .join(run_id)
+        .join("runtime.snapshot.json");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(
+        manifest["journal_origin"],
+        serde_json::json!({ "kind": "fresh_top_level", "first_seq": 1 }),
+        "fresh top-level run must persist the provenance that makes seq 1 an anchor"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_resume_accepts_missing_seq_one_for_ambiguous_legacy_manifest() {
+    let dir = temp_project("resume-legacy-missing-seq-one");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("first", {});
+                await chidori.log("second", {});
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori(&["run", agent.to_str().unwrap()], &dir);
+    assert_success(&output);
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let manifest_path = run_dir.join("runtime.snapshot.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert!(manifest["branch"].is_null());
+    assert!(
+        manifest.get("journal_origin").is_none(),
+        "fixture must represent an ambiguous legacy manifest without an origin marker"
+    );
+
+    let records_path = run_dir.join("records.jsonl");
+    let journal = fs::read_to_string(&records_path).unwrap();
+    let mut lines = journal.lines();
+    let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(
+        first["seq"], 1,
+        "fixture starts with the record being removed"
+    );
+    assert_eq!(first["function"], "log");
+    let remaining = lines.collect::<Vec<_>>().join("\n") + "\n";
+    fs::write(&records_path, remaining).unwrap();
+    // Keep the checkpoint view consistent with the damaged journal when the
+    // selected store layout has one; this makes the missing-head condition
+    // independent of checkpoint/tail precedence.
+    let checkpoint_path = run_dir.join("checkpoint.json");
+    if checkpoint_path.exists() {
+        let mut checkpoint: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+        checkpoint.retain(|record| record["seq"] != 1);
+        fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&checkpoint).unwrap(),
+        )
+        .unwrap();
+    }
+    // Keep the legacy discriminator explicitly ambiguous; older serde readers
+    // default both an absent marker and branch=None to unknown provenance.
+    manifest.as_object_mut().unwrap().remove("journal_origin");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let output = run_chidori(&["resume", agent.to_str().unwrap(), &run_id], &dir);
+    assert_success(&output);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_resume_rejects_out_of_order_non_one_history() {
+    let dir = temp_project("resume-legacy-out-of-order");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("first", {});
+                await chidori.log("second", {});
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori(&["run", agent.to_str().unwrap()], &dir);
+    assert_success(&output);
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
+    let rows: Vec<serde_json::Value> = fs::read_to_string(&records_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(rows.len() >= 2, "fixture must contain at least two records");
+    let mut invalid = rows.clone();
+    // Keep seq 1 as the root anchor so this specifically exercises structural
+    // order validation rather than the fresh-root missing-head guard.
+    invalid[0]["seq"] = serde_json::json!(1);
+    invalid[1]["seq"] = serde_json::json!(0);
+    let mut journal = Vec::new();
+    for row in &invalid {
+        journal.extend(serde_json::to_vec(row).unwrap());
+        journal.push(b'\n');
+    }
+    fs::write(&records_path, &journal).unwrap();
+    fs::write(
+        run_dir.join("checkpoint.json"),
+        serde_json::to_vec_pretty(&invalid).unwrap(),
+    )
+    .unwrap();
+
+    let output = run_chidori(&["resume", agent.to_str().unwrap(), &run_id], &dir);
+    assert_failure(&output);
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.to_lowercase().contains("corrupt"),
+        "out-of-order records must be rejected as journal corruption; output:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(&records_path.display().to_string()),
+        "out-of-order corruption must identify the journal path; output:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("line 2"),
+        "out-of-order corruption must identify 1-based line 2; output:\n{diagnostic}"
     );
     fs::remove_dir_all(dir).ok();
 }
