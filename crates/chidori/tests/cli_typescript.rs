@@ -338,6 +338,35 @@ fn assert_failure(output: &Output) {
     );
 }
 
+fn output_diagnostic(output: &Output) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn assert_diagnostic_contains(output: &Output, expected: &str) {
+    let diagnostic = output_diagnostic(output);
+    assert!(
+        diagnostic.contains(expected),
+        "diagnostic must contain {expected:?}; output:\n{diagnostic}"
+    );
+}
+
+fn assert_journal_location(output: &Output, path: &Path, line: usize) {
+    let diagnostic = output_diagnostic(output);
+    assert!(
+        diagnostic.contains(&path.display().to_string()),
+        "journal diagnostic must identify {}; output:\n{diagnostic}",
+        path.display()
+    );
+    assert!(
+        diagnostic.contains(&format!("line {line}")),
+        "journal diagnostic must identify 1-based line {line}; output:\n{diagnostic}"
+    );
+}
+
 #[test]
 fn cli_check_accepts_typescript_agent() {
     let dir = temp_project("check");
@@ -1138,6 +1167,7 @@ fn cli_resume_rejects_missing_first_root_record_before_live_effect() {
         "corruption must be rejected before replay can execute the deleted live effect"
     );
     assert_failure(&output);
+    assert_journal_location(&output, &records_path, 1);
     let diagnostic = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1255,6 +1285,7 @@ fn cli_resume_rejects_truncated_final_effect_before_live_reexecution() {
         "resume must reject the damaged final row before executing the third live effect again"
     );
     assert_failure(&output);
+    assert_journal_location(&output, &records_path, 3);
     let diagnostic = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1399,6 +1430,11 @@ fn cli_resume_rejects_mismatched_http_promise_args_even_in_replay_lax_mode() {
         "argument mismatch must not reissue the HTTP effect, even in lax mode"
     );
     assert_failure(&output);
+    assert_diagnostic_contains(&output, "Replay divergence at seq 2");
+    assert_diagnostic_contains(
+        &output,
+        "does not permit re-execution after a durable completion",
+    );
     fs::remove_dir_all(&fixture.dir).ok();
 }
 
@@ -1418,6 +1454,7 @@ fn cli_resume_rejects_mismatched_http_promise_kind_before_live_contact() {
         "kind mismatch must not reissue the HTTP effect"
     );
     assert_failure(&output);
+    assert_diagnostic_contains(&output, "inconsistent with function `http`");
     fs::remove_dir_all(&fixture.dir).ok();
 }
 
@@ -1439,6 +1476,7 @@ fn cli_resume_rejects_ambiguous_duplicate_http_completions_before_live_contact()
         "ambiguous completions must not trigger a live HTTP effect"
     );
     assert_failure(&output);
+    assert_diagnostic_contains(&output, "multiple operations at seq 2");
     fs::remove_dir_all(&fixture.dir).ok();
 }
 
@@ -1466,6 +1504,7 @@ fn cli_resume_rejects_dangling_journal_reference_before_live_contact() {
         "dangling completed reference must fail before live contact"
     );
     assert_failure(&output);
+    assert_diagnostic_contains(&output, "journal has no clean record at that seq");
     fs::remove_dir_all(&fixture.dir).ok();
 }
 
@@ -1495,8 +1534,8 @@ fn cli_resume_rejects_malformed_http_promise_blob_before_live_contact() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        diagnostic.contains("host_promises/2.json"),
-        "malformed host-promise diagnostic must identify its blob key; output:\n{diagnostic}"
+        diagnostic.contains("parsing durable host-promise record host_promises/2.json"),
+        "malformed host-promise diagnostic must identify the parsing context and blob key; output:\n{diagnostic}"
     );
     fs::remove_dir_all(&fixture.dir).ok();
 }

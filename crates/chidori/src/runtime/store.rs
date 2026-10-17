@@ -2308,12 +2308,20 @@ mod tests {
         bytes.extend_from_slice(b"\n{not-json}\n");
         bytes.extend(serde_json::to_vec(&record(3, "tool")).unwrap());
         bytes.push(b'\n');
-        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
+        let path = dir.join(RECORDS_FILE);
+        std::fs::write(&path, bytes).unwrap();
 
-        let result = FsRunStore::new(&dir).load_call_log();
+        let error = FsRunStore::new(&dir)
+            .load_call_log()
+            .expect_err("malformed interior JSONL record was discarded");
+        let diagnostic = format!("{error:#}");
         assert!(
-            result.is_err(),
-            "malformed interior JSONL record was discarded"
+            diagnostic.contains(&path.display().to_string()),
+            "missing journal path: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("line 2"),
+            "missing 1-based line: {diagnostic}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2327,12 +2335,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut bytes = serde_json::to_vec(&record(1, "prompt")).unwrap();
         bytes.extend_from_slice(b"\n{not-json}\n");
-        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
+        let path = dir.join(RECORDS_FILE);
+        std::fs::write(&path, bytes).unwrap();
 
-        let result = FsRunStore::new(&dir).load_call_log();
+        let error = FsRunStore::new(&dir)
+            .load_call_log()
+            .expect_err("complete malformed final record was discarded");
+        let diagnostic = format!("{error:#}");
         assert!(
-            result.is_err(),
-            "complete malformed final record was discarded"
+            diagnostic.contains(&path.display().to_string()),
+            "missing journal path: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("line 2"),
+            "missing 1-based line: {diagnostic}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2344,12 +2360,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut bytes = serde_json::to_vec(&record(1, "prompt")).unwrap();
         bytes.extend_from_slice(b"\n{\"seq\":");
-        std::fs::write(dir.join(RECORDS_FILE), bytes).unwrap();
+        let path = dir.join(RECORDS_FILE);
+        std::fs::write(&path, bytes).unwrap();
 
-        let result = FsRunStore::new(&dir).load_call_log();
+        let error = FsRunStore::new(&dir)
+            .load_call_log()
+            .expect_err("unterminated final record was discarded and prior records accepted");
+        let diagnostic = format!("{error:#}");
         assert!(
-            result.is_err(),
-            "unterminated final record was discarded and prior records accepted"
+            diagnostic.contains(&path.display().to_string()),
+            "missing journal path: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("line 2"),
+            "missing 1-based line: {diagnostic}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
