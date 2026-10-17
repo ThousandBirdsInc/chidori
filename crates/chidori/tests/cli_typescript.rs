@@ -122,6 +122,7 @@ struct HttpReplayFixture {
     run_dir: PathBuf,
     records_path: PathBuf,
     http_record: serde_json::Value,
+    mirror_db: Option<PathBuf>,
 }
 
 impl Drop for HttpReplayFixture {
@@ -131,7 +132,18 @@ impl Drop for HttpReplayFixture {
 }
 
 fn create_http_replay_fixture(server: &LocalHttpServer) -> HttpReplayFixture {
+    create_http_replay_fixture_with_mirror(server, false)
+}
+
+fn create_http_replay_fixture_with_mirror(
+    server: &LocalHttpServer,
+    use_sqlite_mirror: bool,
+) -> HttpReplayFixture {
     let dir = temp_project("http-promise-contract");
+    let mirror_db = use_sqlite_mirror.then(|| dir.join("runs.sqlite3"));
+    let mirror_db_text = mirror_db
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
     let agent = dir.join("agent.ts");
     fs::write(
         &agent,
@@ -147,14 +159,16 @@ fn create_http_replay_fixture(server: &LocalHttpServer) -> HttpReplayFixture {
         ),
     )
     .unwrap();
-    let output = run_chidori_with_str_env(
-        &["run", agent.to_str().unwrap(), "--trusted"],
-        &dir,
-        &[
-            ("CHIDORI_DURABILITY", "effect"),
-            ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
-        ],
-    );
+    let mut envs = vec![
+        ("CHIDORI_DURABILITY", "effect"),
+        ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
+    ];
+    if let Some(db_path) = &mirror_db_text {
+        envs.push(("CHIDORI_RUN_STORE", "sqlite"));
+        envs.push(("CHIDORI_RUN_DB", db_path));
+    }
+    let output =
+        run_chidori_with_str_env(&["run", agent.to_str().unwrap(), "--trusted"], &dir, &envs);
     assert_success(&output);
     let run_id = first_run_id(&dir);
     let run_dir = dir.join(".chidori").join("runs").join(&run_id);
@@ -179,6 +193,7 @@ fn create_http_replay_fixture(server: &LocalHttpServer) -> HttpReplayFixture {
         run_dir,
         records_path,
         http_record: records[1].clone(),
+        mirror_db,
     }
 }
 
@@ -193,30 +208,19 @@ fn journal_records(path: &Path) -> Vec<serde_json::Value> {
 fn remove_http_journal_row(fixture: &HttpReplayFixture) {
     let mut records = journal_records(&fixture.records_path);
     records.retain(|record| record["seq"] != 2);
-    fs::write(
-        &fixture.records_path,
-        records
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .join("\n")
-            + "\n",
-    )
-    .unwrap();
+    let records: Vec<chidori::runtime::call_log::CallRecord> = records
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    fixture_run_store(fixture).write_call_log(&records).unwrap();
 }
 
 fn persist_resolved_http_operation(fixture: &HttpReplayFixture) -> serde_json::Value {
     use chidori::runtime::context::RuntimeContext;
     use chidori::runtime::snapshot::PendingHostOperationKind;
-    use chidori::runtime::store::FsRunStore;
-    use std::sync::Arc;
-
     let ctx = RuntimeContext::new();
-    ctx.enable_persistence_with_store(
-        fixture.run_dir.clone(),
-        Arc::new(FsRunStore::new(&fixture.run_dir)),
-    );
+    ctx.enable_persistence_with_store(fixture.run_dir.clone(), fixture_run_store(fixture));
     let prefix = ctx.begin_host_operation_with_function(
         1,
         PendingHostOperationKind::Log,
@@ -246,14 +250,8 @@ fn persist_resolved_http_operation(fixture: &HttpReplayFixture) -> serde_json::V
 fn persist_pending_http_operation(fixture: &HttpReplayFixture) -> serde_json::Value {
     use chidori::runtime::context::RuntimeContext;
     use chidori::runtime::snapshot::PendingHostOperationKind;
-    use chidori::runtime::store::FsRunStore;
-    use std::sync::Arc;
-
     let ctx = RuntimeContext::new();
-    ctx.enable_persistence_with_store(
-        fixture.run_dir.clone(),
-        Arc::new(FsRunStore::new(&fixture.run_dir)),
-    );
+    ctx.enable_persistence_with_store(fixture.run_dir.clone(), fixture_run_store(fixture));
     let prefix = ctx.begin_host_operation_with_function(
         1,
         PendingHostOperationKind::Log,
@@ -272,6 +270,25 @@ fn persist_pending_http_operation(fixture: &HttpReplayFixture) -> serde_json::Va
 
     let path = fixture.run_dir.join("host_promises").join("2.json");
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+fn fixture_run_store(
+    fixture: &HttpReplayFixture,
+) -> std::sync::Arc<dyn chidori::runtime::store::RunStore> {
+    use chidori::runtime::store::{FsRunStore, SqliteRunStore, SqliteRunStoreShared, TeeRunStore};
+    use std::sync::Arc;
+
+    let primary = FsRunStore::new(&fixture.run_dir);
+    match &fixture.mirror_db {
+        Some(db_path) => {
+            let shared = SqliteRunStoreShared::open(db_path).unwrap();
+            Arc::new(TeeRunStore::new(
+                primary,
+                Arc::new(SqliteRunStore::new(shared, fixture.run_id.clone())),
+            ))
+        }
+        None => Arc::new(primary),
+    }
 }
 
 fn store_host_promise_blob(fixture: &HttpReplayFixture, id: u64, blob: &serde_json::Value) {
@@ -1285,6 +1302,65 @@ fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
 }
 
 #[test]
+fn cli_resume_hydrates_resolved_http_promise_from_sqlite_mirror() {
+    let server = LocalHttpServer::start();
+    let fixture = create_http_replay_fixture_with_mirror(&server, true);
+    assert_eq!(server.request_count(), 1);
+    let promise = persist_resolved_http_operation(&fixture);
+    assert_eq!(promise["operation"]["seq"], 2);
+    assert_eq!(promise["operation"]["kind"], "http");
+    assert_eq!(promise["operation"]["args"], fixture.http_record["args"]);
+    assert_eq!(
+        promise["state"]["resolved"]["value"],
+        fixture.http_record["result"]
+    );
+
+    remove_http_journal_row(&fixture);
+    let mirror = fixture_run_store(&fixture);
+    let mirrored_journal = mirror.load_call_log().unwrap().unwrap();
+    assert_eq!(mirrored_journal.len(), 1);
+    assert_eq!(mirrored_journal[0].seq, 1);
+    assert!(mirror.get_blob("host_promises/2.json").unwrap().is_some());
+
+    fs::remove_dir_all(&fixture.run_dir).unwrap();
+    assert!(
+        !fixture.run_dir.exists(),
+        "resume must begin without a local run directory"
+    );
+    let db_path = fixture
+        .mirror_db
+        .as_ref()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let output = resume_http_fixture(
+        &fixture,
+        &[
+            ("CHIDORI_RUN_STORE", "sqlite"),
+            ("CHIDORI_RUN_DB", &db_path),
+        ],
+    );
+
+    // Count external contact before inspecting recovery output: a resumed
+    // request would be the duplicate side effect this mirror case guards.
+    assert_eq!(
+        server.request_count(),
+        1,
+        "mirror hydration must serve the resolved operation without a second HTTP request"
+    );
+    assert_success(&output);
+    let recovered = journal_records(&fixture.records_path);
+    let recovered_http = recovered
+        .iter()
+        .find(|record| record["seq"] == 2 && record["function"] == "http")
+        .expect("hydrated resume should restore the missing HTTP journal row");
+    assert_eq!(
+        recovered_http["result"],
+        promise["state"]["resolved"]["value"]
+    );
+}
+
+#[test]
 fn cli_resume_prefers_intact_http_journal_over_promise_fallback() {
     let server = LocalHttpServer::start();
     let fixture = create_http_replay_fixture(&server);
@@ -1413,6 +1489,15 @@ fn cli_resume_rejects_malformed_http_promise_blob_before_live_contact() {
         "malformed completion must fail before live contact"
     );
     assert_failure(&output);
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("host_promises/2.json"),
+        "malformed host-promise diagnostic must identify its blob key; output:\n{diagnostic}"
+    );
     fs::remove_dir_all(&fixture.dir).ok();
 }
 
