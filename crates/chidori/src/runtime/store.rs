@@ -314,11 +314,18 @@ impl RunStore for FsRunStore {
         let tail: Vec<CallRecord> = match std::fs::read_to_string(self.run_dir.join(RECORDS_FILE)) {
             Ok(text) => text
                 .lines()
-                .filter(|line| !line.trim().is_empty())
-                // A crash can truncate the final line mid-write; drop it and
-                // keep every complete record before it.
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
+                .enumerate()
+                .filter(|(_, line)| !line.trim().is_empty())
+                .map(|(index, line)| {
+                    serde_json::from_str(line).with_context(|| {
+                        format!(
+                            "corrupt call journal: parsing {} line {}",
+                            self.run_dir.join(RECORDS_FILE).display(),
+                            index + 1
+                        )
+                    })
+                })
+                .collect::<Result<Vec<CallRecord>>>()?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => {
                 return Err(err).with_context(|| {
@@ -326,7 +333,11 @@ impl RunStore for FsRunStore {
                 })
             }
         };
-        Ok(union_checkpoint_and_tail(checkpoint, tail))
+        let records = union_checkpoint_and_tail(checkpoint, tail);
+        if let Some(records) = &records {
+            validate_composed_journal(records)?;
+        }
+        Ok(records)
     }
 
     fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -407,6 +418,20 @@ impl RunStore for FsRunStore {
     fn flush(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Validate invariants after checkpoint and append-tail records are composed.
+/// Numeric gaps are valid because actors reserve sequence ranges.
+pub(crate) fn validate_composed_journal(records: &[CallRecord]) -> Result<()> {
+    for pair in records.windows(2) {
+        anyhow::ensure!(
+            pair[0].seq < pair[1].seq,
+            "corrupt call journal: sequence numbers are not strictly increasing ({} then {})",
+            pair[0].seq,
+            pair[1].seq
+        );
+    }
+    Ok(())
 }
 
 /// Union a full checkpoint with the appended tail: checkpoint order wins;

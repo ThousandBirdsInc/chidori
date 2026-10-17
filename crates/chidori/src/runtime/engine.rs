@@ -638,6 +638,26 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    /// Resume under the original run id with durable async host-promise state.
+    /// A completed promise can cover the crash window after its result was
+    /// persisted but before the corresponding journal append landed.
+    pub fn resume_run_with_host_promises(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        run_id: &str,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::with_replay_host_promises_and_vfs(
+            replay_log,
+            host_promises,
+            crate::runtime::vfs::Vfs::new(),
+        );
+        ctx.set_run_id(run_id.to_string());
+        self.run_with_context(path, inputs, ctx)
+    }
+
     #[allow(dead_code)] // Lib-facade entry point; the bin target compiles the module tree separately and never calls it.
     pub fn run_with_replay_and_host_promises(
         &self,
@@ -731,6 +751,26 @@ impl Engine {
         sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<RunResult> {
         let ctx = RuntimeContext::with_replay(replay_log);
+        ctx.set_run_id(run_id.to_string());
+        ctx.set_event_sender(sender);
+        self.run_with_context(path, inputs, ctx)
+    }
+
+    /// Streaming twin of [`Engine::resume_run_with_host_promises`].
+    pub fn resume_run_streaming_with_host_promises(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        run_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::with_replay_host_promises_and_vfs(
+            replay_log,
+            host_promises,
+            crate::runtime::vfs::Vfs::new(),
+        );
         ctx.set_run_id(run_id.to_string());
         ctx.set_event_sender(sender);
         self.run_with_context(path, inputs, ctx)

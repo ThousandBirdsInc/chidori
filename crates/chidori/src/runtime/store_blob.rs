@@ -537,14 +537,18 @@ impl RunStore for BlobRunStore {
         let mut tail = Vec::with_capacity(tail_keys.len());
         for key in tail_keys {
             if let Some(bytes) = self.store.get_object(&key)? {
-                if let Ok(record) = serde_json::from_slice::<CallRecord>(&bytes) {
-                    tail.push(record);
-                }
+                tail.push(
+                    serde_json::from_slice::<CallRecord>(&bytes).with_context(|| {
+                        format!("corrupt call journal: parsing record object {key}")
+                    })?,
+                );
             }
         }
-        Ok(crate::runtime::store::union_checkpoint_and_tail(
-            checkpoint, tail,
-        ))
+        let records = crate::runtime::store::union_checkpoint_and_tail(checkpoint, tail);
+        if let Some(records) = &records {
+            crate::runtime::store::validate_composed_journal(records)?;
+        }
+        Ok(records)
     }
 
     fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {

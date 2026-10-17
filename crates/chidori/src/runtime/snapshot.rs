@@ -514,12 +514,10 @@ pub fn load_host_promise_records(
         let Some(bytes) = store.get_blob(&key)? else {
             continue;
         };
-        match serde_json::from_slice::<HostPromiseRecord>(&bytes) {
-            Ok(record) => tail.push(record),
-            // A crash can truncate a blob mid-write; the compacted base (or
-            // the pending re-execution path) covers that operation.
-            Err(_) => continue,
-        }
+        tail.push(
+            serde_json::from_slice::<HostPromiseRecord>(&bytes)
+                .with_context(|| format!("parsing durable host-promise record {key}"))?,
+        );
     }
     tail.sort_by_key(|record| record.operation.id.0);
     for record in tail {

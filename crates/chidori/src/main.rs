@@ -2795,6 +2795,12 @@ fn cmd_resume(
         .store_for(run_id)
         .load_call_log()?
         .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
+    anyhow::ensure!(
+        records.first().is_some_and(|record| record.seq == 1),
+        "corrupt top-level run journal: expected its first record at seq 1 before replay"
+    );
+    let host_promises =
+        crate::runtime::snapshot::load_host_promise_records(factory.store_for(run_id).as_ref())?;
 
     // `--retry-failed`: first-class repair for a failed run. The trailing
     // failed record(s) — the crash frontier — are stripped with the exact
@@ -2965,11 +2971,20 @@ fn cmd_resume(
     // replayed prefix stays silent. CHIDORI_QUIET=1 opts out.
     let result = match spawn_prompt_progress_listener() {
         Some((event_tx, drain)) => {
-            let result = engine.resume_run_streaming(file, &input_value, records, run_id, event_tx);
+            let result = engine.resume_run_streaming_with_host_promises(
+                file,
+                &input_value,
+                records,
+                host_promises,
+                run_id,
+                event_tx,
+            );
             drain.join().ok();
             result
         }
-        None => engine.resume_run(file, &input_value, records, run_id),
+        None => {
+            engine.resume_run_with_host_promises(file, &input_value, records, host_promises, run_id)
+        }
     };
     let _ =
         crate::runtime::store::release_lease(factory.store_for(run_id).as_ref(), &cli_lease_owner);
