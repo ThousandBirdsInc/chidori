@@ -1801,15 +1801,16 @@ mod tests {
 
         let mut failures = Vec::new();
         for backend in ["fs", "sqlite"] {
-            let base = test_dir(&format!("inbox-missed-wake-{backend}"));
+            let base = tempfile::tempdir().unwrap();
+            let db_path = base.path().join("runs.sqlite3");
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("runtime::host_agent::tests::detached_inbox_missed_wake_does_not_hibernate_with_matching_payloads")
                 .arg("--nocapture")
                 .env(CHILD, "1")
-                .env("CHIDORI_TEST_DETACHED_INBOX_BASE", &base)
+                .env("CHIDORI_TEST_DETACHED_INBOX_BASE", base.path())
                 .env("CHIDORI_RUN_STORE", backend)
-                .env("CHIDORI_RUN_DB", base.join("runs.sqlite3"))
+                .env("CHIDORI_RUN_DB", db_path)
                 .output()
                 .unwrap();
             let report = format!(
@@ -1818,7 +1819,6 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            let _ = std::fs::remove_dir_all(&base);
             if !output.status.success() {
                 failures.push(report);
             }
