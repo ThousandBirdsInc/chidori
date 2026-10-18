@@ -675,22 +675,37 @@ impl DetachedAgentHub {
             };
             let name = descriptor.name.clone();
             match descriptor.status.as_str() {
-                // Died mid-run: resume-by-replay continues at the frontier.
-                "running" => {
+                "running" | "hibernating" => {
                     factory.hydrate(&descriptor.run_id).map_err(|err| {
                         format!("hydrating detached-agent journal for {name}: {err:#}")
                     })?;
                     let entry = self.ensure_entry(&parts_for_entries, &name)?;
-                    self.start_thread(entry)?;
-                    rearmed += 1;
-                }
-                // Hibernating: entry re-created; sends and (via the timer
-                // thread) alarm deadlines wake it.
-                "hibernating" => {
-                    factory.hydrate(&descriptor.run_id).map_err(|err| {
-                        format!("hydrating detached-agent journal for {name}: {err:#}")
-                    })?;
-                    self.ensure_entry(&parts_for_entries, &name)?;
+                    let completed_listen = if let Some(listen) = descriptor.listen.as_ref() {
+                        let records = factory
+                            .store_for(&descriptor.run_id)
+                            .load_call_log()
+                            .map_err(|err| {
+                                format!("loading detached-agent journal for {name}: {err:#}")
+                            })?
+                            .unwrap_or_default();
+                        listen_has_completed_record(listen, &records)
+                    } else {
+                        false
+                    };
+                    if completed_listen {
+                        // The durable descriptor can lag a successful listen
+                        // record when the process exits between inbox commit
+                        // and publishing the live context. Journal evidence
+                        // proves this listen already completed, so don't use
+                        // its stale names to decide whether replay can start.
+                        entry.state.lock().unwrap().descriptor.listen = None;
+                    }
+                    if descriptor.status == "running" || completed_listen {
+                        // A mid-run descriptor always resumes. A hibernating
+                        // descriptor resumes here only when the journal proves
+                        // its persisted listener is already past the frontier.
+                        self.start_thread(entry)?;
+                    }
                     rearmed += 1;
                 }
                 _ => {}
@@ -1333,6 +1348,35 @@ fn listen_state(ctx: &RuntimeContext, pending: &PendingSignal) -> ListenState {
             .timeout_ms
             .map(|ms| Utc::now() + chrono::Duration::milliseconds(ms as i64)),
     }
+}
+
+/// A completed journal record is authoritative when a crash left the
+/// descriptor pointing at the listen that produced it. This lets rearm
+/// distinguish an already-consumed listener from a genuinely pending hibernate
+/// without inferring state from a descriptor status alone.
+fn listen_has_completed_record(listen: &ListenState, records: &[CallRecord]) -> bool {
+    records.iter().any(|record| {
+        if record.seq != listen.seq || record.function != listen.function || record.error.is_some()
+        {
+            return false;
+        }
+        match listen.function.as_str() {
+            "signal" => listen.names.first().is_some_and(|name| {
+                record.args.get("name").and_then(Value::as_str) == Some(name.as_str())
+            }),
+            "signal_any" => record
+                .args
+                .get("names")
+                .and_then(Value::as_array)
+                .is_some_and(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .eq(listen.names.iter().map(String::as_str))
+                }),
+            _ => false,
+        }
+    })
 }
 
 /// Persist `descriptor` to the registry (and the run dir's `agent.json`),
