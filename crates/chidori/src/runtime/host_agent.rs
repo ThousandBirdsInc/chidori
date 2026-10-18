@@ -925,6 +925,8 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
             _ => Vec::new(),
         };
+        #[cfg(test)]
+        tests::pause_after_supervisor_inbox_snapshot(&entry.name);
         if let Some(listen) = descriptor.listen.clone() {
             let matched = inbox
                 .iter()
@@ -1080,6 +1082,8 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             let mut state = entry.state.lock().unwrap();
             state.live_ctx = Some(ctx.clone());
         }
+        #[cfg(test)]
+        tests::pause_after_supervisor_publishes_live_context(&entry.name);
         let result =
             crate::runtime::rust_engine::run_agent_file(&resolved, &descriptor.input, &backend);
         {
@@ -1666,6 +1670,59 @@ mod tests {
 
     static INBOX_RACE_BARRIERS: OnceLock<StdMutex<Option<Arc<InboxRaceBarriers>>>> =
         OnceLock::new();
+
+    struct InboxSnapshotGapBarriers {
+        agent_name: String,
+        snapshot_arrived: std::sync::mpsc::Sender<()>,
+        snapshot_release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        context_published: std::sync::mpsc::Sender<()>,
+        context_release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        snapshot_claimed: AtomicBool,
+        context_claimed: AtomicBool,
+    }
+
+    static INBOX_SNAPSHOT_GAP_BARRIERS: OnceLock<StdMutex<Option<Arc<InboxSnapshotGapBarriers>>>> =
+        OnceLock::new();
+
+    pub(super) fn pause_after_supervisor_inbox_snapshot(agent_name: &str) {
+        let barriers = INBOX_SNAPSHOT_GAP_BARRIERS
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap()
+            .clone();
+        let Some(barriers) = barriers.filter(|barriers| barriers.agent_name == agent_name) else {
+            return;
+        };
+        if barriers.snapshot_claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = barriers.snapshot_arrived.send(());
+        let _ = barriers
+            .snapshot_release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+    }
+
+    pub(super) fn pause_after_supervisor_publishes_live_context(agent_name: &str) {
+        let barriers = INBOX_SNAPSHOT_GAP_BARRIERS
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap()
+            .clone();
+        let Some(barriers) = barriers.filter(|barriers| barriers.agent_name == agent_name) else {
+            return;
+        };
+        if barriers.context_claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = barriers.context_published.send(());
+        let _ = barriers
+            .context_release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+    }
 
     pub(super) fn pause_after_live_context_snapshot(agent_name: &str) {
         let barriers = INBOX_RACE_BARRIERS
@@ -2839,6 +2896,184 @@ mod tests {
             output.status.success(),
             "paced SQLite detached signal batch lost an acknowledged payload:\n{report}"
         );
+    }
+
+    #[test]
+    fn detached_inbox_snapshot_to_live_context_gap_preserves_acknowledged_payloads() {
+        const CHILD: &str = "CHIDORI_TEST_INBOX_SNAPSHOT_GAP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let base =
+                PathBuf::from(std::env::var_os("CHIDORI_TEST_INBOX_SNAPSHOT_GAP_BASE").unwrap());
+            let loss = run_inbox_snapshot_to_live_context_gap(&base);
+            assert!(
+                loss.is_none(),
+                "acknowledged payload missing from both child journal and inbox: {}",
+                loss.unwrap_or_default()
+            );
+            return;
+        }
+
+        let base = tempfile::tempdir().unwrap();
+        let db_path = base.path().join("runs.sqlite3");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::host_agent::tests::detached_inbox_snapshot_to_live_context_gap_preserves_acknowledged_payloads",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CHIDORI_TEST_INBOX_SNAPSHOT_GAP_BASE", base.path())
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env("CHIDORI_RUN_DB", db_path)
+            .env("CHIDORI_DURABILITY", "strict")
+            .output()
+            .unwrap();
+        let report = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "inbox snapshot-to-live-context interleaving lost an acknowledged payload:\n{report}"
+        );
+    }
+
+    fn run_inbox_snapshot_to_live_context_gap(base: &Path) -> Option<String> {
+        let project = base.join("snapshot-gap");
+        std::fs::create_dir_all(project.join("services")).unwrap();
+        let source = project.join("services/worker.ts");
+        std::fs::write(
+            &source,
+            r#"export async function agent() {
+                for (let i = 0; i < 5; i++) {
+                    const message = await chidori.signal("tick");
+                    await chidori.log("cycle", { n: message.payload.n });
+                }
+                return { done: true };
+            }"#,
+        )
+        .unwrap();
+        let agent_name = unique("inbox-snapshot-gap");
+        let run_base = project.join(".chidori/runs");
+        let parts = sqlite_test_parts(&project, run_base.clone(), Arc::new(ToolRegistry::new()));
+        hub().install_parts(parts.clone());
+        let options = SpawnOptions {
+            name: Some(agent_name.clone()),
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            model: None,
+        };
+
+        let snapshot_arrived_rx;
+        let snapshot_release_tx;
+        let context_published_rx;
+        let context_release_tx;
+        {
+            let (arrived_tx, rx) = std::sync::mpsc::channel();
+            snapshot_arrived_rx = rx;
+            let (release_tx, snapshot_release_rx) = std::sync::mpsc::channel();
+            snapshot_release_tx = release_tx;
+            let (published_tx, rx) = std::sync::mpsc::channel();
+            context_published_rx = rx;
+            let (release_tx, context_release_rx) = std::sync::mpsc::channel();
+            context_release_tx = release_tx;
+            *INBOX_SNAPSHOT_GAP_BARRIERS
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap() = Some(Arc::new(InboxSnapshotGapBarriers {
+                agent_name: agent_name.clone(),
+                snapshot_arrived: arrived_tx,
+                snapshot_release: StdMutex::new(snapshot_release_rx),
+                context_published: published_tx,
+                context_release: StdMutex::new(context_release_rx),
+                snapshot_claimed: AtomicBool::new(false),
+                context_claimed: AtomicBool::new(false),
+            }));
+        }
+
+        let spawned = hub()
+            .spawn(
+                &parts,
+                source.to_str().unwrap(),
+                json!({}),
+                &options,
+                "snapshot-gap-test".to_string(),
+            )
+            .unwrap();
+        snapshot_arrived_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("supervisor did not reach inbox snapshot barrier");
+
+        let run_id = spawned["runId"].as_str().unwrap().to_string();
+        let mut acknowledged_ids = Vec::new();
+        for n in 0..5 {
+            if n == 1 {
+                snapshot_release_tx.send(()).unwrap();
+                context_published_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("supervisor did not publish live context");
+            }
+            let result = hub()
+                .send(
+                    &parts,
+                    &agent_name,
+                    "tick",
+                    json!({ "n": n }),
+                    json!({ "kind": "agent", "id": "snapshot-gap-test" }),
+                )
+                .unwrap();
+            assert_eq!(result["delivered"], json!(true), "payload n={n}");
+            acknowledged_ids.push(n);
+        }
+        context_release_tx.send(()).unwrap();
+        wait_for_agent_status(&parts, &agent_name, |status| {
+            status == "hibernating" || status == "completed" || status == "failed"
+        });
+        *INBOX_SNAPSHOT_GAP_BARRIERS
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap() = None;
+
+        let factory = RunStoreFactory::shared(&run_base);
+        let store = factory.store_for(&run_id);
+        let records = store.load_call_log().unwrap().unwrap_or_default();
+        let inbox: Vec<Value> = store
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+            .unwrap_or_default();
+        let accounted: Vec<(usize, usize, usize)> = acknowledged_ids
+            .iter()
+            .map(|n| {
+                let journal_count = records
+                    .iter()
+                    .filter(|record| {
+                        record.function == "signal" && record.result["payload"]["n"] == json!(n)
+                    })
+                    .count();
+                let inbox_count = inbox
+                    .iter()
+                    .filter(|queued| queued["payload"]["n"] == json!(n))
+                    .count();
+                (*n, journal_count, inbox_count)
+            })
+            .collect();
+        let missing: Vec<_> = accounted
+            .iter()
+            .filter(|(_, journal_count, inbox_count)| journal_count + inbox_count != 1)
+            .cloned()
+            .collect();
+        let _ = hub().stop(&parts, &agent_name);
+        wait_for_agent_status(&parts, &agent_name, |status| {
+            matches!(status, "stopped" | "completed" | "failed")
+        });
+        (!missing.is_empty()).then(|| {
+            format!(
+                "expected acknowledged n=0..4 exactly once in child journal or inbox; missing/duplicate={missing:?}, all_counts={accounted:?}, inbox={inbox:?}"
+            )
+        })
     }
 
     fn run_paced_signal_batch(base: &Path, trial: usize, count: usize) -> Option<String> {
