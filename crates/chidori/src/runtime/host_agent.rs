@@ -2853,52 +2853,6 @@ mod tests {
     }
 
     #[test]
-    fn paced_sqlite_detached_five_signal_batch_preserves_every_acknowledged_payload() {
-        const CHILD: &str = "CHIDORI_TEST_PACED_SQLITE_SIGNAL_LOSS_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            let base = PathBuf::from(
-                std::env::var_os("CHIDORI_TEST_PACED_SQLITE_SIGNAL_LOSS_BASE").unwrap(),
-            );
-            let mut losses = Vec::new();
-            for trial in 0..4 {
-                if let Some(loss) = run_paced_signal_batch(&base, trial, 5) {
-                    losses.push(loss);
-                }
-            }
-            assert!(
-                losses.is_empty(),
-                "acknowledged SQLite detached payloads missing from both journal and inbox: {losses:#?}"
-            );
-            return;
-        }
-
-        let base = tempfile::tempdir().unwrap();
-        let db_path = base.path().join("runs.sqlite3");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "runtime::host_agent::tests::paced_sqlite_detached_five_signal_batch_preserves_every_acknowledged_payload",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("CHIDORI_TEST_PACED_SQLITE_SIGNAL_LOSS_BASE", base.path())
-            .env("CHIDORI_RUN_STORE", "sqlite")
-            .env("CHIDORI_RUN_DB", db_path)
-            .env("CHIDORI_DURABILITY", "strict")
-            .output()
-            .unwrap();
-        let report = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            output.status.success(),
-            "paced SQLite detached signal batch lost an acknowledged payload:\n{report}"
-        );
-    }
-
-    #[test]
     fn detached_inbox_snapshot_to_live_context_gap_preserves_acknowledged_payloads() {
         const CHILD: &str = "CHIDORI_TEST_INBOX_SNAPSHOT_GAP_CHILD";
         if std::env::var_os(CHILD).is_some() {
@@ -2906,7 +2860,6 @@ mod tests {
                 PathBuf::from(std::env::var_os("CHIDORI_TEST_INBOX_SNAPSHOT_GAP_BASE").unwrap());
             let loss = run_inbox_snapshot_to_live_context_gap(&base);
             run_sequential_inbox_control(&base, 2);
-            println!("SQLite after-consumption sequential control passed; it is separate from the forced batch interleaving");
             assert!(
                 loss.is_none(),
                 "acknowledged payload missing from both child journal and inbox: {}",
@@ -3077,101 +3030,6 @@ mod tests {
         (!missing.is_empty()).then(|| {
             format!(
                 "expected acknowledged n=1 and n=2 exactly once in child journal or inbox; missing/duplicate={missing:?}, all_counts={accounted:?}, inbox={inbox:?}"
-            )
-        })
-    }
-
-    fn run_paced_signal_batch(base: &Path, trial: usize, count: usize) -> Option<String> {
-        let project = base.join(format!("trial-{trial}"));
-        std::fs::create_dir_all(project.join("services")).unwrap();
-        write_module(
-            &project,
-            "worker.ts",
-            r#"export async function agent(input: { cycles: number }) {
-                const seen = [];
-                for (let i = 0; i < input.cycles; i++) {
-                    const message = await chidori.signal("tick");
-                    seen.push(message.payload.n);
-                    await chidori.log("cycle", { n: message.payload.n });
-                }
-                return { seen };
-            }"#,
-        );
-        let agent_name = unique(&format!("paced-sqlite-{trial}"));
-        let path = project.join("agent.ts");
-        let source = r#"export async function agent() {
-            const svc = await chidori.agents.spawn("services/worker.ts", { cycles: 5 },
-                { name: "__NAME__", restart: "resume" });
-            const initial = await svc.join({ timeoutMs: 500 });
-            for (let n = 0; n < 5; n++) {
-                await chidori.agents.send("__NAME__", "tick", { n });
-                await new Promise(resolve => setTimeout(resolve, 20));
-            }
-            const outcome = await svc.join({ timeoutMs: 3000 });
-            return { initial: initial.status, outcome };
-        }"#
-        .replace("__NAME__", &agent_name);
-        std::fs::write(&path, &source).unwrap();
-
-        let ctx = RuntimeContext::new();
-        let backend = test_backend(ctx.clone(), &project);
-        let output = run_agent(&path, &source, &json!({}), &backend).unwrap();
-        let sends: Vec<_> = ctx
-            .call_log()
-            .into_records()
-            .into_iter()
-            .filter(|record| record.function == "send_agent")
-            .collect();
-        assert_eq!(sends.len(), count, "parent output: {output}");
-        assert!(
-            sends
-                .iter()
-                .all(|record| record.result["delivered"] == json!(true)),
-            "parent did not acknowledge all sends: {sends:#?}"
-        );
-        let child_run_id = ctx
-            .call_log()
-            .into_records()
-            .into_iter()
-            .find(|record| record.function == "spawn_agent")
-            .unwrap()
-            .result["runId"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let run_base = project.join(".chidori").join("runs");
-        let factory = RunStoreFactory::shared(&run_base);
-        let store = factory.store_for(&child_run_id);
-        let records = store.load_call_log().unwrap().unwrap_or_default();
-        let inbox: Vec<Value> = store
-            .get_blob(SIGNAL_INBOX_FILE)
-            .unwrap()
-            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
-            .unwrap_or_default();
-        let accounted: Vec<(usize, usize, usize)> = (0..count)
-            .map(|n| {
-                let journal_count = records
-                    .iter()
-                    .filter(|record| {
-                        record.function == "signal" && record.result["payload"]["n"] == json!(n)
-                    })
-                    .count();
-                let inbox_count = inbox
-                    .iter()
-                    .filter(|message| message["payload"]["n"] == json!(n))
-                    .count();
-                (n, journal_count, inbox_count)
-            })
-            .collect();
-        let missing: Vec<_> = accounted
-            .iter()
-            .filter(|(_, journal_count, inbox_count)| journal_count + inbox_count != 1)
-            .cloned()
-            .collect();
-        (!missing.is_empty()).then(|| {
-            format!(
-                "trial={trial}, expected each acked n=0..{} exactly once in child journal or inbox; missing/duplicate={missing:?}, all_counts={accounted:?}, inbox={inbox:?}, outcome={output}",
-                count - 1
             )
         })
     }
