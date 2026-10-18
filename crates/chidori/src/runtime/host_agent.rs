@@ -2104,42 +2104,43 @@ mod tests {
                 )
                 .output()
                 .unwrap();
-            assert!(
-                diagnostic.status.success(),
-                "{backend} descriptor-only diagnostic control failed: stdout={} stderr={}",
-                String::from_utf8_lossy(&diagnostic.stdout),
-                String::from_utf8_lossy(&diagnostic.stderr)
-            );
-            let diagnostic_report: Value = serde_json::from_slice(
-                &std::fs::read(diagnostic_temp.path().join("rearm-report.json")).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                diagnostic_report["rearmed"],
-                json!(1),
-                "diagnostic rearm should re-arm one agent; report={diagnostic_report}"
-            );
-            assert_eq!(
-                diagnostic_report["descriptor_before_rearm"]["status"],
-                json!("running"),
-                "diagnostic should modify descriptor status only; report={diagnostic_report}"
-            );
-            assert_eq!(
-                diagnostic_report["descriptor_before_rearm"]["listen"],
-                Value::Null,
-                "diagnostic should clear only the stale listen; report={diagnostic_report}"
-            );
-            assert_eq!(
-                diagnostic_report["cut_signal_rows"],
-                json!(1),
-                "diagnostic control should journal cut-1 once; report={diagnostic_report}"
-            );
-            assert!(
-                diagnostic_report["inbox"]
-                    .as_array()
-                    .is_some_and(Vec::is_empty),
-                "diagnostic control should empty inbox; report={diagnostic_report}"
-            );
+            let diagnostic_report = if diagnostic.status.success() {
+                match std::fs::read(diagnostic_temp.path().join("rearm-report.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                {
+                    Some(report) => Some(report),
+                    None => {
+                        failures.push(format!(
+                            "{backend} descriptor-only diagnostic control produced no valid report; stdout={} stderr={}",
+                            String::from_utf8_lossy(&diagnostic.stdout),
+                            String::from_utf8_lossy(&diagnostic.stderr)
+                        ));
+                        None
+                    }
+                }
+            } else {
+                failures.push(format!(
+                    "{backend} descriptor-only diagnostic control failed: stdout={} stderr={}",
+                    String::from_utf8_lossy(&diagnostic.stdout),
+                    String::from_utf8_lossy(&diagnostic.stderr)
+                ));
+                None
+            };
+            if let Some(diagnostic_report) = diagnostic_report {
+                let diagnostic_ok = diagnostic_report["rearmed"] == json!(1)
+                    && diagnostic_report["descriptor_before_rearm"]["status"] == json!("running")
+                    && diagnostic_report["descriptor_before_rearm"]["listen"] == Value::Null
+                    && diagnostic_report["cut_signal_rows"] == json!(1)
+                    && diagnostic_report["inbox"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty);
+                if !diagnostic_ok {
+                    failures.push(format!(
+                        "{backend} descriptor-only diagnostic control did not recover as expected; report={diagnostic_report}"
+                    ));
+                }
+            }
 
             let descriptor = &report["descriptor_before_rearm"];
             let listen = &descriptor["listen"];
