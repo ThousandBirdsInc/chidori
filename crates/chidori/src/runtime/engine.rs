@@ -527,6 +527,7 @@ impl Engine {
     /// next outcome (out-of-band — the parent run is untouched history).
     /// Returns the updated `BranchOutcome` JSON.
     pub fn resume_branch(&self, run_dir: &Path, branch_id: &str, response: &str) -> Result<Value> {
+        Self::ensure_branch_run_store_initialized(run_dir)?;
         let backend = self.branch_backend(branch_id)?;
         crate::runtime::host_branch::resume_branch(&backend, run_dir, branch_id, response)
             .map_err(|err| anyhow::anyhow!(err))
@@ -536,9 +537,17 @@ impl Engine {
     /// anchor with whatever its stored `source.ts` now contains — the
     /// edit-and-rerun flow. Returns the updated `BranchOutcome` JSON.
     pub fn rerun_branch(&self, run_dir: &Path, branch_id: &str) -> Result<Value> {
+        Self::ensure_branch_run_store_initialized(run_dir)?;
         let backend = self.branch_backend(branch_id)?;
         crate::runtime::host_branch::rerun_branch(&backend, run_dir, branch_id)
             .map_err(|err| anyhow::anyhow!(err))
+    }
+
+    fn ensure_branch_run_store_initialized(run_dir: &Path) -> Result<()> {
+        let run_base = run_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("branch run directory has no run-base parent"))?;
+        crate::runtime::store::RunStoreFactory::shared(run_base).ensure_initialized()
     }
 
     /// List the persisted branch stores of the run at `run_dir`.
