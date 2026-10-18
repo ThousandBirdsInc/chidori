@@ -101,6 +101,19 @@ silent live re-execution. This remains true with
 `CHIDORI_REPLAY_LAX=1`: once the host-promise table records durable completion,
 an argument mismatch refuses replay and cannot trigger a second live effect.
 
+For Unix local-filesystem blob writes under `strict` and `effect`, the store
+syncs the staged file, renames it into place, then syncs the target parent
+directory before reporting success. When a write creates parent directories,
+their containing-directory ancestry is synced before the blob is written. An
+ancestry-sync failure returns an error; because created directory entries may
+remain visible, do not assume a later retry has repeated or completed that
+barrier. A target-parent sync failure after rename also returns an error even
+though the complete replacement may already be visible; the rename is not
+rolled back. `besteffort` skips these directory barriers. On non-Unix
+platforms, `strict` and `effect` local-filesystem blob writes fail explicitly
+because directory syncing is unsupported. These rules apply to the local
+filesystem store; HTTP and S3 behavior is unchanged.
+
 ## Backends
 
 Selected by `CHIDORI_RUN_STORE`:
@@ -272,6 +285,11 @@ Journal writes are not fire-and-forget:
   recording of it"), filesystem journal writes fsync before acknowledging,
   and the run's completion is gated on a final flush (the output-gate point:
   a result is not surfaced until its journal is durable).
+
+The local-filesystem blob tests assert sync-call ordering and injected error
+propagation only. They do not simulate an actual power cut, so they do not
+establish that a renamed blob survives sudden power loss on a particular OS,
+filesystem, or device; no power-cut durability guarantee is claimed here.
 
 The durability mode also decides how remote-mirror appends are paced. Under
 `besteffort`, HTTP/S3 record appends are **pipelined**: each append is
