@@ -2687,6 +2687,86 @@ async fn stream_session_resolves_signal_pause_in_process() {
     let _ = std::fs::remove_dir_all(dir_b);
 }
 
+#[tokio::test]
+async fn live_signal_route_does_not_accept_when_inbox_persistence_fails() {
+    use crate::runtime::snapshot::SIGNAL_INBOX_FILE;
+    use crate::runtime::store::{FailSignalInboxStore, RunStore};
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = r#"
+        export async function agent(input, chidori) {
+            const review = await chidori.signal("review");
+            return review.payload;
+        }
+    "#;
+    let agent_path = write_agent(temp.path(), source);
+    let state = signal_test_state(temp.path(), agent_path);
+    let sse = start_stream(&state, "live-persist-failure", json!({})).await;
+    let paused = wait_for_status(&state, "live-persist-failure", SessionStatus::Paused).await;
+    let run_id = paused
+        .run_id
+        .clone()
+        .expect("streamed session has a run id");
+
+    let (store, ctx, mut signal_rx) = {
+        let mut active = state.active_sessions.lock().unwrap();
+        let live = active
+            .get_mut("live-persist-failure")
+            .and_then(|active| active.signals.as_ref())
+            .expect("paused streaming session has live signal routing");
+        let ctx_slot = live.ctx_slot.clone();
+        let ctx = ctx_slot.lock().unwrap().clone();
+        let run_dir = state.run_base.join(&run_id);
+        let store = Arc::new(FailSignalInboxStore::new(&run_dir));
+        ctx.enable_persistence_with_store(run_dir, store.clone());
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
+        active.get_mut("live-persist-failure").unwrap().signals = Some(super::LiveSignalSession {
+            ctx_slot,
+            signal_tx,
+        });
+        (store, ctx, signal_rx)
+    };
+
+    let (status, body) = response_json(
+        signal_session(
+            State(state.clone()),
+            Path("live-persist-failure".to_string()),
+            Json(SignalRequest {
+                allow_source_change: false,
+                name: "review".to_string(),
+                payload: json!({"id": "route-1"}),
+                from: json!(null),
+            }),
+        )
+        .await,
+    )
+    .await;
+
+    let notified = signal_rx.try_recv().is_ok();
+    let in_memory = ctx.signal_inbox();
+    let error = format!("status={status}, body={body}, notified={notified}, inbox={in_memory:?}");
+    assert_eq!(store.failure_count(), 1);
+    assert!(
+        status != StatusCode::ACCEPTED,
+        "live route must not return HTTP 202: {error}"
+    );
+    assert!(
+        !notified,
+        "live route must not notify the signal worker: {error}"
+    );
+    assert!(
+        in_memory.is_empty(),
+        "failed route must not publish in memory: {error}"
+    );
+    assert_eq!(
+        store.get_blob(SIGNAL_INBOX_FILE).unwrap(),
+        None,
+        "injected failure is pre-commit and leaves durable inbox absent"
+    );
+
+    drop(sse);
+}
+
 /// A signal delivered live for a name the run is NOT waiting on lands in
 /// the live in-memory mailbox (write-through persisted) and survives the
 /// in-process resume: the resumed run drains it at a later `pollSignal`.

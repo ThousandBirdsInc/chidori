@@ -1768,8 +1768,73 @@ mod tests {
     use crate::policy::{PolicyCache, PolicyConfig};
     use crate::providers::ProviderRegistry;
     use crate::runtime::rust_engine::run_agent;
+    use crate::runtime::store::FailSignalInboxStore;
     use crate::runtime::store::RunStoreFactory;
     use crate::tools::ToolRegistry;
+
+    #[test]
+    fn live_send_does_not_acknowledge_when_signal_inbox_persistence_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_base = temp.path().join(".chidori/runs");
+        std::fs::create_dir_all(&run_base).unwrap();
+        let parts = sqlite_test_parts(temp.path(), run_base, Arc::new(ToolRegistry::new()));
+        let name = unique("live-send-persist-failure");
+        let ctx = RuntimeContext::new();
+        let run_dir = temp.path().join("run");
+        let store = Arc::new(FailSignalInboxStore::new(&run_dir));
+        ctx.enable_persistence_with_store(run_dir, store.clone());
+        let now = Utc::now();
+        let entry = Arc::new(AgentEntry {
+            name: name.clone(),
+            parts: parts.clone(),
+            state: Mutex::new(AgentState {
+                descriptor: AgentDescriptor {
+                    name: name.clone(),
+                    run_id: "live-run".to_string(),
+                    source: "test.ts".to_string(),
+                    input: Value::Null,
+                    restart: "never".to_string(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    owner_run_id: "owner".to_string(),
+                    model: None,
+                    status: "running".to_string(),
+                    listen: None,
+                    restarts: 0,
+                    output: None,
+                    error: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                live_ctx: Some(ctx.clone()),
+                thread_live: true,
+                wake_pending: false,
+                stop_requested: false,
+            }),
+            signal: Condvar::new(),
+        });
+        hub().entries.lock().unwrap().insert(name.clone(), entry);
+
+        let response = hub().send(
+            &parts,
+            &name,
+            "approval",
+            json!({"id": "hub-1"}),
+            json!(null),
+        );
+
+        hub().entries.lock().unwrap().remove(&name);
+        let published = ctx.signal_inbox();
+        assert_eq!(store.failure_count(), 1);
+        assert!(
+            response.as_ref().is_err() || response.as_ref().unwrap()["delivered"] != json!(true),
+            "live hub send must surface pre-commit persistence failure, got {response:?}"
+        );
+        assert!(
+            published.is_empty(),
+            "failed send must not publish in memory"
+        );
+    }
 
     struct InboxRaceBarriers {
         agent_name: String,

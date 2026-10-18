@@ -2167,6 +2167,63 @@ mod tests {
     use crate::runtime::snapshot::{HostPromiseState, PENDING_HOST_OPERATION_FILE};
 
     #[test]
+    fn live_signal_is_not_published_when_inbox_persistence_fails() {
+        const CHILD: &str = "CHIDORI_TEST_LIVE_SIGNAL_FAILURE_CHILD";
+        const TEST: &str =
+            "runtime::context::tests::live_signal_is_not_published_when_inbox_persistence_fails";
+        if std::env::var_os(CHILD).is_none() {
+            let mut failures = Vec::new();
+            for mode in ["besteffort", "effect", "strict"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg(TEST)
+                    .arg("--nocapture")
+                    .env(CHILD, "1")
+                    .env("CHIDORI_DURABILITY", mode)
+                    .output()
+                    .unwrap();
+                if !output.status.success() {
+                    failures.push(format!(
+                        "{mode}: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "inbox failure contract failed by mode:\n{}",
+                failures.join("\n")
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runtime::store::FailSignalInboxStore::new(
+            temp.path(),
+        ));
+        let ctx = RuntimeContext::new();
+        ctx.enable_persistence_with_store(temp.path().to_path_buf(), store.clone());
+
+        let queued = ctx.enqueue_live_signal(
+            "approval",
+            serde_json::json!({"id": "signal-1"}),
+            serde_json::json!(null),
+        );
+
+        assert_eq!(store.failure_count(), 1);
+        assert!(
+            ctx.signal_inbox().is_empty(),
+            "failed durable enqueue must not publish an in-memory signal: {queued:?}"
+        );
+        assert_eq!(
+            store.get_blob(SIGNAL_INBOX_FILE).unwrap(),
+            None,
+            "injected failure is before commit and leaves durable inbox absent"
+        );
+    }
+
+    #[test]
     fn runtime_context_tracks_host_promise_lifecycle() {
         let ctx = RuntimeContext::new();
         let id = ctx.create_host_promise(

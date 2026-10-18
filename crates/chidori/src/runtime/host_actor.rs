@@ -1913,6 +1913,35 @@ mod tests {
     use crate::runtime::typescript::bindings::HostBindingBackend;
     use crate::tools::ToolRegistry;
 
+    #[test]
+    fn actor_keeps_the_uncommitted_mailbox_item_when_signal_persistence_fails() {
+        use crate::runtime::snapshot::SIGNAL_INBOX_FILE;
+        use crate::runtime::store::{FailSignalInboxStore, RunStore};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(FailSignalInboxStore::new(temp.path()));
+        let shared = super::ActorShared::new();
+        shared.deliver("approval", json!({"id": "actor-1"}), json!(null));
+        let ctx = RuntimeContext::new();
+        ctx.enable_persistence_with_store(temp.path().to_path_buf(), store.clone());
+
+        super::pump_mailbox(&shared, &ctx);
+
+        let mailbox = shared.state.lock().unwrap().mailbox.clone();
+        assert_eq!(
+            mailbox.len(),
+            1,
+            "pre-commit failure must retain the actor's queued item"
+        );
+        assert_eq!(mailbox[0].payload, json!({"id": "actor-1"}));
+        assert!(
+            ctx.signal_inbox().is_empty(),
+            "failed item must not be published to context"
+        );
+        assert_eq!(store.failure_count(), 1);
+        assert_eq!(store.get_blob(SIGNAL_INBOX_FILE).unwrap(), None);
+    }
+
     use super::{strip_crash_frontier, DOWN_MESSAGE};
     use std::time::Duration;
 
