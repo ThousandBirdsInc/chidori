@@ -675,22 +675,37 @@ impl DetachedAgentHub {
             };
             let name = descriptor.name.clone();
             match descriptor.status.as_str() {
-                // Died mid-run: resume-by-replay continues at the frontier.
-                "running" => {
+                "running" | "hibernating" => {
                     factory.hydrate(&descriptor.run_id).map_err(|err| {
                         format!("hydrating detached-agent journal for {name}: {err:#}")
                     })?;
                     let entry = self.ensure_entry(&parts_for_entries, &name)?;
-                    self.start_thread(entry)?;
-                    rearmed += 1;
-                }
-                // Hibernating: entry re-created; sends and (via the timer
-                // thread) alarm deadlines wake it.
-                "hibernating" => {
-                    factory.hydrate(&descriptor.run_id).map_err(|err| {
-                        format!("hydrating detached-agent journal for {name}: {err:#}")
-                    })?;
-                    self.ensure_entry(&parts_for_entries, &name)?;
+                    let completed_listen = if let Some(listen) = descriptor.listen.as_ref() {
+                        let records = factory
+                            .store_for(&descriptor.run_id)
+                            .load_call_log()
+                            .map_err(|err| {
+                                format!("loading detached-agent journal for {name}: {err:#}")
+                            })?
+                            .unwrap_or_default();
+                        listen_has_completed_record(listen, &records)
+                    } else {
+                        false
+                    };
+                    if completed_listen {
+                        // The durable descriptor can lag a successful listen
+                        // record when the process exits between inbox commit
+                        // and publishing the live context. Journal evidence
+                        // proves this listen already completed, so don't use
+                        // its stale names to decide whether replay can start.
+                        entry.state.lock().unwrap().descriptor.listen = None;
+                    }
+                    if descriptor.status == "running" || completed_listen {
+                        // A mid-run descriptor always resumes. A hibernating
+                        // descriptor resumes here only when the journal proves
+                        // its persisted listener is already past the frontier.
+                        self.start_thread(entry)?;
+                    }
                     rearmed += 1;
                 }
                 _ => {}
@@ -1335,6 +1350,25 @@ fn listen_state(ctx: &RuntimeContext, pending: &PendingSignal) -> ListenState {
     }
 }
 
+/// A completed journal record is authoritative when a crash left the
+/// descriptor pointing at the listen that produced it. This lets rearm
+/// distinguish an already-consumed listener from a genuinely pending hibernate
+/// without inferring state from a descriptor status alone.
+fn listen_has_completed_record(listen: &ListenState, records: &[CallRecord]) -> bool {
+    let expected_args = match listen.function.as_str() {
+        "signal" if listen.names.len() == 1 => json!({ "name": listen.names[0] }),
+        "signal_any" => json!({ "names": listen.names }),
+        _ => return false,
+    };
+
+    records.iter().any(|record| {
+        record.seq == listen.seq
+            && record.function == listen.function
+            && record.error.is_none()
+            && record.args == expected_args
+    })
+}
+
 /// Persist `descriptor` to the registry (and the run dir's `agent.json`),
 /// the durable record a fresh process re-arms the fleet from.
 fn persist_descriptor(factory: &RunStoreFactory, descriptor: &AgentDescriptor) {
@@ -1796,6 +1830,56 @@ mod tests {
     use crate::runtime::store::FailSignalInboxStore;
     use crate::runtime::store::RunStoreFactory;
     use crate::tools::ToolRegistry;
+
+    #[test]
+    fn completed_listen_requires_exact_canonical_arguments() {
+        let record = |function: &str, args: Value| CallRecord {
+            seq: 7,
+            parent_seq: None,
+            function: function.to_string(),
+            args,
+            result: Value::Null,
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        };
+        let listen = |function: &str, names: &[&str]| ListenState {
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+            seq: 7,
+            function: function.to_string(),
+            deadline: None,
+        };
+
+        assert!(listen_has_completed_record(
+            &listen("signal", &["x"]),
+            &[record("signal", json!({ "name": "x" }))]
+        ));
+        assert!(!listen_has_completed_record(
+            &listen("signal", &["x", "y"]),
+            &[record("signal", json!({ "name": "x" }))]
+        ));
+        assert!(!listen_has_completed_record(
+            &listen("signal", &["x"]),
+            &[record("signal", json!({ "name": "x", "extra": true }))]
+        ));
+
+        assert!(listen_has_completed_record(
+            &listen("signal_any", &["x"]),
+            &[record("signal_any", json!({ "names": ["x"] }))]
+        ));
+        assert!(!listen_has_completed_record(
+            &listen("signal_any", &["x"]),
+            &[record("signal_any", json!({ "names": ["x", null] }))]
+        ));
+        assert!(!listen_has_completed_record(
+            &listen("signal_any", &["x"]),
+            &[record(
+                "signal_any",
+                json!({ "names": ["x"], "extra": true })
+            )]
+        ));
+    }
 
     #[test]
     fn detached_live_send_commit_exit_rearms_and_journals_once() {
