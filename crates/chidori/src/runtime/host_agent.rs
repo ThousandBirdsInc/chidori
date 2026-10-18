@@ -425,6 +425,8 @@ impl DetachedAgentHub {
                 // Write-through: in-memory mailbox + durable inbox mutate in
                 // one critical section inside enqueue_live_signal.
                 drop(state);
+                #[cfg(test)]
+                tests::pause_after_live_context_snapshot(&entry.name);
                 ctx.enqueue_live_signal(name, payload, from);
                 entry.signal.notify_all();
                 return Ok(json!({ "delivered": true }));
@@ -1061,6 +1063,8 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             let mut state = entry.state.lock().unwrap();
             state.live_ctx = None;
         }
+        #[cfg(test)]
+        tests::pause_after_worker_clears_live_context(&entry.name);
         ctx.clear_event_sender();
         drop(backend);
         let _ = crate::runtime::engine::persist_journal_scaffold(
@@ -1614,6 +1618,7 @@ pub(crate) fn lookup_agent(backend: &HostBindingBackend, a: &Value) -> Result<Va
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex as StdMutex;
 
     use serde_json::json;
@@ -1625,6 +1630,59 @@ mod tests {
     use crate::runtime::rust_engine::run_agent;
     use crate::runtime::store::RunStoreFactory;
     use crate::tools::ToolRegistry;
+
+    struct InboxRaceBarriers {
+        agent_name: String,
+        sender_arrived: std::sync::mpsc::Sender<()>,
+        sender_release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        worker_arrived: std::sync::mpsc::Sender<()>,
+        worker_release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        sender_claimed: AtomicBool,
+        worker_claimed: AtomicBool,
+    }
+
+    static INBOX_RACE_BARRIERS: OnceLock<StdMutex<Option<Arc<InboxRaceBarriers>>>> =
+        OnceLock::new();
+
+    pub(super) fn pause_after_live_context_snapshot(agent_name: &str) {
+        let barriers = INBOX_RACE_BARRIERS
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap()
+            .clone();
+        let Some(barriers) = barriers.filter(|barriers| barriers.agent_name == agent_name) else {
+            return;
+        };
+        if barriers.sender_claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = barriers.sender_arrived.send(());
+        let _ = barriers
+            .sender_release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+    }
+
+    pub(super) fn pause_after_worker_clears_live_context(agent_name: &str) {
+        let barriers = INBOX_RACE_BARRIERS
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap()
+            .clone();
+        let Some(barriers) = barriers.filter(|barriers| barriers.agent_name == agent_name) else {
+            return;
+        };
+        if barriers.worker_claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = barriers.worker_arrived.send(());
+        let _ = barriers
+            .worker_release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+    }
 
     fn sqlite_test_parts(
         base: &Path,
@@ -1639,6 +1697,396 @@ mod tests {
             tools,
             mcp: Arc::new(McpManager::new()),
             run_base,
+        }
+    }
+
+    #[test]
+    fn detached_inbox_competing_writers_preserve_every_acknowledged_payload() {
+        const CHILD: &str = "CHIDORI_TEST_DETACHED_INBOX_RACE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let base = PathBuf::from(std::env::var_os("CHIDORI_TEST_DETACHED_INBOX_BASE").unwrap());
+            let mut losses = Vec::new();
+            for count in [2, 5] {
+                let loss = run_deterministic_inbox_race(&base, count);
+                println!(
+                    "backend={} competing sends N={count}: {}",
+                    std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string()),
+                    loss.as_deref()
+                        .unwrap_or("all acknowledged IDs accounted exactly once")
+                );
+                if let Some(loss) = loss {
+                    losses.push(loss);
+                }
+            }
+            run_sequential_inbox_control(&base, 25);
+            println!(
+                "backend={} N=25 sequential control passed",
+                std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string())
+            );
+            assert!(
+                losses.is_empty(),
+                "confirmed inbox overwrite losses: {losses:#?}"
+            );
+            return;
+        }
+
+        let mut failures = Vec::new();
+        for backend in ["fs", "sqlite"] {
+            let base = test_dir(&format!("inbox-race-{backend}"));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("runtime::host_agent::tests::detached_inbox_competing_writers_preserve_every_acknowledged_payload")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env("CHIDORI_TEST_DETACHED_INBOX_BASE", &base)
+                .env("CHIDORI_RUN_STORE", backend)
+                .env("CHIDORI_RUN_DB", base.join("runs.sqlite3"))
+                .output()
+                .unwrap();
+            let report = format!(
+                "detached inbox race child backend={backend} exited {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            if !output.status.success() {
+                failures.push(report);
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    fn run_deterministic_inbox_race(base: &Path, competing_sends: usize) -> Option<String> {
+        let agent_name = unique(&format!("inbox-race-{competing_sends}"));
+        let run_base = base
+            .join(format!("race-{competing_sends}"))
+            .join(".chidori/runs");
+        let source = base.join(format!("race-{competing_sends}.ts"));
+        std::fs::write(
+            &source,
+            r#"export async function agent(input: { count: number }) {
+                for (let i = 0; i <= input.count; i++) {
+                    const message = await chidori.signal("race");
+                    await chidori.tool("raceConsumed", { id: message.payload.id });
+                    if (i === 0) await chidori.tool("raceReady", {});
+                }
+                return { done: true };
+            }"#,
+        )
+        .unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (consumed_tx, consumed_rx) = std::sync::mpsc::channel();
+        let mut tools = ToolRegistry::new();
+        tools.register_native(
+            "raceReady",
+            "signals the first listen completed",
+            Vec::new(),
+            move |_| {
+                let _ = ready_tx.send(());
+                Ok(json!({ "ready": true }))
+            },
+        );
+        tools.register_native(
+            "raceConsumed",
+            "records a consumed inbox payload",
+            Vec::new(),
+            move |args| {
+                let _ = consumed_tx.send(args["id"].clone());
+                Ok(json!({ "consumed": true }))
+            },
+        );
+        let parts = sqlite_test_parts(base, run_base.clone(), Arc::new(tools));
+        hub().install_parts(parts.clone());
+        let options = SpawnOptions {
+            name: Some(agent_name.clone()),
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            model: None,
+        };
+        let spawned = hub()
+            .spawn(
+                &parts,
+                source.to_str().unwrap(),
+                json!({ "count": competing_sends }),
+                &options,
+                "inbox-race-test".to_string(),
+            )
+            .unwrap();
+        let run_id = spawned["runId"].as_str().unwrap().to_string();
+        wait_for_agent_status(&parts, &agent_name, |status| status == "hibernating");
+
+        let seed_id = format!("{agent_name}-seed");
+        assert!(hub()
+            .send(
+                &parts,
+                &agent_name,
+                "race",
+                json!({ "id": seed_id }),
+                json!({ "test": true })
+            )
+            .unwrap()["delivered"]
+            .as_bool()
+            .unwrap());
+        assert_eq!(
+            consumed_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            json!(seed_id)
+        );
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let sender_arrived_rx;
+        let sender_release_tx;
+        let worker_arrived_rx;
+        let worker_release_tx;
+        {
+            let (sender_arrived_tx, rx) = std::sync::mpsc::channel();
+            sender_arrived_rx = rx;
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            sender_release_tx = release_tx;
+            let sender_release_rx = release_rx;
+            let (worker_arrived_tx, rx) = std::sync::mpsc::channel();
+            worker_arrived_rx = rx;
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            worker_release_tx = release_tx;
+            let worker_release_rx = release_rx;
+            *INBOX_RACE_BARRIERS
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap() = Some(Arc::new(InboxRaceBarriers {
+                agent_name: agent_name.clone(),
+                sender_arrived: sender_arrived_tx,
+                sender_release: StdMutex::new(sender_release_rx),
+                worker_arrived: worker_arrived_tx,
+                worker_release: StdMutex::new(worker_release_rx),
+                sender_claimed: AtomicBool::new(false),
+                worker_claimed: AtomicBool::new(false),
+            }));
+        }
+
+        let live_id = format!("{agent_name}-live");
+        let sender_parts = parts.clone();
+        let sender_name = agent_name.clone();
+        let live_id_for_thread = live_id.clone();
+        let sender = std::thread::spawn(move || {
+            hub().send(
+                &sender_parts,
+                &sender_name,
+                "race",
+                json!({ "id": live_id_for_thread }),
+                json!({ "test": true }),
+            )
+        });
+        sender_arrived_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("live sender did not reach the post-snapshot barrier");
+        worker_arrived_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker did not reach the post-context-clear barrier");
+
+        let status = hub().status(&parts, &agent_name).unwrap();
+        assert_eq!(status["status"], json!("running"), "{status}");
+        assert_eq!(status["live"], json!(true), "{status}");
+        let mut acknowledged_ids = vec![live_id.clone()];
+        let mut other_ids = Vec::new();
+        for index in 1..competing_sends {
+            let id = format!("{agent_name}-store-{index}");
+            let result = hub()
+                .send(
+                    &parts,
+                    &agent_name,
+                    "race",
+                    json!({ "id": id }),
+                    json!({ "test": true }),
+                )
+                .unwrap();
+            assert_eq!(result["delivered"], json!(true));
+            acknowledged_ids.push(id.clone());
+            other_ids.push(id);
+        }
+
+        sender_release_tx.send(()).unwrap();
+        let live_result = sender.join().unwrap().unwrap();
+        assert_eq!(live_result["delivered"], json!(true));
+        worker_release_tx.send(()).unwrap();
+        wait_for_agent_status(&parts, &agent_name, |status| {
+            status == "hibernating" || status == "completed" || status == "failed"
+        });
+        *INBOX_RACE_BARRIERS
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap() = None;
+
+        let factory = RunStoreFactory::shared(&run_base);
+        let records = factory
+            .store_for(&run_id)
+            .load_call_log()
+            .unwrap()
+            .unwrap_or_default();
+        let inbox = factory
+            .store_for(&run_id)
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .map(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).unwrap())
+            .unwrap_or_default();
+        let accounted: Vec<(String, usize, usize)> = acknowledged_ids
+            .iter()
+            .map(|id| {
+                let journal_count = records
+                    .iter()
+                    .filter(|record| {
+                        record.function == "signal" && record.result["payload"]["id"] == json!(id)
+                    })
+                    .count();
+                let inbox_count = inbox
+                    .iter()
+                    .filter(|queued| queued["payload"]["id"] == json!(id))
+                    .count();
+                (id.clone(), journal_count, inbox_count)
+            })
+            .collect();
+        let unaccounted: Vec<_> = accounted
+            .iter()
+            .filter(|(_, journal_count, inbox_count)| journal_count + inbox_count != 1)
+            .cloned()
+            .collect();
+
+        let _ = hub().stop(&parts, &agent_name);
+        wait_for_agent_status(&parts, &agent_name, |status| {
+            matches!(status, "stopped" | "completed" | "failed")
+        });
+        (!unaccounted.is_empty()).then(|| {
+            format!(
+                "backend={}, N={}, acknowledged payload IDs must be consumed exactly once or remain queued; counts={accounted:?}, inbox={inbox:?}, other_store_ids={other_ids:?}",
+                std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string()),
+                competing_sends
+            )
+        })
+    }
+
+    fn run_sequential_inbox_control(base: &Path, count: usize) {
+        let agent_name = unique("inbox-sequential");
+        let run_base = base.join("sequential").join(".chidori/runs");
+        let source = base.join("sequential.ts");
+        std::fs::write(
+            &source,
+            r#"export async function agent(input: { count: number }) {
+                for (let i = 0; i < input.count; i++) {
+                    const message = await chidori.signal("sequential");
+                    await chidori.tool("raceConsumed", { id: message.payload.id });
+                }
+                return { done: true };
+            }"#,
+        )
+        .unwrap();
+        let (consumed_tx, consumed_rx) = std::sync::mpsc::channel();
+        let mut tools = ToolRegistry::new();
+        tools.register_native(
+            "raceConsumed",
+            "records a consumed inbox payload",
+            Vec::new(),
+            move |args| {
+                let _ = consumed_tx.send(args["id"].clone());
+                Ok(json!({ "consumed": true }))
+            },
+        );
+        let parts = sqlite_test_parts(base, run_base.clone(), Arc::new(tools));
+        hub().install_parts(parts.clone());
+        let options = SpawnOptions {
+            name: Some(agent_name.clone()),
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            model: None,
+        };
+        let spawned = hub()
+            .spawn(
+                &parts,
+                source.to_str().unwrap(),
+                json!({ "count": count }),
+                &options,
+                "inbox-sequential-test".to_string(),
+            )
+            .unwrap();
+        let run_id = spawned["runId"].as_str().unwrap().to_string();
+        wait_for_agent_status(&parts, &agent_name, |status| status == "hibernating");
+
+        let mut acknowledged_ids = Vec::new();
+        for index in 0..count {
+            let id = format!("{agent_name}-{index}");
+            let result = hub()
+                .send(
+                    &parts,
+                    &agent_name,
+                    "sequential",
+                    json!({ "id": id }),
+                    json!({ "test": true }),
+                )
+                .unwrap();
+            assert_eq!(result["delivered"], json!(true));
+            assert_eq!(
+                consumed_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                json!(id)
+            );
+            acknowledged_ids.push(id);
+        }
+        wait_for_agent_status(&parts, &agent_name, |status| status == "completed");
+
+        let factory = RunStoreFactory::shared(&run_base);
+        let records = factory
+            .store_for(&run_id)
+            .load_call_log()
+            .unwrap()
+            .unwrap_or_default();
+        let inbox = factory
+            .store_for(&run_id)
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .map(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).unwrap())
+            .unwrap_or_default();
+        for id in acknowledged_ids {
+            let journal_count = records
+                .iter()
+                .filter(|record| {
+                    record.function == "signal" && record.result["payload"]["id"] == json!(id)
+                })
+                .count();
+            let inbox_count = inbox
+                .iter()
+                .filter(|queued| queued["payload"]["id"] == json!(id))
+                .count();
+            assert_eq!(
+                journal_count + inbox_count,
+                1,
+                "payload {id} not accounted exactly once"
+            );
+        }
+    }
+
+    fn wait_for_agent_status(
+        parts: &AgentRuntimeParts,
+        name: &str,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Value {
+        let entry = hub().ensure_entry(parts, name).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut state = entry.state.lock().unwrap();
+        loop {
+            if predicate(&state.descriptor.status) {
+                return state.descriptor.status_json();
+            }
+            let now = std::time::Instant::now();
+            assert!(
+                now < deadline,
+                "timed out waiting for {name}: {}",
+                state.descriptor.status
+            );
+            let (next, _) = entry
+                .signal
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
         }
     }
 
