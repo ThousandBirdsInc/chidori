@@ -164,6 +164,10 @@ struct AgentState {
     /// the address live sends enqueue into (durably, through the ctx store).
     live_ctx: Option<RuntimeContext>,
     thread_live: bool,
+    /// A matching delivery can arrive after hibernation releases its lease but
+    /// before the current supervisor thread has returned. The thread wrapper
+    /// consumes this bit and starts the queued wake after marking itself dead.
+    wake_pending: bool,
     stop_requested: bool,
 }
 
@@ -242,6 +246,7 @@ impl DetachedAgentHub {
                 descriptor,
                 live_ctx: None,
                 thread_live: false,
+                wake_pending: false,
                 stop_requested: false,
             }),
             signal: Condvar::new(),
@@ -355,6 +360,7 @@ impl DetachedAgentHub {
                 descriptor,
                 live_ctx: None,
                 thread_live: false,
+                wake_pending: false,
                 stop_requested: false,
             }),
             signal: Condvar::new(),
@@ -392,10 +398,21 @@ impl DetachedAgentHub {
             .stack_size(AGENT_THREAD_STACK_BYTES)
             .spawn(move || {
                 supervise_detached(hub(), &entry);
-                let mut state = entry.state.lock().unwrap();
-                state.thread_live = false;
-                state.live_ctx = None;
-                entry.signal.notify_all();
+                let wake_pending = {
+                    let mut state = entry.state.lock().unwrap();
+                    state.thread_live = false;
+                    state.live_ctx = None;
+                    let wake_pending = std::mem::take(&mut state.wake_pending)
+                        && state.descriptor.status == "running"
+                        && !state.stop_requested;
+                    entry.signal.notify_all();
+                    wake_pending
+                };
+                if wake_pending {
+                    if let Err(err) = hub().start_thread(entry.clone()) {
+                        tracing::warn!(agent = %entry.name, error = %err, "starting queued detached-agent wake");
+                    }
+                }
             })
             .map_err(|err| format!("chidori.agents.spawn: spawning agent thread: {err}"))?;
         Ok(())
@@ -477,11 +494,16 @@ impl DetachedAgentHub {
             if wake {
                 state.descriptor.status = "running".to_string();
                 state.descriptor.updated_at = Utc::now();
+                if state.thread_live {
+                    state.wake_pending = true;
+                }
             }
         }
         if wake {
             persist_descriptor(&factory, &entry.state.lock().unwrap().descriptor.clone());
-            self.start_thread(entry.clone())?;
+            if !entry.state.lock().unwrap().thread_live {
+                self.start_thread(entry.clone())?;
+            }
         }
         let live = {
             let state = entry.state.lock().unwrap();
@@ -955,8 +977,22 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 });
             } else if !matched {
                 // Spuriously started with nothing to do — go back to sleep.
-                hibernate(hub, entry, listen);
-                return;
+                match hibernate(hub, entry, listen) {
+                    Ok(true) => return,
+                    Ok(false) => continue,
+                    Err(err) => {
+                        settle(
+                            hub,
+                            entry,
+                            "failed",
+                            None,
+                            Some(format!(
+                                "checking detached-agent inbox before hibernate: {err}"
+                            )),
+                        );
+                        return;
+                    }
+                }
             }
             let mut state = entry.state.lock().unwrap();
             state.descriptor.listen = None;
@@ -1078,9 +1114,34 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             parts.mcp.clone(),
         );
 
-        {
+        let publish_result = {
             let mut state = entry.state.lock().unwrap();
-            state.live_ctx = Some(ctx.clone());
+            // The inbox snapshot used to construct `ctx` predates source
+            // loading and VM setup. A store-only send can append during that
+            // interval, so refresh under AgentState immediately before
+            // publication. Holding the lock through both operations makes a
+            // subsequent sender choose this live context instead of racing a
+            // whole-file store write against the stale snapshot.
+            match store.get_blob(SIGNAL_INBOX_FILE) {
+                Ok(Some(bytes)) => {
+                    let inbox = serde_json::from_slice(&bytes).unwrap_or_default();
+                    ctx.set_signal_inbox(inbox);
+                    state.live_ctx = Some(ctx.clone());
+                    Ok(())
+                }
+                Ok(None) => {
+                    ctx.set_signal_inbox(Vec::new());
+                    state.live_ctx = Some(ctx.clone());
+                    Ok(())
+                }
+                Err(err) => Err(format!(
+                    "reading detached-agent inbox before context publication: {err}"
+                )),
+            }
+        };
+        if let Err(err) = publish_result {
+            settle(hub, entry, "failed", None, Some(err));
+            return;
         }
         #[cfg(test)]
         tests::pause_after_supervisor_publishes_live_context(&entry.name);
@@ -1138,8 +1199,22 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 if raced {
                     continue;
                 }
-                hibernate(hub, entry, listen);
-                return;
+                match hibernate(hub, entry, listen) {
+                    Ok(true) => return,
+                    Ok(false) => continue,
+                    Err(err) => {
+                        settle(
+                            hub,
+                            entry,
+                            "failed",
+                            None,
+                            Some(format!(
+                                "checking detached-agent inbox before hibernate: {err}"
+                            )),
+                        );
+                        return;
+                    }
+                }
             }
             IterationEnd::Failed(message) => {
                 let stop = entry.state.lock().unwrap().stop_requested;
@@ -1261,21 +1336,57 @@ fn release_agent_lease(entry: &Arc<AgentEntry>) {
     let _ = crate::runtime::store::release_lease(store.as_ref(), process_lease_owner());
 }
 
-fn hibernate(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>, listen: ListenState) {
+/// Persist the hibernation handoff while excluding senders. Returns `Ok(false)`
+/// when a matching durable message arrived before the transition; the caller
+/// should continue the supervisor loop and consume it instead of sleeping.
+fn hibernate(
+    hub: &DetachedAgentHub,
+    entry: &Arc<AgentEntry>,
+    listen: ListenState,
+) -> Result<bool, String> {
     let has_deadline = listen.deadline.is_some();
-    let descriptor = {
+    let factory = entry.factory();
+    {
         let mut state = entry.state.lock().unwrap();
+        let run_id = state.descriptor.run_id.clone();
+        let store = factory.store_for(&run_id);
+        let inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE) {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Ok(None) => Vec::new(),
+            Err(err) => return Err(format!("reading signal inbox: {err}")),
+        };
+        if inbox
+            .iter()
+            .any(|queued| listen.names.iter().any(|name| name == &queued.name))
+        {
+            // Keep the pending listen in memory for the next supervisor pass.
+            // It will observe the queued payload and clear the descriptor's
+            // listen state as it begins replay.
+            state.descriptor.listen = Some(listen);
+            return Ok(false);
+        }
+
         state.descriptor.status = "hibernating".to_string();
         state.descriptor.listen = Some(listen);
         state.descriptor.updated_at = Utc::now();
-        state.descriptor.clone()
-    };
-    persist_descriptor(&entry.factory(), &descriptor);
-    release_agent_lease(entry);
+        let descriptor = state.descriptor.clone();
+
+        // Keep senders behind AgentState until both durable transitions have
+        // completed. Otherwise a sender can persist `running` and start a new
+        // worker, then this stale hibernate write or lease release can undo
+        // that wake.
+        persist_descriptor(&factory, &descriptor);
+        if let Err(err) =
+            crate::runtime::store::release_lease(store.as_ref(), process_lease_owner())
+        {
+            tracing::warn!(agent = %entry.name, error = %err, "releasing detached-agent lease on hibernate");
+        }
+    }
     if has_deadline {
         hub.ensure_timer();
     }
     entry.signal.notify_all();
+    Ok(true)
 }
 
 fn settle(
@@ -2868,29 +2979,34 @@ mod tests {
             return;
         }
 
-        let base = tempfile::tempdir().unwrap();
-        let db_path = base.path().join("runs.sqlite3");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "runtime::host_agent::tests::detached_inbox_snapshot_to_live_context_gap_preserves_acknowledged_payloads",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("CHIDORI_TEST_INBOX_SNAPSHOT_GAP_BASE", base.path())
-            .env("CHIDORI_RUN_STORE", "sqlite")
-            .env("CHIDORI_RUN_DB", db_path)
-            .env("CHIDORI_DURABILITY", "strict")
-            .output()
-            .unwrap();
-        let report = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let mut failures = Vec::new();
+        for backend in ["fs", "sqlite"] {
+            let base = tempfile::tempdir().unwrap();
+            let db_path = base.path().join("runs.sqlite3");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::host_agent::tests::detached_inbox_snapshot_to_live_context_gap_preserves_acknowledged_payloads",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("CHIDORI_TEST_INBOX_SNAPSHOT_GAP_BASE", base.path())
+                .env("CHIDORI_RUN_STORE", backend)
+                .env("CHIDORI_RUN_DB", db_path)
+                .env("CHIDORI_DURABILITY", "strict")
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                failures.push(format!(
+                    "backend={backend}\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
         assert!(
-            output.status.success(),
-            "inbox snapshot-to-live-context interleaving lost an acknowledged payload:\n{report}"
+            failures.is_empty(),
+            "inbox snapshot-to-live-context interleaving lost an acknowledged payload:\n{failures:#?}"
         );
     }
 
