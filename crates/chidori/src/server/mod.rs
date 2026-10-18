@@ -102,12 +102,11 @@ struct AppState {
     max_concurrent: usize,
     acquire_timeout: std::time::Duration,
     active_sessions: Arc<StdMutex<HashMap<String, ActiveSession>>>,
-    /// Per-run advisory locks serializing `signals/inbox.json` read-modify-write
-    /// (enqueue and the delivery routing decision). A paused run is not a live
-    /// task in Phase 1, but the endpoint can still race itself across concurrent
-    /// deliveries; this in-process mutex (keyed by run id) makes each delivery's
-    /// inbox mutation atomic, matching how the server already serializes per-run
-    /// state. See `docs/signals.md` §11.
+    /// Process-local per-run locks around `signals/inbox.json` enqueue and the
+    /// delivery routing decision. The RunStore update operation also serializes
+    /// durable inbox mutations across processes; this mutex keeps the local
+    /// delivery routing decision ordered with this server's handlers. See
+    /// `docs/signals.md` §11.
     signal_inbox_locks: Arc<StdMutex<HashMap<String, Arc<StdMutex<()>>>>>,
     /// Warm-parked runs by SESSION id (`docs/resume-performance.md` §5): while
     /// a run is parked at an `input()` pause its VM stays live on its blocking
@@ -649,13 +648,12 @@ fn load_persisted_signal_inbox(
     crate::runtime::context::load_signal_inbox(&run_base.join(run_id))
 }
 
-/// Append a signal to a run's durable mailbox under a per-run advisory lock,
-/// assigning it the next `delivery_seq` (`max(existing)+1`, starting at 1) so
-/// global arrival order across senders is frozen and same-name signals are
-/// consumed lowest-first (doc §8.4/§10/§11). The lock is the same per-run mutex
-/// the server uses to serialize inbox read-modify-write while a run is paused or
-/// running (doc §11: "guard `inbox.json` read-modify-write with a per-run
-/// advisory ... lock"). Creates the `signals/` directory if absent.
+/// Append a signal to a run's durable mailbox through the store's serialized
+/// update operation, assigning it the next `delivery_seq` (`max(existing)+1`,
+/// starting at 1) so global arrival order across senders is frozen and
+/// same-name signals are consumed lowest-first (doc §8.4/§10/§11). The local
+/// per-run mutex also orders this server's delivery-routing decision. Creates
+/// the `signals/` directory if absent.
 fn enqueue_signal_to_inbox(
     state: &AppState,
     run_id: &str,
@@ -670,26 +668,33 @@ fn enqueue_signal_to_inbox(
     let factory = crate::runtime::store::RunStoreFactory::shared(&state.run_base);
     factory.hydrate(run_id)?;
     let store = factory.store_for(run_id);
-    let mut inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE)? {
-        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        None => Vec::new(),
+    let mut queued = None;
+    let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+        let mut inbox: Vec<QueuedSignal> = current
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?
+            .unwrap_or_default();
+        let next_delivery_seq = inbox
+            .iter()
+            .map(|signal| signal.delivery_seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let signal = QueuedSignal {
+            name: name.to_string(),
+            payload: payload.clone(),
+            from: from.clone(),
+            delivery_seq: next_delivery_seq,
+            enqueued_at: chrono::Utc::now(),
+        };
+        inbox.push(signal.clone());
+        queued = Some(signal);
+        Ok(serde_json::to_vec_pretty(&inbox)?)
     };
-    let next_delivery_seq = inbox
-        .iter()
-        .map(|s| s.delivery_seq)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-    let queued = QueuedSignal {
-        name: name.to_string(),
-        payload,
-        from,
-        delivery_seq: next_delivery_seq,
-        enqueued_at: chrono::Utc::now(),
-    };
-    inbox.push(queued.clone());
-    store.put_blob(SIGNAL_INBOX_FILE, &serde_json::to_vec_pretty(&inbox)?)?;
-    Ok(queued)
+    store.update_blob(SIGNAL_INBOX_FILE, &mut update)?;
+    queued
+        .ok_or_else(|| anyhow::anyhow!("signal inbox update completed without an appended signal"))
 }
 
 #[allow(dead_code)]

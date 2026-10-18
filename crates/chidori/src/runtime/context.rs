@@ -1752,12 +1752,13 @@ impl RuntimeContext {
 
     /// Drain the lowest-`delivery_seq` queued signal whose name matches `name`,
     /// removing it from the in-memory mailbox and — if persistence is enabled —
-    /// immediately re-persisting the shrunken inbox to `SIGNAL_INBOX_FILE` in the
-    /// SAME critical section as consumption. This is the determinism guarantee
-    /// from `docs/signals.md` §8.4/§10: a crash between consumption and the
-    /// recorded `CallRecord` must not leave the signal in the inbox for a second
-    /// delivery — on restart the recorded result wins and the inbox is never
-    /// re-drained for that seq. Returns `None` when no matching entry exists.
+    /// atomically removing that exact `delivery_seq` from `SIGNAL_INBOX_FILE`
+    /// in the SAME critical section as consumption. This is the determinism
+    /// guarantee from `docs/signals.md` §8.4/§10: a crash between consumption
+    /// and the recorded `CallRecord` must not leave the signal in the inbox for
+    /// a second delivery — on restart the recorded result wins and the inbox is
+    /// never re-drained for that seq. Returns `None` when no matching entry
+    /// exists.
     pub fn take_queued_signal(&self, name: &str) -> Option<QueuedSignal> {
         self.take_queued_signal_any(std::slice::from_ref(&name.to_string()))
     }
@@ -1777,12 +1778,13 @@ impl RuntimeContext {
             .min_by_key(|(_, s)| s.delivery_seq)
             .map(|(i, _)| i)?;
         let signal = inner.signal_inbox.remove(idx);
-        persist_signal_inbox(&mut inner);
+        remove_persisted_signal(&mut inner, signal.delivery_seq);
         Some(signal)
     }
 
-    /// Remove a specific queued signal by its `delivery_seq`, re-persisting the
-    /// shrunken inbox in the same critical section. Used by the live streaming
+    /// Remove a specific queued signal by its `delivery_seq`, atomically
+    /// removing that entry from the durable inbox in the same critical section.
+    /// Used by the live streaming
     /// supervisor (Phase 3, `docs/signals.md`) to apply the pinned
     /// "pending-pause-wins-with-newest" tie-break: a just-delivered signal is
     /// write-through enqueued for durability, then *that exact entry* is taken
@@ -1795,7 +1797,7 @@ impl RuntimeContext {
             .iter()
             .position(|s| s.delivery_seq == delivery_seq)?;
         let signal = inner.signal_inbox.remove(idx);
-        persist_signal_inbox(&mut inner);
+        remove_persisted_signal(&mut inner, delivery_seq);
         Some(signal)
     }
 
@@ -1804,8 +1806,8 @@ impl RuntimeContext {
     /// The in-memory and on-disk inboxes mutate in one critical section, so the
     /// running agent sees the entry at its next listen point and a crash after
     /// the enqueue cannot lose an acknowledged delivery. Returns the stored
-    /// entry with its assigned `delivery_seq` (monotonic above every entry
-    /// currently queued).
+    /// entry with its assigned `delivery_seq` (monotonic above every durable
+    /// entry currently queued).
     pub fn enqueue_live_signal(
         &self,
         name: &str,
@@ -1813,22 +1815,55 @@ impl RuntimeContext {
         from: serde_json::Value,
     ) -> QueuedSignal {
         let mut inner = self.inner.lock().unwrap();
-        let delivery_seq = inner
-            .signal_inbox
-            .iter()
-            .map(|s| s.delivery_seq)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let queued = QueuedSignal {
-            name: name.to_string(),
-            payload,
-            from,
-            delivery_seq,
-            enqueued_at: chrono::Utc::now(),
-        };
+        let mut persisted = None;
+        if let Some(store) = inner.store.clone() {
+            let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+                let mut inbox: Vec<QueuedSignal> = current
+                    .as_deref()
+                    .map(serde_json::from_slice)
+                    .transpose()?
+                    .unwrap_or_default();
+                let delivery_seq = inbox
+                    .iter()
+                    .map(|signal| signal.delivery_seq)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let queued = QueuedSignal {
+                    name: name.to_string(),
+                    payload: payload.clone(),
+                    from: from.clone(),
+                    delivery_seq,
+                    enqueued_at: chrono::Utc::now(),
+                };
+                inbox.push(queued.clone());
+                persisted = Some(queued);
+                Ok(serde_json::to_vec_pretty(&inbox)?)
+            };
+            note_persist_result(
+                &mut inner,
+                store
+                    .update_blob(SIGNAL_INBOX_FILE, &mut update)
+                    .map(|_| ()),
+            )
+        }
+        let queued = persisted.unwrap_or_else(|| {
+            let delivery_seq = inner
+                .signal_inbox
+                .iter()
+                .map(|signal| signal.delivery_seq)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            QueuedSignal {
+                name: name.to_string(),
+                payload,
+                from,
+                delivery_seq,
+                enqueued_at: chrono::Utc::now(),
+            }
+        });
         inner.signal_inbox.push(queued.clone());
-        persist_signal_inbox(&mut inner);
         queued
     }
 
@@ -2074,15 +2109,24 @@ fn persist_host_promise_change(inner: &mut RuntimeContextInner, id: HostOperatio
     note_persist_result(inner, result);
 }
 
-/// Persist the in-memory signal mailbox to `SIGNAL_INBOX_FILE` through the
-/// run's store. No-op when persistence is disabled.
-fn persist_signal_inbox(inner: &mut RuntimeContextInner) {
+/// Remove one consumed signal from the durable inbox by `delivery_seq`.
+/// No-op when persistence is disabled.
+fn remove_persisted_signal(inner: &mut RuntimeContextInner, delivery_seq: u64) {
     let Some(store) = inner.store.clone() else {
         return;
     };
-    let result = serde_json::to_vec_pretty(&inner.signal_inbox)
-        .map_err(anyhow::Error::from)
-        .and_then(|json| store.put_blob(SIGNAL_INBOX_FILE, &json));
+    let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+        let mut inbox: Vec<QueuedSignal> = current
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?
+            .unwrap_or_default();
+        inbox.retain(|signal| signal.delivery_seq != delivery_seq);
+        Ok(serde_json::to_vec_pretty(&inbox)?)
+    };
+    let result = store
+        .update_blob(SIGNAL_INBOX_FILE, &mut update)
+        .map(|_| ());
     note_persist_result(inner, result);
 }
 

@@ -79,6 +79,22 @@ pub trait RunStore: Send + Sync + std::fmt::Debug {
     /// Read a named auxiliary artifact. `Ok(None)` when absent.
     fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
+    /// Atomically update one blob and return the bytes that were written.
+    ///
+    /// The default implementation is a read-transform-write and does not
+    /// serialize concurrent processes. Filesystem and SQLite stores override
+    /// it with a cross-process serialization point. Callers should keep the
+    /// transform limited to decoding, updating, and encoding the blob.
+    fn update_blob(
+        &self,
+        key: &str,
+        update: &mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let bytes = update(self.get_blob(key)?)?;
+        self.put_blob(key, &bytes)?;
+        Ok(bytes)
+    }
+
     /// Whether `key` exists, without reading its bytes. The source-history
     /// object writer calls this per file on every recording point, so the
     /// filesystem backend answers with one `stat` instead of a full read; the
@@ -264,6 +280,47 @@ impl FsRunStore {
         Ok(self.run_dir.join(rel))
     }
 
+    /// Run all blob update work under a stable sidecar lock. The lock file
+    /// lives beside the run directory, so it is shared by processes using the
+    /// same run base but is not listed or hydrated as a run artifact.
+    fn with_blob_update_lock<T>(&self, update: impl FnOnce() -> Result<T>) -> Result<T> {
+        let parent = self
+            .run_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating run-store directory {}", parent.display()))?;
+        let run_name = self
+            .run_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("run");
+        let lock_path = parent.join(format!(".chidori-{run_name}-blob-update.lock"));
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening blob update lock {}", lock_path.display()))?;
+        lock_file
+            .lock()
+            .with_context(|| format!("locking blob updates for {}", self.run_dir.display()))?;
+        update()
+    }
+
+    /// Caller must hold `with_blob_update_lock` for this run.
+    fn update_blob_under_lock(
+        &self,
+        key: &str,
+        update: &mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let bytes = update(self.get_blob(key)?)?;
+        self.put_blob(key, &bytes)?;
+        Ok(bytes)
+    }
+
     fn load_call_log_with_external_completion_check(&self) -> Result<Option<Vec<CallRecord>>> {
         let checkpoint_path = self.run_dir.join(CHECKPOINT_FILE);
         let checkpoint: Option<Vec<CallRecord>> = match std::fs::read(&checkpoint_path) {
@@ -429,6 +486,14 @@ impl RunStore for FsRunStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err).with_context(|| format!("reading blob {key}")),
         }
+    }
+
+    fn update_blob(
+        &self,
+        key: &str,
+        update: &mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        self.with_blob_update_lock(|| self.update_blob_under_lock(key, update))
     }
 
     fn has_blob(&self, key: &str) -> Result<bool> {
@@ -782,6 +847,32 @@ impl RunStore for SqliteRunStore {
             Some(row) => Ok(Some(row.get::<_, Vec<u8>>(0)?)),
             None => Ok(None),
         }
+    }
+
+    fn update_blob(
+        &self,
+        key: &str,
+        update: &mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let mut conn = self.shared.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = {
+            let mut stmt =
+                tx.prepare_cached("SELECT data FROM run_blobs WHERE run_id = ?1 AND key = ?2")?;
+            let mut rows = stmt.query(rusqlite::params![self.run_id, key])?;
+            match rows.next()? {
+                Some(row) => Some(row.get::<_, Vec<u8>>(0)?),
+                None => None,
+            }
+        };
+        let bytes = update(current)?;
+        tx.execute(
+            "INSERT INTO run_blobs (run_id, key, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(run_id, key) DO UPDATE SET data = excluded.data",
+            rusqlite::params![self.run_id, key, &bytes],
+        )?;
+        tx.commit()?;
+        Ok(bytes)
     }
 
     fn delete_blob(&self, key: &str) -> Result<()> {
@@ -1605,6 +1696,18 @@ impl RunStore for TeeRunStore {
         }
     }
 
+    fn update_blob(
+        &self,
+        key: &str,
+        update: &mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        self.primary.with_blob_update_lock(|| {
+            let bytes = self.primary.update_blob_under_lock(key, update)?;
+            self.secondary.put_blob(key, &bytes)?;
+            Ok(bytes)
+        })
+    }
+
     // Same primary-then-secondary semantics as `get_blob`.
     fn has_blob(&self, key: &str) -> Result<bool> {
         Ok(self.primary.has_blob(key)? || self.secondary.has_blob(key)?)
@@ -1740,6 +1843,14 @@ impl RunStore for ScopedRunStore {
 
     fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.inner.get_blob(&self.key(key))
+    }
+
+    fn update_blob(
+        &self,
+        key: &str,
+        update: &mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        self.inner.update_blob(&self.key(key), update)
     }
 
     fn has_blob(&self, key: &str) -> Result<bool> {
@@ -2519,6 +2630,30 @@ mod tests {
             store.get_blob("manifest.json").unwrap().unwrap(),
             b"{\"a\":1}"
         );
+        for expected_seq in 1..=2 {
+            let mut append = |current: Option<Vec<u8>>| -> Result<Vec<u8>> {
+                let mut inbox: Vec<serde_json::Value> = current
+                    .as_deref()
+                    .map(serde_json::from_slice)
+                    .transpose()?
+                    .unwrap_or_default();
+                inbox.push(serde_json::json!({ "delivery_seq": expected_seq }));
+                Ok(serde_json::to_vec(&inbox)?)
+            };
+            store
+                .update_blob("signals/inbox.json", &mut append)
+                .unwrap();
+        }
+        let inbox: Vec<serde_json::Value> = serde_json::from_slice(
+            &store
+                .get_blob("signals/inbox.json")
+                .unwrap()
+                .expect("updated inbox disappeared"),
+        )
+        .unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[0]["delivery_seq"], 1);
+        assert_eq!(inbox[1]["delivery_seq"], 2);
         let keys = store.list_blobs().unwrap();
         assert!(keys.contains(&"manifest.json".to_string()));
         assert!(keys.contains(&"signals/inbox.json".to_string()));
