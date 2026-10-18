@@ -2007,6 +2007,7 @@ fn dev_iteration(
     crate::runtime::snapshot::validate_manifest_for_resume(run_base, Some(run_id), file, true)?;
 
     let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
+    factory.ensure_initialized()?;
     factory.hydrate(run_id)?;
     let mut records = factory
         .store_for(run_id)
@@ -2381,6 +2382,7 @@ fn cmd_chat(
     // `chidori trace`/`verify`, and can be continued with `--resume`.
     let run_base = base_dir.join(".chidori").join("runs");
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    factory.ensure_initialized()?;
     let lease_owner = format!("chidori-chat-{}", std::process::id());
     let mut messages: Vec<String> = Vec::new();
     let mut call_log: Vec<crate::runtime::call_log::CallRecord> = Vec::new();
@@ -2790,6 +2792,7 @@ fn cmd_resume(
     // durable mirror when this machine has never seen the run, and unions the
     // last checkpoint with any crash-stranded `records.jsonl` tail.
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    factory.ensure_initialized()?;
     factory.hydrate(run_id)?;
     let store = factory.store_for(run_id);
     let mut records = store
@@ -3082,6 +3085,7 @@ fn cmd_rollback(
     let run_base = base_dir.join(".chidori").join("runs");
 
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+    factory.ensure_initialized()?;
     factory.hydrate(run_id)?;
     let store = factory.store_for(run_id);
 

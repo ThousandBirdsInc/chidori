@@ -2567,6 +2567,73 @@ fn assert_explicit_sqlite_init_failure(durability: &str, fixture_name: &str) {
 }
 
 #[test]
+fn cli_resume_reports_sqlite_init_error_before_local_lease_or_journal_preflight() {
+    let dir = temp_project("resume-sqlite-init-preflight");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent() {
+                await chidori.log("completed", {});
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+    let output = run_chidori(&["run", agent.to_str().unwrap()], &dir);
+    assert_success(&output);
+
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
+    let records_before = fs::read(&records_path).unwrap();
+    let lease_path = run_dir.join("lease.json");
+    let lease = serde_json::json!({
+        "owner": "existing-holder",
+        "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+    });
+    let lease_before = serde_json::to_vec(&lease).unwrap();
+    fs::write(&lease_path, &lease_before).unwrap();
+
+    // A directory at the configured DB filename deterministically fails the
+    // SQLite open. The config error must take precedence over local journal
+    // reads and a live-lease refusal, without changing either local artifact.
+    let db_path = dir.join("sqlite-db-is-a-directory");
+    fs::create_dir_all(&db_path).unwrap();
+    let db_path_string = db_path.to_string_lossy().to_string();
+    let envs = [
+        ("CHIDORI_RUN_STORE", "sqlite"),
+        ("CHIDORI_RUN_DB", db_path_string.as_str()),
+        ("CHIDORI_DURABILITY", "besteffort"),
+    ];
+    let output =
+        run_chidori_with_str_env(&["resume", agent.to_str().unwrap(), &run_id], &dir, &envs);
+    let diagnostic = output_diagnostic(&output);
+
+    assert_failure(&output);
+    assert!(
+        diagnostic.contains(&db_path_string)
+            && diagnostic.to_lowercase().contains("opening run store sqlite")
+            && diagnostic
+                .to_lowercase()
+                .contains("unable to open database file"),
+        "resume should surface the explicit SQLite initialization error before local preflight; output:\n{diagnostic}"
+    );
+    assert_eq!(
+        fs::read(&lease_path).unwrap(),
+        lease_before,
+        "resume must not acquire, overwrite, or release a local lease before SQLite initialization is checked"
+    );
+    assert_eq!(
+        fs::read(&records_path).unwrap(),
+        records_before,
+        "resume must not mutate the local journal before SQLite initialization is checked"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn cli_run_rejects_explicit_sqlite_open_failure_before_run_or_effect() {
     assert_explicit_sqlite_init_failure("strict", "sqlite-open-failure-strict");
 }
