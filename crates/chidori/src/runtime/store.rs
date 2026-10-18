@@ -1814,6 +1814,12 @@ impl RunStoreFactory {
     /// Fail before starting a run if an explicitly selected backend could not
     /// be initialized. SQLite open failures are startup errors regardless of
     /// the later write-durability policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the preserved SQLite initialization error, including the
+    /// configured database path and underlying SQLite cause, when SQLite was
+    /// explicitly selected and could not be opened or initialized.
     pub fn ensure_initialized(&self) -> Result<()> {
         if let Some(error) = &self.initialization_error {
             anyhow::bail!("{error}");
