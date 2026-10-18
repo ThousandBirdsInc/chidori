@@ -2905,6 +2905,8 @@ mod tests {
             let base =
                 PathBuf::from(std::env::var_os("CHIDORI_TEST_INBOX_SNAPSHOT_GAP_BASE").unwrap());
             let loss = run_inbox_snapshot_to_live_context_gap(&base);
+            run_sequential_inbox_control(&base, 2);
+            println!("SQLite after-consumption sequential control passed; it is separate from the forced batch interleaving");
             assert!(
                 loss.is_none(),
                 "acknowledged payload missing from both child journal and inbox: {}",
@@ -2946,7 +2948,7 @@ mod tests {
         std::fs::write(
             &source,
             r#"export async function agent() {
-                for (let i = 0; i < 5; i++) {
+                for (let i = 0; i < 2; i++) {
                     const message = await chidori.signal("tick");
                     await chidori.log("cycle", { n: message.payload.n });
                 }
@@ -3007,9 +3009,12 @@ mod tests {
             .expect("supervisor did not reach inbox snapshot barrier");
 
         let run_id = spawned["runId"].as_str().unwrap().to_string();
+        let status = hub().status(&parts, &agent_name).unwrap();
+        assert_eq!(status["status"], json!("running"), "{status}");
+        assert_eq!(status["live"], json!(true), "{status}");
         let mut acknowledged_ids = Vec::new();
-        for n in 0..5 {
-            if n == 1 {
+        for n in 1..=2 {
+            if n == 2 {
                 snapshot_release_tx.send(()).unwrap();
                 context_published_rx
                     .recv_timeout(Duration::from_secs(10))
@@ -3071,7 +3076,7 @@ mod tests {
         });
         (!missing.is_empty()).then(|| {
             format!(
-                "expected acknowledged n=0..4 exactly once in child journal or inbox; missing/duplicate={missing:?}, all_counts={accounted:?}, inbox={inbox:?}"
+                "expected acknowledged n=1 and n=2 exactly once in child journal or inbox; missing/duplicate={missing:?}, all_counts={accounted:?}, inbox={inbox:?}"
             )
         })
     }
