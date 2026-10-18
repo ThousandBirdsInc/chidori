@@ -556,6 +556,133 @@ pub fn host_promise_blob_key(id: HostOperationId) -> String {
 pub fn load_host_promise_records(
     store: &dyn crate::runtime::store::RunStore,
 ) -> Result<Vec<HostPromiseRecord>> {
+    let mut records = load_composed_host_promise_records(store)?;
+    // Validate all same-seq relationships against the journal before a
+    // consumer can start replay. A journal-referenced value is rehydrated from
+    // that same loaded log, while an inline per-operation result remains usable
+    // when its append never landed.
+    let journal = if records.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .load_call_log()
+            .context("loading the journal to validate host-promise records")?
+            .unwrap_or_default()
+    };
+    if records
+        .iter()
+        .any(|record| matches!(record.state, HostPromiseState::ResolvedInJournal { .. }))
+    {
+        let result_at_seq: std::collections::HashMap<u64, &Value> = journal
+            .iter()
+            .filter(|record| record.error.is_none())
+            .map(|record| (record.seq, &record.result))
+            .collect();
+        for record in &mut records {
+            if let HostPromiseState::ResolvedInJournal { completed_at } = record.state {
+                let value = result_at_seq.get(&record.operation.seq).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "host promise {} (seq {}) references its journal record for its \
+                         resolved value, but the journal has no clean record at that seq — \
+                         the run directory is inconsistent (was the journal truncated or \
+                         assembled by hand?)",
+                        record.operation.id.0,
+                        record.operation.seq
+                    )
+                })?;
+                record.state = HostPromiseState::Resolved {
+                    value: (*value).clone(),
+                    completed_at,
+                };
+            }
+        }
+    }
+    validate_host_promise_journal_relationships(&records, &journal)?;
+    Ok(records)
+}
+
+/// Reconcile a detached signal timeout that was journaled by the supervisor
+/// after its pending promise had already been persisted. The timeout row is
+/// authoritative only when operation identity, kind, match arguments, and
+/// exact timeout sentinel all agree; other pending/journal conflicts remain
+/// errors in [`load_host_promise_records`].
+pub(crate) fn reconcile_detached_signal_timeout_promises(
+    store: &dyn crate::runtime::store::RunStore,
+    effective_journal: &[CallRecord],
+) -> Result<()> {
+    let records = load_composed_host_promise_records(store)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let calls_by_seq: std::collections::HashMap<_, _> = effective_journal
+        .iter()
+        .map(|record| (record.seq, record))
+        .collect();
+
+    for mut promise in records {
+        if !matches!(promise.state, HostPromiseState::Pending) {
+            continue;
+        }
+        let Some(call) = calls_by_seq.get(&promise.operation.seq) else {
+            continue;
+        };
+        if !is_matching_detached_signal_timeout(&promise, call) {
+            continue;
+        }
+        promise.state = HostPromiseState::Resolved {
+            value: call.result.clone(),
+            completed_at: call.timestamp,
+        };
+        let bytes = serde_json::to_vec_pretty(&promise)
+            .context("encoding reconciled detached signal timeout promise")?;
+        store
+            .put_blob(&host_promise_blob_key(promise.operation.id), &bytes)
+            .with_context(|| {
+                format!(
+                    "persisting reconciled detached signal timeout promise {}",
+                    promise.operation.id.0
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn is_matching_detached_signal_timeout(promise: &HostPromiseRecord, call: &CallRecord) -> bool {
+    use PendingHostOperationKind::Signal;
+
+    if call.error.is_some()
+        || promise.operation.kind != Signal
+        || promise.operation.function.as_deref() != Some(call.function.as_str())
+        || !completed_args_match(&promise.operation.args, &call.args)
+    {
+        return false;
+    }
+    let names = match (call.function.as_str(), &call.args) {
+        ("signal", Value::Object(args)) => args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| vec![name.to_string()]),
+        ("signal_any", Value::Object(args)) => args
+            .get("names")
+            .and_then(Value::as_array)
+            .and_then(|names| {
+                names
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()
+                    .map(|names| names.into_iter().map(str::to_string).collect())
+            }),
+        _ => None,
+    };
+    let Some(names) = names.filter(|names| !names.is_empty()) else {
+        return false;
+    };
+    call.result == crate::runtime::host_core::signal_timeout_sentinel(&names)
+}
+
+fn load_composed_host_promise_records(
+    store: &dyn crate::runtime::store::RunStore,
+) -> Result<Vec<HostPromiseRecord>> {
     let mut records: Vec<HostPromiseRecord> = match store.get_blob(HOST_PROMISE_TABLE_FILE)? {
         Some(bytes) => serde_json::from_slice(&bytes).context("parsing host promise table")?,
         None => Vec::new(),
@@ -598,47 +725,6 @@ pub fn load_host_promise_records(
         }
     }
     validate_host_promise_records(&records, "composed host promise records")?;
-    // Validate all same-seq relationships against the journal before a
-    // consumer can start replay. A journal-referenced value is rehydrated from
-    // that same loaded log, while an inline per-operation result remains usable
-    // when its append never landed.
-    let journal = if records.is_empty() {
-        Vec::new()
-    } else {
-        store
-            .load_call_log()
-            .context("loading the journal to validate host-promise records")?
-            .unwrap_or_default()
-    };
-    if records
-        .iter()
-        .any(|record| matches!(record.state, HostPromiseState::ResolvedInJournal { .. }))
-    {
-        let result_at_seq: std::collections::HashMap<u64, &Value> = journal
-            .iter()
-            .filter(|record| record.error.is_none())
-            .map(|record| (record.seq, &record.result))
-            .collect();
-        for record in &mut records {
-            if let HostPromiseState::ResolvedInJournal { completed_at } = record.state {
-                let value = result_at_seq.get(&record.operation.seq).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "host promise {} (seq {}) references its journal record for its \
-                         resolved value, but the journal has no clean record at that seq — \
-                         the run directory is inconsistent (was the journal truncated or \
-                         assembled by hand?)",
-                        record.operation.id.0,
-                        record.operation.seq
-                    )
-                })?;
-                record.state = HostPromiseState::Resolved {
-                    value: (*value).clone(),
-                    completed_at,
-                };
-            }
-        }
-    }
-    validate_host_promise_journal_relationships(&records, &journal)?;
     Ok(records)
 }
 

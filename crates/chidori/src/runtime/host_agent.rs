@@ -963,6 +963,21 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         // Fresh VM + context under the agent's OWN durable identity: run id,
         // journal, policy seed, and persistence handle all belong to the
         // agent, not the spawner.
+        if let Err(err) = crate::runtime::snapshot::reconcile_detached_signal_timeout_promises(
+            store.as_ref(),
+            &replay,
+        ) {
+            settle(
+                hub,
+                entry,
+                "failed",
+                None,
+                Some(format!(
+                    "reconciling detached-agent alarm promises: {err:#}"
+                )),
+            );
+            return;
+        }
         let host_promises =
             match crate::runtime::snapshot::load_host_promise_records(store.as_ref()) {
                 Ok(records) => records,
