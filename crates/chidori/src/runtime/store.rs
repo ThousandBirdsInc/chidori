@@ -233,46 +233,75 @@ impl FsRunStore {
         Ok(records)
     }
 
-    fn write_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let mut file =
-            std::fs::File::create(path).with_context(|| format!("writing {}", path.display()))?;
-        file.write_all(bytes)
-            .with_context(|| format!("writing {}", path.display()))?;
-        if self.fsync_writes {
-            file.sync_data()
-                .with_context(|| format!("syncing {}", path.display()))?;
-        }
-        Ok(())
-    }
-
-    /// [`Self::write_file`] with all-or-nothing semantics: write a sibling
-    /// temp file, then `rename` it into place. Used for the journal rewrite,
+    /// Write with all-or-nothing semantics: write a temp file, then `rename`
+    /// it into place. Used for the journal rewrite,
     /// where an in-place truncate-then-write would leave a prefix of the log
     /// as the only copy if the process died mid-write. Under strict
     /// durability the temp file is synced before the rename so the rename
     /// never publishes unflushed data.
     fn write_file_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let tmp = path.with_extension("tmp");
+        self.write_file_atomic_from(path, &tmp, bytes, false)
+    }
+
+    /// Blob staging lives at the run-directory root, outside the blob's
+    /// namespace. In particular, an abandoned temp file must not appear under
+    /// `host_promises/`, where the per-operation loader treats every key as a
+    /// promise record. Keeping it under the run directory also keeps the rename
+    /// on the same filesystem as the target.
+    fn write_blob_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("blob");
+        let tmp = self.run_dir.join(format!(
+            ".chidori-blob-{file_name}-{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        self.write_file_atomic_from(path, &tmp, bytes, true)
+    }
+
+    fn write_file_atomic_from(
+        &self,
+        path: &Path,
+        tmp: &Path,
+        bytes: &[u8],
+        exclusive_temp: bool,
+    ) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let tmp = path.with_extension("tmp");
-        {
-            let mut file = std::fs::File::create(&tmp)
-                .with_context(|| format!("writing {}", tmp.display()))?;
+        if let Some(parent) = tmp.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut created_temp = false;
+        let result = (|| {
+            let mut file = if exclusive_temp {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp)
+            } else {
+                std::fs::File::create(tmp)
+            }
+            .with_context(|| format!("writing {}", tmp.display()))?;
+            created_temp = true;
             file.write_all(bytes)
                 .with_context(|| format!("writing {}", tmp.display()))?;
             if self.fsync_writes {
                 file.sync_data()
                     .with_context(|| format!("syncing {}", tmp.display()))?;
             }
+            drop(file);
+            std::fs::rename(tmp, path)
+                .with_context(|| format!("renaming {} into place", tmp.display()))
+        })();
+        if result.is_err() && exclusive_temp && created_temp {
+            let _ = std::fs::remove_file(tmp);
         }
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("renaming {} into place", tmp.display()))
+        result
     }
 }
 
@@ -332,7 +361,7 @@ impl RunStore for FsRunStore {
     }
 
     fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        self.write_file(&self.blob_path(key)?, bytes)
+        self.write_blob_atomic(&self.blob_path(key)?, bytes)
     }
 
     fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
