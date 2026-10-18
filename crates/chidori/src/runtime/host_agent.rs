@@ -1983,6 +1983,29 @@ mod tests {
         let live_result = sender.join().unwrap().unwrap();
         assert_eq!(live_result["delivered"], json!(true));
         worker_release_tx.send(()).unwrap();
+        let mut consumed_notifications = std::collections::HashMap::<String, usize>::new();
+        if require_wake_resolution {
+            let expected_ids: std::collections::HashSet<_> =
+                acknowledged_ids.iter().cloned().collect();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while expected_ids
+                .iter()
+                .any(|id| consumed_notifications.get(id).copied().unwrap_or(0) == 0)
+            {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match consumed_rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                    Ok(id) => {
+                        if let Some(id) = id.as_str() {
+                            *consumed_notifications.entry(id.to_string()).or_default() += 1;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
         let status = if require_wake_resolution {
             wait_for_inbox_race_outcome(&parts, &agent_name)
         } else {
@@ -2034,6 +2057,43 @@ mod tests {
             .cloned()
             .collect();
 
+        let consumption_failures: Vec<_> = if require_wake_resolution {
+            acknowledged_ids
+                .iter()
+                .filter_map(|id| {
+                    let notification_count = consumed_notifications.get(id).copied().unwrap_or(0);
+                    let (journal_signal_count, inbox_count) = accounted
+                        .iter()
+                        .find(|(accounted_id, _, _)| accounted_id == id)
+                        .map(|(_, journal_count, inbox_count)| (*journal_count, *inbox_count))
+                        .unwrap_or((0, 0));
+                    let race_consumed_call_count = records
+                        .iter()
+                        .filter(|record| {
+                            record.function == "tool"
+                                && record.args["name"] == json!("raceConsumed")
+                                && record.args["kwargs"]["id"] == json!(id)
+                        })
+                        .count();
+                    (notification_count != 1
+                        || journal_signal_count != 1
+                        || inbox_count != 0
+                        || race_consumed_call_count != 1)
+                        .then(|| {
+                            (
+                                id.clone(),
+                                notification_count,
+                                journal_signal_count,
+                                inbox_count,
+                                race_consumed_call_count,
+                            )
+                        })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let _ = hub().stop(&parts, &agent_name);
         wait_for_agent_status(&parts, &agent_name, |status| {
             matches!(status, "stopped" | "completed" | "failed")
@@ -2051,14 +2111,13 @@ mod tests {
             && !live
             && waiting_for_race
             && !stranded_matching_ids.is_empty();
-        let queued_without_driveable_worker = require_wake_resolution
-            && !stranded_matching_ids.is_empty()
-            && status["status"] != "running";
 
-        (!unaccounted.is_empty() || hibernating_with_queued_matches || queued_without_driveable_worker)
+        (!unaccounted.is_empty()
+            || !consumption_failures.is_empty()
+            || hibernating_with_queued_matches)
             .then(|| {
                 format!(
-                    "backend={}, N={}, conservation={accounted:?}, status={status}, live={live}, stranded_matching_ids={stranded_matching_ids:?}, inbox={inbox:?}, other_store_ids={other_ids:?}",
+                    "backend={}, N={}, conservation={accounted:?}, exact_consumption_failures={consumption_failures:?}, status={status}, live={live}, hibernating_with_queued_matches={hibernating_with_queued_matches}, stranded_matching_ids={stranded_matching_ids:?}, inbox={inbox:?}, other_store_ids={other_ids:?}",
                     std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string()),
                     competing_sends
                 )
