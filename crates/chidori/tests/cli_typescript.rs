@@ -2492,3 +2492,147 @@ fn cli_export_refuses_leased_run() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+fn assert_explicit_sqlite_init_failure(durability: &str, fixture_name: &str) {
+    let dir = temp_project(fixture_name);
+    let server = LocalHttpServer::start();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        format!(
+            r#"
+                export async function agent() {{
+                    const response = await fetch("http://{}/effect");
+                    return await response.json();
+                }}
+            "#,
+            server.address
+        ),
+    )
+    .unwrap();
+
+    // A directory at the configured DB filename is an existing, deterministic
+    // SQLite open failure on every supported test platform.
+    let db_path = dir.join("sqlite-db-is-a-directory");
+    fs::create_dir_all(&db_path).unwrap();
+    let db_path_string = db_path.to_string_lossy().to_string();
+    let envs = [
+        ("CHIDORI_RUN_STORE", "sqlite"),
+        ("CHIDORI_RUN_DB", db_path_string.as_str()),
+        ("CHIDORI_DURABILITY", durability),
+        ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
+    ];
+    let output =
+        run_chidori_with_str_env(&["run", agent.to_str().unwrap(), "--trusted"], &dir, &envs);
+
+    // Capture all observations and clean the fixture before assertions, so an
+    // intended Red failure never leaves a temp project or server behind.
+    let request_count = server.request_count();
+    let run_base = dir.join(".chidori").join("runs");
+    let created_run_directory = fs::read_dir(&run_base)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().is_dir());
+    let diagnostic = output_diagnostic(&output);
+    drop(server);
+    fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        request_count, 0,
+        "SQLite initialization failure must be detected before the live HTTP effect"
+    );
+    assert_failure(&output);
+    assert!(
+        !created_run_directory,
+        "SQLite initialization failure must not create a per-run directory"
+    );
+    assert!(
+        diagnostic.contains(&db_path_string),
+        "diagnostic must identify configured CHIDORI_RUN_DB path `{db_path_string}`; output:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic
+            .to_lowercase()
+            .contains("opening run store sqlite"),
+        "diagnostic must identify the SQLite open operation; output:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic
+            .to_lowercase()
+            .contains("unable to open database file"),
+        "diagnostic must preserve the SQLite open cause; output:\n{diagnostic}"
+    );
+}
+
+#[test]
+fn cli_run_rejects_explicit_sqlite_open_failure_before_run_or_effect() {
+    assert_explicit_sqlite_init_failure("strict", "sqlite-open-failure-strict");
+}
+
+#[test]
+fn cli_run_rejects_explicit_sqlite_open_failure_in_besteffort_mode() {
+    assert_explicit_sqlite_init_failure("besteffort", "sqlite-open-failure-besteffort");
+}
+
+#[test]
+fn cli_run_mirrors_records_to_valid_sqlite_store() {
+    let dir = temp_project("sqlite-valid-mirror");
+    let server = LocalHttpServer::start();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        format!(
+            r#"
+                export async function agent() {{
+                    const response = await fetch("http://{}/effect");
+                    return await response.json();
+                }}
+            "#,
+            server.address
+        ),
+    )
+    .unwrap();
+    let db_path = dir.join("runs.sqlite3");
+    let db_path_string = db_path.to_string_lossy().to_string();
+    let envs = [
+        ("CHIDORI_RUN_STORE", "sqlite"),
+        ("CHIDORI_RUN_DB", db_path_string.as_str()),
+        ("CHIDORI_DURABILITY", "strict"),
+        ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
+    ];
+    let output =
+        run_chidori_with_str_env(&["run", agent.to_str().unwrap(), "--trusted"], &dir, &envs);
+    assert_success(&output);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "valid SQLite configuration should allow the live HTTP effect"
+    );
+
+    let run_id = first_run_id(&dir);
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let mut statement = connection
+        .prepare("SELECT data FROM run_records WHERE run_id = ?1 ORDER BY pos, seq")
+        .unwrap();
+    let rows = statement
+        .query_map([run_id.as_str()], |row| row.get::<_, String>(0))
+        .unwrap();
+    let records: Vec<serde_json::Value> = rows
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect();
+    assert!(
+        !records.is_empty(),
+        "successful run must persist call records to the SQLite mirror"
+    );
+    assert!(
+        records.iter().any(|record| record["function"] == "http"),
+        "SQLite mirror must include the HTTP call record: {records:?}"
+    );
+
+    drop(statement);
+    drop(connection);
+    drop(server);
+    fs::remove_dir_all(dir).ok();
+}
