@@ -1633,7 +1633,7 @@ mod tests {
                 &alarm_source,
                 r#"export async function agent() {
                     await chidori.alarm(60000);
-                    await chidori.tool("count", {});
+                    await chidori.tool("alarmCount", {});
                     return {};
                 }"#,
             )
@@ -1643,6 +1643,7 @@ mod tests {
             let rearm_base = base.join("rearm-runs");
             let alarm_base = base.join("alarm-runs");
             let effect_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (alarm_event_tx, alarm_event_rx) = std::sync::mpsc::channel();
             let mut tool_registry = ToolRegistry::new();
             let effect_counter = effect_count.clone();
             tool_registry.register_native(
@@ -1651,6 +1652,18 @@ mod tests {
                 Vec::new(),
                 move |_| {
                     effect_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!({ "counted": true }))
+                },
+            );
+            let alarm_event = alarm_event_tx;
+            let alarm_counter = effect_count.clone();
+            tool_registry.register_native(
+                "alarmCount",
+                "marks the due-alarm wake effect",
+                Vec::new(),
+                move |_| {
+                    alarm_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = alarm_event.send(true);
                     Ok(json!({ "counted": true }))
                 },
             );
@@ -1717,14 +1730,10 @@ mod tests {
             let alarm_registry_before = std::fs::read(&alarm_registry).unwrap();
             let alarm_rearm = hub().rearm_from_registry(alarm_parts.clone());
 
-            // The timer checks due alarms once per second. Give a vulnerable
-            // rearm enough time to start the persisted agent and reach its tool.
-            let effect_deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while effect_count.load(std::sync::atomic::Ordering::SeqCst) < 4
-                && std::time::Instant::now() < effect_deadline
-            {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            // Wait for the alarm agent's distinctive effect event. This proves
+            // the due-alarm path reached execution without sleep polling.
+            let alarm_effect_seen =
+                alarm_rearm.is_ok() && alarm_event_rx.recv_timeout(Duration::from_secs(5)).is_ok();
 
             let spawn_registry_written = spawn_base
                 .join("agents")
@@ -1750,7 +1759,7 @@ mod tests {
             let observed_effects = effect_count.load(std::sync::atomic::Ordering::SeqCst);
             assert_eq!(
                 observed_effects, 0,
-                "detached agent executed a live tool effect under invalid SQLite"
+                "detached agent executed a live tool effect under invalid SQLite; due-alarm effect observed={alarm_effect_seen}"
             );
             assert!(
                 errors.iter().all(|error| error.as_deref().is_some_and(|text| {
