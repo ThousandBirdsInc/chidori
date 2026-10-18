@@ -813,6 +813,13 @@ pub async fn serve(
              this server already controls access."
         );
     }
+    let base_dir = agent_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let run_base = base_dir.join(".chidori").join("runs");
+    crate::runtime::store::RunStoreFactory::shared(&run_base).ensure_initialized()?;
+
     // Configurable concurrency cap. Default 8 is low enough to keep one
     // LLM provider from being flooded and high enough that a small agent
     // fleet can saturate. Expose as env var so ops can tune without a
@@ -843,12 +850,7 @@ pub async fn serve(
     });
     let mcp_tools = Arc::new(mcp_tools);
 
-    let base_dir = agent_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
     let session_store = build_session_store(&base_dir)?;
-    let run_base = base_dir.join(".chidori").join("runs");
 
     let recipe_dir = std::env::var("CHIDORI_RECIPE_DIR").ok().map(PathBuf::from);
     let mut recipes = recipe_dir

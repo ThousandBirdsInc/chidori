@@ -112,6 +112,11 @@ Selected by `CHIDORI_RUN_STORE`:
 | `s3://bucket[/prefix]` | Mirror to any **S3-compatible object store** — AWS S3, Cloudflare R2, GCS interop, Backblaze, MinIO, LocalStack. No server-side code to deploy: point `CHIDORI_RUN_STORE_ENDPOINT` at the store (default `https://s3.<region>.amazonaws.com`), supply the standard `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (or `CHIDORI_RUN_STORE_*` overrides), and requests are SigV4-signed in-process (no AWS SDK). Each journal append is one object PUT (`runs/<id>/records/<seq>.json`); `checkpoint.json` rewrites at compaction points fold the tail objects. Bucket versioning gives point-in-time recovery for free. |
 | `http(s)://…` | Mirror to a remote relay speaking the run-store REST protocol. Two reference deployments: one **Cloudflare Durable Object per run** (`integrations/cloudflare-durable-objects/`), which gives every acknowledged write cross-datacenter replication, 30-day point-in-time recovery, and a **serialized writer per run** (the platform enforces a single instance per id — the strongest lease story); or the **self-hosted cell store** (`chidori cell-store`, below), which delivers the same one-database-per-run, single-writer model on your own machines. `CHIDORI_RUN_STORE_TOKEN` adds bearer auth to both. |
 
+When `CHIDORI_RUN_STORE=sqlite` is explicitly selected, failure to open or
+initialize `CHIDORI_RUN_DB` aborts run startup and reports the configured
+database path and SQLite cause, regardless of `CHIDORI_DURABILITY`. Select
+`fs` or leave `CHIDORI_RUN_STORE` unset for filesystem-only storage.
+
 Rule of thumb: `sqlite` on a durable disk you back up; `s3://` when the
 machine is ephemeral (containers, managed hosts); `chidori cell-store` when
 you want enforced single writers on your own infrastructure; the Durable
