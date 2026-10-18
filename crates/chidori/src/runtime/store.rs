@@ -251,6 +251,21 @@ impl RunStore for FailSignalInboxStore {
 pub struct FsRunStore {
     run_dir: PathBuf,
     fsync_writes: bool,
+    #[cfg(test)]
+    blob_write_events: Arc<Mutex<Vec<BlobWriteEvent>>>,
+    #[cfg(test)]
+    fail_blob_directory_sync: Arc<Mutex<Option<PathBuf>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlobWriteEvent {
+    TargetParentCreated(PathBuf),
+    TempFileWritten,
+    TempFileSynced,
+    Renamed,
+    DirectorySyncAttempted(PathBuf),
+    DirectorySynced(PathBuf),
 }
 
 impl FsRunStore {
@@ -258,7 +273,59 @@ impl FsRunStore {
         Self {
             run_dir: run_dir.into(),
             fsync_writes: latching_durability(),
+            #[cfg(test)]
+            blob_write_events: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            fail_blob_directory_sync: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(run_dir: impl Into<PathBuf>, mode: DurabilityMode) -> Self {
+        Self {
+            run_dir: run_dir.into(),
+            fsync_writes: matches!(mode, DurabilityMode::Effect | DurabilityMode::Strict),
+            blob_write_events: Arc::new(Mutex::new(Vec::new())),
+            fail_blob_directory_sync: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    fn record_blob_write_event(&self, event: BlobWriteEvent) {
+        self.blob_write_events
+            .lock()
+            .expect("blob write event lock poisoned")
+            .push(event);
+    }
+
+    /// Test hook for the required directory-sync syscall. The production
+    /// implementation calls this immediately before syncing a directory;
+    /// tests can inject a deterministic error at that exact boundary.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn before_blob_directory_sync(&self, directory: &Path) -> Result<()> {
+        self.record_blob_write_event(BlobWriteEvent::DirectorySyncAttempted(
+            directory.to_path_buf(),
+        ));
+        let fail = self
+            .fail_blob_directory_sync
+            .lock()
+            .expect("blob directory-sync failure lock poisoned")
+            .as_ref()
+            .is_some_and(|expected| expected.as_path() == directory);
+        if fail {
+            anyhow::bail!(
+                "injected directory sync failure for {}",
+                directory.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn after_blob_directory_sync(&self, directory: &Path) {
+        self.record_blob_write_event(BlobWriteEvent::DirectorySynced(directory.to_path_buf()));
     }
 
     #[allow(dead_code)] // Not yet wired into a call path; staged API.
@@ -384,9 +451,18 @@ impl FsRunStore {
         bytes: &[u8],
         exclusive_temp: bool,
     ) -> Result<()> {
+        #[cfg(test)]
+        let target_parent_was_missing =
+            exclusive_temp && path.parent().is_some_and(|parent| !parent.exists());
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
+            #[cfg(test)]
+            if target_parent_was_missing {
+                self.record_blob_write_event(BlobWriteEvent::TargetParentCreated(
+                    parent.to_path_buf(),
+                ));
+            }
         }
         if let Some(parent) = tmp.parent() {
             std::fs::create_dir_all(parent)
@@ -406,13 +482,26 @@ impl FsRunStore {
             created_temp = true;
             file.write_all(bytes)
                 .with_context(|| format!("writing {}", tmp.display()))?;
+            #[cfg(test)]
+            if exclusive_temp {
+                self.record_blob_write_event(BlobWriteEvent::TempFileWritten);
+            }
             if self.fsync_writes {
                 file.sync_data()
                     .with_context(|| format!("syncing {}", tmp.display()))?;
+                #[cfg(test)]
+                if exclusive_temp {
+                    self.record_blob_write_event(BlobWriteEvent::TempFileSynced);
+                }
             }
             drop(file);
             std::fs::rename(tmp, path)
-                .with_context(|| format!("renaming {} into place", tmp.display()))
+                .with_context(|| format!("renaming {} into place", tmp.display()))?;
+            #[cfg(test)]
+            if exclusive_temp {
+                self.record_blob_write_event(BlobWriteEvent::Renamed);
+            }
+            Ok(())
         })();
         if result.is_err() && exclusive_temp && created_temp {
             let _ = std::fs::remove_file(tmp);
@@ -2469,6 +2558,106 @@ mod tests {
             timestamp: chrono::Utc::now(),
             error: None,
         }
+    }
+
+    #[test]
+    fn fs_host_promise_blob_syncs_parent_after_rename_and_propagates_failure() {
+        let mut failures = Vec::new();
+        for mode in [DurabilityMode::Strict, DurabilityMode::Effect] {
+            let fixture = tempfile::tempdir().unwrap();
+            let run_dir = fixture.path().join("run");
+            let host_promises = run_dir.join("host_promises");
+            std::fs::create_dir_all(&host_promises).unwrap();
+            let store = FsRunStore::new_for_test(&run_dir, mode);
+            let key = "host_promises/2.json";
+            let prior = br#"{"state":"pending"}"#;
+            store.put_blob(key, prior).unwrap();
+            store.blob_write_events.lock().unwrap().clear();
+            *store.fail_blob_directory_sync.lock().unwrap() = Some(host_promises.clone());
+
+            let replacement = br#"{"state":"resolved","value":{"ok":true}}"#;
+            let result = store.put_blob(key, replacement);
+            let visible = store.get_blob(key).unwrap();
+            let events = store.blob_write_events.lock().unwrap().clone();
+
+            if visible.as_deref() != Some(replacement.as_slice()) {
+                failures.push(format!(
+                    "{mode:?} at {}: expected the complete replacement after rename, observed {visible:?}",
+                    fixture.path().display()
+                ));
+            }
+            if result.is_ok() {
+                failures.push(format!(
+                    "{mode:?} at {}: put_blob returned Ok with visible target {visible:?}; events before return: {events:?}",
+                    fixture.path().display()
+                ));
+            } else {
+                let expected = vec![
+                    BlobWriteEvent::TempFileWritten,
+                    BlobWriteEvent::TempFileSynced,
+                    BlobWriteEvent::Renamed,
+                    BlobWriteEvent::DirectorySyncAttempted(host_promises),
+                ];
+                if events != expected {
+                    failures.push(format!(
+                        "{mode:?} at {}: required stage order {expected:?}, observed {events:?}",
+                        fixture.path().display()
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    #[test]
+    fn fs_host_promise_blob_syncs_new_parent_entry_before_success() {
+        let mut failures = Vec::new();
+        for mode in [DurabilityMode::Strict, DurabilityMode::Effect] {
+            let fixture = tempfile::tempdir().unwrap();
+            let run_dir = fixture.path().join("run");
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let host_promises = run_dir.join("host_promises");
+            let store = FsRunStore::new_for_test(&run_dir, mode);
+            let key = "host_promises/2.json";
+
+            store.put_blob(key, br#"{"state":"resolved"}"#).unwrap();
+
+            let events = store.blob_write_events.lock().unwrap().clone();
+            let created_parent = events.iter().position(|event| {
+                event == &BlobWriteEvent::TargetParentCreated(host_promises.clone())
+            });
+            let run_dir_synced = events
+                .iter()
+                .position(|event| event == &BlobWriteEvent::DirectorySynced(run_dir.clone()));
+            let staged_write = events
+                .iter()
+                .position(|event| event == &BlobWriteEvent::TempFileWritten);
+            let staged_sync = events
+                .iter()
+                .position(|event| event == &BlobWriteEvent::TempFileSynced);
+            let renamed = events
+                .iter()
+                .position(|event| event == &BlobWriteEvent::Renamed);
+            let host_promises_synced = events
+                .iter()
+                .position(|event| event == &BlobWriteEvent::DirectorySynced(host_promises.clone()));
+            let run_dir_sync_follows_creation = matches!(
+                (created_parent, run_dir_synced),
+                (Some(created), Some(synced)) if created < synced
+            );
+            let file_and_target_order = matches!(
+                (staged_write, staged_sync, renamed, host_promises_synced),
+                (Some(written), Some(synced), Some(rename), Some(parent_synced))
+                    if written < synced && synced < rename && rename < parent_synced
+            );
+            if !run_dir_sync_follows_creation || !file_and_target_order {
+                failures.push(format!(
+                    "{mode:?} at {}: require run-dir sync after creating host_promises and target-parent sync after staged write/sync/rename; observed {events:?}",
+                    fixture.path().display()
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
     }
 
     /// Replacing a per-operation host-promise must not expose a partial file
