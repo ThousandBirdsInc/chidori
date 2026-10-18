@@ -189,6 +189,12 @@ Each tier survives strictly more:
 | `http(s)://…` → `chidori cell-store` | + machine loss, **enforced single writer across hosts**, per-run isolation | an S3 bucket + a store node you run |
 | `http(s)://…` → Durable Object relay | + cross-DC replication, 30-day PITR, enforced single writer | [Cloudflare Durable Objects](../integrations/cloudflare-durable-objects/) |
 
+When `CHIDORI_RUN_STORE=sqlite` is explicitly selected, failure to open or
+initialize `CHIDORI_RUN_DB` aborts run startup before run-directory creation or
+agent effects and reports the configured database path and SQLite cause,
+regardless of `CHIDORI_DURABILITY`. Select `fs` or leave
+`CHIDORI_RUN_STORE` unset for filesystem-only storage.
+
 Rule of thumb: `sqlite` on a durable disk you back up; `s3://` when the
 machine is ephemeral (containers, managed hosts); `chidori cell-store` when
 you want enforced single writers on your own infrastructure; the Durable
