@@ -464,14 +464,18 @@ impl FsRunStore {
             return Ok(());
         }
 
-        let mut missing = Vec::new();
+        #[cfg(test)]
+        let mut target_parent_was_missing = false;
         let mut cursor = parent.to_path_buf();
         loop {
             match std::fs::metadata(&cursor) {
                 Ok(metadata) if metadata.is_dir() => break,
                 Ok(_) => anyhow::bail!("blob parent {} is not a directory", cursor.display()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    missing.push(cursor.clone());
+                    #[cfg(test)]
+                    if cursor == parent {
+                        target_parent_was_missing = true;
+                    }
                     cursor = cursor
                         .parent()
                         .ok_or_else(|| {
@@ -493,7 +497,7 @@ impl FsRunStore {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
         #[cfg(test)]
-        if missing.iter().any(|created| created == parent) {
+        if target_parent_was_missing {
             self.record_blob_write_event(BlobWriteEvent::TargetParentCreated(parent.to_path_buf()));
         }
 
