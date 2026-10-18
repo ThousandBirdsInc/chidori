@@ -1803,20 +1803,22 @@ impl RuntimeContext {
 
     /// Append a signal delivered to a LIVE run into its in-memory mailbox,
     /// write-through persisting the grown inbox (`docs/signals.md` Phase 3).
-    /// The in-memory and on-disk inboxes mutate in one critical section, so the
-    /// running agent sees the entry at its next listen point and a crash after
-    /// the enqueue cannot lose an acknowledged delivery. Returns the stored
-    /// entry with its assigned `delivery_seq` (monotonic above every durable
-    /// entry currently queued).
+    /// Persist a live signal before publishing it to the in-memory inbox, then
+    /// return the entry with its assigned `delivery_seq` (monotonic above every
+    /// durable entry currently queued). A persistence failure leaves the
+    /// in-memory inbox unchanged and is returned to the caller before it can
+    /// acknowledge or notify the delivery. A backend may have committed the
+    /// write before reporting a mirror/transport error, so retrying after an
+    /// error is not guaranteed to be duplicate-free.
     pub fn enqueue_live_signal(
         &self,
         name: &str,
         payload: serde_json::Value,
         from: serde_json::Value,
-    ) -> QueuedSignal {
+    ) -> anyhow::Result<QueuedSignal> {
         let mut inner = self.inner.lock().unwrap();
-        let mut persisted = None;
-        if let Some(store) = inner.store.clone() {
+        let queued = if let Some(store) = inner.store.clone() {
+            let mut persisted = None;
             let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
                 let mut inbox: Vec<QueuedSignal> = current
                     .as_deref()
@@ -1840,14 +1842,17 @@ impl RuntimeContext {
                 persisted = Some(queued);
                 Ok(serde_json::to_vec_pretty(&inbox)?)
             };
-            note_persist_result(
-                &mut inner,
-                store
-                    .update_blob(SIGNAL_INBOX_FILE, &mut update)
-                    .map(|_| ()),
-            )
-        }
-        let queued = persisted.unwrap_or_else(|| {
+            store
+                .update_blob(SIGNAL_INBOX_FILE, &mut update)
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "persisting live signal inbox failed; delivery was not acknowledged and persistence outcome may be uncertain; retry may duplicate if the backend committed before reporting the error: {err}"
+                    )
+                })?;
+            persisted.ok_or_else(|| {
+                anyhow::anyhow!("run store completed live signal update without invoking updater")
+            })?
+        } else {
             let delivery_seq = inner
                 .signal_inbox
                 .iter()
@@ -1862,9 +1867,9 @@ impl RuntimeContext {
                 delivery_seq,
                 enqueued_at: chrono::Utc::now(),
             }
-        });
+        };
         inner.signal_inbox.push(queued.clone());
-        queued
+        Ok(queued)
     }
 
     #[allow(dead_code)]

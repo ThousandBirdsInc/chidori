@@ -70,10 +70,11 @@ impl HostBindingBackend {
     /// When this backend's context belongs to an actor sub-run, drain the
     /// actor's shared mailbox into the run-level signal inbox (no-op
     /// otherwise). Called before the signal-family effects.
-    fn pump_actor_mailbox(&self) {
+    fn pump_actor_mailbox(&self) -> std::result::Result<(), String> {
         if let Some(ctx) = self.runtime_ctx() {
-            crate::runtime::host_actor::pump_own_mailbox(ctx);
+            crate::runtime::host_actor::pump_own_mailbox(ctx).map_err(|err| err.to_string())?;
         }
+        Ok(())
     }
 
     pub(crate) fn template_engine(&self) -> Arc<TemplateEngine> {
@@ -1081,15 +1082,15 @@ impl HostBindingBackend {
             // the run-level inbox first, so the listen point's drain sees
             // every message delivered while the iteration was executing.
             "signal" => {
-                self.pump_actor_mailbox();
+                self.pump_actor_mailbox()?;
                 self.signal(a)
             }
             "poll_signal" => {
-                self.pump_actor_mailbox();
+                self.pump_actor_mailbox()?;
                 self.poll_signal(a)
             }
             "signal_any" => {
-                self.pump_actor_mailbox();
+                self.pump_actor_mailbox()?;
                 self.signal_any(a)
             }
             // The two halves of `chidori.step(name, fn)` — the durable value
@@ -1401,7 +1402,7 @@ impl HostBindingBackend {
                     "name": crate::runtime::host_agent::ALARM_SIGNAL_NAME,
                     "opts": { "timeoutMs": ms },
                 });
-                self.pump_actor_mailbox();
+                self.pump_actor_mailbox()?;
                 self.signal(&args)
             }
             "send_actor" => crate::runtime::host_actor::send_actor(self, a),

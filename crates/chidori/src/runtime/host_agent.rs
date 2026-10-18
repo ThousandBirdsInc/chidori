@@ -458,7 +458,11 @@ impl DetachedAgentHub {
                 // one critical section. Keep AgentState locked until the
                 // context has persisted, so the worker cannot clear this
                 // context and race a store-backed whole-file inbox write.
-                ctx.enqueue_live_signal(name, payload, from);
+                ctx.enqueue_live_signal(name, payload, from).map_err(|err| {
+                    format!(
+                        "chidori.agents.send: live signal persistence failed before acknowledgement: {err}"
+                    )
+                })?;
                 #[cfg(test)]
                 entry
                     .live_send_notify_count
@@ -493,7 +497,11 @@ impl DetachedAgentHub {
             };
             store
                 .update_blob(SIGNAL_INBOX_FILE, &mut update)
-                .map_err(|err| format!("chidori.agents.send: atomically updating inbox: {err}"))?;
+                .map_err(|err| {
+                    format!(
+                        "chidori.agents.send: inbox persistence failed before acknowledgement; persistence outcome may be uncertain and retry may duplicate: {err}"
+                    )
+                })?;
             if state.descriptor.status == "hibernating" {
                 let matches = state
                     .descriptor
