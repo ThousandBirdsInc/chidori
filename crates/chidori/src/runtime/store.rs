@@ -2253,6 +2253,10 @@ pub fn effect_barriers() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::snapshot::{
+        HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation,
+        PendingHostOperationKind,
+    };
 
     fn record(seq: u64, function: &str) -> CallRecord {
         CallRecord {
@@ -2266,6 +2270,105 @@ mod tests {
             timestamp: chrono::Utc::now(),
             error: None,
         }
+    }
+
+    /// Replacing a per-operation host-promise must not expose a partial file
+    /// if the process runs out of permitted file size while writing it. The
+    /// child process keeps the resource limit and SIGXFSZ disposition local to
+    /// this test so it cannot affect the rest of the test runner.
+    #[cfg(unix)]
+    #[test]
+    fn fs_blob_replacement_interruption_preserves_existing_pending_record() {
+        const CHILD: &str = "CHIDORI_TEST_FS_BLOB_REPLACEMENT_CHILD";
+        const RUN_DIR: &str = "CHIDORI_TEST_FS_BLOB_REPLACEMENT_RUN_DIR";
+
+        if std::env::var_os(CHILD).is_some() {
+            let run_dir = PathBuf::from(std::env::var_os(RUN_DIR).unwrap());
+            let store = FsRunStore::new(&run_dir);
+            let key = "host_promises/2.json";
+            let pending = HostPromiseRecord {
+                operation: PendingHostOperation::new(
+                    HostOperationId(2),
+                    2,
+                    PendingHostOperationKind::Http,
+                    serde_json::json!({ "url": "http://127.0.0.1/result" }),
+                )
+                .with_function("http"),
+                state: HostPromiseState::Pending,
+            };
+            let prior_bytes = serde_json::to_vec(&pending).unwrap();
+            store.put_blob(key, &prior_bytes).unwrap();
+
+            // Ignore SIGXFSZ so the kernel reports EFBIG to write_all instead
+            // of terminating this isolated child at the partial-write point.
+            // SAFETY: changing the signal disposition is process-local, and
+            // this code runs only in the dedicated child test process.
+            unsafe {
+                assert_ne!(
+                    libc::signal(libc::SIGXFSZ, libc::SIG_IGN),
+                    libc::SIG_ERR,
+                    "installing SIGXFSZ ignore disposition"
+                );
+            }
+
+            let limit = libc::rlimit {
+                rlim_cur: 4096,
+                rlim_max: 4096,
+            };
+            // SAFETY: setrlimit applies only to this child; the limit is
+            // lowered after the small seed blob has been persisted.
+            let limit_result = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) };
+            assert_eq!(limit_result, 0, "setting child RLIMIT_FSIZE");
+
+            let resolved = HostPromiseRecord {
+                operation: pending.operation,
+                state: HostPromiseState::Resolved {
+                    value: serde_json::json!({ "body": "x".repeat(64 * 1024) }),
+                    completed_at: chrono::Utc::now(),
+                },
+            };
+            let replacement = serde_json::to_vec(&resolved).unwrap();
+            let write_result = store.put_blob(key, &replacement);
+            assert!(
+                write_result.is_err(),
+                "RLIMIT_FSIZE should interrupt the oversized blob replacement"
+            );
+
+            let visible = store
+                .get_blob(key)
+                .unwrap()
+                .expect("promise blob disappeared");
+            assert!(
+                visible == prior_bytes,
+                "interrupted replacement changed prior pending blob ({} bytes became {} bytes)",
+                prior_bytes.len(),
+                visible.len()
+            );
+            let parsed: HostPromiseRecord = serde_json::from_slice(&visible)
+                .expect("interrupted replacement made the pending record unparsable");
+            assert!(
+                matches!(parsed.state, HostPromiseState::Pending),
+                "the surviving blob no longer represents the original pending state"
+            );
+            return;
+        }
+
+        let run_dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("runtime::store::tests::fs_blob_replacement_interruption_preserves_existing_pending_record")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env(RUN_DIR, run_dir.path())
+            .output()
+            .unwrap();
+        let report = format!(
+            "blob replacement child exited {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{report}");
     }
 
     /// Pipelined appends never block or fail the hot path on mirror trouble:
