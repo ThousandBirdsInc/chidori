@@ -420,13 +420,21 @@ impl DetachedAgentHub {
         let factory = entry.factory();
         let mut wake = false;
         {
+            let had_live_context = entry.state.lock().unwrap().live_ctx.is_some();
+            if had_live_context {
+                // Do not carry a context snapshot across the handoff to the
+                // durable-mailbox path. The worker may clear it while a send
+                // is in flight, so pause here and re-check under the state
+                // lock before choosing which inbox writer owns this delivery.
+                #[cfg(test)]
+                tests::pause_after_live_context_snapshot(&entry.name);
+            }
             let mut state = entry.state.lock().unwrap();
             if let Some(ctx) = state.live_ctx.clone() {
                 // Write-through: in-memory mailbox + durable inbox mutate in
-                // one critical section inside enqueue_live_signal.
-                drop(state);
-                #[cfg(test)]
-                tests::pause_after_live_context_snapshot(&entry.name);
+                // one critical section. Keep AgentState locked until the
+                // context has persisted, so the worker cannot clear this
+                // context and race a store-backed whole-file inbox write.
                 ctx.enqueue_live_signal(name, payload, from);
                 entry.signal.notify_all();
                 return Ok(json!({ "delivered": true }));
@@ -955,6 +963,21 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         // Fresh VM + context under the agent's OWN durable identity: run id,
         // journal, policy seed, and persistence handle all belong to the
         // agent, not the spawner.
+        if let Err(err) = crate::runtime::snapshot::reconcile_detached_signal_timeout_promises(
+            store.as_ref(),
+            &replay,
+        ) {
+            settle(
+                hub,
+                entry,
+                "failed",
+                None,
+                Some(format!(
+                    "reconciling detached-agent alarm promises: {err:#}"
+                )),
+            );
+            return;
+        }
         let host_promises =
             match crate::runtime::snapshot::load_host_promise_records(store.as_ref()) {
                 Ok(records) => records,
