@@ -1908,9 +1908,20 @@ mod tests {
                 panic!("post-commit failpoint did not terminate the sender process");
             }
 
-            assert_eq!(mode, "rearm");
+            assert!(matches!(mode.as_ref(), "rearm" | "diagnostic"));
             let run_id = std::fs::read_to_string(base.join("run-id.txt")).unwrap();
             let factory = RunStoreFactory::shared(&run_base);
+            if mode == "diagnostic" {
+                let registered = factory
+                    .registry_get(AGENT)
+                    .unwrap()
+                    .expect("registry entry missing in diagnostic copy");
+                let mut descriptor: AgentDescriptor =
+                    serde_json::from_value(registered["descriptor"].clone()).unwrap();
+                descriptor.status = "running".to_string();
+                descriptor.listen = None;
+                persist_descriptor(&factory, &descriptor);
+            }
             let store = factory.store_for(&run_id);
             let records_before_rearm = store.load_call_log().unwrap().unwrap_or_default();
             let inbox_before_rearm: Vec<QueuedSignal> = store
@@ -1938,9 +1949,11 @@ mod tests {
             // Wait on the hub's state condition variable for completion, while
             // retaining the last observed status when the expected worker never starts.
             let entry = hub().ensure_entry(&parts, AGENT).unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut state = entry.state.lock().unwrap();
-            while !matches!(state.descriptor.status.as_str(), "completed" | "failed") {
+            while !matches!(state.descriptor.status.as_str(), "completed" | "failed")
+                && !(state.descriptor.status == "hibernating" && !state.thread_live)
+            {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     break;
@@ -1952,6 +1965,7 @@ mod tests {
                 state = next;
             }
             let final_status = state.descriptor.status_json();
+            let final_live = state.thread_live;
             drop(state);
 
             let store = factory.store_for(&run_id);
@@ -1975,6 +1989,7 @@ mod tests {
                 "cut_inbox_before_rearm": cut_inbox_before_rearm,
                 "rearmed": rearmed,
                 "status_after_rearm": final_status,
+                "live_after_rearm": final_live,
                 "cut_signal_rows": cut_rows.len(),
                 "cut_signal_result": cut_rows.first().map(|record| &record.result),
                 "journal_rows": records.len(),
@@ -2021,6 +2036,32 @@ mod tests {
                 "crash cut must occur before hub.send returns; no response is not delivered:true"
             );
 
+            let run_id = std::fs::read_to_string(base.join("run-id.txt")).unwrap();
+            let store: Arc<dyn crate::runtime::store::RunStore> = match backend {
+                "fs" => Arc::new(crate::runtime::store::FsRunStore::new(
+                    base.join(".chidori/runs").join(&run_id),
+                )),
+                "sqlite" => Arc::new(crate::runtime::store::SqliteRunStore::new(
+                    crate::runtime::store::SqliteRunStoreShared::open(&db_path).unwrap(),
+                    run_id,
+                )),
+                _ => unreachable!(),
+            };
+            let expired = crate::runtime::store::RunLease {
+                owner: "dead-live-cut-child".to_string(),
+                expires_at: Utc::now() - chrono::Duration::seconds(1),
+            };
+            store
+                .put_blob(
+                    crate::runtime::store::LEASE_FILE,
+                    &serde_json::to_vec(&expired).unwrap(),
+                )
+                .unwrap();
+            drop(store);
+
+            let diagnostic_temp = tempfile::tempdir().unwrap();
+            copy_test_tree(&base, diagnostic_temp.path()).unwrap();
+
             let rearm = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg(TEST)
@@ -2048,6 +2089,58 @@ mod tests {
             let report: Value =
                 serde_json::from_slice(&std::fs::read(base.join("rearm-report.json")).unwrap())
                     .unwrap();
+            assert_eq!(report["rearmed"], json!(1), "report={report}");
+
+            let diagnostic = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(TEST)
+                .arg("--nocapture")
+                .env(MODE, "diagnostic")
+                .env(BASE_ENV, diagnostic_temp.path())
+                .env("CHIDORI_RUN_STORE", backend)
+                .env(
+                    "CHIDORI_RUN_DB",
+                    diagnostic_temp.path().join("runs.sqlite3"),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                diagnostic.status.success(),
+                "{backend} descriptor-only diagnostic control failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&diagnostic.stdout),
+                String::from_utf8_lossy(&diagnostic.stderr)
+            );
+            let diagnostic_report: Value = serde_json::from_slice(
+                &std::fs::read(diagnostic_temp.path().join("rearm-report.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                diagnostic_report["rearmed"],
+                json!(1),
+                "diagnostic rearm should re-arm one agent; report={diagnostic_report}"
+            );
+            assert_eq!(
+                diagnostic_report["descriptor_before_rearm"]["status"],
+                json!("running"),
+                "diagnostic should modify descriptor status only; report={diagnostic_report}"
+            );
+            assert_eq!(
+                diagnostic_report["descriptor_before_rearm"]["listen"],
+                Value::Null,
+                "diagnostic should clear only the stale listen; report={diagnostic_report}"
+            );
+            assert_eq!(
+                diagnostic_report["cut_signal_rows"],
+                json!(1),
+                "diagnostic control should journal cut-1 once; report={diagnostic_report}"
+            );
+            assert!(
+                diagnostic_report["inbox"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty),
+                "diagnostic control should empty inbox; report={diagnostic_report}"
+            );
+
             let descriptor = &report["descriptor_before_rearm"];
             let listen = &descriptor["listen"];
             assert!(
@@ -2072,13 +2165,16 @@ mod tests {
 
             let recovered = report["status_after_rearm"]["status"] == json!("completed")
                 && report["cut_signal_rows"] == json!(1)
+                && report["cut_signal_result"]["payload"]["id"] == json!("cut-1")
                 && report["inbox"].as_array().is_some_and(Vec::is_empty);
             if !recovered {
                 failures.push(format!(
-                    "{backend}: committed cut-1 was not consumed/journaled exactly once after real rearm; observed status={}, waitingFor={}, cut_rows={}, inbox={}; artifact_base={}",
+                    "{backend}: committed cut-1 was not consumed/journaled exactly once after real rearm; observed status={}, live={}, waitingFor={}, cut_rows={}, journal_rows={}, inbox={}; artifact_base={}",
                     report["status_after_rearm"]["status"],
+                    report["live_after_rearm"],
                     report["status_after_rearm"]["waitingFor"],
                     report["cut_signal_rows"],
+                    report["journal_rows"],
                     report["inbox"],
                     base.display()
                 ));
@@ -2094,6 +2190,23 @@ mod tests {
             "detached live signal restart contract failed:\n{}",
             failures.join("\n")
         );
+    }
+
+    fn copy_test_tree(
+        source: &std::path::Path,
+        destination: &std::path::Path,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_test_tree(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
