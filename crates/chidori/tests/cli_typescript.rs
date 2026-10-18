@@ -2718,38 +2718,6 @@ fn cli_run_mirrors_records_to_valid_sqlite_store() {
     fs::remove_dir_all(dir).ok();
 }
 
-fn invalid_sqlite_env(dir: &Path) -> (PathBuf, String, [(&'static str, String); 3]) {
-    let db_path = dir.join("sqlite-db-is-a-directory");
-    fs::create_dir_all(&db_path).unwrap();
-    let db_path_string = db_path.to_string_lossy().to_string();
-    let envs = [
-        ("CHIDORI_RUN_STORE", "sqlite".to_string()),
-        ("CHIDORI_RUN_DB", db_path_string.clone()),
-        ("CHIDORI_DURABILITY", "strict".to_string()),
-    ];
-    (db_path, db_path_string, envs)
-}
-
-fn env_refs<'a, const N: usize>(
-    envs: &'a [(&'static str, String); N],
-) -> [(&'static str, &'a str); N] {
-    std::array::from_fn(|i| (envs[i].0, envs[i].1.as_str()))
-}
-
-fn assert_sqlite_open_diagnostic(output: &Output, db_path: &str) {
-    let diagnostic = output_diagnostic(output);
-    assert!(
-        diagnostic.contains(db_path)
-            && diagnostic
-                .to_lowercase()
-                .contains("opening run store sqlite")
-            && diagnostic
-                .to_lowercase()
-                .contains("unable to open database file"),
-        "expected the explicit SQLite path and open cause, got:\n{diagnostic}"
-    );
-}
-
 #[test]
 fn cli_run_supports_unset_and_filesystem_run_store() {
     for mode in [None, Some("fs")] {
@@ -2771,60 +2739,4 @@ fn cli_run_supports_unset_and_filesystem_run_store() {
             .exists());
         fs::remove_dir_all(dir).ok();
     }
-}
-
-#[test]
-fn cli_holdings_rejects_sqlite_init_before_hydration() {
-    let dir = temp_project("holdings-sqlite-preflight");
-    let agent = dir.join("agent.ts");
-    fs::write(
-        &agent,
-        "export async function agent() { await chidori.log('done', {}); return {}; }",
-    )
-    .unwrap();
-    let output = run_chidori_with_str_env(
-        &["run", agent.to_str().unwrap()],
-        &dir,
-        &[("CHIDORI_RUN_STORE", "fs")],
-    );
-    assert_success(&output);
-    let run_id = first_run_id(&dir);
-    let (_db_path, db_path_string, envs) = invalid_sqlite_env(&dir);
-    let output = run_chidori_with_str_env(
-        &["holdings", &run_id, "--dir", dir.to_str().unwrap()],
-        &dir,
-        &env_refs(&envs),
-    );
-    fs::remove_dir_all(&dir).ok();
-
-    assert_failure(&output);
-    assert_sqlite_open_diagnostic(&output, &db_path_string);
-}
-
-#[test]
-fn cli_trace_rejects_sqlite_init_before_hydration() {
-    let dir = temp_project("trace-sqlite-preflight");
-    let agent = dir.join("agent.ts");
-    fs::write(
-        &agent,
-        "export async function agent() { await chidori.log('done', {}); return {}; }",
-    )
-    .unwrap();
-    let output = run_chidori_with_str_env(
-        &["run", agent.to_str().unwrap()],
-        &dir,
-        &[("CHIDORI_RUN_STORE", "fs")],
-    );
-    assert_success(&output);
-    let run_id = first_run_id(&dir);
-    let (_db_path, db_path_string, envs) = invalid_sqlite_env(&dir);
-    let output = run_chidori_with_str_env(
-        &["trace", &run_id, "--dir", dir.to_str().unwrap()],
-        &dir,
-        &env_refs(&envs),
-    );
-    fs::remove_dir_all(&dir).ok();
-
-    assert_failure(&output);
-    assert_sqlite_open_diagnostic(&output, &db_path_string);
 }

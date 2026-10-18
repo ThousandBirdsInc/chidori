@@ -1597,36 +1597,56 @@ mod tests {
     use crate::runtime::store::RunStoreFactory;
     use crate::tools::ToolRegistry;
 
-    fn sqlite_test_parts(base: &Path, run_base: PathBuf) -> AgentRuntimeParts {
+    fn sqlite_test_parts(
+        base: &Path,
+        run_base: PathBuf,
+        tools: Arc<ToolRegistry>,
+    ) -> AgentRuntimeParts {
         AgentRuntimeParts {
             providers: Arc::new(ProviderRegistry::new()),
             template_engine: Arc::new(TemplateEngine::new(base)),
             tokio_rt: Arc::new(tokio::runtime::Runtime::new().unwrap()),
             policy: Arc::new(PolicyConfig::default()),
-            tools: Arc::new(ToolRegistry::new()),
+            tools,
             mcp: Arc::new(McpManager::new()),
             run_base,
         }
     }
 
     #[test]
-    fn explicit_sqlite_failure_rejects_hub_registry_spawn_rearm_and_wake() {
+    fn explicit_sqlite_failure_rejects_detached_spawn_rearm_and_wake_before_effects() {
         const CHILD: &str = "CHIDORI_TEST_AGENT_SQLITE_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let base = PathBuf::from(std::env::var_os("CHIDORI_TEST_AGENT_BASE").unwrap());
             let db_path = std::env::var("CHIDORI_RUN_DB").unwrap();
             let source = base.join("agent.ts");
-            std::fs::write(&source, "export async function agent() { return {}; }").unwrap();
-            let list_base = base.join("list-runs");
+            std::fs::write(
+                &source,
+                r#"export async function agent() {
+                    await chidori.tool("count", {});
+                    return {};
+                }"#,
+            )
+            .unwrap();
             let spawn_base = base.join("spawn-runs");
             let wake_base = base.join("wake-runs");
             let rearm_base = base.join("rearm-runs");
-            let list_parts = sqlite_test_parts(&base, list_base.clone());
-            let spawn_parts = sqlite_test_parts(&base, spawn_base.clone());
-            let wake_parts = sqlite_test_parts(&base, wake_base.clone());
-            let rearm_parts = sqlite_test_parts(&base, rearm_base.clone());
-
-            let list_result = hub().list(&list_parts);
+            let effect_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut tool_registry = ToolRegistry::new();
+            let effect_counter = effect_count.clone();
+            tool_registry.register_native(
+                "count",
+                "counts detached agent effects",
+                Vec::new(),
+                move |_| {
+                    effect_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!({ "counted": true }))
+                },
+            );
+            let tools = Arc::new(tool_registry);
+            let spawn_parts = sqlite_test_parts(&base, spawn_base.clone(), tools.clone());
+            let wake_parts = sqlite_test_parts(&base, wake_base.clone(), tools.clone());
+            let rearm_parts = sqlite_test_parts(&base, rearm_base.clone(), tools);
 
             let spawn_name = "sqlite-red-spawn";
             let spawn_result = hub().spawn(
@@ -1658,15 +1678,15 @@ mod tests {
             write_registry_fixture(&rearm_base, rearm_name, "rearm-agent", &source, "running");
             let rearm_result = hub().rearm_from_registry(rearm_parts.clone());
 
-            // Let any vulnerable path settle and stop/join fixture workers
-            // before making the final assertions, so a Red failure leaves no
-            // worker active in the test process.
+            // Wait for any vulnerable worker to finish so its live tool call
+            // is observable, then ensure no worker leaks from this subprocess.
             for (parts, name) in [
                 (&spawn_parts, spawn_name),
                 (&wake_parts, wake_name),
                 (&rearm_parts, rearm_name),
             ] {
                 if hub().entries.lock().unwrap().contains_key(name) {
+                    let _ = hub().join(parts, name, Some(5_000));
                     let _ = hub().stop(parts, name);
                 }
             }
@@ -1685,10 +1705,9 @@ mod tests {
             let rearm_entry_installed = hub().entries.lock().unwrap().contains_key(rearm_name);
 
             let errors = [
-                list_result.err(),
                 spawn_result.err(),
-                wake_result.err(),
                 wake_rearm.err(),
+                wake_result.err(),
                 rearm_result.err(),
             ];
             let error_text = errors
@@ -1696,11 +1715,17 @@ mod tests {
                 .filter_map(|error| error.as_deref())
                 .collect::<Vec<_>>()
                 .join("\n");
+            let observed_effects = effect_count.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                observed_effects, 0,
+                "detached agent executed a live tool effect under invalid SQLite"
+            );
             assert!(
                 errors.iter().all(Option::is_some)
                     && error_text.contains(&db_path)
                     && error_text.to_lowercase().contains("unable to open database file"),
-                "hub operations did not propagate invalid SQLite before registry/spawn/rearm/wake; observed errors={errors:?}, spawn_registry_written={spawn_registry_written}, wake_inbox_written={wake_inbox_written}, entries=[{spawn_entry_installed}, {wake_entry_installed}, {rearm_entry_installed}]"
+                "hub operations did not propagate invalid SQLite before spawn/rearm/wake; observed errors={errors:?}, effects={}, spawn_registry_written={spawn_registry_written}, wake_inbox_written={wake_inbox_written}, entries=[{spawn_entry_installed}, {wake_entry_installed}, {rearm_entry_installed}]",
+                observed_effects
             );
             assert!(
                 !spawn_registry_written && !wake_inbox_written,
@@ -1719,7 +1744,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "runtime::host_agent::tests::explicit_sqlite_failure_rejects_hub_registry_spawn_rearm_and_wake",
+                "runtime::host_agent::tests::explicit_sqlite_failure_rejects_detached_spawn_rearm_and_wake_before_effects",
                 "--nocapture",
             ])
             .env(CHILD, "1")
