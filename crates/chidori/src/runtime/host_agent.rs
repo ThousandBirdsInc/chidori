@@ -144,6 +144,8 @@ struct AgentEntry {
     /// Woken on lifecycle transitions (join waiters) and to interrupt
     /// restart backoff on stop.
     signal: Condvar,
+    #[cfg(test)]
+    live_send_notify_count: std::sync::atomic::AtomicUsize,
 }
 
 impl AgentEntry {
@@ -250,6 +252,8 @@ impl DetachedAgentHub {
                 stop_requested: false,
             }),
             signal: Condvar::new(),
+            #[cfg(test)]
+            live_send_notify_count: std::sync::atomic::AtomicUsize::new(0),
         });
         self.entries
             .lock()
@@ -364,6 +368,8 @@ impl DetachedAgentHub {
                 stop_requested: false,
             }),
             signal: Condvar::new(),
+            #[cfg(test)]
+            live_send_notify_count: std::sync::atomic::AtomicUsize::new(0),
         });
         self.entries
             .lock()
@@ -453,6 +459,10 @@ impl DetachedAgentHub {
                 // context has persisted, so the worker cannot clear this
                 // context and race a store-backed whole-file inbox write.
                 ctx.enqueue_live_signal(name, payload, from);
+                #[cfg(test)]
+                entry
+                    .live_send_notify_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 entry.signal.notify_all();
                 return Ok(json!({ "delivered": true }));
             }
@@ -1768,8 +1778,107 @@ mod tests {
     use crate::policy::{PolicyCache, PolicyConfig};
     use crate::providers::ProviderRegistry;
     use crate::runtime::rust_engine::run_agent;
+    use crate::runtime::store::FailSignalInboxStore;
     use crate::runtime::store::RunStoreFactory;
     use crate::tools::ToolRegistry;
+
+    #[test]
+    fn live_send_does_not_acknowledge_when_signal_inbox_persistence_fails() {
+        const CHILD: &str = "CHIDORI_TEST_LIVE_HUB_FAILURE_CHILD";
+        const TEST: &str =
+            "runtime::host_agent::tests::live_send_does_not_acknowledge_when_signal_inbox_persistence_fails";
+        if std::env::var_os(CHILD).is_none() {
+            let mut failures = Vec::new();
+            for mode in ["besteffort", "effect", "strict"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg(TEST)
+                    .arg("--nocapture")
+                    .env(CHILD, "1")
+                    .env("CHIDORI_DURABILITY", mode)
+                    .output()
+                    .unwrap();
+                if !output.status.success() {
+                    failures.push(format!(
+                        "{mode}: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "live hub delivery contract failed by mode:\n{}",
+                failures.join("\n")
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let run_base = temp.path().join(".chidori/runs");
+        std::fs::create_dir_all(&run_base).unwrap();
+        let parts = sqlite_test_parts(temp.path(), run_base, Arc::new(ToolRegistry::new()));
+        let name = unique("live-send-persist-failure");
+        let ctx = RuntimeContext::new();
+        let run_dir = temp.path().join("run");
+        let store = Arc::new(FailSignalInboxStore::new(&run_dir));
+        ctx.enable_persistence_with_store(run_dir, store.clone());
+        let now = Utc::now();
+        let entry = Arc::new(AgentEntry {
+            name: name.clone(),
+            parts: parts.clone(),
+            state: Mutex::new(AgentState {
+                descriptor: AgentDescriptor {
+                    name: name.clone(),
+                    run_id: "live-run".to_string(),
+                    source: "test.ts".to_string(),
+                    input: Value::Null,
+                    restart: "never".to_string(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    owner_run_id: "owner".to_string(),
+                    model: None,
+                    status: "running".to_string(),
+                    listen: None,
+                    restarts: 0,
+                    output: None,
+                    error: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                live_ctx: Some(ctx.clone()),
+                thread_live: true,
+                wake_pending: false,
+                stop_requested: false,
+            }),
+            signal: Condvar::new(),
+            #[cfg(test)]
+            live_send_notify_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        hub()
+            .entries
+            .lock()
+            .unwrap()
+            .insert(name.clone(), entry.clone());
+
+        let response = hub().send(
+            &parts,
+            &name,
+            "approval",
+            json!({"id": "hub-1"}),
+            json!(null),
+        );
+        hub().entries.lock().unwrap().remove(&name);
+        let published = ctx.signal_inbox();
+        let notify_count = entry
+            .live_send_notify_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(store.failure_count(), 1);
+        assert!(
+            response.is_err() && notify_count == 0 && published.is_empty(),
+            "failed live send must return Err without calling notify_all/publishing: response={response:?}, notify_count={notify_count}, inbox={published:?}"
+        );
+    }
 
     struct InboxRaceBarriers {
         agent_name: String,

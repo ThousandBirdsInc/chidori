@@ -164,6 +164,65 @@ pub trait RunStore: Send + Sync + std::fmt::Debug {
     fn flush(&self) -> Result<()>;
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FailSignalInboxStore {
+    inner: FsRunStore,
+    failures: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl FailSignalInboxStore {
+    pub(crate) fn new(run_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: FsRunStore::new(run_dir),
+            failures: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn failure_count(&self) -> usize {
+        self.failures.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn fail_if_inbox(&self, key: &str) -> Result<()> {
+        if key == crate::runtime::snapshot::SIGNAL_INBOX_FILE {
+            self.failures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("injected pre-commit signal inbox failure")
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl RunStore for FailSignalInboxStore {
+    fn append_record(&self, record: &CallRecord) -> Result<()> {
+        self.inner.append_record(record)
+    }
+    fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        self.inner.write_call_log(records)
+    }
+    fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
+        self.inner.load_call_log()
+    }
+    fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.fail_if_inbox(key)?;
+        self.inner.put_blob(key, bytes)
+    }
+    fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get_blob(key)
+    }
+    fn delete_blob(&self, key: &str) -> Result<()> {
+        self.inner.delete_blob(key)
+    }
+    fn list_blobs(&self) -> Result<Vec<String>> {
+        self.inner.list_blobs()
+    }
+    fn flush(&self) -> Result<()> {
+        self.inner.flush()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem backend
 // ---------------------------------------------------------------------------

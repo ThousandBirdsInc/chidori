@@ -1913,6 +1913,60 @@ mod tests {
     use crate::runtime::typescript::bindings::HostBindingBackend;
     use crate::tools::ToolRegistry;
 
+    trait MailboxPumpOutcome {
+        fn is_error(&self) -> bool;
+    }
+
+    impl MailboxPumpOutcome for () {
+        fn is_error(&self) -> bool {
+            false
+        }
+    }
+
+    impl<E> MailboxPumpOutcome for std::result::Result<(), E> {
+        fn is_error(&self) -> bool {
+            self.is_err()
+        }
+    }
+
+    #[test]
+    fn actor_keeps_the_uncommitted_mailbox_item_when_signal_persistence_fails() {
+        use crate::runtime::snapshot::SIGNAL_INBOX_FILE;
+        use crate::runtime::store::{FailSignalInboxStore, RunStore};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(FailSignalInboxStore::new(temp.path()));
+        let shared = super::ActorShared::new();
+        shared.deliver("approval", json!({"id": "actor-1"}), json!(null));
+        shared.deliver("approval", json!({"id": "actor-2"}), json!(null));
+        let ctx = RuntimeContext::new();
+        ctx.enable_persistence_with_store(temp.path().to_path_buf(), store.clone());
+
+        let pump = super::pump_mailbox(&shared, &ctx);
+
+        let mailbox = shared.state.lock().unwrap().mailbox.clone();
+        let mailbox_items: Vec<(u64, serde_json::Value)> = mailbox
+            .iter()
+            .map(|item| (item.delivery_seq, item.payload.clone()))
+            .collect();
+        let in_memory = ctx.signal_inbox();
+        let durable = store.get_blob(SIGNAL_INBOX_FILE).unwrap();
+        assert!(
+            pump.is_error()
+                && mailbox_items
+                    == vec![
+                        (1, json!({"id": "actor-1"})),
+                        (2, json!({"id": "actor-2"})),
+                    ]
+                && in_memory.is_empty()
+                && durable.is_none()
+                && store.failure_count() == 1,
+            "failed transfer must propagate and retain both FIFO items without publishing: error={}, mailbox={mailbox_items:?}, context={in_memory:?}, durable={durable:?}, failed_writes={}",
+            pump.is_error(),
+            store.failure_count()
+        );
+    }
+
     use super::{strip_crash_frontier, DOWN_MESSAGE};
     use std::time::Duration;
 
