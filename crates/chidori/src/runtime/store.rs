@@ -2802,8 +2802,31 @@ mod tests {
             }
 
             store.blob_write_events.lock().unwrap().clear();
+            let retry_while_sync_fails =
+                store.put_blob("host_promises/2.json", br#"{"state":"pending"}"#);
+            let failed_retry_events = store.blob_write_events.lock().unwrap().clone();
+            let retried_sync_attempted = failed_retry_events
+                .iter()
+                .any(|event| event == &BlobWriteEvent::DirectorySyncAttempted(run_dir.clone()));
+            let retry_staged_or_renamed = failed_retry_events.iter().any(|event| {
+                matches!(
+                    event,
+                    BlobWriteEvent::TempFileWritten | BlobWriteEvent::Renamed
+                )
+            });
+            if retry_while_sync_fails.is_ok() || !retried_sync_attempted || retry_staged_or_renamed
+            {
+                failures.push(format!(
+                    "{mode:?} at {}: retry must fail before staging while run-dir sync still fails; result={retry_while_sync_fails:?}, events={failed_retry_events:?}",
+                    fixture.path().display()
+                ));
+                continue;
+            }
+
+            store.blob_write_events.lock().unwrap().clear();
             *store.fail_blob_directory_sync.lock().unwrap() = None;
-            let retry = store.put_blob("host_promises/2.json", br#"{"state":"pending"}"#);
+            let retry_after_sync_recovers =
+                store.put_blob("host_promises/2.json", br#"{"state":"pending"}"#);
             let events = store.blob_write_events.lock().unwrap().clone();
             let run_dir_synced = events
                 .iter()
@@ -2825,9 +2848,12 @@ mod tests {
                 (rename, target_synced),
                 (Some(renamed), Some(synced)) if renamed < synced
             );
-            if retry.is_err() || !ancestry_precedes_write || !target_sync_follows_rename {
+            if retry_after_sync_recovers.is_err()
+                || !ancestry_precedes_write
+                || !target_sync_follows_rename
+            {
                 failures.push(format!(
-                    "{mode:?} at {}: retry must sync run dir before staging and target parent after rename; result={retry:?}, events={events:?}",
+                    "{mode:?} at {}: recovered retry must sync run dir before staging and target parent after rename; result={retry_after_sync_recovers:?}, events={events:?}",
                     fixture.path().display()
                 ));
             }
