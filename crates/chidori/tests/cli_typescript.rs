@@ -52,6 +52,20 @@ fn run_chidori_with_str_env(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) ->
     command.output().unwrap()
 }
 
+fn run_chidori_with_run_store_mode(args: &[&str], cwd: &Path, mode: Option<&str>) -> Output {
+    let mut command = Command::new(chidori_bin());
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("CHIDORI_RUN_STORE")
+        .env_remove("CHIDORI_RUN_DB")
+        .env_remove("CHIDORI_DURABILITY");
+    if let Some(mode) = mode {
+        command.env("CHIDORI_RUN_STORE", mode);
+    }
+    command.output().unwrap()
+}
+
 struct LocalHttpServer {
     address: String,
     requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -2702,4 +2716,236 @@ fn cli_run_mirrors_records_to_valid_sqlite_store() {
     drop(connection);
     drop(server);
     fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_run_supports_unset_and_filesystem_run_store() {
+    for mode in [None, Some("fs")] {
+        let dir = temp_project("filesystem-store-control");
+        let agent = dir.join("agent.ts");
+        fs::write(
+            &agent,
+            "export async function agent() { await chidori.log('ok', {}); return {}; }",
+        )
+        .unwrap();
+        let output = run_chidori_with_run_store_mode(&["run", agent.to_str().unwrap()], &dir, mode);
+        assert_success(&output);
+        let run_id = first_run_id(&dir);
+        assert!(dir
+            .join(".chidori")
+            .join("runs")
+            .join(run_id)
+            .join("records.jsonl")
+            .exists());
+        fs::remove_dir_all(dir).ok();
+    }
+}
+
+struct SqliteBranchFixture {
+    dir: PathBuf,
+    run_id: String,
+    branch_id: String,
+    branch_dir: PathBuf,
+}
+
+impl Drop for SqliteBranchFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn create_sqlite_branch_fixture(
+    server: &LocalHttpServer,
+    pause_for_resume: bool,
+) -> SqliteBranchFixture {
+    let dir = temp_project("sqlite-branch-preflight");
+    let branch_source = dir.join("branch.ts");
+    let branch_body = if pause_for_resume {
+        format!(
+            r#"
+                export async function agent() {{
+                    await chidori.input("continue?", {{ default: "yes" }});
+                    await fetch("http://{}/effect", {{ method: "POST" }});
+                    return {{ complete: true }};
+                }}
+            "#,
+            server.address
+        )
+    } else {
+        format!(
+            r#"
+                export async function agent() {{
+                    await fetch("http://{}/effect", {{ method: "POST" }});
+                    return {{ complete: true }};
+                }}
+            "#,
+            server.address
+        )
+    };
+    fs::write(&branch_source, branch_body).unwrap();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        format!(
+            r#"
+                export async function agent() {{
+                    const outcomes = await chidori.branch([
+                        {{ label: "work", source: "{}", input: {{}} }}
+                    ]);
+                    return {{ outcomes }};
+                }}
+            "#,
+            branch_source.display()
+        ),
+    )
+    .unwrap();
+    let envs = [
+        ("CHIDORI_DURABILITY", "effect"),
+        ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
+    ];
+    let output =
+        run_chidori_with_str_env(&["run", agent.to_str().unwrap(), "--trusted"], &dir, &envs);
+    assert_success(&output);
+    let run_id = first_run_id(&dir);
+    let run_output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let branch_id = run_output["outcomes"][0]["branchId"]
+        .as_str()
+        .expect("CLI run must return a branch id")
+        .to_string();
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let branch_dir = fs::read_dir(run_dir.join("branches"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find_map(|op_dir| {
+            let candidate = op_dir.join("branch-000");
+            candidate.join("branch.json").is_file().then_some(candidate)
+        })
+        .expect("CLI run must persist the branch store");
+
+    if pause_for_resume {
+        let meta_path = branch_dir.join("branch.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let checkpoint_path = branch_dir.join("checkpoint.json");
+        let checkpoint: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+        let input = checkpoint
+            .iter()
+            .find(|record| record["function"] == "input")
+            .expect("default input should have a persisted input row");
+        meta["status"] = serde_json::json!("paused");
+        meta["pending_prompt"] = serde_json::json!("continue?");
+        meta["pending_input"] = serde_json::json!({
+            "seq": input["seq"],
+            "prompt": "continue?",
+        });
+        meta["output"] = serde_json::Value::Null;
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+        // The pending input is the branch's replay boundary. Preserve no rows
+        // after it so resume must continue to the HTTP side effect.
+        fs::write(&checkpoint_path, b"[]").unwrap();
+    }
+
+    SqliteBranchFixture {
+        dir,
+        run_id,
+        branch_id,
+        branch_dir,
+    }
+}
+
+fn assert_invalid_sqlite_branch_command_fails_before_mutation(
+    fixture: &SqliteBranchFixture,
+    server: &LocalHttpServer,
+    command: &[&str],
+    expected_requests: usize,
+) {
+    let db_path = fixture.dir.join("sqlite-db-is-a-directory");
+    fs::create_dir_all(&db_path).unwrap();
+    let db_path_text = db_path.to_string_lossy().to_string();
+    let envs = [
+        ("CHIDORI_RUN_STORE", "sqlite"),
+        ("CHIDORI_RUN_DB", db_path_text.as_str()),
+        ("CHIDORI_DURABILITY", "strict"),
+        ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
+    ];
+    let tracked = [
+        fixture.branch_dir.join("branch.json"),
+        fixture.branch_dir.join("checkpoint.json"),
+        fixture.branch_dir.join("source.ts"),
+        fixture.branch_dir.join("history").join("commits.jsonl"),
+    ];
+    let before: Vec<_> = tracked
+        .into_iter()
+        .map(|path| {
+            let contents = fs::read(&path).unwrap_or_default();
+            (path, contents)
+        })
+        .collect();
+    let output = run_chidori_with_str_env(command, &fixture.dir, &envs);
+
+    // The external request count comes before status and diagnostic checks so
+    // vulnerable CLI wiring reports the live branch effect directly.
+    assert_eq!(
+        server.request_count(),
+        expected_requests,
+        "branch command performed an HTTP effect before rejecting invalid SQLite"
+    );
+    assert_failure(&output);
+    assert_diagnostic_contains(&output, &db_path_text);
+    assert_diagnostic_contains(&output, "unable to open database file");
+    for (path, contents) in before {
+        assert_eq!(
+            fs::read(&path).unwrap_or_default(),
+            contents,
+            "mutated {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn cli_branch_resume_rejects_invalid_sqlite_before_branch_effect_or_mutation() {
+    let server = LocalHttpServer::start();
+    let fixture = create_sqlite_branch_fixture(&server, true);
+    assert_eq!(server.request_count(), 1, "fixture's initial HTTP effect");
+    let run_id = fixture.run_id.as_str();
+    let branch_id = fixture.branch_id.as_str();
+    assert_invalid_sqlite_branch_command_fails_before_mutation(
+        &fixture,
+        &server,
+        &[
+            "branch-resume",
+            run_id,
+            branch_id,
+            "--value",
+            "yes",
+            "--dir",
+            fixture.dir.to_str().unwrap(),
+            "--trusted",
+        ],
+        1,
+    );
+}
+
+#[test]
+fn cli_branch_rerun_rejects_invalid_sqlite_before_branch_effect_or_mutation() {
+    let server = LocalHttpServer::start();
+    let fixture = create_sqlite_branch_fixture(&server, false);
+    assert_eq!(server.request_count(), 1, "fixture's initial HTTP effect");
+    let run_id = fixture.run_id.as_str();
+    let branch_id = fixture.branch_id.as_str();
+    assert_invalid_sqlite_branch_command_fails_before_mutation(
+        &fixture,
+        &server,
+        &[
+            "branch-rerun",
+            run_id,
+            branch_id,
+            "--dir",
+            fixture.dir.to_str().unwrap(),
+            "--trusted",
+        ],
+        1,
+    );
 }

@@ -1597,6 +1597,276 @@ mod tests {
     use crate::runtime::store::RunStoreFactory;
     use crate::tools::ToolRegistry;
 
+    fn sqlite_test_parts(
+        base: &Path,
+        run_base: PathBuf,
+        tools: Arc<ToolRegistry>,
+    ) -> AgentRuntimeParts {
+        AgentRuntimeParts {
+            providers: Arc::new(ProviderRegistry::new()),
+            template_engine: Arc::new(TemplateEngine::new(base)),
+            tokio_rt: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            policy: Arc::new(PolicyConfig::default()),
+            tools,
+            mcp: Arc::new(McpManager::new()),
+            run_base,
+        }
+    }
+
+    #[test]
+    fn explicit_sqlite_failure_rejects_detached_spawn_rearm_send_and_alarm_wake_before_effects() {
+        const CHILD: &str = "CHIDORI_TEST_AGENT_SQLITE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let base = PathBuf::from(std::env::var_os("CHIDORI_TEST_AGENT_BASE").unwrap());
+            let db_path = std::env::var("CHIDORI_RUN_DB").unwrap();
+            let source = base.join("agent.ts");
+            std::fs::write(
+                &source,
+                r#"export async function agent() {
+                    await chidori.tool("count", {});
+                    return {};
+                }"#,
+            )
+            .unwrap();
+            let alarm_source = base.join("alarm-agent.ts");
+            std::fs::write(
+                &alarm_source,
+                r#"export async function agent() {
+                    await chidori.alarm(60000);
+                    await chidori.tool("alarmCount", {});
+                    return {};
+                }"#,
+            )
+            .unwrap();
+            let spawn_base = base.join("spawn-runs");
+            let wake_base = base.join("wake-runs");
+            let rearm_base = base.join("rearm-runs");
+            let alarm_base = base.join("alarm-runs");
+            let effect_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (alarm_event_tx, alarm_event_rx) = std::sync::mpsc::channel();
+            let mut tool_registry = ToolRegistry::new();
+            let effect_counter = effect_count.clone();
+            tool_registry.register_native(
+                "count",
+                "counts detached agent effects",
+                Vec::new(),
+                move |_| {
+                    effect_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!({ "counted": true }))
+                },
+            );
+            let alarm_event = alarm_event_tx;
+            let alarm_counter = effect_count.clone();
+            tool_registry.register_native(
+                "alarmCount",
+                "marks the due-alarm wake effect",
+                Vec::new(),
+                move |_| {
+                    alarm_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = alarm_event.send(true);
+                    Ok(json!({ "counted": true }))
+                },
+            );
+            let tools = Arc::new(tool_registry);
+            let spawn_parts = sqlite_test_parts(&base, spawn_base.clone(), tools.clone());
+            let wake_parts = sqlite_test_parts(&base, wake_base.clone(), tools.clone());
+            let rearm_parts = sqlite_test_parts(&base, rearm_base.clone(), tools);
+            let alarm_parts =
+                sqlite_test_parts(&base, alarm_base.clone(), spawn_parts.tools.clone());
+
+            let spawn_name = "sqlite-red-spawn";
+            let spawn_result = hub().spawn(
+                &spawn_parts,
+                source.to_str().unwrap(),
+                json!({}),
+                &SpawnOptions {
+                    name: Some(spawn_name.to_string()),
+                    restart: "never".to_string(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    model: None,
+                },
+                "owner-run".to_string(),
+            );
+
+            let wake_name = "sqlite-red-wake";
+            write_registry_fixture(&wake_base, wake_name, "wake-agent", &source, "hibernating");
+            let wake_registry = wake_base.join("agents").join(format!("{wake_name}.json"));
+            let wake_registry_before = std::fs::read(&wake_registry).unwrap();
+            let wake_rearm = hub().rearm_from_registry(wake_parts.clone());
+            let wake_result = hub().send(
+                &wake_parts,
+                wake_name,
+                "wake",
+                json!({"payload": true}),
+                json!({"from": "test"}),
+            );
+
+            let rearm_name = "sqlite-red-rearm";
+            write_registry_fixture(&rearm_base, rearm_name, "rearm-agent", &source, "running");
+            let rearm_registry = rearm_base.join("agents").join(format!("{rearm_name}.json"));
+            let rearm_registry_before = std::fs::read(&rearm_registry).unwrap();
+            let rearm_result = hub().rearm_from_registry(rearm_parts.clone());
+
+            let alarm_name = "sqlite-red-alarm-wake";
+            write_registry_fixture(
+                &alarm_base,
+                alarm_name,
+                "alarm-agent",
+                &alarm_source,
+                "hibernating",
+            );
+            let alarm_registry = alarm_base.join("agents").join(format!("{alarm_name}.json"));
+            let mut alarm_entry: Value =
+                serde_json::from_slice(&std::fs::read(&alarm_registry).unwrap()).unwrap();
+            alarm_entry["descriptor"]["listen"]["names"] = json!([ALARM_SIGNAL_NAME]);
+            alarm_entry["descriptor"]["listen"]["deadline"] =
+                json!((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+            std::fs::write(
+                &alarm_registry,
+                serde_json::to_vec_pretty(&alarm_entry).unwrap(),
+            )
+            .unwrap();
+            let alarm_registry_before = std::fs::read(&alarm_registry).unwrap();
+            let alarm_rearm = hub().rearm_from_registry(alarm_parts.clone());
+
+            // Wait for the alarm agent's distinctive effect event. This proves
+            // the due-alarm path reached execution without sleep polling.
+            let alarm_effect_seen =
+                alarm_rearm.is_ok() && alarm_event_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+
+            let spawn_registry_written = spawn_base
+                .join("agents")
+                .join(format!("{spawn_name}.json"))
+                .exists();
+            let wake_inbox_written = wake_base
+                .join("wake-agent")
+                .join("signals")
+                .join("inbox.json")
+                .exists();
+            let spawn_entry_installed = hub().entries.lock().unwrap().contains_key(spawn_name);
+            let wake_entry_installed = hub().entries.lock().unwrap().contains_key(wake_name);
+            let rearm_entry_installed = hub().entries.lock().unwrap().contains_key(rearm_name);
+            let alarm_entry_installed = hub().entries.lock().unwrap().contains_key(alarm_name);
+
+            let errors = [
+                spawn_result.err(),
+                wake_rearm.err(),
+                wake_result.err(),
+                rearm_result.err(),
+                alarm_rearm.err(),
+            ];
+            let observed_effects = effect_count.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                observed_effects, 0,
+                "detached agent executed a live tool effect under invalid SQLite; due-alarm effect observed={alarm_effect_seen}"
+            );
+            assert!(
+                errors.iter().all(|error| error.as_deref().is_some_and(|text| {
+                    text.contains(&db_path)
+                        && text.to_lowercase().contains("unable to open database file")
+                })),
+                "hub operations did not propagate invalid SQLite before spawn/rearm/send/alarm wake; observed errors={errors:?}, effects={}, spawn_registry_written={spawn_registry_written}, wake_inbox_written={wake_inbox_written}, entries=[{spawn_entry_installed}, {wake_entry_installed}, {rearm_entry_installed}, {alarm_entry_installed}]",
+                observed_effects
+            );
+            assert!(
+                !spawn_registry_written && !wake_inbox_written,
+                "invalid SQLite mutated a detached-agent registry or mailbox"
+            );
+            assert_eq!(std::fs::read(&wake_registry).unwrap(), wake_registry_before);
+            assert_eq!(
+                std::fs::read(&rearm_registry).unwrap(),
+                rearm_registry_before
+            );
+            assert_eq!(
+                std::fs::read(&alarm_registry).unwrap(),
+                alarm_registry_before
+            );
+            assert!(
+                !spawn_entry_installed
+                    && !wake_entry_installed
+                    && !rearm_entry_installed
+                    && !alarm_entry_installed,
+                "invalid SQLite installed an agent entry or started a supervision path"
+            );
+            assert!(
+                hub().parts.lock().unwrap().is_none(),
+                "invalid SQLite installed detached-agent runtime parts"
+            );
+            assert!(
+                !*hub().timer_started.lock().unwrap(),
+                "invalid SQLite started the detached-agent timer"
+            );
+            return;
+        }
+
+        let base = test_dir("sqlite-factory-paths");
+        let db_path = base.join("sqlite-db-is-a-directory");
+        std::fs::create_dir_all(&db_path).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::host_agent::tests::explicit_sqlite_failure_rejects_detached_spawn_rearm_send_and_alarm_wake_before_effects",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CHIDORI_TEST_AGENT_BASE", &base)
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env("CHIDORI_RUN_DB", &db_path)
+            .env("CHIDORI_DURABILITY", "strict")
+            .output()
+            .unwrap();
+        let report = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(&base).ok();
+        assert!(
+            output.status.success(),
+            "isolated detached-agent SQLite assertions failed:\n{report}"
+        );
+    }
+
+    fn write_registry_fixture(
+        run_base: &Path,
+        name: &str,
+        run_id: &str,
+        source: &Path,
+        status: &str,
+    ) {
+        let agents = run_base.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let descriptor = json!({
+            "name": name,
+            "run_id": run_id,
+            "source": source,
+            "input": {},
+            "restart": "never",
+            "max_restarts": 0,
+            "backoff_ms": 0,
+            "owner_run_id": "owner-run",
+            "model": null,
+            "status": status,
+            "listen": if status == "hibernating" {
+                json!({"names": ["wake"], "seq": 1, "function": "signal", "deadline": null})
+            } else {
+                Value::Null
+            },
+            "restarts": 0,
+            "output": null,
+            "error": null,
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+        });
+        let entry = json!({ "name": name, "run_id": run_id, "descriptor": descriptor });
+        std::fs::write(
+            agents.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&entry).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// A fully-wired runtime backend over `ctx`, with the template engine
     /// anchored at `dir` so relative agent sources resolve — mirroring the
     /// host_actor test harness, plus persistence (detached agents are
