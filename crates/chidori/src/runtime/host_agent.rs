@@ -1730,7 +1730,7 @@ mod tests {
             let base = PathBuf::from(std::env::var_os("CHIDORI_TEST_DETACHED_INBOX_BASE").unwrap());
             let mut losses = Vec::new();
             for count in [2, 5] {
-                let loss = run_deterministic_inbox_race(&base, count);
+                let loss = run_deterministic_inbox_race(&base, count, false);
                 println!(
                     "backend={} competing sends N={count}: {}",
                     std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string()),
@@ -1780,7 +1780,57 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
-    fn run_deterministic_inbox_race(base: &Path, competing_sends: usize) -> Option<String> {
+    #[test]
+    fn detached_inbox_missed_wake_does_not_hibernate_with_matching_payloads() {
+        const CHILD: &str = "CHIDORI_TEST_DETACHED_INBOX_MISSED_WAKE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let base = PathBuf::from(std::env::var_os("CHIDORI_TEST_DETACHED_INBOX_BASE").unwrap());
+            let mut failures = Vec::new();
+            for count in [2, 5] {
+                if let Some(failure) = run_deterministic_inbox_race(&base, count, true) {
+                    failures.push(failure);
+                }
+            }
+            run_sequential_inbox_control(&base, 25);
+            assert!(
+                failures.is_empty(),
+                "missed detached-agent wake: {failures:#?}"
+            );
+            return;
+        }
+
+        let mut failures = Vec::new();
+        for backend in ["fs", "sqlite"] {
+            let base = test_dir(&format!("inbox-missed-wake-{backend}"));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("runtime::host_agent::tests::detached_inbox_missed_wake_does_not_hibernate_with_matching_payloads")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env("CHIDORI_TEST_DETACHED_INBOX_BASE", &base)
+                .env("CHIDORI_RUN_STORE", backend)
+                .env("CHIDORI_RUN_DB", base.join("runs.sqlite3"))
+                .output()
+                .unwrap();
+            let report = format!(
+                "detached inbox missed-wake child backend={backend} exited {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            if !output.status.success() {
+                failures.push(report);
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    fn run_deterministic_inbox_race(
+        base: &Path,
+        competing_sends: usize,
+        require_wake_resolution: bool,
+    ) -> Option<String> {
         let agent_name = unique(&format!("inbox-race-{competing_sends}"));
         let run_base = base
             .join(format!("race-{competing_sends}"))
@@ -1933,9 +1983,13 @@ mod tests {
         let live_result = sender.join().unwrap().unwrap();
         assert_eq!(live_result["delivered"], json!(true));
         worker_release_tx.send(()).unwrap();
-        wait_for_agent_status(&parts, &agent_name, |status| {
-            status == "hibernating" || status == "completed" || status == "failed"
-        });
+        let status = if require_wake_resolution {
+            wait_for_inbox_race_outcome(&parts, &agent_name)
+        } else {
+            wait_for_agent_status(&parts, &agent_name, |status| {
+                status == "hibernating" || status == "completed" || status == "failed"
+            })
+        };
         *INBOX_RACE_BARRIERS
             .get_or_init(|| StdMutex::new(None))
             .lock()
@@ -1953,6 +2007,11 @@ mod tests {
             .unwrap()
             .map(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).unwrap())
             .unwrap_or_default();
+        let live = if require_wake_resolution {
+            status["live"] == json!(true)
+        } else {
+            hub().status(&parts, &agent_name).unwrap()["live"] == json!(true)
+        };
         let accounted: Vec<(String, usize, usize)> = acknowledged_ids
             .iter()
             .map(|id| {
@@ -1979,13 +2038,31 @@ mod tests {
         wait_for_agent_status(&parts, &agent_name, |status| {
             matches!(status, "stopped" | "completed" | "failed")
         });
-        (!unaccounted.is_empty()).then(|| {
-            format!(
-                "backend={}, N={}, acknowledged payload IDs must be consumed exactly once or remain queued; counts={accounted:?}, inbox={inbox:?}, other_store_ids={other_ids:?}",
-                std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string()),
-                competing_sends
-            )
-        })
+        let stranded_matching_ids: Vec<_> = accounted
+            .iter()
+            .filter(|(_, journal_count, inbox_count)| *journal_count == 0 && *inbox_count == 1)
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        let waiting_for_race = status["waitingFor"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|name| name == "race"));
+        let hibernating_with_queued_matches = require_wake_resolution
+            && status["status"] == "hibernating"
+            && !live
+            && waiting_for_race
+            && !stranded_matching_ids.is_empty();
+        let queued_without_driveable_worker = require_wake_resolution
+            && !stranded_matching_ids.is_empty()
+            && status["status"] != "running";
+
+        (!unaccounted.is_empty() || hibernating_with_queued_matches || queued_without_driveable_worker)
+            .then(|| {
+                format!(
+                    "backend={}, N={}, conservation={accounted:?}, status={status}, live={live}, stranded_matching_ids={stranded_matching_ids:?}, inbox={inbox:?}, other_store_ids={other_ids:?}",
+                    std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string()),
+                    competing_sends
+                )
+            })
     }
 
     fn run_sequential_inbox_control(base: &Path, count: usize) {
@@ -2110,6 +2187,39 @@ mod tests {
                 .wait_timeout(state, deadline.saturating_duration_since(now))
                 .unwrap();
             state = next;
+        }
+    }
+
+    fn wait_for_inbox_race_outcome(parts: &AgentRuntimeParts, name: &str) -> Value {
+        let entry = hub().ensure_entry(parts, name).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut state = entry.state.lock().unwrap();
+        loop {
+            let settled = AgentEntry::is_settled(&state);
+            let hibernated = state.descriptor.status == "hibernating" && !state.thread_live;
+            let driveable = state.descriptor.status == "running" && !state.thread_live;
+            if settled || hibernated || driveable {
+                let mut status = state.descriptor.status_json();
+                status["live"] = json!(state.thread_live);
+                return status;
+            }
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                let mut status = state.descriptor.status_json();
+                status["live"] = json!(state.thread_live);
+                return status;
+            }
+            let (next, timeout) = entry
+                .signal
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+            if timeout.timed_out() {
+                let mut status = state.descriptor.status_json();
+                status["live"] = json!(state.thread_live);
+                return status;
+            }
         }
     }
 
