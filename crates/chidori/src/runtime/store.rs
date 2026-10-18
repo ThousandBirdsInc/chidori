@@ -2353,16 +2353,13 @@ mod tests {
             return;
         }
 
-        let run_dir = std::env::temp_dir().join(format!(
-            "chidori-fs-blob-replacement-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let run_dir = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("runtime::store::tests::fs_blob_replacement_interruption_preserves_existing_pending_record")
             .arg("--nocapture")
             .env(CHILD, "1")
-            .env(RUN_DIR, &run_dir)
+            .env(RUN_DIR, run_dir.path())
             .output()
             .unwrap();
         let report = format!(
@@ -2371,7 +2368,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let _ = std::fs::remove_dir_all(&run_dir);
         assert!(output.status.success(), "{report}");
     }
 
