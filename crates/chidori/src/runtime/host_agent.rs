@@ -1355,27 +1355,17 @@ fn listen_state(ctx: &RuntimeContext, pending: &PendingSignal) -> ListenState {
 /// distinguish an already-consumed listener from a genuinely pending hibernate
 /// without inferring state from a descriptor status alone.
 fn listen_has_completed_record(listen: &ListenState, records: &[CallRecord]) -> bool {
+    let expected_args = match listen.function.as_str() {
+        "signal" if listen.names.len() == 1 => json!({ "name": listen.names[0] }),
+        "signal_any" => json!({ "names": listen.names }),
+        _ => return false,
+    };
+
     records.iter().any(|record| {
-        if record.seq != listen.seq || record.function != listen.function || record.error.is_some()
-        {
-            return false;
-        }
-        match listen.function.as_str() {
-            "signal" => listen.names.first().is_some_and(|name| {
-                record.args.get("name").and_then(Value::as_str) == Some(name.as_str())
-            }),
-            "signal_any" => record
-                .args
-                .get("names")
-                .and_then(Value::as_array)
-                .is_some_and(|names| {
-                    names
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .eq(listen.names.iter().map(String::as_str))
-                }),
-            _ => false,
-        }
+        record.seq == listen.seq
+            && record.function == listen.function
+            && record.error.is_none()
+            && record.args == expected_args
     })
 }
 
@@ -1840,6 +1830,56 @@ mod tests {
     use crate::runtime::store::FailSignalInboxStore;
     use crate::runtime::store::RunStoreFactory;
     use crate::tools::ToolRegistry;
+
+    #[test]
+    fn completed_listen_requires_exact_canonical_arguments() {
+        let record = |function: &str, args: Value| CallRecord {
+            seq: 7,
+            parent_seq: None,
+            function: function.to_string(),
+            args,
+            result: Value::Null,
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        };
+        let listen = |function: &str, names: &[&str]| ListenState {
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+            seq: 7,
+            function: function.to_string(),
+            deadline: None,
+        };
+
+        assert!(listen_has_completed_record(
+            &listen("signal", &["x"]),
+            &[record("signal", json!({ "name": "x" }))]
+        ));
+        assert!(!listen_has_completed_record(
+            &listen("signal", &["x", "y"]),
+            &[record("signal", json!({ "name": "x" }))]
+        ));
+        assert!(!listen_has_completed_record(
+            &listen("signal", &["x"]),
+            &[record("signal", json!({ "name": "x", "extra": true }))]
+        ));
+
+        assert!(listen_has_completed_record(
+            &listen("signal_any", &["x"]),
+            &[record("signal_any", json!({ "names": ["x"] }))]
+        ));
+        assert!(!listen_has_completed_record(
+            &listen("signal_any", &["x"]),
+            &[record("signal_any", json!({ "names": ["x", null] }))]
+        ));
+        assert!(!listen_has_completed_record(
+            &listen("signal_any", &["x"]),
+            &[record(
+                "signal_any",
+                json!({ "names": ["x"], "extra": true })
+            )]
+        ));
+    }
 
     #[test]
     fn detached_live_send_commit_exit_rearms_and_journals_once() {
