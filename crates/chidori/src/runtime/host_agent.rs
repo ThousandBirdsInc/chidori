@@ -152,6 +152,12 @@ impl AgentEntry {
     }
 }
 
+fn ensure_run_store_initialized(run_base: &Path, operation: &str) -> Result<(), String> {
+    RunStoreFactory::shared(run_base)
+        .ensure_initialized()
+        .map_err(|err| format!("{operation}: {err:#}"))
+}
+
 struct AgentState {
     descriptor: AgentDescriptor,
     /// The live iteration's context while a supervision thread is running —
@@ -258,6 +264,10 @@ impl DetachedAgentHub {
         owner_run_id: String,
     ) -> Result<Value, String> {
         let parts = parts.clone();
+        ensure_run_store_initialized(
+            &parts.run_base,
+            "chidori.agents.spawn: initializing run store",
+        )?;
         let factory = RunStoreFactory::shared(&parts.run_base);
         let name = options
             .name
@@ -359,6 +369,10 @@ impl DetachedAgentHub {
 
     /// Start the supervision thread for an entry that isn't already running.
     fn start_thread(&self, entry: Arc<AgentEntry>) -> Result<(), String> {
+        ensure_run_store_initialized(
+            &entry.parts.run_base,
+            "chidori.agents: initializing run store before worker start",
+        )?;
         {
             let mut state = entry.state.lock().unwrap();
             if state.thread_live {
@@ -398,6 +412,10 @@ impl DetachedAgentHub {
         payload: Value,
         from: Value,
     ) -> Result<Value, String> {
+        ensure_run_store_initialized(
+            &parts.run_base,
+            "chidori.agents.send: initializing run store",
+        )?;
         let entry = self.ensure_entry(parts, to)?;
         let factory = entry.factory();
         let mut wake = false;
@@ -579,6 +597,10 @@ impl DetachedAgentHub {
     /// previous process died, and re-arm alarm deadlines. Returns how many
     /// agents were re-armed.
     pub fn rearm_from_registry(&self, parts: AgentRuntimeParts) -> Result<usize, String> {
+        ensure_run_store_initialized(
+            &parts.run_base,
+            "chidori.agents.rearm: initializing run store",
+        )?;
         let factory = RunStoreFactory::shared(&parts.run_base);
         let parts_for_entries = parts.clone();
         self.install_parts(parts);
@@ -670,6 +692,13 @@ impl DetachedAgentHub {
                         .collect()
                 };
                 for entry in due {
+                    if let Err(err) = ensure_run_store_initialized(
+                        &entry.parts.run_base,
+                        "chidori.agents.alarm: initializing run store",
+                    ) {
+                        tracing::warn!(agent = %entry.name, error = %err, "skipping detached-agent wake because run store initialization failed");
+                        continue;
+                    }
                     {
                         let mut state = entry.state.lock().unwrap();
                         state.descriptor.status = "running".to_string();
