@@ -1798,6 +1798,419 @@ mod tests {
     use crate::tools::ToolRegistry;
 
     #[test]
+    fn detached_live_send_commit_exit_rearms_and_journals_once() {
+        const MODE: &str = "CHIDORI_TEST_LIVE_CUT_MODE";
+        const BASE_ENV: &str = "CHIDORI_TEST_LIVE_CUT_BASE";
+        const TEST: &str =
+            "runtime::host_agent::tests::detached_live_send_commit_exit_rearms_and_journals_once";
+        const AGENT: &str = "live-cut-rearm-agent";
+
+        if let Some(mode) = std::env::var_os(MODE) {
+            let mode = mode.to_string_lossy();
+            let base = PathBuf::from(std::env::var_os(BASE_ENV).unwrap());
+            let run_base = base.join(".chidori/runs");
+            let source = base.join("services/live-cut.ts");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(
+                &source,
+                r#"export async function agent() {
+                    await chidori.signal("start");
+                    await chidori.tool("testHold", {});
+                    const cut = await chidori.signal("cut");
+                    return { id: cut.payload.id };
+                }"#,
+            )
+            .unwrap();
+
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Arc::new(StdMutex::new(release_rx));
+            let block_tool = mode == "crash";
+            let mut tools = ToolRegistry::new();
+            tools.register_native(
+                "testHold",
+                "test-only barrier for detached live signal cut",
+                Vec::new(),
+                move |_| {
+                    entered_tx.send(()).map_err(|err| anyhow::anyhow!(err))?;
+                    if block_tool {
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(20))
+                            .map_err(|err| anyhow::anyhow!("tool barrier timed out: {err}"))?;
+                    }
+                    Ok(json!({"ok": true}))
+                },
+            );
+            let parts = sqlite_test_parts(&base, run_base.clone(), Arc::new(tools));
+
+            if mode == "crash" {
+                let spawned = hub()
+                    .spawn(
+                        &parts,
+                        source.to_str().unwrap(),
+                        json!({}),
+                        &SpawnOptions {
+                            name: Some(AGENT.to_string()),
+                            restart: "resume".to_string(),
+                            max_restarts: 0,
+                            backoff_ms: 0,
+                            model: None,
+                        },
+                        "live-cut-test-owner".to_string(),
+                    )
+                    .unwrap();
+                wait_for_agent_status(&parts, AGENT, |status| status == "hibernating");
+                let entry = hub().ensure_entry(&parts, AGENT).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut state = entry.state.lock().unwrap();
+                while state.descriptor.status != "hibernating" || state.thread_live {
+                    let now = std::time::Instant::now();
+                    assert!(now < deadline, "worker did not finish initial hibernation");
+                    let (next, _) = entry
+                        .signal
+                        .wait_timeout(state, deadline.saturating_duration_since(now))
+                        .unwrap();
+                    state = next;
+                }
+                drop(state);
+                assert_eq!(
+                    hub().status(&parts, AGENT).unwrap()["live"],
+                    json!(false),
+                    "initial signal listen must be hibernating before send"
+                );
+                assert_eq!(
+                    hub()
+                        .send(&parts, AGENT, "start", json!({}), json!({"test": true}))
+                        .unwrap()["delivered"],
+                    json!(true)
+                );
+                entered_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("worker did not enter the blocking tool");
+                let live_status = hub().status(&parts, AGENT).unwrap();
+                assert_eq!(live_status["status"], json!("running"), "{live_status}");
+                assert_eq!(live_status["live"], json!(true), "{live_status}");
+
+                let run_id = spawned["runId"].as_str().unwrap();
+                std::fs::write(base.join("run-id.txt"), run_id).unwrap();
+                std::fs::write(base.join("send-state.txt"), "about-to-call").unwrap();
+                std::env::set_var("CHIDORI_TEST_EXIT_AFTER_SIGNAL_INBOX_COMMIT", "1");
+                let _ = hub().send(
+                    &parts,
+                    AGENT,
+                    "cut",
+                    json!({"id": "cut-1"}),
+                    json!({"test": true}),
+                );
+                let _ = release_tx.send(());
+                panic!("post-commit failpoint did not terminate the sender process");
+            }
+
+            assert!(matches!(mode.as_ref(), "rearm" | "diagnostic"));
+            let run_id = std::fs::read_to_string(base.join("run-id.txt")).unwrap();
+            let factory = RunStoreFactory::shared(&run_base);
+            if mode == "diagnostic" {
+                let registered = factory
+                    .registry_get(AGENT)
+                    .unwrap()
+                    .expect("registry entry missing in diagnostic copy");
+                let mut descriptor: AgentDescriptor =
+                    serde_json::from_value(registered["descriptor"].clone()).unwrap();
+                descriptor.status = "running".to_string();
+                descriptor.listen = None;
+                persist_descriptor(&factory, &descriptor);
+            }
+            let store = factory.store_for(&run_id);
+            let records_before_rearm = store.load_call_log().unwrap().unwrap_or_default();
+            let inbox_before_rearm: Vec<QueuedSignal> = store
+                .get_blob(SIGNAL_INBOX_FILE)
+                .unwrap()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .unwrap_or_default();
+            let cut_rows_before_rearm = records_before_rearm
+                .iter()
+                .filter(|record| {
+                    record.function == "signal" && record.result["payload"]["id"] == json!("cut-1")
+                })
+                .count();
+            let cut_inbox_before_rearm = inbox_before_rearm
+                .iter()
+                .filter(|queued| queued.payload["id"] == json!("cut-1"))
+                .count();
+            let registry_before = factory
+                .registry_get(AGENT)
+                .unwrap()
+                .expect("registry entry missing before rearm");
+            let descriptor_before = registry_before["descriptor"].clone();
+            let rearmed = hub().rearm_from_registry(parts.clone()).unwrap();
+
+            // Wait on the hub's state condition variable for completion, while
+            // retaining the last observed status when the expected worker never starts.
+            let entry = hub().ensure_entry(&parts, AGENT).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut state = entry.state.lock().unwrap();
+            while !matches!(state.descriptor.status.as_str(), "completed" | "failed")
+                && !(state.descriptor.status == "hibernating" && !state.thread_live)
+            {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (next, _) = entry
+                    .signal
+                    .wait_timeout(state, deadline.saturating_duration_since(now))
+                    .unwrap();
+                state = next;
+            }
+            let final_status = state.descriptor.status_json();
+            let final_live = state.thread_live;
+            drop(state);
+
+            let store = factory.store_for(&run_id);
+            let records = store.load_call_log().unwrap().unwrap_or_default();
+            let inbox: Vec<QueuedSignal> = store
+                .get_blob(SIGNAL_INBOX_FILE)
+                .unwrap()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .unwrap_or_default();
+            let cut_rows: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    record.function == "signal" && record.result["payload"]["id"] == json!("cut-1")
+                })
+                .collect();
+            let report = json!({
+                "ack": "no response: crash child exited before hub.send returned",
+                "send_state": std::fs::read_to_string(base.join("send-state.txt")).unwrap(),
+                "descriptor_before_rearm": descriptor_before,
+                "cut_rows_before_rearm": cut_rows_before_rearm,
+                "cut_inbox_before_rearm": cut_inbox_before_rearm,
+                "rearmed": rearmed,
+                "status_after_rearm": final_status,
+                "live_after_rearm": final_live,
+                "cut_signal_rows": cut_rows.len(),
+                "cut_signal_result": cut_rows.first().map(|record| &record.result),
+                "journal_rows": records.len(),
+                "inbox": inbox,
+            });
+            std::fs::write(
+                base.join("rearm-report.json"),
+                serde_json::to_vec_pretty(&report).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+
+        let mut failures = Vec::new();
+        for backend in ["fs", "sqlite"] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().to_path_buf();
+            let db_path = base.join("runs.sqlite3");
+            eprintln!(
+                "ARTIFACT_BACKEND={backend} ARTIFACT_BASE={}",
+                base.display()
+            );
+
+            let crash = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(TEST)
+                .arg("--nocapture")
+                .env(MODE, "crash")
+                .env(BASE_ENV, &base)
+                .env("CHIDORI_RUN_STORE", backend)
+                .env("CHIDORI_RUN_DB", &db_path)
+                .output()
+                .unwrap();
+            assert_eq!(
+                crash.status.code(),
+                Some(87),
+                "{backend} crash child did not exit at the post-commit/pre-publication cut; stdout={} stderr={}",
+                String::from_utf8_lossy(&crash.stdout),
+                String::from_utf8_lossy(&crash.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(base.join("send-state.txt")).unwrap(),
+                "about-to-call",
+                "crash cut must occur before hub.send returns; no response is not delivered:true"
+            );
+
+            let run_id = std::fs::read_to_string(base.join("run-id.txt")).unwrap();
+            let store: Arc<dyn crate::runtime::store::RunStore> = match backend {
+                "fs" => Arc::new(crate::runtime::store::FsRunStore::new(
+                    base.join(".chidori/runs").join(&run_id),
+                )),
+                "sqlite" => Arc::new(crate::runtime::store::SqliteRunStore::new(
+                    crate::runtime::store::SqliteRunStoreShared::open(&db_path).unwrap(),
+                    run_id,
+                )),
+                _ => unreachable!(),
+            };
+            let expired = crate::runtime::store::RunLease {
+                owner: "dead-live-cut-child".to_string(),
+                expires_at: Utc::now() - chrono::Duration::seconds(1),
+            };
+            store
+                .put_blob(
+                    crate::runtime::store::LEASE_FILE,
+                    &serde_json::to_vec(&expired).unwrap(),
+                )
+                .unwrap();
+            drop(store);
+
+            let diagnostic_temp = tempfile::tempdir().unwrap();
+            copy_test_tree(&base, diagnostic_temp.path()).unwrap();
+
+            let rearm = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(TEST)
+                .arg("--nocapture")
+                .env(MODE, "rearm")
+                .env(BASE_ENV, &base)
+                .env("CHIDORI_RUN_STORE", backend)
+                .env("CHIDORI_RUN_DB", &db_path)
+                .output()
+                .unwrap();
+            if !rearm.status.success() {
+                failures.push(format!(
+                    "{backend}: rearm child failed; stdout={} stderr={}",
+                    String::from_utf8_lossy(&rearm.stdout),
+                    String::from_utf8_lossy(&rearm.stderr)
+                ));
+                let preserved = temp.keep();
+                failures.push(format!(
+                    "{backend} artifacts preserved at {}",
+                    preserved.display()
+                ));
+                continue;
+            }
+
+            let report: Value =
+                serde_json::from_slice(&std::fs::read(base.join("rearm-report.json")).unwrap())
+                    .unwrap();
+            assert_eq!(report["rearmed"], json!(1), "report={report}");
+
+            let diagnostic = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(TEST)
+                .arg("--nocapture")
+                .env(MODE, "diagnostic")
+                .env(BASE_ENV, diagnostic_temp.path())
+                .env("CHIDORI_RUN_STORE", backend)
+                .env(
+                    "CHIDORI_RUN_DB",
+                    diagnostic_temp.path().join("runs.sqlite3"),
+                )
+                .output()
+                .unwrap();
+            let diagnostic_report = if diagnostic.status.success() {
+                match std::fs::read(diagnostic_temp.path().join("rearm-report.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                {
+                    Some(report) => Some(report),
+                    None => {
+                        failures.push(format!(
+                            "{backend} descriptor-only diagnostic control produced no valid report; stdout={} stderr={}",
+                            String::from_utf8_lossy(&diagnostic.stdout),
+                            String::from_utf8_lossy(&diagnostic.stderr)
+                        ));
+                        None
+                    }
+                }
+            } else {
+                failures.push(format!(
+                    "{backend} descriptor-only diagnostic control failed: stdout={} stderr={}",
+                    String::from_utf8_lossy(&diagnostic.stdout),
+                    String::from_utf8_lossy(&diagnostic.stderr)
+                ));
+                None
+            };
+            if let Some(diagnostic_report) = diagnostic_report {
+                let diagnostic_ok = diagnostic_report["rearmed"] == json!(1)
+                    && diagnostic_report["descriptor_before_rearm"]["status"] == json!("running")
+                    && diagnostic_report["descriptor_before_rearm"]["listen"] == Value::Null
+                    && diagnostic_report["cut_signal_rows"] == json!(1)
+                    && diagnostic_report["inbox"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty);
+                if !diagnostic_ok {
+                    failures.push(format!(
+                        "{backend} descriptor-only diagnostic control did not recover as expected; report={diagnostic_report}"
+                    ));
+                }
+            }
+
+            let descriptor = &report["descriptor_before_rearm"];
+            let listen = &descriptor["listen"];
+            assert!(
+                matches!(
+                    descriptor["status"].as_str(),
+                    Some("running" | "hibernating")
+                ),
+                "descriptor should remain nonterminal at the stale start listen; report={report}"
+            );
+            assert_eq!(listen["seq"], json!(1), "report={report}");
+            assert_eq!(listen["names"][0], json!("start"), "report={report}");
+            assert_eq!(
+                report["ack"],
+                json!("no response: crash child exited before hub.send returned")
+            );
+            assert_eq!(report["cut_rows_before_rearm"], json!(0), "report={report}");
+            assert_eq!(
+                report["cut_inbox_before_rearm"],
+                json!(1),
+                "report={report}"
+            );
+
+            let recovered = report["status_after_rearm"]["status"] == json!("completed")
+                && report["cut_signal_rows"] == json!(1)
+                && report["cut_signal_result"]["payload"]["id"] == json!("cut-1")
+                && report["inbox"].as_array().is_some_and(Vec::is_empty);
+            if !recovered {
+                failures.push(format!(
+                    "{backend}: committed cut-1 was not consumed/journaled exactly once after real rearm; observed status={}, live={}, waitingFor={}, cut_rows={}, journal_rows={}, inbox={}; artifact_base={}",
+                    report["status_after_rearm"]["status"],
+                    report["live_after_rearm"],
+                    report["status_after_rearm"]["waitingFor"],
+                    report["cut_signal_rows"],
+                    report["journal_rows"],
+                    report["inbox"],
+                    base.display()
+                ));
+                let preserved = temp.keep();
+                failures.push(format!(
+                    "{backend} artifacts preserved at {}",
+                    preserved.display()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "detached live signal restart contract failed:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    fn copy_test_tree(
+        source: &std::path::Path,
+        destination: &std::path::Path,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_test_tree(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn live_send_does_not_acknowledge_when_signal_inbox_persistence_fails() {
         const CHILD: &str = "CHIDORI_TEST_LIVE_HUB_FAILURE_CHILD";
         const TEST: &str =

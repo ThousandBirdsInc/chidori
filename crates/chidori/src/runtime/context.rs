@@ -1849,6 +1849,11 @@ impl RuntimeContext {
                         "persisting live signal inbox failed; delivery was not acknowledged and persistence outcome may be uncertain; retry may duplicate if the backend committed before reporting the error: {err}"
                     )
                 })?;
+            #[cfg(test)]
+            if std::env::var_os("CHIDORI_TEST_EXIT_AFTER_SIGNAL_INBOX_COMMIT").is_some() {
+                // Isolated child-process seam for the commit-to-publication crash cut.
+                std::process::exit(87);
+            }
             persisted.ok_or_else(|| {
                 anyhow::anyhow!("run store completed live signal update without invoking updater")
             })?
