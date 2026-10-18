@@ -1717,6 +1717,7 @@ pub enum RunStoreBackend {
 pub struct RunStoreFactory {
     run_base: PathBuf,
     backend: RunStoreBackend,
+    initialization_error: Option<String>,
 }
 
 impl RunStoreFactory {
@@ -1725,6 +1726,7 @@ impl RunStoreFactory {
         Self {
             run_base: run_base.into(),
             backend: RunStoreBackend::Fs,
+            initialization_error: None,
         }
     }
 
@@ -1734,6 +1736,7 @@ impl RunStoreFactory {
     ///   * `http(s)://...` → mirror to a remote relay
     pub fn from_env(run_base: impl Into<PathBuf>) -> Self {
         let run_base = run_base.into();
+        let mut initialization_error = None;
         let backend = match std::env::var("CHIDORI_RUN_STORE") {
             Ok(value) if value.eq_ignore_ascii_case("sqlite") => {
                 let db_path = std::env::var("CHIDORI_RUN_DB")
@@ -1745,9 +1748,10 @@ impl RunStoreFactory {
                         RunStoreBackend::Sqlite(shared)
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            "run store sqlite mirror failed ({err}); falling back to fs only"
-                        );
+                        initialization_error = Some(format!(
+                            "failed to initialize explicitly configured SQLite run store at {}: {err:#}",
+                            db_path.display()
+                        ));
                         RunStoreBackend::Fs
                     }
                 }
@@ -1779,7 +1783,11 @@ impl RunStoreFactory {
             }
             _ => RunStoreBackend::Fs,
         };
-        Self { run_base, backend }
+        Self {
+            run_base,
+            backend,
+            initialization_error,
+        }
     }
 
     /// The process-wide factory for `run_base`, built from the environment on
@@ -1801,6 +1809,16 @@ impl RunStoreFactory {
 
     pub fn run_base(&self) -> &Path {
         &self.run_base
+    }
+
+    /// Fail before starting a run if an explicitly selected backend could not
+    /// be initialized. SQLite open failures are startup errors regardless of
+    /// the later write-durability policy.
+    pub fn ensure_initialized(&self) -> Result<()> {
+        if let Some(error) = &self.initialization_error {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
     }
 
     /// Whether a durable mirror is configured (vs filesystem only).
@@ -2569,6 +2587,7 @@ mod tests {
         let factory = RunStoreFactory {
             run_base: base.clone(),
             backend: RunStoreBackend::Sqlite(shared),
+            initialization_error: None,
         };
         assert!(factory.hydrate("run-1").unwrap());
         let local = FsRunStore::new(base.join("run-1"));
@@ -2605,6 +2624,7 @@ mod tests {
         let factory = RunStoreFactory {
             run_base: base.clone(),
             backend: RunStoreBackend::Sqlite(shared),
+            initialization_error: None,
         };
 
         let error = factory
@@ -2622,6 +2642,7 @@ mod tests {
         let factory = RunStoreFactory {
             run_base: base.clone(),
             backend: RunStoreBackend::Sqlite(shared),
+            initialization_error: None,
         };
         factory
             .store_for("run-local")

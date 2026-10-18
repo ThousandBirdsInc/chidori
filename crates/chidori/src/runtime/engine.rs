@@ -994,6 +994,10 @@ impl Engine {
         inputs: &Value,
         ctx: RuntimeContext,
     ) -> Result<RunResult> {
+        if let Some(factory) = &self.run_store {
+            factory.ensure_initialized()?;
+        }
+
         // Fall back to the engine's default workspace root when the context
         // doesn't already have one. `CHIDORI_WORKSPACE_ROOT` populates the
         // context default (via `RuntimeContext::new`), so an explicit env var
