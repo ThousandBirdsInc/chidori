@@ -556,7 +556,7 @@ fn actor_inline_signal_wait(
             // pump it into the run-level inbox and drain through the same
             // path a pre-queued signal takes (ordering + durable-inbox
             // semantics included).
-            crate::runtime::host_actor::pump_own_mailbox(ctx);
+            crate::runtime::host_actor::pump_own_mailbox(ctx)?;
             if let Some(queued) = ctx.take_queued_signal_any(names) {
                 let result = json!({
                     "name": queued.name,
@@ -3560,7 +3560,9 @@ mod tests {
         ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
             move |names, _timeout_ms| {
                 // Simulate a delivery landing while the listen point waits.
-                waiter_ctx.enqueue_live_signal(&names[0], json!({ "n": 1 }), json!("tester"));
+                waiter_ctx
+                    .enqueue_live_signal(&names[0], json!({ "n": 1 }), json!("tester"))
+                    .unwrap();
                 crate::runtime::context::ActorSignalWait::Delivered
             },
         ));
@@ -3620,7 +3622,9 @@ mod tests {
         ctx.set_actor_signal_waiter(crate::runtime::context::ActorSignalWaiter::new(
             move |names, _timeout_ms| {
                 assert_eq!(names.len(), 2);
-                waiter_ctx.enqueue_live_signal(&names[1], json!("payload-b"), json!(null));
+                waiter_ctx
+                    .enqueue_live_signal(&names[1], json!("payload-b"), json!(null))
+                    .unwrap();
                 crate::runtime::context::ActorSignalWait::Delivered
             },
         ));

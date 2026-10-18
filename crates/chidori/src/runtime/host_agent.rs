@@ -458,7 +458,11 @@ impl DetachedAgentHub {
                 // one critical section. Keep AgentState locked until the
                 // context has persisted, so the worker cannot clear this
                 // context and race a store-backed whole-file inbox write.
-                ctx.enqueue_live_signal(name, payload, from);
+                ctx.enqueue_live_signal(name, payload, from).map_err(|err| {
+                    format!(
+                        "chidori.agents.send: live signal persistence failed before acknowledgement: {err}"
+                    )
+                })?;
                 #[cfg(test)]
                 entry
                     .live_send_notify_count
@@ -468,25 +472,36 @@ impl DetachedAgentHub {
             }
             let run_id = state.descriptor.run_id.clone();
             let store = factory.store_for(&run_id);
-            let mut inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE) {
-                Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
-                _ => Vec::new(),
-            };
             #[cfg(test)]
-            tests::pause_after_cross_process_inbox_read(&entry.name);
-            let delivery_seq = inbox.iter().map(|s| s.delivery_seq).max().unwrap_or(0) + 1;
-            inbox.push(QueuedSignal {
-                name: name.to_string(),
-                payload,
-                from,
-                delivery_seq,
-                enqueued_at: Utc::now(),
-            });
-            let bytes = serde_json::to_vec_pretty(&inbox)
-                .map_err(|err| format!("chidori.agents.send: encoding inbox: {err}"))?;
+            tests::pause_before_cross_process_inbox_update(&entry.name);
+            let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+                let mut inbox: Vec<QueuedSignal> = current
+                    .as_deref()
+                    .map(serde_json::from_slice)
+                    .transpose()?
+                    .unwrap_or_default();
+                let delivery_seq = inbox
+                    .iter()
+                    .map(|signal| signal.delivery_seq)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                inbox.push(QueuedSignal {
+                    name: name.to_string(),
+                    payload: payload.clone(),
+                    from: from.clone(),
+                    delivery_seq,
+                    enqueued_at: Utc::now(),
+                });
+                Ok(serde_json::to_vec_pretty(&inbox)?)
+            };
             store
-                .put_blob(SIGNAL_INBOX_FILE, &bytes)
-                .map_err(|err| format!("chidori.agents.send: persisting inbox: {err}"))?;
+                .update_blob(SIGNAL_INBOX_FILE, &mut update)
+                .map_err(|err| {
+                    format!(
+                        "chidori.agents.send: inbox persistence failed before acknowledgement; persistence outcome may be uncertain and retry may duplicate: {err}"
+                    )
+                })?;
             if state.descriptor.status == "hibernating" {
                 let matches = state
                     .descriptor
@@ -1906,7 +1921,7 @@ mod tests {
     static INBOX_SNAPSHOT_GAP_BARRIERS: OnceLock<StdMutex<Option<Arc<InboxSnapshotGapBarriers>>>> =
         OnceLock::new();
 
-    pub(super) fn pause_after_cross_process_inbox_read(agent_name: &str) {
+    pub(super) fn pause_before_cross_process_inbox_update(agent_name: &str) {
         let Some(target) = std::env::var_os("CHIDORI_TEST_CROSS_PROCESS_INBOX_GATE") else {
             return;
         };

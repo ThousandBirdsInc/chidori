@@ -487,6 +487,20 @@ pub(in crate::server) async fn signal_session(
             let ctx = live.ctx_slot.lock().unwrap();
             ctx.enqueue_live_signal(&body.name, body.payload.clone(), body.from.clone())
         };
+        let queued = match queued {
+            Ok(queued) => queued,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!(
+                            "live signal persistence failed before acknowledgement; persistence outcome may be uncertain and retry may duplicate: {err}"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+        };
         let _ = live
             .signal_tx
             .send((queued.delivery_seq, queued.name.clone()));

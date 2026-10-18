@@ -1629,7 +1629,6 @@ fn supervise(
         if let Some(intercept) = &options.intercept {
             intercept.apply_to_ctx(parent_ctx, &ctx);
         }
-        pump_mailbox(shared, &ctx);
         // Inline listen-point wait: a `chidori.signal` with an empty inbox
         // blocks HERE for the next matching delivery (or its own timeout) and
         // continues in place — the actor's history is not re-executed per
@@ -1676,8 +1675,10 @@ fn supervise(
                 .unwrap_or(iter_backend),
             None => iter_backend,
         };
-        let result = crate::runtime::rust_engine::run_agent_file(source, input, &iter_backend);
-
+        let result = match pump_mailbox(shared, &ctx) {
+            Ok(()) => crate::runtime::rust_engine::run_agent_file(source, input, &iter_backend),
+            Err(err) => Err(err),
+        };
         match settle_iteration(result, &ctx) {
             IterationEnd::Completed(output) => {
                 return outcome(
@@ -1824,29 +1825,42 @@ fn supervise(
 /// (`chidori.signal` / `pollSignal`) and `chidori.receive` see
 /// them. Called at the start of every iteration and (via
 /// [`pump_own_mailbox`]) right before each live listen-family host call.
-fn pump_mailbox(shared: &ActorShared, ctx: &RuntimeContext) {
-    let drained: Vec<QueuedSignal> = {
+fn pump_mailbox(shared: &ActorShared, ctx: &RuntimeContext) -> anyhow::Result<()> {
+    loop {
+        let message = shared.state.lock().unwrap().mailbox.first().cloned();
+        let Some(message) = message else {
+            return Ok(());
+        };
+        ctx.enqueue_live_signal(&message.name, message.payload.clone(), message.from.clone())?;
         let mut state = shared.state.lock().unwrap();
-        std::mem::take(&mut state.mailbox)
-    };
-    for message in drained {
-        ctx.enqueue_live_signal(&message.name, message.payload, message.from);
+        let index = state
+            .mailbox
+            .iter()
+            .position(|queued| queued.delivery_seq == message.delivery_seq)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "actor mailbox item {} disappeared after durable signal enqueue",
+                    message.delivery_seq
+                )
+            })?;
+        state.mailbox.remove(index);
     }
 }
 
 /// If `ctx` is an actor context, pump its shared mailbox into the run-level
 /// inbox so an imminent listen-point drain sees every delivery to date. Called
 /// by the dispatch layer before the signal-family effects.
-pub(crate) fn pump_own_mailbox(ctx: &RuntimeContext) {
+pub(crate) fn pump_own_mailbox(ctx: &RuntimeContext) -> anyhow::Result<()> {
     let Some(pid) = ctx.actor_id() else {
-        return;
+        return Ok(());
     };
     let Some(hub) = ctx.actor_hub() else {
-        return;
+        return Ok(());
     };
     if let Some(shared) = hub.shared_of(&pid) {
-        pump_mailbox(&shared, ctx);
+        pump_mailbox(&shared, ctx)?;
     }
+    Ok(())
 }
 
 /// Park the actor thread until a matching message is delivered, a stop is
