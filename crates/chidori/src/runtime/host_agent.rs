@@ -462,6 +462,8 @@ impl DetachedAgentHub {
                 Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
                 _ => Vec::new(),
             };
+            #[cfg(test)]
+            tests::pause_after_cross_process_inbox_read(&entry.name);
             let delivery_seq = inbox.iter().map(|s| s.delivery_seq).max().unwrap_or(0) + 1;
             inbox.push(QueuedSignal {
                 name: name.to_string(),
@@ -1795,6 +1797,42 @@ mod tests {
     static INBOX_SNAPSHOT_GAP_BARRIERS: OnceLock<StdMutex<Option<Arc<InboxSnapshotGapBarriers>>>> =
         OnceLock::new();
 
+    pub(super) fn pause_after_cross_process_inbox_read(agent_name: &str) {
+        let Some(target) = std::env::var_os("CHIDORI_TEST_CROSS_PROCESS_INBOX_GATE") else {
+            return;
+        };
+        let configured_name = std::env::var("CHIDORI_TEST_CROSS_PROCESS_INBOX_AGENT")
+            .expect("cross-process inbox gate requires an agent name");
+        if configured_name != agent_name {
+            return;
+        }
+        let role = std::env::var("CHIDORI_TEST_CROSS_PROCESS_INBOX_ROLE")
+            .expect("cross-process inbox gate requires a writer role");
+        let role_byte = role
+            .as_bytes()
+            .last()
+            .copied()
+            .expect("cross-process inbox writer role cannot be empty");
+        let target: std::net::SocketAddr = target
+            .to_string_lossy()
+            .parse()
+            .expect("invalid cross-process inbox gate address");
+        let mut stream = std::net::TcpStream::connect_timeout(&target, Duration::from_secs(10))
+            .expect("connecting to cross-process inbox gate");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("setting cross-process inbox gate read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("setting cross-process inbox gate write timeout");
+        std::io::Write::write_all(&mut stream, &[role_byte])
+            .expect("announcing cross-process inbox snapshot");
+        let mut release = [0];
+        std::io::Read::read_exact(&mut stream, &mut release)
+            .expect("waiting for cross-process inbox gate release");
+        assert_eq!(release, [b'G'], "invalid cross-process inbox gate release");
+    }
+
     pub(super) fn pause_after_supervisor_inbox_snapshot(agent_name: &str) {
         let barriers = INBOX_SNAPSHOT_GAP_BARRIERS
             .get_or_init(|| StdMutex::new(None))
@@ -1889,6 +1927,271 @@ mod tests {
             mcp: Arc::new(McpManager::new()),
             run_base,
         }
+    }
+
+    #[tokio::test]
+    async fn detached_inbox_cross_process_writers_preserve_acknowledged_payloads() {
+        const CHILD: &str = "CHIDORI_TEST_CROSS_PROCESS_INBOX_CHILD";
+        const TEST_NAME: &str = "runtime::host_agent::tests::detached_inbox_cross_process_writers_preserve_acknowledged_payloads";
+
+        if let Some(role) = std::env::var_os(CHILD) {
+            let role = role.to_string_lossy();
+            let base =
+                PathBuf::from(std::env::var_os("CHIDORI_TEST_CROSS_PROCESS_INBOX_BASE").unwrap());
+            let agent_name = std::env::var("CHIDORI_TEST_CROSS_PROCESS_INBOX_AGENT").unwrap();
+            let run_base = base.join(".chidori/runs");
+            let parts = sqlite_test_parts(&base, run_base.clone(), Arc::new(ToolRegistry::new()));
+            hub().install_parts(parts.clone());
+
+            match role.as_ref() {
+                "seed" => {
+                    std::fs::create_dir_all(base.join("services")).unwrap();
+                    let source = base.join("services/worker.ts");
+                    std::fs::write(
+                        &source,
+                        r#"export async function agent() {
+                            await chidori.signal("hold");
+                            return { done: true };
+                        }"#,
+                    )
+                    .unwrap();
+                    let options = SpawnOptions {
+                        name: Some(agent_name.clone()),
+                        restart: "never".to_string(),
+                        max_restarts: 0,
+                        backoff_ms: 0,
+                        model: None,
+                    };
+                    hub()
+                        .spawn(
+                            &parts,
+                            source.to_str().unwrap(),
+                            json!({}),
+                            &options,
+                            "cross-process-inbox-test".to_string(),
+                        )
+                        .unwrap();
+                    wait_for_agent_status(&parts, &agent_name, |status| status == "hibernating");
+                }
+                "send" => {
+                    let id = std::env::var("CHIDORI_TEST_CROSS_PROCESS_INBOX_ID").unwrap();
+                    let result = hub()
+                        .send(
+                            &parts,
+                            &agent_name,
+                            "tick",
+                            json!({ "id": id }),
+                            json!({ "test": true }),
+                        )
+                        .unwrap();
+                    assert_eq!(result["delivered"], json!(true));
+                }
+                "inspect" => {
+                    let expected: std::collections::HashSet<_> =
+                        std::env::var("CHIDORI_TEST_CROSS_PROCESS_INBOX_IDS")
+                            .unwrap()
+                            .split(',')
+                            .map(str::to_string)
+                            .collect();
+                    let factory = RunStoreFactory::shared(&run_base);
+                    let registry = factory.registry_get(&agent_name).unwrap().unwrap();
+                    let run_id = registry["run_id"].as_str().unwrap();
+                    let store = factory.store_for(run_id);
+                    let records = store.load_call_log().unwrap().unwrap_or_default();
+                    let inbox: Vec<QueuedSignal> = store
+                        .get_blob(SIGNAL_INBOX_FILE)
+                        .unwrap()
+                        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                        .unwrap_or_default();
+                    assert!(
+                        records.iter().all(|record| record.function != "signal"),
+                        "mismatched listen name unexpectedly consumed a message: {records:#?}"
+                    );
+                    let actual: Vec<_> = inbox
+                        .iter()
+                        .map(|queued| queued.payload["id"].as_str().unwrap().to_string())
+                        .collect();
+                    let actual_set: std::collections::HashSet<_> = actual.iter().cloned().collect();
+                    if actual.len() != actual_set.len() || actual_set != expected {
+                        let missing: Vec<_> = expected.difference(&actual_set).cloned().collect();
+                        let unexpected: Vec<_> =
+                            actual_set.difference(&expected).cloned().collect();
+                        std::fs::write(
+                            base.join("inbox-inspector-red.txt"),
+                            format!(
+                                "expected={expected:?}; actual={actual:?}; missing={missing:?}; unexpected={unexpected:?}"
+                            ),
+                        )
+                        .unwrap();
+                        std::process::exit(17);
+                    }
+                }
+                _ => panic!("unknown cross-process inbox child role: {role}"),
+            }
+            return;
+        }
+
+        async fn child(
+            base: &Path,
+            agent: &str,
+            role: &str,
+            ids: &str,
+            backend: &str,
+        ) -> std::process::Child {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("runtime::host_agent::tests::detached_inbox_cross_process_writers_preserve_acknowledged_payloads")
+                .arg("--nocapture")
+                .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_CHILD", role)
+                .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_BASE", base)
+                .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_AGENT", agent)
+                .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_IDS", ids)
+                .env("CHIDORI_RUN_STORE", backend)
+                .env("CHIDORI_RUN_DB", base.join("runs.sqlite3"));
+            if role == "send" {
+                command.env("CHIDORI_TEST_CROSS_PROCESS_INBOX_ID", ids);
+            }
+            command.spawn().unwrap()
+        }
+
+        async fn wait_child(child: std::process::Child, role: &str) {
+            let status = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+                .await
+                .unwrap();
+            assert!(
+                status.status.success(),
+                "cross-process inbox {role} child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+
+        let mut red_failures = Vec::new();
+        for backend in ["fs", "sqlite"] {
+            let base = tempfile::tempdir().unwrap();
+            let sequential_agent = unique("cross-process-sequential");
+            wait_child(
+                child(base.path(), &sequential_agent, "seed", "", backend).await,
+                "seed",
+            )
+            .await;
+            for id in ["sequential-a", "sequential-b"] {
+                wait_child(
+                    child(base.path(), &sequential_agent, "send", id, backend).await,
+                    "sequential send",
+                )
+                .await;
+            }
+            wait_child(
+                child(
+                    base.path(),
+                    &sequential_agent,
+                    "inspect",
+                    "sequential-a,sequential-b",
+                    backend,
+                )
+                .await,
+                "sequential inspect",
+            )
+            .await;
+
+            let concurrent_agent = unique("cross-process-concurrent");
+            wait_child(
+                child(base.path(), &concurrent_agent, "seed", "", backend).await,
+                "seed",
+            )
+            .await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let gate = listener.local_addr().unwrap().to_string();
+            let mut writers = Vec::new();
+            for (role, id) in [("writer-a", "concurrent-a"), ("writer-b", "concurrent-b")] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .arg("--exact")
+                    .arg(TEST_NAME)
+                    .arg("--nocapture")
+                    .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_CHILD", "send")
+                    .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_BASE", base.path())
+                    .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_AGENT", &concurrent_agent)
+                    .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_ID", id)
+                    .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_ROLE", role)
+                    .env("CHIDORI_TEST_CROSS_PROCESS_INBOX_GATE", &gate)
+                    .env("CHIDORI_RUN_STORE", backend)
+                    .env("CHIDORI_RUN_DB", base.path().join("runs.sqlite3"));
+                writers.push(command.spawn().unwrap());
+            }
+
+            let mut arrivals = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                        .await
+                        .expect("writer did not reach the post-read gate")
+                        .unwrap();
+                let mut role = [0];
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut role),
+                )
+                .await
+                .expect("writer role announcement timed out")
+                .unwrap();
+                arrivals.push((stream, role[0]));
+            }
+            arrivals.sort_by_key(|(_, role)| *role);
+            assert_eq!(
+                arrivals.iter().map(|(_, role)| *role).collect::<Vec<_>>(),
+                vec![b'a', b'b']
+            );
+            for (mut stream, _) in arrivals {
+                tokio::io::AsyncWriteExt::write_all(&mut stream, b"G")
+                    .await
+                    .unwrap();
+            }
+            for writer in writers {
+                let result =
+                    tokio::task::spawn_blocking(move || writer.wait_with_output().unwrap())
+                        .await
+                        .unwrap();
+                assert!(
+                    result.status.success(),
+                    "cross-process writer did not acknowledge delivery: stdout={} stderr={}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+
+            let inspect = child(
+                base.path(),
+                &concurrent_agent,
+                "inspect",
+                "concurrent-a,concurrent-b",
+                backend,
+            )
+            .await;
+            let result = tokio::task::spawn_blocking(move || inspect.wait_with_output().unwrap())
+                .await
+                .unwrap();
+            if !result.status.success() {
+                assert!(
+                    result.status.code() == Some(17),
+                    "unexpected inspector failure for {backend}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                red_failures.push(format!(
+                    "{backend}: inspector found missing or duplicate acknowledged IDs (exit 17): {}",
+                    std::fs::read_to_string(base.path().join("inbox-inspector-red.txt"))
+                        .unwrap()
+                ));
+            }
+        }
+        assert!(
+            red_failures.is_empty(),
+            "acknowledged inbox payloads were lost:\n{}",
+            red_failures.join("\n")
+        );
     }
 
     #[test]
