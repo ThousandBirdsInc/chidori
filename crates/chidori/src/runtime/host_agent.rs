@@ -2091,6 +2091,239 @@ mod tests {
     }
 
     #[test]
+    fn detached_alarm_timeout_wakes_reconcile_host_promises_across_cycles() {
+        const CHILD: &str = "CHIDORI_TEST_DETACHED_ALARM_RECOVERY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let base = PathBuf::from(std::env::var_os("CHIDORI_TEST_DETACHED_ALARM_BASE").unwrap());
+            let no_alarm = run_paced_alarm_case(&base, "no-alarm", false);
+            assert_eq!(
+                no_alarm.status, "completed",
+                "no-alarm control: {no_alarm:?}"
+            );
+            assert_eq!(no_alarm.output, Some(json!({ "seen": [0, 1, 2] })));
+            assert!(
+                no_alarm.promise_load.is_ok(),
+                "no-alarm control: {no_alarm:?}"
+            );
+            assert!(no_alarm
+                .records
+                .iter()
+                .all(|record| record.args["name"] != json!(ALARM_SIGNAL_NAME)));
+            println!(
+                "backend={} paced no-alarm control passed (3 cycles)",
+                std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string())
+            );
+
+            let with_alarm = run_paced_alarm_case(&base, "with-alarm", true);
+            println!("backend={} paced alarm observation: status={}, error={:?}, journal_rows={}, promise_load={:?}",
+                std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string()),
+                with_alarm.status,
+                with_alarm.error,
+                with_alarm.records.len(),
+                with_alarm.promise_load.as_ref().map(|records| records.len()).map_err(|error| error.clone()));
+            assert_eq!(
+                with_alarm.status,
+                "completed",
+                "three alarm timeouts must resume through all cycles and durably reconcile each completion: {with_alarm:?}"
+            );
+            assert_eq!(with_alarm.output, Some(json!({ "seen": [0, 1, 2] })));
+            let promises = with_alarm.promise_load.as_ref().unwrap();
+            let timeout_rows: Vec<_> = with_alarm
+                .records
+                .iter()
+                .filter(|record| {
+                    record.function == "signal"
+                        && record.args["name"] == json!(ALARM_SIGNAL_NAME)
+                        && record.result["timedOut"] == json!(true)
+                })
+                .collect();
+            assert_eq!(timeout_rows.len(), 3, "{with_alarm:?}");
+            for timeout in timeout_rows {
+                let promise = promises
+                    .iter()
+                    .find(|promise| promise.operation.seq == timeout.seq)
+                    .expect("durable promise for each timeout journal row");
+                assert!(
+                    matches!(
+                        &promise.state,
+                        crate::runtime::snapshot::HostPromiseState::Resolved { .. }
+                            | crate::runtime::snapshot::HostPromiseState::ResolvedInJournal { .. }
+                    ),
+                    "timeout at seq {} was not persisted as completed: {promise:?}",
+                    timeout.seq
+                );
+            }
+            return;
+        }
+
+        let mut failures = Vec::new();
+        for backend in ["fs", "sqlite"] {
+            let base = test_dir(&format!("detached-alarm-{backend}"));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("runtime::host_agent::tests::detached_alarm_timeout_wakes_reconcile_host_promises_across_cycles")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env("CHIDORI_TEST_DETACHED_ALARM_BASE", &base)
+                .env("CHIDORI_RUN_STORE", backend)
+                .env("CHIDORI_RUN_DB", base.join("runs.sqlite3"))
+                .output()
+                .unwrap();
+            let report = format!(
+                "detached alarm recovery child backend={backend} exited {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            if !output.status.success() {
+                failures.push(report);
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[derive(Debug)]
+    struct PacedAlarmOutcome {
+        status: String,
+        error: Option<String>,
+        output: Option<Value>,
+        records: Vec<CallRecord>,
+        promise_load: Result<Vec<crate::runtime::snapshot::HostPromiseRecord>, String>,
+    }
+
+    fn run_paced_alarm_case(base: &Path, case: &str, with_alarm: bool) -> PacedAlarmOutcome {
+        let project = base.join(case);
+        std::fs::create_dir_all(project.join("services")).unwrap();
+        let source = project.join("services/worker.ts");
+        std::fs::write(
+            &source,
+            r#"export async function agent(input: { cycles: number; withAlarm: boolean }) {
+                const seen = [];
+                for (let i = 0; i < input.cycles; i++) {
+                    const message = await chidori.signal("tick");
+                    seen.push(message.payload.n);
+                    if (input.withAlarm) await chidori.alarm(10);
+                    await chidori.log("cycle", { n: message.payload.n });
+                }
+                return { seen };
+            }"#,
+        )
+        .unwrap();
+
+        let run_base = project.join(".chidori/runs");
+        let parts = sqlite_test_parts(&project, run_base.clone(), Arc::new(ToolRegistry::new()));
+        hub().install_parts(parts.clone());
+        let name = unique(if with_alarm {
+            "paced-alarm"
+        } else {
+            "paced-no-alarm"
+        });
+        let options = SpawnOptions {
+            name: Some(name.clone()),
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            model: None,
+        };
+        let spawned = hub()
+            .spawn(
+                &parts,
+                source.to_str().unwrap(),
+                json!({ "cycles": 3, "withAlarm": with_alarm }),
+                &options,
+                format!("{case}-parent"),
+            )
+            .unwrap();
+        let run_id = spawned["runId"].as_str().unwrap().to_string();
+        let mut descriptor = wait_for_agent_descriptor(&parts, &name, |descriptor| {
+            descriptor.status == "hibernating"
+                && descriptor
+                    .listen
+                    .as_ref()
+                    .is_some_and(|listen| listen.names.iter().any(|name| name == "tick"))
+        });
+
+        for tick in 0..3 {
+            let previous_seq = descriptor
+                .listen
+                .as_ref()
+                .expect("paced worker is hibernating on a listen")
+                .seq;
+            let delivery = hub()
+                .send(
+                    &parts,
+                    &name,
+                    "tick",
+                    json!({ "n": tick }),
+                    json!({ "kind": "test", "id": case }),
+                )
+                .unwrap();
+            assert_eq!(delivery["delivered"], json!(true));
+            descriptor = wait_for_agent_descriptor(&parts, &name, |current| {
+                matches!(current.status.as_str(), "failed" | "completed")
+                    || (current.status == "hibernating"
+                        && current.listen.as_ref().is_some_and(|listen| {
+                            listen.names.iter().any(|name| name == "tick")
+                                && listen.seq > previous_seq
+                        }))
+            });
+            if matches!(descriptor.status.as_str(), "failed" | "completed") {
+                break;
+            }
+        }
+
+        if !matches!(
+            descriptor.status.as_str(),
+            "failed" | "completed" | "stopped"
+        ) {
+            let _ = hub().stop(&parts, &name);
+            descriptor = wait_for_agent_descriptor(&parts, &name, |current| {
+                matches!(current.status.as_str(), "failed" | "completed" | "stopped")
+            });
+        }
+
+        let factory = RunStoreFactory::shared(&run_base);
+        let store = factory.store_for(&run_id);
+        let records = store.load_call_log().unwrap().unwrap_or_default();
+        let promise_load = crate::runtime::snapshot::load_host_promise_records(store.as_ref())
+            .map_err(|error| format!("{error:#}"));
+        PacedAlarmOutcome {
+            status: descriptor.status,
+            error: descriptor.error,
+            output: descriptor.output,
+            records,
+            promise_load,
+        }
+    }
+
+    fn wait_for_agent_descriptor(
+        parts: &AgentRuntimeParts,
+        name: &str,
+        predicate: impl Fn(&AgentDescriptor) -> bool,
+    ) -> AgentDescriptor {
+        let entry = hub().ensure_entry(parts, name).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut state = entry.state.lock().unwrap();
+        loop {
+            if predicate(&state.descriptor) {
+                return state.descriptor.clone();
+            }
+            let now = std::time::Instant::now();
+            assert!(
+                now < deadline,
+                "timed out waiting for {name}: {:?}",
+                state.descriptor
+            );
+            let (next, _) = entry
+                .signal
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+        }
+    }
+
+    #[test]
     fn explicit_sqlite_failure_rejects_detached_spawn_rearm_send_and_alarm_wake_before_effects() {
         const CHILD: &str = "CHIDORI_TEST_AGENT_SQLITE_CHILD";
         if std::env::var_os(CHILD).is_some() {
