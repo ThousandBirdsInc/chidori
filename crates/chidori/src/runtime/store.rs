@@ -444,6 +444,93 @@ impl FsRunStore {
         self.write_file_atomic_from(path, &tmp, bytes, true)
     }
 
+    /// Create blob parent directories and, when filesystem writes are durable,
+    /// sync the directory that contains each newly created directory entry.
+    /// `missing` is collected leaf-first so the parent containing the deepest
+    /// new entry is synced before its own parent entry.
+    fn create_blob_parent_dirs(&self, parent: &Path) -> Result<()> {
+        if !self.fsync_writes {
+            #[cfg(test)]
+            let parent_was_missing = !parent.exists();
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+            #[cfg(test)]
+            if parent_was_missing {
+                self.record_blob_write_event(BlobWriteEvent::TargetParentCreated(
+                    parent.to_path_buf(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let mut missing = Vec::new();
+        let mut cursor = parent.to_path_buf();
+        loop {
+            match std::fs::metadata(&cursor) {
+                Ok(metadata) if metadata.is_dir() => break,
+                Ok(_) => anyhow::bail!("blob parent {} is not a directory", cursor.display()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(cursor.clone());
+                    cursor = cursor
+                        .parent()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "no existing ancestor for blob parent {}",
+                                parent.display()
+                            )
+                        })?
+                        .to_path_buf();
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("checking blob parent directory {}", cursor.display())
+                    });
+                }
+            }
+        }
+
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        #[cfg(test)]
+        if missing.iter().any(|created| created == parent) {
+            self.record_blob_write_event(BlobWriteEvent::TargetParentCreated(parent.to_path_buf()));
+        }
+
+        for created in missing {
+            if let Some(containing_dir) = created.parent() {
+                self.sync_blob_directory(containing_dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sync a directory entry update. Unix platforms support opening and
+    /// syncing directory descriptors through the standard filesystem API;
+    /// on other platforms durable blob writes fail explicitly instead of
+    /// claiming the rename is durable without a directory-sync primitive.
+    fn sync_blob_directory(&self, directory: &Path) -> Result<()> {
+        #[cfg(test)]
+        self.before_blob_directory_sync(directory)?;
+
+        #[cfg(unix)]
+        {
+            std::fs::File::open(directory)
+                .with_context(|| format!("opening directory for sync {}", directory.display()))?
+                .sync_all()
+                .with_context(|| format!("syncing directory {}", directory.display()))?;
+        }
+
+        #[cfg(not(unix))]
+        anyhow::bail!(
+            "directory sync for durable filesystem blob writes is unsupported on this platform: {}",
+            directory.display()
+        );
+
+        #[cfg(all(test, unix))]
+        self.after_blob_directory_sync(directory);
+        Ok(())
+    }
+
     fn write_file_atomic_from(
         &self,
         path: &Path,
@@ -451,17 +538,12 @@ impl FsRunStore {
         bytes: &[u8],
         exclusive_temp: bool,
     ) -> Result<()> {
-        #[cfg(test)]
-        let target_parent_was_missing =
-            exclusive_temp && path.parent().is_some_and(|parent| !parent.exists());
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-            #[cfg(test)]
-            if target_parent_was_missing {
-                self.record_blob_write_event(BlobWriteEvent::TargetParentCreated(
-                    parent.to_path_buf(),
-                ));
+            if exclusive_temp {
+                self.create_blob_parent_dirs(parent)?;
+            } else {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
             }
         }
         if let Some(parent) = tmp.parent() {
@@ -500,6 +582,10 @@ impl FsRunStore {
             #[cfg(test)]
             if exclusive_temp {
                 self.record_blob_write_event(BlobWriteEvent::Renamed);
+            }
+            if exclusive_temp && self.fsync_writes {
+                let target_parent = path.parent().expect("blob path has a parent");
+                self.sync_blob_directory(target_parent)?;
             }
             Ok(())
         })();
@@ -2658,6 +2744,66 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    #[test]
+    fn fs_host_promise_blob_besteffort_skips_directory_sync_barriers() {
+        let fixture = tempfile::tempdir().unwrap();
+        let run_dir = fixture.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let store = FsRunStore::new_for_test(&run_dir, DurabilityMode::BestEffort);
+
+        store
+            .put_blob("host_promises/2.json", br#"{"state":"pending"}"#)
+            .unwrap();
+
+        let events = store.blob_write_events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                BlobWriteEvent::TargetParentCreated(run_dir.join("host_promises")),
+                BlobWriteEvent::TempFileWritten,
+                BlobWriteEvent::Renamed,
+            ]
+        );
+    }
+
+    #[test]
+    fn tee_fs_primary_propagates_blob_directory_sync_failure() {
+        let fixture = tempfile::tempdir().unwrap();
+        let primary_dir = fixture.path().join("primary");
+        let secondary_dir = fixture.path().join("secondary");
+        let key = "host_promises/2.json";
+        let prior = br#"{"state":"pending"}"#;
+        let replacement = br#"{"state":"resolved"}"#;
+        let primary = FsRunStore::new_for_test(&primary_dir, DurabilityMode::Strict);
+        let secondary = FsRunStore::new_for_test(&secondary_dir, DurabilityMode::Strict);
+        primary.put_blob(key, prior).unwrap();
+        secondary.put_blob(key, prior).unwrap();
+        *primary.fail_blob_directory_sync.lock().unwrap() = Some(primary_dir.join("host_promises"));
+        let tee = TeeRunStore::new(primary, Arc::new(secondary));
+
+        let result = tee.put_blob(key, replacement);
+        assert!(
+            result.is_err(),
+            "Tee must propagate primary directory-sync failure"
+        );
+        assert_eq!(
+            FsRunStore::new_for_test(&primary_dir, DurabilityMode::Strict)
+                .get_blob(key)
+                .unwrap()
+                .as_deref(),
+            Some(replacement.as_slice()),
+            "rename may expose the complete replacement before directory sync fails"
+        );
+        assert_eq!(
+            FsRunStore::new_for_test(&secondary_dir, DurabilityMode::Strict)
+                .get_blob(key)
+                .unwrap()
+                .as_deref(),
+            Some(prior.as_slice()),
+            "Tee must stop after the primary reports failure"
+        );
     }
 
     /// Replacing a per-operation host-promise must not expose a partial file
