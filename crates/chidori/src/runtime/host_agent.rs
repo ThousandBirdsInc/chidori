@@ -1597,6 +1597,189 @@ mod tests {
     use crate::runtime::store::RunStoreFactory;
     use crate::tools::ToolRegistry;
 
+    fn sqlite_test_parts(base: &Path, run_base: PathBuf) -> AgentRuntimeParts {
+        AgentRuntimeParts {
+            providers: Arc::new(ProviderRegistry::new()),
+            template_engine: Arc::new(TemplateEngine::new(base)),
+            tokio_rt: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            policy: Arc::new(PolicyConfig::default()),
+            tools: Arc::new(ToolRegistry::new()),
+            mcp: Arc::new(McpManager::new()),
+            run_base,
+        }
+    }
+
+    #[test]
+    fn explicit_sqlite_failure_rejects_hub_registry_spawn_rearm_and_wake() {
+        const CHILD: &str = "CHIDORI_TEST_AGENT_SQLITE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let base = PathBuf::from(std::env::var_os("CHIDORI_TEST_AGENT_BASE").unwrap());
+            let db_path = std::env::var("CHIDORI_RUN_DB").unwrap();
+            let source = base.join("agent.ts");
+            std::fs::write(&source, "export async function agent() { return {}; }").unwrap();
+            let list_base = base.join("list-runs");
+            let spawn_base = base.join("spawn-runs");
+            let wake_base = base.join("wake-runs");
+            let rearm_base = base.join("rearm-runs");
+            let list_parts = sqlite_test_parts(&base, list_base.clone());
+            let spawn_parts = sqlite_test_parts(&base, spawn_base.clone());
+            let wake_parts = sqlite_test_parts(&base, wake_base.clone());
+            let rearm_parts = sqlite_test_parts(&base, rearm_base.clone());
+
+            let list_result = hub().list(&list_parts);
+
+            let spawn_name = "sqlite-red-spawn";
+            let spawn_result = hub().spawn(
+                &spawn_parts,
+                source.to_str().unwrap(),
+                json!({}),
+                &SpawnOptions {
+                    name: Some(spawn_name.to_string()),
+                    restart: "never".to_string(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    model: None,
+                },
+                "owner-run".to_string(),
+            );
+
+            let wake_name = "sqlite-red-wake";
+            write_registry_fixture(&wake_base, wake_name, "wake-agent", &source, "hibernating");
+            let wake_rearm = hub().rearm_from_registry(wake_parts.clone());
+            let wake_result = hub().send(
+                &wake_parts,
+                wake_name,
+                "wake",
+                json!({"payload": true}),
+                json!({"from": "test"}),
+            );
+
+            let rearm_name = "sqlite-red-rearm";
+            write_registry_fixture(&rearm_base, rearm_name, "rearm-agent", &source, "running");
+            let rearm_result = hub().rearm_from_registry(rearm_parts.clone());
+
+            // Let any vulnerable path settle and stop/join fixture workers
+            // before making the final assertions, so a Red failure leaves no
+            // worker active in the test process.
+            for (parts, name) in [
+                (&spawn_parts, spawn_name),
+                (&wake_parts, wake_name),
+                (&rearm_parts, rearm_name),
+            ] {
+                if hub().entries.lock().unwrap().contains_key(name) {
+                    let _ = hub().stop(parts, name);
+                }
+            }
+
+            let spawn_registry_written = spawn_base
+                .join("agents")
+                .join(format!("{spawn_name}.json"))
+                .exists();
+            let wake_inbox_written = wake_base
+                .join("wake-agent")
+                .join("signals")
+                .join("inbox.json")
+                .exists();
+            let spawn_entry_installed = hub().entries.lock().unwrap().contains_key(spawn_name);
+            let wake_entry_installed = hub().entries.lock().unwrap().contains_key(wake_name);
+            let rearm_entry_installed = hub().entries.lock().unwrap().contains_key(rearm_name);
+
+            let errors = [
+                list_result.err(),
+                spawn_result.err(),
+                wake_result.err(),
+                wake_rearm.err(),
+                rearm_result.err(),
+            ];
+            let error_text = errors
+                .iter()
+                .filter_map(|error| error.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                errors.iter().all(Option::is_some)
+                    && error_text.contains(&db_path)
+                    && error_text.to_lowercase().contains("unable to open database file"),
+                "hub operations did not propagate invalid SQLite before registry/spawn/rearm/wake; observed errors={errors:?}, spawn_registry_written={spawn_registry_written}, wake_inbox_written={wake_inbox_written}, entries=[{spawn_entry_installed}, {wake_entry_installed}, {rearm_entry_installed}]"
+            );
+            assert!(
+                !spawn_registry_written && !wake_inbox_written,
+                "invalid SQLite mutated a detached-agent registry or mailbox"
+            );
+            assert!(
+                !spawn_entry_installed && !wake_entry_installed && !rearm_entry_installed,
+                "invalid SQLite installed an agent entry or started a supervision path"
+            );
+            return;
+        }
+
+        let base = test_dir("sqlite-factory-paths");
+        let db_path = base.join("sqlite-db-is-a-directory");
+        std::fs::create_dir_all(&db_path).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::host_agent::tests::explicit_sqlite_failure_rejects_hub_registry_spawn_rearm_and_wake",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CHIDORI_TEST_AGENT_BASE", &base)
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env("CHIDORI_RUN_DB", &db_path)
+            .env("CHIDORI_DURABILITY", "strict")
+            .output()
+            .unwrap();
+        let report = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(&base).ok();
+        assert!(
+            output.status.success(),
+            "isolated detached-agent SQLite assertions failed:\n{report}"
+        );
+    }
+
+    fn write_registry_fixture(
+        run_base: &Path,
+        name: &str,
+        run_id: &str,
+        source: &Path,
+        status: &str,
+    ) {
+        let agents = run_base.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let descriptor = json!({
+            "name": name,
+            "run_id": run_id,
+            "source": source,
+            "input": {},
+            "restart": "never",
+            "max_restarts": 0,
+            "backoff_ms": 0,
+            "owner_run_id": "owner-run",
+            "model": null,
+            "status": status,
+            "listen": if status == "hibernating" {
+                json!({"names": ["wake"], "seq": 1, "function": "signal", "deadline": null})
+            } else {
+                Value::Null
+            },
+            "restarts": 0,
+            "output": null,
+            "error": null,
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+        });
+        let entry = json!({ "name": name, "run_id": run_id, "descriptor": descriptor });
+        std::fs::write(
+            agents.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&entry).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// A fully-wired runtime backend over `ctx`, with the template engine
     /// anchored at `dir` so relative agent sources resolve — mirroring the
     /// host_actor test harness, plus persistence (detached agents are

@@ -177,6 +177,146 @@ async fn response_json(response: Response) -> (StatusCode, Value) {
     (status, value)
 }
 
+#[tokio::test]
+async fn explicit_sqlite_failure_rejects_direct_server_store_operations_before_mutation() {
+    const CHILD: &str = "CHIDORI_TEST_SERVER_SQLITE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let base = PathBuf::from(std::env::var_os("CHIDORI_TEST_SERVER_BASE").unwrap());
+        let run_base = base.join(".chidori").join("runs");
+        let db_path = std::env::var("CHIDORI_RUN_DB").unwrap();
+        let run_id = "paused-run";
+        let agent_path = base.join("agent.ts");
+        let state = test_state(run_base.clone(), agent_path);
+        let run_dir = run_base.join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        state
+            .session_store
+            .put(&StoredSession {
+                id: "session-1".to_string(),
+                run_id: Some(run_id.to_string()),
+                status: SessionStatus::Running,
+                input: json!({}),
+                output: None,
+                call_log: Vec::new(),
+                error: None,
+                pending_seq: None,
+                pending_prompt: None,
+                pending_details: None,
+                pending_signal_name: None,
+                pending_signal_names: Vec::new(),
+                pending_signal_deadline: None,
+                pending_approval: None,
+                approvals: Vec::new(),
+                policy_profile: None,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        // This direct helper bypasses `serve`'s already-covered startup guard.
+        let lease_result = acquire_run_lease(&state, Some(run_id));
+        let lease_was_acquired = matches!(lease_result, Ok(Some(_)));
+        drop(lease_result);
+        let lease_path = run_dir.join(crate::runtime::store::LEASE_FILE);
+        let lease_file_remains = lease_path.exists();
+
+        let (signal_status, signal_body) = response_json(
+            sessions::resume::signal_session(
+                State(state.clone()),
+                Path("session-1".to_string()),
+                Json(sessions::resume::SignalRequest {
+                    allow_source_change: false,
+                    name: "wake".to_string(),
+                    payload: json!({"value": 1}),
+                    from: json!({"id": "test"}),
+                }),
+            )
+            .await,
+        )
+        .await;
+        let inbox_path = run_dir.join("signals").join("inbox.json");
+        let inbox_was_written = inbox_path.exists();
+
+        let (holdings_status, holdings_body) = response_json(
+            sessions::get_holdings(State(state), Path("session-1".to_string())).await,
+        )
+        .await;
+
+        assert!(
+            !lease_was_acquired && !lease_file_remains,
+            "server acquired a filesystem lease before reporting invalid SQLite `{db_path}`"
+        );
+        assert_eq!(
+            signal_status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "signal route used filesystem fallback instead of rejecting SQLite init: {signal_body}"
+        );
+        assert!(
+            signal_body["error"].as_str().is_some_and(|error| {
+                error.contains(&db_path)
+                    && error
+                        .to_lowercase()
+                        .contains("unable to open database file")
+            }),
+            "signal route must include SQLite path and cause: {signal_body}"
+        );
+        assert!(
+            !inbox_was_written,
+            "signal route wrote inbox under invalid SQLite"
+        );
+        assert_eq!(
+            holdings_status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "holdings route read the filesystem fallback: {holdings_body}"
+        );
+        assert!(
+            holdings_body["error"].as_str().is_some_and(|error| {
+                error.contains(&db_path)
+                    && error
+                        .to_lowercase()
+                        .contains("unable to open database file")
+            }),
+            "holdings route must include SQLite path and cause: {holdings_body}"
+        );
+        return;
+    }
+
+    let base = test_run_base("server-sqlite-direct-store");
+    let agent_path = base.join("agent.ts");
+    std::fs::write(&agent_path, "export async function agent() { return {}; }").unwrap();
+    let db_path = base.join("sqlite-db-is-a-directory");
+    std::fs::create_dir_all(&db_path).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "server::tests::explicit_sqlite_failure_rejects_direct_server_store_operations_before_mutation",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("CHIDORI_TEST_SERVER_BASE", &base)
+        .env("CHIDORI_RUN_STORE", "sqlite")
+        .env("CHIDORI_RUN_DB", &db_path)
+        .env("CHIDORI_DURABILITY", "strict")
+        .output()
+        .unwrap();
+    let report = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inbox_written = base
+        .join(".chidori")
+        .join("runs")
+        .join("paused-run")
+        .join("signals")
+        .join("inbox.json")
+        .exists();
+    std::fs::remove_dir_all(&base).ok();
+    assert!(
+        output.status.success(),
+        "isolated direct server store assertions failed (inbox_written={inbox_written}):\n{report}"
+    );
+}
+
 #[test]
 fn stamp_attempt_adds_attempt_number_to_object_events() {
     let stamped = stamp_attempt(json!({"stream_id": "s1"}), Some(42));
