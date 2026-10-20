@@ -1756,6 +1756,7 @@ fn cli_resume_refuses_held_sqlite_tenure_before_effect_or_journal_mutation() {
     let process_status_after = output.status;
     let stdout_after = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr_after = String::from_utf8_lossy(&output.stderr).into_owned();
+    let diagnostic_after = format!("{stdout_after}\n{stderr_after}");
     let journal_after = fs::read(&fixture.records_path).unwrap();
     let lease_after = store.get_blob("lease.json").unwrap().unwrap();
     let contender_result = acquire_lease_with_token(
@@ -1789,7 +1790,15 @@ fn cli_resume_refuses_held_sqlite_tenure_before_effect_or_journal_mutation() {
         ));
     }
     if process_status_after.success() {
-        observed.push("resume subprocess unexpectedly succeeded".to_string());
+        observed.push(format!(
+            "resume continued instead of rejecting the held tenure (exit status: {process_status_after})"
+        ));
+    }
+    if !diagnostic_after.contains("external-sqlite-holder") {
+        observed.push(
+            "resume output did not identify the external held-lease owner; this may be an unrelated CLI failure"
+                .to_string(),
+        );
     }
     if journal_after != journal_before {
         observed.push("local journal bytes changed".to_string());
@@ -1802,7 +1811,7 @@ fn cli_resume_refuses_held_sqlite_tenure_before_effect_or_journal_mutation() {
     }
     assert!(
         observed.is_empty(),
-        "held SQLite tenure must reject resume without effects or mutations: {}; status={process_status_after}; stdout:\n{stdout_after}\nstderr:\n{stderr_after}",
+        "held SQLite tenure must reject resume with the holder identified before effects or mutations: {}; status={process_status_after}; stdout:\n{stdout_after}\nstderr:\n{stderr_after}",
         observed.join("; ")
     );
     // Once the external tenure is released, the same command must resume the
