@@ -1846,7 +1846,7 @@ fn cli_resume_refuses_held_sqlite_tenure_before_effect_or_journal_mutation() {
 
 #[test]
 fn cli_resume_refuses_competing_filesystem_lease() {
-    use chidori::runtime::store::acquire_lease;
+    use chidori::runtime::store::{acquire_lease, release_lease};
 
     let server = LocalHttpServer::start();
     let fixture = create_http_replay_fixture(&server);
@@ -1882,25 +1882,51 @@ fn cli_resume_refuses_competing_filesystem_lease() {
         .output()
         .unwrap();
 
+    let request_count_after = server.request_count();
+    let process_status_after = output.status;
+    let diagnostic_after = output_diagnostic(&output);
+    let journal_after = fs::read(&fixture.records_path).unwrap();
+    let lease_after = store.get_blob("lease.json").unwrap().unwrap();
+
+    // Release before checking the Red/control assertions so a failure cannot
+    // leave a known filesystem lease behind in this temporary run.
+    release_lease(store.as_ref(), &held.owner).unwrap();
+
     assert_eq!(
-        server.request_count(),
-        1,
-        "filesystem lease control must reject before the unjournaled HTTP effect"
+        request_count_after, 1,
+        "a sequential contender must not execute the unjournaled HTTP effect; stderr/stdout:\n{diagnostic_after}"
     );
-    assert_failure(&output);
     assert!(
-        output_diagnostic(&output).contains("external-fs-holder"),
-        "filesystem control should identify the competing holder; output:\n{}",
-        output_diagnostic(&output)
+        !process_status_after.success(),
+        "resume must refuse the known unexpired filesystem holder; output:\n{diagnostic_after}"
     );
-    assert_eq!(fs::read(&fixture.records_path).unwrap(), journal_before);
-    assert_eq!(store.get_blob("lease.json").unwrap().unwrap(), lease_before);
+    assert!(
+        diagnostic_after.contains("external-fs-holder"),
+        "filesystem control should identify the competing holder; output:\n{diagnostic_after}"
+    );
+    assert_eq!(journal_after, journal_before);
+    assert_eq!(lease_after, lease_before);
     assert_eq!(held.owner, "external-fs-holder");
     assert_eq!(
         store.load_call_log().unwrap().unwrap().len(),
         1,
         "refused filesystem resume must not repair the removed HTTP row"
     );
+
+    let retry = resume_http_fixture(&fixture, &[]);
+    assert_eq!(server.request_count(), 2);
+    assert_success(&retry);
+    assert!(journal_records(&fixture.records_path)
+        .iter()
+        .any(|record| record["seq"] == 2 && record["function"] == "http"));
+    let reacquired = acquire_lease(
+        store.as_ref(),
+        "post-filesystem-resume-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap()
+    .expect("the sequential filesystem resume leg must release its lease");
+    release_lease(store.as_ref(), &reacquired.owner).unwrap();
 }
 
 #[test]
