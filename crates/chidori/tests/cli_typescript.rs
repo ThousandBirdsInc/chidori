@@ -1750,40 +1750,61 @@ fn cli_resume_refuses_held_sqlite_tenure_before_effect_or_journal_mutation() {
             ("CHIDORI_RUN_DB", &db_path),
         ],
     );
-
-    // Check the externally visible effect first: vulnerable tokenless resume
-    // warns and continues, so this becomes 2 instead of staying at 1.
-    assert_eq!(
-        server.request_count(),
-        1,
-        "resume must stand down before issuing the unjournaled HTTP effect"
-    );
-    assert_failure(&output);
-    assert_eq!(
-        fs::read(&fixture.records_path).unwrap(),
-        journal_before,
-        "a rejected resume must leave the local journal byte-identical"
-    );
-    assert_eq!(
-        store.get_blob("lease.json").unwrap().unwrap(),
-        lease_before,
-        "a rejected resume must preserve the external SQLite tenure"
-    );
-    let contender = acquire_lease_with_token(
+    // Capture every oracle before asserting, so a recovered journal row or a
+    // successful status cannot hide another sign of the lease bypass.
+    let request_count_after = server.request_count();
+    let process_status_after = output.status;
+    let stdout_after = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr_after = String::from_utf8_lossy(&output.stderr).into_owned();
+    let journal_after = fs::read(&fixture.records_path).unwrap();
+    let lease_after = store.get_blob("lease.json").unwrap().unwrap();
+    let contender_result = acquire_lease_with_token(
         store.as_ref(),
         "verification-contender",
         chrono::Duration::minutes(1),
     )
     .unwrap();
-    assert_eq!(
-        contender
-            .expect_err("external tenure must remain held")
-            .owner,
-        "external-sqlite-holder"
-    );
+    let contender_blocked = match contender_result {
+        Err(_) => true,
+        Ok(contender_lease) => {
+            chidori::runtime::store::release_lease_with_token(
+                store.as_ref(),
+                contender_lease.lease(),
+                contender_lease.token(),
+            )
+            .unwrap();
+            false
+        }
+    };
+
+    // Release before the combined assertion so even the intended Red leaves
+    // no externally held tenure behind during fixture cleanup.
     chidori::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
         .unwrap();
 
+    let mut observed = Vec::new();
+    if request_count_after != 1 {
+        observed.push(format!(
+            "HTTP request count was {request_count_after}, expected 1"
+        ));
+    }
+    if process_status_after.success() {
+        observed.push("resume subprocess unexpectedly succeeded".to_string());
+    }
+    if journal_after != journal_before {
+        observed.push("local journal bytes changed".to_string());
+    }
+    if lease_after != lease_before {
+        observed.push("external lease bytes changed".to_string());
+    }
+    if !contender_blocked {
+        observed.push("a contender acquired while the external tenure was held".to_string());
+    }
+    assert!(
+        observed.is_empty(),
+        "held SQLite tenure must reject resume without effects or mutations: {}; status={process_status_after}; stdout:\n{stdout_after}\nstderr:\n{stderr_after}",
+        observed.join("; ")
+    );
     // Once the external tenure is released, the same command must resume the
     // run successfully. Its own fenced lease must then be available to a new
     // contender, proving the complete CLI leg released the token it acquired.
