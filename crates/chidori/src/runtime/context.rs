@@ -263,6 +263,9 @@ struct RuntimeContextInner {
     /// policy is strict. Checked before the next live host effect executes so
     /// a run cannot keep taking side effects its journal isn't recording.
     pub persist_failure: Option<String>,
+    /// Lease loss is fatal under every durability mode, unlike ordinary
+    /// best-effort artifact write failures.
+    pub lease_failure: Option<String>,
     /// Whether persistence failures poison the run (`CHIDORI_DURABILITY=strict`
     /// or `effect`) or are logged and tolerated (default, the pre-store
     /// behavior).
@@ -600,6 +603,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
+                lease_failure: None,
                 strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
@@ -678,6 +682,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
+                lease_failure: None,
                 strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
@@ -728,6 +733,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
+                lease_failure: None,
                 strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Stdin,
                 pending_input: None,
@@ -786,6 +792,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
+                lease_failure: None,
                 strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: parent_inner.input_mode,
                 pending_input: None,
@@ -845,6 +852,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
+                lease_failure: None,
                 strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Pause,
                 pending_input: None,
@@ -915,6 +923,7 @@ impl RuntimeContext {
                 persist_dir: None,
                 store: None,
                 persist_failure: None,
+                lease_failure: None,
                 strict_durability: crate::runtime::store::latching_durability(),
                 input_mode: InputMode::Pause,
                 pending_input: None,
@@ -1031,7 +1040,11 @@ impl RuntimeContext {
     /// Host dispatch checks this before executing a live effect so a run whose
     /// journal writes are failing stops taking side effects.
     pub fn persist_failure(&self) -> Option<String> {
-        self.inner.lock().unwrap().persist_failure.clone()
+        let inner = self.inner.lock().unwrap();
+        inner
+            .lease_failure
+            .clone()
+            .or_else(|| inner.persist_failure.clone())
     }
 
     /// Durability barrier for the run's store: every buffered write is durable
@@ -1040,12 +1053,19 @@ impl RuntimeContext {
     pub fn flush_store(&self) -> anyhow::Result<()> {
         let (store, failure) = {
             let inner = self.inner.lock().unwrap();
-            (inner.store.clone(), inner.persist_failure.clone())
+            (
+                inner.store.clone(),
+                inner
+                    .lease_failure
+                    .clone()
+                    .or_else(|| inner.persist_failure.clone()),
+            )
         };
         if let Some(failure) = failure {
             anyhow::bail!("durable journal write failed: {failure}");
         }
         if let Some(store) = store {
+            store.check_ownership()?;
             store.flush()?;
         }
         Ok(())
@@ -1932,6 +1952,7 @@ impl RuntimeContext {
     }
 
     pub fn run_host_operation_safepoint(&self, id: HostOperationId) -> anyhow::Result<()> {
+        self.check_run_ownership()?;
         let (safepoint, operation) = {
             let inner = self.inner.lock().unwrap();
             let safepoint = inner.host_operation_safepoint.clone();
@@ -1960,6 +1981,7 @@ impl RuntimeContext {
                 )
             })?;
         }
+        self.check_run_ownership()?;
         Ok(())
     }
 
@@ -1967,6 +1989,7 @@ impl RuntimeContext {
         &self,
         id: HostOperationId,
     ) -> anyhow::Result<()> {
+        self.check_run_ownership()?;
         let (safepoint, record) = {
             let inner = self.inner.lock().unwrap();
             let safepoint = inner.host_operation_completion_safepoint.clone();
@@ -1986,6 +2009,26 @@ impl RuntimeContext {
         // the pre-effect barrier above.
         if crate::runtime::store::effect_barriers() {
             self.flush_store()?;
+        }
+        self.check_run_ownership()?;
+        Ok(())
+    }
+
+    fn check_run_ownership(&self) -> anyhow::Result<()> {
+        let (store, prior_failure) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.store.clone(), inner.lease_failure.clone())
+        };
+        if let Some(failure) = prior_failure {
+            anyhow::bail!("detached run lease ownership lost: {failure}");
+        }
+        let Some(store) = store else {
+            return Ok(());
+        };
+        if let Err(err) = store.check_ownership() {
+            let message = err.to_string();
+            note_persist_result(&mut self.inner.lock().unwrap(), Err(err));
+            anyhow::bail!("detached run lease ownership lost: {message}");
         }
         Ok(())
     }
@@ -2082,7 +2125,19 @@ impl RuntimeContext {
 /// policy logs and continues, preserving the pre-store behavior.
 fn note_persist_result(inner: &mut RuntimeContextInner, result: anyhow::Result<()>) {
     if let Err(err) = result {
-        if inner.strict_durability {
+        let lease_lost = err.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::runtime::store::LeaseLostError>()
+                .is_some()
+        });
+        if lease_lost {
+            if inner.lease_failure.is_none() {
+                inner.lease_failure = Some(err.to_string());
+            }
+            if inner.persist_failure.is_none() {
+                inner.persist_failure = Some(err.to_string());
+            }
+        } else if inner.strict_durability {
             if inner.persist_failure.is_none() {
                 inner.persist_failure = Some(err.to_string());
             }
@@ -2219,6 +2274,86 @@ fn vfs_from_seed_env() -> Vfs {
 mod tests {
     use super::*;
     use crate::runtime::snapshot::{HostPromiseState, PENDING_HOST_OPERATION_FILE};
+
+    #[test]
+    fn lease_loss_is_fatal_under_all_durability_modes() {
+        for (mode, latches_ordinary_writes) in
+            [("besteffort", false), ("effect", true), ("strict", true)]
+        {
+            let ctx = RuntimeContext::new();
+            let mut inner = ctx.inner.lock().unwrap();
+            inner.strict_durability = latches_ordinary_writes;
+            note_persist_result(
+                &mut inner,
+                Err(crate::runtime::store::LeaseLostError {
+                    owner: "stale-owner".to_string(),
+                    generation: 4,
+                }
+                .into()),
+            );
+            assert!(
+                inner.lease_failure.is_some(),
+                "lease failure not latched in {mode} mode"
+            );
+            assert!(
+                inner.persist_failure.is_some(),
+                "future host effects would not be blocked in {mode} mode"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_lease_refuses_pre_effect_safepoint_under_all_durability_modes() {
+        use crate::runtime::store::{
+            acquire_lease, LeaseFencedRunStore, RunStore, SqliteRunStore, SqliteRunStoreShared,
+            LEASE_FILE,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let base = tempfile::tempdir().unwrap();
+        let db_path = base.path().join("runs.sqlite3");
+        let shared = SqliteRunStoreShared::open(&db_path).unwrap();
+        let sqlite: Arc<dyn RunStore> = Arc::new(SqliteRunStore::new(shared.clone(), "run-1"));
+        let lease_a = acquire_lease(&*sqlite, "owner-a", chrono::Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+        let fenced_a: Arc<dyn RunStore> =
+            Arc::new(LeaseFencedRunStore::new(sqlite.clone(), lease_a.clone()).unwrap());
+        let current = sqlite.get_blob(LEASE_FILE).unwrap().unwrap();
+        let mut expired: crate::runtime::store::RunLease =
+            serde_json::from_slice(&current).unwrap();
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let expired = serde_json::to_vec(&expired).unwrap();
+        assert!(sqlite
+            .compare_and_swap_blob(LEASE_FILE, Some(&current), Some(&expired))
+            .unwrap());
+        acquire_lease(&*sqlite, "owner-b", chrono::Duration::seconds(30))
+            .unwrap()
+            .unwrap();
+
+        for (mode, latches_ordinary_writes) in
+            [("besteffort", false), ("effect", true), ("strict", true)]
+        {
+            let ctx = RuntimeContext::new();
+            ctx.enable_persistence_with_store(base.path().join(mode), fenced_a.clone());
+            ctx.inner.lock().unwrap().strict_durability = latches_ordinary_writes;
+            let effect_count = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&effect_count);
+            ctx.set_host_operation_safepoint(HostOperationSafepoint::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }));
+            let error = ctx
+                .run_host_operation_safepoint(HostOperationId(1))
+                .expect_err("stale lease must stop before the effect safepoint");
+            assert!(
+                error.to_string().contains("lease ownership lost"),
+                "{mode}: {error:#}"
+            );
+            assert_eq!(effect_count.load(Ordering::SeqCst), 0, "{mode}");
+            assert!(ctx.persist_failure().is_some(), "{mode}");
+        }
+    }
 
     trait SignalEnqueueOutcome {
         fn is_error(&self) -> bool;

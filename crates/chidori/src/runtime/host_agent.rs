@@ -41,7 +41,7 @@ use crate::runtime::errors::RunInterrupt;
 use crate::runtime::host_actor::strip_crash_frontier;
 use crate::runtime::host_core;
 use crate::runtime::snapshot::{QueuedSignal, RuntimePolicy, SIGNAL_INBOX_FILE};
-use crate::runtime::store::RunStoreFactory;
+use crate::runtime::store::{RunStore, RunStoreFactory};
 use crate::runtime::template::TemplateEngine;
 use crate::runtime::typescript::bindings::HostBindingBackend;
 use crate::tools::ToolRegistry;
@@ -875,8 +875,8 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
     // drive the same agent — the loser backs off and leaves the run to the
     // live holder; an expired lease (a dead node) transfers on the next wake.
     let lease_owner = process_lease_owner();
-    let lease_ttl = chrono::Duration::minutes(5);
-    {
+    let lease_ttl = detached_lease_ttl();
+    let (lease_store, active_lease) = {
         let run_id = entry.state.lock().unwrap().descriptor.run_id.clone();
         let store = factory.store_for(&run_id);
         // Contended lease: wait out the holder's TTL instead of standing down
@@ -885,14 +885,14 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         // THAT is the genuinely-driven-elsewhere case worth yielding to.
         // (Standing down permanently on a not-yet-expired stale lease was how
         // an agent could wedge forever as `running` with no worker anywhere.)
-        loop {
+        let lease = loop {
             #[cfg(test)]
             tests::lease_wait_test_gate(&entry.name, tests::LeaseWaitGatePoint::BeforeAcquire);
             match crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl) {
-                Ok(Ok(_)) => {
+                Ok(Ok(lease)) => {
                     #[cfg(test)]
                     tests::pause_stale_owner_after_lease_acquired(&entry.name);
-                    break;
+                    break Some(lease);
                 }
                 Ok(Err(holder)) => {
                     #[cfg(test)]
@@ -947,28 +947,47 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 }
                 Err(err) => {
                     tracing::warn!(agent = %entry.name, error = %err, "acquiring agent lease");
-                    break;
+                    break None;
                 }
             }
-        }
+        };
+        (store, lease)
+    };
+    if lease_store.supports_lease_fencing() && active_lease.is_none() {
+        tracing::warn!(agent = %entry.name, "SQLite run lease was not acquired; refusing to execute without ownership");
+        return;
     }
+    let _heartbeat = active_lease
+        .as_ref()
+        .filter(|_| lease_store.supports_lease_fencing())
+        .map(|lease| LeaseHeartbeat::start(lease_store.clone(), lease.clone(), lease_ttl));
+    let settle_run =
+        |status, output, error| settle(hub, entry, status, output, error, active_lease.as_ref());
+    let hibernate_run = |listen| hibernate(hub, entry, listen, active_lease.as_ref());
 
     loop {
-        // Renew the lease each iteration so a long-running agent keeps its
-        // ownership fresh; renewal failure is logged, not fatal (the lease
-        // protects against concurrent drivers, not against running at all).
+        // SQLite runs use the independent heartbeat above during long host
+        // calls; check the tenure again before beginning another iteration.
+        // Advisory backends retain their existing per-iteration renewal.
         {
             let run_id = entry.state.lock().unwrap().descriptor.run_id.clone();
-            let store = factory.store_for(&run_id);
-            if let Ok(Err(holder)) =
-                crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl)
-            {
-                tracing::warn!(
-                    agent = %entry.name,
-                    holder = %holder.owner,
-                    "lost the agent lease mid-run; standing down"
-                );
-                return;
+            if active_lease.is_none() || !lease_store.supports_lease_fencing() {
+                let store = factory.store_for(&run_id);
+                if let Ok(Err(holder)) =
+                    crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl)
+                {
+                    tracing::warn!(
+                        agent = %entry.name,
+                        holder = %holder.owner,
+                        "lost the agent lease mid-run; standing down"
+                    );
+                    return;
+                }
+            } else if let Some(lease) = active_lease.as_ref() {
+                if let Err(err) = lease_store.check_lease(lease) {
+                    tracing::warn!(agent = %entry.name, error = %err, "lost the agent lease mid-run");
+                    return;
+                }
             }
         }
         let (descriptor, stop_requested) = {
@@ -976,13 +995,31 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             (state.descriptor.clone(), state.stop_requested)
         };
         if stop_requested {
-            settle(hub, entry, "stopped", None, None);
+            settle_run("stopped", None, None);
             return;
         }
 
         let run_id = descriptor.run_id.clone();
         let run_dir = parts.run_base.join(&run_id);
         let store = factory.store_for(&run_id);
+        let write_store: Arc<dyn crate::runtime::store::RunStore> = if store
+            .supports_lease_fencing()
+        {
+            if let Some(lease) = active_lease.as_ref() {
+                match crate::runtime::store::LeaseFencedRunStore::new(store.clone(), lease.clone())
+                {
+                    Ok(store) => Arc::new(store),
+                    Err(err) => {
+                        settle_run("failed", None, Some(err.to_string()));
+                        return;
+                    }
+                }
+            } else {
+                store.clone()
+            }
+        } else {
+            store.clone()
+        };
 
         // The accumulated journal (empty on first run), plus a synthetic
         // timeout-sentinel record when this wake is an expired alarm/timeout
@@ -990,9 +1027,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         let mut replay: Vec<CallRecord> = match store.load_call_log() {
             Ok(records) => records.unwrap_or_default(),
             Err(err) => {
-                settle(
-                    hub,
-                    entry,
+                settle_run(
                     "failed",
                     None,
                     Some(format!("loading detached-agent journal: {err:#}")),
@@ -1034,13 +1069,11 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 });
             } else if !matched {
                 // Spuriously started with nothing to do — go back to sleep.
-                match hibernate(hub, entry, listen) {
+                match hibernate_run(listen) {
                     Ok(true) => return,
                     Ok(false) => continue,
                     Err(err) => {
-                        settle(
-                            hub,
-                            entry,
+                        settle_run(
                             "failed",
                             None,
                             Some(format!(
@@ -1059,12 +1092,10 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         // journal, policy seed, and persistence handle all belong to the
         // agent, not the spawner.
         if let Err(err) = crate::runtime::snapshot::reconcile_detached_signal_timeout_promises(
-            store.as_ref(),
+            write_store.as_ref(),
             &replay,
         ) {
-            settle(
-                hub,
-                entry,
+            settle_run(
                 "failed",
                 None,
                 Some(format!(
@@ -1077,9 +1108,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             match crate::runtime::snapshot::load_host_promise_records(store.as_ref()) {
                 Ok(records) => records,
                 Err(err) => {
-                    settle(
-                        hub,
-                        entry,
+                    settle_run(
                         "failed",
                         None,
                         Some(format!("loading detached-agent host promises: {err:#}")),
@@ -1099,7 +1128,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         );
         ctx.set_run_id(run_id.clone());
         ctx.set_input_mode(crate::runtime::context::InputMode::Pause);
-        ctx.enable_persistence_with_store(run_dir.clone(), store.clone());
+        ctx.enable_persistence_with_store(run_dir.clone(), write_store.clone());
         // The agent's model travels with its descriptor: a wake in a process
         // configured for a different provider/model must not silently switch
         // what the agent's prompts run on.
@@ -1118,28 +1147,20 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         }
 
         let Ok(policy) = RuntimePolicy::from_env_for_durable_run(&run_id) else {
-            settle(
-                hub,
-                entry,
-                "failed",
-                None,
-                Some("building runtime policy".into()),
-            );
+            settle_run("failed", None, Some("building runtime policy".into()));
             return;
         };
         let resolved = match resolve_wake_source(&parts, store.as_ref(), &descriptor) {
             Ok(resolved) => resolved,
             Err(err) => {
-                settle(hub, entry, "failed", None, Some(err));
+                settle_run("failed", None, Some(err));
                 return;
             }
         };
         let source_text = match std::fs::read_to_string(&resolved) {
             Ok(source) => source,
             Err(err) => {
-                settle(
-                    hub,
-                    entry,
+                settle_run(
                     "failed",
                     None,
                     Some(format!("reading {}: {err}", resolved.display())),
@@ -1197,7 +1218,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             }
         };
         if let Err(err) = publish_result {
-            settle(hub, entry, "failed", None, Some(err));
+            settle_run("failed", None, Some(err));
             return;
         }
         #[cfg(test)]
@@ -1231,17 +1252,11 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                             .as_bytes(),
                     );
                 }
-                settle(hub, entry, "completed", Some(output), None);
+                settle_run("completed", Some(output), None);
                 return;
             }
             IterationEnd::Parked(prompt) => {
-                settle(
-                    hub,
-                    entry,
-                    "paused",
-                    None,
-                    prompt.map(|p| format!("paused: {p}")),
-                );
+                settle_run("paused", None, prompt.map(|p| format!("paused: {p}")));
                 return;
             }
             IterationEnd::WaitSignal(pending) => {
@@ -1256,13 +1271,11 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 if raced {
                     continue;
                 }
-                match hibernate(hub, entry, listen) {
+                match hibernate_run(listen) {
                     Ok(true) => return,
                     Ok(false) => continue,
                     Err(err) => {
-                        settle(
-                            hub,
-                            entry,
+                        settle_run(
                             "failed",
                             None,
                             Some(format!(
@@ -1276,7 +1289,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             IterationEnd::Failed(message) => {
                 let stop = entry.state.lock().unwrap().stop_requested;
                 if stop {
-                    settle(hub, entry, "stopped", None, None);
+                    settle_run("stopped", None, None);
                     return;
                 }
                 let (restarts, budget_left) = {
@@ -1289,7 +1302,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                     (state.descriptor.restarts, left)
                 };
                 if !budget_left {
-                    settle(hub, entry, "failed", None, Some(message));
+                    settle_run("failed", None, Some(message));
                     return;
                 }
                 if descriptor.backoff_ms > 0 {
@@ -1318,19 +1331,20 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                     "clean" => Vec::new(),
                     _ => strip_crash_frontier(records),
                 };
-                let _ = store.write_call_log(&rewritten);
+                let _ = write_store.write_call_log(&rewritten);
                 if descriptor.restart == "clean" {
-                    let _ = store.delete_blob(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE);
                     let _ =
-                        store.delete_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE);
+                        write_store.delete_blob(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE);
+                    let _ = write_store
+                        .delete_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE);
                     // Per-op promise blobs are part of the table; a clean
                     // restart retires them too or the union loader would
                     // resurrect the wiped state.
-                    if let Ok(keys) = store.list_blobs() {
+                    if let Ok(keys) = write_store.list_blobs() {
                         for key in keys {
                             if key.starts_with(crate::runtime::snapshot::HOST_PROMISE_EVENTS_PREFIX)
                             {
-                                let _ = store.delete_blob(&key);
+                                let _ = write_store.delete_blob(&key);
                             }
                         }
                     }
@@ -1397,6 +1411,30 @@ fn persist_descriptor(factory: &RunStoreFactory, descriptor: &AgentDescriptor) {
     }
 }
 
+fn persist_descriptor_for_lease(
+    factory: &RunStoreFactory,
+    descriptor: &AgentDescriptor,
+    lease: Option<&crate::runtime::store::RunLease>,
+) -> anyhow::Result<()> {
+    let store = factory.store_for(&descriptor.run_id);
+    if let Some(lease) = lease.filter(|_| store.supports_lease_fencing()) {
+        let fenced = crate::runtime::store::LeaseFencedRunStore::new(store, lease.clone())?;
+        if let Ok(bytes) = serde_json::to_vec_pretty(descriptor) {
+            fenced.put_blob(AGENT_DESCRIPTOR_FILE, &bytes)?;
+        }
+        factory.registry_put_fenced(
+            lease,
+            &descriptor.name,
+            &descriptor.run_id,
+            &serde_json::to_value(descriptor)?,
+        )?;
+        Ok(())
+    } else {
+        persist_descriptor(factory, descriptor);
+        Ok(())
+    }
+}
+
 /// The process-stable lease owner id: one per OS process, so every agent this
 /// process drives is leased under the same identity.
 fn process_lease_owner() -> &'static str {
@@ -1404,12 +1442,86 @@ fn process_lease_owner() -> &'static str {
     OWNER.get_or_init(|| format!("chidori-{}", uuid::Uuid::new_v4()))
 }
 
+fn detached_lease_ttl() -> chrono::Duration {
+    #[cfg(test)]
+    if let Some(milliseconds) = std::env::var("CHIDORI_TEST_SQLITE_LEASE_TTL_MS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        return chrono::Duration::milliseconds(milliseconds.max(30));
+    }
+    chrono::Duration::minutes(5)
+}
+
+/// Renew a SQLite tenure independently of agent execution, which may be
+/// blocked in a long host call. Every renewal carries the generation token;
+/// an expired or displaced owner cannot renew itself.
+struct LeaseHeartbeat {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LeaseHeartbeat {
+    fn start(
+        store: Arc<dyn crate::runtime::store::RunStore>,
+        lease: crate::runtime::store::RunLease,
+        ttl: chrono::Duration,
+    ) -> Self {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let interval =
+            (ttl.to_std().unwrap_or(Duration::from_secs(1)) / 3).max(Duration::from_millis(10));
+        let thread = std::thread::spawn(move || loop {
+            match stopped.recv_timeout(interval) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            match store.renew_lease(&lease, ttl) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::warn!(
+                        owner = %lease.owner,
+                        generation = lease.generation,
+                        "SQLite run lease heartbeat was fenced"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        owner = %lease.owner,
+                        generation = lease.generation,
+                        error = %err,
+                        "SQLite run lease heartbeat failed"
+                    );
+                    break;
+                }
+            }
+        });
+        Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Release the agent run's lease — called when the agent stops executing here
 /// (hibernate or settle), so any process may drive the next wake.
-fn release_agent_lease(entry: &Arc<AgentEntry>) {
+fn release_agent_lease(entry: &Arc<AgentEntry>, lease: Option<&crate::runtime::store::RunLease>) {
     let run_id = entry.state.lock().unwrap().descriptor.run_id.clone();
     let store = entry.factory().store_for(&run_id);
-    let _ = crate::runtime::store::release_lease(store.as_ref(), process_lease_owner());
+    if let Some(lease) = lease.filter(|_| store.supports_lease_fencing()) {
+        let _ = crate::runtime::store::release_lease_token(store.as_ref(), lease);
+    } else {
+        let _ = crate::runtime::store::release_lease(store.as_ref(), process_lease_owner());
+    }
 }
 
 /// Persist the hibernation handoff while excluding senders. Returns `Ok(false)`
@@ -1419,6 +1531,7 @@ fn hibernate(
     hub: &DetachedAgentHub,
     entry: &Arc<AgentEntry>,
     listen: ListenState,
+    lease: Option<&crate::runtime::store::RunLease>,
 ) -> Result<bool, String> {
     let has_deadline = listen.deadline.is_some();
     let factory = entry.factory();
@@ -1426,6 +1539,21 @@ fn hibernate(
         let mut state = entry.state.lock().unwrap();
         let run_id = state.descriptor.run_id.clone();
         let store = factory.store_for(&run_id);
+        let owned_store: Arc<dyn crate::runtime::store::RunStore> = if let Some(lease) =
+            lease.filter(|_| store.supports_lease_fencing())
+        {
+            match crate::runtime::store::LeaseFencedRunStore::new(store.clone(), lease.clone()) {
+                Ok(fenced) => Arc::new(fenced),
+                Err(err) => return Err(format!("creating lease-fenced store: {err}")),
+            }
+        } else {
+            store.clone()
+        };
+        if let Err(err) = owned_store.check_ownership() {
+            return Err(format!(
+                "detached-agent lease ownership lost before hibernate: {err}"
+            ));
+        }
         let inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE) {
             Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Ok(None) => Vec::new(),
@@ -1451,10 +1579,15 @@ fn hibernate(
         // completed. Otherwise a sender can persist `running` and start a new
         // worker, then this stale hibernate write or lease release can undo
         // that wake.
-        persist_descriptor(&factory, &descriptor);
-        if let Err(err) =
+        if let Err(err) = persist_descriptor_for_lease(&factory, &descriptor, lease) {
+            return Err(format!("persisting detached-agent hibernation: {err}"));
+        }
+        let released = if let Some(lease) = lease.filter(|_| store.supports_lease_fencing()) {
+            crate::runtime::store::release_lease_token(store.as_ref(), lease)
+        } else {
             crate::runtime::store::release_lease(store.as_ref(), process_lease_owner())
-        {
+        };
+        if let Err(err) = released {
             tracing::warn!(agent = %entry.name, error = %err, "releasing detached-agent lease on hibernate");
         }
     }
@@ -1471,6 +1604,7 @@ fn settle(
     status: &str,
     output: Option<Value>,
     error: Option<String>,
+    lease: Option<&crate::runtime::store::RunLease>,
 ) {
     let descriptor = {
         let mut state = entry.state.lock().unwrap();
@@ -1481,8 +1615,10 @@ fn settle(
         state.descriptor.updated_at = Utc::now();
         state.descriptor.clone()
     };
-    persist_descriptor(&entry.factory(), &descriptor);
-    release_agent_lease(entry);
+    if let Err(err) = persist_descriptor_for_lease(&entry.factory(), &descriptor, lease) {
+        tracing::warn!(agent = %entry.name, error = %err, "persisting detached-agent settlement");
+    }
+    release_agent_lease(entry, lease);
     entry.signal.notify_all();
 }
 
@@ -2450,6 +2586,7 @@ mod tests {
             let expired = crate::runtime::store::RunLease {
                 owner: "dead-live-cut-child".to_string(),
                 expires_at: Utc::now() - chrono::Duration::seconds(1),
+                generation: 1,
             };
             store
                 .put_blob(
@@ -2875,6 +3012,13 @@ mod tests {
         if let Ok(role) = std::env::var(SQLITE_STALE_CHILD_ENV) {
             let base = PathBuf::from(std::env::var_os(SQLITE_STALE_BASE_ENV).unwrap());
             let http = std::env::var(SQLITE_STALE_HTTP_ENV).unwrap();
+            if role == "a" {
+                eprintln!(
+                    "stale-owner child proxy bypass before fetch: NO_PROXY={:?} no_proxy={:?}",
+                    std::env::var("NO_PROXY"),
+                    std::env::var("no_proxy")
+                );
+            }
             let run_base = base.join(".chidori/runs");
             let source = base.join("services/stale-owner.ts");
             std::fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -2896,6 +3040,21 @@ mod tests {
                 ),
             )
             .unwrap();
+
+            if role == "proxy_probe" {
+                let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+                let response = crate::runtime::host_core::execute_http(
+                    &tokio_rt,
+                    &json!({"url": format!("http://{http}/prelude"), "method": "GET"}),
+                )
+                .unwrap();
+                assert_eq!(
+                    response["status"], 200,
+                    "loopback probe response={response:#}"
+                );
+                assert_eq!(response["body"], json!({}));
+                return;
+            }
 
             let mut tools = ToolRegistry::new();
             if role == "a" {
@@ -3021,6 +3180,7 @@ mod tests {
         let follow_on_count = Arc::new(AtomicUsize::new(0));
         let held_count = Arc::new(AtomicUsize::new(0));
         let (http_tx, http_rx) = std::sync::mpsc::channel::<String>();
+        let (http_diag_tx, http_diag_rx) = std::sync::mpsc::channel::<String>();
         let (release_a_tx, release_a_rx) = std::sync::mpsc::channel::<()>();
         let release_a_rx = Arc::new(StdMutex::new(release_a_rx));
         let server_stopped = Arc::clone(&stopped);
@@ -3029,13 +3189,42 @@ mod tests {
         let server = std::thread::spawn(move || {
             while !server_stopped.load(AtomicOrdering::SeqCst) {
                 match http_listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut bytes = [0u8; 4096];
-                        let count = stream.read(&mut bytes).unwrap_or(0);
-                        if count == 0 {
+                    Ok((mut stream, peer)) => {
+                        let _ = http_diag_tx
+                            .send(format!("accepted peer={peer}; waiting for request headers"));
+                        // macOS may preserve the listener's nonblocking mode
+                        // on accepted sockets; the fixture uses bounded
+                        // blocking reads after accept.
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut request = Vec::with_capacity(1024);
+                        let mut bytes = [0u8; 1024];
+                        while request.len() < 64 * 1024
+                            && !request.windows(4).any(|window| window == b"\r\n\r\n")
+                        {
+                            match stream.read(&mut bytes) {
+                                Ok(0) => break,
+                                Ok(count) => request.extend_from_slice(&bytes[..count]),
+                                Err(error) => {
+                                    let _ = http_diag_tx.send(format!(
+                                        "request read failed peer={peer}: {error}; bytes={:?}",
+                                        String::from_utf8_lossy(&request)
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        if request.is_empty() {
+                            let _ = http_diag_tx.send(format!(
+                                "empty request peer={peer}; received_bytes={request:?}"
+                            ));
                             continue;
                         }
-                        let request = String::from_utf8_lossy(&bytes[..count]);
+                        let request = String::from_utf8_lossy(&request).into_owned();
+                        let _ = http_diag_tx
+                            .send(format!("complete request peer={peer}; bytes={request:?}"));
                         let target = request
                             .lines()
                             .next()
@@ -3077,7 +3266,9 @@ mod tests {
                                 _ => "{}".to_string(),
                             };
                             let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-                            let _ = stream.write_all(response.as_bytes());
+                            if let Err(error) = stream.write_all(response.as_bytes()) {
+                                eprintln!("stale-owner HTTP fixture response write failed: {error}; request={request}");
+                            }
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3099,6 +3290,10 @@ mod tests {
                 .env("CHIDORI_RUN_DB", base.join("runs.sqlite3"))
                 .env("CHIDORI_DURABILITY", "effect")
                 .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
+                .env("CHIDORI_TEST_SQLITE_LEASE_TTL_MS", "3000")
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("no_proxy", "127.0.0.1,localhost")
+                .env("CHIDORI_TEST_SQLITE_STALE_NO_PROXY", "1")
                 .spawn()
                 .unwrap()
         };
@@ -3107,16 +3302,55 @@ mod tests {
                 .recv_timeout(Duration::from_secs(20))
                 .unwrap_or_else(|err| {
                     let child_event = event_rx.try_recv().ok().map(|(event, _)| event);
-                    panic!("timed out waiting for HTTP {expected}: {err}; pending child event={child_event:?}")
+                    let mut server_diagnostics = Vec::new();
+                    while let Ok(diagnostic) = http_diag_rx.try_recv() {
+                        server_diagnostics.push(diagnostic);
+                    }
+                    panic!("timed out waiting for HTTP {expected}: {err}; full pending child event={child_event:#?}; listener diagnostics={server_diagnostics:#?}")
                 });
             assert_eq!(path, expected);
         };
+        let proxy_probe = child("proxy_probe");
+        wait_http("/prelude");
+        let probe_output = proxy_probe.wait_with_output().unwrap();
+        assert!(
+            probe_output.status.success(),
+            "loopback proxy probe child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&probe_output.stdout),
+            String::from_utf8_lossy(&probe_output.stderr)
+        );
+        let probe_diagnostics: Vec<_> = http_diag_rx.try_iter().collect();
+        assert!(
+            probe_diagnostics
+                .iter()
+                .any(|line| line.contains("complete request") && line.contains("GET /prelude HTTP/1.1") && line.contains("host:")),
+            "loopback probe did not deliver HTTP request headers; diagnostics={probe_diagnostics:#?}"
+        );
+        if std::env::var_os("CHIDORI_TEST_SQLITE_STALE_PROXY_PROBE_ONLY").is_some() {
+            stopped.store(true, AtomicOrdering::SeqCst);
+            server.join().unwrap();
+            std::net::TcpStream::connect(control_address)
+                .unwrap()
+                .write_all(b"STOP\n")
+                .unwrap();
+            control_thread.join().unwrap();
+            return;
+        }
         let a = child("a");
         let (ready, ready_socket) = event_rx.recv_timeout(Duration::from_secs(20)).unwrap();
         let run_id = ready
             .strip_prefix("A_READY ")
             .expect("A ready event")
             .to_string();
+        let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
+        let store = SqliteRunStore::new(shared.clone(), &run_id);
+        let tee = TeeRunStore::new(
+            FsRunStore::new(run_base.join(&run_id)),
+            Arc::new(SqliteRunStore::new(shared.clone(), &run_id)),
+        );
+        let initial_lease = stale_owner_lease(&store);
+        let initial_expiry: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(initial_lease["expires_at"].clone()).unwrap();
         stale_owner_release(ready_socket, b'G');
         let a_signalled = stale_owner_wait_event(&event_rx, "A_SIGNALLED");
         stale_owner_release(a_signalled, b'G');
@@ -3126,13 +3360,29 @@ mod tests {
 
         let b = child("b");
         let contended = stale_owner_wait_event(&event_rx, "B_CONTENDED");
-        let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
-        let store = SqliteRunStore::new(shared.clone(), &run_id);
-        // Mirror the configured factory's FS-primary + SQLite-secondary Tee
-        // without mutating this process's environment or factory cache.
-        let tee = TeeRunStore::new(
-            FsRunStore::new(run_base.join(&run_id)),
-            Arc::new(SqliteRunStore::new(shared, &run_id)),
+        // Keep B paused after the real contention result while A remains
+        // blocked in its dispatched HTTP request. Wait for A's independent
+        // heartbeat to extend the original SQLite expiry; B must still be
+        // unable to acquire this live tenure after the original TTL elapsed.
+        let renewal_deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let mut renewed = false;
+        while std::time::Instant::now() < renewal_deadline {
+            let current = stale_owner_lease(&store);
+            let expires: chrono::DateTime<chrono::Utc> =
+                serde_json::from_value(current["expires_at"].clone()).unwrap();
+            if current["owner"] == initial_lease["owner"]
+                && current["generation"] == initial_lease["generation"]
+                && expires > initial_expiry + chrono::Duration::seconds(2)
+            {
+                renewed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(renewed, "A's heartbeat did not extend its original lease: initial={initial_lease:#}; current={:#}", stale_owner_lease(&store));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "B acquired while A's heartbeat kept its lease live"
         );
         let before = stale_owner_lease(&store);
         let owner_a = before["owner"].as_str().unwrap().to_string();
@@ -3160,6 +3410,7 @@ mod tests {
         let expired = serde_json::to_vec(&crate::runtime::store::RunLease {
             owner: owner_a.clone(),
             expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            generation: before["generation"].as_u64().unwrap_or(0),
         })
         .unwrap();
         let prior = store

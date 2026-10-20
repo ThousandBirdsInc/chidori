@@ -1578,11 +1578,24 @@ fn http_client() -> Result<reqwest::Client> {
     // redirect hops are covered by the same check the connector dials from),
     // and the redirect policy re-validates each hop's scheme and IP-literal
     // host. See `runtime::ssrf`.
-    let built = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .gzip(true)
         .dns_resolver(crate::runtime::ssrf::dns_resolver())
-        .redirect(crate::runtime::ssrf::redirect_policy())
-        .build()?;
+        .redirect(crate::runtime::ssrf::redirect_policy());
+    #[cfg(test)]
+    let built = {
+        // The detached stale-owner integration test uses a loopback listener.
+        // Its child process opts out of host proxy settings before this global
+        // client is initialized; production clients retain reqwest defaults.
+        let builder = if std::env::var_os("CHIDORI_TEST_SQLITE_STALE_NO_PROXY").is_some() {
+            builder.no_proxy()
+        } else {
+            builder
+        };
+        builder.build()?
+    };
+    #[cfg(not(test))]
+    let built = builder.build()?;
     Ok(CLIENT.get_or_init(|| built).clone())
 }
 
@@ -2608,9 +2621,34 @@ mod tests {
         let url = format!("http://{addr}/ua-check");
         let handle = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let n = stream.read(&mut buf).await.unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let mut buf = Vec::with_capacity(4096);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&buf[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                    let mut chunk = [0u8; 4096];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(n, 0, "request ended before its declared body arrived");
+                    buf.extend_from_slice(&chunk[..n]);
+                    assert!(buf.len() <= 64 * 1024, "request exceeded fixture limit");
+                }
+            })
+            .await
+            .expect("timed out reading complete fixture request");
+            let request = String::from_utf8_lossy(&buf).to_string();
             let _ = stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .await;
