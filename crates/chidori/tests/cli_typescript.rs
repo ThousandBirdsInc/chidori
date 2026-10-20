@@ -1616,7 +1616,7 @@ fn cli_resume_rejects_truncated_final_effect_before_live_reexecution() {
 #[test]
 fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
     let server = LocalHttpServer::start();
-    let fixture = create_http_replay_fixture(&server);
+    let fixture = create_http_replay_fixture_with_mirror(&server, true);
     assert_eq!(server.request_count(), 1);
     let promise = persist_resolved_http_operation(&fixture);
     assert_eq!(promise["operation"]["seq"], 2);
@@ -1703,6 +1703,144 @@ fn cli_resume_hydrates_resolved_http_promise_from_sqlite_mirror() {
     assert_eq!(
         recovered_http["result"],
         promise["state"]["resolved"]["value"]
+    );
+}
+
+#[test]
+fn cli_resume_refuses_held_sqlite_tenure_before_effect_or_journal_mutation() {
+    use chidori::runtime::store::acquire_lease_with_token;
+
+    let server = LocalHttpServer::start();
+    let fixture = create_http_replay_fixture_with_mirror(&server, true);
+    assert_eq!(server.request_count(), 1);
+
+    // Leave a real completed run with its HTTP row absent and its resolved
+    // promise removed, so resume would perform the HTTP request live unless
+    // the external SQLite tenure is honored first. Remove the cached promise
+    // from both the filesystem primary and SQLite mirror so the live effect
+    // is the only possible continuation if the lease is bypassed.
+    let store = fixture_run_store(&fixture);
+    let mut records = store.load_call_log().unwrap().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].function, "http");
+    records.pop();
+    store.write_call_log(&records).unwrap();
+    store.delete_blob("host_promises/2.json").unwrap();
+    store.delete_blob("host_promises.json").unwrap();
+    let journal_before = fs::read(&fixture.records_path).unwrap();
+
+    let held = acquire_lease_with_token(
+        store.as_ref(),
+        "external-sqlite-holder",
+        chrono::Duration::minutes(10),
+    )
+    .unwrap()
+    .expect("the fixture run lease must be free before this test holds it");
+    let lease_before = store.get_blob("lease.json").unwrap().unwrap();
+    let db_path = fixture
+        .mirror_db
+        .as_ref()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let output = resume_http_fixture(
+        &fixture,
+        &[
+            ("CHIDORI_RUN_STORE", "sqlite"),
+            ("CHIDORI_RUN_DB", &db_path),
+        ],
+    );
+
+    // Check the externally visible effect first: vulnerable tokenless resume
+    // warns and continues, so this becomes 2 instead of staying at 1.
+    assert_eq!(
+        server.request_count(),
+        1,
+        "resume must stand down before issuing the unjournaled HTTP effect"
+    );
+    assert_failure(&output);
+    assert_eq!(
+        fs::read(&fixture.records_path).unwrap(),
+        journal_before,
+        "a rejected resume must leave the local journal byte-identical"
+    );
+    assert_eq!(
+        store.get_blob("lease.json").unwrap().unwrap(),
+        lease_before,
+        "a rejected resume must preserve the external SQLite tenure"
+    );
+    let contender = acquire_lease_with_token(
+        store.as_ref(),
+        "verification-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap();
+    assert_eq!(
+        contender
+            .expect_err("external tenure must remain held")
+            .owner,
+        "external-sqlite-holder"
+    );
+    chidori::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
+        .unwrap();
+}
+
+#[test]
+fn cli_resume_refuses_competing_filesystem_lease() {
+    use chidori::runtime::store::acquire_lease;
+
+    let server = LocalHttpServer::start();
+    let fixture = create_http_replay_fixture(&server);
+    let store = fixture_run_store(&fixture);
+    let mut records = store.load_call_log().unwrap().unwrap();
+    assert_eq!(records.len(), 2);
+    records.pop();
+    store.write_call_log(&records).unwrap();
+    store.delete_blob("host_promises/2.json").unwrap();
+    store.delete_blob("host_promises.json").unwrap();
+    let journal_before = fs::read(&fixture.records_path).unwrap();
+    let held = acquire_lease(
+        store.as_ref(),
+        "external-fs-holder",
+        chrono::Duration::minutes(10),
+    )
+    .unwrap()
+    .expect("the filesystem lease must be acquirable");
+    let lease_before = store.get_blob("lease.json").unwrap().unwrap();
+
+    let output = Command::new(chidori_bin())
+        .args([
+            "resume",
+            fixture.agent.to_str().unwrap(),
+            &fixture.run_id,
+            "--trusted",
+        ])
+        .current_dir(&fixture.dir)
+        .env_remove("CHIDORI_RUN_STORE")
+        .env_remove("CHIDORI_RUN_DB")
+        .env("CHIDORI_DURABILITY", "effect")
+        .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        server.request_count(),
+        1,
+        "filesystem lease control must reject before the unjournaled HTTP effect"
+    );
+    assert_failure(&output);
+    assert!(
+        output_diagnostic(&output).contains("external-fs-holder"),
+        "filesystem control should identify the competing holder; output:\n{}",
+        output_diagnostic(&output)
+    );
+    assert_eq!(fs::read(&fixture.records_path).unwrap(), journal_before);
+    assert_eq!(store.get_blob("lease.json").unwrap().unwrap(), lease_before);
+    assert_eq!(held.owner, "external-fs-holder");
+    assert_eq!(
+        store.load_call_log().unwrap().unwrap().len(),
+        1,
+        "refused filesystem resume must not repair the removed HTTP row"
     );
 }
 
@@ -2303,6 +2441,80 @@ fn cli_chat_session_persists_and_resumes() {
     assert_success(&run_chidori(&["trace", &session_id], &dir));
 
     fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
+    use chidori::runtime::store::{
+        acquire_lease_with_token, RunStore, SqliteRunStore, SqliteRunStoreShared,
+    };
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let dir = temp_project("chat-sqlite-lease");
+    let chat_env = [("CHIDORI_TEST_LLM_RESPONSE", "canned reply")];
+    let output = run_chidori_with_stdin(&["chat"], &dir, &chat_env, "first message\nexit\n");
+    assert_success(&output);
+    let session_id = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| line.starts_with("session ") && !line.starts_with("session saved"))
+        .and_then(|line| line.strip_prefix("session "))
+        .map(|rest| rest.split_whitespace().next().unwrap().to_string())
+        .expect("chat announces the durable session id");
+    let run_dir = dir.join(".chidori").join("runs").join(&session_id);
+    let input_path = run_dir.join("input.json");
+    let records_path = run_dir.join("records.jsonl");
+    let input_before = fs::read(&input_path).unwrap();
+    let records_before = fs::read(&records_path).unwrap();
+
+    let db_path = dir.join("chat-lease.sqlite3");
+    let shared = SqliteRunStoreShared::open(&db_path).unwrap();
+    let store: std::sync::Arc<dyn RunStore> =
+        std::sync::Arc::new(SqliteRunStore::new(shared, session_id.clone()));
+    let held = acquire_lease_with_token(
+        store.as_ref(),
+        "external-chat-holder",
+        chrono::Duration::minutes(10),
+    )
+    .unwrap()
+    .expect("the chat run lease must be free before this test holds it");
+    let lease_before = store.get_blob("lease.json").unwrap().unwrap();
+
+    let mut command = Command::new(chidori_bin());
+    command
+        .args(["chat", "--resume", &session_id])
+        .current_dir(&dir)
+        .env_remove("CHIDORI_RUN_STORE")
+        .env_remove("CHIDORI_RUN_DB")
+        .env("CHIDORI_RUN_STORE", "sqlite")
+        .env("CHIDORI_RUN_DB", &db_path)
+        .env("CHIDORI_TEST_LLM_RESPONSE", "canned reply")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"second message\nexit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        fs::read(&input_path).unwrap(),
+        input_before,
+        "a refused chat resume must not append a turn to input.json"
+    );
+    assert_eq!(
+        fs::read(&records_path).unwrap(),
+        records_before,
+        "a refused chat resume must not append journal records"
+    );
+    assert_eq!(store.get_blob("lease.json").unwrap().unwrap(), lease_before);
+    assert_eq!(held.lease().owner, "external-chat-holder");
+    assert_failure(&output);
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// Total size in bytes of every regular file under `path`, recursively.

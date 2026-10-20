@@ -3420,6 +3420,102 @@ async fn resume_session_returns_409_when_run_lease_held_elsewhere() {
     assert_eq!(held.expect_err("still held").owner, "other-server");
 }
 
+/// SQLite requires the opaque tenure token. Exercise the real signal-to-paused
+/// resume route in a child test process so its process-wide RunStoreFactory is
+/// initialized from an isolated SQLite environment before the run is created.
+#[tokio::test]
+async fn sqlite_signal_resume_refuses_external_tenure_before_mutation() {
+    const CHILD: &str = "CHIDORI_TEST_SQLITE_SIGNAL_LEASE_CHILD";
+    const TEST: &str =
+        "server::tests::sqlite_signal_resume_refuses_external_tenure_before_mutation";
+    if std::env::var_os(CHILD).is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("runs.sqlite3");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env("CHIDORI_RUN_DB", &db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated SQLite route test failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    use crate::runtime::store::acquire_lease_with_token;
+
+    let temp = tempfile::tempdir().unwrap();
+    let agent_path = write_agent(
+        temp.path(),
+        r#"
+            export async function agent(input, chidori) {
+                const review = await chidori.signal("review");
+                return { decision: review.payload.decision };
+            }
+        "#,
+    );
+    let state = signal_test_state(temp.path(), agent_path);
+    let created = create_paused_session(&state, "sqlite-lease-signal", json!({})).await;
+    assert_eq!(created["status"], json!("paused"));
+    assert_eq!(created["pending_signal_name"], json!("review"));
+    let run_id = created["run_id"].as_str().unwrap().to_string();
+
+    let factory = crate::runtime::store::RunStoreFactory::shared(&state.run_base);
+    factory.ensure_initialized().unwrap();
+    let store = factory.store_for(&run_id);
+    let held = acquire_lease_with_token(
+        store.as_ref(),
+        "external-sqlite-server",
+        chrono::Duration::minutes(10),
+    )
+    .unwrap()
+    .expect("the newly paused run lease must be free");
+    let journal_before = serde_json::to_value(store.load_call_log().unwrap()).unwrap();
+    let pending_before = store.get_blob("pending.json").unwrap();
+    let lease_before = store.get_blob("lease.json").unwrap().unwrap();
+
+    let (status, body) = response_json(
+        signal_session(
+            State(state.clone()),
+            Path("sqlite-lease-signal".to_string()),
+            Json(SignalRequest {
+                allow_source_change: false,
+                name: "review".to_string(),
+                payload: json!({"decision":"blocked"}),
+                from: json!({"kind":"test"}),
+            }),
+        )
+        .await,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a signal that resumes a paused run must be rejected while another SQLite tenure is held; body: {body}"
+    );
+    assert_eq!(body["lease_holder"], json!("external-sqlite-server"));
+    let session = state
+        .session_store
+        .get("sqlite-lease-signal")
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.status, SessionStatus::Paused);
+    assert_eq!(
+        serde_json::to_value(store.load_call_log().unwrap()).unwrap(),
+        journal_before
+    );
+    assert_eq!(store.get_blob("pending.json").unwrap(), pending_before);
+    assert_eq!(store.get_blob("lease.json").unwrap().unwrap(), lease_before);
+    crate::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
+        .unwrap();
+}
+
 /// The guard's lifecycle: a free run is acquirable, the holder excludes other
 /// owners, the same server renews (a second leg re-acquires under the same
 /// owner), and dropping the guard releases the run for the next writer.
