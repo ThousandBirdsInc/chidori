@@ -1844,7 +1844,8 @@ mod tests {
     use crate::runtime::rust_engine::run_agent;
     use crate::runtime::snapshot::{load_host_promise_records, HostPromiseState};
     use crate::runtime::store::{
-        FailSignalInboxStore, RunStore, RunStoreFactory, SqliteRunStore, SqliteRunStoreShared,
+        FailSignalInboxStore, FsRunStore, RunStore, RunStoreFactory, SqliteRunStore,
+        SqliteRunStoreShared, TeeRunStore,
     };
     use crate::tools::ToolRegistry;
 
@@ -2992,6 +2993,7 @@ mod tests {
         // its barrier name and blocks until the parent explicitly releases it.
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path();
+        let run_base = base.join(".chidori/runs");
         let control_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let control_address = control_listener.local_addr().unwrap();
         let (event_tx, event_rx) = std::sync::mpsc::channel::<(String, TcpStream)>();
@@ -3125,7 +3127,13 @@ mod tests {
         let b = child("b");
         let contended = stale_owner_wait_event(&event_rx, "B_CONTENDED");
         let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
-        let store = SqliteRunStore::new(shared, &run_id);
+        let store = SqliteRunStore::new(shared.clone(), &run_id);
+        // Mirror the configured factory's FS-primary + SQLite-secondary Tee
+        // without mutating this process's environment or factory cache.
+        let tee = TeeRunStore::new(
+            FsRunStore::new(run_base.join(&run_id)),
+            Arc::new(SqliteRunStore::new(shared, &run_id)),
+        );
         let before = stale_owner_lease(&store);
         let owner_a = before["owner"].as_str().unwrap().to_string();
         let expires_a: chrono::DateTime<chrono::Utc> =
@@ -3210,6 +3218,27 @@ mod tests {
             HostPromiseState::Resolved { value, .. } => value.clone(),
             other => panic!("B seq-3 host promise is not resolved: {other:?}"),
         };
+        let tee_records_b = tee.load_call_log().unwrap().unwrap();
+        let tee_seq3_b = tee_records_b
+            .iter()
+            .find(|record| record.seq == 3)
+            .expect("factory Tee should read B's primary seq-3 result");
+        let tee_promises_b = load_host_promise_records(&tee).unwrap();
+        let tee_promise_b = tee_promises_b
+            .iter()
+            .find(|record| record.operation.seq == 3)
+            .expect("factory Tee should read B's primary seq-3 promise");
+        assert_eq!(tee_seq3_b.result, seq3_result_b);
+        assert_eq!(
+            tee_promise_b.state,
+            HostPromiseState::Resolved {
+                value: promise_value_b.clone(),
+                completed_at: match &promise_b.state {
+                    HostPromiseState::Resolved { completed_at, .. } => *completed_at,
+                    _ => unreachable!("resolved state checked above"),
+                },
+            }
+        );
         assert_eq!(
             follow_on_count.load(AtomicOrdering::SeqCst),
             0,
@@ -3227,6 +3256,16 @@ mod tests {
             .collect();
         let final_promises = load_host_promise_records(&store).unwrap();
         let final_promise = final_promises
+            .iter()
+            .find(|record| record.operation.seq == 3)
+            .unwrap();
+        let tee_final_records = tee.load_call_log().unwrap().unwrap();
+        let tee_final_seq3: Vec<_> = tee_final_records
+            .iter()
+            .filter(|record| record.seq == 3)
+            .collect();
+        let tee_final_promises = load_host_promise_records(&tee).unwrap();
+        let tee_final_promise = tee_final_promises
             .iter()
             .find(|record| record.operation.seq == 3)
             .unwrap();
@@ -3283,6 +3322,31 @@ mod tests {
             red_failures.push(format!(
                 "stale A replaced B's seq-3 host-promise result: expected {}, observed {:?}",
                 promise_value_b, final_promise_value
+            ));
+        }
+        if tee_final_seq3.len() != 1 {
+            red_failures.push(format!(
+                "factory Tee primary should expose one seq-3 row, observed {}",
+                tee_final_seq3.len()
+            ));
+        } else if tee_final_seq3[0].result != tee_seq3_b.result {
+            red_failures.push(format!(
+                "stale A replaced the factory Tee primary seq-3 result: expected {}, observed {}",
+                tee_seq3_b.result, tee_final_seq3[0].result
+            ));
+        }
+        let tee_final_promise_value = match &tee_final_promise.state {
+            HostPromiseState::Resolved { value, .. } => Some(value),
+            _ => None,
+        };
+        let tee_promise_value_b = match &tee_promise_b.state {
+            HostPromiseState::Resolved { value, .. } => value,
+            _ => unreachable!("resolved state checked above"),
+        };
+        if tee_final_promise_value != Some(tee_promise_value_b) {
+            red_failures.push(format!(
+                "stale A replaced the factory Tee primary seq-3 host-promise result: expected {}, observed {:?}",
+                tee_promise_value_b, tee_final_promise_value
             ));
         }
         if follow_on != 0 {
