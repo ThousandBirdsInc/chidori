@@ -886,9 +886,16 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         // (Standing down permanently on a not-yet-expired stale lease was how
         // an agent could wedge forever as `running` with no worker anywhere.)
         loop {
+            #[cfg(test)]
+            tests::lease_wait_test_gate(&entry.name, tests::LeaseWaitGatePoint::BeforeAcquire);
             match crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl) {
                 Ok(Ok(_)) => break,
                 Ok(Err(holder)) => {
+                    #[cfg(test)]
+                    tests::lease_wait_test_gate(
+                        &entry.name,
+                        tests::LeaseWaitGatePoint::ContendedBeforeWait,
+                    );
                     let previous_expiry = holder.expires_at;
                     tracing::warn!(
                         agent = %entry.name,
@@ -1830,6 +1837,235 @@ mod tests {
     use crate::runtime::store::FailSignalInboxStore;
     use crate::runtime::store::RunStoreFactory;
     use crate::tools::ToolRegistry;
+
+    const LEASE_WAIT_AGENT: &str = "lease-wait-status-probe";
+    const LEASE_WAIT_CHILD_ENV: &str = "CHIDORI_TEST_LEASE_WAIT_STATUS_CHILD";
+    const LEASE_WAIT_BASE_ENV: &str = "CHIDORI_TEST_LEASE_WAIT_STATUS_BASE";
+    const LEASE_WAIT_CLEANUP_ENV: &str = "CHIDORI_TEST_LEASE_WAIT_STATUS_CLEANUP";
+
+    #[derive(Clone, Copy)]
+    pub(super) enum LeaseWaitGatePoint {
+        BeforeAcquire,
+        ContendedBeforeWait,
+    }
+
+    struct LeaseWaitTestGate {
+        agent_name: String,
+        before_arrived: std::sync::mpsc::Sender<()>,
+        before_release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        contention_arrived: std::sync::mpsc::Sender<()>,
+        contention_release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        before_claimed: AtomicBool,
+        contention_claimed: AtomicBool,
+    }
+
+    static LEASE_WAIT_TEST_GATE: std::sync::OnceLock<StdMutex<Option<LeaseWaitTestGate>>> =
+        std::sync::OnceLock::new();
+
+    pub(super) fn lease_wait_test_gate(agent_name: &str, point: LeaseWaitGatePoint) {
+        let gates = LEASE_WAIT_TEST_GATE.get_or_init(|| StdMutex::new(None));
+        let gates = gates.lock().unwrap();
+        let Some(gates) = gates
+            .as_ref()
+            .filter(|gates| gates.agent_name == agent_name)
+        else {
+            return;
+        };
+        let (claimed, arrived, release) = match point {
+            LeaseWaitGatePoint::BeforeAcquire => (
+                &gates.before_claimed,
+                &gates.before_arrived,
+                &gates.before_release,
+            ),
+            LeaseWaitGatePoint::ContendedBeforeWait => (
+                &gates.contention_claimed,
+                &gates.contention_arrived,
+                &gates.contention_release,
+            ),
+        };
+        if claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = arrived.send(());
+        release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(20))
+            .expect("lease-wait test gate timed out");
+    }
+
+    fn install_lease_wait_test_gate(
+        agent_name: &str,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (before_arrived_tx, before_arrived_rx) = std::sync::mpsc::channel();
+        let (before_release_tx, before_release_rx) = std::sync::mpsc::channel();
+        let (contention_arrived_tx, contention_arrived_rx) = std::sync::mpsc::channel();
+        let (contention_release_tx, contention_release_rx) = std::sync::mpsc::channel();
+        *LEASE_WAIT_TEST_GATE
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap() = Some(LeaseWaitTestGate {
+            agent_name: agent_name.to_string(),
+            before_arrived: before_arrived_tx,
+            before_release: StdMutex::new(before_release_rx),
+            contention_arrived: contention_arrived_tx,
+            contention_release: StdMutex::new(contention_release_rx),
+            before_claimed: AtomicBool::new(false),
+            contention_claimed: AtomicBool::new(false),
+        });
+        (
+            before_arrived_rx,
+            before_release_tx,
+            contention_arrived_rx,
+            contention_release_tx,
+        )
+    }
+
+    #[test]
+    fn detached_status_is_not_live_while_supervisor_waits_for_lease() {
+        const TEST: &str = "runtime::host_agent::tests::detached_status_is_not_live_while_supervisor_waits_for_lease";
+        if std::env::var_os(LEASE_WAIT_CHILD_ENV).is_some() {
+            let base = PathBuf::from(std::env::var_os(LEASE_WAIT_BASE_ENV).unwrap());
+            let run_base = base.join(".chidori/runs");
+            let source = base.join("services/lease-wait.ts");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(
+                &source,
+                r#"export async function agent() {
+                    await chidori.tool("executionMarker", {});
+                    await chidori.signal("never");
+                }"#,
+            )
+            .unwrap();
+
+            let (before_arrived, before_release, contention_arrived, contention_release) =
+                install_lease_wait_test_gate(LEASE_WAIT_AGENT);
+            let (execution_tx, execution_rx) = std::sync::mpsc::channel();
+            let mut tools = ToolRegistry::new();
+            tools.register_native(
+                "executionMarker",
+                "test execution marker",
+                Vec::new(),
+                move |_| {
+                    execution_tx.send(()).map_err(|err| anyhow::anyhow!(err))?;
+                    Ok(json!({ "entered": true }))
+                },
+            );
+            let parts = sqlite_test_parts(&base, run_base.clone(), Arc::new(tools));
+            let spawned = hub()
+                .spawn(
+                    &parts,
+                    source.to_str().unwrap(),
+                    json!({}),
+                    &SpawnOptions {
+                        name: Some(LEASE_WAIT_AGENT.to_string()),
+                        restart: "resume".to_string(),
+                        max_restarts: 0,
+                        backoff_ms: 0,
+                        model: None,
+                    },
+                    "lease-wait-test-owner".to_string(),
+                )
+                .unwrap();
+
+            before_arrived
+                .recv_timeout(Duration::from_secs(10))
+                .expect("supervisor did not reach pre-acquire gate");
+            let run_id = spawned["runId"].as_str().unwrap();
+            let store = RunStoreFactory::shared(&run_base).store_for(run_id);
+            crate::runtime::store::acquire_lease(
+                store.as_ref(),
+                "other-process-and-run",
+                chrono::Duration::minutes(5),
+            )
+            .unwrap()
+            .expect("test fixture must acquire the seeded lease");
+            before_release.send(()).unwrap();
+            contention_arrived
+                .recv_timeout(Duration::from_secs(10))
+                .expect("supervisor did not report actual lease contention");
+
+            let observed = hub().status(&parts, LEASE_WAIT_AGENT).unwrap();
+            let execution_marker_empty = matches!(
+                execution_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            );
+
+            // Stop before opening the contended path so the real stop-aware
+            // loop exits immediately instead of sleeping to the lease TTL.
+            let entry = hub().ensure_entry(&parts, LEASE_WAIT_AGENT).unwrap();
+            entry.state.lock().unwrap().stop_requested = true;
+            contention_release.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut state = entry.state.lock().unwrap();
+            while state.thread_live {
+                let now = std::time::Instant::now();
+                assert!(now < deadline, "supervisor did not exit after stop request");
+                let (next, _) = entry
+                    .signal
+                    .wait_timeout(state, deadline.saturating_duration_since(now))
+                    .unwrap();
+                state = next;
+            }
+            std::fs::write(
+                std::env::var_os(LEASE_WAIT_CLEANUP_ENV).unwrap(),
+                "supervisor-exited-before-ttl",
+            )
+            .unwrap();
+
+            assert_eq!(observed["status"], json!("running"), "{observed}");
+            assert!(
+                execution_marker_empty,
+                "agent execution marker was already sent"
+            );
+            assert_eq!(
+                observed["live"],
+                json!(false),
+                "a supervisor waiting on another process's lease is not executing the agent: {observed}"
+            );
+            return;
+        }
+
+        let base = tempfile::tempdir().unwrap();
+        let cleanup_marker = base.path().join("cleanup-complete");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(LEASE_WAIT_CHILD_ENV, "1")
+            .env(LEASE_WAIT_BASE_ENV, base.path())
+            .env(LEASE_WAIT_CLEANUP_ENV, &cleanup_marker)
+            .env("CHIDORI_RUN_STORE", "fs")
+            .env_remove("CHIDORI_RUN_DB")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "child unexpectedly passed: {stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "a supervisor waiting on another process's lease is not executing the agent"
+            ),
+            "child failed before the intended live assertion: {stderr}"
+        );
+        assert!(
+            stderr.contains("left: Bool(true)"),
+            "expected current-main live=true Red failure: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cleanup_marker).unwrap(),
+            "supervisor-exited-before-ttl",
+            "child cleanup must complete before its expected Red assertion"
+        );
+        panic!(
+            "expected Red: child observed live=true while blocked on lease; cleanup completed without TTL sleep. Child assertion:\n{stderr}"
+        );
+    }
 
     #[test]
     fn completed_listen_requires_exact_canonical_arguments() {
