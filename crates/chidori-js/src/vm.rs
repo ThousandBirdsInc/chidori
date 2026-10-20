@@ -2614,9 +2614,23 @@ pub fn is_canonical_numeric(s: &str) -> bool {
     }
 }
 
+/// Magnitude below which `n as i64` is exact for every truncated value (2^63):
+/// the `ToInt32`/`ToUint32` fast path below reads the low 32 bits of that
+/// integer instead of reducing through `f64::rem_euclid` (a libm `fmod`
+/// call — ~250 instructions, and the dominant cost of every `>>> 0` / `| 0`
+/// on a value outside the i32 range, e.g. an LCG step).
+const INT64_EXACT: f64 = 9_223_372_036_854_775_808.0;
+
+#[inline]
 pub fn to_int32(n: f64) -> i32 {
     if !n.is_finite() || n == 0.0 {
         return 0;
+    }
+    if n.abs() < INT64_EXACT {
+        // `as i64` truncates toward zero (== `trunc`), and the i64→i32 cast
+        // keeps the low 32 bits — exactly the spec's modulo-2^32 reduction
+        // followed by the signed reinterpretation, for negatives too.
+        return (n as i64) as i32;
     }
     let n = n.trunc();
     let m = n.rem_euclid(4294967296.0);
@@ -2628,9 +2642,14 @@ pub fn to_int32(n: f64) -> i32 {
     m as i32
 }
 
+#[inline]
 pub fn to_uint32(n: f64) -> u32 {
     if !n.is_finite() || n == 0.0 {
         return 0;
+    }
+    if n.abs() < INT64_EXACT {
+        // See `to_int32`: the i64→u32 cast is the modulo-2^32 reduction.
+        return (n as i64) as u32;
     }
     let n = n.trunc();
     n.rem_euclid(4294967296.0) as u32
@@ -2705,7 +2724,13 @@ pub fn push_number_string(n: f64, out: &mut String) {
                 break;
             }
         }
-        out.push_str(std::str::from_utf8(&buf[p..]).expect("ascii digits"));
+        // Digits are ASCII by construction; pushing them as `char`s is the
+        // validation-free way to get them into a `String` without `unsafe`
+        // (the `from_utf8` check cost more than the formatting itself).
+        out.reserve(buf.len() - p);
+        for &d in &buf[p..] {
+            out.push(d as char);
+        }
     } else {
         out.push_str(&number_to_string(n));
     }

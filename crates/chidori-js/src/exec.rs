@@ -3342,7 +3342,13 @@ impl Vm {
         frame.stack.clear();
         frame.locals.clear();
         for cell in frame.cells.drain(..) {
-            self.recycle_cell(cell);
+            // A localized binding's slot is the shared placeholder (see
+            // `init_frame`): never poolable (its count is never 1), so skip
+            // the pool probe — this was one out-of-line call per cell per
+            // return, on every call of a function with localized bindings.
+            if !Rc::ptr_eq(&cell, &self.dummy_cell) {
+                self.recycle_cell(cell);
+            }
         }
         frame.this = Value::Undefined;
         frame.new_target = Value::Undefined;
@@ -4139,6 +4145,7 @@ impl Vm {
         }
     }
 
+    #[inline]
     fn const_val(&self, frame: &Frame, idx: u32) -> Value {
         match &frame.func.proto.consts[idx as usize] {
             Const::Undefined => Value::Undefined,
@@ -8919,7 +8926,7 @@ fn dense_index(i: f64) -> Option<usize> {
 /// `Number`, or a valid-index non-BigInt typed-array element (a valid-index
 /// [[Get]] reads element storage directly — own props and the prototype
 /// chain are never consulted).
-#[inline]
+#[inline(always)]
 pub(crate) fn kernel_elem_load(objs: &[JsObject], obj: usize, i: f64) -> Option<f64> {
     let iu = dense_index(i)?;
     let b = objs[obj].borrow();
@@ -8928,13 +8935,18 @@ pub(crate) fn kernel_elem_load(objs: &[JsObject], obj: usize, i: f64) -> Option<
             Some(Value::Number(n)) => Some(*n),
             _ => None,
         },
-        Internal::TypedArray(t)
-            if !t.kind.is_bigint() && iu < crate::typed_array::ta_eff_length(t) =>
-        {
-            let off = t.byte_offset + iu * t.kind.bytes();
+        Internal::TypedArray(t) if !t.kind.is_bigint() => {
+            // ONE borrow of the backing buffer serves both the effective-
+            // length bound (`ta_eff_length` re-borrowed it) and the byte
+            // read — this arm is the whole inner loop of byte-codec
+            // workloads, where the second `RefCell` round-trip per element
+            // was ~7% of the instructions.
             let buf = t.buffer.borrow();
             match &buf.internal {
-                Internal::ArrayBuffer(Some(bytes)) => {
+                Internal::ArrayBuffer(Some(bytes))
+                    if iu < crate::typed_array::ta_eff_length_in(t, bytes.len()) =>
+                {
+                    let off = t.byte_offset + iu * t.kind.bytes();
                     Some(crate::typed_array::decode(bytes, off, t.kind))
                 }
                 _ => None,
@@ -8949,7 +8961,7 @@ pub(crate) fn kernel_elem_load(objs: &[JsObject], obj: usize, i: f64) -> Option<
 /// end APPEND (both require extensibility and the dense bound — see the
 /// interpreter arm's comment), or a valid-index non-BigInt typed-array write
 /// (`encode` applies the per-kind conversion). `false` = bail.
-#[inline]
+#[inline(always)]
 pub(crate) fn kernel_elem_store(objs: &[JsObject], obj: usize, i: f64, val: f64) -> bool {
     let Some(iu) = dense_index(i) else {
         return false;
@@ -8982,14 +8994,15 @@ pub(crate) fn kernel_elem_store(objs: &[JsObject], obj: usize, i: f64, val: f64)
                 }
             }
         },
-        Internal::TypedArray(t)
-            if !t.kind.is_bigint() && iu < crate::typed_array::ta_eff_length(t) =>
-        {
-            let off = t.byte_offset + iu * t.kind.bytes();
+        Internal::TypedArray(t) if !t.kind.is_bigint() => {
+            // Single buffer borrow for bound + write (see `kernel_elem_load`).
             let kind = t.kind;
             let mut buf = t.buffer.borrow_mut();
             match &mut buf.internal {
-                Internal::ArrayBuffer(Some(bytes)) => {
+                Internal::ArrayBuffer(Some(bytes))
+                    if iu < crate::typed_array::ta_eff_length_in(t, bytes.len()) =>
+                {
+                    let off = t.byte_offset + iu * kind.bytes();
                     crate::typed_array::encode(bytes, off, kind, val);
                     true
                 }
@@ -9003,7 +9016,7 @@ pub(crate) fn kernel_elem_store(objs: &[JsObject], obj: usize, i: f64, val: f64)
 /// `.length` fast path: dense array length (unshadowed only) or typed-array
 /// effective length (any kind — the entry guard verified the canonical
 /// accessor resolution for typed-array bases). `None` = bail.
-#[inline]
+#[inline(always)]
 pub(crate) fn kernel_elem_len(objs: &[JsObject], obj: usize) -> Option<f64> {
     let b = objs[obj].borrow();
     match &b.internal {
@@ -9054,28 +9067,50 @@ pub(crate) fn kernel_array_pop(objs: &[JsObject], obj: usize) -> Option<f64> {
     None
 }
 
+/// `%` on Numbers. `inline(always)`: the integer fast path below is the
+/// whole op for loop counters and hash/checksum idioms (`i % 3`,
+/// `(a + x) % 65521`), and out of line it cost a call plus ~70 instructions
+/// per `%` — 22% of `checksum`'s and 27% of `arith_loop`'s totals; only the
+/// non-integral fallback pays the libm `fmod` call.
+#[inline(always)]
 fn js_mod(a: f64, b: f64) -> f64 {
+    // Fast path: both operands integral and exactly representable (|x| <=
+    // 2^53) and b != 0 — the loop-counter case. Integer remainder matches
+    // libm fmod on integers (truncated division, sign of the dividend),
+    // except that a zero result must carry the dividend's sign (-6 % 3 is
+    // -0 in JS, as fmod also returns); restore that explicitly.
+    //
+    // Integrality via cast round-trip (no libm trunc): within ±2^53 the
+    // i64 cast is exact, so equality holds iff the value is integral. NaN
+    // casts to 0 and ±Infinity saturate, neither of which round-trips, so
+    // every non-finite operand (and a ±0 divisor, whose integer form is 0)
+    // falls through to the spec cases in `js_mod_slow`.
+    const MAX_EXACT: i64 = 9_007_199_254_740_992; // 2^53
+    let (ai, bi) = (a as i64, b as i64);
+    if ai as f64 == a
+        && bi as f64 == b
+        && bi != 0
+        && ai.unsigned_abs() <= MAX_EXACT as u64
+        && bi.unsigned_abs() <= MAX_EXACT as u64
+    {
+        let r = ai % bi;
+        if r == 0 {
+            return if a.is_sign_negative() { -0.0 } else { 0.0 };
+        }
+        return r as f64;
+    }
+    js_mod_slow(a, b)
+}
+
+/// The spec special cases and the libm `fmod` fallback of [`js_mod`].
+#[cold]
+#[inline(never)]
+fn js_mod_slow(a: f64, b: f64) -> f64 {
     if b == 0.0 || a.is_nan() || b.is_nan() || a.is_infinite() {
         f64::NAN
     } else if b.is_infinite() || a == 0.0 {
         a
     } else {
-        // Fast path: both operands integral and exactly representable (|x| <=
-        // 2^53) — the loop-counter case. Integer remainder matches libm fmod on
-        // integers (truncated division, sign of the dividend), except that a
-        // zero result must carry the dividend's sign (-6 % 3 is -0 in JS, as
-        // fmod also returns); restore that explicitly.
-        const MAX_EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
-                                                        // Integrality via cast round-trip (no libm trunc): within ±2^53 the
-                                                        // i64 cast is exact, so equality holds iff the value is integral.
-        let (ai, bi) = (a as i64, b as i64);
-        if ai as f64 == a && bi as f64 == b && a.abs() <= MAX_EXACT && b.abs() <= MAX_EXACT {
-            let r = ai % bi;
-            if r == 0 {
-                return if a.is_sign_negative() { -0.0 } else { 0.0 };
-            }
-            return r as f64;
-        }
         a % b
     }
 }
@@ -9713,6 +9748,13 @@ fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {
 /// The raw `f64` form of [`number_arith`] — shared with the typed loop
 /// kernels (`kernel.rs` / [`Vm::run_kernel_op`]) so kernel arithmetic is
 /// bit-identical to the interpreter's Number×Number paths by construction.
+/// `inline(always)`: every caller is a hot dispatch arm (the kernel tiers'
+/// `Arith`/`ArithK` and their fused forms, the register tier's `Arith`)
+/// where `kind` is the op's own immediate. Out of line this was a call plus
+/// a second switch on every kernel arithmetic op — ~45% of `arith_loop`'s
+/// instructions and ~28% of `checksum`'s; inlined, the switch sits in the
+/// arm and the cheap kinds (`Sub`/`Mul`/`Div`/bitwise) are one instruction.
+#[inline(always)]
 pub(crate) fn number_arith_raw(x: f64, y: f64, kind: ArithKind) -> f64 {
     use crate::vm::{to_int32, to_uint32};
     match kind {

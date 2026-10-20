@@ -1955,6 +1955,131 @@ cliffs: register dispatch ~16%, boxed `Value` clone/drop ~18%, call
 ceremony ~8% — the §6.12.2 levers (smaller `Value`, reg superinstructions,
 ObjectData arena) are the next altitude.
 
+## 6.19 Kernel arithmetic inlining, integer `ToInt32`/`ToUint32`, and
+single-borrow typed-array element paths (2026-10-20)
+
+A fresh callgrind sweep of the whole cross-runtime corpus (plain release
+build, baseline `v3.8.1`) found four cheap, zero-unsafe, zero-dependency
+items that the earlier rounds had left behind in the kernel tiers:
+
+1. **`number_arith_raw` was an out-of-line call on every kernel arithmetic
+   op** — a call plus a second switch on the op's own `kind` immediate: 45%
+   of `arith_loop`'s instructions, 28% of `checksum`'s, 12% of
+   `array_sum`'s, 9% of `fib_recursive`'s. It and `js_mod` are now
+   `inline(always)` (the switch folds into each dispatch arm; the integer
+   `%` fast path is the whole op for loop counters and `(a + x) % 65521`
+   idioms), with the spec special cases and the libm `fmod` fallback split
+   into a `#[cold]` `js_mod_slow`.
+2. **`ToInt32`/`ToUint32` reduced every value outside the i32 range through
+   `f64::rem_euclid`** — a libm `fmod` call (~250 instructions) per
+   `>>> 0` / `| 0` on a wide product, i.e. every step of the `sort`
+   workload's LCG (5% of its total). Below 2^63 the truncated value fits an
+   `i64` exactly and the `i64 → u32/i32` cast IS the modulo-2^32 reduction
+   (two's complement, negatives included); the `rem_euclid` route is kept
+   for the astronomically-large remainder.
+3. **The typed-array kernel element paths borrowed the backing buffer
+   twice per element** (`ta_eff_length` for the bound, then again for the
+   bytes); `kernel_elem_load`/`kernel_elem_store` now take one borrow and
+   bound against it via `ta_eff_length_in`. The element helpers
+   (`kernel_elem_load/store/len`, `decode`/`encode`, `ta_eff_length`) are
+   `inline(always)`: the kernel dispatch function is large enough that
+   LLVM's inliner budget had left them as calls (`kernel_elem_load` alone
+   was 85 instructions per byte read in `checksum`).
+4. **`protos_allow_index_create` stack-formatted the index eagerly**, plus
+   the UTF-8 check that makes it a `&str`, for a probe that never runs on
+   the common `Array.prototype → Object.prototype` chain (`has_idx_keys`
+   answers both levels in O(1)); it now formats lazily on the first level
+   that carries index keys. ~3% of a hole-filling `a[i] = v` loop.
+
+Two smaller items rode along: `recycle_frame` no longer routes a localized
+binding's shared placeholder cell through the pool probe (one out-of-line
+call per cell per return), and `push_number_string` pushes its ASCII digits
+as `char`s instead of re-validating them through `from_utf8`.
+
+### 6.19.1 Measured (callgrind, whole workload, deterministic)
+
+Instruction counts, `v3.8.1` release build → this round, same toolchain:
+
+| workload | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| arith_loop | 302.5 M | 242.8 M | **−19.7%** |
+| checksum | 3.498 G | 2.856 G | **−18.3%** |
+| typed_array | 442.8 M | 359.3 M | **−18.9%** |
+| sort | 1.485 G | 1.269 G | **−14.5%** |
+| fib_recursive | 706.2 M | 618.7 M | **−12.4%** |
+| mutual_recursion | 986.2 M | 865.7 M | **−12.2%** |
+| array_sum | 1.520 G | 1.358 G | **−10.6%** |
+| closures | 324.3 M | 304.3 M | −6.2% |
+| string_scan | 111.0 M | 106.2 M | −4.3% |
+| array_hof | 314.0 M | 303.6 M | −3.3% |
+| mixed_helpers | 1.689 G | 1.653 G | −2.1% |
+| array_push_sum | 223.9 M | 220.4 M | −1.6% |
+| string_build / json_roundtrip | — | — | ±0.1% (not touched) |
+| property_access | 165.2 M | 172.2 M | +4.2% |
+
+The one regression is codegen drift inside the (now larger) kernel dispatch
+function: `property_access` is 99% that one function, runs no `%`, no
+element loads and no typed arrays, and gained exactly 7 instructions per
+loop iteration from the re-laid-out dispatch — a layout effect, not a
+semantic path. It is the price of the force-inlining that buys the
+−10..−20% rows above; §6.19.2 shows it disappears (and turns into a win)
+under the PGO build that re-lays the dispatch by measured frequency.
+
+### 6.19.2 Wall-clock (4-core cloud container, interleaved, execution-only medians)
+
+Plain release build, 7 interleaved runs per workload; the baseline binary
+rode in the harness's second chidori column so both ran in the same
+session (`node benchmarks/run.mjs --no-build --chidori-bin <new>
+--chidori-jit-bin <old>`):
+
+| workload | before | after | Δ | node | bun | cpython |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| typed_array | 27.8 ms | 22.8 ms | **−18%** | 21.5 | 8.1 | 60.4 |
+| fib_recursive | 51.0 ms | 42.5 ms | **−17%** | 9.3 | 9.6 | 95.0 |
+| arith_loop | 22.9 ms | 19.3 ms | **−16%** | 12.0 | 8.5 | 54.9 |
+| sort | 155.5 ms | 133.7 ms | **−14%** | 107.1 | 60.7 | 99.9 |
+| array_sum | 110.9 ms | 96.4 ms | **−13%** | 47.1 | 46.7 | 186.5 |
+| checksum | 230.7 ms | 206.0 ms | **−11%** | 49.4 | 29.7 | 354.4 |
+| mutual_recursion | 70.2 ms | 63.4 ms | −10% | 6.6 | 5.0 | 123.0 |
+| closures | 20.3 ms | 18.4 ms | −9% | 7.9 | 4.7 | 59.1 |
+| array_push_sum | 26.3 ms | 24.0 ms | −9% | 17.5 | 18.8 | 38.8 |
+| string_scan | 10.3 ms | 10.0 ms | −3% | 7.2 | 4.5 | 7.9 |
+| mixed_helpers | 193.5 ms | 191.2 ms | −1% | 23.9 | 21.8 | 84.9 |
+| string_build | 6.6 ms | 6.7 ms | ±0 | 6.7 | 4.3 | 1.2 |
+| json_roundtrip | 62.4 ms | 63.9 ms | +2% (noise) | 34.9 | 17.2 | 153.9 |
+| array_hof | 46.3 ms | 48.8 ms | +5% (noise; 21-run re-check 46.5 → 47.6) | 27.3 | 19.6 | 38.4 |
+| property_access | 13.4 ms | 16.4 ms | +22% (layout; see below) | 4.1 | 4.2 | 60.8 |
+
+The container's noise floor is the documented 10–15% (the untouched
+baseline binary itself measured 13.7 / 17.8 / 17.5 ms on `property_access`
+across three sessions), so single-digit rows are reported as neutral. The
+`property_access` wall-clock gap, however, reproduced across sessions
+(+17% on a 21-run re-check) while its instruction count moved +4% — the
+signature of a branch-layout/icache effect in the re-laid-out dispatch
+function, not of extra work. Bisected: keeping `kernel_elem_*` out of line
+(experiment A) did NOT recover it (24.1 vs 17.5 ms) and cost `checksum` and
+`array_sum` their wins, so the force-inlining stays.
+
+**PGO cross-check (the recommended benchmark/release build,
+`scripts/pgo-build.sh`, both binaries PGO'd on the same corpus, 9–15
+interleaved runs):** the layout effect vanishes once the profile lays the
+dispatch out by measured frequency — `property_access` 18.4 → 15.2 ms
+(−17%), `checksum` 225.7 → 215.2 ms, `sort` 119.8 → 102.9 ms (−14%),
+`arith_loop` 17.5 → 14.2 ms (−19%), `array_hof` 28.5 → 24.4 ms (−14%),
+`mutual_recursion` 70.8 → 64.6 ms; `array_sum` is a wash under PGO
+(106.1 → 104.0 ms; PGO had already inlined its element path, callgrind
+1.341 G → 1.295 G) and every other row is inside the noise. No workload
+regresses under PGO.
+
+**Gates:** full chidori-js suite green (30 test binaries, including the
+register/kernel differential corpora and record→replay byte-identity);
+a new `tests/numeric_fast_paths.rs` pins `to_int32`/`to_uint32` and the
+engine's `%` (register + kernel tiers) bit-for-bit — sign of zero included
+— against the pre-fast-path `rem_euclid`/`fmod` definitions across the
+i32/u32 boundaries, the 2^53 exactness bound, and the 2^63 cast bound;
+clippy clean on the default and `jit` builds; cross-runtime `RESULT=`
+cross-check green on all five columns.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

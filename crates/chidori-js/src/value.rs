@@ -944,10 +944,14 @@ fn fmt_index(idx: u32, buf: &mut [u8; 10]) -> &str {
 /// write. The hot dense-array write fast paths call this before creating;
 /// anything else declines to the generic path.
 pub fn protos_allow_index_create(proto: Option<JsObject>, idx: u32, count: u32) -> bool {
-    // Stack-format the first index once — the common `count == 1` case
-    // (a push of one element, one `a[i] = v` store) reuses it at every level.
+    // The index is stack-formatted LAZILY, on the first level that actually
+    // carries index keys: the overwhelmingly common chain (`Array.prototype`
+    // → `Object.prototype`, neither with a reified index) answers from the
+    // `has_idx_keys` flags alone, and formatting the digits (plus the UTF-8
+    // check that turns them into a `&str`) was ~3% of a hole-filling
+    // `a[i] = v` loop's instructions for a probe that never ran.
     let mut buf = [0u8; 10];
-    let first = fmt_index(idx, &mut buf);
+    let mut first: Option<&str> = None;
     let mut cur = proto;
     while let Some(p) = cur {
         let b = p.borrow();
@@ -960,6 +964,14 @@ pub fn protos_allow_index_create(proto: Option<JsObject>, idx: u32, count: u32) 
         // `has_idx_keys` is exact: a level with no index-keyed own props
         // cannot contain the specific probes below.
         if b.has_idx_keys() {
+            let first = match first {
+                Some(f) => f,
+                None => {
+                    let f = fmt_index(idx, &mut buf);
+                    first = Some(f);
+                    f
+                }
+            };
             if b.own_contains_key(&StrKeyRef(first)) {
                 return false;
             }
