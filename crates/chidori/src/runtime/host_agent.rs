@@ -165,6 +165,9 @@ struct AgentState {
     /// The live iteration's context while a supervision thread is running —
     /// the address live sends enqueue into (durably, through the ctx store).
     live_ctx: Option<RuntimeContext>,
+    /// Whether the worker is inside agent execution. `thread_live` also covers
+    /// lifecycle work such as waiting for a lease.
+    execution_active: bool,
     thread_live: bool,
     /// A matching delivery can arrive after hibernation releases its lease but
     /// before the current supervisor thread has returned. The thread wrapper
@@ -247,6 +250,7 @@ impl DetachedAgentHub {
             state: Mutex::new(AgentState {
                 descriptor,
                 live_ctx: None,
+                execution_active: false,
                 thread_live: false,
                 wake_pending: false,
                 stop_requested: false,
@@ -363,6 +367,7 @@ impl DetachedAgentHub {
             state: Mutex::new(AgentState {
                 descriptor,
                 live_ctx: None,
+                execution_active: false,
                 thread_live: false,
                 wake_pending: false,
                 stop_requested: false,
@@ -407,6 +412,7 @@ impl DetachedAgentHub {
                 let wake_pending = {
                     let mut state = entry.state.lock().unwrap();
                     state.thread_live = false;
+                    state.execution_active = false;
                     state.live_ctx = None;
                     let wake_pending = std::mem::take(&mut state.wake_pending)
                         && state.descriptor.status == "running"
@@ -603,9 +609,9 @@ impl DetachedAgentHub {
         let mut status = state.descriptor.status_json();
         // The descriptor is durable state; `live` is the truth about THIS
         // process: whether a worker thread is actually executing the agent
-        // right now. `status: "running", live: false` means the driver died
-        // and the reconciler will re-drive it — not that work is happening.
-        status["live"] = json!(state.thread_live);
+        // right now. A supervisor can have a live OS thread while waiting for
+        // another process's lease, so thread existence is tracked separately.
+        status["live"] = json!(state.execution_active);
         Ok(status)
     }
 
@@ -888,7 +894,18 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         let lease = loop {
             #[cfg(test)]
             tests::lease_wait_test_gate(&entry.name, tests::LeaseWaitGatePoint::BeforeAcquire);
-            match crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl) {
+            #[cfg(test)]
+            let acquisition = if tests::fail_next_lease_acquire(&entry.name) {
+                Err(anyhow::anyhow!(
+                    "injected detached lease acquisition failure"
+                ))
+            } else {
+                crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl)
+            };
+            #[cfg(not(test))]
+            let acquisition =
+                crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl);
+            match acquisition {
                 Ok(Ok(lease)) => {
                     #[cfg(test)]
                     tests::pause_stale_owner_after_lease_acquired(&entry.name);
@@ -957,13 +974,22 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         tracing::warn!(agent = %entry.name, "SQLite run lease was not acquired; refusing to execute without ownership");
         return;
     }
+    {
+        let mut state = entry.state.lock().unwrap();
+        state.execution_active = true;
+    }
     let _heartbeat = active_lease
         .as_ref()
         .filter(|_| lease_store.supports_lease_fencing())
         .map(|lease| LeaseHeartbeat::start(lease_store.clone(), lease.clone(), lease_ttl));
-    let settle_run =
-        |status, output, error| settle(hub, entry, status, output, error, active_lease.as_ref());
-    let hibernate_run = |listen| hibernate(hub, entry, listen, active_lease.as_ref());
+    let settle_run = |status, output, error| {
+        entry.state.lock().unwrap().execution_active = false;
+        settle(hub, entry, status, output, error, active_lease.as_ref())
+    };
+    let hibernate_run = |listen| {
+        entry.state.lock().unwrap().execution_active = false;
+        hibernate(hub, entry, listen, active_lease.as_ref())
+    };
 
     loop {
         // SQLite runs use the independent heartbeat above during long host
@@ -1989,6 +2015,9 @@ mod tests {
     const LEASE_WAIT_CHILD_ENV: &str = "CHIDORI_TEST_LEASE_WAIT_STATUS_CHILD";
     const LEASE_WAIT_BASE_ENV: &str = "CHIDORI_TEST_LEASE_WAIT_STATUS_BASE";
     const LEASE_WAIT_CLEANUP_ENV: &str = "CHIDORI_TEST_LEASE_WAIT_STATUS_CLEANUP";
+    const LEASE_ACQUIRE_ERROR_CHILD_ENV: &str = "CHIDORI_TEST_LEASE_ACQUIRE_ERROR_CHILD";
+    const LEASE_ACQUIRE_ERROR_BASE_ENV: &str = "CHIDORI_TEST_LEASE_ACQUIRE_ERROR_BASE";
+    const LEASE_ACQUIRE_ERROR_AGENT_NAME: &str = "sqlite-acquire-error-probe";
     const SQLITE_STALE_CHILD_ENV: &str = "CHIDORI_TEST_SQLITE_STALE_OWNER_CHILD";
     const SQLITE_STALE_BASE_ENV: &str = "CHIDORI_TEST_SQLITE_STALE_OWNER_BASE";
     const SQLITE_STALE_CONTROL_ENV: &str = "CHIDORI_TEST_SQLITE_STALE_OWNER_CONTROL";
@@ -2077,6 +2106,26 @@ mod tests {
 
     static LEASE_WAIT_TEST_GATE: std::sync::OnceLock<StdMutex<Option<LeaseWaitTestGate>>> =
         std::sync::OnceLock::new();
+    static LEASE_ACQUIRE_ERROR_AGENT: std::sync::OnceLock<StdMutex<Option<String>>> =
+        std::sync::OnceLock::new();
+
+    pub(super) fn fail_next_lease_acquire(agent_name: &str) -> bool {
+        let slot = LEASE_ACQUIRE_ERROR_AGENT.get_or_init(|| StdMutex::new(None));
+        let mut slot = slot.lock().unwrap();
+        if slot.as_deref() == Some(agent_name) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn inject_lease_acquire_error(agent_name: &str) {
+        *LEASE_ACQUIRE_ERROR_AGENT
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap() = Some(agent_name.to_string());
+    }
 
     pub(super) fn lease_wait_test_gate(agent_name: &str, point: LeaseWaitGatePoint) {
         let gates = LEASE_WAIT_TEST_GATE.get_or_init(|| StdMutex::new(None));
@@ -2260,26 +2309,107 @@ mod tests {
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            !output.status.success(),
-            "child unexpectedly passed: {stderr}"
-        );
-        assert!(
-            stderr.contains(
-                "a supervisor waiting on another process's lease is not executing the agent"
-            ),
-            "child failed before the intended live assertion: {stderr}"
-        );
-        assert!(
-            stderr.contains("left: Bool(true)"),
-            "expected current-main live=true Red failure: {stderr}"
+            output.status.success(),
+            "lease-wait status child failed: {stderr}"
         );
         assert_eq!(
             std::fs::read_to_string(cleanup_marker).unwrap(),
             "supervisor-exited-before-ttl",
-            "child cleanup must complete before its expected Red assertion"
+            "child must stop its waiting supervisor before the lease TTL"
         );
-        panic!(
-            "expected Red: child observed live=true while blocked on lease; cleanup completed without TTL sleep. Child assertion:\n{stderr}"
+    }
+
+    #[test]
+    fn sqlite_supervisor_fails_closed_when_lease_acquisition_errors() {
+        const TEST: &str =
+            "runtime::host_agent::tests::sqlite_supervisor_fails_closed_when_lease_acquisition_errors";
+        if std::env::var_os(LEASE_ACQUIRE_ERROR_CHILD_ENV).is_some() {
+            let base = PathBuf::from(std::env::var_os(LEASE_ACQUIRE_ERROR_BASE_ENV).unwrap());
+            let run_base = base.join(".chidori/runs");
+            let source = base.join("services/acquire-error.ts");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(
+                &source,
+                r#"export async function agent() {
+                    await chidori.tool("executionMarker", {});
+                }"#,
+            )
+            .unwrap();
+
+            let (execution_tx, execution_rx) = std::sync::mpsc::channel();
+            let mut tools = ToolRegistry::new();
+            tools.register_native(
+                "executionMarker",
+                "test execution marker",
+                Vec::new(),
+                move |_| {
+                    execution_tx.send(()).map_err(|err| anyhow::anyhow!(err))?;
+                    Ok(json!({ "entered": true }))
+                },
+            );
+            let parts = sqlite_test_parts(&base, run_base, Arc::new(tools));
+            inject_lease_acquire_error(LEASE_ACQUIRE_ERROR_AGENT_NAME);
+            hub()
+                .spawn(
+                    &parts,
+                    source.to_str().unwrap(),
+                    json!({}),
+                    &SpawnOptions {
+                        name: Some(LEASE_ACQUIRE_ERROR_AGENT_NAME.to_string()),
+                        restart: "resume".to_string(),
+                        max_restarts: 0,
+                        backoff_ms: 0,
+                        model: None,
+                    },
+                    "lease-acquire-error-test-owner".to_string(),
+                )
+                .unwrap();
+
+            let entry = hub()
+                .ensure_entry(&parts, LEASE_ACQUIRE_ERROR_AGENT_NAME)
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut state = entry.state.lock().unwrap();
+            while state.thread_live {
+                let now = std::time::Instant::now();
+                assert!(now < deadline, "supervisor did not stop after lease error");
+                let (next, _) = entry
+                    .signal
+                    .wait_timeout(state, deadline.saturating_duration_since(now))
+                    .unwrap();
+                state = next;
+            }
+            drop(state);
+
+            assert!(
+                matches!(
+                    execution_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "SQLite-capable supervisor executed without a lease token"
+            );
+            assert_eq!(
+                hub()
+                    .status(&parts, LEASE_ACQUIRE_ERROR_AGENT_NAME)
+                    .unwrap()["live"],
+                json!(false)
+            );
+            return;
+        }
+
+        let base = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(LEASE_ACQUIRE_ERROR_CHILD_ENV, "1")
+            .env(LEASE_ACQUIRE_ERROR_BASE_ENV, base.path())
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env_remove("CHIDORI_RUN_DB")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "SQLite lease-acquisition fail-closed child failed: {stderr}"
         );
     }
 
@@ -2812,6 +2942,7 @@ mod tests {
                     updated_at: now,
                 },
                 live_ctx: Some(ctx.clone()),
+                execution_active: true,
                 thread_live: true,
                 wake_pending: false,
                 stop_requested: false,
