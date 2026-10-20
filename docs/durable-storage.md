@@ -104,15 +104,16 @@ an argument mismatch refuses replay and cannot trigger a second live effect.
 For Unix local-filesystem blob writes under `strict` and `effect`, the store
 syncs the staged file, renames it into place, then syncs the target parent
 directory before reporting success. When a write creates parent directories,
-their containing-directory ancestry is synced before the blob is written. An
-ancestry-sync failure returns an error; because created directory entries may
-remain visible, do not assume a later retry has repeated or completed that
-barrier. A target-parent sync failure after rename also returns an error even
-though the complete replacement may already be visible; the rename is not
-rolled back. `besteffort` skips these directory barriers. On non-Unix
-platforms, `strict` and `effect` local-filesystem blob writes fail explicitly
-because directory syncing is unsupported. These rules apply to the local
-filesystem store; HTTP and S3 behavior is unchanged.
+their containing-directory ancestry is synced before the blob is written. Each
+strict/effect retry repeats this ancestry barrier before staging. If an
+ancestry sync fails, that attempt returns an error before blob staging and is
+not acknowledged; a later retry repeats the barrier, and only a successful
+sync allows the write to proceed. A target-parent sync failure after rename
+also returns an error even though the complete replacement may already be
+visible; the rename is not rolled back. `besteffort` skips these directory
+barriers. On non-Unix platforms, `strict` and `effect` local-filesystem blob
+writes fail explicitly because directory syncing is unsupported. These rules
+apply to the local filesystem store; HTTP and S3 behavior is unchanged.
 
 ## Backends
 
