@@ -2531,7 +2531,7 @@ fn cli_chat_session_persists_and_resumes() {
 #[test]
 fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
     use chidori::runtime::store::{
-        acquire_lease_with_token, RunStore, SqliteRunStore, SqliteRunStoreShared,
+        acquire_lease_with_token, FsRunStore, RunStore, SqliteRunStore, SqliteRunStoreShared,
     };
     use std::io::Write as _;
     use std::process::Stdio;
@@ -2548,14 +2548,43 @@ fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
         .expect("chat announces the durable session id");
     let run_dir = dir.join(".chidori").join("runs").join(&session_id);
     let input_path = run_dir.join("input.json");
-    let records_path = run_dir.join("records.jsonl");
-    let input_before = fs::read(&input_path).unwrap();
-    let records_before = fs::read(&records_path).unwrap();
 
     let db_path = dir.join("chat-lease.sqlite3");
     let shared = SqliteRunStoreShared::open(&db_path).unwrap();
     let store: std::sync::Arc<dyn RunStore> =
         std::sync::Arc::new(SqliteRunStore::new(shared, session_id.clone()));
+    // Seed the configured SQLite mirror with the already-existing FS run so
+    // hydration during resume does not masquerade as a lease-time mutation.
+    let fs_store = FsRunStore::new(&run_dir);
+    let initial_records = fs_store.load_call_log().unwrap().unwrap();
+    store.write_call_log(&initial_records).unwrap();
+    for key in fs_store.list_blobs().unwrap() {
+        let bytes = fs_store
+            .get_blob(&key)
+            .unwrap()
+            .expect("listed filesystem blob must be readable");
+        store.put_blob(&key, &bytes).unwrap();
+    }
+    let snapshot_blobs = |store: &dyn RunStore| {
+        store
+            .list_blobs()
+            .unwrap()
+            .into_iter()
+            .map(|key| {
+                let bytes = store
+                    .get_blob(&key)
+                    .unwrap()
+                    .expect("listed SQLite blob must be readable");
+                (key, bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    let journal_before = serde_json::to_value(store.load_call_log().unwrap().unwrap()).unwrap();
+    let blobs_before = snapshot_blobs(store.as_ref());
+    assert!(
+        blobs_before.iter().any(|(key, _)| key == "input.json"),
+        "the SQLite snapshot must include the chat input blob"
+    );
     let held = acquire_lease_with_token(
         store.as_ref(),
         "external-chat-holder",
@@ -2585,26 +2614,47 @@ fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
         .write_all(b"second message\nexit\n")
         .unwrap();
     let output = child.wait_with_output().unwrap();
-    let input_after = fs::read(&input_path).unwrap();
-    let records_after = fs::read(&records_path).unwrap();
+    let journal_after = serde_json::to_value(store.load_call_log().unwrap().unwrap()).unwrap();
+    let blobs_after = snapshot_blobs(store.as_ref());
     let lease_after = store.get_blob("lease.json").unwrap().unwrap();
+    let process_status_after = output.status;
+    let stdout_after = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr_after = String::from_utf8_lossy(&output.stderr).into_owned();
+    let diagnostic_after = format!("{stdout_after}\n{stderr_after}");
 
     // Release before assertions so a Red failure cannot leave the external
     // token held during fixture cleanup.
     chidori::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
         .unwrap();
 
-    assert_eq!(
-        input_after, input_before,
-        "a refused chat resume must not append a turn to input.json"
+    let mut observed = Vec::new();
+    if process_status_after.success() {
+        if stderr_after.contains("warning: could not take the session lease:") {
+            observed.push(
+                "chat warned that tokenless acquisition failed, then succeeded anyway".to_string(),
+            );
+        } else {
+            observed
+                .push("chat resumed successfully while the external tenure was held".to_string());
+        }
+    }
+    if !diagnostic_after.contains("external-chat-holder") {
+        observed.push("chat output did not identify the external held-lease owner".to_string());
+    }
+    if journal_after != journal_before {
+        observed.push("SQLite call journal changed during refused chat resume".to_string());
+    }
+    if blobs_after != blobs_before {
+        observed.push("SQLite session/input blobs changed during refused chat resume".to_string());
+    }
+    if lease_after != lease_before {
+        observed.push("held SQLite lease bytes changed during refused chat resume".to_string());
+    }
+    assert!(
+        !process_status_after.success() && observed.is_empty(),
+        "chat resume must fail with the held owner identified before turn execution: {}; status={process_status_after}; stdout:\n{stdout_after}\nstderr:\n{stderr_after}",
+        observed.join("; ")
     );
-    assert_eq!(
-        records_after, records_before,
-        "a refused chat resume must not append journal records"
-    );
-    assert_eq!(lease_after, lease_before);
-    assert_eq!(held.lease().owner, "external-chat-holder");
-    assert_failure(&output);
 
     let db_path_text = db_path.to_string_lossy().to_string();
     let retry_env = [
