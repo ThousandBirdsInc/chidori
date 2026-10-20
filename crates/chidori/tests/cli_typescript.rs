@@ -1616,7 +1616,7 @@ fn cli_resume_rejects_truncated_final_effect_before_live_reexecution() {
 #[test]
 fn cli_resume_uses_resolved_http_promise_when_journal_row_is_missing() {
     let server = LocalHttpServer::start();
-    let fixture = create_http_replay_fixture(&server);
+    let fixture = create_http_replay_fixture_with_mirror(&server, true);
     assert_eq!(server.request_count(), 1);
     let promise = persist_resolved_http_operation(&fixture);
     assert_eq!(promise["operation"]["seq"], 2);
@@ -1704,6 +1704,229 @@ fn cli_resume_hydrates_resolved_http_promise_from_sqlite_mirror() {
         recovered_http["result"],
         promise["state"]["resolved"]["value"]
     );
+}
+
+#[test]
+fn cli_resume_refuses_held_sqlite_tenure_before_effect_or_journal_mutation() {
+    use chidori::runtime::store::acquire_lease_with_token;
+
+    let server = LocalHttpServer::start();
+    let fixture = create_http_replay_fixture_with_mirror(&server, true);
+    assert_eq!(server.request_count(), 1);
+
+    // Leave a real completed run with its HTTP row absent and its resolved
+    // promise removed, so resume would perform the HTTP request live unless
+    // the external SQLite tenure is honored first. Remove the cached promise
+    // from both the filesystem primary and SQLite mirror so the live effect
+    // is the only possible continuation if the lease is bypassed.
+    let store = fixture_run_store(&fixture);
+    let mut records = store.load_call_log().unwrap().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].function, "http");
+    records.pop();
+    store.write_call_log(&records).unwrap();
+    store.delete_blob("host_promises/2.json").unwrap();
+    store.delete_blob("host_promises.json").unwrap();
+    let journal_before = fs::read(&fixture.records_path).unwrap();
+
+    let held = acquire_lease_with_token(
+        store.as_ref(),
+        "external-sqlite-holder",
+        chrono::Duration::minutes(10),
+    )
+    .unwrap()
+    .expect("the fixture run lease must be free before this test holds it");
+    let lease_before = store.get_blob("lease.json").unwrap().unwrap();
+    let db_path = fixture
+        .mirror_db
+        .as_ref()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let output = resume_http_fixture(
+        &fixture,
+        &[
+            ("CHIDORI_RUN_STORE", "sqlite"),
+            ("CHIDORI_RUN_DB", &db_path),
+        ],
+    );
+    // Capture every oracle before asserting, so a recovered journal row or a
+    // successful status cannot hide another sign of the lease bypass.
+    let request_count_after = server.request_count();
+    let process_status_after = output.status;
+    let stdout_after = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr_after = String::from_utf8_lossy(&output.stderr).into_owned();
+    let diagnostic_after = format!("{stdout_after}\n{stderr_after}");
+    let journal_after = fs::read(&fixture.records_path).unwrap();
+    let lease_after = store.get_blob("lease.json").unwrap().unwrap();
+    let contender_result = acquire_lease_with_token(
+        store.as_ref(),
+        "verification-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap();
+    let contender_blocked = match contender_result {
+        Err(_) => true,
+        Ok(contender_lease) => {
+            chidori::runtime::store::release_lease_with_token(
+                store.as_ref(),
+                contender_lease.lease(),
+                contender_lease.token(),
+            )
+            .unwrap();
+            false
+        }
+    };
+
+    // Release before the combined assertion so even the intended Red leaves
+    // no externally held tenure behind during fixture cleanup.
+    chidori::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
+        .unwrap();
+
+    let mut observed = Vec::new();
+    if request_count_after != 1 {
+        observed.push(format!(
+            "HTTP request count was {request_count_after}, expected 1"
+        ));
+    }
+    if process_status_after.success() {
+        observed.push(format!(
+            "resume continued instead of rejecting the held tenure (exit status: {process_status_after})"
+        ));
+    }
+    if !diagnostic_after.contains("external-sqlite-holder") {
+        observed.push(
+            "resume output did not identify the external held-lease owner; this may be an unrelated CLI failure"
+                .to_string(),
+        );
+    }
+    if journal_after != journal_before {
+        observed.push("local journal bytes changed".to_string());
+    }
+    if lease_after != lease_before {
+        observed.push("external lease bytes changed".to_string());
+    }
+    if !contender_blocked {
+        observed.push("a contender acquired while the external tenure was held".to_string());
+    }
+    assert!(
+        observed.is_empty(),
+        "held SQLite tenure must reject resume with the holder identified before effects or mutations: {}; status={process_status_after}; stdout:\n{stdout_after}\nstderr:\n{stderr_after}",
+        observed.join("; ")
+    );
+    // Once the external tenure is released, the same command must resume the
+    // run successfully. Its own fenced lease must then be available to a new
+    // contender, proving the complete CLI leg released the token it acquired.
+    let retry = resume_http_fixture(
+        &fixture,
+        &[
+            ("CHIDORI_RUN_STORE", "sqlite"),
+            ("CHIDORI_RUN_DB", &db_path),
+        ],
+    );
+    assert_eq!(server.request_count(), 2);
+    assert_success(&retry);
+    assert!(journal_records(&fixture.records_path)
+        .iter()
+        .any(|record| record["seq"] == 2 && record["function"] == "http"));
+    let post_retry = acquire_lease_with_token(
+        store.as_ref(),
+        "post-resume-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap()
+    .expect("CLI resume must release its own SQLite tenure after the leg");
+    chidori::runtime::store::release_lease_with_token(
+        store.as_ref(),
+        post_retry.lease(),
+        post_retry.token(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn cli_resume_refuses_competing_filesystem_lease() {
+    use chidori::runtime::store::{acquire_lease, release_lease};
+
+    let server = LocalHttpServer::start();
+    let fixture = create_http_replay_fixture(&server);
+    let store = fixture_run_store(&fixture);
+    let mut records = store.load_call_log().unwrap().unwrap();
+    assert_eq!(records.len(), 2);
+    records.pop();
+    store.write_call_log(&records).unwrap();
+    store.delete_blob("host_promises/2.json").unwrap();
+    store.delete_blob("host_promises.json").unwrap();
+    let journal_before = fs::read(&fixture.records_path).unwrap();
+    let held = acquire_lease(
+        store.as_ref(),
+        "external-fs-holder",
+        chrono::Duration::minutes(10),
+    )
+    .unwrap()
+    .expect("the filesystem lease must be acquirable");
+    let lease_before = store.get_blob("lease.json").unwrap().unwrap();
+
+    let output = Command::new(chidori_bin())
+        .args([
+            "resume",
+            fixture.agent.to_str().unwrap(),
+            &fixture.run_id,
+            "--trusted",
+        ])
+        .current_dir(&fixture.dir)
+        .env_remove("CHIDORI_RUN_STORE")
+        .env_remove("CHIDORI_RUN_DB")
+        .env("CHIDORI_DURABILITY", "effect")
+        .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
+        .output()
+        .unwrap();
+
+    let request_count_after = server.request_count();
+    let process_status_after = output.status;
+    let diagnostic_after = output_diagnostic(&output);
+    let journal_after = fs::read(&fixture.records_path).unwrap();
+    let lease_after = store.get_blob("lease.json").unwrap().unwrap();
+
+    // Release before checking the Red/control assertions so a failure cannot
+    // leave a known filesystem lease behind in this temporary run.
+    release_lease(store.as_ref(), &held.owner).unwrap();
+
+    assert_eq!(
+        request_count_after, 1,
+        "a sequential contender must not execute the unjournaled HTTP effect; stderr/stdout:\n{diagnostic_after}"
+    );
+    assert!(
+        !process_status_after.success(),
+        "resume must refuse the known unexpired filesystem holder; output:\n{diagnostic_after}"
+    );
+    assert!(
+        diagnostic_after.contains("external-fs-holder"),
+        "filesystem control should identify the competing holder; output:\n{diagnostic_after}"
+    );
+    assert_eq!(journal_after, journal_before);
+    assert_eq!(lease_after, lease_before);
+    assert_eq!(held.owner, "external-fs-holder");
+    assert_eq!(
+        store.load_call_log().unwrap().unwrap().len(),
+        1,
+        "refused filesystem resume must not repair the removed HTTP row"
+    );
+
+    let retry = resume_http_fixture(&fixture, &[]);
+    assert_eq!(server.request_count(), 2);
+    assert_success(&retry);
+    assert!(journal_records(&fixture.records_path)
+        .iter()
+        .any(|record| record["seq"] == 2 && record["function"] == "http"));
+    let reacquired = acquire_lease(
+        store.as_ref(),
+        "post-filesystem-resume-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap()
+    .expect("the sequential filesystem resume leg must release its lease");
+    release_lease(store.as_ref(), &reacquired.owner).unwrap();
 }
 
 #[test]
@@ -2303,6 +2526,168 @@ fn cli_chat_session_persists_and_resumes() {
     assert_success(&run_chidori(&["trace", &session_id], &dir));
 
     fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
+    use chidori::runtime::store::{
+        acquire_lease_with_token, FsRunStore, RunStore, SqliteRunStore, SqliteRunStoreShared,
+    };
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let dir = temp_project("chat-sqlite-lease");
+    let chat_env = [("CHIDORI_TEST_LLM_RESPONSE", "canned reply")];
+    let output = run_chidori_with_stdin(&["chat"], &dir, &chat_env, "first message\nexit\n");
+    assert_success(&output);
+    let session_id = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| line.starts_with("session ") && !line.starts_with("session saved"))
+        .and_then(|line| line.strip_prefix("session "))
+        .map(|rest| rest.split_whitespace().next().unwrap().to_string())
+        .expect("chat announces the durable session id");
+    let run_dir = dir.join(".chidori").join("runs").join(&session_id);
+    let input_path = run_dir.join("input.json");
+
+    let db_path = dir.join("chat-lease.sqlite3");
+    let shared = SqliteRunStoreShared::open(&db_path).unwrap();
+    let store: std::sync::Arc<dyn RunStore> =
+        std::sync::Arc::new(SqliteRunStore::new(shared, session_id.clone()));
+    // Seed the configured SQLite mirror with the already-existing FS run so
+    // hydration during resume does not masquerade as a lease-time mutation.
+    let fs_store = FsRunStore::new(&run_dir);
+    let initial_records = fs_store.load_call_log().unwrap().unwrap();
+    store.write_call_log(&initial_records).unwrap();
+    for key in fs_store.list_blobs().unwrap() {
+        let bytes = fs_store
+            .get_blob(&key)
+            .unwrap()
+            .expect("listed filesystem blob must be readable");
+        store.put_blob(&key, &bytes).unwrap();
+    }
+    let snapshot_blobs = |store: &dyn RunStore| {
+        store
+            .list_blobs()
+            .unwrap()
+            .into_iter()
+            .map(|key| {
+                let bytes = store
+                    .get_blob(&key)
+                    .unwrap()
+                    .expect("listed SQLite blob must be readable");
+                (key, bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    let journal_before = serde_json::to_value(store.load_call_log().unwrap().unwrap()).unwrap();
+    let blobs_before = snapshot_blobs(store.as_ref());
+    assert!(
+        blobs_before.iter().any(|(key, _)| key == "input.json"),
+        "the SQLite snapshot must include the chat input blob"
+    );
+    let held = acquire_lease_with_token(
+        store.as_ref(),
+        "external-chat-holder",
+        chrono::Duration::minutes(10),
+    )
+    .unwrap()
+    .expect("the chat run lease must be free before this test holds it");
+    let lease_before = store.get_blob("lease.json").unwrap().unwrap();
+
+    let mut command = Command::new(chidori_bin());
+    command
+        .args(["chat", "--resume", &session_id])
+        .current_dir(&dir)
+        .env_remove("CHIDORI_RUN_STORE")
+        .env_remove("CHIDORI_RUN_DB")
+        .env("CHIDORI_RUN_STORE", "sqlite")
+        .env("CHIDORI_RUN_DB", &db_path)
+        .env("CHIDORI_TEST_LLM_RESPONSE", "canned reply")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"second message\nexit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let journal_after = serde_json::to_value(store.load_call_log().unwrap().unwrap()).unwrap();
+    let blobs_after = snapshot_blobs(store.as_ref());
+    let lease_after = store.get_blob("lease.json").unwrap().unwrap();
+    let process_status_after = output.status;
+    let stdout_after = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr_after = String::from_utf8_lossy(&output.stderr).into_owned();
+    let diagnostic_after = format!("{stdout_after}\n{stderr_after}");
+
+    // Release before assertions so a Red failure cannot leave the external
+    // token held during fixture cleanup.
+    chidori::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
+        .unwrap();
+
+    let mut observed = Vec::new();
+    if process_status_after.success() {
+        if stderr_after.contains("warning: could not take the session lease:") {
+            observed.push(
+                "chat warned that tokenless acquisition failed, then succeeded anyway".to_string(),
+            );
+        } else {
+            observed
+                .push("chat resumed successfully while the external tenure was held".to_string());
+        }
+    }
+    if !diagnostic_after.contains("external-chat-holder") {
+        observed.push("chat output did not identify the external held-lease owner".to_string());
+    }
+    if journal_after != journal_before {
+        observed.push("SQLite call journal changed during refused chat resume".to_string());
+    }
+    if blobs_after != blobs_before {
+        observed.push("SQLite session/input blobs changed during refused chat resume".to_string());
+    }
+    if lease_after != lease_before {
+        observed.push("held SQLite lease bytes changed during refused chat resume".to_string());
+    }
+    assert!(
+        !process_status_after.success() && observed.is_empty(),
+        "chat resume must fail with the held owner identified before turn execution: {}; status={process_status_after}; stdout:\n{stdout_after}\nstderr:\n{stderr_after}",
+        observed.join("; ")
+    );
+
+    let db_path_text = db_path.to_string_lossy().to_string();
+    let retry_env = [
+        ("CHIDORI_RUN_STORE", "sqlite"),
+        ("CHIDORI_RUN_DB", db_path_text.as_str()),
+        ("CHIDORI_TEST_LLM_RESPONSE", "canned reply"),
+    ];
+    let retry = run_chidori_with_stdin(
+        &["chat", "--resume", &session_id],
+        &dir,
+        &retry_env,
+        "second message\nexit\n",
+    );
+    assert_success(&retry);
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(&input_path).unwrap()).unwrap();
+    assert_eq!(
+        input["messages"],
+        serde_json::json!(["first message", "second message"])
+    );
+    let post_retry = acquire_lease_with_token(
+        store.as_ref(),
+        "post-chat-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap()
+    .expect("chat resume must release its own SQLite tenure after the leg");
+    chidori::runtime::store::release_lease_with_token(
+        store.as_ref(),
+        post_retry.lease(),
+        post_retry.token(),
+    )
+    .unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// Total size in bytes of every regular file under `path`, recursively.
