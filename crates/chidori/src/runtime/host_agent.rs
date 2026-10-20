@@ -889,13 +889,21 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             #[cfg(test)]
             tests::lease_wait_test_gate(&entry.name, tests::LeaseWaitGatePoint::BeforeAcquire);
             match crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl) {
-                Ok(Ok(_)) => break,
+                Ok(Ok(_)) => {
+                    #[cfg(test)]
+                    tests::pause_stale_owner_after_lease_acquired(&entry.name);
+                    break;
+                }
                 Ok(Err(holder)) => {
                     #[cfg(test)]
                     tests::lease_wait_test_gate(
                         &entry.name,
                         tests::LeaseWaitGatePoint::ContendedBeforeWait,
                     );
+                    #[cfg(test)]
+                    if tests::stale_owner_retry_after_contention(&entry.name) {
+                        continue;
+                    }
                     let previous_expiry = holder.expires_at;
                     tracing::warn!(
                         agent = %entry.name,
@@ -1834,14 +1842,85 @@ mod tests {
     use crate::policy::{PolicyCache, PolicyConfig};
     use crate::providers::ProviderRegistry;
     use crate::runtime::rust_engine::run_agent;
-    use crate::runtime::store::FailSignalInboxStore;
-    use crate::runtime::store::RunStoreFactory;
+    use crate::runtime::snapshot::{load_host_promise_records, HostPromiseState};
+    use crate::runtime::store::{
+        FailSignalInboxStore, RunStore, RunStoreFactory, SqliteRunStore, SqliteRunStoreShared,
+    };
     use crate::tools::ToolRegistry;
 
     const LEASE_WAIT_AGENT: &str = "lease-wait-status-probe";
     const LEASE_WAIT_CHILD_ENV: &str = "CHIDORI_TEST_LEASE_WAIT_STATUS_CHILD";
     const LEASE_WAIT_BASE_ENV: &str = "CHIDORI_TEST_LEASE_WAIT_STATUS_BASE";
     const LEASE_WAIT_CLEANUP_ENV: &str = "CHIDORI_TEST_LEASE_WAIT_STATUS_CLEANUP";
+    const SQLITE_STALE_CHILD_ENV: &str = "CHIDORI_TEST_SQLITE_STALE_OWNER_CHILD";
+    const SQLITE_STALE_BASE_ENV: &str = "CHIDORI_TEST_SQLITE_STALE_OWNER_BASE";
+    const SQLITE_STALE_CONTROL_ENV: &str = "CHIDORI_TEST_SQLITE_STALE_OWNER_CONTROL";
+    const SQLITE_STALE_HTTP_ENV: &str = "CHIDORI_TEST_SQLITE_STALE_OWNER_HTTP";
+    const SQLITE_STALE_AGENT: &str = "sqlite-stale-owner-probe";
+    const SQLITE_STALE_TEST: &str =
+        "runtime::host_agent::tests::detached_sqlite_expired_live_owner_cannot_write_or_start_next_effect";
+
+    fn sqlite_stale_control_wait(event: &str) -> u8 {
+        let address = std::env::var(SQLITE_STALE_CONTROL_ENV)
+            .expect("missing SQLite stale-owner control address");
+        let mut stream = std::net::TcpStream::connect(address)
+            .expect("connect to SQLite stale-owner test controller");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        use std::io::{Read, Write};
+        writeln!(stream, "{event}").expect("announce SQLite stale-owner test event");
+        let mut release = [0u8; 1];
+        stream
+            .read_exact(&mut release)
+            .expect("wait for SQLite stale-owner test release");
+        release[0]
+    }
+
+    pub(super) fn stale_owner_retry_after_contention(agent_name: &str) -> bool {
+        if agent_name != SQLITE_STALE_AGENT
+            || std::env::var(SQLITE_STALE_CHILD_ENV).as_deref() != Ok("b")
+        {
+            return false;
+        }
+        sqlite_stale_control_wait("B_CONTENDED") == b'R'
+    }
+
+    pub(super) fn pause_stale_owner_after_lease_acquired(agent_name: &str) {
+        if agent_name == SQLITE_STALE_AGENT
+            && std::env::var(SQLITE_STALE_CHILD_ENV).as_deref() == Ok("b")
+        {
+            let release =
+                sqlite_stale_control_wait(&format!("B_ACQUIRED {}", process_lease_owner()));
+            assert_eq!(release, b'G', "unexpected B acquire barrier release");
+        }
+    }
+
+    fn stale_owner_wait_event(
+        events: &std::sync::mpsc::Receiver<(String, std::net::TcpStream)>,
+        expected: &str,
+    ) -> std::net::TcpStream {
+        let (event, stream) = events
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|err| panic!("timed out waiting for {expected}: {err}"));
+        assert_eq!(event, expected, "unexpected stale-owner barrier event");
+        stream
+    }
+
+    fn stale_owner_release(mut stream: std::net::TcpStream, value: u8) {
+        use std::io::Write;
+        stream.write_all(&[value]).unwrap();
+    }
+
+    fn stale_owner_lease(store: &dyn RunStore) -> Value {
+        serde_json::from_slice(
+            &store
+                .get_blob(crate::runtime::store::LEASE_FILE)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    }
 
     #[derive(Clone, Copy)]
     pub(super) enum LeaseWaitGatePoint {
@@ -2784,6 +2863,438 @@ mod tests {
             mcp: Arc::new(McpManager::new()),
             run_base,
         }
+    }
+
+    #[test]
+    fn detached_sqlite_expired_live_owner_cannot_write_or_start_next_effect() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        if let Ok(role) = std::env::var(SQLITE_STALE_CHILD_ENV) {
+            let base = PathBuf::from(std::env::var_os(SQLITE_STALE_BASE_ENV).unwrap());
+            let http = std::env::var(SQLITE_STALE_HTTP_ENV).unwrap();
+            let run_base = base.join(".chidori/runs");
+            let source = base.join("services/stale-owner.ts");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(
+                &source,
+                format!(
+                    r#"export async function agent(input) {{
+                        await chidori.signal("start");
+                        await chidori.tool("aExecutionBarrier", {{}});
+                        const response = await fetch("http://{http}/held");
+                        const result = await response.json();
+                        if (result.continue) {{
+                            await fetch("http://{http}/follow-on");
+                        }} else {{
+                            await chidori.tool("bCommitHold", {{}});
+                        }}
+                        return result;
+                    }}"#
+                ),
+            )
+            .unwrap();
+
+            let mut tools = ToolRegistry::new();
+            if role == "a" {
+                tools.register_native(
+                    "aExecutionBarrier",
+                    "confirm A entered agent execution before the held request",
+                    Vec::new(),
+                    |_| {
+                        let release = sqlite_stale_control_wait("A_IN_AGENT");
+                        assert_eq!(release, b'G');
+                        Ok(json!({ "entered": true }))
+                    },
+                );
+            }
+            if role == "b" {
+                tools.register_native(
+                    "bCommitHold",
+                    "hold B after seq-3 commit",
+                    Vec::new(),
+                    |_| {
+                        let release = sqlite_stale_control_wait("B_SEQ3_DURABLE");
+                        assert_eq!(release, b'G', "unexpected B commit barrier release");
+                        Ok(json!({ "committed": true }))
+                    },
+                );
+            }
+            let parts = sqlite_test_parts(&base, run_base, Arc::new(tools));
+            hub().install_parts(parts.clone());
+            match role.as_str() {
+                "a" => {
+                    let spawned = hub()
+                        .spawn(
+                            &parts,
+                            source.to_str().unwrap(),
+                            json!({}),
+                            &SpawnOptions {
+                                name: Some(SQLITE_STALE_AGENT.to_string()),
+                                restart: "never".to_string(),
+                                max_restarts: 0,
+                                backoff_ms: 0,
+                                model: None,
+                            },
+                            "sqlite-stale-owner-test".to_string(),
+                        )
+                        .unwrap();
+                    let run_id = spawned["runId"].as_str().unwrap();
+                    let release = sqlite_stale_control_wait(&format!("A_READY {run_id}"));
+                    assert_eq!(release, b'G');
+                    hub()
+                        .send(
+                            &parts,
+                            SQLITE_STALE_AGENT,
+                            "start",
+                            json!({ "run": run_id }),
+                            json!({ "test": true }),
+                        )
+                        .unwrap();
+                    let release = sqlite_stale_control_wait("A_SIGNALLED");
+                    assert_eq!(release, b'G');
+                    let terminal = wait_for_agent_status(&parts, SQLITE_STALE_AGENT, |status| {
+                        status == "completed" || status == "failed"
+                    });
+                    let run_store = RunStoreFactory::shared(&parts.run_base).store_for(run_id);
+                    let records = run_store.load_call_log().unwrap().unwrap_or_default();
+                    let release = sqlite_stale_control_wait(&format!(
+                        "A_DONE {terminal} records={}",
+                        serde_json::to_string(&records).unwrap()
+                    ));
+                    assert_eq!(release, b'G');
+                }
+                "b" => {
+                    hub().rearm_from_registry(parts.clone()).unwrap();
+                    let terminal = wait_for_agent_status(&parts, SQLITE_STALE_AGENT, |status| {
+                        status == "completed" || status == "failed"
+                    });
+                    let registry = RunStoreFactory::shared(&parts.run_base)
+                        .registry_get(SQLITE_STALE_AGENT)
+                        .unwrap()
+                        .unwrap();
+                    let run_id = registry["run_id"].as_str().unwrap();
+                    let run_store = RunStoreFactory::shared(&parts.run_base).store_for(run_id);
+                    let records = run_store.load_call_log().unwrap().unwrap_or_default();
+                    let release = sqlite_stale_control_wait(&format!(
+                        "B_DONE {terminal} records={}",
+                        serde_json::to_string(&records).unwrap()
+                    ));
+                    assert_eq!(release, b'G');
+                }
+                other => panic!("unknown stale-owner child role {other}"),
+            }
+            return;
+        }
+
+        // A socket coordinator is used instead of sleeps. Each child reports
+        // its barrier name and blocks until the parent explicitly releases it.
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
+        let control_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_address = control_listener.local_addr().unwrap();
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<(String, TcpStream)>();
+        let control_thread = std::thread::spawn(move || {
+            while let Ok((stream, _)) = control_listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut event = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut event)
+                    .unwrap();
+                let event = event.trim().to_string();
+                if event == "STOP" {
+                    break;
+                }
+                event_tx.send((event, stream)).unwrap();
+            }
+        });
+
+        let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_address = http_listener.local_addr().unwrap();
+        http_listener.set_nonblocking(true).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let follow_on_count = Arc::new(AtomicUsize::new(0));
+        let held_count = Arc::new(AtomicUsize::new(0));
+        let (http_tx, http_rx) = std::sync::mpsc::channel::<String>();
+        let (release_a_tx, release_a_rx) = std::sync::mpsc::channel::<()>();
+        let release_a_rx = Arc::new(StdMutex::new(release_a_rx));
+        let server_stopped = Arc::clone(&stopped);
+        let server_follow_on = Arc::clone(&follow_on_count);
+        let server_held = Arc::clone(&held_count);
+        let server = std::thread::spawn(move || {
+            while !server_stopped.load(AtomicOrdering::SeqCst) {
+                match http_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut bytes = [0u8; 4096];
+                        let count = stream.read(&mut bytes).unwrap_or(0);
+                        if count == 0 {
+                            continue;
+                        }
+                        let request = String::from_utf8_lossy(&bytes[..count]);
+                        let target = request
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("/");
+                        let path = url::Url::parse(target)
+                            .map(|url| url.path().to_string())
+                            .unwrap_or_else(|_| target.to_string());
+                        let held_index = if path == "/held" {
+                            server_held.fetch_add(1, AtomicOrdering::SeqCst)
+                        } else {
+                            usize::MAX
+                        };
+                        http_tx.send(path.clone()).unwrap();
+                        let release = Arc::clone(&release_a_rx);
+                        let follow_on = Arc::clone(&server_follow_on);
+
+                        std::thread::spawn(move || {
+                            let body = match path.as_str() {
+                                "/prelude" => "{}".to_string(),
+                                "/held" => {
+                                    if held_index == 0 {
+                                        release
+                                            .lock()
+                                            .unwrap()
+                                            .recv_timeout(Duration::from_secs(30))
+                                            .expect("A held HTTP response was not released");
+                                        r#"{"writer":"A","continue":true}"#.to_string()
+                                    } else {
+                                        r#"{"writer":"B","continue":false}"#.to_string()
+                                    }
+                                }
+                                "/follow-on" => {
+                                    follow_on.fetch_add(1, AtomicOrdering::SeqCst);
+                                    "{}".to_string()
+                                }
+                                _ => "{}".to_string(),
+                            };
+                            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                            let _ = stream.write_all(response.as_bytes());
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("stale-owner HTTP fixture failed: {error}"),
+                }
+            }
+        });
+
+        let child = |role: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", SQLITE_STALE_TEST, "--nocapture"])
+                .env(SQLITE_STALE_CHILD_ENV, role)
+                .env(SQLITE_STALE_BASE_ENV, base)
+                .env(SQLITE_STALE_CONTROL_ENV, control_address.to_string())
+                .env(SQLITE_STALE_HTTP_ENV, http_address.to_string())
+                .env("CHIDORI_RUN_STORE", "sqlite")
+                .env("CHIDORI_RUN_DB", base.join("runs.sqlite3"))
+                .env("CHIDORI_DURABILITY", "effect")
+                .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
+                .spawn()
+                .unwrap()
+        };
+        let wait_http = |expected: &str| {
+            let path = http_rx
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|err| {
+                    let child_event = event_rx.try_recv().ok().map(|(event, _)| event);
+                    panic!("timed out waiting for HTTP {expected}: {err}; pending child event={child_event:?}")
+                });
+            assert_eq!(path, expected);
+        };
+        let a = child("a");
+        let (ready, ready_socket) = event_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let run_id = ready
+            .strip_prefix("A_READY ")
+            .expect("A ready event")
+            .to_string();
+        stale_owner_release(ready_socket, b'G');
+        let a_signalled = stale_owner_wait_event(&event_rx, "A_SIGNALLED");
+        stale_owner_release(a_signalled, b'G');
+        let a_in_agent = stale_owner_wait_event(&event_rx, "A_IN_AGENT");
+        stale_owner_release(a_in_agent, b'G');
+        wait_http("/held");
+
+        let b = child("b");
+        let contended = stale_owner_wait_event(&event_rx, "B_CONTENDED");
+        let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
+        let store = SqliteRunStore::new(shared, &run_id);
+        let before = stale_owner_lease(&store);
+        let owner_a = before["owner"].as_str().unwrap().to_string();
+        let expires_a: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(before["expires_at"].clone()).unwrap();
+        assert!(
+            expires_a > chrono::Utc::now(),
+            "before-expiry control: A lease is not in the future"
+        );
+        assert_eq!(
+            held_count.load(AtomicOrdering::SeqCst),
+            1,
+            "only A's pending request should have arrived before takeover"
+        );
+        let before_records = store.load_call_log().unwrap().unwrap_or_default();
+        assert!(
+            before_records.iter().all(|record| record.seq != 3),
+            "seq 3 must still be pending before B takes over: {before_records:#?}"
+        );
+        let before_promises = load_host_promise_records(&store).unwrap();
+        assert!(before_promises.iter().any(|record| {
+            record.operation.seq == 3 && record.state == HostPromiseState::Pending
+        }), "the held seq-3 HTTP operation must remain pending before takeover: {before_promises:#?}");
+
+        let expired = serde_json::to_vec(&crate::runtime::store::RunLease {
+            owner: owner_a.clone(),
+            expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+        })
+        .unwrap();
+        let prior = store
+            .get_blob(crate::runtime::store::LEASE_FILE)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .compare_and_swap_blob(
+                crate::runtime::store::LEASE_FILE,
+                Some(&prior),
+                Some(&expired)
+            )
+            .unwrap());
+        stale_owner_release(contended, b'R');
+
+        let (acquired_event, acquired) = event_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let owner_b_reported = acquired_event
+            .strip_prefix("B_ACQUIRED ")
+            .expect("B acquired lease event");
+        let lease_b = stale_owner_lease(&store);
+        let owner_b = lease_b["owner"].as_str().unwrap().to_string();
+        assert_eq!(
+            owner_b, owner_b_reported,
+            "B must own the real SQLite lease before replay"
+        );
+        assert_ne!(owner_a, owner_b, "lease transfer must replace A's owner");
+        let expires_b: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(lease_b["expires_at"].clone()).unwrap();
+        assert!(expires_b > chrono::Utc::now());
+        stale_owner_release(acquired, b'G');
+        wait_http("/held");
+        let b_committed = stale_owner_wait_event(&event_rx, "B_SEQ3_DURABLE");
+
+        let records_b = store.load_call_log().unwrap().unwrap();
+        let seq3_b = records_b
+            .iter()
+            .find(|record| record.seq == 3)
+            .expect("B seq-3 result must be durable");
+        assert_eq!(seq3_b.function, "http");
+        assert_eq!(
+            seq3_b.result["body"]["writer"],
+            json!("B"),
+            "seq-3 HTTP result={:#}",
+            seq3_b.result
+        );
+        let promises_b = load_host_promise_records(&store).unwrap();
+        let promise_b = promises_b
+            .iter()
+            .find(|record| record.operation.seq == 3)
+            .expect("B seq-3 promise must be durable");
+        assert!(
+            matches!(&promise_b.state, HostPromiseState::Resolved { value, .. } if value["body"]["writer"] == json!("B"))
+        );
+        let seq3_result_b = seq3_b.result.clone();
+        let promise_value_b = match &promise_b.state {
+            HostPromiseState::Resolved { value, .. } => value.clone(),
+            other => panic!("B seq-3 host promise is not resolved: {other:?}"),
+        };
+        assert_eq!(
+            follow_on_count.load(AtomicOrdering::SeqCst),
+            0,
+            "B's continue=false response must not dispatch the follow-on effect"
+        );
+
+        release_a_tx.send(()).unwrap();
+        let (a_done, a_socket) = event_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(a_done.starts_with("A_DONE "), "{a_done}");
+        stale_owner_release(a_socket, b'G');
+        let final_records = store.load_call_log().unwrap().unwrap();
+        let final_seq3: Vec<_> = final_records
+            .iter()
+            .filter(|record| record.seq == 3)
+            .collect();
+        let final_promises = load_host_promise_records(&store).unwrap();
+        let final_promise = final_promises
+            .iter()
+            .find(|record| record.operation.seq == 3)
+            .unwrap();
+        let follow_on = follow_on_count.load(AtomicOrdering::SeqCst);
+
+        // Hold B until all stale-A observations have been captured: its lease
+        // must not be released before the final journal/promise check.
+        stale_owner_release(b_committed, b'G');
+        let (event, stream) = event_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(event.starts_with("B_DONE "), "{event}");
+        stale_owner_release(stream, b'G');
+        let wait = |child: std::process::Child, role: &str| {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{role} child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        wait(a, "A");
+        wait(b, "B");
+
+        // A's pending HTTP request was already dispatched before takeover and
+        // B may replay it. Do not assert exactly-once delivery for that call;
+        // only the later follow-on request is fenced by this test.
+
+        // Release local fixtures only after child processes have completed.
+        stopped.store(true, AtomicOrdering::SeqCst);
+        server.join().unwrap();
+        std::net::TcpStream::connect(control_address)
+            .unwrap()
+            .write_all(b"STOP\n")
+            .unwrap();
+        control_thread.join().unwrap();
+
+        let mut red_failures = Vec::new();
+        if final_seq3.len() != 1 {
+            red_failures.push(format!(
+                "expected one seq-3 journal row, observed {}",
+                final_seq3.len()
+            ));
+        } else if final_seq3[0].result != seq3_result_b {
+            red_failures.push(format!(
+                "stale A replaced B's seq-3 journal result: expected {}, observed {}",
+                seq3_result_b, final_seq3[0].result
+            ));
+        }
+        let final_promise_value = match &final_promise.state {
+            HostPromiseState::Resolved { value, .. } => Some(value),
+            _ => None,
+        };
+        if final_promise_value != Some(&promise_value_b) {
+            red_failures.push(format!(
+                "stale A replaced B's seq-3 host-promise result: expected {}, observed {:?}",
+                promise_value_b, final_promise_value
+            ));
+        }
+        if follow_on != 0 {
+            red_failures.push(format!(
+                "stale A dispatched {follow_on} follow-on external effect(s)"
+            ));
+        }
+        assert!(
+            red_failures.is_empty(),
+            "stale-owner violations:\n{}",
+            red_failures.join("\n")
+        );
     }
 
     #[tokio::test]
