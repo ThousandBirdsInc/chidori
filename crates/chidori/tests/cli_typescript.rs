@@ -1783,6 +1783,35 @@ fn cli_resume_refuses_held_sqlite_tenure_before_effect_or_journal_mutation() {
     );
     chidori::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
         .unwrap();
+
+    // Once the external tenure is released, the same command must resume the
+    // run successfully. Its own fenced lease must then be available to a new
+    // contender, proving the complete CLI leg released the token it acquired.
+    let retry = resume_http_fixture(
+        &fixture,
+        &[
+            ("CHIDORI_RUN_STORE", "sqlite"),
+            ("CHIDORI_RUN_DB", &db_path),
+        ],
+    );
+    assert_eq!(server.request_count(), 2);
+    assert_success(&retry);
+    assert!(journal_records(&fixture.records_path)
+        .iter()
+        .any(|record| record["seq"] == 2 && record["function"] == "http"));
+    let post_retry = acquire_lease_with_token(
+        store.as_ref(),
+        "post-resume-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap()
+    .expect("CLI resume must release its own SQLite tenure after the leg");
+    chidori::runtime::store::release_lease_with_token(
+        store.as_ref(),
+        post_retry.lease(),
+        post_retry.token(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -2514,6 +2543,34 @@ fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
     assert_eq!(store.get_blob("lease.json").unwrap().unwrap(), lease_before);
     assert_eq!(held.lease().owner, "external-chat-holder");
     assert_failure(&output);
+
+    chidori::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
+        .unwrap();
+    let retry = run_chidori_with_stdin(
+        &["chat", "--resume", &session_id],
+        &dir,
+        &chat_env,
+        "second message\nexit\n",
+    );
+    assert_success(&retry);
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(&input_path).unwrap()).unwrap();
+    assert_eq!(
+        input["messages"],
+        serde_json::json!(["first message", "second message"])
+    );
+    let post_retry = acquire_lease_with_token(
+        store.as_ref(),
+        "post-chat-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap()
+    .expect("chat resume must release its own SQLite tenure after the leg");
+    chidori::runtime::store::release_lease_with_token(
+        store.as_ref(),
+        post_retry.lease(),
+        post_retry.token(),
+    )
+    .unwrap();
     let _ = fs::remove_dir_all(dir);
 }
 

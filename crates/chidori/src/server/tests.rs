@@ -3420,51 +3420,103 @@ async fn resume_session_returns_409_when_run_lease_held_elsewhere() {
     assert_eq!(held.expect_err("still held").owner, "other-server");
 }
 
-/// SQLite requires the opaque tenure token. Exercise the real signal-to-paused
-/// resume route in a child test process so its process-wide RunStoreFactory is
-/// initialized from an isolated SQLite environment before the run is created.
+/// Exercise each real route that shares the server run-lease gate in isolated
+/// SQLite child processes. The lease owner is external to the request; after
+/// the rejection it is released and the same route must be able to complete.
 #[tokio::test]
-async fn sqlite_signal_resume_refuses_external_tenure_before_mutation() {
-    const CHILD: &str = "CHIDORI_TEST_SQLITE_SIGNAL_LEASE_CHILD";
+async fn sqlite_server_resume_signal_and_approve_refuse_external_tenure_then_retry() {
+    const CHILD: &str = "CHIDORI_TEST_SQLITE_SERVER_LEASE_ROUTE_CHILD";
+    const ROUTE: &str = "CHIDORI_TEST_SQLITE_SERVER_LEASE_ROUTE";
     const TEST: &str =
-        "server::tests::sqlite_signal_resume_refuses_external_tenure_before_mutation";
+        "server::tests::sqlite_server_resume_signal_and_approve_refuse_external_tenure_then_retry";
     if std::env::var_os(CHILD).is_none() {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("runs.sqlite3");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture"])
-            .env(CHILD, "1")
-            .env("CHIDORI_RUN_STORE", "sqlite")
-            .env("CHIDORI_RUN_DB", &db_path)
-            .output()
-            .unwrap();
+        let mut failures = Vec::new();
+        for route in ["resume", "signal", "approve"] {
+            let db_path = temp.path().join(format!("{route}.sqlite3"));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(ROUTE, route)
+                .env("CHIDORI_RUN_STORE", "sqlite")
+                .env("CHIDORI_RUN_DB", &db_path)
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                failures.push(format!(
+                    "{route}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
         assert!(
-            output.status.success(),
-            "isolated SQLite route test failed:\n{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            failures.is_empty(),
+            "SQLite run-lease route contract failed:\n{}",
+            failures.join("\n")
         );
         return;
     }
 
     use crate::runtime::store::acquire_lease_with_token;
 
+    let route = std::env::var(ROUTE).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let agent_path = write_agent(
-        temp.path(),
-        r#"
+    let source = match route.as_str() {
+        "resume" => {
+            r#"
+            export async function agent(input, chidori) {
+                const answer = await chidori.input("continue?");
+                await chidori.log("resumed", { answer });
+                return { answer };
+            }
+        "#
+        }
+        "signal" => {
+            r#"
             export async function agent(input, chidori) {
                 const review = await chidori.signal("review");
                 return { decision: review.payload.decision };
             }
-        "#,
-    );
+        "#
+        }
+        "approve" => HTTP_AGENT,
+        _ => panic!("unexpected server lease route {route}"),
+    };
+    let agent_path = write_agent(temp.path(), source);
     let state = signal_test_state(temp.path(), agent_path);
-    let created = create_paused_session(&state, "sqlite-lease-signal", json!({})).await;
-    assert_eq!(created["status"], json!("paused"));
-    assert_eq!(created["pending_signal_name"], json!("review"));
+    let id = format!("sqlite-lease-{route}");
+    let created = if route == "approve" {
+        let mut request = create_request(Some("supervised"));
+        request.session_id = Some(id.clone());
+        let (status, body) =
+            response_json(create_session(State(state.clone()), Json(request)).await).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["status"], json!("awaitingapproval"));
+        body
+    } else {
+        create_paused_session(&state, &id, json!({})).await
+    };
+    let expected_status = if route == "approve" {
+        SessionStatus::AwaitingApproval
+    } else {
+        SessionStatus::Paused
+    };
+    assert_eq!(
+        created["status"],
+        json!(if route == "approve" {
+            "awaitingapproval"
+        } else {
+            "paused"
+        })
+    );
+    if route == "signal" {
+        assert_eq!(created["pending_signal_name"], json!("review"));
+    }
+    if route == "approve" {
+        assert_eq!(created["pending_approval"]["target"], json!("http"));
+    }
     let run_id = created["run_id"].as_str().unwrap().to_string();
-
     let factory = crate::runtime::store::RunStoreFactory::shared(&state.run_base);
     factory.ensure_initialized().unwrap();
     let store = factory.store_for(&run_id);
@@ -3477,43 +3529,110 @@ async fn sqlite_signal_resume_refuses_external_tenure_before_mutation() {
     .expect("the newly paused run lease must be free");
     let journal_before = serde_json::to_value(store.load_call_log().unwrap()).unwrap();
     let pending_before = store.get_blob("pending.json").unwrap();
+    let promises_before = store.get_blob("host_promises.json").unwrap();
     let lease_before = store.get_blob("lease.json").unwrap().unwrap();
 
-    let (status, body) = response_json(
-        signal_session(
-            State(state.clone()),
-            Path("sqlite-lease-signal".to_string()),
-            Json(SignalRequest {
-                allow_source_change: false,
-                name: "review".to_string(),
-                payload: json!({"decision":"blocked"}),
-                from: json!({"kind":"test"}),
-            }),
-        )
-        .await,
-    )
-    .await;
+    let invoke = |state: &AppState| {
+        let route = route.clone();
+        let id = id.clone();
+        let state = state.clone();
+        async move {
+            match route.as_str() {
+                "resume" => {
+                    resume_session(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        Json(ResumeRequest {
+                            response: "continue".to_string(),
+                            allow_source_change: false,
+                        }),
+                    )
+                    .await
+                }
+                "signal" => {
+                    signal_session(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        Json(SignalRequest {
+                            allow_source_change: false,
+                            name: "review".to_string(),
+                            payload: json!({"decision":"blocked"}),
+                            from: json!({"kind":"test"}),
+                        }),
+                    )
+                    .await
+                }
+                "approve" => {
+                    approve_session(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        Json(ApproveRequest {
+                            decision: "deny".to_string(),
+                            allow_source_change: false,
+                        }),
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            }
+        }
+    };
+    let (status, body) = response_json(invoke(&state).await).await;
 
     assert_eq!(
         status,
         StatusCode::CONFLICT,
-        "a signal that resumes a paused run must be rejected while another SQLite tenure is held; body: {body}"
+        "{route} route must reject before mutation while another SQLite tenure is held; body: {body}"
     );
     assert_eq!(body["lease_holder"], json!("external-sqlite-server"));
-    let session = state
-        .session_store
-        .get("sqlite-lease-signal")
-        .unwrap()
-        .unwrap();
-    assert_eq!(session.status, SessionStatus::Paused);
+    let session = state.session_store.get(&id).unwrap().unwrap();
+    assert_eq!(session.status, expected_status);
     assert_eq!(
         serde_json::to_value(store.load_call_log().unwrap()).unwrap(),
         journal_before
     );
     assert_eq!(store.get_blob("pending.json").unwrap(), pending_before);
+    assert_eq!(
+        store.get_blob("host_promises.json").unwrap(),
+        promises_before
+    );
     assert_eq!(store.get_blob("lease.json").unwrap().unwrap(), lease_before);
+    let still_held = acquire_lease_with_token(
+        store.as_ref(),
+        "verification-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap();
+    assert_eq!(
+        still_held
+            .expect_err("the external tenure must survive rejection")
+            .owner,
+        "external-sqlite-server"
+    );
+
     crate::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
         .unwrap();
+    let (retry_status, retry_body) = response_json(invoke(&state).await).await;
+    if route == "approve" {
+        assert_eq!(retry_status, StatusCode::OK, "body: {retry_body}");
+        assert_eq!(retry_body["status"], json!("failed"));
+    } else {
+        assert_eq!(retry_status, StatusCode::OK, "body: {retry_body}");
+        assert_eq!(retry_body["status"], json!("completed"));
+    }
+    let reacquired = acquire_lease_with_token(
+        store.as_ref(),
+        "post-retry-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap()
+    .expect("a completed route leg must release its own fenced tenure");
+    crate::runtime::store::release_lease_with_token(
+        store.as_ref(),
+        reacquired.lease(),
+        reacquired.token(),
+    )
+    .unwrap();
 }
 
 /// The guard's lifecycle: a free run is acquirable, the holder excludes other
