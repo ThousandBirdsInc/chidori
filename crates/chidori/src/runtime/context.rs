@@ -2305,8 +2305,8 @@ mod tests {
     #[test]
     fn stale_lease_refuses_pre_effect_safepoint_under_all_durability_modes() {
         use crate::runtime::store::{
-            acquire_lease, LeaseFencedRunStore, RunStore, SqliteRunStore, SqliteRunStoreShared,
-            LEASE_FILE,
+            acquire_lease_with_token, LeaseFencedRunStore, RunStore, SqliteRunStore,
+            SqliteRunStoreShared, LEASE_FILE,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2314,20 +2314,26 @@ mod tests {
         let db_path = base.path().join("runs.sqlite3");
         let shared = SqliteRunStoreShared::open(&db_path).unwrap();
         let sqlite: Arc<dyn RunStore> = Arc::new(SqliteRunStore::new(shared.clone(), "run-1"));
-        let lease_a = acquire_lease(&*sqlite, "owner-a", chrono::Duration::seconds(30))
+        let lease_a = acquire_lease_with_token(&*sqlite, "owner-a", chrono::Duration::seconds(30))
             .unwrap()
             .unwrap();
-        let fenced_a: Arc<dyn RunStore> =
-            Arc::new(LeaseFencedRunStore::new(sqlite.clone(), lease_a.clone()).unwrap());
+        let fenced_a: Arc<dyn RunStore> = Arc::new(
+            LeaseFencedRunStore::new_with_token(
+                sqlite.clone(),
+                lease_a.lease().clone(),
+                lease_a.token().clone(),
+            )
+            .unwrap(),
+        );
         let current = sqlite.get_blob(LEASE_FILE).unwrap().unwrap();
-        let mut expired: crate::runtime::store::RunLease =
+        let mut expired: crate::runtime::store::StoredRunLease =
             serde_json::from_slice(&current).unwrap();
         expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
         let expired = serde_json::to_vec(&expired).unwrap();
         assert!(sqlite
             .compare_and_swap_blob(LEASE_FILE, Some(&current), Some(&expired))
             .unwrap());
-        acquire_lease(&*sqlite, "owner-b", chrono::Duration::seconds(30))
+        acquire_lease_with_token(&*sqlite, "owner-b", chrono::Duration::seconds(30))
             .unwrap()
             .unwrap();
 

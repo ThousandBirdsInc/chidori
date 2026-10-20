@@ -165,8 +165,9 @@ struct AgentState {
     /// The live iteration's context while a supervision thread is running —
     /// the address live sends enqueue into (durably, through the ctx store).
     live_ctx: Option<RuntimeContext>,
-    /// Whether the worker is inside agent execution. `thread_live` also covers
-    /// lifecycle work such as waiting for a lease.
+    /// Whether this process's lease-owning supervisor is actively driving the
+    /// agent, including setup and handoff. `thread_live` also covers lifecycle
+    /// work such as waiting for a lease.
     execution_active: bool,
     thread_live: bool,
     /// A matching delivery can arrive after hibernation releases its lease but
@@ -607,10 +608,11 @@ impl DetachedAgentHub {
         let entry = self.ensure_entry(parts, to)?;
         let state = entry.state.lock().unwrap();
         let mut status = state.descriptor.status_json();
-        // The descriptor is durable state; `live` is the truth about THIS
-        // process: whether a worker thread is actually executing the agent
-        // right now. A supervisor can have a live OS thread while waiting for
-        // another process's lease, so thread existence is tracked separately.
+        // The descriptor is durable state; `live` reports whether THIS
+        // process's supervisor holds the lease and is actively driving the
+        // agent, including setup and handoff. A supervisor thread can exist
+        // while waiting for another process's lease, so thread existence is
+        // tracked separately.
         status["live"] = json!(state.execution_active);
         Ok(status)
     }
@@ -900,11 +902,18 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                     "injected detached lease acquisition failure"
                 ))
             } else {
-                crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl)
+                crate::runtime::store::acquire_lease_with_token(
+                    store.as_ref(),
+                    lease_owner,
+                    lease_ttl,
+                )
             };
             #[cfg(not(test))]
-            let acquisition =
-                crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl);
+            let acquisition = crate::runtime::store::acquire_lease_with_token(
+                store.as_ref(),
+                lease_owner,
+                lease_ttl,
+            );
             match acquisition {
                 Ok(Ok(lease)) => {
                     #[cfg(test)]
@@ -988,7 +997,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
     };
     let hibernate_run = |listen| {
         entry.state.lock().unwrap().execution_active = false;
-        hibernate(hub, entry, listen, active_lease.as_ref())
+        finish_hibernate_transition(entry, hibernate(hub, entry, listen, active_lease.as_ref()))
     };
 
     loop {
@@ -999,9 +1008,11 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             let run_id = entry.state.lock().unwrap().descriptor.run_id.clone();
             if active_lease.is_none() || !lease_store.supports_lease_fencing() {
                 let store = factory.store_for(&run_id);
-                if let Ok(Err(holder)) =
-                    crate::runtime::store::acquire_lease(store.as_ref(), lease_owner, lease_ttl)
-                {
+                if let Ok(Err(holder)) = crate::runtime::store::acquire_lease_with_token(
+                    store.as_ref(),
+                    lease_owner,
+                    lease_ttl,
+                ) {
                     tracing::warn!(
                         agent = %entry.name,
                         holder = %holder.owner,
@@ -1010,7 +1021,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                     return;
                 }
             } else if let Some(lease) = active_lease.as_ref() {
-                if let Err(err) = lease_store.check_lease(lease) {
+                if let Err(err) = lease_store.check_lease_with_token(lease.lease(), lease.token()) {
                     tracing::warn!(agent = %entry.name, error = %err, "lost the agent lease mid-run");
                     return;
                 }
@@ -1028,24 +1039,26 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         let run_id = descriptor.run_id.clone();
         let run_dir = parts.run_base.join(&run_id);
         let store = factory.store_for(&run_id);
-        let write_store: Arc<dyn crate::runtime::store::RunStore> = if store
-            .supports_lease_fencing()
-        {
-            if let Some(lease) = active_lease.as_ref() {
-                match crate::runtime::store::LeaseFencedRunStore::new(store.clone(), lease.clone())
-                {
-                    Ok(store) => Arc::new(store),
-                    Err(err) => {
-                        settle_run("failed", None, Some(err.to_string()));
-                        return;
+        let write_store: Arc<dyn crate::runtime::store::RunStore> =
+            if store.supports_lease_fencing() {
+                if let Some(lease) = active_lease.as_ref() {
+                    match crate::runtime::store::LeaseFencedRunStore::new_with_token(
+                        store.clone(),
+                        lease.lease().clone(),
+                        lease.token().clone(),
+                    ) {
+                        Ok(store) => Arc::new(store),
+                        Err(err) => {
+                            settle_run("failed", None, Some(err.to_string()));
+                            return;
+                        }
                     }
+                } else {
+                    store.clone()
                 }
             } else {
                 store.clone()
-            }
-        } else {
-            store.clone()
-        };
+            };
 
         // The accumulated journal (empty on first run), plus a synthetic
         // timeout-sentinel record when this wake is an expired alarm/timeout
@@ -1440,16 +1453,21 @@ fn persist_descriptor(factory: &RunStoreFactory, descriptor: &AgentDescriptor) {
 fn persist_descriptor_for_lease(
     factory: &RunStoreFactory,
     descriptor: &AgentDescriptor,
-    lease: Option<&crate::runtime::store::RunLease>,
+    lease: Option<&crate::runtime::store::FencedLease>,
 ) -> anyhow::Result<()> {
     let store = factory.store_for(&descriptor.run_id);
     if let Some(lease) = lease.filter(|_| store.supports_lease_fencing()) {
-        let fenced = crate::runtime::store::LeaseFencedRunStore::new(store, lease.clone())?;
+        let fenced = crate::runtime::store::LeaseFencedRunStore::new_with_token(
+            store,
+            lease.lease().clone(),
+            lease.token().clone(),
+        )?;
         if let Ok(bytes) = serde_json::to_vec_pretty(descriptor) {
             fenced.put_blob(AGENT_DESCRIPTOR_FILE, &bytes)?;
         }
-        factory.registry_put_fenced(
-            lease,
+        factory.registry_put_fenced_with_token(
+            lease.lease(),
+            lease.token(),
             &descriptor.name,
             &descriptor.run_id,
             &serde_json::to_value(descriptor)?,
@@ -1490,7 +1508,7 @@ struct LeaseHeartbeat {
 impl LeaseHeartbeat {
     fn start(
         store: Arc<dyn crate::runtime::store::RunStore>,
-        lease: crate::runtime::store::RunLease,
+        lease: crate::runtime::store::FencedLease,
         ttl: chrono::Duration,
     ) -> Self {
         let (stop, stopped) = std::sync::mpsc::channel();
@@ -1501,20 +1519,20 @@ impl LeaseHeartbeat {
                 Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            match store.renew_lease(&lease, ttl) {
+            match store.renew_lease_with_token(lease.lease(), lease.token(), ttl) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     tracing::warn!(
-                        owner = %lease.owner,
-                        generation = lease.generation,
+                        owner = %lease.lease().owner,
+                        generation = lease.token().generation_for_log(),
                         "SQLite run lease heartbeat was fenced"
                     );
                     break;
                 }
                 Err(err) => {
                     tracing::error!(
-                        owner = %lease.owner,
-                        generation = lease.generation,
+                        owner = %lease.lease().owner,
+                        generation = lease.token().generation_for_log(),
                         error = %err,
                         "SQLite run lease heartbeat failed"
                     );
@@ -1540,11 +1558,18 @@ impl Drop for LeaseHeartbeat {
 
 /// Release the agent run's lease — called when the agent stops executing here
 /// (hibernate or settle), so any process may drive the next wake.
-fn release_agent_lease(entry: &Arc<AgentEntry>, lease: Option<&crate::runtime::store::RunLease>) {
+fn release_agent_lease(
+    entry: &Arc<AgentEntry>,
+    lease: Option<&crate::runtime::store::FencedLease>,
+) {
     let run_id = entry.state.lock().unwrap().descriptor.run_id.clone();
     let store = entry.factory().store_for(&run_id);
     if let Some(lease) = lease.filter(|_| store.supports_lease_fencing()) {
-        let _ = crate::runtime::store::release_lease_token(store.as_ref(), lease);
+        let _ = crate::runtime::store::release_lease_with_token(
+            store.as_ref(),
+            lease.lease(),
+            lease.token(),
+        );
     } else {
         let _ = crate::runtime::store::release_lease(store.as_ref(), process_lease_owner());
     }
@@ -1557,7 +1582,7 @@ fn hibernate(
     hub: &DetachedAgentHub,
     entry: &Arc<AgentEntry>,
     listen: ListenState,
-    lease: Option<&crate::runtime::store::RunLease>,
+    lease: Option<&crate::runtime::store::FencedLease>,
 ) -> Result<bool, String> {
     let has_deadline = listen.deadline.is_some();
     let factory = entry.factory();
@@ -1565,16 +1590,19 @@ fn hibernate(
         let mut state = entry.state.lock().unwrap();
         let run_id = state.descriptor.run_id.clone();
         let store = factory.store_for(&run_id);
-        let owned_store: Arc<dyn crate::runtime::store::RunStore> = if let Some(lease) =
-            lease.filter(|_| store.supports_lease_fencing())
-        {
-            match crate::runtime::store::LeaseFencedRunStore::new(store.clone(), lease.clone()) {
-                Ok(fenced) => Arc::new(fenced),
-                Err(err) => return Err(format!("creating lease-fenced store: {err}")),
-            }
-        } else {
-            store.clone()
-        };
+        let owned_store: Arc<dyn crate::runtime::store::RunStore> =
+            if let Some(lease) = lease.filter(|_| store.supports_lease_fencing()) {
+                match crate::runtime::store::LeaseFencedRunStore::new_with_token(
+                    store.clone(),
+                    lease.lease().clone(),
+                    lease.token().clone(),
+                ) {
+                    Ok(fenced) => Arc::new(fenced),
+                    Err(err) => return Err(format!("creating lease-fenced store: {err}")),
+                }
+            } else {
+                store.clone()
+            };
         if let Err(err) = owned_store.check_ownership() {
             return Err(format!(
                 "detached-agent lease ownership lost before hibernate: {err}"
@@ -1609,7 +1637,11 @@ fn hibernate(
             return Err(format!("persisting detached-agent hibernation: {err}"));
         }
         let released = if let Some(lease) = lease.filter(|_| store.supports_lease_fencing()) {
-            crate::runtime::store::release_lease_token(store.as_ref(), lease)
+            crate::runtime::store::release_lease_with_token(
+                store.as_ref(),
+                lease.lease(),
+                lease.token(),
+            )
         } else {
             crate::runtime::store::release_lease(store.as_ref(), process_lease_owner())
         };
@@ -1624,13 +1656,28 @@ fn hibernate(
     Ok(true)
 }
 
+/// A false hibernate result means a matching durable signal raced with the
+/// transition. The supervisor still owns the lease and will continue driving
+/// the agent, so restore the public execution state before the next pass.
+fn finish_hibernate_transition(
+    entry: &Arc<AgentEntry>,
+    result: Result<bool, String>,
+) -> Result<bool, String> {
+    if matches!(result, Ok(false)) {
+        entry.state.lock().unwrap().execution_active = true;
+        #[cfg(test)]
+        tests::pause_after_hibernate_race(&entry.name);
+    }
+    result
+}
+
 fn settle(
     _hub: &DetachedAgentHub,
     entry: &Arc<AgentEntry>,
     status: &str,
     output: Option<Value>,
     error: Option<String>,
-    lease: Option<&crate::runtime::store::RunLease>,
+    lease: Option<&crate::runtime::store::FencedLease>,
 ) {
     let descriptor = {
         let mut state = entry.state.lock().unwrap();
@@ -2713,7 +2760,7 @@ mod tests {
                 )),
                 _ => unreachable!(),
             };
-            let expired = crate::runtime::store::RunLease {
+            let expired = crate::runtime::store::StoredRunLease {
                 owner: "dead-live-cut-child".to_string(),
                 expires_at: Utc::now() - chrono::Duration::seconds(1),
                 generation: 1,
@@ -2989,6 +3036,17 @@ mod tests {
     static INBOX_RACE_BARRIERS: OnceLock<StdMutex<Option<Arc<InboxRaceBarriers>>>> =
         OnceLock::new();
 
+    struct HibernateRaceStatusBarrier {
+        agent_name: String,
+        reached: std::sync::mpsc::Sender<()>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        claimed: AtomicBool,
+    }
+
+    static HIBERNATE_RACE_STATUS_BARRIER: OnceLock<
+        StdMutex<Option<Arc<HibernateRaceStatusBarrier>>>,
+    > = OnceLock::new();
+
     struct InboxSnapshotGapBarriers {
         agent_name: String,
         snapshot_arrived: std::sync::mpsc::Sender<()>,
@@ -3056,6 +3114,22 @@ mod tests {
             .lock()
             .unwrap()
             .recv_timeout(Duration::from_secs(30));
+    }
+
+    pub(super) fn pause_after_hibernate_race(agent_name: &str) {
+        let barrier = HIBERNATE_RACE_STATUS_BARRIER
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap()
+            .clone();
+        let Some(barrier) = barrier.filter(|barrier| barrier.agent_name == agent_name) else {
+            return;
+        };
+        if barrier.claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = barrier.reached.send(());
+        let _ = barrier.release.lock().unwrap().recv();
     }
 
     pub(super) fn pause_after_supervisor_publishes_live_context(agent_name: &str) {
@@ -3538,7 +3612,7 @@ mod tests {
             record.operation.seq == 3 && record.state == HostPromiseState::Pending
         }), "the held seq-3 HTTP operation must remain pending before takeover: {before_promises:#?}");
 
-        let expired = serde_json::to_vec(&crate::runtime::store::RunLease {
+        let expired = serde_json::to_vec(&crate::runtime::store::StoredRunLease {
             owner: owner_a.clone(),
             expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
             generation: before["generation"].as_u64().unwrap_or(0),
@@ -4223,6 +4297,23 @@ mod tests {
             }));
         }
 
+        let (hibernate_status_reached, hibernate_status_release) = if require_wake_resolution {
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *HIBERNATE_RACE_STATUS_BARRIER
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap() = Some(Arc::new(HibernateRaceStatusBarrier {
+                agent_name: agent_name.clone(),
+                reached: reached_tx,
+                release: StdMutex::new(release_rx),
+                claimed: AtomicBool::new(false),
+            }));
+            (Some(reached_rx), Some(release_tx))
+        } else {
+            (None, None)
+        };
+
         let live_id = format!("{agent_name}-live");
         let sender_parts = parts.clone();
         let sender_name = agent_name.clone();
@@ -4268,6 +4359,48 @@ mod tests {
         let live_result = sender.join().unwrap().unwrap();
         assert_eq!(live_result["delivered"], json!(true));
         worker_release_tx.send(()).unwrap();
+        if require_wake_resolution {
+            let race_returned = hibernate_status_reached
+                .as_ref()
+                .expect("hibernate status barrier was not configured")
+                .recv_timeout(Duration::from_secs(10))
+                .is_ok();
+            if race_returned {
+                let status = hub().status(&parts, &agent_name).unwrap();
+                let entry = hub().ensure_entry(&parts, &agent_name).unwrap();
+                let thread_live = entry.state.lock().unwrap().thread_live;
+                let live_status_ok = status["live"] == json!(true);
+                let thread_live_ok = thread_live;
+                hibernate_status_release
+                    .as_ref()
+                    .expect("hibernate status barrier was not configured")
+                    .send(())
+                    .unwrap();
+                *HIBERNATE_RACE_STATUS_BARRIER
+                    .get_or_init(|| StdMutex::new(None))
+                    .lock()
+                    .unwrap() = None;
+                assert!(live_status_ok, "raced hibernate lost live state: {status}");
+                assert!(
+                    thread_live_ok,
+                    "raced hibernate should keep the supervisor thread live"
+                );
+            } else {
+                hibernate_status_release
+                    .as_ref()
+                    .expect("hibernate status barrier was not configured")
+                    .send(())
+                    .unwrap();
+            }
+            *HIBERNATE_RACE_STATUS_BARRIER
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap() = None;
+            assert!(
+                race_returned,
+                "worker did not reach the hibernate-race status barrier"
+            );
+        }
         let mut consumed_notifications = std::collections::HashMap::<String, usize>::new();
         if require_wake_resolution {
             let expected_ids: std::collections::HashSet<_> =
