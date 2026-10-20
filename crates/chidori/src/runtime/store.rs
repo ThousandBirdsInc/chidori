@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use rusqlite::OptionalExtension as _;
 
 use crate::runtime::call_log::CallRecord;
 
@@ -48,6 +49,40 @@ pub const RECORDS_FILE: &str = "records.jsonl";
 pub const CHECKPOINT_FILE: &str = "checkpoint.json";
 /// Lease blob for single-writer ownership of a run (`docs/durable-storage.md`).
 pub const LEASE_FILE: &str = "lease.json";
+
+/// A mutation that must be serialized with validation of a SQLite lease.
+/// SQLite applies the mutation and optional filesystem mirror while holding
+/// the same `BEGIN IMMEDIATE` transaction that verifies the tenure token.
+pub enum FencedMutation<'a> {
+    AppendRecord(&'a CallRecord),
+    WriteCallLog(&'a [CallRecord]),
+    PutBlob {
+        key: &'a str,
+        bytes: &'a [u8],
+    },
+    UpdateBlob {
+        key: &'a str,
+        update: &'a mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+    },
+    DeleteBlob {
+        key: &'a str,
+    },
+    AppendBlobLine {
+        key: &'a str,
+        line: &'a [u8],
+    },
+    CompareAndSwapBlob {
+        key: &'a str,
+        expected: Option<&'a [u8]>,
+        new: Option<&'a [u8]>,
+    },
+}
+
+pub enum FencedMutationResult {
+    Unit,
+    Bytes(Vec<u8>),
+    Bool(bool),
+}
 
 /// One persistence handle for a single run. Implementations must be safe to
 /// call from any thread; the runtime holds the handle behind the context lock.
@@ -172,6 +207,95 @@ pub trait RunStore: Send + Sync + std::fmt::Debug {
     /// private lease, which is no lease at all.
     fn coordination_target(&self) -> Option<&dyn RunStore> {
         None
+    }
+
+    /// Whether this store can make lease checks and run mutations share one
+    /// serialization point. Filesystem, HTTP, and S3 keep their existing
+    /// advisory/remote behavior; SQLite and an FS-primary/SQLite-secondary
+    /// tee opt in.
+    fn supports_lease_fencing(&self) -> bool {
+        false
+    }
+
+    /// Validate a tenure token without mutating run data. Legacy implementations
+    /// without SQLite fencing fail closed; callers should use the token-aware
+    /// method for fenced stores.
+    fn check_lease(&self, _lease: &RunLease) -> Result<()> {
+        anyhow::bail!(
+            "legacy lease check cannot validate a tenure token; use check_lease_with_token"
+        )
+    }
+
+    /// Validate an opaque tenure token without changing the public `RunLease`
+    /// struct shape. Advisory backends retain their legacy behavior. A backend
+    /// that reports [`RunStore::supports_lease_fencing`] must override this
+    /// method; the default fails closed for such backends.
+    fn check_lease_with_token(&self, lease: &RunLease, _token: &LeaseToken) -> Result<()> {
+        if self.supports_lease_fencing() {
+            anyhow::bail!("fencing-capable run store must implement check_lease_with_token")
+        }
+        self.check_lease(lease)
+    }
+
+    /// Check the tenure token bound to a lease-fenced view. Ordinary stores
+    /// have no enforced ownership check and return `Ok(())`.
+    fn check_ownership(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Legacy renewal API. It cannot identify a SQLite tenure; use
+    /// [`RunStore::renew_lease_with_token`] with the token from
+    /// [`acquire_lease_with_token`]. SQLite fails this operation closed.
+    fn renew_lease(&self, _lease: &RunLease, _ttl: chrono::Duration) -> Result<Option<RunLease>> {
+        anyhow::bail!("legacy lease renewal cannot identify a tenure; use renew_lease_with_token")
+    }
+
+    /// Renew only the tenure represented by `token`. The token is separate
+    /// from `RunLease` to preserve downstream struct-literal compatibility.
+    /// A fencing-capable backend must override this method; the default fails
+    /// closed for such backends.
+    fn renew_lease_with_token(
+        &self,
+        lease: &RunLease,
+        _token: &LeaseToken,
+        ttl: chrono::Duration,
+    ) -> Result<Option<RunLease>> {
+        if self.supports_lease_fencing() {
+            anyhow::bail!("fencing-capable run store must implement renew_lease_with_token")
+        }
+        self.renew_lease(lease, ttl)
+    }
+
+    /// Legacy mutation API without a tenure token. SQLite rejects it; use
+    /// [`RunStore::fenced_mutation_with_token`] through
+    /// [`LeaseFencedRunStore::new_with_token`].
+    ///
+    /// Validate `lease` and apply `mutation` atomically with SQLite. `mirror`
+    /// is the local FS primary for a configured SQLite tee and is updated only
+    /// after the SQLite transaction has accepted the current tenure.
+    fn fenced_mutation(
+        &self,
+        _lease: &RunLease,
+        _mutation: FencedMutation<'_>,
+        _mirror: Option<&dyn RunStore>,
+    ) -> Result<FencedMutationResult> {
+        anyhow::bail!("this run store does not enforce SQLite lease fencing")
+    }
+
+    /// Validate the opaque tenure token and mutate atomically where supported.
+    /// A fencing-capable backend must override this method; the default fails
+    /// closed for such backends.
+    fn fenced_mutation_with_token(
+        &self,
+        lease: &RunLease,
+        _token: &LeaseToken,
+        mutation: FencedMutation<'_>,
+        mirror: Option<&dyn RunStore>,
+    ) -> Result<FencedMutationResult> {
+        if self.supports_lease_fencing() {
+            anyhow::bail!("fencing-capable run store must implement fenced_mutation_with_token")
+        }
+        self.fenced_mutation(lease, mutation, mirror)
     }
 
     /// Durability barrier: every prior write on this handle is durable when
@@ -947,6 +1071,54 @@ impl SqliteRunStore {
             next_pos: Mutex::new(None),
         }
     }
+
+    fn validate_lease_tx(
+        tx: &rusqlite::Transaction<'_>,
+        run_id: &str,
+        lease: &RunLease,
+        token: &LeaseToken,
+    ) -> Result<bool> {
+        let bytes: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT data FROM run_blobs WHERE run_id = ?1 AND key = ?2",
+                rusqlite::params![run_id, LEASE_FILE],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(bytes) = bytes else {
+            return Ok(false);
+        };
+        let Ok(current) = serde_json::from_slice::<StoredRunLease>(&bytes) else {
+            return Ok(false);
+        };
+        Ok(current.owner == lease.owner
+            && current.generation == token.generation
+            && current.expires_at > chrono::Utc::now())
+    }
+
+    fn put_blob_tx(
+        tx: &rusqlite::Transaction<'_>,
+        run_id: &str,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO run_blobs (run_id, key, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(run_id, key) DO UPDATE SET data = excluded.data",
+            rusqlite::params![run_id, key, bytes],
+        )?;
+        Ok(())
+    }
+
+    fn blob_tx(tx: &rusqlite::Transaction<'_>, run_id: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(tx
+            .query_row(
+                "SELECT data FROM run_blobs WHERE run_id = ?1 AND key = ?2",
+                rusqlite::params![run_id, key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
 }
 
 impl RunStore for SqliteRunStore {
@@ -1140,6 +1312,208 @@ impl RunStore for SqliteRunStore {
         };
         tx.commit()?;
         Ok(true)
+    }
+
+    fn supports_lease_fencing(&self) -> bool {
+        true
+    }
+
+    fn check_lease(&self, lease: &RunLease) -> Result<()> {
+        let _ = lease;
+        anyhow::bail!(
+            "SQLite lease checks require the opaque tenure token; use check_lease_with_token"
+        )
+    }
+
+    fn check_lease_with_token(&self, lease: &RunLease, token: &LeaseToken) -> Result<()> {
+        let mut conn = self.shared.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !Self::validate_lease_tx(&tx, &self.run_id, lease, token)? {
+            return Err(LeaseLostError {
+                owner: lease.owner.clone(),
+                generation: token.generation,
+            }
+            .into());
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn renew_lease(&self, lease: &RunLease, ttl: chrono::Duration) -> Result<Option<RunLease>> {
+        let _ = (lease, ttl);
+        anyhow::bail!(
+            "SQLite lease renewal requires the opaque tenure token; use renew_lease_with_token"
+        )
+    }
+
+    fn renew_lease_with_token(
+        &self,
+        lease: &RunLease,
+        token: &LeaseToken,
+        ttl: chrono::Duration,
+    ) -> Result<Option<RunLease>> {
+        let mut conn = self.shared.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !Self::validate_lease_tx(&tx, &self.run_id, lease, token)? {
+            return Ok(None);
+        }
+        let renewed = RunLease {
+            owner: lease.owner.clone(),
+            expires_at: chrono::Utc::now() + ttl,
+        };
+        let stored = StoredRunLease {
+            owner: renewed.owner.clone(),
+            expires_at: renewed.expires_at,
+            generation: token.generation,
+        };
+        Self::put_blob_tx(&tx, &self.run_id, LEASE_FILE, &serde_json::to_vec(&stored)?)?;
+        tx.commit()?;
+        Ok(Some(renewed))
+    }
+
+    fn fenced_mutation(
+        &self,
+        lease: &RunLease,
+        mutation: FencedMutation<'_>,
+        mirror: Option<&dyn RunStore>,
+    ) -> Result<FencedMutationResult> {
+        let _ = (lease, mutation, mirror);
+        anyhow::bail!(
+            "SQLite fenced mutation requires the opaque tenure token; use fenced_mutation_with_token"
+        )
+    }
+
+    fn fenced_mutation_with_token(
+        &self,
+        lease: &RunLease,
+        token: &LeaseToken,
+        mutation: FencedMutation<'_>,
+        mirror: Option<&dyn RunStore>,
+    ) -> Result<FencedMutationResult> {
+        let mut conn = self.shared.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !Self::validate_lease_tx(&tx, &self.run_id, lease, token)? {
+            return Err(LeaseLostError {
+                owner: lease.owner.clone(),
+                generation: token.generation,
+            }
+            .into());
+        }
+
+        let result = match mutation {
+            FencedMutation::AppendRecord(record) => {
+                let pos: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(pos), 0) + 1 FROM run_records WHERE run_id = ?1",
+                    rusqlite::params![self.run_id],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(run_id, seq) DO UPDATE SET data = excluded.data",
+                    rusqlite::params![
+                        self.run_id,
+                        record.seq as i64,
+                        pos,
+                        serde_json::to_string(record)?
+                    ],
+                )?;
+                if let Some(mirror) = mirror {
+                    mirror.append_record(record)?;
+                }
+                FencedMutationResult::Unit
+            }
+            FencedMutation::WriteCallLog(records) => {
+                validate_composed_journal(records)?;
+                tx.execute(
+                    "DELETE FROM run_records WHERE run_id = ?1",
+                    rusqlite::params![self.run_id],
+                )?;
+                {
+                    let mut stmt = tx.prepare_cached(
+                        "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)",
+                    )?;
+                    for (pos, record) in records.iter().enumerate() {
+                        stmt.execute(rusqlite::params![
+                            self.run_id,
+                            record.seq as i64,
+                            pos as i64,
+                            serde_json::to_string(record)?
+                        ])?;
+                    }
+                }
+                if let Some(mirror) = mirror {
+                    mirror.write_call_log(records)?;
+                }
+                FencedMutationResult::Unit
+            }
+            FencedMutation::PutBlob { key, bytes } => {
+                Self::put_blob_tx(&tx, &self.run_id, key, bytes)?;
+                if let Some(mirror) = mirror {
+                    mirror.put_blob(key, bytes)?;
+                }
+                FencedMutationResult::Unit
+            }
+            FencedMutation::UpdateBlob { key, update } => {
+                let bytes = update(Self::blob_tx(&tx, &self.run_id, key)?)?;
+                Self::put_blob_tx(&tx, &self.run_id, key, &bytes)?;
+                if let Some(mirror) = mirror {
+                    mirror.put_blob(key, &bytes)?;
+                }
+                FencedMutationResult::Bytes(bytes)
+            }
+            FencedMutation::DeleteBlob { key } => {
+                tx.execute(
+                    "DELETE FROM run_blobs WHERE run_id = ?1 AND key = ?2",
+                    rusqlite::params![self.run_id, key],
+                )?;
+                if let Some(mirror) = mirror {
+                    mirror.delete_blob(key)?;
+                }
+                FencedMutationResult::Unit
+            }
+            FencedMutation::AppendBlobLine { key, line } => {
+                let mut bytes = Self::blob_tx(&tx, &self.run_id, key)?.unwrap_or_default();
+                bytes.extend_from_slice(line);
+                bytes.push(b'\n');
+                Self::put_blob_tx(&tx, &self.run_id, key, &bytes)?;
+                if let Some(mirror) = mirror {
+                    mirror.append_blob_line(key, line)?;
+                }
+                FencedMutationResult::Unit
+            }
+            FencedMutation::CompareAndSwapBlob { key, expected, new } => {
+                let current = Self::blob_tx(&tx, &self.run_id, key)?;
+                if current.as_deref() != expected {
+                    FencedMutationResult::Bool(false)
+                } else {
+                    match new {
+                        Some(bytes) => {
+                            Self::put_blob_tx(&tx, &self.run_id, key, bytes)?;
+                            if let Some(mirror) = mirror {
+                                mirror.put_blob(key, bytes)?;
+                            }
+                        }
+                        None => {
+                            tx.execute(
+                                "DELETE FROM run_blobs WHERE run_id = ?1 AND key = ?2",
+                                rusqlite::params![self.run_id, key],
+                            )?;
+                            if let Some(mirror) = mirror {
+                                mirror.delete_blob(key)?;
+                            }
+                        }
+                    }
+                    FencedMutationResult::Bool(true)
+                }
+            }
+        };
+        tx.commit()?;
+        if let FencedMutationResult::Unit = result {
+            // `next_pos` is only a hint; clearing it keeps future appends on
+            // this handle correct after a fenced journal rewrite.
+            *self.next_pos.lock().unwrap() = None;
+        }
+        Ok(result)
     }
 
     fn flush(&self) -> Result<()> {
@@ -1967,9 +2341,237 @@ impl RunStore for TeeRunStore {
         Some(self.secondary.as_ref())
     }
 
+    fn supports_lease_fencing(&self) -> bool {
+        self.secondary.supports_lease_fencing()
+    }
+
+    fn check_lease(&self, lease: &RunLease) -> Result<()> {
+        self.secondary.check_lease(lease)
+    }
+
+    fn check_lease_with_token(&self, lease: &RunLease, token: &LeaseToken) -> Result<()> {
+        self.secondary.check_lease_with_token(lease, token)
+    }
+
+    fn renew_lease(&self, lease: &RunLease, ttl: chrono::Duration) -> Result<Option<RunLease>> {
+        self.secondary.renew_lease(lease, ttl)
+    }
+
+    fn renew_lease_with_token(
+        &self,
+        lease: &RunLease,
+        token: &LeaseToken,
+        ttl: chrono::Duration,
+    ) -> Result<Option<RunLease>> {
+        self.secondary.renew_lease_with_token(lease, token, ttl)
+    }
+
+    fn fenced_mutation(
+        &self,
+        lease: &RunLease,
+        mutation: FencedMutation<'_>,
+        _mirror: Option<&dyn RunStore>,
+    ) -> Result<FencedMutationResult> {
+        // Match the normal Tee update order (stable FS sidecar lock, then
+        // SQLite) so a live signal enqueue cannot race a fenced inbox
+        // consumption or deadlock across opposite lock orders.
+        self.primary.with_blob_update_lock(|| {
+            self.secondary
+                .fenced_mutation(lease, mutation, Some(&self.primary))
+        })
+    }
+
+    fn fenced_mutation_with_token(
+        &self,
+        lease: &RunLease,
+        token: &LeaseToken,
+        mutation: FencedMutation<'_>,
+        _mirror: Option<&dyn RunStore>,
+    ) -> Result<FencedMutationResult> {
+        self.primary.with_blob_update_lock(|| {
+            self.secondary
+                .fenced_mutation_with_token(lease, token, mutation, Some(&self.primary))
+        })
+    }
+
     fn flush(&self) -> Result<()> {
         self.primary.flush()?;
         self.secondary.flush()
+    }
+}
+
+/// Run-store view bound to one SQLite lease tenure. Every write goes through
+/// the backend's atomic lease-validation mutation API; reads retain the
+/// underlying store's normal primary-first behavior.
+#[derive(Debug)]
+pub struct LeaseFencedRunStore {
+    inner: Arc<dyn RunStore>,
+    lease: RunLease,
+    token: LeaseToken,
+}
+
+impl LeaseFencedRunStore {
+    /// Compatibility stub retained for callers compiled against the former
+    /// constructor. It cannot safely fence writes because `RunLease` does not
+    /// carry a tenure token, so it fails closed. For SQLite, migrate acquisition
+    /// to [`acquire_lease_with_token`] and pass both returned values to
+    /// [`Self::new_with_token`].
+    #[deprecated(note = "use acquire_lease_with_token and new_with_token with its opaque token")]
+    #[allow(dead_code)]
+    pub fn new(_inner: Arc<dyn RunStore>, _lease: RunLease) -> Result<Self> {
+        anyhow::bail!(
+            "lease-fenced store requires the opaque tenure token; use acquire_lease_with_token and new_with_token"
+        )
+    }
+
+    pub fn new_with_token(
+        inner: Arc<dyn RunStore>,
+        lease: RunLease,
+        token: LeaseToken,
+    ) -> Result<Self> {
+        if !inner.supports_lease_fencing() {
+            anyhow::bail!("run store does not support enforced lease fencing")
+        }
+        Ok(Self {
+            inner,
+            lease,
+            token,
+        })
+    }
+}
+
+impl RunStore for LeaseFencedRunStore {
+    fn append_record(&self, record: &CallRecord) -> Result<()> {
+        match self.inner.fenced_mutation_with_token(
+            &self.lease,
+            &self.token,
+            FencedMutation::AppendRecord(record),
+            None,
+        )? {
+            FencedMutationResult::Unit => Ok(()),
+            _ => unreachable!("append_record fenced mutation result"),
+        }
+    }
+
+    fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        match self.inner.fenced_mutation_with_token(
+            &self.lease,
+            &self.token,
+            FencedMutation::WriteCallLog(records),
+            None,
+        )? {
+            FencedMutationResult::Unit => Ok(()),
+            _ => unreachable!("write_call_log fenced mutation result"),
+        }
+    }
+
+    fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
+        self.inner.load_call_log()
+    }
+
+    fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        match self.inner.fenced_mutation_with_token(
+            &self.lease,
+            &self.token,
+            FencedMutation::PutBlob { key, bytes },
+            None,
+        )? {
+            FencedMutationResult::Unit => Ok(()),
+            _ => unreachable!("put_blob fenced mutation result"),
+        }
+    }
+
+    fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get_blob(key)
+    }
+
+    fn update_blob(
+        &self,
+        key: &str,
+        update: &mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        match self.inner.fenced_mutation_with_token(
+            &self.lease,
+            &self.token,
+            FencedMutation::UpdateBlob { key, update },
+            None,
+        )? {
+            FencedMutationResult::Bytes(bytes) => Ok(bytes),
+            _ => unreachable!("update_blob fenced mutation result"),
+        }
+    }
+
+    fn has_blob(&self, key: &str) -> Result<bool> {
+        self.inner.has_blob(key)
+    }
+
+    fn append_blob_line(&self, key: &str, line: &[u8]) -> Result<()> {
+        match self.inner.fenced_mutation_with_token(
+            &self.lease,
+            &self.token,
+            FencedMutation::AppendBlobLine { key, line },
+            None,
+        )? {
+            FencedMutationResult::Unit => Ok(()),
+            _ => unreachable!("append_blob_line fenced mutation result"),
+        }
+    }
+
+    fn blob_os_path(&self, key: &str) -> Option<PathBuf> {
+        self.inner.blob_os_path(key)
+    }
+
+    fn delete_blob(&self, key: &str) -> Result<()> {
+        match self.inner.fenced_mutation_with_token(
+            &self.lease,
+            &self.token,
+            FencedMutation::DeleteBlob { key },
+            None,
+        )? {
+            FencedMutationResult::Unit => Ok(()),
+            _ => unreachable!("delete_blob fenced mutation result"),
+        }
+    }
+
+    fn list_blobs(&self) -> Result<Vec<String>> {
+        self.inner.list_blobs()
+    }
+
+    fn compare_and_swap_blob(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<bool> {
+        match self.inner.fenced_mutation_with_token(
+            &self.lease,
+            &self.token,
+            FencedMutation::CompareAndSwapBlob { key, expected, new },
+            None,
+        )? {
+            FencedMutationResult::Bool(swapped) => Ok(swapped),
+            _ => unreachable!("compare_and_swap_blob fenced mutation result"),
+        }
+    }
+
+    fn coordination_target(&self) -> Option<&dyn RunStore> {
+        self.inner.coordination_target()
+    }
+
+    fn supports_lease_fencing(&self) -> bool {
+        true
+    }
+
+    fn check_lease(&self, _lease: &RunLease) -> Result<()> {
+        self.inner.check_lease_with_token(&self.lease, &self.token)
+    }
+
+    fn check_ownership(&self) -> Result<()> {
+        self.inner.check_lease_with_token(&self.lease, &self.token)
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -2090,6 +2692,14 @@ impl RunStore for ScopedRunStore {
     ) -> Result<bool> {
         self.inner
             .compare_and_swap_blob(&self.key(key), expected, new)
+    }
+
+    fn supports_lease_fencing(&self) -> bool {
+        self.inner.supports_lease_fencing()
+    }
+
+    fn check_ownership(&self) -> Result<()> {
+        self.inner.check_ownership()
     }
 
     fn flush(&self) -> Result<()> {
@@ -2383,6 +2993,63 @@ impl RunStoreFactory {
         Ok(())
     }
 
+    /// Update the detached-agent registry only while the supplied SQLite
+    /// tenure still owns `run_id`. The SQLite lease check and registry row
+    /// write share one immediate transaction; the local registry mirror is
+    /// written only after that check succeeds.
+    #[deprecated(note = "use registry_put_fenced_with_token")]
+    #[allow(dead_code)]
+    pub fn registry_put_fenced(
+        &self,
+        lease: &RunLease,
+        name: &str,
+        run_id: &str,
+        descriptor: &serde_json::Value,
+    ) -> Result<()> {
+        let _ = (lease, name, run_id, descriptor);
+        anyhow::bail!("SQLite registry writes require the opaque lease tenure token")
+    }
+
+    pub fn registry_put_fenced_with_token(
+        &self,
+        lease: &RunLease,
+        token: &LeaseToken,
+        name: &str,
+        run_id: &str,
+        descriptor: &serde_json::Value,
+    ) -> Result<()> {
+        let RunStoreBackend::Sqlite(shared) = &self.backend else {
+            return self.registry_put(name, run_id, descriptor);
+        };
+        let entry = serde_json::json!({
+            "name": name,
+            "run_id": run_id,
+            "descriptor": descriptor,
+        });
+        let bytes = serde_json::to_vec_pretty(&entry)?;
+        let mut conn = shared.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !SqliteRunStore::validate_lease_tx(&tx, run_id, lease, token)? {
+            return Err(LeaseLostError {
+                owner: lease.owner.clone(),
+                generation: token.generation,
+            }
+            .into());
+        }
+        tx.execute(
+            "INSERT INTO run_registry (name, run_id, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET run_id = excluded.run_id, data = excluded.data",
+            rusqlite::params![name, run_id, serde_json::to_string(&entry)?],
+        )?;
+        let path = self.registry_path(name)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn registry_get(&self, name: &str) -> Result<Option<serde_json::Value>> {
         match std::fs::read(self.registry_path(name)?) {
             Ok(bytes) => return Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -2497,7 +3164,72 @@ pub struct RunLease {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// How many times [`acquire_lease`] re-reads and re-decides after losing a
+/// Opaque proof of one fenced lease tenure. Its value is deliberately not a
+/// field of `RunLease`, whose public struct-literal shape is compatibility API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseToken {
+    generation: u64,
+}
+
+/// A lease and its separate opaque SQLite tenure proof.
+#[derive(Debug, Clone)]
+pub struct FencedLease {
+    lease: RunLease,
+    token: LeaseToken,
+}
+
+impl FencedLease {
+    pub fn lease(&self) -> &RunLease {
+        &self.lease
+    }
+
+    pub fn token(&self) -> &LeaseToken {
+        &self.token
+    }
+}
+
+impl LeaseToken {
+    pub(crate) fn generation_for_log(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredRunLease {
+    pub(crate) owner: String,
+    pub(crate) expires_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub(crate) generation: u64,
+}
+
+impl From<StoredRunLease> for RunLease {
+    fn from(stored: StoredRunLease) -> Self {
+        Self {
+            owner: stored.owner,
+            expires_at: stored.expires_at,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LeaseLostError {
+    pub owner: String,
+    pub generation: u64,
+}
+
+impl std::fmt::Display for LeaseLostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SQLite lease ownership lost for owner {} generation {}",
+            self.owner, self.generation
+        )
+    }
+}
+
+impl std::error::Error for LeaseLostError {}
+
+/// How many times [`acquire_lease_with_token`] re-reads and re-decides after losing a
 /// compare-and-swap. Each loss means a concurrent writer won, so this bounds
 /// livelock under contention rather than expressing a retry-on-failure policy.
 const LEASE_CAS_ATTEMPTS: usize = 8;
@@ -2519,6 +3251,11 @@ const LEASE_CAS_ATTEMPTS: usize = 8;
 /// ([`RunStore::coordination_target`]): a tee's local-primary-first reads
 /// would give every machine its own private lease.
 ///
+/// For a fencing-capable backend, use [`acquire_lease_with_token`]: this
+/// compatibility API cannot return the opaque tenure proof and therefore
+/// fails with an actionable error instead of appearing to grant an unusable
+/// lease. Advisory backends keep the historical behavior.
+///
 /// A [`FencedError`] — this node's run was taken over — is reported as the
 /// ordinary "held by someone else" outcome, so callers' existing standdown
 /// paths handle it instead of it surfacing as a write failure.
@@ -2528,11 +3265,28 @@ pub fn acquire_lease(
     ttl: chrono::Duration,
 ) -> Result<std::result::Result<RunLease, RunLease>> {
     let store = store.coordination_target().unwrap_or(store);
+    if store.supports_lease_fencing() {
+        anyhow::bail!(
+            "lease acquisition on a fencing-capable run store requires the opaque tenure token; use acquire_lease_with_token"
+        )
+    }
+    acquire_lease_with_token(store, owner, ttl)
+        .map(|result| result.map(|grant| grant.lease.clone()))
+}
+
+/// Acquire a lease and return its opaque fencing token separately from the
+/// compatibility-stable public `RunLease` value.
+pub fn acquire_lease_with_token(
+    store: &dyn RunStore,
+    owner: &str,
+    ttl: chrono::Duration,
+) -> Result<std::result::Result<FencedLease, RunLease>> {
+    let store = store.coordination_target().unwrap_or(store);
 
     // A fenced store means someone else owns the run; report them as the
     // holder. When the store couldn't name them, park the waiter for one TTL
     // rather than reporting an already-expired lease, which would spin.
-    let standdown = |err: anyhow::Error| -> Result<std::result::Result<RunLease, RunLease>> {
+    let standdown = |err: anyhow::Error| -> Result<std::result::Result<FencedLease, RunLease>> {
         match fenced_owner(&err) {
             Some(fenced) => Ok(Err(RunLease {
                 owner: fenced.owner.clone(),
@@ -2551,19 +3305,45 @@ pub fn acquire_lease(
         };
         let now = chrono::Utc::now();
         if let Some(bytes) = &current {
-            if let Ok(existing) = serde_json::from_slice::<RunLease>(bytes) {
+            if let Ok(existing) = serde_json::from_slice::<StoredRunLease>(bytes) {
                 if existing.owner != owner && existing.expires_at > now {
-                    return Ok(Err(existing));
+                    return Ok(Err(existing.into()));
                 }
             }
         }
+        let generation = if !store.supports_lease_fencing() {
+            0
+        } else {
+            match &current {
+                Some(bytes) => serde_json::from_slice::<StoredRunLease>(bytes)
+                    .map(|existing| {
+                        if existing.owner == owner && existing.expires_at > now {
+                            existing.generation
+                        } else {
+                            existing.generation.saturating_add(1).max(1)
+                        }
+                    })
+                    .unwrap_or(1),
+                None => 1,
+            }
+        };
         let lease = RunLease {
             owner: owner.to_string(),
             expires_at: now + ttl,
         };
-        let bytes = serde_json::to_vec_pretty(&lease)?;
+        let stored = StoredRunLease {
+            owner: lease.owner.clone(),
+            expires_at: lease.expires_at,
+            generation,
+        };
+        let bytes = serde_json::to_vec_pretty(&stored)?;
         match store.compare_and_swap_blob(LEASE_FILE, current.as_deref(), Some(&bytes)) {
-            Ok(true) => return Ok(Ok(lease)),
+            Ok(true) => {
+                return Ok(Ok(FencedLease {
+                    lease,
+                    token: LeaseToken { generation },
+                }))
+            }
             // Someone wrote between the read and the swap: re-read and
             // re-decide — they may now be a live holder we must yield to.
             Ok(false) => continue,
@@ -2576,13 +3356,21 @@ pub fn acquire_lease(
     )
 }
 
-/// Release the run's lease if `owner` holds it.
+/// Release an advisory run lease if `owner` holds it.
 ///
 /// The delete is itself conditional on the exact bytes read, so a lease that
 /// was taken over between the read and the delete is left alone instead of
 /// being deleted out from under its new owner.
+///
+/// This owner-only API cannot identify a SQLite tenure and fails closed on
+/// fencing-capable stores. Use [`release_lease_with_token`] there.
 pub fn release_lease(store: &dyn RunStore, owner: &str) -> Result<()> {
     let store = store.coordination_target().unwrap_or(store);
+    if store.supports_lease_fencing() {
+        anyhow::bail!(
+            "owner-only release cannot identify a fenced lease tenure; use release_lease_with_token"
+        )
+    }
     let current = match store.get_blob(LEASE_FILE) {
         Ok(current) => current,
         // Already fenced: this node owns nothing here, so there is nothing to
@@ -2591,7 +3379,7 @@ pub fn release_lease(store: &dyn RunStore, owner: &str) -> Result<()> {
         Err(err) => return Err(err),
     };
     if let Some(bytes) = current {
-        if let Ok(existing) = serde_json::from_slice::<RunLease>(&bytes) {
+        if let Ok(existing) = serde_json::from_slice::<StoredRunLease>(&bytes) {
             if existing.owner == owner {
                 match store.compare_and_swap_blob(LEASE_FILE, Some(&bytes), None) {
                     Ok(_) => {}
@@ -2600,6 +3388,48 @@ pub fn release_lease(store: &dyn RunStore, owner: &str) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Release an advisory lease using the compatibility `RunLease` value.
+///
+/// This API does not identify a unique tenure. On a fencing-capable backend it
+/// fails closed; use [`release_lease_with_token`] with the token returned by
+/// [`acquire_lease_with_token`].
+#[deprecated(note = "use release_lease_with_token with the token from acquire_lease_with_token")]
+#[allow(dead_code)]
+pub fn release_lease_token(store: &dyn RunStore, lease: &RunLease) -> Result<()> {
+    let store = store.coordination_target().unwrap_or(store);
+    if store.supports_lease_fencing() {
+        anyhow::bail!(
+            "release_lease_token cannot identify a fenced lease tenure; use release_lease_with_token"
+        )
+    } else {
+        release_lease(store, &lease.owner)
+    }
+}
+
+/// Expire exactly the supplied opaque tenure without affecting a later lease
+/// held by the same process owner.
+pub fn release_lease_with_token(
+    store: &dyn RunStore,
+    lease: &RunLease,
+    token: &LeaseToken,
+) -> Result<()> {
+    if !store.supports_lease_fencing() {
+        return release_lease(store, &lease.owner);
+    }
+    let store = store.coordination_target().unwrap_or(store);
+    let current = store.get_blob(LEASE_FILE)?;
+    let Some(bytes) = current else { return Ok(()) };
+    let Ok(mut existing) = serde_json::from_slice::<StoredRunLease>(&bytes) else {
+        return Ok(());
+    };
+    if existing.owner == lease.owner && existing.generation == token.generation {
+        existing.expires_at = chrono::Utc::now();
+        let released = serde_json::to_vec_pretty(&existing)?;
+        store.compare_and_swap_blob(LEASE_FILE, Some(&bytes), Some(&released))?;
     }
     Ok(())
 }
@@ -3893,26 +4723,324 @@ mod tests {
         let (a, b) = (machine("a"), machine("b"));
         let ttl = chrono::Duration::seconds(60);
 
-        assert!(acquire_lease(&a, "node-a", ttl).unwrap().is_ok());
+        assert!(acquire_lease_with_token(&a, "node-a", ttl).unwrap().is_ok());
         // B sees A's lease through the shared mirror and stands down.
         assert_eq!(
-            acquire_lease(&b, "node-b", ttl).unwrap().unwrap_err().owner,
+            acquire_lease_with_token(&b, "node-b", ttl)
+                .unwrap()
+                .unwrap_err()
+                .owner,
             "node-a"
         );
 
         // A's lease expires and B takes over. A's *local* copy still names A
         // with a live expiry — the stale view that used to fool it.
-        let expired = RunLease {
+        let expired = StoredRunLease {
             owner: "node-a".to_string(),
             expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            generation: 1,
         };
         SqliteRunStore::new(shared.clone(), "run-1")
             .put_blob(LEASE_FILE, &serde_json::to_vec_pretty(&expired).unwrap())
             .unwrap();
-        assert!(acquire_lease(&b, "node-b", ttl).unwrap().is_ok());
+        assert!(acquire_lease_with_token(&b, "node-b", ttl).unwrap().is_ok());
         assert_eq!(
-            acquire_lease(&a, "node-a", ttl).unwrap().unwrap_err().owner,
+            acquire_lease_with_token(&a, "node-a", ttl)
+                .unwrap()
+                .unwrap_err()
+                .owner,
             "node-b"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn stale_sqlite_tenure_is_rejected_before_tee_primary_mutation() {
+        let base = std::env::temp_dir().join(format!(
+            "chidori-store-lease-fence-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let run_id = "run-fenced";
+        let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
+        let make_store = || -> Arc<dyn RunStore> {
+            Arc::new(TeeRunStore::new(
+                FsRunStore::new(base.join(run_id)),
+                Arc::new(SqliteRunStore::new(shared.clone(), run_id)),
+            ))
+        };
+        let store_a = make_store();
+        let lease_a =
+            acquire_lease_with_token(store_a.as_ref(), "owner-a", chrono::Duration::seconds(60))
+                .unwrap()
+                .unwrap();
+        let fenced_a = LeaseFencedRunStore::new_with_token(
+            store_a,
+            lease_a.lease().clone(),
+            lease_a.token().clone(),
+        )
+        .unwrap();
+        fenced_a
+            .put_blob("state.json", b"A-before-takeover")
+            .unwrap();
+
+        let sqlite = SqliteRunStore::new(shared.clone(), run_id);
+        let current = sqlite.get_blob(LEASE_FILE).unwrap().unwrap();
+        let mut expired: StoredRunLease = serde_json::from_slice(&current).unwrap();
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let expired = serde_json::to_vec(&expired).unwrap();
+        assert!(sqlite
+            .compare_and_swap_blob(LEASE_FILE, Some(&current), Some(&expired))
+            .unwrap());
+
+        let store_b = make_store();
+        let lease_b =
+            acquire_lease_with_token(store_b.as_ref(), "owner-b", chrono::Duration::seconds(60))
+                .unwrap()
+                .unwrap();
+        assert!(lease_b.token().generation > lease_a.token().generation);
+        let fenced_b = LeaseFencedRunStore::new_with_token(
+            store_b,
+            lease_b.lease().clone(),
+            lease_b.token().clone(),
+        )
+        .unwrap();
+        fenced_b
+            .put_blob("state.json", b"B-after-takeover")
+            .unwrap();
+
+        let error = fenced_a
+            .put_blob("state.json", b"stale-A-write")
+            .expect_err("stale tenure must be rejected");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<LeaseLostError>()
+                .is_some_and(|lost| lost.generation == lease_a.token().generation)
+        }));
+        assert_eq!(
+            FsRunStore::new(base.join(run_id))
+                .get_blob("state.json")
+                .unwrap()
+                .unwrap(),
+            b"B-after-takeover"
+        );
+        assert_eq!(
+            sqlite.get_blob("state.json").unwrap().unwrap(),
+            b"B-after-takeover"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn stale_same_owner_token_cannot_check_or_release_a_later_tenure() {
+        let base = std::env::temp_dir().join(format!(
+            "chidori-store-same-owner-lease-token-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
+        let store = SqliteRunStore::new(shared, "run-same-owner");
+        let first = acquire_lease_with_token(&store, "same-owner", chrono::Duration::seconds(60))
+            .unwrap()
+            .unwrap();
+
+        let bytes = store.get_blob(LEASE_FILE).unwrap().unwrap();
+        let mut expired: StoredRunLease = serde_json::from_slice(&bytes).unwrap();
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let expired = serde_json::to_vec(&expired).unwrap();
+        assert!(store
+            .compare_and_swap_blob(LEASE_FILE, Some(&bytes), Some(&expired))
+            .unwrap());
+
+        let second = acquire_lease_with_token(&store, "same-owner", chrono::Duration::seconds(60))
+            .unwrap()
+            .unwrap();
+        assert!(second.token().generation > first.token().generation);
+        assert!(store
+            .check_lease_with_token(first.lease(), first.token())
+            .is_err());
+
+        // The compatibility release API has no tenure token and must never
+        // guess based on owner/expiry, even when both tenures share an owner.
+        #[allow(deprecated)]
+        let legacy_release = release_lease_token(&store, first.lease());
+        assert!(legacy_release
+            .expect_err("legacy release must fail closed on SQLite")
+            .to_string()
+            .contains("release_lease_with_token"));
+        assert!(release_lease(&store, "same-owner")
+            .expect_err("owner-only release must fail closed on SQLite")
+            .to_string()
+            .contains("release_lease_with_token"));
+
+        // The token-bearing release also cannot release the later tenure.
+        release_lease_with_token(&store, first.lease(), first.token()).unwrap();
+
+        let current: StoredRunLease =
+            serde_json::from_slice(&store.get_blob(LEASE_FILE).unwrap().unwrap()).unwrap();
+        assert_eq!(current.generation, second.token().generation);
+        assert!(current.expires_at > chrono::Utc::now());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[derive(Debug)]
+    struct DeclaredFencingStore;
+
+    impl RunStore for DeclaredFencingStore {
+        fn append_record(&self, _: &CallRecord) -> Result<()> {
+            Ok(())
+        }
+        fn write_call_log(&self, _: &[CallRecord]) -> Result<()> {
+            Ok(())
+        }
+        fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
+            Ok(None)
+        }
+        fn put_blob(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn get_blob(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn delete_blob(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn list_blobs(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn supports_lease_fencing(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn token_aware_trait_defaults_fail_closed_for_fencing_store() {
+        let store = DeclaredFencingStore;
+        let lease = RunLease {
+            owner: "owner".to_string(),
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
+        };
+        let token = LeaseToken { generation: 1 };
+
+        assert!(store
+            .check_lease_with_token(&lease, &token)
+            .unwrap_err()
+            .to_string()
+            .contains("must implement check_lease_with_token"));
+        assert!(store
+            .renew_lease_with_token(&lease, &token, chrono::Duration::seconds(60))
+            .unwrap_err()
+            .to_string()
+            .contains("must implement renew_lease_with_token"));
+        let mutation_error = match store.fenced_mutation_with_token(
+            &lease,
+            &token,
+            FencedMutation::DeleteBlob { key: "state.json" },
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("fencing-capable default mutation must fail closed"),
+        };
+        assert!(mutation_error
+            .to_string()
+            .contains("must implement fenced_mutation_with_token"));
+    }
+
+    #[test]
+    fn legacy_sqlite_lease_acquisition_requires_opaque_token() {
+        let base = std::env::temp_dir().join(format!(
+            "chidori-store-legacy-sqlite-lease-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shared = SqliteRunStoreShared::open(&base.join("runs.sqlite3")).unwrap();
+        let store = SqliteRunStore::new(shared, "run-legacy-acquire");
+
+        let error = acquire_lease(&store, "legacy-owner", chrono::Duration::seconds(60))
+            .expect_err("legacy acquisition must not discard the SQLite tenure token");
+        assert!(format!("{error:#}").contains("acquire_lease_with_token"));
+        assert!(
+            store.get_blob(LEASE_FILE).unwrap().is_none(),
+            "failed legacy acquisition must not create a lease"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn sqlite_lease_check_and_blob_mutation_serialize_with_takeover() {
+        let base = std::env::temp_dir().join(format!(
+            "chidori-store-lease-transaction-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db_path = base.join("runs.sqlite3");
+        let shared_a = SqliteRunStoreShared::open(&db_path).unwrap();
+        let store_a: Arc<dyn RunStore> = Arc::new(SqliteRunStore::new(shared_a, "run-atomic"));
+        let ttl = chrono::Duration::milliseconds(120);
+        let lease_a = acquire_lease_with_token(store_a.as_ref(), "owner-a", ttl)
+            .unwrap()
+            .unwrap();
+        let fenced_a = Arc::new(
+            LeaseFencedRunStore::new_with_token(
+                store_a.clone(),
+                lease_a.lease().clone(),
+                lease_a.token().clone(),
+            )
+            .unwrap(),
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut update = |_current: Option<Vec<u8>>| -> Result<Vec<u8>> {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(b"owner-a-write".to_vec())
+            };
+            fenced_a.update_blob("atomic.json", &mut update)
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+
+        while lease_a.lease().expires_at > chrono::Utc::now() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let shared_b = SqliteRunStoreShared::open(&db_path).unwrap();
+        let store_b = SqliteRunStore::new(shared_b, "run-atomic");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let takeover = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let lease =
+                acquire_lease_with_token(&store_b, "owner-b", chrono::Duration::seconds(10))
+                    .unwrap()
+                    .unwrap();
+            acquired_tx.send(lease).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            matches!(
+                acquired_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "takeover completed while A's validated mutation held BEGIN IMMEDIATE"
+        );
+
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        let lease_b = acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        takeover.join().unwrap();
+        assert!(lease_b.token().generation > lease_a.token().generation);
+        assert_eq!(
+            SqliteRunStore::new(SqliteRunStoreShared::open(&db_path).unwrap(), "run-atomic")
+                .get_blob("atomic.json")
+                .unwrap()
+                .unwrap(),
+            b"owner-a-write"
         );
         let _ = std::fs::remove_dir_all(base);
     }
@@ -4012,9 +5140,10 @@ mod tests {
                 .is_ok()
         );
         // An expired lease transfers.
-        let expired = RunLease {
+        let expired = StoredRunLease {
             owner: "node-a".to_string(),
             expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            generation: 1,
         };
         store
             .put_blob(LEASE_FILE, &serde_json::to_vec_pretty(&expired).unwrap())
@@ -4028,5 +5157,26 @@ mod tests {
         release_lease(&store, "node-b").unwrap();
         assert!(store.get_blob(LEASE_FILE).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_lease_keeps_its_two_field_public_shape() {
+        let lease = RunLease {
+            owner: "downstream-literal".to_string(),
+            expires_at: chrono::Utc::now(),
+        };
+        let value = serde_json::to_value(&lease).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert!(value.get("generation").is_none());
+
+        // Persisted fencing metadata remains readable without making it part
+        // of the public Rust value or its struct-literal contract.
+        let stored = serde_json::json!({
+            "owner": lease.owner,
+            "expires_at": lease.expires_at,
+            "generation": 7,
+        });
+        let public: RunLease = serde_json::from_value(stored).unwrap();
+        assert_eq!(public.owner, "downstream-literal");
     }
 }

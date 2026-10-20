@@ -113,10 +113,12 @@ it ever hibernated — is picked back up instead of sitting `running` forever.
 A queued `send` to such an agent also wakes it directly.
 
 **Status tells the truth about liveness.** `status()` /
-`GET /agents/detached/{name}` include `live: boolean` — whether a worker
-thread in this process is executing the agent right now. `status:
-"running", live: false` means the driver died and the server will re-drive
-it, not that work is happening.
+`GET /agents/detached/{name}` include `live: boolean` — `true` while this
+process's supervisor holds the lease and actively drives the agent, including
+setup and handoff. It is `false` while waiting on another process's lease,
+even if the supervisor thread still exists. Therefore `status: "running"`
+with `live: false` can mean either a lease wait or a driverless run that the
+server will re-drive.
 
 ## API
 
