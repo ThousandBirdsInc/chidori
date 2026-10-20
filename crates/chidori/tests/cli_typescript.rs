@@ -2570,6 +2570,7 @@ fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
             .list_blobs()
             .unwrap()
             .into_iter()
+            .filter(|key| key != "lease.json")
             .map(|key| {
                 let bytes = store
                     .get_blob(&key)
