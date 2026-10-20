@@ -2550,27 +2550,37 @@ fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
         .write_all(b"second message\nexit\n")
         .unwrap();
     let output = child.wait_with_output().unwrap();
+    let input_after = fs::read(&input_path).unwrap();
+    let records_after = fs::read(&records_path).unwrap();
+    let lease_after = store.get_blob("lease.json").unwrap().unwrap();
+
+    // Release before assertions so a Red failure cannot leave the external
+    // token held during fixture cleanup.
+    chidori::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
+        .unwrap();
 
     assert_eq!(
-        fs::read(&input_path).unwrap(),
-        input_before,
+        input_after, input_before,
         "a refused chat resume must not append a turn to input.json"
     );
     assert_eq!(
-        fs::read(&records_path).unwrap(),
-        records_before,
+        records_after, records_before,
         "a refused chat resume must not append journal records"
     );
-    assert_eq!(store.get_blob("lease.json").unwrap().unwrap(), lease_before);
+    assert_eq!(lease_after, lease_before);
     assert_eq!(held.lease().owner, "external-chat-holder");
     assert_failure(&output);
 
-    chidori::runtime::store::release_lease_with_token(store.as_ref(), held.lease(), held.token())
-        .unwrap();
+    let db_path_text = db_path.to_string_lossy().to_string();
+    let retry_env = [
+        ("CHIDORI_RUN_STORE", "sqlite"),
+        ("CHIDORI_RUN_DB", db_path_text.as_str()),
+        ("CHIDORI_TEST_LLM_RESPONSE", "canned reply"),
+    ];
     let retry = run_chidori_with_stdin(
         &["chat", "--resume", &session_id],
         &dir,
-        &chat_env,
+        &retry_env,
         "second message\nexit\n",
     );
     assert_success(&retry);
