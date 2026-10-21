@@ -4447,7 +4447,7 @@ impl Vm {
     /// `Op::GetPropDynamic` / `ROp::GetElem` body: computed-key read with the
     /// dense-array integer fast path.
     #[inline]
-    pub(crate) fn elem_get(&mut self, obj: Value, key_v: Value) -> Result<Value, Value> {
+    pub(crate) fn elem_get(&mut self, obj: &Value, key_v: &Value) -> Result<Value, Value> {
         // Integer fast path: `a[i]` on a dense array with an integral
         // Number key reads the element directly — skipping
         // ToPropertyKey's Number→String conversion (a float-format +
@@ -4456,7 +4456,7 @@ impl Vm {
         // entry can shadow the dense element (`props.is_empty()`) and
         // the slot is a real element (in bounds, not a hole);
         // everything else takes the unchanged spec path.
-        if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+        if let (Value::Object(o), Value::Number(n)) = (obj, key_v) {
             if let Some(iu) = dense_index(*n) {
                 let b = o.borrow();
                 if let Internal::Array(arr) = &b.internal {
@@ -4476,7 +4476,7 @@ impl Vm {
         // Number→String key conversion and the digit re-parse inside
         // `string_own_prop`. Out-of-bounds falls through — the spec path
         // climbs to String.prototype, which is observable.
-        if let (Value::String(s), Value::Number(n)) = (&obj, &key_v) {
+        if let (Value::String(s), Value::Number(n)) = (obj, key_v) {
             if let Some(iu) = dense_index(*n) {
                 if let Some(u) = s.code_unit_at(iu) {
                     return Ok(Value::String(JsString::from_code_units(&[u])));
@@ -4490,7 +4490,7 @@ impl Vm {
         // shape unchanged since the step, same key, plain data slot), so
         // the hint can only miss into the generic path, never mis-read; an
         // own data property's [[Get]] is exactly its slot value.
-        if let (Value::Object(o), Value::String(s)) = (&obj, &key_v) {
+        if let (Value::Object(o), Value::String(s)) = (obj, key_v) {
             if let Some(h) = self.forin_hint.take() {
                 if o.ptr_eq(&h.obj) && *s == h.key {
                     let b = o.borrow();
@@ -4514,7 +4514,7 @@ impl Vm {
         // (coercibility check, index-string parse, prototype climb). The
         // `buckets[kind]` / `table[name]` idiom. A miss (no own key, an
         // accessor, an exotic receiver) takes the unchanged path below.
-        if let (Value::Object(o), Value::String(s)) = (&obj, &key_v) {
+        if let (Value::Object(o), Value::String(s)) = (obj, key_v) {
             let b = o.borrow();
             if matches!(b.internal, Internal::Ordinary) {
                 if let Some((_, _, prop)) = b.own_get_full(&PropertyKey::Str(s.clone())) {
@@ -4526,9 +4526,9 @@ impl Vm {
         }
         // GetValue: RequireObjectCoercible(base) (via ToObject) throws
         // BEFORE ToPropertyKey coerces the key expression's value.
-        self.require_object_coercible(&obj, "read properties of")?;
-        let key = self.to_property_key(&key_v)?;
-        self.get_prop(&obj, &key)
+        self.require_object_coercible(obj, "read properties of")?;
+        let key = self.to_property_key(key_v)?;
+        self.get_prop(obj, &key)
     }
 
     /// `Op::SetPropDynamic` / `ROp::SetElem` body: computed-key write with
@@ -4537,8 +4537,8 @@ impl Vm {
     #[inline]
     pub(crate) fn elem_set(
         &mut self,
-        obj: Value,
-        key_v: Value,
+        obj: &Value,
+        key_v: &Value,
         value: Value,
         strict: bool,
     ) -> Result<Value, Value> {
@@ -4557,7 +4557,7 @@ impl Vm {
         // non-writable index must intercept via the generic path
         // (`protos_allow_index_create`). Gaps past the end, shadowed
         // elements, and non-arrays take the spec path.
-        if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+        if let (Value::Object(o), Value::Number(n)) = (obj, key_v) {
             if let Some(i) = dense_index(*n) {
                 let mut creates = None;
                 {
@@ -4610,7 +4610,7 @@ impl Vm {
         // the chain can intervene, attributes and order are preserved) —
         // the same condition `ic_set_prop`'s fast path relies on, resolved
         // here with one own-map probe. `buckets[kind]++`'s write half.
-        if let (Value::Object(o), Value::String(s)) = (&obj, &key_v) {
+        if let (Value::Object(o), Value::String(s)) = (obj, key_v) {
             let mut b = o.borrow_mut();
             if matches!(b.internal, Internal::Ordinary) {
                 if let Some((_, _, prop)) = b.own_get_full_mut(&PropertyKey::Str(s.clone())) {
@@ -4625,9 +4625,9 @@ impl Vm {
                 }
             }
         }
-        self.require_object_coercible(&obj, "set properties of")?;
-        let key = self.to_property_key(&key_v)?;
-        self.put_value(&obj, &key, value.clone(), strict)?;
+        self.require_object_coercible(obj, "set properties of")?;
+        let key = self.to_property_key(key_v)?;
+        self.put_value(obj, &key, value.clone(), strict)?;
         Ok(value)
     }
 
@@ -5453,6 +5453,58 @@ impl Vm {
                     frame.locals[$i as usize] = $v
                 };
             }
+            // Borrow-or-take operand read for ops whose helper takes the
+            // operand by REFERENCE: a live register is borrowed in place (no
+            // `Rc` bump/release pair), a dying temp (`TAKE`) moves out into
+            // `$slot` so its release stays this op's. `$slot` is a `let`
+            // binding declared by the caller (`let taken;`).
+            macro_rules! rref {
+                ($i:expr, $slot:ident) => {{
+                    let i = $i as usize;
+                    if i & crate::reg::TAKE as usize != 0 {
+                        $slot = std::mem::replace(
+                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        );
+                        &$slot
+                    } else {
+                        &frame.locals[i]
+                    }
+                }};
+            }
+            // Two-operand form of `rref!`: both TAKE moves happen before
+            // either borrow (the borrow checker will not let a second move
+            // follow a live borrow of the register file).
+            macro_rules! rref2 {
+                ($a:expr, $b:expr, $ta:ident, $tb:ident) => {{
+                    let (ia, ib) = ($a as usize, $b as usize);
+                    $ta = if ia & crate::reg::TAKE as usize != 0 {
+                        Some(std::mem::replace(
+                            &mut frame.locals[ia & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        ))
+                    } else {
+                        None
+                    };
+                    $tb = if ib & crate::reg::TAKE as usize != 0 {
+                        Some(std::mem::replace(
+                            &mut frame.locals[ib & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        ))
+                    } else {
+                        None
+                    };
+                    let ra: &Value = match &$ta {
+                        Some(v) => v,
+                        None => &frame.locals[ia],
+                    };
+                    let rb: &Value = match &$tb {
+                        Some(v) => v,
+                        None => &frame.locals[ib],
+                    };
+                    (ra, rb)
+                }};
+            }
             // Frame exit with the module-linker snapshot (mirror of the
             // stack loop's `Ctl::Return` arm).
             macro_rules! ret {
@@ -5804,16 +5856,7 @@ impl Vm {
                     // access. A dying temp still moves out (its release
                     // is the op's).
                     let taken;
-                    let i = *obj as usize;
-                    let obj_ref: &Value = if i & crate::reg::TAKE as usize != 0 {
-                        taken = std::mem::replace(
-                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
-                            Value::Undefined,
-                        );
-                        &taken
-                    } else {
-                        &frame.locals[i]
-                    };
+                    let obj_ref: &Value = rref!(*obj, taken);
                     let v = match &consts[*name as usize] {
                         Const::String(n) => {
                             tryv!(self.ic_get_prop(obj_ref, n, reg.ic.get(*ic as usize)))
@@ -5835,16 +5878,7 @@ impl Vm {
                 } => {
                     let value = rd!(*src);
                     let taken;
-                    let i = *obj as usize;
-                    let obj_ref: &Value = if i & crate::reg::TAKE as usize != 0 {
-                        taken = std::mem::replace(
-                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
-                            Value::Undefined,
-                        );
-                        &taken
-                    } else {
-                        &frame.locals[i]
-                    };
+                    let obj_ref: &Value = rref!(*obj, taken);
                     let v = match &consts[*name as usize] {
                         Const::String(n) => tryv!(self.ic_set_prop(
                             obj_ref,
@@ -5864,13 +5898,16 @@ impl Vm {
                     wr!(*dst, v);
                 }
                 ROp::GetElem { dst, obj, key } => {
-                    let (obj, key) = (rd!(*obj), rd!(*key));
-                    let v = tryv!(self.elem_get(obj, key));
+                    let (taken_o, taken_k);
+                    let (obj_ref, key_ref) = rref2!(*obj, *key, taken_o, taken_k);
+                    let v = tryv!(self.elem_get(obj_ref, key_ref));
                     wr!(*dst, v);
                 }
                 ROp::SetElem { dst, obj, key, src } => {
-                    let (obj, key, value) = (rd!(*obj), rd!(*key), rd!(*src));
-                    let v = tryv!(self.elem_set(obj, key, value, proto.is_strict));
+                    let value = rd!(*src);
+                    let (taken_o, taken_k);
+                    let (obj_ref, key_ref) = rref2!(*obj, *key, taken_o, taken_k);
+                    let v = tryv!(self.elem_set(obj_ref, key_ref, value, proto.is_strict));
                     wr!(*dst, v);
                 }
                 // ---- calls ----
@@ -6793,7 +6830,7 @@ impl Vm {
             Op::GetPropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
-                let v = self.elem_get(obj, key_v)?;
+                let v = self.elem_get(&obj, &key_v)?;
                 push!(v);
             }
             Op::SetPropDynamic => {
@@ -6801,7 +6838,7 @@ impl Vm {
                 let key_v = pop!();
                 let obj = pop!();
                 let strict = frame.func.proto.is_strict;
-                let value = self.elem_set(obj, key_v, value, strict)?;
+                let value = self.elem_set(&obj, &key_v, value, strict)?;
                 push!(value);
             }
             Op::HasProp => {
