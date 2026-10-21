@@ -2124,6 +2124,102 @@ frame per call. It does not close with more kernel work; it needs the
 value-representation project (NaN-boxing / unboxed slots and shape-guarded
 inline property access).
 
+## 6.20 The remaining gap to Node, and the project that closes it (plan, 2026-10-21)
+
+§6.19.3 leaves exactly one workload behind Node under the JIT+PGO build:
+`mixed_helpers`, 163 ms against 22 ms. This section records what was tried
+on it in this session, why none of it can reach Node, and the scoped
+project that can — so the next engine round starts from a plan.
+
+### 6.20.1 What was tried, with numbers
+
+| change | mixed_helpers Ir | verdict |
+| --- | ---: | --- |
+| baseline v3.8.1 | 1.689 G | — |
+| §6.19 kernel/arith round | 1.653 G (−2.1%) | landed |
+| for-in trio + `NewObjectTpl` in the hot register loop (no `rstep_cold` round-trip) | 1.631 G (−1.3%) | landed |
+| hand-written `Value::clone` with inline immediate fast path + immediate-aware register writes | 1.683 G (+1.8%; array_hof +4.4%) | rejected: glue registers mostly hold strings/objects, so the tag test only preceded the same call |
+
+Per iteration of the workload's loop the engine executes ~27,000
+instructions; Node executes the same iteration in ~370 ns. Parity needs
+roughly a 7× cut, and the profile has no pooled hot spot: register
+dispatch ~30%, `Value` clone/drop ~11%, frame setup/teardown ~8% (three
+JS calls at ~500 instructions each), string `+` and allocator traffic
+~15%, for-in ~5%, ICs and `typeof` dispatch ~5%. Every lever above moves a
+single-digit share. The ceiling for an interpreter over this value model,
+with every remaining lever pulled, is ~2×; the gap is 7×.
+
+### 6.20.2 Why the value model is the gap
+
+- `Value` is a 24-byte tagged union; a string or object is an `Rc`, so
+  every move between registers, into a property slot, or into a call
+  argument is a refcount increment and a later out-of-line drop. V8 moves
+  tagged words.
+- A JS call takes a pooled heap `Frame` (~25 fields) and zero-fills its
+  register file; V8's baseline code uses the native stack.
+- Property access resolves through `Rc<RefCell<ObjectData>>` → shape
+  `Rc::ptr_eq` → slot `Vec` → `Property { kind, flags }`; the IC saves the
+  lookup but not the two indirections and the borrow flag. V8's inline
+  cache is a shape-guarded load at a fixed offset.
+- Small strings are already inline (≤23 bytes), but every concatenation
+  result over that size is a `String` build followed by an `Rc<str>` copy.
+
+### 6.20.3 The project
+
+**Goal.** `mixed_helpers` execution-only within 1.5× of Node on the
+benchmark container (≈35 ms), with the §6.19.3 rows that already beat Node
+unchanged, under the same gates every tier already passes: record→replay
+byte-identity, the register/kernel differential corpora, Test262 at
+≥99.9%, `forbid(unsafe_code)` in the default build.
+
+**Design, in dependency order.**
+
+1. **Unboxed register slots** (the register tier only; the stack tier
+   keeps `Value`). A register file of `u64` words with a side tag array, or
+   NaN-boxing (doubles as themselves, pointers and small ints in the NaN
+   payload). NaN-boxing is the standard answer, but under
+   `forbid(unsafe_code)` a pointer cannot live in a NaN payload without an
+   `unsafe` decode; the zero-unsafe form is a parallel `Vec<u8>` of tags
+   plus a `Vec<u64>` of payloads with `Rc` handles kept in a per-frame
+   arena indexed by the payload. Expected effect: clone/drop traffic and
+   `Value` moves vanish from the hot loop (−11%), and arithmetic/compare
+   ops stop re-tagging (part of the −30% dispatch share).
+2. **Native-stack frames for the register tier.** The register file for a
+   callee becomes a window of the caller's register `Vec` (a bump
+   pointer), not a pooled `Box<Frame>`: `init_frame`/`recycle_frame` go
+   from ~500 instructions per call to a bounds check and a base-pointer
+   bump. Try-handlers, `arguments`, generators and `with` keep the heap
+   frame (they bail to the stack tier, as kernels already do).
+3. **Shape-guarded property slots without the `RefCell`.** Move the
+   per-object slot `Vec` behind a `Cell<Rc<Shape>>` + `UnsafeCell`-free
+   split: the IC stores (shape ptr, slot index) and the read is one
+   `ptr_eq` and one indexed load from a `Vec<Value>` whose borrow is
+   taken once per op, not once per level. Expected: `ic_get_prop`/
+   `ic_set_prop` halve.
+4. **String building into the final buffer.** A `JsString` arm backed by
+   `Rc<String>`-like growable storage so `a + b + c` chains append once
+   and never copy into `Rc<str>`; the rope stays for the large case.
+5. **Register-tier superinstructions** over the new slots (`typeof`
+   dispatch, `GetProp`+`Cmp`+`Br`, `Call`+`Ret` for leaf callees), chosen
+   from the op-histogram feature's pair counts on `mixed_helpers` and the
+   React render workload.
+
+**Phasing and gates.** Each step lands alone behind the differential
+corpora and is measured on `mixed_helpers`, the React render (§6.17) and
+`json_roundtrip`; a step that does not move its target share by at least
+half its estimate is reverted, as the `Value::clone` experiment above
+was. Steps 1 and 2 are the regime change and carry the risk (every op
+that materializes a `Value` for a helper call needs a boxing bridge; the
+JIT's dense-element contract reads `Value` tags and must be re-pinned);
+3–5 are incremental on top.
+
+**Estimate.** Steps 1+2: a multi-week engine change with a new `Value`
+bridge at ~200 helper call sites. Steps 3–5: one round each. The honest
+expectation is `mixed_helpers` at 2–3× Node after 1+2 and inside 1.5×
+after 3–5 — parity on total wall-clock everywhere, and execution-only
+parity on everything but the allocation-bound rows, which then need the
+ObjectData arena §6.12.2 already tracks.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —
