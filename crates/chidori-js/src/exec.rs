@@ -4217,8 +4217,8 @@ impl Vm {
     #[inline]
     pub(crate) fn ic_get_prop(
         &mut self,
-        obj: Value,
-        name: JsString,
+        obj: &Value,
+        name: &JsString,
         ic: Option<&crate::bytecode::IcEntry>,
     ) -> Result<Value, Value> {
         // Inline cache (key-verified hints; see `FuncProto::ic`).
@@ -4233,7 +4233,7 @@ impl Vm {
         //    behavior (`length`, indices). Deeper chains, accessors,
         //    proxies, and every other exotic fall to the unchanged
         //    slow path.
-        if let Value::Object(o) = &obj {
+        if let Value::Object(o) = obj {
             if let Some(ic) = ic {
                 let b = o.borrow();
                 let (is_ord, is_arr) = (
@@ -4280,7 +4280,7 @@ impl Vm {
                                 b.own_get_index(ic.own_slot.get() as usize)
                             {
                                 if let PropertyKind::Data { value, .. } = &prop.kind {
-                                    if k == &name {
+                                    if k == name {
                                         let v = value.clone();
                                         return Ok(v);
                                     }
@@ -4316,7 +4316,7 @@ impl Vm {
                                         hb.own_get_index(ic.proto_slot.get() as usize)
                                     {
                                         if let PropertyKind::Data { value, .. } = &prop.kind {
-                                            if k == &name {
+                                            if k == name {
                                                 let v = value.clone();
                                                 return Ok(v);
                                             }
@@ -4363,7 +4363,7 @@ impl Vm {
                 }
             }
         }
-        self.get_prop(&obj, &PropertyKey::Str(name))
+        self.get_prop(obj, &PropertyKey::Str(name.clone()))
     }
 
     /// `Op::SetProp` / `ROp::SetProp` body: IC-accelerated named property
@@ -4371,8 +4371,8 @@ impl Vm {
     #[inline]
     pub(crate) fn ic_set_prop(
         &mut self,
-        obj: Value,
-        name: JsString,
+        obj: &Value,
+        name: &JsString,
         value: Value,
         strict: bool,
         ic: Option<&crate::bytecode::IcEntry>,
@@ -4386,7 +4386,7 @@ impl Vm {
         // key → proto-chain setters/read-only checks, accessors,
         // non-writable → strict TypeError, exotics) takes the
         // unchanged put_value path, which also refills the hint.
-        if let Value::Object(o) = &obj {
+        if let Value::Object(o) = obj {
             if let Some(ic) = ic {
                 let mut b = o.borrow_mut();
                 if matches!(b.internal, Internal::Ordinary) {
@@ -4411,7 +4411,7 @@ impl Vm {
                         if let Some((PropertyKey::Str(k), prop)) =
                             b.own_get_index_mut(ic.own_slot.get() as usize)
                         {
-                            if k == &name {
+                            if k == name {
                                 if let PropertyKind::Data {
                                     value: slot,
                                     writable: true,
@@ -4440,7 +4440,7 @@ impl Vm {
                 }
             }
         }
-        self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
+        self.put_value(obj, &PropertyKey::Str(name.clone()), value.clone(), strict)?;
         Ok(value)
     }
 
@@ -5798,9 +5798,32 @@ impl Vm {
                 }
                 // ---- property access ----
                 ROp::GetProp { dst, obj, name, ic } => {
-                    let obj = rd!(*obj);
-                    let name = Self::const_name_proto(&proto, *name);
-                    let v = tryv!(self.ic_get_prop(obj, name, reg.ic.get(*ic as usize)));
+                    // Receiver and name by REFERENCE: a live register is
+                    // read in place and the name straight off the const
+                    // table — no `Rc` bump/release pair for either per
+                    // access. A dying temp still moves out (its release
+                    // is the op's).
+                    let taken;
+                    let i = *obj as usize;
+                    let obj_ref: &Value = if i & crate::reg::TAKE as usize != 0 {
+                        taken = std::mem::replace(
+                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        );
+                        &taken
+                    } else {
+                        &frame.locals[i]
+                    };
+                    let v = match &consts[*name as usize] {
+                        Const::String(n) => {
+                            tryv!(self.ic_get_prop(obj_ref, n, reg.ic.get(*ic as usize)))
+                        }
+                        _ => tryv!(self.ic_get_prop(
+                            obj_ref,
+                            &JsString::new(""),
+                            reg.ic.get(*ic as usize)
+                        )),
+                    };
                     wr!(*dst, v);
                 }
                 ROp::SetProp {
@@ -5810,16 +5833,34 @@ impl Vm {
                     src,
                     ic,
                 } => {
-                    let obj = rd!(*obj);
                     let value = rd!(*src);
-                    let name = Self::const_name_proto(&proto, *name);
-                    let v = tryv!(self.ic_set_prop(
-                        obj,
-                        name,
-                        value,
-                        proto.is_strict,
-                        reg.ic.get(*ic as usize)
-                    ));
+                    let taken;
+                    let i = *obj as usize;
+                    let obj_ref: &Value = if i & crate::reg::TAKE as usize != 0 {
+                        taken = std::mem::replace(
+                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        );
+                        &taken
+                    } else {
+                        &frame.locals[i]
+                    };
+                    let v = match &consts[*name as usize] {
+                        Const::String(n) => tryv!(self.ic_set_prop(
+                            obj_ref,
+                            n,
+                            value,
+                            proto.is_strict,
+                            reg.ic.get(*ic as usize)
+                        )),
+                        _ => tryv!(self.ic_set_prop(
+                            obj_ref,
+                            &JsString::new(""),
+                            value,
+                            proto.is_strict,
+                            reg.ic.get(*ic as usize)
+                        )),
+                    };
                     wr!(*dst, v);
                 }
                 ROp::GetElem { dst, obj, key } => {
@@ -6737,7 +6778,7 @@ impl Vm {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
                 let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
-                let v = self.ic_get_prop(obj, name, ic)?;
+                let v = self.ic_get_prop(&obj, &name, ic)?;
                 push!(v);
             }
             Op::SetProp(i) => {
@@ -6746,7 +6787,7 @@ impl Vm {
                 let obj = pop!();
                 let strict = frame.func.proto.is_strict;
                 let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
-                let value = self.ic_set_prop(obj, name, value, strict, ic)?;
+                let value = self.ic_set_prop(&obj, &name, value, strict, ic)?;
                 push!(value);
             }
             Op::GetPropDynamic => {
