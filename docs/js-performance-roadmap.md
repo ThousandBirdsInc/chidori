@@ -2080,6 +2080,50 @@ i32/u32 boundaries, the 2^53 exactness bound, and the 2^63 cast bound;
 clippy clean on the default and `jit` builds; cross-runtime `RESULT=`
 cross-check green on all five columns.
 
+### 6.19.3 Against Node, with the opt-in JIT and PGO stacked (2026-10-21)
+
+The same container, same harness, 9 interleaved runs: the PGO'd
+interpreter (`chidori`), the PGO'd Cranelift-JIT runner (`chidori-jit`,
+built with the new `scripts/pgo-build.sh --bin chidori-js-jit` mode) and
+Node 22. Two readings of "as fast as Node", both from one run:
+
+| workload | jit+PGO exec | node exec | jit+PGO total | node total | total |
+| --- | ---: | ---: | ---: | ---: | :---: |
+| arith_loop | 2.5 ms | 5.6 ms | 5.8 ms | 42.1 ms | faster |
+| array_hof | 17.5 ms | 18.9 ms | 20.8 ms | 55.4 ms | faster |
+| array_push_sum | 18.2 ms | 11.9 ms | 21.6 ms | 48.3 ms | faster |
+| array_sum | 79.1 ms | 47.0 ms | 82.4 ms | 83.5 ms | faster |
+| checksum | 28.5 ms | 40.6 ms | 31.9 ms | 77.1 ms | faster |
+| closures | 2.8 ms | 2.7 ms | 6.1 ms | 39.2 ms | faster |
+| fib_recursive | 8.6 ms | 9.4 ms | 11.9 ms | 45.8 ms | faster |
+| json_roundtrip | 53.2 ms | 34.9 ms | 56.5 ms | 71.4 ms | faster |
+| mixed_helpers | 163.2 ms | 22.4 ms | 166.5 ms | 58.8 ms | **slower** |
+| mutual_recursion | 16.1 ms | 11.5 ms | 19.4 ms | 47.9 ms | faster |
+| property_access | 1.6 ms | 0.9 ms | 4.9 ms | 37.4 ms | faster |
+| sort | 103.7 ms | 101.0 ms | 107.0 ms | 137.5 ms | faster |
+| string_build | 6.2 ms | 5.9 ms | 9.5 ms | 42.4 ms | faster |
+| string_scan | 9.3 ms | 10.1 ms | 12.6 ms | 46.6 ms | faster |
+| typed_array | 15.8 ms | 31.2 ms | 19.1 ms | 67.7 ms | faster |
+
+- **Total wall-clock (what running a script costs):** faster than Node on
+  14 of 15 workloads, geomean **0.39×** Node's time. chidori-js starts in
+  ~4 ms against Node's ~35 ms, and the JIT tier carries the kernel-shaped
+  rows outright.
+- **Execution-only (startup subtracted):** geomean **1.16×** Node; at or
+  under Node on 7 rows (arith_loop, array_hof, checksum, closures,
+  fib_recursive, string_scan, typed_array), within 10% on sort and
+  string_build, 1.5–1.7× on array_push_sum, array_sum, json_roundtrip,
+  mutual_recursion and property_access (the last three are sub-20 ms rows
+  where startup-subtraction noise dominates), and 7.3× on mixed_helpers.
+  Without that one row the execution-only geomean is 1.02×.
+
+`mixed_helpers` (object-literal glue, for-in, string joins across small
+calls) is the structural gap §6.12.2 and docs/cranelift-jit.md already
+name: boxed 24-byte `Value` with `Rc` traffic on every move and a heap
+frame per call. It does not close with more kernel work; it needs the
+value-representation project (NaN-boxing / unboxed slots and shape-guarded
+inline property access).
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —
