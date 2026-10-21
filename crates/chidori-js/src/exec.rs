@@ -5333,6 +5333,10 @@ impl Vm {
         let costs = &reg.costs[..];
         let mut poll: u32 = 0;
         let code = &reg.code[..];
+        // The const table as a local slice: `Const`/`ArithK`/`AddK` read it
+        // on every iteration of glue loops, and going through
+        // `frame.func.proto.consts` was three dependent loads plus a call.
+        let consts = &proto.consts[..];
         let num_locals = proto.num_locals as usize;
         let mut pc: usize = 0;
         loop {
@@ -5452,7 +5456,7 @@ impl Vm {
                 // head via the cost table; the op itself runs nothing.
                 ROp::Charge => {}
                 ROp::Mov { dst, src } => wr!(*dst, rd!(*src)),
-                ROp::Const { dst, idx } => wr!(*dst, self.const_val(&frame, *idx)),
+                ROp::Const { dst, idx } => wr!(*dst, const_of(consts, *idx)),
                 ROp::Undef { dst } => wr!(*dst, Value::Undefined),
                 ROp::Null { dst } => wr!(*dst, Value::Null),
                 ROp::Bool { dst, v } => wr!(*dst, Value::Bool(*v)),
@@ -5528,7 +5532,14 @@ impl Vm {
                     wr!(*dst, r);
                 }
                 ROp::Arith { kind, dst, a, b } => {
-                    let r = tryv!(self.arith(rd!(*a), rd!(*b), *kind));
+                    // Number × Number inline (the generic `arith` call is the
+                    // BigInt/coercion path).
+                    let (a, b) = (rd!(*a), rd!(*b));
+                    let r = if let (Value::Number(x), Value::Number(y)) = (&a, &b) {
+                        Value::Number(number_arith_raw(*x, *y, *kind))
+                    } else {
+                        tryv!(self.arith(a, b, *kind))
+                    };
                     wr!(*dst, r);
                 }
                 ROp::ArithK {
@@ -5537,8 +5548,19 @@ impl Vm {
                     a,
                     konst,
                 } => {
-                    let b = self.const_val(&frame, *konst);
-                    let r = tryv!(self.arith(rd!(*a), b, *kind));
+                    // A Number constant is read straight off the const table
+                    // (no `Value` materialization) when the operand is a
+                    // Number — the `i % 7`, `i & 1023`, `x * 3` idioms.
+                    let a = rd!(*a);
+                    let r = match (&a, &consts[*konst as usize]) {
+                        (Value::Number(x), Const::Number(k)) => {
+                            Value::Number(number_arith_raw(*x, *k, *kind))
+                        }
+                        _ => {
+                            let b = const_of(consts, *konst);
+                            tryv!(self.arith(a, b, *kind))
+                        }
+                    };
                     wr!(*dst, r);
                 }
                 ROp::AddCellK { dst, cell, konst } => {
@@ -8548,17 +8570,20 @@ impl Vm {
                 _ => None,
             };
             if let Some((s, n, str_first)) = sn {
-                if let Some(flat) = s.as_flat_utf8() {
+                if let Some(flat) = s.flat_wf_bytes() {
                     if flat.len() + 24 < crate::value::ROPE_MIN_BYTES {
-                        let mut out = String::with_capacity(flat.len() + 24);
+                        // `WfBuilder`: the common ≤22-byte result is assembled
+                        // in place (no heap, no UTF-8 re-check); a longer one
+                        // takes one buffer and one validation.
+                        let mut out = crate::value::WfBuilder::new();
                         if str_first {
-                            out.push_str(flat);
-                            crate::vm::push_number_string(n, &mut out);
+                            out.push(flat);
+                            out.push_number(n);
                         } else {
-                            crate::vm::push_number_string(n, &mut out);
-                            out.push_str(flat);
+                            out.push_number(n);
+                            out.push(flat);
                         }
-                        return Ok(Value::String(JsString::from(out)));
+                        return Ok(Value::String(out.finish()));
                     }
                 }
             }
@@ -9755,6 +9780,24 @@ fn kmath2(kind: crate::bytecode::KMath, a: f64, b: f64) -> f64 {
     }
 }
 
+/// A constant-table entry as a `Value` (the body of `Vm::const_val`, as a
+/// free function over the table slice the register loop already holds).
+#[inline(always)]
+pub(crate) fn const_of(consts: &[Const], idx: u32) -> Value {
+    match &consts[idx as usize] {
+        Const::Undefined => Value::Undefined,
+        Const::Null => Value::Null,
+        Const::Bool(b) => Value::Bool(*b),
+        Const::Number(n) => Value::Number(*n),
+        Const::String(s) => Value::String(s.clone()),
+        Const::Func(_) => Value::Undefined, // handled by Closure
+        Const::BigInt(s) => {
+            Value::bigint(parse_string_bigint(s).unwrap_or_else(|| num_bigint::BigInt::from(0)))
+        }
+    }
+}
+
+#[inline]
 fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {
     Value::Number(number_arith_raw(x, y, kind))
 }

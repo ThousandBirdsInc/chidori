@@ -135,6 +135,96 @@ fn inline_repr(s: &str) -> Option<Repr> {
     }
 }
 
+/// Zero-allocation assembly of a short well-formed string from well-formed
+/// PIECES — a flat string's bytes, ASCII digits — straight into the inline
+/// representation. Nothing is re-validated piece by piece (the pieces are
+/// well-formed by construction, so a `&str` round-trip per piece would only
+/// re-run the UTF-8 check the inline arm cannot skip without `unsafe`); a
+/// result past `INLINE_CAP` spills to one heap buffer that is validated ONCE
+/// at the end. The `string + number` / `number + string` glue idiom
+/// (`"item" + i`, `"[" + rec.id + "] "`) used to pay a `String` allocation
+/// and free plus that re-validation per `+` for a result that was inline
+/// anyway.
+pub(crate) struct WfBuilder {
+    buf: [u8; INLINE_CAP],
+    len: usize,
+    spill: Vec<u8>,
+}
+
+impl WfBuilder {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        WfBuilder {
+            buf: [0u8; INLINE_CAP],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    /// Append well-formed UTF-8 bytes (a flat string's bytes, ASCII text).
+    #[inline]
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        if self.spill.is_empty() {
+            if self.len + bytes.len() <= INLINE_CAP {
+                self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+                self.len += bytes.len();
+                return;
+            }
+            self.spill.reserve(self.len + bytes.len() + 16);
+            self.spill.extend_from_slice(&self.buf[..self.len]);
+        }
+        self.spill.extend_from_slice(bytes);
+    }
+
+    /// Append a Number's `ToString` (the integer fast path formats straight
+    /// into the builder; everything else goes through `number_to_string`).
+    #[inline]
+    pub(crate) fn push_number(&mut self, n: f64) {
+        if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_992.0 {
+            let mut i = n as i64; // -0.0 casts to 0: prints "0" like the spec
+            if i < 0 {
+                self.push(b"-");
+                i = -i;
+            }
+            let mut digits = [0u8; 16]; // 2^53 has 16 digits
+            let mut p = digits.len();
+            loop {
+                p -= 1;
+                digits[p] = b'0' + (i % 10) as u8;
+                i /= 10;
+                if i == 0 {
+                    break;
+                }
+            }
+            self.push(&digits[p..]);
+        } else {
+            self.push(crate::vm::number_to_string(n).as_bytes());
+        }
+    }
+
+    pub(crate) fn finish(self) -> JsString {
+        if self.spill.is_empty() {
+            let ascii = if self.buf[..self.len].is_ascii() {
+                INLINE_ASCII
+            } else {
+                0
+            };
+            return JsString(Repr::Inline {
+                meta: self.len as u8 | ascii,
+                buf: self.buf,
+            });
+        }
+        // One validation for the whole result. The pieces are well-formed by
+        // contract; a violation (a caller passing WTF-8 bytes) degrades to the
+        // lossy view rather than panicking inside the engine.
+        let s = match String::from_utf8(self.spill) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+        JsString(utf8_repr(Rc::from(s.as_str())))
+    }
+}
+
 /// Assemble an inline repr directly from well-formed UTF-8 bytes (both
 /// halves come out of existing `JsString`s, so no validation is needed —
 /// only the ASCII scan for the meta bit).
@@ -426,6 +516,19 @@ impl JsString {
         match &self.0 {
             Repr::Inline { meta, buf } => Some(inline_str(buf, *meta)),
             Repr::Utf8(s, _) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The bytes of a flat WELL-FORMED string (inline or heap UTF-8) without
+    /// the `&str` round-trip — for [`WfBuilder`] pieces, where the inline
+    /// arm's UTF-8 re-validation would be pure overhead. `None` for WTF-8
+    /// and ropes.
+    #[inline]
+    pub(crate) fn flat_wf_bytes(&self) -> Option<&[u8]> {
+        match &self.0 {
+            Repr::Inline { meta, buf } => Some(&buf[..inline_len(*meta)]),
+            Repr::Utf8(s, _) => Some(s.as_bytes()),
             _ => None,
         }
     }
