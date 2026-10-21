@@ -3350,24 +3350,40 @@ impl Vm {
                 self.recycle_cell(cell);
             }
         }
-        frame.this = Value::Undefined;
-        frame.new_target = Value::Undefined;
+        // Clears guarded by "already clear": each unconditional `= Undefined`
+        // / `= None` was an out-of-line drop-glue call per field per return,
+        // for fields that are `undefined`/`None` on the vast majority of
+        // frames (a plain call with no `this`, no throw, no finally).
+        clear_value_slot(&mut frame.this);
+        clear_value_slot(&mut frame.new_target);
         frame.handlers.clear();
-        frame.pending_completion = None;
+        if frame.pending_completion.is_some() {
+            frame.pending_completion = None;
+        }
         frame.finally_parks.clear();
-        frame.pending_throw = None;
-        frame.pending_return = None;
+        if frame.pending_throw.is_some() {
+            frame.pending_throw = None;
+        }
+        if frame.pending_return.is_some() {
+            frame.pending_return = None;
+        }
         frame.unwind_pos = None;
         frame.args.clear();
-        frame.func_obj = None;
+        if frame.func_obj.is_some() {
+            frame.func_obj = None;
+        }
         frame.dispose_scopes.clear();
-        frame.completion = Value::Undefined;
+        clear_value_slot(&mut frame.completion);
         frame.enumerators.clear();
         frame.with_scope.clear();
         frame.trace_token = None;
         frame.skip_delegation_throw = false;
-        frame.eval_vars = None;
-        frame.priv_env = None;
+        if frame.eval_vars.is_some() {
+            frame.eval_vars = None;
+        }
+        if frame.priv_env.is_some() {
+            frame.priv_env = None;
+        }
         self.frame_pool.push(frame);
     }
 
@@ -3474,9 +3490,9 @@ impl Vm {
     ) {
         f.ip = 0;
         let proto = &bf.proto;
-        for i in 0..proto.num_cells as usize {
-            // A localized index lives in `frame.locals`; its cell slot is a
-            // shared never-read placeholder (`Rc` bump, no pool round-trip).
+        // Only the leading slots up to the last live cell (`cells_live`); a
+        // localized index among them gets the shared never-read placeholder.
+        for i in 0..proto.cells_live as usize {
             let c = if proto.localized.get(i).copied().unwrap_or(false) {
                 self.dummy_cell.clone()
             } else {
@@ -3484,15 +3500,26 @@ impl Vm {
             };
             f.cells.push(c);
         }
-        f.locals.resize(proto.num_locals as usize, Value::Undefined);
+        // One register-file fill: a register-tier function sizes straight to
+        // its full register count here (`run_reg_frame`'s resize is then a
+        // no-op) instead of two extend passes per call.
+        let regs = match &proto.reg {
+            Some(r) => (r.num_regs as usize).max(proto.num_locals as usize),
+            None => proto.num_locals as usize,
+        };
+        f.locals.resize(regs, Value::Undefined);
         // A closure created inside `with (o) { … }` carries the with-object
         // chain; seed the frame's with-scope stack with it so the body's
         // dynamic name ops resolve against it (under any with the body enters).
         f.with_scope.extend_from_slice(&bf.captured_with);
-        f.priv_env = bf.captured_priv_env.clone();
+        if bf.captured_priv_env.is_some() || f.priv_env.is_some() {
+            f.priv_env = bf.captured_priv_env.clone();
+        }
         f.func = bf;
-        f.this = this;
-        f.new_target = new_target;
+        // A recycled frame holds `undefined` in both; skip the drop glue
+        // call the plain assignment would make for that no-op drop.
+        set_value_slot(&mut f.this, this);
+        set_value_slot(&mut f.new_target, new_target);
     }
 
     // =====================================================================
@@ -9777,6 +9804,26 @@ fn kmath2(kind: crate::bytecode::KMath, a: f64, b: f64) -> f64 {
         KMath::Pow2 => m::math_pow(a, b),
         KMath::Imul2 => m::math_imul2(a, b),
         _ => unreachable!("unary Math kind in Math2"),
+    }
+}
+
+/// `*slot = v` without the drop-glue call when the old value is `undefined`
+/// — the state a recycled frame's `this`/`new_target`/`completion` are in.
+#[inline(always)]
+fn set_value_slot(slot: &mut Value, v: Value) {
+    let old = std::mem::replace(slot, v);
+    if !matches!(old, Value::Undefined) {
+        drop(old);
+    } else {
+        std::mem::forget(old);
+    }
+}
+
+/// `*slot = Value::Undefined`, skipping the drop-glue call when it already is.
+#[inline(always)]
+fn clear_value_slot(slot: &mut Value) {
+    if !matches!(slot, Value::Undefined) {
+        *slot = Value::Undefined;
     }
 }
 

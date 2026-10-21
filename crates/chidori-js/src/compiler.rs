@@ -2295,6 +2295,16 @@ impl Compiler {
                 flags
             },
             stable_cells: fc.stable_cells.clone(),
+            cells_live: loc
+                .localized
+                .iter()
+                .rposition(|&l| !l)
+                .map_or(0, |i| i as u32 + 1)
+                .max(if loc.localized.is_empty() {
+                    fc.num_cells
+                } else {
+                    0
+                }),
             localized: loc.localized,
             this_cell: fc.this_cell,
             inherit_home: fc.inherit_home,
