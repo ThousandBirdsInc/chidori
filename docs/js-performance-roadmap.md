@@ -2220,6 +2220,38 @@ after 3–5 — parity on total wall-clock everywhere, and execution-only
 parity on everything but the allocation-bound rows, which then need the
 ObjectData arena §6.12.2 already tracks.
 
+### 6.20.4 Phase 1 checkpoint (2026-10-21, branch `perf/value-model-phase1`)
+
+The approved reading of the goal is execution-only parity with Node on
+every workload, so the project started with the cheap increments the
+fresh profile ranked above the structural steps — each landed alone,
+measured on the whole corpus, gated by the full suite and clippy:
+
+| increment | change | mixed_helpers Ir |
+| --- | --- | ---: |
+| (start) | §6.19 + the §6.20.1 rounds | 1.559 G |
+| 1a | `WfBuilder`: zero-alloc, validation-free `string + number`; const table as a local slice; Number×Number inline in `Arith`/`ArithK` | 1.464 G (−6.1%) |
+| 1b | `cells_live`; one register fill per call; guarded frame clears | 1.443 G (−1.5%) |
+| 1c | own-property paths for computed string keys (`obj[k]`, `obj[k] = v`) | 1.391 G (−3.6%) |
+| 1d | property ICs borrow receiver + name; register arms read live registers in place | 1.341 G (−3.6%) |
+| 1e | same for `GetElem`/`SetElem` (`rref!`/`rref2!`) | 1.319 G (−1.6%) |
+| 1g | Number fast paths in `ToNumeric`/`Inc`/`Dec`; `CmpBrK` decides string/Number constants against the const table | 1.281 G (−2.9%) |
+
+Cumulative since `v3.8.1`: **1.689 G → 1.281 G (−24.2%)**; string_build
+−13%, json_roundtrip −1.4%, string_scan −3%, nothing regressed. Wall-clock
+on the PGO JIT build, 15 interleaved runs: mixed_helpers 146.5 ms total
+against Node's 64.5 ms (≈5.0× on execution-only, from 7.3× at the start
+of the project).
+
+What the profile says now (per loop iteration, ~22 k instructions):
+register dispatch and the inlined arm bodies 27%, `Value` drop/clone 14%,
+object-literal allocation + GC registry + free 10%, string `+` 11% (now
+mostly the inline-concat copies and digit formatting), frame
+setup/teardown 8%, property ICs 6%, for-in 6%, computed-key ops 4%. The
+cheap levers are spent: everything left is a structural item of §6.20.3 —
+frames as windows of a shared register stack (step 2) is the next, then
+the unboxed slots (step 1).
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

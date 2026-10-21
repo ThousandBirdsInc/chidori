@@ -5709,9 +5709,22 @@ impl Vm {
                         // ToNumber throws TypeError for BigInt (unary + is
                         // invalid on it).
                         RUnary::Pos => Value::Number(tryv!(self.to_number(&a))),
-                        RUnary::ToNumeric => tryv!(self.to_numeric(&a)),
-                        RUnary::Inc => tryv!(self.unary_arith(a, UnaryKind::Inc)),
-                        RUnary::Dec => tryv!(self.unary_arith(a, UnaryKind::Dec)),
+                        // A Number is already numeric: ToNumeric is the
+                        // identity and `++`/`--` is one add — skip the
+                        // ToPrimitive/ToNumber round-trip for the common
+                        // counter case.
+                        RUnary::ToNumeric => match a {
+                            Value::Number(_) => a,
+                            _ => tryv!(self.to_numeric(&a)),
+                        },
+                        RUnary::Inc => match a {
+                            Value::Number(n) => Value::Number(n + 1.0),
+                            _ => tryv!(self.unary_arith(a, UnaryKind::Inc)),
+                        },
+                        RUnary::Dec => match a {
+                            Value::Number(n) => Value::Number(n - 1.0),
+                            _ => tryv!(self.unary_arith(a, UnaryKind::Dec)),
+                        },
                         RUnary::BitNot => tryv!(self.unary_arith(a, UnaryKind::BitNot)),
                         RUnary::Not => Value::Bool(!self.to_boolean(&a)),
                         RUnary::Typeof => Value::String(crate::names::typeof_result(a.type_of())),
@@ -5813,8 +5826,25 @@ impl Vm {
                     if_true,
                     target,
                 } => {
-                    let b = self.const_val(&frame, *konst);
-                    let r = tryv!(self.cmp_values(*cmp, &frame.locals[*a as usize], &b));
+                    // Strict (in)equality against a string or Number
+                    // constant is decided against the const table directly
+                    // — no `Value` materialized (an `Rc` bump + release per
+                    // compare for a string constant, e.g. `k === "id"` on
+                    // every for-in step).
+                    let r = match (*cmp, &frame.locals[*a as usize], &consts[*konst as usize]) {
+                        (CmpOp::StrictEq, Value::String(x), Const::String(k)) => x == k,
+                        (CmpOp::StrictNe, Value::String(x), Const::String(k)) => x != k,
+                        (CmpOp::StrictEq, Value::Number(x), Const::Number(k)) => x == k,
+                        (CmpOp::StrictNe, Value::Number(x), Const::Number(k)) => x != k,
+                        (CmpOp::StrictEq, Value::String(_), Const::Number(_))
+                        | (CmpOp::StrictEq, Value::Number(_), Const::String(_)) => false,
+                        (CmpOp::StrictNe, Value::String(_), Const::Number(_))
+                        | (CmpOp::StrictNe, Value::Number(_), Const::String(_)) => true,
+                        _ => {
+                            let b = const_of(consts, *konst);
+                            tryv!(self.cmp_values(*cmp, &frame.locals[*a as usize], &b))
+                        }
+                    };
                     if r == *if_true {
                         pc = *target as usize;
                     }
