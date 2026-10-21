@@ -4508,6 +4508,22 @@ impl Vm {
                 self.forin_hint.set(Some(h));
             }
         }
+        // Computed STRING key on an ordinary object: an own data property's
+        // [[Get]] is exactly its slot value, so resolve it with one own-map
+        // probe and skip ToPropertyKey + the generic `get_prop` ceremony
+        // (coercibility check, index-string parse, prototype climb). The
+        // `buckets[kind]` / `table[name]` idiom. A miss (no own key, an
+        // accessor, an exotic receiver) takes the unchanged path below.
+        if let (Value::Object(o), Value::String(s)) = (&obj, &key_v) {
+            let b = o.borrow();
+            if matches!(b.internal, Internal::Ordinary) {
+                if let Some((_, _, prop)) = b.own_get_full(&PropertyKey::Str(s.clone())) {
+                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                        return Ok(value.clone());
+                    }
+                }
+            }
+        }
         // GetValue: RequireObjectCoercible(base) (via ToObject) throws
         // BEFORE ToPropertyKey coerces the key expression's value.
         self.require_object_coercible(&obj, "read properties of")?;
@@ -4584,6 +4600,27 @@ impl Vm {
                             }
                             return Ok(value);
                         }
+                    }
+                }
+            }
+        }
+        // Computed STRING key on an ordinary object whose OWN property at
+        // that key is a WRITABLE data property: per OrdinarySetWithOwn-
+        // Descriptor the assignment updates the slot in place (no setter on
+        // the chain can intervene, attributes and order are preserved) —
+        // the same condition `ic_set_prop`'s fast path relies on, resolved
+        // here with one own-map probe. `buckets[kind]++`'s write half.
+        if let (Value::Object(o), Value::String(s)) = (&obj, &key_v) {
+            let mut b = o.borrow_mut();
+            if matches!(b.internal, Internal::Ordinary) {
+                if let Some((_, _, prop)) = b.own_get_full_mut(&PropertyKey::Str(s.clone())) {
+                    if let PropertyKind::Data {
+                        value: slot,
+                        writable: true,
+                    } = &mut prop.kind
+                    {
+                        *slot = value.clone();
+                        return Ok(value);
                     }
                 }
             }
