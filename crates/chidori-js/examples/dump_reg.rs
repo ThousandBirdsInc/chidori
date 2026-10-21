@@ -10,10 +10,7 @@ use chidori_js::bytecode::{Const, FuncProto};
 
 fn name_of(op: &chidori_js::reg::ROp) -> String {
     let s = format!("{op:?}");
-    s.split([' ', '{', '('])
-        .next()
-        .unwrap_or("")
-        .to_string()
+    s.split([' ', '{', '(']).next().unwrap_or("").to_string()
 }
 
 fn walk(
