@@ -618,6 +618,11 @@ impl fmt::Debug for JsObject {
 }
 
 /// A JS value. `Clone` is cheap for all variants (scalars or `Rc` bumps).
+// (A hand-written `Clone` with an inline immediate fast path was measured
+// 2026-10-21 and rejected: on object-glue code most cloned registers hold
+// strings/objects, so the inline tag test only preceded the same call, and
+// the hot loop grew by more than the immediate clones saved — +1.8%
+// instructions on mixed_helpers, +4% on array_hof.)
 #[derive(Clone)]
 // The primitive representation (RFC 2195: tag byte + union of C-laid-out
 // variant structs) pins the layout the `jit` feature's dense-element fast

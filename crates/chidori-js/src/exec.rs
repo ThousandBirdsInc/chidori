@@ -5874,6 +5874,33 @@ impl Vm {
                     let f = tryv!(self.closure_from_const(&frame, *idx));
                     wr!(*dst, f);
                 }
+                // The for-in trio and the object-literal template are glue-
+                // code HOT ops (every `for (k in rec)` iteration, every
+                // `{...}` literal in a helper): their bodies are one helper
+                // call each, so they add nothing to this frame's locals, and
+                // routing them through `rstep_cold` cost a second dispatch
+                // plus the cold function's prologue per op — ~5% of an
+                // object-glue workload's instructions.
+                ROp::ForInEnumerate { dst, src } => {
+                    let v = rd!(*src);
+                    let idx = tryv!(self.for_in_enumerate(&mut frame, &v));
+                    wr!(*dst, idx);
+                }
+                ROp::ForInNext { dst } => {
+                    let (k, more) = self.for_in_next(&mut frame);
+                    wr!(*dst, k);
+                    wr!(*dst + 1, more);
+                }
+                ROp::ForInPop => {
+                    if let Some((keys, ..)) = frame.enumerators.pop() {
+                        self.park_forin_vec(keys);
+                    }
+                    self.forin_hint.set(None);
+                }
+                ROp::NewObjectTpl { dst, at, n, tpl } => {
+                    let obj = self.new_object_from_tpl_at(&mut frame, *at, *n, *tpl);
+                    wr!(*dst, Value::Object(obj));
+                }
                 // Everything rarer runs through the cold arm, keeping this
                 // loop's native stack frame small (same split — and same
                 // reason — as `step`/`step_cold`).
@@ -5940,6 +5967,19 @@ impl Vm {
             Completion::Throw(e) => Err(e),
             Completion::Jump { target, .. } => Ok(RegCtl::Jump(target as usize)),
         }
+    }
+
+    /// `ROp::NewObjectTpl` body: build the literal from template `tpl`,
+    /// MOVING its `n` values out of the registers at `at..at+n`.
+    #[inline(never)]
+    fn new_object_from_tpl_at(&mut self, frame: &mut Frame, at: u16, n: u16, tpl: u32) -> JsObject {
+        let tpl = frame.func.proto.obj_tpls[tpl as usize].clone();
+        self.new_object_from_tpl(
+            &tpl,
+            frame.locals[at as usize..(at + n) as usize]
+                .iter_mut()
+                .map(|slot| std::mem::replace(slot, Value::Undefined)),
+        )
     }
 
     /// The register tier's rare ops. `#[inline(never)]` keeps their unioned
@@ -6136,16 +6176,6 @@ impl Vm {
                 }
                 wr!(*dst, Value::Object(self.new_array(elems)));
             }
-            ROp::NewObjectTpl { dst, at, n, tpl } => {
-                let tpl = frame.func.proto.obj_tpls[*tpl as usize].clone();
-                let obj = self.new_object_from_tpl(
-                    &tpl,
-                    frame.locals[*at as usize..(*at + *n) as usize]
-                        .iter_mut()
-                        .map(|slot| std::mem::replace(slot, Value::Undefined)),
-                );
-                wr!(*dst, Value::Object(obj));
-            }
             ROp::ArraySpread { arr, src } => {
                 let (arr_v, src) = (rd!(*arr), rd!(*src));
                 self.array_spread(&arr_v, &src)?;
@@ -6235,16 +6265,6 @@ impl Vm {
                 wr!(*dst, value);
                 wr!(*dst + 1, Value::Bool(done));
             }
-            ROp::ForInEnumerate { dst, src } => {
-                let v = rd!(*src);
-                let idx = self.for_in_enumerate(frame, &v)?;
-                wr!(*dst, idx);
-            }
-            ROp::ForInNext { dst } => {
-                let (k, more) = self.for_in_next(frame);
-                wr!(*dst, k);
-                wr!(*dst + 1, more);
-            }
             ROp::IteratorClose { it } => {
                 // Reached only on an abrupt completion (for-of / destructuring
                 // landing pads), with that completion parked. Per spec
@@ -6286,12 +6306,6 @@ impl Vm {
                     // TypeError (masked only by an in-flight throw).
                     return Err(self.throw_type("iterator return is not a function"));
                 }
-            }
-            ROp::ForInPop => {
-                if let Some((keys, ..)) = frame.enumerators.pop() {
-                    self.park_forin_vec(keys);
-                }
-                self.forin_hint.set(None);
             }
             // Every ROp is either handled above or inline in run_reg_frame's
             // dispatch loop. Reaching here means the register-tier translator
