@@ -3340,7 +3340,17 @@ impl Vm {
         }
         frame.func = self.dummy_bf.clone();
         frame.stack.clear();
-        frame.locals.clear();
+        // The register file is cleared IN PLACE and keeps its length: a slot
+        // that already holds `undefined` (most of them at return) costs a
+        // tag test instead of a drop-glue call, and the next activation of
+        // a function with the same register count skips the refill
+        // entirely (`init_frame` resizes only on a length change). Nothing
+        // else differs from `clear()`: no value outlives the return.
+        for slot in frame.locals.iter_mut() {
+            if !matches!(slot, Value::Undefined) {
+                *slot = Value::Undefined;
+            }
+        }
         for cell in frame.cells.drain(..) {
             // A localized binding's slot is the shared placeholder (see
             // `init_frame`): never poolable (its count is never 1), so skip
@@ -3503,11 +3513,30 @@ impl Vm {
         // One register-file fill: a register-tier function sizes straight to
         // its full register count here (`run_reg_frame`'s resize is then a
         // no-op) instead of two extend passes per call.
-        let regs = match &proto.reg {
-            Some(r) => (r.num_regs as usize).max(proto.num_locals as usize),
-            None => proto.num_locals as usize,
-        };
-        f.locals.resize(regs, Value::Undefined);
+        match &proto.reg {
+            // Register tier: grow-only. A pooled frame that last served a
+            // larger function keeps its longer register file (the surplus
+            // slots are `undefined` and never addressed — every register
+            // index is bounded by the function's own count), so alternating
+            // calls of differently sized helpers stop resizing per call.
+            // Register-tier frames never suspend, so no surplus is ever
+            // serialized.
+            Some(r) => {
+                let regs = (r.num_regs as usize).max(proto.num_locals as usize);
+                if f.locals.len() < regs {
+                    f.locals.resize(regs, Value::Undefined);
+                }
+            }
+            // Stack tier (generators and async functions live here and DO
+            // suspend): exact size, so a snapshot of a suspended frame is
+            // independent of the pool's history.
+            None => {
+                let n = proto.num_locals as usize;
+                if f.locals.len() != n {
+                    f.locals.resize(n, Value::Undefined);
+                }
+            }
+        }
         // A closure created inside `with (o) { … }` carries the with-object
         // chain; seed the frame's with-scope stack with it so the body's
         // dynamic name ops resolve against it (under any with the body enters).
