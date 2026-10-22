@@ -71,7 +71,7 @@ jobs:
           # Project pages are served under /<repo>. Drop this (or set it to
           # empty) if the site moves to a custom domain.
           DOCS_BASE_PATH: /chidori
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: website/out
 
