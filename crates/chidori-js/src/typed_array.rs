@@ -17,6 +17,7 @@ pub const ARRAY_BUFFER_MAX_SLOT: &str = "[[ArrayBufferMaxByteLength]]";
 // =========================================================================
 
 /// Decode the element at byte `off` of `bytes` as an `f64` JS number.
+#[inline(always)]
 pub fn decode(bytes: &[u8], off: usize, kind: TAKind) -> f64 {
     macro_rules! rd {
         ($t:ty, $n:expr) => {{
@@ -88,6 +89,7 @@ fn bigint_low_u64(v: &BigInt) -> u64 {
 
 /// Encode `v` into the element at byte `off`, applying the kind's coercion
 /// (ToInt8/ToUint8/ToUint8Clamp/…/ identity for floats).
+#[inline(always)]
 pub fn encode(bytes: &mut [u8], off: usize, kind: TAKind, v: f64) {
     macro_rules! wr {
         ($e:expr, $n:expr) => {{
@@ -146,11 +148,20 @@ fn to_uint8_clamp(v: f64) -> u8 {
 /// auto-length view on a resizable buffer — the count derived from the buffer's
 /// current byte length (`floor((bufferByteLength - byteOffset) / elementSize)`,
 /// clamped to 0 when the view no longer fits / the buffer is detached).
+#[inline(always)]
 pub fn ta_eff_length(t: &TypedArrayData) -> usize {
     let buf_len = match &t.buffer.borrow().internal {
         Internal::ArrayBuffer(Some(bytes)) => bytes.len(),
         _ => 0, // detached
     };
+    ta_eff_length_in(t, buf_len)
+}
+
+/// [`ta_eff_length`] against an already-read buffer byte length (`0` for a
+/// detached buffer) — for callers that hold the buffer borrow anyway (the
+/// kernel element paths) and must not re-enter the `RefCell`.
+#[inline(always)]
+pub fn ta_eff_length_in(t: &TypedArrayData, buf_len: usize) -> usize {
     if !t.length_tracking {
         // IsTypedArrayOutOfBounds: a fixed-length view that no longer fits its
         // (shrunk resizable) buffer behaves like a detached one — length 0.

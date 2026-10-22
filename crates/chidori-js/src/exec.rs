@@ -3340,28 +3340,60 @@ impl Vm {
         }
         frame.func = self.dummy_bf.clone();
         frame.stack.clear();
-        frame.locals.clear();
-        for cell in frame.cells.drain(..) {
-            self.recycle_cell(cell);
+        // The register file is cleared IN PLACE and keeps its length: a slot
+        // that already holds `undefined` (most of them at return) costs a
+        // tag test instead of a drop-glue call, and the next activation of
+        // a function with the same register count skips the refill
+        // entirely (`init_frame` resizes only on a length change). Nothing
+        // else differs from `clear()`: no value outlives the return.
+        for slot in frame.locals.iter_mut() {
+            if !matches!(slot, Value::Undefined) {
+                *slot = Value::Undefined;
+            }
         }
-        frame.this = Value::Undefined;
-        frame.new_target = Value::Undefined;
+        for cell in frame.cells.drain(..) {
+            // A localized binding's slot is the shared placeholder (see
+            // `init_frame`): never poolable (its count is never 1), so skip
+            // the pool probe — this was one out-of-line call per cell per
+            // return, on every call of a function with localized bindings.
+            if !Rc::ptr_eq(&cell, &self.dummy_cell) {
+                self.recycle_cell(cell);
+            }
+        }
+        // Clears guarded by "already clear": each unconditional `= Undefined`
+        // / `= None` was an out-of-line drop-glue call per field per return,
+        // for fields that are `undefined`/`None` on the vast majority of
+        // frames (a plain call with no `this`, no throw, no finally).
+        clear_value_slot(&mut frame.this);
+        clear_value_slot(&mut frame.new_target);
         frame.handlers.clear();
-        frame.pending_completion = None;
+        if frame.pending_completion.is_some() {
+            frame.pending_completion = None;
+        }
         frame.finally_parks.clear();
-        frame.pending_throw = None;
-        frame.pending_return = None;
+        if frame.pending_throw.is_some() {
+            frame.pending_throw = None;
+        }
+        if frame.pending_return.is_some() {
+            frame.pending_return = None;
+        }
         frame.unwind_pos = None;
         frame.args.clear();
-        frame.func_obj = None;
+        if frame.func_obj.is_some() {
+            frame.func_obj = None;
+        }
         frame.dispose_scopes.clear();
-        frame.completion = Value::Undefined;
+        clear_value_slot(&mut frame.completion);
         frame.enumerators.clear();
         frame.with_scope.clear();
         frame.trace_token = None;
         frame.skip_delegation_throw = false;
-        frame.eval_vars = None;
-        frame.priv_env = None;
+        if frame.eval_vars.is_some() {
+            frame.eval_vars = None;
+        }
+        if frame.priv_env.is_some() {
+            frame.priv_env = None;
+        }
         self.frame_pool.push(frame);
     }
 
@@ -3468,9 +3500,9 @@ impl Vm {
     ) {
         f.ip = 0;
         let proto = &bf.proto;
-        for i in 0..proto.num_cells as usize {
-            // A localized index lives in `frame.locals`; its cell slot is a
-            // shared never-read placeholder (`Rc` bump, no pool round-trip).
+        // Only the leading slots up to the last live cell (`cells_live`); a
+        // localized index among them gets the shared never-read placeholder.
+        for i in 0..proto.cells_live as usize {
             let c = if proto.localized.get(i).copied().unwrap_or(false) {
                 self.dummy_cell.clone()
             } else {
@@ -3478,15 +3510,45 @@ impl Vm {
             };
             f.cells.push(c);
         }
-        f.locals.resize(proto.num_locals as usize, Value::Undefined);
+        // One register-file fill: a register-tier function sizes straight to
+        // its full register count here (`run_reg_frame`'s resize is then a
+        // no-op) instead of two extend passes per call.
+        match &proto.reg {
+            // Register tier: grow-only. A pooled frame that last served a
+            // larger function keeps its longer register file (the surplus
+            // slots are `undefined` and never addressed — every register
+            // index is bounded by the function's own count), so alternating
+            // calls of differently sized helpers stop resizing per call.
+            // Register-tier frames never suspend, so no surplus is ever
+            // serialized.
+            Some(r) => {
+                let regs = (r.num_regs as usize).max(proto.num_locals as usize);
+                if f.locals.len() < regs {
+                    f.locals.resize(regs, Value::Undefined);
+                }
+            }
+            // Stack tier (generators and async functions live here and DO
+            // suspend): exact size, so a snapshot of a suspended frame is
+            // independent of the pool's history.
+            None => {
+                let n = proto.num_locals as usize;
+                if f.locals.len() != n {
+                    f.locals.resize(n, Value::Undefined);
+                }
+            }
+        }
         // A closure created inside `with (o) { … }` carries the with-object
         // chain; seed the frame's with-scope stack with it so the body's
         // dynamic name ops resolve against it (under any with the body enters).
         f.with_scope.extend_from_slice(&bf.captured_with);
-        f.priv_env = bf.captured_priv_env.clone();
+        if bf.captured_priv_env.is_some() || f.priv_env.is_some() {
+            f.priv_env = bf.captured_priv_env.clone();
+        }
         f.func = bf;
-        f.this = this;
-        f.new_target = new_target;
+        // A recycled frame holds `undefined` in both; skip the drop glue
+        // call the plain assignment would make for that no-op drop.
+        set_value_slot(&mut f.this, this);
+        set_value_slot(&mut f.new_target, new_target);
     }
 
     // =====================================================================
@@ -4139,6 +4201,7 @@ impl Vm {
         }
     }
 
+    #[inline]
     fn const_val(&self, frame: &Frame, idx: u32) -> Value {
         match &frame.func.proto.consts[idx as usize] {
             Const::Undefined => Value::Undefined,
@@ -4183,8 +4246,8 @@ impl Vm {
     #[inline]
     pub(crate) fn ic_get_prop(
         &mut self,
-        obj: Value,
-        name: JsString,
+        obj: &Value,
+        name: &JsString,
         ic: Option<&crate::bytecode::IcEntry>,
     ) -> Result<Value, Value> {
         // Inline cache (key-verified hints; see `FuncProto::ic`).
@@ -4199,7 +4262,7 @@ impl Vm {
         //    behavior (`length`, indices). Deeper chains, accessors,
         //    proxies, and every other exotic fall to the unchanged
         //    slow path.
-        if let Value::Object(o) = &obj {
+        if let Value::Object(o) = obj {
             if let Some(ic) = ic {
                 let b = o.borrow();
                 let (is_ord, is_arr) = (
@@ -4246,7 +4309,7 @@ impl Vm {
                                 b.own_get_index(ic.own_slot.get() as usize)
                             {
                                 if let PropertyKind::Data { value, .. } = &prop.kind {
-                                    if k == &name {
+                                    if k == name {
                                         let v = value.clone();
                                         return Ok(v);
                                     }
@@ -4282,7 +4345,7 @@ impl Vm {
                                         hb.own_get_index(ic.proto_slot.get() as usize)
                                     {
                                         if let PropertyKind::Data { value, .. } = &prop.kind {
-                                            if k == &name {
+                                            if k == name {
                                                 let v = value.clone();
                                                 return Ok(v);
                                             }
@@ -4329,7 +4392,7 @@ impl Vm {
                 }
             }
         }
-        self.get_prop(&obj, &PropertyKey::Str(name))
+        self.get_prop(obj, &PropertyKey::Str(name.clone()))
     }
 
     /// `Op::SetProp` / `ROp::SetProp` body: IC-accelerated named property
@@ -4337,8 +4400,8 @@ impl Vm {
     #[inline]
     pub(crate) fn ic_set_prop(
         &mut self,
-        obj: Value,
-        name: JsString,
+        obj: &Value,
+        name: &JsString,
         value: Value,
         strict: bool,
         ic: Option<&crate::bytecode::IcEntry>,
@@ -4352,7 +4415,7 @@ impl Vm {
         // key → proto-chain setters/read-only checks, accessors,
         // non-writable → strict TypeError, exotics) takes the
         // unchanged put_value path, which also refills the hint.
-        if let Value::Object(o) = &obj {
+        if let Value::Object(o) = obj {
             if let Some(ic) = ic {
                 let mut b = o.borrow_mut();
                 if matches!(b.internal, Internal::Ordinary) {
@@ -4377,7 +4440,7 @@ impl Vm {
                         if let Some((PropertyKey::Str(k), prop)) =
                             b.own_get_index_mut(ic.own_slot.get() as usize)
                         {
-                            if k == &name {
+                            if k == name {
                                 if let PropertyKind::Data {
                                     value: slot,
                                     writable: true,
@@ -4406,14 +4469,14 @@ impl Vm {
                 }
             }
         }
-        self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
+        self.put_value(obj, &PropertyKey::Str(name.clone()), value.clone(), strict)?;
         Ok(value)
     }
 
     /// `Op::GetPropDynamic` / `ROp::GetElem` body: computed-key read with the
     /// dense-array integer fast path.
     #[inline]
-    pub(crate) fn elem_get(&mut self, obj: Value, key_v: Value) -> Result<Value, Value> {
+    pub(crate) fn elem_get(&mut self, obj: &Value, key_v: &Value) -> Result<Value, Value> {
         // Integer fast path: `a[i]` on a dense array with an integral
         // Number key reads the element directly — skipping
         // ToPropertyKey's Number→String conversion (a float-format +
@@ -4422,7 +4485,7 @@ impl Vm {
         // entry can shadow the dense element (`props.is_empty()`) and
         // the slot is a real element (in bounds, not a hole);
         // everything else takes the unchanged spec path.
-        if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+        if let (Value::Object(o), Value::Number(n)) = (obj, key_v) {
             if let Some(iu) = dense_index(*n) {
                 let b = o.borrow();
                 if let Internal::Array(arr) = &b.internal {
@@ -4442,7 +4505,7 @@ impl Vm {
         // Number→String key conversion and the digit re-parse inside
         // `string_own_prop`. Out-of-bounds falls through — the spec path
         // climbs to String.prototype, which is observable.
-        if let (Value::String(s), Value::Number(n)) = (&obj, &key_v) {
+        if let (Value::String(s), Value::Number(n)) = (obj, key_v) {
             if let Some(iu) = dense_index(*n) {
                 if let Some(u) = s.code_unit_at(iu) {
                     return Ok(Value::String(JsString::from_code_units(&[u])));
@@ -4456,7 +4519,7 @@ impl Vm {
         // shape unchanged since the step, same key, plain data slot), so
         // the hint can only miss into the generic path, never mis-read; an
         // own data property's [[Get]] is exactly its slot value.
-        if let (Value::Object(o), Value::String(s)) = (&obj, &key_v) {
+        if let (Value::Object(o), Value::String(s)) = (obj, key_v) {
             if let Some(h) = self.forin_hint.take() {
                 if o.ptr_eq(&h.obj) && *s == h.key {
                     let b = o.borrow();
@@ -4474,11 +4537,27 @@ impl Vm {
                 self.forin_hint.set(Some(h));
             }
         }
+        // Computed STRING key on an ordinary object: an own data property's
+        // [[Get]] is exactly its slot value, so resolve it with one own-map
+        // probe and skip ToPropertyKey + the generic `get_prop` ceremony
+        // (coercibility check, index-string parse, prototype climb). The
+        // `buckets[kind]` / `table[name]` idiom. A miss (no own key, an
+        // accessor, an exotic receiver) takes the unchanged path below.
+        if let (Value::Object(o), Value::String(s)) = (obj, key_v) {
+            let b = o.borrow();
+            if matches!(b.internal, Internal::Ordinary) {
+                if let Some((_, _, prop)) = b.own_get_full(&PropertyKey::Str(s.clone())) {
+                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                        return Ok(value.clone());
+                    }
+                }
+            }
+        }
         // GetValue: RequireObjectCoercible(base) (via ToObject) throws
         // BEFORE ToPropertyKey coerces the key expression's value.
-        self.require_object_coercible(&obj, "read properties of")?;
-        let key = self.to_property_key(&key_v)?;
-        self.get_prop(&obj, &key)
+        self.require_object_coercible(obj, "read properties of")?;
+        let key = self.to_property_key(key_v)?;
+        self.get_prop(obj, &key)
     }
 
     /// `Op::SetPropDynamic` / `ROp::SetElem` body: computed-key write with
@@ -4487,8 +4566,8 @@ impl Vm {
     #[inline]
     pub(crate) fn elem_set(
         &mut self,
-        obj: Value,
-        key_v: Value,
+        obj: &Value,
+        key_v: &Value,
         value: Value,
         strict: bool,
     ) -> Result<Value, Value> {
@@ -4507,7 +4586,7 @@ impl Vm {
         // non-writable index must intercept via the generic path
         // (`protos_allow_index_create`). Gaps past the end, shadowed
         // elements, and non-arrays take the spec path.
-        if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+        if let (Value::Object(o), Value::Number(n)) = (obj, key_v) {
             if let Some(i) = dense_index(*n) {
                 let mut creates = None;
                 {
@@ -4554,9 +4633,30 @@ impl Vm {
                 }
             }
         }
-        self.require_object_coercible(&obj, "set properties of")?;
-        let key = self.to_property_key(&key_v)?;
-        self.put_value(&obj, &key, value.clone(), strict)?;
+        // Computed STRING key on an ordinary object whose OWN property at
+        // that key is a WRITABLE data property: per OrdinarySetWithOwn-
+        // Descriptor the assignment updates the slot in place (no setter on
+        // the chain can intervene, attributes and order are preserved) —
+        // the same condition `ic_set_prop`'s fast path relies on, resolved
+        // here with one own-map probe. `buckets[kind]++`'s write half.
+        if let (Value::Object(o), Value::String(s)) = (obj, key_v) {
+            let mut b = o.borrow_mut();
+            if matches!(b.internal, Internal::Ordinary) {
+                if let Some((_, _, prop)) = b.own_get_full_mut(&PropertyKey::Str(s.clone())) {
+                    if let PropertyKind::Data {
+                        value: slot,
+                        writable: true,
+                    } = &mut prop.kind
+                    {
+                        *slot = value.clone();
+                        return Ok(value);
+                    }
+                }
+            }
+        }
+        self.require_object_coercible(obj, "set properties of")?;
+        let key = self.to_property_key(key_v)?;
+        self.put_value(obj, &key, value.clone(), strict)?;
         Ok(value)
     }
 
@@ -5326,6 +5426,10 @@ impl Vm {
         let costs = &reg.costs[..];
         let mut poll: u32 = 0;
         let code = &reg.code[..];
+        // The const table as a local slice: `Const`/`ArithK`/`AddK` read it
+        // on every iteration of glue loops, and going through
+        // `frame.func.proto.consts` was three dependent loads plus a call.
+        let consts = &proto.consts[..];
         let num_locals = proto.num_locals as usize;
         let mut pc: usize = 0;
         loop {
@@ -5377,6 +5481,58 @@ impl Vm {
                 ($i:expr, $v:expr) => {
                     frame.locals[$i as usize] = $v
                 };
+            }
+            // Borrow-or-take operand read for ops whose helper takes the
+            // operand by REFERENCE: a live register is borrowed in place (no
+            // `Rc` bump/release pair), a dying temp (`TAKE`) moves out into
+            // `$slot` so its release stays this op's. `$slot` is a `let`
+            // binding declared by the caller (`let taken;`).
+            macro_rules! rref {
+                ($i:expr, $slot:ident) => {{
+                    let i = $i as usize;
+                    if i & crate::reg::TAKE as usize != 0 {
+                        $slot = std::mem::replace(
+                            &mut frame.locals[i & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        );
+                        &$slot
+                    } else {
+                        &frame.locals[i]
+                    }
+                }};
+            }
+            // Two-operand form of `rref!`: both TAKE moves happen before
+            // either borrow (the borrow checker will not let a second move
+            // follow a live borrow of the register file).
+            macro_rules! rref2 {
+                ($a:expr, $b:expr, $ta:ident, $tb:ident) => {{
+                    let (ia, ib) = ($a as usize, $b as usize);
+                    $ta = if ia & crate::reg::TAKE as usize != 0 {
+                        Some(std::mem::replace(
+                            &mut frame.locals[ia & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        ))
+                    } else {
+                        None
+                    };
+                    $tb = if ib & crate::reg::TAKE as usize != 0 {
+                        Some(std::mem::replace(
+                            &mut frame.locals[ib & !(crate::reg::TAKE as usize)],
+                            Value::Undefined,
+                        ))
+                    } else {
+                        None
+                    };
+                    let ra: &Value = match &$ta {
+                        Some(v) => v,
+                        None => &frame.locals[ia],
+                    };
+                    let rb: &Value = match &$tb {
+                        Some(v) => v,
+                        None => &frame.locals[ib],
+                    };
+                    (ra, rb)
+                }};
             }
             // Frame exit with the module-linker snapshot (mirror of the
             // stack loop's `Ctl::Return` arm).
@@ -5445,7 +5601,7 @@ impl Vm {
                 // head via the cost table; the op itself runs nothing.
                 ROp::Charge => {}
                 ROp::Mov { dst, src } => wr!(*dst, rd!(*src)),
-                ROp::Const { dst, idx } => wr!(*dst, self.const_val(&frame, *idx)),
+                ROp::Const { dst, idx } => wr!(*dst, const_of(consts, *idx)),
                 ROp::Undef { dst } => wr!(*dst, Value::Undefined),
                 ROp::Null { dst } => wr!(*dst, Value::Null),
                 ROp::Bool { dst, v } => wr!(*dst, Value::Bool(*v)),
@@ -5521,7 +5677,14 @@ impl Vm {
                     wr!(*dst, r);
                 }
                 ROp::Arith { kind, dst, a, b } => {
-                    let r = tryv!(self.arith(rd!(*a), rd!(*b), *kind));
+                    // Number × Number inline (the generic `arith` call is the
+                    // BigInt/coercion path).
+                    let (a, b) = (rd!(*a), rd!(*b));
+                    let r = if let (Value::Number(x), Value::Number(y)) = (&a, &b) {
+                        Value::Number(number_arith_raw(*x, *y, *kind))
+                    } else {
+                        tryv!(self.arith(a, b, *kind))
+                    };
                     wr!(*dst, r);
                 }
                 ROp::ArithK {
@@ -5530,8 +5693,19 @@ impl Vm {
                     a,
                     konst,
                 } => {
-                    let b = self.const_val(&frame, *konst);
-                    let r = tryv!(self.arith(rd!(*a), b, *kind));
+                    // A Number constant is read straight off the const table
+                    // (no `Value` materialization) when the operand is a
+                    // Number — the `i % 7`, `i & 1023`, `x * 3` idioms.
+                    let a = rd!(*a);
+                    let r = match (&a, &consts[*konst as usize]) {
+                        (Value::Number(x), Const::Number(k)) => {
+                            Value::Number(number_arith_raw(*x, *k, *kind))
+                        }
+                        _ => {
+                            let b = const_of(consts, *konst);
+                            tryv!(self.arith(a, b, *kind))
+                        }
+                    };
                     wr!(*dst, r);
                 }
                 ROp::AddCellK { dst, cell, konst } => {
@@ -5564,9 +5738,22 @@ impl Vm {
                         // ToNumber throws TypeError for BigInt (unary + is
                         // invalid on it).
                         RUnary::Pos => Value::Number(tryv!(self.to_number(&a))),
-                        RUnary::ToNumeric => tryv!(self.to_numeric(&a)),
-                        RUnary::Inc => tryv!(self.unary_arith(a, UnaryKind::Inc)),
-                        RUnary::Dec => tryv!(self.unary_arith(a, UnaryKind::Dec)),
+                        // A Number is already numeric: ToNumeric is the
+                        // identity and `++`/`--` is one add — skip the
+                        // ToPrimitive/ToNumber round-trip for the common
+                        // counter case.
+                        RUnary::ToNumeric => match a {
+                            Value::Number(_) => a,
+                            _ => tryv!(self.to_numeric(&a)),
+                        },
+                        RUnary::Inc => match a {
+                            Value::Number(n) => Value::Number(n + 1.0),
+                            _ => tryv!(self.unary_arith(a, UnaryKind::Inc)),
+                        },
+                        RUnary::Dec => match a {
+                            Value::Number(n) => Value::Number(n - 1.0),
+                            _ => tryv!(self.unary_arith(a, UnaryKind::Dec)),
+                        },
                         RUnary::BitNot => tryv!(self.unary_arith(a, UnaryKind::BitNot)),
                         RUnary::Not => Value::Bool(!self.to_boolean(&a)),
                         RUnary::Typeof => Value::String(crate::names::typeof_result(a.type_of())),
@@ -5668,8 +5855,25 @@ impl Vm {
                     if_true,
                     target,
                 } => {
-                    let b = self.const_val(&frame, *konst);
-                    let r = tryv!(self.cmp_values(*cmp, &frame.locals[*a as usize], &b));
+                    // Strict (in)equality against a string or Number
+                    // constant is decided against the const table directly
+                    // — no `Value` materialized (an `Rc` bump + release per
+                    // compare for a string constant, e.g. `k === "id"` on
+                    // every for-in step).
+                    let r = match (*cmp, &frame.locals[*a as usize], &consts[*konst as usize]) {
+                        (CmpOp::StrictEq, Value::String(x), Const::String(k)) => x == k,
+                        (CmpOp::StrictNe, Value::String(x), Const::String(k)) => x != k,
+                        (CmpOp::StrictEq, Value::Number(x), Const::Number(k)) => x == k,
+                        (CmpOp::StrictNe, Value::Number(x), Const::Number(k)) => x != k,
+                        (CmpOp::StrictEq, Value::String(_), Const::Number(_))
+                        | (CmpOp::StrictEq, Value::Number(_), Const::String(_)) => false,
+                        (CmpOp::StrictNe, Value::String(_), Const::Number(_))
+                        | (CmpOp::StrictNe, Value::Number(_), Const::String(_)) => true,
+                        _ => {
+                            let b = const_of(consts, *konst);
+                            tryv!(self.cmp_values(*cmp, &frame.locals[*a as usize], &b))
+                        }
+                    };
                     if r == *if_true {
                         pc = *target as usize;
                     }
@@ -5705,9 +5909,23 @@ impl Vm {
                 }
                 // ---- property access ----
                 ROp::GetProp { dst, obj, name, ic } => {
-                    let obj = rd!(*obj);
-                    let name = Self::const_name_proto(&proto, *name);
-                    let v = tryv!(self.ic_get_prop(obj, name, reg.ic.get(*ic as usize)));
+                    // Receiver and name by REFERENCE: a live register is
+                    // read in place and the name straight off the const
+                    // table — no `Rc` bump/release pair for either per
+                    // access. A dying temp still moves out (its release
+                    // is the op's).
+                    let taken;
+                    let obj_ref: &Value = rref!(*obj, taken);
+                    let v = match &consts[*name as usize] {
+                        Const::String(n) => {
+                            tryv!(self.ic_get_prop(obj_ref, n, reg.ic.get(*ic as usize)))
+                        }
+                        _ => tryv!(self.ic_get_prop(
+                            obj_ref,
+                            &JsString::new(""),
+                            reg.ic.get(*ic as usize)
+                        )),
+                    };
                     wr!(*dst, v);
                 }
                 ROp::SetProp {
@@ -5717,26 +5935,38 @@ impl Vm {
                     src,
                     ic,
                 } => {
-                    let obj = rd!(*obj);
                     let value = rd!(*src);
-                    let name = Self::const_name_proto(&proto, *name);
-                    let v = tryv!(self.ic_set_prop(
-                        obj,
-                        name,
-                        value,
-                        proto.is_strict,
-                        reg.ic.get(*ic as usize)
-                    ));
+                    let taken;
+                    let obj_ref: &Value = rref!(*obj, taken);
+                    let v = match &consts[*name as usize] {
+                        Const::String(n) => tryv!(self.ic_set_prop(
+                            obj_ref,
+                            n,
+                            value,
+                            proto.is_strict,
+                            reg.ic.get(*ic as usize)
+                        )),
+                        _ => tryv!(self.ic_set_prop(
+                            obj_ref,
+                            &JsString::new(""),
+                            value,
+                            proto.is_strict,
+                            reg.ic.get(*ic as usize)
+                        )),
+                    };
                     wr!(*dst, v);
                 }
                 ROp::GetElem { dst, obj, key } => {
-                    let (obj, key) = (rd!(*obj), rd!(*key));
-                    let v = tryv!(self.elem_get(obj, key));
+                    let (taken_o, taken_k);
+                    let (obj_ref, key_ref) = rref2!(*obj, *key, taken_o, taken_k);
+                    let v = tryv!(self.elem_get(obj_ref, key_ref));
                     wr!(*dst, v);
                 }
                 ROp::SetElem { dst, obj, key, src } => {
-                    let (obj, key, value) = (rd!(*obj), rd!(*key), rd!(*src));
-                    let v = tryv!(self.elem_set(obj, key, value, proto.is_strict));
+                    let value = rd!(*src);
+                    let (taken_o, taken_k);
+                    let (obj_ref, key_ref) = rref2!(*obj, *key, taken_o, taken_k);
+                    let v = tryv!(self.elem_set(obj_ref, key_ref, value, proto.is_strict));
                     wr!(*dst, v);
                 }
                 // ---- calls ----
@@ -5867,6 +6097,33 @@ impl Vm {
                     let f = tryv!(self.closure_from_const(&frame, *idx));
                     wr!(*dst, f);
                 }
+                // The for-in trio and the object-literal template are glue-
+                // code HOT ops (every `for (k in rec)` iteration, every
+                // `{...}` literal in a helper): their bodies are one helper
+                // call each, so they add nothing to this frame's locals, and
+                // routing them through `rstep_cold` cost a second dispatch
+                // plus the cold function's prologue per op — ~5% of an
+                // object-glue workload's instructions.
+                ROp::ForInEnumerate { dst, src } => {
+                    let v = rd!(*src);
+                    let idx = tryv!(self.for_in_enumerate(&mut frame, &v));
+                    wr!(*dst, idx);
+                }
+                ROp::ForInNext { dst } => {
+                    let (k, more) = self.for_in_next(&mut frame);
+                    wr!(*dst, k);
+                    wr!(*dst + 1, more);
+                }
+                ROp::ForInPop => {
+                    if let Some((keys, ..)) = frame.enumerators.pop() {
+                        self.park_forin_vec(keys);
+                    }
+                    self.forin_hint.set(None);
+                }
+                ROp::NewObjectTpl { dst, at, n, tpl } => {
+                    let obj = self.new_object_from_tpl_at(&mut frame, *at, *n, *tpl);
+                    wr!(*dst, Value::Object(obj));
+                }
                 // Everything rarer runs through the cold arm, keeping this
                 // loop's native stack frame small (same split — and same
                 // reason — as `step`/`step_cold`).
@@ -5933,6 +6190,19 @@ impl Vm {
             Completion::Throw(e) => Err(e),
             Completion::Jump { target, .. } => Ok(RegCtl::Jump(target as usize)),
         }
+    }
+
+    /// `ROp::NewObjectTpl` body: build the literal from template `tpl`,
+    /// MOVING its `n` values out of the registers at `at..at+n`.
+    #[inline(never)]
+    fn new_object_from_tpl_at(&mut self, frame: &mut Frame, at: u16, n: u16, tpl: u32) -> JsObject {
+        let tpl = frame.func.proto.obj_tpls[tpl as usize].clone();
+        self.new_object_from_tpl(
+            &tpl,
+            frame.locals[at as usize..(at + n) as usize]
+                .iter_mut()
+                .map(|slot| std::mem::replace(slot, Value::Undefined)),
+        )
     }
 
     /// The register tier's rare ops. `#[inline(never)]` keeps their unioned
@@ -6129,16 +6399,6 @@ impl Vm {
                 }
                 wr!(*dst, Value::Object(self.new_array(elems)));
             }
-            ROp::NewObjectTpl { dst, at, n, tpl } => {
-                let tpl = frame.func.proto.obj_tpls[*tpl as usize].clone();
-                let obj = self.new_object_from_tpl(
-                    &tpl,
-                    frame.locals[*at as usize..(*at + *n) as usize]
-                        .iter_mut()
-                        .map(|slot| std::mem::replace(slot, Value::Undefined)),
-                );
-                wr!(*dst, Value::Object(obj));
-            }
             ROp::ArraySpread { arr, src } => {
                 let (arr_v, src) = (rd!(*arr), rd!(*src));
                 self.array_spread(&arr_v, &src)?;
@@ -6228,16 +6488,6 @@ impl Vm {
                 wr!(*dst, value);
                 wr!(*dst + 1, Value::Bool(done));
             }
-            ROp::ForInEnumerate { dst, src } => {
-                let v = rd!(*src);
-                let idx = self.for_in_enumerate(frame, &v)?;
-                wr!(*dst, idx);
-            }
-            ROp::ForInNext { dst } => {
-                let (k, more) = self.for_in_next(frame);
-                wr!(*dst, k);
-                wr!(*dst + 1, more);
-            }
             ROp::IteratorClose { it } => {
                 // Reached only on an abrupt completion (for-of / destructuring
                 // landing pads), with that completion parked. Per spec
@@ -6279,12 +6529,6 @@ impl Vm {
                     // TypeError (masked only by an in-flight throw).
                     return Err(self.throw_type("iterator return is not a function"));
                 }
-            }
-            ROp::ForInPop => {
-                if let Some((keys, ..)) = frame.enumerators.pop() {
-                    self.park_forin_vec(keys);
-                }
-                self.forin_hint.set(None);
             }
             // Every ROp is either handled above or inline in run_reg_frame's
             // dispatch loop. Reaching here means the register-tier translator
@@ -6630,7 +6874,7 @@ impl Vm {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
                 let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
-                let v = self.ic_get_prop(obj, name, ic)?;
+                let v = self.ic_get_prop(&obj, &name, ic)?;
                 push!(v);
             }
             Op::SetProp(i) => {
@@ -6639,13 +6883,13 @@ impl Vm {
                 let obj = pop!();
                 let strict = frame.func.proto.is_strict;
                 let ic = frame.func.proto.ic.get(frame.ip.wrapping_sub(1));
-                let value = self.ic_set_prop(obj, name, value, strict, ic)?;
+                let value = self.ic_set_prop(&obj, &name, value, strict, ic)?;
                 push!(value);
             }
             Op::GetPropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
-                let v = self.elem_get(obj, key_v)?;
+                let v = self.elem_get(&obj, &key_v)?;
                 push!(v);
             }
             Op::SetPropDynamic => {
@@ -6653,7 +6897,7 @@ impl Vm {
                 let key_v = pop!();
                 let obj = pop!();
                 let strict = frame.func.proto.is_strict;
-                let value = self.elem_set(obj, key_v, value, strict)?;
+                let value = self.elem_set(&obj, &key_v, value, strict)?;
                 push!(value);
             }
             Op::HasProp => {
@@ -8527,17 +8771,20 @@ impl Vm {
                 _ => None,
             };
             if let Some((s, n, str_first)) = sn {
-                if let Some(flat) = s.as_flat_utf8() {
+                if let Some(flat) = s.flat_wf_bytes() {
                     if flat.len() + 24 < crate::value::ROPE_MIN_BYTES {
-                        let mut out = String::with_capacity(flat.len() + 24);
+                        // `WfBuilder`: the common ≤22-byte result is assembled
+                        // in place (no heap, no UTF-8 re-check); a longer one
+                        // takes one buffer and one validation.
+                        let mut out = crate::value::WfBuilder::new();
                         if str_first {
-                            out.push_str(flat);
-                            crate::vm::push_number_string(n, &mut out);
+                            out.push(flat);
+                            out.push_number(n);
                         } else {
-                            crate::vm::push_number_string(n, &mut out);
-                            out.push_str(flat);
+                            out.push_number(n);
+                            out.push(flat);
                         }
-                        return Ok(Value::String(JsString::from(out)));
+                        return Ok(Value::String(out.finish()));
                     }
                 }
             }
@@ -8919,7 +9166,7 @@ fn dense_index(i: f64) -> Option<usize> {
 /// `Number`, or a valid-index non-BigInt typed-array element (a valid-index
 /// [[Get]] reads element storage directly — own props and the prototype
 /// chain are never consulted).
-#[inline]
+#[inline(always)]
 pub(crate) fn kernel_elem_load(objs: &[JsObject], obj: usize, i: f64) -> Option<f64> {
     let iu = dense_index(i)?;
     let b = objs[obj].borrow();
@@ -8928,13 +9175,18 @@ pub(crate) fn kernel_elem_load(objs: &[JsObject], obj: usize, i: f64) -> Option<
             Some(Value::Number(n)) => Some(*n),
             _ => None,
         },
-        Internal::TypedArray(t)
-            if !t.kind.is_bigint() && iu < crate::typed_array::ta_eff_length(t) =>
-        {
-            let off = t.byte_offset + iu * t.kind.bytes();
+        Internal::TypedArray(t) if !t.kind.is_bigint() => {
+            // ONE borrow of the backing buffer serves both the effective-
+            // length bound (`ta_eff_length` re-borrowed it) and the byte
+            // read — this arm is the whole inner loop of byte-codec
+            // workloads, where the second `RefCell` round-trip per element
+            // was ~7% of the instructions.
             let buf = t.buffer.borrow();
             match &buf.internal {
-                Internal::ArrayBuffer(Some(bytes)) => {
+                Internal::ArrayBuffer(Some(bytes))
+                    if iu < crate::typed_array::ta_eff_length_in(t, bytes.len()) =>
+                {
+                    let off = t.byte_offset + iu * t.kind.bytes();
                     Some(crate::typed_array::decode(bytes, off, t.kind))
                 }
                 _ => None,
@@ -8949,7 +9201,7 @@ pub(crate) fn kernel_elem_load(objs: &[JsObject], obj: usize, i: f64) -> Option<
 /// end APPEND (both require extensibility and the dense bound — see the
 /// interpreter arm's comment), or a valid-index non-BigInt typed-array write
 /// (`encode` applies the per-kind conversion). `false` = bail.
-#[inline]
+#[inline(always)]
 pub(crate) fn kernel_elem_store(objs: &[JsObject], obj: usize, i: f64, val: f64) -> bool {
     let Some(iu) = dense_index(i) else {
         return false;
@@ -8982,14 +9234,15 @@ pub(crate) fn kernel_elem_store(objs: &[JsObject], obj: usize, i: f64, val: f64)
                 }
             }
         },
-        Internal::TypedArray(t)
-            if !t.kind.is_bigint() && iu < crate::typed_array::ta_eff_length(t) =>
-        {
-            let off = t.byte_offset + iu * t.kind.bytes();
+        Internal::TypedArray(t) if !t.kind.is_bigint() => {
+            // Single buffer borrow for bound + write (see `kernel_elem_load`).
             let kind = t.kind;
             let mut buf = t.buffer.borrow_mut();
             match &mut buf.internal {
-                Internal::ArrayBuffer(Some(bytes)) => {
+                Internal::ArrayBuffer(Some(bytes))
+                    if iu < crate::typed_array::ta_eff_length_in(t, bytes.len()) =>
+                {
+                    let off = t.byte_offset + iu * kind.bytes();
                     crate::typed_array::encode(bytes, off, kind, val);
                     true
                 }
@@ -9003,7 +9256,7 @@ pub(crate) fn kernel_elem_store(objs: &[JsObject], obj: usize, i: f64, val: f64)
 /// `.length` fast path: dense array length (unshadowed only) or typed-array
 /// effective length (any kind — the entry guard verified the canonical
 /// accessor resolution for typed-array bases). `None` = bail.
-#[inline]
+#[inline(always)]
 pub(crate) fn kernel_elem_len(objs: &[JsObject], obj: usize) -> Option<f64> {
     let b = objs[obj].borrow();
     match &b.internal {
@@ -9054,28 +9307,50 @@ pub(crate) fn kernel_array_pop(objs: &[JsObject], obj: usize) -> Option<f64> {
     None
 }
 
+/// `%` on Numbers. `inline(always)`: the integer fast path below is the
+/// whole op for loop counters and hash/checksum idioms (`i % 3`,
+/// `(a + x) % 65521`), and out of line it cost a call plus ~70 instructions
+/// per `%` — 22% of `checksum`'s and 27% of `arith_loop`'s totals; only the
+/// non-integral fallback pays the libm `fmod` call.
+#[inline(always)]
 fn js_mod(a: f64, b: f64) -> f64 {
+    // Fast path: both operands integral and exactly representable (|x| <=
+    // 2^53) and b != 0 — the loop-counter case. Integer remainder matches
+    // libm fmod on integers (truncated division, sign of the dividend),
+    // except that a zero result must carry the dividend's sign (-6 % 3 is
+    // -0 in JS, as fmod also returns); restore that explicitly.
+    //
+    // Integrality via cast round-trip (no libm trunc): within ±2^53 the
+    // i64 cast is exact, so equality holds iff the value is integral. NaN
+    // casts to 0 and ±Infinity saturate, neither of which round-trips, so
+    // every non-finite operand (and a ±0 divisor, whose integer form is 0)
+    // falls through to the spec cases in `js_mod_slow`.
+    const MAX_EXACT: i64 = 9_007_199_254_740_992; // 2^53
+    let (ai, bi) = (a as i64, b as i64);
+    if ai as f64 == a
+        && bi as f64 == b
+        && bi != 0
+        && ai.unsigned_abs() <= MAX_EXACT as u64
+        && bi.unsigned_abs() <= MAX_EXACT as u64
+    {
+        let r = ai % bi;
+        if r == 0 {
+            return if a.is_sign_negative() { -0.0 } else { 0.0 };
+        }
+        return r as f64;
+    }
+    js_mod_slow(a, b)
+}
+
+/// The spec special cases and the libm `fmod` fallback of [`js_mod`].
+#[cold]
+#[inline(never)]
+fn js_mod_slow(a: f64, b: f64) -> f64 {
     if b == 0.0 || a.is_nan() || b.is_nan() || a.is_infinite() {
         f64::NAN
     } else if b.is_infinite() || a == 0.0 {
         a
     } else {
-        // Fast path: both operands integral and exactly representable (|x| <=
-        // 2^53) — the loop-counter case. Integer remainder matches libm fmod on
-        // integers (truncated division, sign of the dividend), except that a
-        // zero result must carry the dividend's sign (-6 % 3 is -0 in JS, as
-        // fmod also returns); restore that explicitly.
-        const MAX_EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
-                                                        // Integrality via cast round-trip (no libm trunc): within ±2^53 the
-                                                        // i64 cast is exact, so equality holds iff the value is integral.
-        let (ai, bi) = (a as i64, b as i64);
-        if ai as f64 == a && bi as f64 == b && a.abs() <= MAX_EXACT && b.abs() <= MAX_EXACT {
-            let r = ai % bi;
-            if r == 0 {
-                return if a.is_sign_negative() { -0.0 } else { 0.0 };
-            }
-            return r as f64;
-        }
         a % b
     }
 }
@@ -9706,6 +9981,44 @@ fn kmath2(kind: crate::bytecode::KMath, a: f64, b: f64) -> f64 {
     }
 }
 
+/// `*slot = v` without the drop-glue call when the old value is `undefined`
+/// — the state a recycled frame's `this`/`new_target`/`completion` are in.
+#[inline(always)]
+fn set_value_slot(slot: &mut Value, v: Value) {
+    let old = std::mem::replace(slot, v);
+    if !matches!(old, Value::Undefined) {
+        drop(old);
+    } else {
+        std::mem::forget(old);
+    }
+}
+
+/// `*slot = Value::Undefined`, skipping the drop-glue call when it already is.
+#[inline(always)]
+fn clear_value_slot(slot: &mut Value) {
+    if !matches!(slot, Value::Undefined) {
+        *slot = Value::Undefined;
+    }
+}
+
+/// A constant-table entry as a `Value` (the body of `Vm::const_val`, as a
+/// free function over the table slice the register loop already holds).
+#[inline(always)]
+pub(crate) fn const_of(consts: &[Const], idx: u32) -> Value {
+    match &consts[idx as usize] {
+        Const::Undefined => Value::Undefined,
+        Const::Null => Value::Null,
+        Const::Bool(b) => Value::Bool(*b),
+        Const::Number(n) => Value::Number(*n),
+        Const::String(s) => Value::String(s.clone()),
+        Const::Func(_) => Value::Undefined, // handled by Closure
+        Const::BigInt(s) => {
+            Value::bigint(parse_string_bigint(s).unwrap_or_else(|| num_bigint::BigInt::from(0)))
+        }
+    }
+}
+
+#[inline]
 fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {
     Value::Number(number_arith_raw(x, y, kind))
 }
@@ -9713,6 +10026,13 @@ fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {
 /// The raw `f64` form of [`number_arith`] — shared with the typed loop
 /// kernels (`kernel.rs` / [`Vm::run_kernel_op`]) so kernel arithmetic is
 /// bit-identical to the interpreter's Number×Number paths by construction.
+/// `inline(always)`: every caller is a hot dispatch arm (the kernel tiers'
+/// `Arith`/`ArithK` and their fused forms, the register tier's `Arith`)
+/// where `kind` is the op's own immediate. Out of line this was a call plus
+/// a second switch on every kernel arithmetic op — ~45% of `arith_loop`'s
+/// instructions and ~28% of `checksum`'s; inlined, the switch sits in the
+/// arm and the cheap kinds (`Sub`/`Mul`/`Div`/bitwise) are one instruction.
+#[inline(always)]
 pub(crate) fn number_arith_raw(x: f64, y: f64, kind: ArithKind) -> f64 {
     use crate::vm::{to_int32, to_uint32};
     match kind {

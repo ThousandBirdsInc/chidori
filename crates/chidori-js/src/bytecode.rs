@@ -244,6 +244,14 @@ pub struct FuncProto {
     /// cell-vec slot is filled with a shared never-read placeholder at frame
     /// setup instead of a pooled cell. See `localize.rs`.
     pub localized: Box<[bool]>,
+    /// Number of LEADING cell slots a frame must materialize: one past the
+    /// highest NON-localized cell index (`num_cells` when nothing is
+    /// localized). Every cell op, closure capture and `this_cell` read
+    /// targets a non-localized index, so the trailing localized slots —
+    /// which only ever held a never-read placeholder — are not allocated
+    /// at all. Frame setup for a small helper is then a loop over the
+    /// cells it actually uses, usually none.
+    pub cells_live: u32,
     /// Per-op inline-cache entries (len == `code.len()`, indexed by
     /// instruction pointer). Used by `GetProp`/`SetProp`/`LoadGlobal` to
     /// remember where the property resolved at that site. Every hint is
@@ -366,6 +374,7 @@ impl FuncProto {
             stable_cells: Vec::new(),
             stable_flags: Box::new([]),
             localized: Box::new([]),
+            cells_live: 0,
             ic: Box::new([]),
             eval_scopes: Vec::new(),
             this_cell: None,

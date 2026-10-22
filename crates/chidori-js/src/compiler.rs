@@ -1086,6 +1086,18 @@ impl Compiler {
             .is_none_or(|s| s.contains("arguments"))
     }
 
+    /// Whether the source region could read the function's own `this` or
+    /// `new.target` binding: the words `this` and `super` (super property
+    /// and call forms read `%this`/`%newtarget`) and `target` (`new.target`).
+    /// Conservative like the scans around it: a false positive only keeps
+    /// the prologue; a miss is impossible because every reader spells the
+    /// word.
+    fn region_mentions_this(&self, start: u32, end: u32) -> bool {
+        self.source
+            .get(start as usize..end as usize)
+            .is_none_or(|s| s.contains("this") || s.contains("super") || s.contains("target"))
+    }
+
     /// Whether the source region mentions `eval` — the conservative trigger
     /// for the direct-eval deopt (dynamic name ops + eval-vars object). A
     /// false positive only costs speed, never correctness.
@@ -1681,6 +1693,48 @@ impl Compiler {
         }
     }
 
+    /// The `%this` / `%newtarget` (and derived-constructor `%fieldinit`)
+    /// prologue of a non-arrow function. Skipped by `compile_function_body`
+    /// for plain functions that provably never read either binding.
+    fn emit_this_and_new_target_bindings(
+        &mut self,
+        kind: FuncKind,
+        ctor_fields: Option<&[&PropertyDefinition]>,
+    ) -> R {
+        let tc = self.declare("%this", false);
+        if kind == FuncKind::DerivedCtor {
+            // A derived constructor has no `this` until `super()` constructs
+            // it: the cell stays in TDZ (reads throw a ReferenceError) and
+            // `super()` initializes it in place via BindThis*. The cell is
+            // STABLE and recorded on the proto so [[Construct]] can read the
+            // final `this` at frame exit (after `finally` blocks have run).
+            self.cur().this_cell = Some(tc);
+            self.cur().stable_cells.push(tc);
+            self.emit(Op::InitCellTdz(tc));
+        } else {
+            self.emit(Op::LoadThis);
+            // Sloppy functions substitute the global object / box a primitive
+            // `this` (OrdinaryCallBindThis); strict functions keep it as-is.
+            if !self.cur().strict {
+                self.emit(Op::BindThisSloppy);
+            }
+            self.emit(Op::InitCell(tc));
+        }
+        let nt = self.declare("%newtarget", false);
+        self.emit(Op::LoadNewTarget);
+        self.emit(Op::InitCell(nt));
+        if kind == FuncKind::DerivedCtor {
+            // Instance fields/private brands install when `super()` returns,
+            // not at constructor entry. The work lives in a closure so a
+            // `super()` reached from a nested arrow (or direct eval) can run
+            // it against the freshly bound `this`.
+            let fi = self.declare("%fieldinit", false);
+            self.emit_field_init_closure(ctor_fields.unwrap_or(&[]))?;
+            self.emit(Op::InitCell(fi));
+        }
+        Ok(())
+    }
+
     fn load_binding(&mut self, name: &str) {
         let fallback = self.load_fallback(name);
         if self.in_with(name) {
@@ -2241,6 +2295,16 @@ impl Compiler {
                 flags
             },
             stable_cells: fc.stable_cells.clone(),
+            cells_live: loc
+                .localized
+                .iter()
+                .rposition(|&l| !l)
+                .map_or(0, |i| i as u32 + 1)
+                .max(if loc.localized.is_empty() {
+                    fc.num_cells
+                } else {
+                    0
+                }),
             localized: loc.localized,
             this_cell: fc.this_cell,
             inherit_home: fc.inherit_home,
@@ -6925,37 +6989,29 @@ impl Compiler {
             self.in_field_initializer = false;
         }
 
+        // A plain function whose source region never mentions `this`,
+        // `super` or `new.target` (and holds no direct eval that could) binds
+        // neither `%this` nor `%newtarget`: the text scan has no false
+        // negatives (a use spells the word, nested arrows included — their
+        // text is inside this region), and every other reader of the two
+        // bindings is a class/method form, which keeps the prologue. Each
+        // elided binding was three ops per CALL (`LoadThis` +
+        // `BindThisSloppy` + the init, and `LoadNewTarget` + init), with
+        // `BindThisSloppy` taking the register tier's cold path — ~2% of a
+        // call-heavy glue workload for a value no op ever read.
+        let elide_this_bindings = !arrow
+            && matches!(
+                kind,
+                FuncKind::Normal | FuncKind::Async | FuncKind::Generator | FuncKind::AsyncGenerator
+            )
+            && !self.cur_ref().contains_eval
+            && !self.region_mentions_this(
+                params.span.start,
+                body.map(|b| b.span.end).unwrap_or(params.span.end),
+            );
         if !arrow {
-            let tc = self.declare("%this", false);
-            if kind == FuncKind::DerivedCtor {
-                // A derived constructor has no `this` until `super()` constructs
-                // it: the cell stays in TDZ (reads throw a ReferenceError) and
-                // `super()` initializes it in place via BindThis*. The cell is
-                // STABLE and recorded on the proto so [[Construct]] can read the
-                // final `this` at frame exit (after `finally` blocks have run).
-                self.cur().this_cell = Some(tc);
-                self.cur().stable_cells.push(tc);
-                self.emit(Op::InitCellTdz(tc));
-            } else {
-                self.emit(Op::LoadThis);
-                // Sloppy functions substitute the global object / box a primitive
-                // `this` (OrdinaryCallBindThis); strict functions keep it as-is.
-                if !self.cur().strict {
-                    self.emit(Op::BindThisSloppy);
-                }
-                self.emit(Op::InitCell(tc));
-            }
-            let nt = self.declare("%newtarget", false);
-            self.emit(Op::LoadNewTarget);
-            self.emit(Op::InitCell(nt));
-            if kind == FuncKind::DerivedCtor {
-                // Instance fields/private brands install when `super()` returns,
-                // not at constructor entry. The work lives in a closure so a
-                // `super()` reached from a nested arrow (or direct eval) can run
-                // it against the freshly bound `this`.
-                let fi = self.declare("%fieldinit", false);
-                self.emit_field_init_closure(ctor_fields.unwrap_or(&[]))?;
-                self.emit(Op::InitCell(fi));
+            if !elide_this_bindings {
+                self.emit_this_and_new_target_bindings(kind, ctor_fields)?;
             }
             // The `arguments` object is materialized (an allocation per call) only
             // when the body actually mentions `arguments` — the common case skips

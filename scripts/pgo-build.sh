@@ -14,6 +14,11 @@
 #   scripts/pgo-build.sh [output-path]
 #       (default) builds the chidori-js `run` example, training on the
 #       cross-runtime benchmark workloads. For benchmarking the engine.
+#   scripts/pgo-build.sh --bin chidori-js-jit [output-path]
+#       builds the opt-in Cranelift-JIT runner (`--features jit`,
+#       docs/cranelift-jit.md), training on the same benchmark corpus as the
+#       default mode. This is the build behind the "vs Node" numbers in
+#       docs/js-performance-roadmap.md §6.19.3: PGO over the JIT binary.
 #   scripts/pgo-build.sh --bin chidori [--target <triple>] [--locked] [output-path]
 #       builds the shipped `chidori` CLI binary, training on offline example
 #       agents plus scripts/pgo-train/train.ts (a deterministic agent that
@@ -47,8 +52,12 @@ CARGO_ARGS=(${PGO_CARGO_ARGS-})
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --bin)
-            [[ "${2:-}" == "chidori" ]] || { echo "only '--bin chidori' is supported" >&2; exit 1; }
-            MODE="chidori"; shift 2 ;;
+            case "${2:-}" in
+                chidori) MODE="chidori" ;;
+                chidori-js-jit) MODE="jit" ;;
+                *) echo "only '--bin chidori' or '--bin chidori-js-jit' is supported" >&2; exit 1 ;;
+            esac
+            shift 2 ;;
         --target)
             TARGET="$2"; shift 2 ;;
         --locked)
@@ -70,6 +79,13 @@ fi
 if [[ "$MODE" == "chidori" ]]; then
     BUILD_ARGS=(-p chidori --bin chidori)
     BIN="$TARGET_DIR/${TARGET_SUBDIR}release/chidori"
+elif [[ "$MODE" == "jit" ]]; then
+    # Its own profile + target dirs: the instrumented JIT build must not
+    # share .profraw files or artifacts with the interpreter-only build.
+    PGO_DIR="$REPO_ROOT/target/pgo-data-jit"
+    TARGET_DIR="$REPO_ROOT/target/pgo-jit"
+    BUILD_ARGS=(-p chidori-js --features jit --bin chidori-js-jit)
+    BIN="$TARGET_DIR/${TARGET_SUBDIR}release/chidori-js-jit"
 else
     BUILD_ARGS=(-p chidori-js --example run)
     BIN="$TARGET_DIR/${TARGET_SUBDIR}release/examples/run"

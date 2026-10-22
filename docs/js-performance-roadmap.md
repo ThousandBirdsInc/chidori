@@ -1955,6 +1955,303 @@ cliffs: register dispatch ~16%, boxed `Value` clone/drop ~18%, call
 ceremony ~8% — the §6.12.2 levers (smaller `Value`, reg superinstructions,
 ObjectData arena) are the next altitude.
 
+## 6.19 Kernel arithmetic inlining, integer `ToInt32`/`ToUint32`, and
+single-borrow typed-array element paths (2026-10-20)
+
+A fresh callgrind sweep of the whole cross-runtime corpus (plain release
+build, baseline `v3.8.1`) found four cheap, zero-unsafe, zero-dependency
+items that the earlier rounds had left behind in the kernel tiers:
+
+1. **`number_arith_raw` was an out-of-line call on every kernel arithmetic
+   op** — a call plus a second switch on the op's own `kind` immediate: 45%
+   of `arith_loop`'s instructions, 28% of `checksum`'s, 12% of
+   `array_sum`'s, 9% of `fib_recursive`'s. It and `js_mod` are now
+   `inline(always)` (the switch folds into each dispatch arm; the integer
+   `%` fast path is the whole op for loop counters and `(a + x) % 65521`
+   idioms), with the spec special cases and the libm `fmod` fallback split
+   into a `#[cold]` `js_mod_slow`.
+2. **`ToInt32`/`ToUint32` reduced every value outside the i32 range through
+   `f64::rem_euclid`** — a libm `fmod` call (~250 instructions) per
+   `>>> 0` / `| 0` on a wide product, i.e. every step of the `sort`
+   workload's LCG (5% of its total). Below 2^63 the truncated value fits an
+   `i64` exactly and the `i64 → u32/i32` cast IS the modulo-2^32 reduction
+   (two's complement, negatives included); the `rem_euclid` route is kept
+   for the astronomically-large remainder.
+3. **The typed-array kernel element paths borrowed the backing buffer
+   twice per element** (`ta_eff_length` for the bound, then again for the
+   bytes); `kernel_elem_load`/`kernel_elem_store` now take one borrow and
+   bound against it via `ta_eff_length_in`. The element helpers
+   (`kernel_elem_load/store/len`, `decode`/`encode`, `ta_eff_length`) are
+   `inline(always)`: the kernel dispatch function is large enough that
+   LLVM's inliner budget had left them as calls (`kernel_elem_load` alone
+   was 85 instructions per byte read in `checksum`).
+4. **`protos_allow_index_create` stack-formatted the index eagerly**, plus
+   the UTF-8 check that makes it a `&str`, for a probe that never runs on
+   the common `Array.prototype → Object.prototype` chain (`has_idx_keys`
+   answers both levels in O(1)); it now formats lazily on the first level
+   that carries index keys. ~3% of a hole-filling `a[i] = v` loop.
+
+Two smaller items rode along: `recycle_frame` no longer routes a localized
+binding's shared placeholder cell through the pool probe (one out-of-line
+call per cell per return), and `push_number_string` pushes its ASCII digits
+as `char`s instead of re-validating them through `from_utf8`.
+
+### 6.19.1 Measured (callgrind, whole workload, deterministic)
+
+Instruction counts, `v3.8.1` release build → this round, same toolchain:
+
+| workload | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| arith_loop | 302.5 M | 242.8 M | **−19.7%** |
+| checksum | 3.498 G | 2.856 G | **−18.3%** |
+| typed_array | 442.8 M | 359.3 M | **−18.9%** |
+| sort | 1.485 G | 1.269 G | **−14.5%** |
+| fib_recursive | 706.2 M | 618.7 M | **−12.4%** |
+| mutual_recursion | 986.2 M | 865.7 M | **−12.2%** |
+| array_sum | 1.520 G | 1.358 G | **−10.6%** |
+| closures | 324.3 M | 304.3 M | −6.2% |
+| string_scan | 111.0 M | 106.2 M | −4.3% |
+| array_hof | 314.0 M | 303.6 M | −3.3% |
+| mixed_helpers | 1.689 G | 1.653 G | −2.1% |
+| array_push_sum | 223.9 M | 220.4 M | −1.6% |
+| string_build / json_roundtrip | — | — | ±0.1% (not touched) |
+| property_access | 165.2 M | 172.2 M | +4.2% |
+
+The one regression is codegen drift inside the (now larger) kernel dispatch
+function: `property_access` is 99% that one function, runs no `%`, no
+element loads and no typed arrays, and gained exactly 7 instructions per
+loop iteration from the re-laid-out dispatch — a layout effect, not a
+semantic path. It is the price of the force-inlining that buys the
+−10..−20% rows above; §6.19.2 shows it disappears (and turns into a win)
+under the PGO build that re-lays the dispatch by measured frequency.
+
+### 6.19.2 Wall-clock (4-core cloud container, interleaved, execution-only medians)
+
+Plain release build, 7 interleaved runs per workload; the baseline binary
+rode in the harness's second chidori column so both ran in the same
+session (`node benchmarks/run.mjs --no-build --chidori-bin <new>
+--chidori-jit-bin <old>`):
+
+| workload | before | after | Δ | node | bun | cpython |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| typed_array | 27.8 ms | 22.8 ms | **−18%** | 21.5 | 8.1 | 60.4 |
+| fib_recursive | 51.0 ms | 42.5 ms | **−17%** | 9.3 | 9.6 | 95.0 |
+| arith_loop | 22.9 ms | 19.3 ms | **−16%** | 12.0 | 8.5 | 54.9 |
+| sort | 155.5 ms | 133.7 ms | **−14%** | 107.1 | 60.7 | 99.9 |
+| array_sum | 110.9 ms | 96.4 ms | **−13%** | 47.1 | 46.7 | 186.5 |
+| checksum | 230.7 ms | 206.0 ms | **−11%** | 49.4 | 29.7 | 354.4 |
+| mutual_recursion | 70.2 ms | 63.4 ms | −10% | 6.6 | 5.0 | 123.0 |
+| closures | 20.3 ms | 18.4 ms | −9% | 7.9 | 4.7 | 59.1 |
+| array_push_sum | 26.3 ms | 24.0 ms | −9% | 17.5 | 18.8 | 38.8 |
+| string_scan | 10.3 ms | 10.0 ms | −3% | 7.2 | 4.5 | 7.9 |
+| mixed_helpers | 193.5 ms | 191.2 ms | −1% | 23.9 | 21.8 | 84.9 |
+| string_build | 6.6 ms | 6.7 ms | ±0 | 6.7 | 4.3 | 1.2 |
+| json_roundtrip | 62.4 ms | 63.9 ms | +2% (noise) | 34.9 | 17.2 | 153.9 |
+| array_hof | 46.3 ms | 48.8 ms | +5% (noise; 21-run re-check 46.5 → 47.6) | 27.3 | 19.6 | 38.4 |
+| property_access | 13.4 ms | 16.4 ms | +22% (layout; see below) | 4.1 | 4.2 | 60.8 |
+
+The container's noise floor is the documented 10–15% (the untouched
+baseline binary itself measured 13.7 / 17.8 / 17.5 ms on `property_access`
+across three sessions), so single-digit rows are reported as neutral. The
+`property_access` wall-clock gap, however, reproduced across sessions
+(+17% on a 21-run re-check) while its instruction count moved +4% — the
+signature of a branch-layout/icache effect in the re-laid-out dispatch
+function, not of extra work. Bisected: keeping `kernel_elem_*` out of line
+(experiment A) did NOT recover it (24.1 vs 17.5 ms) and cost `checksum` and
+`array_sum` their wins, so the force-inlining stays.
+
+**PGO cross-check (the recommended benchmark/release build,
+`scripts/pgo-build.sh`, both binaries PGO'd on the same corpus, 9–15
+interleaved runs):** the layout effect vanishes once the profile lays the
+dispatch out by measured frequency — `property_access` 18.4 → 15.2 ms
+(−17%), `checksum` 225.7 → 215.2 ms, `sort` 119.8 → 102.9 ms (−14%),
+`arith_loop` 17.5 → 14.2 ms (−19%), `array_hof` 28.5 → 24.4 ms (−14%),
+`mutual_recursion` 70.8 → 64.6 ms; `array_sum` is a wash under PGO
+(106.1 → 104.0 ms; PGO had already inlined its element path, callgrind
+1.341 G → 1.295 G) and every other row is inside the noise. No workload
+regresses under PGO.
+
+**Gates:** full chidori-js suite green (30 test binaries, including the
+register/kernel differential corpora and record→replay byte-identity);
+a new `tests/numeric_fast_paths.rs` pins `to_int32`/`to_uint32` and the
+engine's `%` (register + kernel tiers) bit-for-bit — sign of zero included
+— against the pre-fast-path `rem_euclid`/`fmod` definitions across the
+i32/u32 boundaries, the 2^53 exactness bound, and the 2^63 cast bound;
+clippy clean on the default and `jit` builds; cross-runtime `RESULT=`
+cross-check green on all five columns.
+
+### 6.19.3 Against Node, with the opt-in JIT and PGO stacked (2026-10-21)
+
+The same container, same harness, 9 interleaved runs: the PGO'd
+interpreter (`chidori`), the PGO'd Cranelift-JIT runner (`chidori-jit`,
+built with the new `scripts/pgo-build.sh --bin chidori-js-jit` mode) and
+Node 22. Two readings of "as fast as Node", both from one run:
+
+| workload | jit+PGO exec | node exec | jit+PGO total | node total | total |
+| --- | ---: | ---: | ---: | ---: | :---: |
+| arith_loop | 2.5 ms | 5.6 ms | 5.8 ms | 42.1 ms | faster |
+| array_hof | 17.5 ms | 18.9 ms | 20.8 ms | 55.4 ms | faster |
+| array_push_sum | 18.2 ms | 11.9 ms | 21.6 ms | 48.3 ms | faster |
+| array_sum | 79.1 ms | 47.0 ms | 82.4 ms | 83.5 ms | faster |
+| checksum | 28.5 ms | 40.6 ms | 31.9 ms | 77.1 ms | faster |
+| closures | 2.8 ms | 2.7 ms | 6.1 ms | 39.2 ms | faster |
+| fib_recursive | 8.6 ms | 9.4 ms | 11.9 ms | 45.8 ms | faster |
+| json_roundtrip | 53.2 ms | 34.9 ms | 56.5 ms | 71.4 ms | faster |
+| mixed_helpers | 163.2 ms | 22.4 ms | 166.5 ms | 58.8 ms | **slower** |
+| mutual_recursion | 16.1 ms | 11.5 ms | 19.4 ms | 47.9 ms | faster |
+| property_access | 1.6 ms | 0.9 ms | 4.9 ms | 37.4 ms | faster |
+| sort | 103.7 ms | 101.0 ms | 107.0 ms | 137.5 ms | faster |
+| string_build | 6.2 ms | 5.9 ms | 9.5 ms | 42.4 ms | faster |
+| string_scan | 9.3 ms | 10.1 ms | 12.6 ms | 46.6 ms | faster |
+| typed_array | 15.8 ms | 31.2 ms | 19.1 ms | 67.7 ms | faster |
+
+- **Total wall-clock (what running a script costs):** faster than Node on
+  14 of 15 workloads, geomean **0.39×** Node's time. chidori-js starts in
+  ~4 ms against Node's ~35 ms, and the JIT tier carries the kernel-shaped
+  rows outright.
+- **Execution-only (startup subtracted):** geomean **1.16×** Node; at or
+  under Node on 7 rows (arith_loop, array_hof, checksum, closures,
+  fib_recursive, string_scan, typed_array), within 10% on sort and
+  string_build, 1.5–1.7× on array_push_sum, array_sum, json_roundtrip,
+  mutual_recursion and property_access (the last three are sub-20 ms rows
+  where startup-subtraction noise dominates), and 7.3× on mixed_helpers.
+  Without that one row the execution-only geomean is 1.02×.
+
+`mixed_helpers` (object-literal glue, for-in, string joins across small
+calls) is the structural gap §6.12.2 and docs/cranelift-jit.md already
+name: boxed 24-byte `Value` with `Rc` traffic on every move and a heap
+frame per call. It does not close with more kernel work; it needs the
+value-representation project (NaN-boxing / unboxed slots and shape-guarded
+inline property access).
+
+## 6.20 The remaining gap to Node, and the project that closes it (plan, 2026-10-21)
+
+§6.19.3 leaves exactly one workload behind Node under the JIT+PGO build:
+`mixed_helpers`, 163 ms against 22 ms. This section records what was tried
+on it in this session, why none of it can reach Node, and the scoped
+project that can — so the next engine round starts from a plan.
+
+### 6.20.1 What was tried, with numbers
+
+| change | mixed_helpers Ir | verdict |
+| --- | ---: | --- |
+| baseline v3.8.1 | 1.689 G | — |
+| §6.19 kernel/arith round | 1.653 G (−2.1%) | landed |
+| for-in trio + `NewObjectTpl` in the hot register loop (no `rstep_cold` round-trip) | 1.631 G (−1.3%) | landed |
+| hand-written `Value::clone` with inline immediate fast path + immediate-aware register writes | 1.683 G (+1.8%; array_hof +4.4%) | rejected: glue registers mostly hold strings/objects, so the tag test only preceded the same call |
+
+Per iteration of the workload's loop the engine executes ~27,000
+instructions; Node executes the same iteration in ~370 ns. Parity needs
+roughly a 7× cut, and the profile has no pooled hot spot: register
+dispatch ~30%, `Value` clone/drop ~11%, frame setup/teardown ~8% (three
+JS calls at ~500 instructions each), string `+` and allocator traffic
+~15%, for-in ~5%, ICs and `typeof` dispatch ~5%. Every lever above moves a
+single-digit share. The ceiling for an interpreter over this value model,
+with every remaining lever pulled, is ~2×; the gap is 7×.
+
+### 6.20.2 Why the value model is the gap
+
+- `Value` is a 24-byte tagged union; a string or object is an `Rc`, so
+  every move between registers, into a property slot, or into a call
+  argument is a refcount increment and a later out-of-line drop. V8 moves
+  tagged words.
+- A JS call takes a pooled heap `Frame` (~25 fields) and zero-fills its
+  register file; V8's baseline code uses the native stack.
+- Property access resolves through `Rc<RefCell<ObjectData>>` → shape
+  `Rc::ptr_eq` → slot `Vec` → `Property { kind, flags }`; the IC saves the
+  lookup but not the two indirections and the borrow flag. V8's inline
+  cache is a shape-guarded load at a fixed offset.
+- Small strings are already inline (≤23 bytes), but every concatenation
+  result over that size is a `String` build followed by an `Rc<str>` copy.
+
+### 6.20.3 The project
+
+**Goal.** `mixed_helpers` execution-only within 1.5× of Node on the
+benchmark container (≈35 ms), with the §6.19.3 rows that already beat Node
+unchanged, under the same gates every tier already passes: record→replay
+byte-identity, the register/kernel differential corpora, Test262 at
+≥99.9%, `forbid(unsafe_code)` in the default build.
+
+**Design, in dependency order.**
+
+1. **Unboxed register slots** (the register tier only; the stack tier
+   keeps `Value`). A register file of `u64` words with a side tag array, or
+   NaN-boxing (doubles as themselves, pointers and small ints in the NaN
+   payload). NaN-boxing is the standard answer, but under
+   `forbid(unsafe_code)` a pointer cannot live in a NaN payload without an
+   `unsafe` decode; the zero-unsafe form is a parallel `Vec<u8>` of tags
+   plus a `Vec<u64>` of payloads with `Rc` handles kept in a per-frame
+   arena indexed by the payload. Expected effect: clone/drop traffic and
+   `Value` moves vanish from the hot loop (−11%), and arithmetic/compare
+   ops stop re-tagging (part of the −30% dispatch share).
+2. **Native-stack frames for the register tier.** The register file for a
+   callee becomes a window of the caller's register `Vec` (a bump
+   pointer), not a pooled `Box<Frame>`: `init_frame`/`recycle_frame` go
+   from ~500 instructions per call to a bounds check and a base-pointer
+   bump. Try-handlers, `arguments`, generators and `with` keep the heap
+   frame (they bail to the stack tier, as kernels already do).
+3. **Shape-guarded property slots without the `RefCell`.** Move the
+   per-object slot `Vec` behind a `Cell<Rc<Shape>>` + `UnsafeCell`-free
+   split: the IC stores (shape ptr, slot index) and the read is one
+   `ptr_eq` and one indexed load from a `Vec<Value>` whose borrow is
+   taken once per op, not once per level. Expected: `ic_get_prop`/
+   `ic_set_prop` halve.
+4. **String building into the final buffer.** A `JsString` arm backed by
+   `Rc<String>`-like growable storage so `a + b + c` chains append once
+   and never copy into `Rc<str>`; the rope stays for the large case.
+5. **Register-tier superinstructions** over the new slots (`typeof`
+   dispatch, `GetProp`+`Cmp`+`Br`, `Call`+`Ret` for leaf callees), chosen
+   from the op-histogram feature's pair counts on `mixed_helpers` and the
+   React render workload.
+
+**Phasing and gates.** Each step lands alone behind the differential
+corpora and is measured on `mixed_helpers`, the React render (§6.17) and
+`json_roundtrip`; a step that does not move its target share by at least
+half its estimate is reverted, as the `Value::clone` experiment above
+was. Steps 1 and 2 are the regime change and carry the risk (every op
+that materializes a `Value` for a helper call needs a boxing bridge; the
+JIT's dense-element contract reads `Value` tags and must be re-pinned);
+3–5 are incremental on top.
+
+**Estimate.** Steps 1+2: a multi-week engine change with a new `Value`
+bridge at ~200 helper call sites. Steps 3–5: one round each. The honest
+expectation is `mixed_helpers` at 2–3× Node after 1+2 and inside 1.5×
+after 3–5 — parity on total wall-clock everywhere, and execution-only
+parity on everything but the allocation-bound rows, which then need the
+ObjectData arena §6.12.2 already tracks.
+
+### 6.20.4 Phase 1 checkpoint (2026-10-21, branch `perf/value-model-phase1`)
+
+The approved reading of the goal is execution-only parity with Node on
+every workload, so the project started with the cheap increments the
+fresh profile ranked above the structural steps — each landed alone,
+measured on the whole corpus, gated by the full suite and clippy:
+
+| increment | change | mixed_helpers Ir |
+| --- | --- | ---: |
+| (start) | §6.19 + the §6.20.1 rounds | 1.559 G |
+| 1a | `WfBuilder`: zero-alloc, validation-free `string + number`; const table as a local slice; Number×Number inline in `Arith`/`ArithK` | 1.464 G (−6.1%) |
+| 1b | `cells_live`; one register fill per call; guarded frame clears | 1.443 G (−1.5%) |
+| 1c | own-property paths for computed string keys (`obj[k]`, `obj[k] = v`) | 1.391 G (−3.6%) |
+| 1d | property ICs borrow receiver + name; register arms read live registers in place | 1.341 G (−3.6%) |
+| 1e | same for `GetElem`/`SetElem` (`rref!`/`rref2!`) | 1.319 G (−1.6%) |
+| 1g | Number fast paths in `ToNumeric`/`Inc`/`Dec`; `CmpBrK` decides string/Number constants against the const table | 1.281 G (−2.9%) |
+
+Cumulative since `v3.8.1`: **1.689 G → 1.281 G (−24.2%)**; string_build
+−13%, json_roundtrip −1.4%, string_scan −3%, nothing regressed. Wall-clock
+on the PGO JIT build, 15 interleaved runs: mixed_helpers 146.5 ms total
+against Node's 64.5 ms (≈5.0× on execution-only, from 7.3× at the start
+of the project).
+
+What the profile says now (per loop iteration, ~22 k instructions):
+register dispatch and the inlined arm bodies 27%, `Value` drop/clone 14%,
+object-literal allocation + GC registry + free 10%, string `+` 11% (now
+mostly the inline-concat copies and digit formatting), frame
+setup/teardown 8%, property ICs 6%, for-in 6%, computed-key ops 4%. The
+cheap levers are spent: everything left is a structural item of §6.20.3 —
+frames as windows of a shared register stack (step 2) is the next, then
+the unboxed slots (step 1).
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —
