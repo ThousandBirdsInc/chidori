@@ -1,0 +1,76 @@
+1
+00:00:00,400 --> 00:00:01,991
+Your AI agent nailed the demo.
+
+2
+00:00:02,311 --> 00:00:03,402
+Then it hit production.
+
+3
+00:00:04,902 --> 00:00:08,118
+A run crashes halfway through, and all that work is gone.
+
+4
+00:00:08,438 --> 00:00:10,934
+A bug shows up once, and you can't reproduce it.
+
+5
+00:00:11,254 --> 00:00:13,495
+Every retry bills the same tokens again.
+
+6
+00:00:13,815 --> 00:00:17,878
+And waiting for a human sign-off means keeping a process alive for hours.
+
+7
+00:00:18,978 --> 00:00:21,660
+Chidori makes agents dependable, by default.
+
+8
+00:00:21,980 --> 00:00:28,168
+Every LLM call, tool call, and HTTP request goes through one runtime, and gets recorded.
+
+9
+00:00:29,468 --> 00:00:33,172
+You write plain async TypeScript. No graphs. No DSL.
+
+10
+00:00:33,492 --> 00:00:35,512
+Every await is a durable checkpoint.
+
+11
+00:00:36,612 --> 00:00:39,851
+So when a process dies mid-run, resume it in a new one.
+
+12
+00:00:40,171 --> 00:00:45,837
+Finished steps replay from the record. The model isn't called again, and the refund still goes out exactly once.
+
+13
+00:00:46,937 --> 00:00:51,024
+Need a person to approve? The run pauses to disk, with no process held open.
+
+14
+00:00:51,344 --> 00:00:54,455
+Answer minutes or days later, and it picks up where it stopped.
+
+15
+00:00:55,555 --> 00:00:57,575
+And every recorded run becomes a test.
+
+16
+00:00:57,895 --> 00:01:03,305
+Replay it in CI in milliseconds, with zero model calls, and catch drift before your customers do.
+
+17
+00:01:04,405 --> 00:01:10,814
+It's one Rust binary. Bring Anthropic, OpenAI, or any compatible model. Open source, under Apache 2.0.
+
+18
+00:01:11,914 --> 00:01:13,818
+Chidori. Ship agents you can trust.
+
+19
+00:01:14,138 --> 00:01:17,157
+Install it in one command, and start building today.
+

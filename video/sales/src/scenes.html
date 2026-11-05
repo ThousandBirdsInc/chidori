@@ -1,0 +1,536 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Chidori video</title>
+<style>
+@font-face { font-family: "JB"; src: url(fonts/jb.woff2) format("woff2"); font-weight: 100 800; }
+@font-face { font-family: "Inter"; src: url(fonts/inter.woff2) format("woff2"); font-weight: 100 900; }
+:root {
+  --bg: #0e0e0d; --panel: #171715; --panel2: #1d1d1a; --line: #2f2e2a; --line2: #45443e;
+  --text: #ecebe6; --muted: #a3a29a; --dim: #6f6e67;
+  --y: #FACC15; --y2: #F4C752; --sage: #C9DA8A; --red: #EF6F5E; --blue: #8AB4F8;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); color: var(--text);
+  font-family: "Inter", sans-serif; -webkit-font-smoothing: antialiased; }
+.mono { font-family: "JB", monospace; }
+#stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
+.bggrid { position: absolute; inset: 0;
+  background-image: linear-gradient(rgba(255,255,255,.028) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px);
+  background-size: 64px 64px; mask-image: radial-gradient(ellipse at center, #000 30%, transparent 80%); }
+.vignette { position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(ellipse at 50% 40%, rgba(250,204,21,.05), transparent 55%), radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,.55)); }
+.chrome { position: absolute; left: 0; right: 0; top: 0; height: 90px; padding: 38px 72px; display: flex; justify-content: space-between;
+  font-family: "JB"; font-size: 20px; color: var(--muted); letter-spacing: .04em; z-index: 5; }
+.chrome .brand b { color: var(--y); }
+#progress { position: absolute; left: 0; bottom: 0; height: 5px; background: var(--y); z-index: 6; box-shadow: 0 0 12px rgba(250,204,21,.6); }
+#sceneLabel { text-transform: uppercase; }
+
+.scene { position: absolute; inset: 0; opacity: 0; }
+.center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.kicker { font-family: "JB"; font-size: 22px; letter-spacing: .18em; text-transform: uppercase; color: var(--y); }
+h1.big { font-size: 76px; font-weight: 750; letter-spacing: -.025em; line-height: 1.08; text-align: center; }
+h2 { font-size: 58px; font-weight: 720; letter-spacing: -.02em; line-height: 1.1; }
+.text { color: var(--text); } .y { color: var(--y); } .sage { color: var(--sage); } .red { color: var(--red); } .muted { color: var(--muted); } .dim { color: var(--dim); }
+.panel { background: var(--panel); border: 1.5px solid var(--line); border-radius: 18px; }
+.chip { display: inline-flex; align-items: center; gap: 10px; padding: 10px 20px; border-radius: 999px; border: 1.5px solid var(--line2);
+  font-family: "JB"; font-size: 22px; color: var(--text); background: var(--panel2); }
+.chip.y { border-color: var(--y); color: var(--y); background: rgba(250,204,21,.08); }
+.chip.sage { border-color: var(--sage); color: var(--sage); background: rgba(201,218,138,.08); }
+.chip.strike { color: var(--dim); text-decoration: line-through; text-decoration-color: var(--red); text-decoration-thickness: 3px; }
+
+/* ---------- animation vocabulary (driven by data-a, paused & scrubbed) ---------- */
+@keyframes fu { from { opacity: 0; transform: translateY(28px); } to { opacity: 1; transform: none; } }
+@keyframes fi { from { opacity: 0; } to { opacity: 1; } }
+@keyframes fo { from { opacity: 1; } to { opacity: .0; } }
+@keyframes dimto { from { opacity: 1; } to { opacity: .22; } }
+@keyframes pop { 0% { opacity: 0; transform: scale(.82); } 70% { opacity: 1; transform: scale(1.04); } 100% { opacity: 1; transform: scale(1); } }
+@keyframes fl { from { opacity: 0; transform: translateX(-36px); } to { opacity: 1; transform: none; } }
+@keyframes fr { from { opacity: 0; transform: translateX(36px); } to { opacity: 1; transform: none; } }
+@keyframes type { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
+@keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes draw { to { stroke-dashoffset: 0; } }
+@keyframes glow { 0% { box-shadow: 0 0 0 rgba(250,204,21,0); border-color: var(--line); } 100% { box-shadow: 0 0 0 2px var(--y), 0 0 48px rgba(250,204,21,.28); border-color: var(--y); } }
+@keyframes glowsage { 0% { box-shadow: none; } 100% { box-shadow: 0 0 0 2px var(--sage), 0 0 40px rgba(201,218,138,.25); border-color: var(--sage); } }
+@keyframes hl { from { background-color: rgba(250,204,21,0); } to { background-color: rgba(250,204,21,.13); } }
+@keyframes redden { to { background: var(--red); box-shadow: 0 0 24px rgba(239,111,94,.6); } }
+@keyframes shake { 0%,100% { transform: none; } 20% { transform: translateX(-10px); } 40% { transform: translateX(9px); } 60% { transform: translateX(-6px); } 80% { transform: translateX(4px); } }
+@keyframes strike { from { background-size: 0% 3px; } to { background-size: 100% 3px; } }
+@keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%,100% { opacity: .35; transform: scale(.9); } 50% { opacity: 1; transform: scale(1.1); } }
+@keyframes travel { from { offset-distance: 0%; } to { offset-distance: 100%; } }
+@keyframes glitch { 0%,100% { transform: none; filter: none; } 10% { transform: translate(-6px,2px); filter: hue-rotate(40deg); } 20% { transform: translate(5px,-3px); } 30% { transform: none; } 70% { transform: translate(3px,1px); } 80% { transform: none; } }
+
+/* ---------- intro ---------- */
+.wordmark { font-family: "JB"; font-weight: 760; font-size: 200px; letter-spacing: -.04em; line-height: 1; display: flex; }
+.wordmark span { display: inline-block; }
+.bolt { position: absolute; left: 0; top: 0; }
+.bolt path { fill: none; stroke: var(--y); stroke-width: 4; stroke-linejoin: round; filter: drop-shadow(0 0 10px rgba(250,204,21,.8)); }
+.tagline { font-size: 50px; font-weight: 600; letter-spacing: -.015em; text-align: center; line-height: 1.25; }
+
+/* ---------- problem ---------- */
+.pgrid { position: absolute; left: 160px; right: 160px; top: 380px; display: grid; grid-template-columns: 1fr 1fr; gap: 34px; }
+.pcard { height: 270px; padding: 36px 40px; position: relative; overflow: hidden; }
+.pcard .t { font-size: 38px; font-weight: 700; letter-spacing: -.01em; }
+.pcard .s { font-size: 25px; color: var(--muted); margin-top: 10px; }
+.pcard .viz { position: absolute; left: 40px; right: 40px; bottom: 34px; font-family: "JB"; font-size: 24px; }
+.pcard .num { position: absolute; right: 40px; top: 30px; font-family: "JB"; color: var(--dim); font-size: 22px; }
+.bar { height: 16px; border-radius: 8px; background: #26251f; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--y); transform-origin: left; }
+
+/* ---------- boundary ---------- */
+.node { position: absolute; padding: 22px 26px; }
+.node .lbl { font-family: "JB"; font-size: 18px; letter-spacing: .14em; text-transform: uppercase; color: var(--dim); margin-bottom: 10px; }
+.node .ttl { font-size: 32px; font-weight: 700; }
+.wbox { position: absolute; width: 300px; height: 94px; display: flex; align-items: center; gap: 18px; padding: 0 26px; font-size: 30px; font-weight: 650; }
+.wbox .ic { width: 46px; height: 46px; border-radius: 12px; display: grid; place-items: center; font-family: "JB"; font-size: 22px; color: #111; background: var(--sage); font-weight: 800; }
+.packet { position: absolute; left: 0; top: 0; width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%; background: var(--y);
+  box-shadow: 0 0 16px 4px rgba(250,204,21,.7); offset-rotate: 0deg; }
+.packet.back { background: var(--sage); box-shadow: 0 0 16px 4px rgba(201,218,138,.6); }
+.logrow { display: grid; grid-template-columns: 48px 100px 1fr 150px; font-family: "JB"; font-size: 21px; white-space: nowrap; padding: 11px 22px; border-top: 1px solid var(--line); }
+.logrow .k { color: var(--y); } .logrow .ok { color: var(--sage); text-align: right; }
+
+/* ---------- code ---------- */
+.editor { position: absolute; left: 130px; top: 260px; width: 1060px; height: 560px; overflow: hidden; }
+.tabbar { height: 62px; border-bottom: 1.5px solid var(--line); display: flex; align-items: center; gap: 12px; padding: 0 24px; font-family: "JB"; font-size: 20px; color: var(--muted); }
+.dot3 { width: 14px; height: 14px; border-radius: 50%; background: #3a3934; }
+.code { padding: 30px 34px; font-family: "JB"; font-size: 27px; line-height: 1.72; white-space: pre; }
+.code .ln { display: block; position: relative; padding: 0 10px; margin: 0 -10px; border-radius: 8px; }
+.tk-k { color: #C792EA; } .tk-s { color: var(--sage); } .tk-f { color: var(--y); } .tk-c { color: var(--dim); } .tk-t { color: var(--blue); }
+.safetag { position: absolute; right: 18px; top: 9px; line-height: 1.5; font-family: "JB"; font-size: 18px; color: #111; background: var(--y); padding: 3px 12px; border-radius: 6px; font-weight: 700; }
+
+/* ---------- arch ---------- */
+.layer { position: absolute; left: 150px; width: 1180px; }
+.layer .cap { font-family: "JB"; font-size: 18px; letter-spacing: .16em; text-transform: uppercase; color: var(--dim); margin-bottom: 14px; }
+.mods { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+.mod { padding: 22px 24px; border-radius: 14px; background: var(--panel2); border: 1.5px solid var(--line); min-height: 128px; }
+.mod .mt { font-size: 27px; font-weight: 700; }
+.mod .md { font-family: "JB"; font-size: 18px; color: var(--muted); margin-top: 8px; line-height: 1.45; }
+.side { position: absolute; left: 1400px; width: 380px; display: flex; flex-direction: column; gap: 22px; }
+.stat { padding: 24px 28px; }
+.stat .v { font-family: "JB"; font-size: 54px; font-weight: 760; color: var(--y); letter-spacing: -.02em; }
+.stat .l { font-size: 22px; color: var(--muted); margin-top: 4px; }
+.arrowv { position: absolute; width: 3px; background: linear-gradient(var(--line2), var(--y)); transform-origin: top; }
+
+/* ---------- timelines (replay / resume / human) ---------- */
+.tl { position: absolute; left: 150px; right: 150px; }
+.tl .head { display: flex; align-items: baseline; gap: 22px; margin-bottom: 18px; }
+.tl .head .name { font-family: "JB"; font-size: 24px; letter-spacing: .12em; text-transform: uppercase; }
+.blocks { display: flex; gap: 14px; height: 110px; }
+.blk { flex: 1; border-radius: 12px; border: 1.5px solid var(--line); background: var(--panel); position: relative; overflow: hidden; padding: 18px 18px; font-family: "JB"; }
+.blk .bt { font-size: 22px; color: var(--text); position: relative; z-index: 2; }
+.blk .bs { font-size: 17px; color: var(--muted); margin-top: 8px; position: relative; z-index: 2; }
+.blk .fill { position: absolute; inset: 0; background: rgba(250,204,21,.16); border-right: 3px solid var(--y); transform-origin: left; }
+.blk.rp .fill { background: rgba(201,218,138,.16); border-right-color: var(--sage); }
+.meter { display: flex; gap: 40px; font-family: "JB"; font-size: 28px; margin-top: 20px; }
+.meter b { font-weight: 760; }
+
+/* ---------- compare ---------- */
+table.cmp { position: absolute; left: 110px; right: 110px; top: 250px; border-collapse: separate; border-spacing: 0; width: 1700px; }
+.cmp th, .cmp td { padding: 23px 24px; text-align: left; border-bottom: 1px solid var(--line); font-size: 25px; vertical-align: middle; }
+.cmp th { font-size: 28px; font-weight: 750; padding-bottom: 20px; vertical-align: bottom; }
+.cmp th small { display: block; font-family: "JB"; font-size: 17px; font-weight: 400; color: var(--dim); margin-top: 6px; letter-spacing: .04em; }
+.cmp td:first-child { color: var(--muted); font-size: 23px; width: 400px; }
+.cmp .c1 { color: var(--text); }
+.ok { color: var(--sage); font-weight: 700; } .no { color: var(--red); font-weight: 700; } .meh { color: #E5B567; font-weight: 700; }
+.colhl { position: absolute; border-radius: 18px; }
+
+/* ---------- features ---------- */
+.fgrid { position: absolute; left: 130px; right: 130px; top: 290px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 28px; }
+.ftile { height: 330px; padding: 32px 30px; position: relative; }
+.ftile .fi { font-family: "JB"; font-size: 40px; color: var(--y); height: 60px; }
+.ftile .ft { font-size: 31px; font-weight: 720; margin-top: 18px; letter-spacing: -.01em; }
+.ftile .fd { font-size: 22px; color: var(--muted); margin-top: 12px; line-height: 1.4; }
+.ftile .fc { position: absolute; left: 30px; bottom: 28px; font-family: "JB"; font-size: 18px; color: var(--sage); }
+
+/* ---------- terminals ---------- */
+.term { position: absolute; overflow: hidden; }
+.term .body { padding: 30px 36px; font-family: "JB"; font-size: 27px; line-height: 1.8; }
+.term .row { white-space: pre; }
+.prompt { color: var(--y); }
+.caret { display: inline-block; width: 14px; height: 30px; background: var(--y); vertical-align: -5px; margin-left: 4px; }
+
+/* ================= sales cut additions ================= */
+#cap { position: absolute; left: 50%; bottom: 46px; transform: translateX(-50%); width: max-content; max-width: 1500px; z-index: 7;
+  font-size: 36px; font-weight: 600; line-height: 1.3; text-align: center; color: #fff; letter-spacing: -.005em;
+  padding: 12px 30px; border-radius: 14px; background: rgba(8,8,7,.72); border: 1px solid rgba(255,255,255,.07); }
+#cap:empty { display: none; }
+.scene .inner { position: absolute; inset: 0; transform-origin: 50% 45%; }
+@keyframes redglow { to { border-color: var(--red); box-shadow: 0 0 0 2px var(--red), 0 0 60px rgba(239,111,94,.28); } }
+@keyframes sageglow { to { border-color: var(--sage); box-shadow: 0 0 0 2px var(--sage), 0 0 50px rgba(201,218,138,.22); } }
+@keyframes flash { 0% { opacity: 0; } 15% { opacity: .55; } 100% { opacity: 0; } }
+@keyframes sagefill { from { background: var(--panel); } to { background: rgba(201,218,138,.14); border-color: var(--sage); } }
+@keyframes yfill { from { background: var(--panel); } to { background: rgba(250,204,21,.12); border-color: var(--y); } }
+@keyframes press { 0% { transform: scale(1); } 40% { transform: scale(.94); } 100% { transform: scale(1); background: var(--sage); color: #111; border-color: var(--sage); } }
+@keyframes rise { from { opacity: 0; transform: translateY(60px) scale(.96); } to { opacity: 1; transform: none; } }
+@keyframes shrinkup { from { transform: none; } to { transform: translateY(-250px) scale(.42); } }
+
+.headline { font-size: 82px; font-weight: 780; letter-spacing: -.03em; line-height: 1.06; }
+.sub { font-size: 30px; color: var(--muted); }
+.lab { font-family: "JB"; font-size: 18px; letter-spacing: .16em; text-transform: uppercase; color: var(--dim); }
+.rowx { font-family: "JB"; font-size: 24px; padding: 16px 0; border-top: 1px solid var(--line); display: flex; gap: 16px; align-items: center; white-space: nowrap; }
+.rowx:first-of-type { border-top: 0; }
+.ic { width: 34px; text-align: center; font-weight: 800; }
+
+/* hook */
+.env { position: absolute; top: 430px; width: 700px; height: 410px; padding: 34px 40px; }
+.env .lab { margin-bottom: 18px; }
+.env .big { font-size: 44px; font-weight: 760; margin-bottom: 16px; letter-spacing: -.01em; }
+
+/* pain */
+.pgrid2 { position: absolute; left: 160px; right: 160px; top: 290px; display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }
+.pc { height: 268px; padding: 34px 40px; position: relative; overflow: hidden; }
+.pc .t { font-size: 40px; font-weight: 740; letter-spacing: -.015em; }
+.pc .s { font-size: 25px; color: var(--muted); margin-top: 10px; }
+.pc .viz { position: absolute; left: 40px; right: 40px; bottom: 34px; font-family: "JB"; font-size: 24px; }
+.pc .num { position: absolute; right: 40px; top: 32px; font-family: "JB"; color: var(--dim); font-size: 22px; }
+
+/* reveal diagram */
+.box { position: absolute; padding: 26px 30px; }
+.box .ttl { font-size: 34px; font-weight: 740; margin-top: 8px; letter-spacing: -.01em; }
+.box .ms { font-family: "JB"; font-size: 20px; color: var(--muted); margin-top: 10px; }
+.wb { position: absolute; left: 1430px; width: 360px; height: 92px; display: flex; align-items: center; gap: 18px; padding: 0 26px; font-size: 30px; font-weight: 680; }
+.wb .ico { width: 48px; height: 48px; border-radius: 12px; display: grid; place-items: center; font-family: "JB"; font-size: 20px; color: #111; background: var(--sage); font-weight: 800; }
+.wires path { fill: none; stroke: var(--line2); stroke-width: 3; }
+.log { position: absolute; left: 650px; top: 600px; width: 620px; padding: 18px 28px 8px; }
+.log .rowx { font-size: 22px; padding: 13px 0; }
+.rec { margin-left: auto; color: var(--sage); font-size: 19px; }
+
+/* code */
+.ed { position: absolute; left: 130px; top: 175px; width: 1250px; height: 755px; overflow: hidden; }
+.ed .code { white-space: normal; font-variant-ligatures: none; } .ed .code .ln { white-space: pre; min-height: 1.68em; }
+.ed .code { font-size: 27px; line-height: 1.68; padding: 26px 34px; }
+.cp { position: absolute; right: 16px; top: 7px; line-height: 1.45; font-family: "JB"; font-size: 17px; color: #111; background: var(--y); padding: 3px 12px; border-radius: 6px; font-weight: 800; letter-spacing: .02em; }
+.rside { position: absolute; left: 1420px; width: 400px; }
+
+/* terminal */
+.tm { position: absolute; overflow: hidden; }
+.tm .body { padding: 26px 34px; font-family: "JB"; font-size: 20.5px; line-height: 1.75; }
+.tm .row { white-space: pre; min-height: 1.75em; }
+.tm .cmd { color: var(--text); } .tm .cmd .prompt { color: var(--y); }
+.tm .out { color: var(--muted); }
+.tm .hlrow { margin: 4px -14px 0; padding: 4px 14px; border-radius: 8px; }
+.killed { color: var(--red); font-weight: 800; }
+.flashred { position: absolute; inset: 0; background: rgba(239,111,94,.5); opacity: 0; pointer-events: none; }
+.stats { position: absolute; left: 1420px; width: 380px; display: flex; flex-direction: column; gap: 22px; }
+.st { padding: 24px 28px; }
+.st .v { font-family: "JB"; font-size: 64px; font-weight: 780; letter-spacing: -.02em; line-height: 1; }
+.st .l { font-size: 22px; color: var(--muted); margin-top: 10px; }
+
+/* human */
+.tl3 { position: absolute; left: 150px; right: 150px; top: 240px; display: flex; gap: 18px; }
+.tb { flex: 1; height: 128px; padding: 22px 26px; font-family: "JB"; border-radius: 14px; border: 1.5px solid var(--line); background: var(--panel); }
+.tb .a { font-size: 25px; } .tb .b { font-size: 19px; color: var(--muted); margin-top: 10px; }
+.disk { position: absolute; left: 150px; top: 430px; width: 790px; height: 410px; padding: 30px 36px; }
+.disk .f { font-family: "JB"; font-size: 23px; line-height: 1.9; white-space: pre; }
+.appr { position: absolute; left: 980px; top: 430px; width: 790px; height: 410px; padding: 30px 36px; }
+.btn { display: inline-block; padding: 16px 34px; border-radius: 12px; border: 2px solid var(--line2); font-size: 28px; font-weight: 700; margin-right: 16px; }
+
+/* stack */
+.chips { display: flex; flex-wrap: wrap; gap: 18px; justify-content: center; max-width: 1500px; }
+.chips .chip { font-size: 27px; padding: 16px 28px; }
+
+/* cta */
+.cmdbox { font-family: "JB"; font-size: 25px; padding: 24px 34px; border-radius: 16px; background: var(--panel); border: 1.5px solid var(--line2); white-space: nowrap; }
+</style></head>
+<body><div id="stage">
+<div class="bggrid"></div><div class="vignette"></div>
+<div class="chrome"><div class="brand"><b>◆</b> chidori</div><div id="sceneLabel"></div></div>
+<div id="progress"></div>
+<div id="cap"></div>
+
+<!-- ============ 1. HOOK ============ -->
+<section class="scene" data-scene="hook" data-label=""><div class="inner">
+  <div style="position:absolute; left:0; right:0; top:180px; text-align:center">
+    <div class="headline" data-a="fu:0+0:.55">Your AI agent nailed the demo.</div>
+    <div class="headline red" style="margin-top:14px; display:inline-block" data-a="fu:1+0:.35,glitch:1+0.35:.5">Then it hit production.</div>
+  </div>
+  <div class="panel env" style="left:230px" data-a="fu:0+0.25:.6">
+    <div class="lab">demo · laptop</div>
+    <div class="big sage">✓ 12 / 12 steps passed</div>
+    <div class="rowx"><span class="ic sage">✓</span>prompt · triage ticket</div>
+    <div class="rowx"><span class="ic sage">✓</span>tool · lookup_order</div>
+    <div class="rowx"><span class="ic sage">✓</span>tool · issue_refund</div>
+  </div>
+  <div class="panel env" style="left:990px" data-a="fu:1+0:.4,redglow:1+0.2:.4,shake:1+0.35:.45">
+    <div class="lab">production · 3:12 AM</div>
+    <div class="big red">✗ run failed</div>
+    <div class="rowx red" data-a="fl:1+0.3:.3"><span class="ic">✗</span>worker crashed at step 7 of 12</div>
+    <div class="rowx red" data-a="fl:1+0.55:.3"><span class="ic">✗</span>can't reproduce yesterday's run</div>
+    <div class="rowx" style="color:#E5B567" data-a="fl:1+0.8:.3"><span class="ic">⏳</span>approval pending · process held</div>
+  </div>
+</div></section>
+
+<!-- ============ 2. PAIN ============ -->
+<section class="scene" data-scene="pain" data-label="the problem"><div class="inner">
+  <div style="position:absolute; left:160px; top:170px;">
+    <div class="kicker" data-a="fi:0+0:.5">why production agents break</div>
+  </div>
+  <div class="pgrid2">
+    <div class="panel pc" data-a="fu:0+0:.45,redglow:0+1.9:.3">
+      <div class="num">01</div>
+      <div class="t">Crashes lose the run</div><div class="s">Hours of work, gone at step 7.</div>
+      <div class="viz"><div class="bar"><i data-a="grow:0+0.2:1.5,redden:0+1.8:.2" style="width:58%"></i></div>
+        <div class="red" style="margin-top:12px" data-a="pop:0+1.8:.3">✗ process killed · start over from step 1</div></div>
+    </div>
+    <div class="panel pc" data-a="fu:1+0:.45">
+      <div class="num">02</div>
+      <div class="t">Bugs you can't reproduce</div><div class="s">It failed once. Now it passes.</div>
+      <div class="viz"><span class="sage" data-a="fi:1+0.3:.2">run #1 ✓ &nbsp;</span><span class="sage" data-a="fi:1+0.55:.2">run #2 ✓ &nbsp;</span><span class="red" style="display:inline-block" data-a="pop:1+0.8:.3,glitch:1+1.1:.5">run #3 ✗ &nbsp;</span><span class="sage" data-a="fi:1+1.6:.2">run #4 ✓ &nbsp;?</span></div>
+    </div>
+    <div class="panel pc" data-a="fu:2+0:.45">
+      <div class="num">03</div>
+      <div class="t">Every retry re-bills tokens</div><div class="s">Debugging means paying again.</div>
+      <div class="viz" style="display:flex; justify-content:space-between; align-items:baseline"><span class="muted">tokens billed</span><span class="red" style="font-size:40px; font-weight:780" data-count="0,1284000,2,0.2,2.2,int">0</span></div>
+    </div>
+    <div class="panel pc" data-a="fu:3+0:.45">
+      <div class="num">04</div>
+      <div class="t">Approvals hold processes open</div><div class="s">Waiting on a human, burning a worker.</div>
+      <div class="viz" style="display:flex; justify-content:space-between; align-items:baseline"><span class="muted"><span class="y" data-loop="pulse:0:1.2" style="display:inline-block">●</span> process alive</span><span class="y" style="font-size:40px; font-weight:780" data-count="0,15153,3,0.2,3.4,hms">00:00:00</span></div>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ 3. REVEAL ============ -->
+<section class="scene" data-scene="reveal" data-label="the fix"><div class="inner">
+  <div class="center" style="gap: 34px" data-a="fo:1+0:.35">
+    <svg class="bolt" width="1920" height="1080" style="position:absolute;left:0;top:0"><path data-a="draw:0+0:1.0" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"
+      d="M -20 600 L 360 600 L 400 576 L 450 624 L 500 568 L 535 600 L 1385 600 L 1420 578 L 1465 622 L 1510 574 L 1540 600 L 1940 600"/></svg>
+    <div class="wordmark" style="margin-top:-60px">
+      <span data-a="fu:0+0.15:.45">c</span><span data-a="fu:0+0.21:.45">h</span><span data-a="fu:0+0.27:.45">i</span><span data-a="fu:0+0.33:.45" class="y">d</span><span data-a="fu:0+0.39:.45">o</span><span data-a="fu:0+0.45:.45">r</span><span data-a="fu:0+0.51:.45">i</span>
+    </div>
+    <div style="height:70px"></div>
+    <div class="tagline" data-a="fu:0+1.1:.55">Dependable agents, <span class="y">by default.</span></div>
+  </div>
+
+  <div data-a="fi:1+0.2:.4" style="position:absolute; inset:0; transform: translateY(40px)">
+    <div style="position:absolute; left:140px; top:140px"><div class="kicker">one boundary</div></div>
+    <svg class="wires" width="1920" height="1080" style="position:absolute;left:0;top:0">
+      <path d="M500 430 L650 430" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+0.4:.4"/>
+      <path d="M1210 380 C1330 380 1310 336 1430 336" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+0.7:.4"/>
+      <path d="M1210 430 L1430 446" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+0.8:.4"/>
+      <path d="M1210 480 C1330 480 1310 556 1430 556" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+0.9:.4"/>
+      <path d="M930 570 L930 600" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+1.2:.3"/>
+    </svg>
+    <div class="panel box" style="left:140px; top:330px; width:360px; height:200px" data-a="fl:1+0.2:.45">
+      <div class="lab">your agent</div><div class="ttl">TypeScript</div><div class="ms">refund_agent.ts</div>
+    </div>
+    <div class="panel box" style="left:650px; top:290px; width:560px; height:280px" data-a="pop:1+0.3:.5,glow:1+0.9:.6">
+      <div class="lab">chidori runtime</div>
+      <div class="ttl">Every side effect is a<br><span class="y">recorded host call</span></div>
+      <div style="display:flex; gap:12px; margin-top:22px; flex-wrap:wrap">
+        <span class="chip" style="font-size:19px; padding:8px 16px">record</span><span class="chip" style="font-size:19px; padding:8px 16px">replay</span><span class="chip" style="font-size:19px; padding:8px 16px">pause</span><span class="chip" style="font-size:19px; padding:8px 16px">resume</span>
+      </div>
+    </div>
+    <div class="panel wb" style="top:290px" data-a="fr:1+0.6:.4"><span class="ico">AI</span>LLM calls</div>
+    <div class="panel wb" style="top:400px" data-a="fr:1+0.75:.4"><span class="ico">fn</span>Tool calls</div>
+    <div class="panel wb" style="top:510px" data-a="fr:1+0.9:.4"><span class="ico">⇄</span>HTTP requests</div>
+    <div class="packet" data-loop="travel:0:1.3" style="offset-path: path('M500 430 L650 430')" data-a="fi:1+0.9:.3"></div>
+    <div class="packet" data-loop="travel:0.3:1.6" style="offset-path: path('M1210 380 C1330 380 1310 336 1430 336')" data-a="fi:1+1.2:.3"></div>
+    <div class="packet back" data-loop="travel:0.9:1.6" style="offset-path: path('M1430 446 L1210 430')" data-a="fi:1+1.2:.3"></div>
+    <div class="packet" data-loop="travel:0.5:1.6" style="offset-path: path('M1210 480 C1330 480 1310 556 1430 556')" data-a="fi:1+1.2:.3"></div>
+    <div class="panel log" data-a="fu:1+1.3:.45">
+      <div class="lab" style="margin-bottom:6px">call log · records.jsonl</div>
+      <div class="rowx" data-a="fl:1+1.8:.3"><span class="y">#1</span>prompt&nbsp; <span class="muted">gpt-4o-mini</span><span class="rec">● recorded</span></div>
+      <div class="rowx" data-a="fl:1+2.6:.3"><span class="y">#2</span>tool&nbsp;&nbsp;&nbsp; <span class="muted">issue_refund</span><span class="rec">● recorded</span></div>
+      <div class="rowx" data-a="fl:1+3.4:.3"><span class="y">#3</span>http&nbsp;&nbsp;&nbsp; <span class="muted">GET /orders</span><span class="rec">● recorded</span></div>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ 4. CODE ============ -->
+<section class="scene" data-scene="code" data-label="how it works"><div class="inner">
+  <div class="panel ed" data-a="fu:0+0:.5">
+    <div class="tabbar"><span class="dot3"></span><span class="dot3"></span><span class="dot3"></span><span style="margin-left:14px">refund_agent.ts</span></div>
+<div class="code"><span class="ln" data-a="type:0+0.3:.5"><span class="tk-k">import</span> { chidori, run, defineTool } <span class="tk-k">from</span> <span class="tk-s">"chidori:agent"</span>;</span>
+<span class="ln" data-a="type:0+0.6:.4"><span class="tk-k">const</span> issueRefund = <span class="tk-f">defineTool</span>({ <span class="tk-c">/* payments API */</span> });</span>
+<span class="ln"> </span>
+<span class="ln" data-a="type:0+0.9:.5"><span class="tk-f">run</span>(<span class="tk-k">async</span> (input: { order: <span class="tk-t">string</span>; complaint: <span class="tk-t">string</span> }) =&gt; {</span>
+<span class="ln" data-a="type:0+1.2:.4,hl:1+0:.3">  <span class="tk-k">const</span> decision = <span class="tk-k">await</span> chidori.<span class="tk-f">prompt</span>(<span class="cp" data-a="pop:1+0:.3">checkpoint</span></span>
+<span class="ln" data-a="type:0+1.5:.4">    <span class="tk-s">`Decide a refund for ${input.order}: ${input.complaint}`</span>);</span>
+<span class="ln"> </span>
+<span class="ln" data-a="type:0+1.8:.4,hl:1+0.25:.3">  <span class="tk-k">const</span> answer = <span class="tk-k">await</span> chidori.<span class="tk-f">input</span>(<span class="tk-s">`Approve? ${decision}`</span>, {<span class="cp" data-a="pop:1+0.25:.3">checkpoint</span></span>
+<span class="ln" data-a="type:0+2.1:.4">    type: <span class="tk-s">"approval"</span>, choices: [<span class="tk-s">"approve"</span>, <span class="tk-s">"deny"</span>] });</span>
+<span class="ln" data-a="type:0+2.4:.4">  <span class="tk-k">if</span> (answer !== <span class="tk-s">"approve"</span>) <span class="tk-k">return</span> { status: <span class="tk-s">"denied"</span> };</span>
+<span class="ln"> </span>
+<span class="ln" data-a="type:0+2.7:.3,hl:1+0.5:.3">  <span class="tk-k">return await</span> issueRefund.<span class="tk-f">run</span>(<span class="cp" data-a="pop:1+0.5:.3">checkpoint</span></span>
+<span class="ln" data-a="type:0+2.9:.3">    { order: input.order, cents: <span class="tk-t">4200</span> }, chidori);</span>
+<span class="ln" data-a="type:0+3.2:.2">});</span></div>
+  </div>
+  <div class="rside" style="top:230px">
+    <div class="lab" data-a="fi:0+0.4:.4">you write</div>
+    <div style="font-size:52px; font-weight:780; letter-spacing:-.02em; line-height:1.1; margin-top:14px" data-a="fu:0+0.4:.5">Plain async<br>TypeScript</div>
+    <div style="display:flex; flex-direction:column; gap:14px; margin-top:34px; align-items:flex-start">
+      <span class="chip strike" data-a="fl:0+2.0:.35">node graphs</span>
+      <span class="chip strike" data-a="fl:0+2.5:.35">workflow DSL</span>
+    </div>
+    <div style="margin-top:50px; font-size:34px; font-weight:700; line-height:1.25" data-a="fu:1+0.3:.5">Every <span class="mono y">await</span> is a<br>durable checkpoint.</div>
+  </div>
+</div></section>
+
+<!-- ============ 5. CRASH / RESUME ============ -->
+<section class="scene" data-scene="crash" data-label="crash recovery"><div class="inner">
+  <div class="panel tm" style="left:110px; top:190px; width:1270px; height:700px" data-a="fu:0+0:.45,shake:0+2.5:.45">
+    <div class="tabbar"><span class="dot3"></span><span class="dot3"></span><span class="dot3"></span><span style="margin-left:14px">terminal · real chidori 3.8.1 output</span></div>
+    <div class="body">
+      <div class="row cmd" data-a="type:0+0.1:.6"><span class="prompt">$ </span>chidori run refund_agent.ts -i order=A-1007 --trusted</div>
+      <div class="row out" data-a="fi:0+0.8:.1">Run id: a3892d77-9c0f-4ffb-a8ad-f7da5453613d</div>
+      <div class="row out" data-a="fi:0+1.1:.1">seq 1: prompt started (gpt-4o-mini)</div>
+      <div class="row out" data-a="fi:0+1.5:.1">seq 1: prompt finished (0.0s)</div>
+      <div class="row text" data-a="fi:0+1.9:.1">Approve? Refund $42.00. Damaged on arrival, inside the 30-day window.</div>
+      <div class="row killed" data-a="pop:0+2.5:.25">Killed  ✗ process died mid-run</div>
+      <div class="row"> </div>
+      <div class="row cmd" data-a="type:1+0:.7"><span class="prompt">$ </span>chidori resume refund_agent.ts a3892d77-9c0f-4ffb-a8ad-f7da5453613d --trusted</div>
+      <div class="row text" data-a="fi:1+1.0:.1">Approve? Refund $42.00. Damaged on arrival, inside the 30-day window. <span class="y">approve</span></div>
+      <div class="row out" data-a="fi:1+1.6:.1">"refund": { "refundId": "re_1007", "status": "succeeded" }</div>
+      <div class="row sage hlrow" data-a="fi:1+2.3:.15,hl:1+2.5:.4">Resumed from a3892d77-9c0f-4ffb-a8ad-f7da5453613d</div>
+      <div class="row sage hlrow" data-a="fi:1+2.3:.15,hl:1+2.5:.4">(1 recorded calls replayed, 2 executed live)</div>
+    </div>
+    <div class="flashred" data-a="flash:0+2.5:.6"></div>
+  </div>
+  <div class="stats" style="top:220px">
+    <div class="panel st" data-a="fr:1+2.4:.4,sageglow:1+2.8:.4"><div class="v sage">0</div><div class="l">model calls re-billed</div></div>
+    <div class="panel st" data-a="fr:1+2.7:.4"><div class="v">1</div><div class="l">refund issued, exactly once</div></div>
+    <div class="panel st" data-a="fr:1+3.0:.4"><div class="v">0</div><div class="l">steps redone</div></div>
+  </div>
+</div></section>
+
+<!-- ============ 6. HUMAN ============ -->
+<section class="scene" data-scene="human" data-label="human in the loop"><div class="inner">
+  <div class="tl3">
+    <div class="tb" data-a="fu:0+0:.4,sagefill:0+0.2:.3"><div class="a">#1 prompt <span class="sage">✓</span></div><div class="b">recorded</div></div>
+    <div class="tb" data-a="fu:0+0.15:.4,yfill:0+0.6:.3,sagefill:1+1.6:.3"><div class="a">#2 input <span class="y">⏸</span></div><div class="b">waiting for approval</div></div>
+    <div class="tb" data-a="fu:0+0.3:.4,sagefill:1+2.4:.3"><div class="a">#3 issue_refund</div><div class="b" data-a="fi:1+2.4:.3">✓ executed once</div></div>
+  </div>
+  <div class="panel disk" data-a="fu:0+0.8:.5">
+    <div class="lab">saved to disk</div>
+<div class="f" style="margin-top:16px"><span class="y">.chidori/runs/a3892d77…/</span>
+  ├─ records.jsonl
+  ├─ pending.json   <span class="y">← waiting here</span>
+  └─ runtime.snapshot</div>
+    <div class="rowx" style="margin-top:24px; border-top:1px solid var(--line)" data-a="fi:0+2.0:.4"><span class="ic sage">●</span>live process held open: <b class="sage">none</b></div>
+  </div>
+  <div class="panel appr" data-a="fu:0+1.2:.5">
+    <div class="lab">approval request</div>
+    <div style="font-size:31px; font-weight:650; margin-top:18px; line-height:1.35">Approve? Refund $42.00. Damaged on arrival, inside the 30-day window.</div>
+    <div style="margin-top:34px"><span class="btn" data-a="press:1+1.2:.4">Approve</span><span class="btn muted">Deny</span></div>
+    <div class="mono muted" style="margin-top:28px; font-size:22px"><span data-a="fo:1+0:.2">Monday 9:14 AM</span><span class="y" style="position:relative; left:-190px" data-a="fi:1+0.1:.2">Wednesday 4:02 PM · 2 days later</span></div>
+  </div>
+</div></section>
+
+<!-- ============ 7. TEST ============ -->
+<section class="scene" data-scene="test" data-label="regression tests"><div class="inner">
+  <div class="panel tm" style="left:120px; top:190px; width:1680px; height:400px" data-a="fu:0+0:.45">
+    <div class="tabbar"><span class="dot3"></span><span class="dot3"></span><span class="dot3"></span><span style="margin-left:14px">terminal · real chidori 3.8.1 output</span></div>
+    <div class="body" style="font-size:22px">
+      <div class="row cmd" data-a="type:0+0.2:.6"><span class="prompt">$ </span>chidori export a3892d77-9c0f-4ffb-a8ad-f7da5453613d --fixture tests/fixtures</div>
+      <div class="row out" data-a="fi:0+0.9:.1">exported fixture: 2.1 KB (run dir was 5.9 KB)</div>
+      <div class="row cmd" data-a="type:0+1.3:.3"><span class="prompt">$ </span>git add tests/fixtures</div>
+      <div class="row cmd" data-a="type:1+0:.6"><span class="prompt">$ </span>chidori verify refund_agent.ts a3892d77-9c0f-4ffb-a8ad-f7da5453613d --runs-dir tests/fixtures</div>
+      <div class="row sage hlrow" data-a="fi:1+0.9:.1,hl:1+1.0:.4">verified: 3 calls replayed, 0 workspace re-materialization(s), output identical — $0</div>
+    </div>
+  </div>
+  <div style="position:absolute; left:120px; right:120px; top:630px; display:grid; grid-template-columns: 1.3fr 1fr 1fr 1fr; gap:24px">
+    <div class="panel st" data-a="fu:1+1.2:.4,sageglow:1+1.6:.4"><div class="v sage" style="font-size:48px">✓ passed</div><div class="l">CI · agent regression test</div></div>
+    <div class="panel st" data-a="fu:1+1.4:.4"><div class="v"><span data-count="0,40,1,1.4,1.0,int">0</span><span style="font-size:36px"> ms</span></div><div class="l">to replay the run</div></div>
+    <div class="panel st" data-a="fu:1+1.6:.4"><div class="v">0</div><div class="l">model calls</div></div>
+    <div class="panel st" data-a="fu:1+1.8:.4"><div class="v y">$0</div><div class="l">per test run</div></div>
+  </div>
+</div></section>
+
+<!-- ============ 8. STACK ============ -->
+<section class="scene" data-scene="stack" data-label="under the hood"><div class="inner">
+  <div class="center" style="gap:44px; top:-10px">
+    <div class="kicker" data-a="fi:0+0:.4">drop-in, no infrastructure</div>
+    <div class="headline" style="text-align:center" data-a="fu:0+0:.5">One Rust binary.<br><span class="y">Your choice of model.</span></div>
+    <div class="chips">
+      <span class="chip" data-a="pop:0+0.9:.35">No Node · no V8</span>
+      <span class="chip" data-a="pop:0+1.1:.35">TypeScript + Python SDKs</span>
+      <span class="chip" data-a="pop:0+1.3:.35">OpenTelemetry traces</span>
+    </div>
+    <div class="chips">
+      <span class="chip y" data-a="pop:0+2.4:.35">Anthropic</span>
+      <span class="chip y" data-a="pop:0+2.6:.35">OpenAI</span>
+      <span class="chip y" data-a="pop:0+2.8:.35">OpenRouter</span>
+      <span class="chip y" data-a="pop:0+3.0:.35">Any OpenAI-compatible endpoint</span>
+    </div>
+    <div class="chips">
+      <span class="chip sage" data-a="pop:0+5.0:.4">Open source · Apache-2.0</span>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ 9. CTA ============ -->
+<section class="scene" data-scene="cta" data-label=""><div class="inner">
+  <svg class="bolt" width="1920" height="1080" style="position:absolute;left:0;top:0"><path data-a="draw:0+0:1.0" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"
+    d="M -20 404 L 520 404 L 556 386 L 600 422 L 646 380 L 676 404 L 1244 404 L 1274 386 L 1318 422 L 1364 380 L 1400 404 L 1940 404"/></svg>
+  <div class="center" style="gap:30px; top:-40px">
+    <div class="wordmark" style="font-size:150px">
+      <span data-a="fu:0+0.1:.45">c</span><span data-a="fu:0+0.16:.45">h</span><span data-a="fu:0+0.22:.45">i</span><span data-a="fu:0+0.28:.45" class="y">d</span><span data-a="fu:0+0.34:.45">o</span><span data-a="fu:0+0.4:.45">r</span><span data-a="fu:0+0.46:.45">i</span>
+    </div>
+    <div class="headline" style="font-size:72px; margin-top:44px" data-a="fu:0+0.9:.5">Ship agents you can <span class="y">trust.</span></div>
+    <div class="cmdbox" style="margin-top:30px" data-a="fu:1+0:.5"><span class="y">$ </span>curl -fsSL https://raw.githubusercontent.com/ThousandBirdsInc/chidori/main/scripts/install.sh | sh</div>
+    <div class="mono" style="font-size:34px; margin-top:6px" data-a="fu:1+0.4:.5"><span class="y">★</span> github.com/ThousandBirdsInc/chidori</div>
+    <div class="lab" style="margin-top:14px; font-size:22px" data-a="fi:1+1.0:.6">checkpoint · replay · resume</div>
+  </div>
+</div></section>
+
+<script>
+// Driven entirely by setTime(t): every CSS animation is paused and scrubbed to an exact time.
+const T = window.TIMINGS;
+const byId = Object.fromEntries(T.scenes.map(s => [s.id, s]));
+const scenes = [...document.querySelectorAll('.scene')].map(el => ({ el, s: byId[el.dataset.scene], inner: el.querySelector('.inner') }));
+const EASE = { grow: 'cubic-bezier(.4,0,.2,1)', type: 'steps(30,end)', travel: 'linear', blink: 'step-end', shake: 'linear', glitch: 'linear', flash: 'ease-out' };
+const OUT = new Set(['fo', 'dimto']);
+const absT = (s, spec) => { const [c, o] = spec.split('+'); return s.start + s.cues[+c].t + (+o || 0); };
+for (const { el, s } of scenes) {
+  el.querySelectorAll('[data-a]').forEach(n => {
+    n.style.animation = n.dataset.a.split(',').map(part => {
+      const [name, at, d] = part.split(':');
+      return `${name} ${d}s ${EASE[name] || 'cubic-bezier(.2,.7,.2,1)'} ${absT(s, at).toFixed(3)}s 1 ${OUT.has(name) ? 'forwards' : 'both'}`;
+    }).join(',');
+  });
+  el.querySelectorAll('[data-count]').forEach(n => {
+    const [from, to, c, o, d, fmt] = n.dataset.count.split(',');
+    n._count = { from: +from, to: +to, at: absT(s, c + '+' + o), d: +d, fmt };
+  });
+}
+// data-loop elements may also carry data-a (fade in); loop keeps its own infinite animation appended.
+document.querySelectorAll('[data-loop]').forEach(n => {
+  const [name, off, d] = n.dataset.loop.split(':');
+  const loop = `${name} ${d}s ${EASE[name] || 'ease-in-out'} ${-off}s infinite`;
+  n.style.animation = n.style.animation ? n.style.animation + ',' + loop : loop;
+});
+const fmt = (v, f) => {
+  if (f === 'int') return Math.round(v).toLocaleString('en-US');
+  if (f === 'hms') { const x = Math.round(v); return [x / 3600 | 0, (x / 60 | 0) % 60, x % 60].map(n => String(n).padStart(2, '0')).join(':'); }
+  return String(v);
+};
+const counters = [...document.querySelectorAll('[data-count]')];
+const caps = T.scenes.flatMap(s => s.cues.map(c => ({ a: s.start + c.t, b: s.start + c.t + c.d + 0.25, text: c.text })));
+const capEl = document.getElementById('cap');
+const label = document.getElementById('sceneLabel'), prog = document.getElementById('progress');
+const clamp = x => Math.max(0, Math.min(1, x));
+window.setTime = (t) => {
+  for (const a of document.getAnimations()) { a.pause(); a.currentTime = t * 1000; }
+  label.textContent = '';
+  for (const { el, s, inner } of scenes) {
+    const end = s.start + s.dur;
+    const op = clamp((t - s.start) / 0.35) * clamp((end - t) / 0.35);
+    el.style.opacity = op;
+    el.style.visibility = op > 0 ? 'visible' : 'hidden';
+    const k = clamp((t - s.start) / 1.2), e = 1 - Math.pow(1 - k, 3);
+    inner.style.transform = `scale(${(1.025 - 0.025 * e).toFixed(4)})`;
+    if (t >= s.start && t < end) label.textContent = el.dataset.label;
+  }
+  for (const n of counters) {
+    const c = n._count, k = clamp((t - c.at) / c.d), e = 1 - Math.pow(1 - k, 2);
+    n.textContent = fmt(c.from + (c.to - c.from) * e, c.fmt);
+  }
+  const cur = caps.find(c => t >= c.a && t < c.b);
+  const txt = cur ? cur.text : '';
+  if (capEl.textContent !== txt) capEl.textContent = txt;
+  prog.style.width = (100 * t / T.total) + '%';
+};
+window.setTime(0);
+</script>
+</div></body></html>

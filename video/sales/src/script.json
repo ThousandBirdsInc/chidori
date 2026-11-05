@@ -1,0 +1,69 @@
+[
+ {
+  "id": "hook",
+  "pad": 1.1,
+  "segs": [
+   "Your A I agent nailed the demo.",
+   "Then it hit production."
+  ]
+ },
+ {
+  "id": "pain",
+  "segs": [
+   "A run crashes halfway through, and all that work is gone.",
+   "A bug shows up once, and you can't reproduce it.",
+   "Every retry bills the same tokens again.",
+   "And waiting for a human sign-off means keeping a process alive for hours."
+  ]
+ },
+ {
+  "id": "reveal",
+  "segs": [
+   "Chidori makes agents dependable, by default.",
+   "Every L L M call, tool call, and H T T P request goes through one runtime, and gets recorded."
+  ],
+  "pad": 0.9
+ },
+ {
+  "id": "code",
+  "segs": [
+   "You write plain async TypeScript. No graphs. No D S L.",
+   "Every await is a durable checkpoint."
+  ]
+ },
+ {
+  "id": "crash",
+  "segs": [
+   "So when a process dies mid-run, resume it in a new one.",
+   "Finished steps replay from the record. The model isn't called again, and the refund still goes out exactly once."
+  ]
+ },
+ {
+  "id": "human",
+  "segs": [
+   "Need a person to approve? The run pauses to disk, with no process held open.",
+   "Answer minutes or days later, and it picks up where it stopped."
+  ]
+ },
+ {
+  "id": "test",
+  "segs": [
+   "And every recorded run becomes a test.",
+   "Replay it in C I in milliseconds, with zero model calls, and catch drift before your customers do."
+  ]
+ },
+ {
+  "id": "stack",
+  "segs": [
+   "It's one Rust binary. Bring Anthropic, OpenAI, or any compatible model. Open source, under Apache two."
+  ]
+ },
+ {
+  "id": "cta",
+  "pad": 2.6,
+  "segs": [
+   "Chidori. Ship agents you can trust.",
+   "Install it in one command, and start building today."
+  ]
+ }
+]
