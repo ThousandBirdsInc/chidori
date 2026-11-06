@@ -1,536 +1,691 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Chidori video</title>
+<html><head><meta charset="utf-8"><title>Chidori: build agents you can trust</title>
 <style>
-@font-face { font-family: "JB"; src: url(fonts/jb.woff2) format("woff2"); font-weight: 100 800; }
-@font-face { font-family: "Inter"; src: url(fonts/inter.woff2) format("woff2"); font-weight: 100 900; }
+@font-face { font-family: "Geist"; src: url(fonts/geist.woff2) format("woff2"); font-weight: 100 900; }
+@font-face { font-family: "GeistMono"; src: url(fonts/geist-mono.woff2) format("woff2"); font-weight: 100 900; }
 :root {
-  --bg: #0e0e0d; --panel: #171715; --panel2: #1d1d1a; --line: #2f2e2a; --line2: #45443e;
-  --text: #ecebe6; --muted: #a3a29a; --dim: #6f6e67;
-  --y: #FACC15; --y2: #F4C752; --sage: #C9DA8A; --red: #EF6F5E; --blue: #8AB4F8;
+  --bg: #07070a; --ink: #f4f3ee; --muted: #9a998f; --dim: #5d5c55; --line: rgba(255,255,255,.085);
+  --y: #FACC15; --amber: #FB923C; --mint: #86EFAC; --red: #F87171; --sky: #7DD3FC; --violet: #C4B5FD;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); color: var(--text);
-  font-family: "Inter", sans-serif; -webkit-font-smoothing: antialiased; }
-.mono { font-family: "JB", monospace; }
-#stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; }
-.bggrid { position: absolute; inset: 0;
-  background-image: linear-gradient(rgba(255,255,255,.028) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px);
-  background-size: 64px 64px; mask-image: radial-gradient(ellipse at center, #000 30%, transparent 80%); }
-.vignette { position: absolute; inset: 0; pointer-events: none;
-  background: radial-gradient(ellipse at 50% 40%, rgba(250,204,21,.05), transparent 55%), radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,.55)); }
-.chrome { position: absolute; left: 0; right: 0; top: 0; height: 90px; padding: 38px 72px; display: flex; justify-content: space-between;
-  font-family: "JB"; font-size: 20px; color: var(--muted); letter-spacing: .04em; z-index: 5; }
-.chrome .brand b { color: var(--y); }
-#progress { position: absolute; left: 0; bottom: 0; height: 5px; background: var(--y); z-index: 6; box-shadow: 0 0 12px rgba(250,204,21,.6); }
-#sceneLabel { text-transform: uppercase; }
+html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); color: var(--ink);
+  font-family: "Geist", sans-serif; -webkit-font-smoothing: antialiased; }
+.mono { font-family: "GeistMono", monospace; }
+#stage { position: absolute; inset: 0; overflow: hidden; perspective: 1800px; }
+#bg { position: absolute; inset: -10%; }
+.orb { position: absolute; width: 900px; height: 900px; border-radius: 50%; filter: blur(140px); opacity: .5; }
+#grain { position: absolute; inset: 0; opacity: .07; mix-blend-mode: overlay; pointer-events: none; z-index: 50; }
+#vig { position: absolute; inset: 0; pointer-events: none; z-index: 49;
+  background: radial-gradient(ellipse at 50% 50%, transparent 50%, rgba(0,0,0,.65) 100%); }
+#flash { position: absolute; inset: 0; background: #fff; opacity: 0; z-index: 48; pointer-events: none; }
+#redflash { position: absolute; inset: 0; background: #ff3b3b; opacity: 0; z-index: 47; pointer-events: none; mix-blend-mode: screen; }
+#bars { position: absolute; left: 0; right: 0; height: 0; z-index: 46; }
 
-.scene { position: absolute; inset: 0; opacity: 0; }
-.center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
-.kicker { font-family: "JB"; font-size: 22px; letter-spacing: .18em; text-transform: uppercase; color: var(--y); }
-h1.big { font-size: 76px; font-weight: 750; letter-spacing: -.025em; line-height: 1.08; text-align: center; }
-h2 { font-size: 58px; font-weight: 720; letter-spacing: -.02em; line-height: 1.1; }
-.text { color: var(--text); } .y { color: var(--y); } .sage { color: var(--sage); } .red { color: var(--red); } .muted { color: var(--muted); } .dim { color: var(--dim); }
-.panel { background: var(--panel); border: 1.5px solid var(--line); border-radius: 18px; }
-.chip { display: inline-flex; align-items: center; gap: 10px; padding: 10px 20px; border-radius: 999px; border: 1.5px solid var(--line2);
-  font-family: "JB"; font-size: 22px; color: var(--text); background: var(--panel2); }
-.chip.y { border-color: var(--y); color: var(--y); background: rgba(250,204,21,.08); }
-.chip.sage { border-color: var(--sage); color: var(--sage); background: rgba(201,218,138,.08); }
-.chip.strike { color: var(--dim); text-decoration: line-through; text-decoration-color: var(--red); text-decoration-thickness: 3px; }
+.sc { position: absolute; inset: 0; display: none; transform-style: preserve-3d; }
+.cam { position: absolute; inset: 0; transform-origin: 50% 50%; transform-style: preserve-3d; }
+.abs { position: absolute; }
+.will { will-change: transform, opacity, filter; }
 
-/* ---------- animation vocabulary (driven by data-a, paused & scrubbed) ---------- */
-@keyframes fu { from { opacity: 0; transform: translateY(28px); } to { opacity: 1; transform: none; } }
-@keyframes fi { from { opacity: 0; } to { opacity: 1; } }
-@keyframes fo { from { opacity: 1; } to { opacity: .0; } }
-@keyframes dimto { from { opacity: 1; } to { opacity: .22; } }
-@keyframes pop { 0% { opacity: 0; transform: scale(.82); } 70% { opacity: 1; transform: scale(1.04); } 100% { opacity: 1; transform: scale(1); } }
-@keyframes fl { from { opacity: 0; transform: translateX(-36px); } to { opacity: 1; transform: none; } }
-@keyframes fr { from { opacity: 0; transform: translateX(36px); } to { opacity: 1; transform: none; } }
-@keyframes type { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
-@keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
-@keyframes draw { to { stroke-dashoffset: 0; } }
-@keyframes glow { 0% { box-shadow: 0 0 0 rgba(250,204,21,0); border-color: var(--line); } 100% { box-shadow: 0 0 0 2px var(--y), 0 0 48px rgba(250,204,21,.28); border-color: var(--y); } }
-@keyframes glowsage { 0% { box-shadow: none; } 100% { box-shadow: 0 0 0 2px var(--sage), 0 0 40px rgba(201,218,138,.25); border-color: var(--sage); } }
-@keyframes hl { from { background-color: rgba(250,204,21,0); } to { background-color: rgba(250,204,21,.13); } }
-@keyframes redden { to { background: var(--red); box-shadow: 0 0 24px rgba(239,111,94,.6); } }
-@keyframes shake { 0%,100% { transform: none; } 20% { transform: translateX(-10px); } 40% { transform: translateX(9px); } 60% { transform: translateX(-6px); } 80% { transform: translateX(4px); } }
-@keyframes strike { from { background-size: 0% 3px; } to { background-size: 100% 3px; } }
-@keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
-@keyframes spin { to { transform: rotate(360deg); } }
-@keyframes pulse { 0%,100% { opacity: .35; transform: scale(.9); } 50% { opacity: 1; transform: scale(1.1); } }
-@keyframes travel { from { offset-distance: 0%; } to { offset-distance: 100%; } }
-@keyframes glitch { 0%,100% { transform: none; filter: none; } 10% { transform: translate(-6px,2px); filter: hue-rotate(40deg); } 20% { transform: translate(5px,-3px); } 30% { transform: none; } 70% { transform: translate(3px,1px); } 80% { transform: none; } }
+/* type */
+.punch { font-weight: 800; letter-spacing: -.05em; line-height: .98; }
+.h1 { font-size: 132px; font-weight: 820; letter-spacing: -.055em; line-height: .96; }
+.h2 { font-size: 84px; font-weight: 800; letter-spacing: -.045em; line-height: 1.0; }
+.h3 { font-size: 56px; font-weight: 750; letter-spacing: -.035em; line-height: 1.05; }
+.kick { font-family: "GeistMono"; font-size: 22px; letter-spacing: .22em; text-transform: uppercase; color: var(--y); }
+.sub { font-size: 30px; color: var(--muted); font-weight: 450; letter-spacing: -.01em; line-height: 1.35; }
+.y { color: var(--y); } .mint { color: var(--mint); } .red { color: var(--red); } .sky { color: var(--sky); } .muted { color: var(--muted); }
+.grad { background: linear-gradient(92deg, #FDE68A, #FACC15 40%, #FB923C); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.w { display: inline-block; white-space: pre; }
 
-/* ---------- intro ---------- */
-.wordmark { font-family: "JB"; font-weight: 760; font-size: 200px; letter-spacing: -.04em; line-height: 1; display: flex; }
-.wordmark span { display: inline-block; }
-.bolt { position: absolute; left: 0; top: 0; }
-.bolt path { fill: none; stroke: var(--y); stroke-width: 4; stroke-linejoin: round; filter: drop-shadow(0 0 10px rgba(250,204,21,.8)); }
-.tagline { font-size: 50px; font-weight: 600; letter-spacing: -.015em; text-align: center; line-height: 1.25; }
-
-/* ---------- problem ---------- */
-.pgrid { position: absolute; left: 160px; right: 160px; top: 380px; display: grid; grid-template-columns: 1fr 1fr; gap: 34px; }
-.pcard { height: 270px; padding: 36px 40px; position: relative; overflow: hidden; }
-.pcard .t { font-size: 38px; font-weight: 700; letter-spacing: -.01em; }
-.pcard .s { font-size: 25px; color: var(--muted); margin-top: 10px; }
-.pcard .viz { position: absolute; left: 40px; right: 40px; bottom: 34px; font-family: "JB"; font-size: 24px; }
-.pcard .num { position: absolute; right: 40px; top: 30px; font-family: "JB"; color: var(--dim); font-size: 22px; }
-.bar { height: 16px; border-radius: 8px; background: #26251f; overflow: hidden; }
-.bar > i { display: block; height: 100%; background: var(--y); transform-origin: left; }
-
-/* ---------- boundary ---------- */
-.node { position: absolute; padding: 22px 26px; }
-.node .lbl { font-family: "JB"; font-size: 18px; letter-spacing: .14em; text-transform: uppercase; color: var(--dim); margin-bottom: 10px; }
-.node .ttl { font-size: 32px; font-weight: 700; }
-.wbox { position: absolute; width: 300px; height: 94px; display: flex; align-items: center; gap: 18px; padding: 0 26px; font-size: 30px; font-weight: 650; }
-.wbox .ic { width: 46px; height: 46px; border-radius: 12px; display: grid; place-items: center; font-family: "JB"; font-size: 22px; color: #111; background: var(--sage); font-weight: 800; }
-.packet { position: absolute; left: 0; top: 0; width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%; background: var(--y);
-  box-shadow: 0 0 16px 4px rgba(250,204,21,.7); offset-rotate: 0deg; }
-.packet.back { background: var(--sage); box-shadow: 0 0 16px 4px rgba(201,218,138,.6); }
-.logrow { display: grid; grid-template-columns: 48px 100px 1fr 150px; font-family: "JB"; font-size: 21px; white-space: nowrap; padding: 11px 22px; border-top: 1px solid var(--line); }
-.logrow .k { color: var(--y); } .logrow .ok { color: var(--sage); text-align: right; }
-
-/* ---------- code ---------- */
-.editor { position: absolute; left: 130px; top: 260px; width: 1060px; height: 560px; overflow: hidden; }
-.tabbar { height: 62px; border-bottom: 1.5px solid var(--line); display: flex; align-items: center; gap: 12px; padding: 0 24px; font-family: "JB"; font-size: 20px; color: var(--muted); }
-.dot3 { width: 14px; height: 14px; border-radius: 50%; background: #3a3934; }
-.code { padding: 30px 34px; font-family: "JB"; font-size: 27px; line-height: 1.72; white-space: pre; }
-.code .ln { display: block; position: relative; padding: 0 10px; margin: 0 -10px; border-radius: 8px; }
-.tk-k { color: #C792EA; } .tk-s { color: var(--sage); } .tk-f { color: var(--y); } .tk-c { color: var(--dim); } .tk-t { color: var(--blue); }
-.safetag { position: absolute; right: 18px; top: 9px; line-height: 1.5; font-family: "JB"; font-size: 18px; color: #111; background: var(--y); padding: 3px 12px; border-radius: 6px; font-weight: 700; }
-
-/* ---------- arch ---------- */
-.layer { position: absolute; left: 150px; width: 1180px; }
-.layer .cap { font-family: "JB"; font-size: 18px; letter-spacing: .16em; text-transform: uppercase; color: var(--dim); margin-bottom: 14px; }
-.mods { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
-.mod { padding: 22px 24px; border-radius: 14px; background: var(--panel2); border: 1.5px solid var(--line); min-height: 128px; }
-.mod .mt { font-size: 27px; font-weight: 700; }
-.mod .md { font-family: "JB"; font-size: 18px; color: var(--muted); margin-top: 8px; line-height: 1.45; }
-.side { position: absolute; left: 1400px; width: 380px; display: flex; flex-direction: column; gap: 22px; }
-.stat { padding: 24px 28px; }
-.stat .v { font-family: "JB"; font-size: 54px; font-weight: 760; color: var(--y); letter-spacing: -.02em; }
-.stat .l { font-size: 22px; color: var(--muted); margin-top: 4px; }
-.arrowv { position: absolute; width: 3px; background: linear-gradient(var(--line2), var(--y)); transform-origin: top; }
-
-/* ---------- timelines (replay / resume / human) ---------- */
-.tl { position: absolute; left: 150px; right: 150px; }
-.tl .head { display: flex; align-items: baseline; gap: 22px; margin-bottom: 18px; }
-.tl .head .name { font-family: "JB"; font-size: 24px; letter-spacing: .12em; text-transform: uppercase; }
-.blocks { display: flex; gap: 14px; height: 110px; }
-.blk { flex: 1; border-radius: 12px; border: 1.5px solid var(--line); background: var(--panel); position: relative; overflow: hidden; padding: 18px 18px; font-family: "JB"; }
-.blk .bt { font-size: 22px; color: var(--text); position: relative; z-index: 2; }
-.blk .bs { font-size: 17px; color: var(--muted); margin-top: 8px; position: relative; z-index: 2; }
-.blk .fill { position: absolute; inset: 0; background: rgba(250,204,21,.16); border-right: 3px solid var(--y); transform-origin: left; }
-.blk.rp .fill { background: rgba(201,218,138,.16); border-right-color: var(--sage); }
-.meter { display: flex; gap: 40px; font-family: "JB"; font-size: 28px; margin-top: 20px; }
-.meter b { font-weight: 760; }
-
-/* ---------- compare ---------- */
-table.cmp { position: absolute; left: 110px; right: 110px; top: 250px; border-collapse: separate; border-spacing: 0; width: 1700px; }
-.cmp th, .cmp td { padding: 23px 24px; text-align: left; border-bottom: 1px solid var(--line); font-size: 25px; vertical-align: middle; }
-.cmp th { font-size: 28px; font-weight: 750; padding-bottom: 20px; vertical-align: bottom; }
-.cmp th small { display: block; font-family: "JB"; font-size: 17px; font-weight: 400; color: var(--dim); margin-top: 6px; letter-spacing: .04em; }
-.cmp td:first-child { color: var(--muted); font-size: 23px; width: 400px; }
-.cmp .c1 { color: var(--text); }
-.ok { color: var(--sage); font-weight: 700; } .no { color: var(--red); font-weight: 700; } .meh { color: #E5B567; font-weight: 700; }
-.colhl { position: absolute; border-radius: 18px; }
-
-/* ---------- features ---------- */
-.fgrid { position: absolute; left: 130px; right: 130px; top: 290px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 28px; }
-.ftile { height: 330px; padding: 32px 30px; position: relative; }
-.ftile .fi { font-family: "JB"; font-size: 40px; color: var(--y); height: 60px; }
-.ftile .ft { font-size: 31px; font-weight: 720; margin-top: 18px; letter-spacing: -.01em; }
-.ftile .fd { font-size: 22px; color: var(--muted); margin-top: 12px; line-height: 1.4; }
-.ftile .fc { position: absolute; left: 30px; bottom: 28px; font-family: "JB"; font-size: 18px; color: var(--sage); }
-
-/* ---------- terminals ---------- */
-.term { position: absolute; overflow: hidden; }
-.term .body { padding: 30px 36px; font-family: "JB"; font-size: 27px; line-height: 1.8; }
-.term .row { white-space: pre; }
-.prompt { color: var(--y); }
-.caret { display: inline-block; width: 14px; height: 30px; background: var(--y); vertical-align: -5px; margin-left: 4px; }
-
-/* ================= sales cut additions ================= */
-#cap { position: absolute; left: 50%; bottom: 46px; transform: translateX(-50%); width: max-content; max-width: 1500px; z-index: 7;
-  font-size: 36px; font-weight: 600; line-height: 1.3; text-align: center; color: #fff; letter-spacing: -.005em;
-  padding: 12px 30px; border-radius: 14px; background: rgba(8,8,7,.72); border: 1px solid rgba(255,255,255,.07); }
-#cap:empty { display: none; }
-.scene .inner { position: absolute; inset: 0; transform-origin: 50% 45%; }
-@keyframes redglow { to { border-color: var(--red); box-shadow: 0 0 0 2px var(--red), 0 0 60px rgba(239,111,94,.28); } }
-@keyframes sageglow { to { border-color: var(--sage); box-shadow: 0 0 0 2px var(--sage), 0 0 50px rgba(201,218,138,.22); } }
-@keyframes flash { 0% { opacity: 0; } 15% { opacity: .55; } 100% { opacity: 0; } }
-@keyframes sagefill { from { background: var(--panel); } to { background: rgba(201,218,138,.14); border-color: var(--sage); } }
-@keyframes yfill { from { background: var(--panel); } to { background: rgba(250,204,21,.12); border-color: var(--y); } }
-@keyframes press { 0% { transform: scale(1); } 40% { transform: scale(.94); } 100% { transform: scale(1); background: var(--sage); color: #111; border-color: var(--sage); } }
-@keyframes rise { from { opacity: 0; transform: translateY(60px) scale(.96); } to { opacity: 1; transform: none; } }
-@keyframes shrinkup { from { transform: none; } to { transform: translateY(-250px) scale(.42); } }
-
-.headline { font-size: 82px; font-weight: 780; letter-spacing: -.03em; line-height: 1.06; }
-.sub { font-size: 30px; color: var(--muted); }
-.lab { font-family: "JB"; font-size: 18px; letter-spacing: .16em; text-transform: uppercase; color: var(--dim); }
-.rowx { font-family: "JB"; font-size: 24px; padding: 16px 0; border-top: 1px solid var(--line); display: flex; gap: 16px; align-items: center; white-space: nowrap; }
-.rowx:first-of-type { border-top: 0; }
-.ic { width: 34px; text-align: center; font-weight: 800; }
-
-/* hook */
-.env { position: absolute; top: 430px; width: 700px; height: 410px; padding: 34px 40px; }
-.env .lab { margin-bottom: 18px; }
-.env .big { font-size: 44px; font-weight: 760; margin-bottom: 16px; letter-spacing: -.01em; }
-
-/* pain */
-.pgrid2 { position: absolute; left: 160px; right: 160px; top: 290px; display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }
-.pc { height: 268px; padding: 34px 40px; position: relative; overflow: hidden; }
-.pc .t { font-size: 40px; font-weight: 740; letter-spacing: -.015em; }
-.pc .s { font-size: 25px; color: var(--muted); margin-top: 10px; }
-.pc .viz { position: absolute; left: 40px; right: 40px; bottom: 34px; font-family: "JB"; font-size: 24px; }
-.pc .num { position: absolute; right: 40px; top: 32px; font-family: "JB"; color: var(--dim); font-size: 22px; }
-
-/* reveal diagram */
-.box { position: absolute; padding: 26px 30px; }
-.box .ttl { font-size: 34px; font-weight: 740; margin-top: 8px; letter-spacing: -.01em; }
-.box .ms { font-family: "JB"; font-size: 20px; color: var(--muted); margin-top: 10px; }
-.wb { position: absolute; left: 1430px; width: 360px; height: 92px; display: flex; align-items: center; gap: 18px; padding: 0 26px; font-size: 30px; font-weight: 680; }
-.wb .ico { width: 48px; height: 48px; border-radius: 12px; display: grid; place-items: center; font-family: "JB"; font-size: 20px; color: #111; background: var(--sage); font-weight: 800; }
-.wires path { fill: none; stroke: var(--line2); stroke-width: 3; }
-.log { position: absolute; left: 650px; top: 600px; width: 620px; padding: 18px 28px 8px; }
-.log .rowx { font-size: 22px; padding: 13px 0; }
-.rec { margin-left: auto; color: var(--sage); font-size: 19px; }
+/* windows */
+.win { position: absolute; border-radius: 22px; overflow: hidden;
+  background: linear-gradient(180deg, #15151a, #0f0f13); border: 1px solid rgba(255,255,255,.09);
+  box-shadow: 0 1px 0 rgba(255,255,255,.06) inset, 0 50px 140px rgba(0,0,0,.7), 0 0 0 1px rgba(0,0,0,.6); }
+.bar { height: 56px; display: flex; align-items: center; gap: 10px; padding: 0 22px; border-bottom: 1px solid var(--line);
+  font-family: "GeistMono"; font-size: 18px; color: var(--muted); background: rgba(255,255,255,.015); }
+.bar i { width: 13px; height: 13px; border-radius: 50%; background: #2c2c33; display: inline-block; }
+.bar i:nth-child(1) { background: #ff5f57aa; } .bar i:nth-child(2) { background: #febc2eaa; } .bar i:nth-child(3) { background: #28c840aa; }
+.bar .ttl { position: absolute; left: 0; right: 0; text-align: center; pointer-events: none; }
 
 /* code */
-.ed { position: absolute; left: 130px; top: 175px; width: 1250px; height: 755px; overflow: hidden; }
-.ed .code { white-space: normal; font-variant-ligatures: none; } .ed .code .ln { white-space: pre; min-height: 1.68em; }
-.ed .code { font-size: 27px; line-height: 1.68; padding: 26px 34px; }
-.cp { position: absolute; right: 16px; top: 7px; line-height: 1.45; font-family: "JB"; font-size: 17px; color: #111; background: var(--y); padding: 3px 12px; border-radius: 6px; font-weight: 800; letter-spacing: .02em; }
-.rside { position: absolute; left: 1420px; width: 400px; }
+.code { position: absolute; left: 0; right: 0; top: 56px; bottom: 0; overflow: hidden; }
+.codein { position: absolute; left: 0; right: 0; top: 0; padding: 26px 0; font-family: "GeistMono"; font-size: 25px; }
+.cl { position: relative; height: 42px; line-height: 42px; white-space: pre; padding-left: 92px; }
+.cl .gut { position: absolute; left: 0; width: 64px; text-align: right; color: #3c3b37; font-size: 20px; }
+.cl .ct { display: inline-block; white-space: pre; vertical-align: top; overflow: hidden; }
+.cl .hlb { position: absolute; left: 70px; right: 14px; top: 3px; bottom: 3px; border-radius: 8px; background: rgba(250,204,21,.10); box-shadow: inset 3px 0 0 var(--y); opacity: 0; }
+.cl .cpd { position: absolute; left: 74px; top: 15px; width: 12px; height: 12px; border-radius: 50%; background: var(--y); box-shadow: 0 0 14px 3px rgba(250,204,21,.7); opacity: 0; }
+.caret { position: absolute; width: 3px; height: 30px; background: var(--y); box-shadow: 0 0 10px rgba(250,204,21,.8); }
+.k { color: #F472B6; } .s { color: #A3E635; } .f { color: #FDE047; } .c { color: #55544e; } .n { color: #FDBA74; } .t { color: #7DD3FC; } .p { color: #d6d5cf; }
 
 /* terminal */
-.tm { position: absolute; overflow: hidden; }
-.tm .body { padding: 26px 34px; font-family: "JB"; font-size: 20.5px; line-height: 1.75; }
-.tm .row { white-space: pre; min-height: 1.75em; }
-.tm .cmd { color: var(--text); } .tm .cmd .prompt { color: var(--y); }
-.tm .out { color: var(--muted); }
-.tm .hlrow { margin: 4px -14px 0; padding: 4px 14px; border-radius: 8px; }
-.killed { color: var(--red); font-weight: 800; }
-.flashred { position: absolute; inset: 0; background: rgba(239,111,94,.5); opacity: 0; pointer-events: none; }
-.stats { position: absolute; left: 1420px; width: 380px; display: flex; flex-direction: column; gap: 22px; }
-.st { padding: 24px 28px; }
-.st .v { font-family: "JB"; font-size: 64px; font-weight: 780; letter-spacing: -.02em; line-height: 1; }
-.st .l { font-size: 22px; color: var(--muted); margin-top: 10px; }
+.term .tb { position: absolute; left: 0; right: 0; top: 56px; padding: 26px 32px; font-family: "GeistMono"; font-size: 23px; line-height: 1.75; }
+.tl { white-space: pre; position: relative; }
+.tl .ct { display: inline-block; white-space: pre; overflow: hidden; vertical-align: top; }
+.pr { color: var(--y); }
+.o { color: var(--muted); }
+.tag { display: inline-block; font-size: 16px; padding: 1px 10px; border-radius: 6px; margin-left: 12px; vertical-align: 3px; font-weight: 600; letter-spacing: .04em; }
+.tag.rp { color: #0b0b0b; background: var(--mint); }
+.tag.lv { color: #0b0b0b; background: var(--y); }
 
-/* human */
-.tl3 { position: absolute; left: 150px; right: 150px; top: 240px; display: flex; gap: 18px; }
-.tb { flex: 1; height: 128px; padding: 22px 26px; font-family: "JB"; border-radius: 14px; border: 1.5px solid var(--line); background: var(--panel); }
-.tb .a { font-size: 25px; } .tb .b { font-size: 19px; color: var(--muted); margin-top: 10px; }
-.disk { position: absolute; left: 150px; top: 430px; width: 790px; height: 410px; padding: 30px 36px; }
-.disk .f { font-family: "JB"; font-size: 23px; line-height: 1.9; white-space: pre; }
-.appr { position: absolute; left: 980px; top: 430px; width: 790px; height: 410px; padding: 30px 36px; }
-.btn { display: inline-block; padding: 16px 34px; border-radius: 12px; border: 2px solid var(--line2); font-size: 28px; font-weight: 700; margin-right: 16px; }
+/* chips, cards */
+.chip { display: inline-flex; align-items: center; gap: 12px; padding: 14px 24px; border-radius: 999px; font-family: "GeistMono"; font-size: 22px;
+  border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.04); color: var(--ink); }
+.chip b { color: var(--y); font-weight: 600; }
+.card { position: absolute; border-radius: 22px; background: linear-gradient(180deg, #17171c, #101014);
+  border: 1px solid rgba(255,255,255,.09); box-shadow: 0 1px 0 rgba(255,255,255,.06) inset, 0 40px 100px rgba(0,0,0,.6); }
+.callout { position: absolute; left: 1350px; width: 470px; padding: 26px 28px; }
+.callout .ic { width: 52px; height: 52px; border-radius: 14px; display: grid; place-items: center; font-family: "GeistMono"; font-weight: 700; font-size: 22px; color: #111; background: var(--y); }
+.callout .ct2 { font-size: 34px; font-weight: 750; letter-spacing: -.025em; margin-top: 16px; }
+.callout .cd { font-size: 22px; color: var(--muted); margin-top: 6px; line-height: 1.35; }
 
-/* stack */
-.chips { display: flex; flex-wrap: wrap; gap: 18px; justify-content: center; max-width: 1500px; }
-.chips .chip { font-size: 27px; padding: 16px 28px; }
+.btn { display: inline-block; padding: 16px 34px; border-radius: 14px; font-size: 26px; font-weight: 700; border: 1px solid rgba(255,255,255,.14); }
+.btn.yes { background: var(--ink); color: #111; border-color: var(--ink); }
 
-/* cta */
-.cmdbox { font-family: "JB"; font-size: 25px; padding: 24px 34px; border-radius: 16px; background: var(--panel); border: 1.5px solid var(--line2); white-space: nowrap; }
+/* trace */
+.node { position: absolute; width: 230px; margin-left: -115px; text-align: center; }
+.node .dot { width: 26px; height: 26px; border-radius: 50%; margin: 0 auto; background: var(--y); box-shadow: 0 0 0 6px rgba(250,204,21,.15), 0 0 24px rgba(250,204,21,.6); }
+.node .nl { font-family: "GeistMono"; font-size: 21px; margin-top: 18px; }
+.node .ns { font-family: "GeistMono"; font-size: 16px; color: var(--muted); margin-top: 4px; }
+
+/* features */
+.ft { position: absolute; width: 400px; height: 200px; padding: 30px 32px; }
+.ft .fi { font-family: "GeistMono"; font-size: 18px; color: var(--y); letter-spacing: .12em; }
+.ft .fn { font-size: 34px; font-weight: 760; letter-spacing: -.03em; margin-top: 18px; }
+.ft .fd { font-size: 21px; color: var(--muted); margin-top: 8px; }
+
+.wordmark { font-family: "GeistMono"; font-weight: 800; letter-spacing: -.06em; line-height: 1; }
+.bolt path { fill: none; stroke: var(--y); stroke-width: 5; stroke-linejoin: round; stroke-linecap: round; filter: drop-shadow(0 0 14px rgba(250,204,21,.9)); }
 </style></head>
 <body><div id="stage">
-<div class="bggrid"></div><div class="vignette"></div>
-<div class="chrome"><div class="brand"><b>◆</b> chidori</div><div id="sceneLabel"></div></div>
-<div id="progress"></div>
-<div id="cap"></div>
+<div id="bg"><div class="orb" id="o1"></div><div class="orb" id="o2"></div><div class="orb" id="o3"></div></div>
 
-<!-- ============ 1. HOOK ============ -->
-<section class="scene" data-scene="hook" data-label=""><div class="inner">
-  <div style="position:absolute; left:0; right:0; top:180px; text-align:center">
-    <div class="headline" data-a="fu:0+0:.55">Your AI agent nailed the demo.</div>
-    <div class="headline red" style="margin-top:14px; display:inline-block" data-a="fu:1+0:.35,glitch:1+0.35:.5">Then it hit production.</div>
+<!-- ===== HOOK ===== -->
+<section class="sc" id="hook"><div class="cam">
+  <div class="win will" id="hk-ed" style="left:410px; top:300px; width:1100px; height:560px">
+    <div class="bar"><i></i><i></i><i></i><span class="ttl">agent.ts</span></div>
+    <div class="abs mono" style="left:40px; top:96px; font-size:28px; color:#3c3b37">1</div>
+    <div class="caret" id="hk-caret" style="left:92px; top:92px"></div>
   </div>
-  <div class="panel env" style="left:230px" data-a="fu:0+0.25:.6">
-    <div class="lab">demo · laptop</div>
-    <div class="big sage">✓ 12 / 12 steps passed</div>
-    <div class="rowx"><span class="ic sage">✓</span>prompt · triage ticket</div>
-    <div class="rowx"><span class="ic sage">✓</span>tool · lookup_order</div>
-    <div class="rowx"><span class="ic sage">✓</span>tool · issue_refund</div>
+  <div class="abs h2 will" id="hk-0" style="left:0; right:0; top:150px; text-align:center">Let's build an agent.</div>
+  <div class="abs punch will" id="hk-1" style="left:0; right:0; top:440px; text-align:center; font-size:150px">That calls <span class="grad">tools.</span></div>
+  <div class="abs punch will" id="hk-2" style="left:0; right:0; top:440px; text-align:center; font-size:150px">Waits for a <span class="grad">human.</span></div>
+  <div class="abs punch will" id="hk-3" style="left:0; right:0; top:440px; text-align:center; font-size:150px">Survives a <span class="grad">crash.</span></div>
+  <div class="abs punch will" id="hk-4" style="left:0; right:0; top:440px; text-align:center; font-size:132px">Never does anything <span class="grad">twice.</span></div>
+  <div class="abs punch will" id="hk-5" style="left:0; right:0; top:440px; text-align:center; font-size:150px">In plain <span class="sky">TypeScript.</span></div>
+</div></section>
+
+<!-- ===== TITLE ===== -->
+<section class="sc" id="title"><div class="cam">
+  <svg class="bolt abs" width="1920" height="1080" style="left:0;top:0"><path id="tt-bolt" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"
+    d="M -40 640 L 470 640 L 520 600 L 590 680 L 660 590 L 710 640 L 1210 640 L 1260 604 L 1325 676 L 1395 596 L 1440 640 L 1960 640"/></svg>
+  <div class="abs wordmark will" id="tt-wm" style="left:0; right:0; top:330px; text-align:center; font-size:250px">chi<span class="y">d</span>ori</div>
+  <div class="abs will" id="tt-tag" style="left:0; right:0; top:730px; text-align:center; font-size:58px; font-weight:650; letter-spacing:-.03em">Agents you can <span class="grad">trust in production.</span></div>
+  <div class="abs mono will" id="tt-small" style="left:0; right:0; top:830px; text-align:center; font-size:22px; letter-spacing:.24em; color:var(--muted)">OPEN-SOURCE AGENT FRAMEWORK · TYPESCRIPT · RUST CORE</div>
+</div></section>
+
+<!-- ===== 01 INIT ===== -->
+<section class="sc" id="init"><div class="cam">
+  <div class="abs will" id="in-k" style="left:140px; top:300px"><span class="kick">01 · Start</span></div>
+  <div class="abs h1 will" id="in-h" style="left:140px; top:350px">One command.<br><span class="grad">Zero setup.</span></div>
+  <div class="abs will" id="in-chips" style="left:140px; top:660px; display:flex; gap:14px">
+    <span class="chip">one binary</span><span class="chip">no Node</span><span class="chip">no config</span>
   </div>
-  <div class="panel env" style="left:990px" data-a="fu:1+0:.4,redglow:1+0.2:.4,shake:1+0.35:.45">
-    <div class="lab">production · 3:12 AM</div>
-    <div class="big red">✗ run failed</div>
-    <div class="rowx red" data-a="fl:1+0.3:.3"><span class="ic">✗</span>worker crashed at step 7 of 12</div>
-    <div class="rowx red" data-a="fl:1+0.55:.3"><span class="ic">✗</span>can't reproduce yesterday's run</div>
-    <div class="rowx" style="color:#E5B567" data-a="fl:1+0.8:.3"><span class="ic">⏳</span>approval pending · process held</div>
+  <div class="win term will" id="in-term" style="left:1090px; top:330px; width:730px; height:380px">
+    <div class="bar"><i></i><i></i><i></i><span class="ttl">~/code</span></div>
+    <div class="tb" id="in-tb"></div>
   </div>
 </div></section>
 
-<!-- ============ 2. PAIN ============ -->
-<section class="scene" data-scene="pain" data-label="the problem"><div class="inner">
-  <div style="position:absolute; left:160px; top:170px;">
-    <div class="kicker" data-a="fi:0+0:.5">why production agents break</div>
+<!-- ===== 02 WRITE ===== -->
+<section class="sc" id="write"><div class="cam">
+  <div class="abs will" id="wr-k" style="left:110px; top:84px"><span class="kick">02 · Write</span></div>
+  <div class="abs h3 will" id="wr-h" style="left:110px; top:122px">Just TypeScript. <span class="muted">No graphs, no DSL.</span></div>
+  <div class="win will" id="wr-ed" style="left:110px; top:225px; width:1200px; height:790px">
+    <div class="bar"><i></i><i></i><i></i><span class="ttl">support-bot/agent.ts</span></div>
+    <div class="code"><div class="codein" id="wr-code"></div></div>
   </div>
-  <div class="pgrid2">
-    <div class="panel pc" data-a="fu:0+0:.45,redglow:0+1.9:.3">
-      <div class="num">01</div>
-      <div class="t">Crashes lose the run</div><div class="s">Hours of work, gone at step 7.</div>
-      <div class="viz"><div class="bar"><i data-a="grow:0+0.2:1.5,redden:0+1.8:.2" style="width:58%"></i></div>
-        <div class="red" style="margin-top:12px" data-a="pop:0+1.8:.3">✗ process killed · start over from step 1</div></div>
-    </div>
-    <div class="panel pc" data-a="fu:1+0:.45">
-      <div class="num">02</div>
-      <div class="t">Bugs you can't reproduce</div><div class="s">It failed once. Now it passes.</div>
-      <div class="viz"><span class="sage" data-a="fi:1+0.3:.2">run #1 ✓ &nbsp;</span><span class="sage" data-a="fi:1+0.55:.2">run #2 ✓ &nbsp;</span><span class="red" style="display:inline-block" data-a="pop:1+0.8:.3,glitch:1+1.1:.5">run #3 ✗ &nbsp;</span><span class="sage" data-a="fi:1+1.6:.2">run #4 ✓ &nbsp;?</span></div>
-    </div>
-    <div class="panel pc" data-a="fu:2+0:.45">
-      <div class="num">03</div>
-      <div class="t">Every retry re-bills tokens</div><div class="s">Debugging means paying again.</div>
-      <div class="viz" style="display:flex; justify-content:space-between; align-items:baseline"><span class="muted">tokens billed</span><span class="red" style="font-size:40px; font-weight:780" data-count="0,1284000,2,0.2,2.2,int">0</span></div>
-    </div>
-    <div class="panel pc" data-a="fu:3+0:.45">
-      <div class="num">04</div>
-      <div class="t">Approvals hold processes open</div><div class="s">Waiting on a human, burning a worker.</div>
-      <div class="viz" style="display:flex; justify-content:space-between; align-items:baseline"><span class="muted"><span class="y" data-loop="pulse:0:1.2" style="display:inline-block">●</span> process alive</span><span class="y" style="font-size:40px; font-weight:780" data-count="0,15153,3,0.2,3.4,hms">00:00:00</span></div>
-    </div>
+  <div class="card callout will" id="co-0" style="top:228px"><div class="ic">fn</div><div class="ct2">Typed tools</div><div class="cd">A function with a schema. No registry.</div></div>
+  <div class="card callout will" id="co-1" style="top:432px"><div class="ic">AI</div><div class="ct2">Any model</div><div class="cd">Anthropic, OpenAI, OpenRouter.</div></div>
+  <div class="card callout will" id="co-2" style="top:636px"><div class="ic">✋</div><div class="ct2">Human approval</div><div class="cd">One line pauses the run for a person.</div></div>
+  <div class="card callout will" id="co-3" style="top:840px"><div class="ic">⇄</div><div class="ct2">Recorded effects</div><div class="cd">Every fetch is journaled as it happens.</div></div>
+  <div class="abs will" id="wr-cp" style="left:1350px; top:420px; width:480px">
+    <div class="kick" style="color:var(--y)">● checkpoint</div>
+    <div style="font-size:58px; font-weight:800; letter-spacing:-.045em; line-height:1.02; margin-top:18px">Every <span class="mono y">await</span><br>is a durable<br>checkpoint.</div>
   </div>
 </div></section>
 
-<!-- ============ 3. REVEAL ============ -->
-<section class="scene" data-scene="reveal" data-label="the fix"><div class="inner">
-  <div class="center" style="gap: 34px" data-a="fo:1+0:.35">
-    <svg class="bolt" width="1920" height="1080" style="position:absolute;left:0;top:0"><path data-a="draw:0+0:1.0" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"
-      d="M -20 600 L 360 600 L 400 576 L 450 624 L 500 568 L 535 600 L 1385 600 L 1420 578 L 1465 622 L 1510 574 L 1540 600 L 1940 600"/></svg>
-    <div class="wordmark" style="margin-top:-60px">
-      <span data-a="fu:0+0.15:.45">c</span><span data-a="fu:0+0.21:.45">h</span><span data-a="fu:0+0.27:.45">i</span><span data-a="fu:0+0.33:.45" class="y">d</span><span data-a="fu:0+0.39:.45">o</span><span data-a="fu:0+0.45:.45">r</span><span data-a="fu:0+0.51:.45">i</span>
-    </div>
-    <div style="height:70px"></div>
-    <div class="tagline" data-a="fu:0+1.1:.55">Dependable agents, <span class="y">by default.</span></div>
+<!-- ===== 03 RUN ===== -->
+<section class="sc" id="run"><div class="cam">
+  <div class="abs will" id="rn-k" style="left:110px; top:84px"><span class="kick">03 · Run</span></div>
+  <div class="abs h3 will" id="rn-h" style="left:110px; top:122px">Run it. <span class="muted">Pause for a human, for seconds or days.</span></div>
+  <div class="win term will" id="rn-term" style="left:110px; top:240px; width:1030px; height:560px">
+    <div class="bar"><i></i><i></i><i></i><span class="ttl">support-bot</span></div>
+    <div class="tb" id="rn-tb"></div>
   </div>
-
-  <div data-a="fi:1+0.2:.4" style="position:absolute; inset:0; transform: translateY(40px)">
-    <div style="position:absolute; left:140px; top:140px"><div class="kicker">one boundary</div></div>
-    <svg class="wires" width="1920" height="1080" style="position:absolute;left:0;top:0">
-      <path d="M500 430 L650 430" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+0.4:.4"/>
-      <path d="M1210 380 C1330 380 1310 336 1430 336" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+0.7:.4"/>
-      <path d="M1210 430 L1430 446" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+0.8:.4"/>
-      <path d="M1210 480 C1330 480 1310 556 1430 556" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+0.9:.4"/>
-      <path d="M930 570 L930 600" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" data-a="draw:1+1.2:.3"/>
-    </svg>
-    <div class="panel box" style="left:140px; top:330px; width:360px; height:200px" data-a="fl:1+0.2:.45">
-      <div class="lab">your agent</div><div class="ttl">TypeScript</div><div class="ms">refund_agent.ts</div>
-    </div>
-    <div class="panel box" style="left:650px; top:290px; width:560px; height:280px" data-a="pop:1+0.3:.5,glow:1+0.9:.6">
-      <div class="lab">chidori runtime</div>
-      <div class="ttl">Every side effect is a<br><span class="y">recorded host call</span></div>
-      <div style="display:flex; gap:12px; margin-top:22px; flex-wrap:wrap">
-        <span class="chip" style="font-size:19px; padding:8px 16px">record</span><span class="chip" style="font-size:19px; padding:8px 16px">replay</span><span class="chip" style="font-size:19px; padding:8px 16px">pause</span><span class="chip" style="font-size:19px; padding:8px 16px">resume</span>
-      </div>
-    </div>
-    <div class="panel wb" style="top:290px" data-a="fr:1+0.6:.4"><span class="ico">AI</span>LLM calls</div>
-    <div class="panel wb" style="top:400px" data-a="fr:1+0.75:.4"><span class="ico">fn</span>Tool calls</div>
-    <div class="panel wb" style="top:510px" data-a="fr:1+0.9:.4"><span class="ico">⇄</span>HTTP requests</div>
-    <div class="packet" data-loop="travel:0:1.3" style="offset-path: path('M500 430 L650 430')" data-a="fi:1+0.9:.3"></div>
-    <div class="packet" data-loop="travel:0.3:1.6" style="offset-path: path('M1210 380 C1330 380 1310 336 1430 336')" data-a="fi:1+1.2:.3"></div>
-    <div class="packet back" data-loop="travel:0.9:1.6" style="offset-path: path('M1430 446 L1210 430')" data-a="fi:1+1.2:.3"></div>
-    <div class="packet" data-loop="travel:0.5:1.6" style="offset-path: path('M1210 480 C1330 480 1310 556 1430 556')" data-a="fi:1+1.2:.3"></div>
-    <div class="panel log" data-a="fu:1+1.3:.45">
-      <div class="lab" style="margin-bottom:6px">call log · records.jsonl</div>
-      <div class="rowx" data-a="fl:1+1.8:.3"><span class="y">#1</span>prompt&nbsp; <span class="muted">gpt-4o-mini</span><span class="rec">● recorded</span></div>
-      <div class="rowx" data-a="fl:1+2.6:.3"><span class="y">#2</span>tool&nbsp;&nbsp;&nbsp; <span class="muted">issue_refund</span><span class="rec">● recorded</span></div>
-      <div class="rowx" data-a="fl:1+3.4:.3"><span class="y">#3</span>http&nbsp;&nbsp;&nbsp; <span class="muted">GET /orders</span><span class="rec">● recorded</span></div>
-    </div>
+  <div class="card will" id="rn-card" style="left:1180px; top:330px; width:650px; padding:34px 36px">
+    <div style="display:flex; align-items:center; gap:14px"><span style="width:14px;height:14px;border-radius:50%;background:var(--y);box-shadow:0 0 14px var(--y)" id="rn-dot"></span>
+      <span class="mono muted" style="font-size:19px; letter-spacing:.12em" id="rn-state">SUPPORT-BOT · WAITING FOR YOU</span></div>
+    <div style="font-size:36px; font-weight:750; letter-spacing:-.025em; margin-top:22px">Send this reply?</div>
+    <div style="margin-top:18px; padding:20px 22px; border-radius:14px; background:rgba(255,255,255,.04); border:1px solid var(--line); font-size:25px; line-height:1.45; color:#d9d8d2">“Hi Sam, order #1007 shipped this morning and arrives Thursday.”</div>
+    <div style="margin-top:28px; display:flex; gap:14px"><span class="btn yes will" id="rn-yes">Yes, send</span><span class="btn">No</span></div>
   </div>
 </div></section>
 
-<!-- ============ 4. CODE ============ -->
-<section class="scene" data-scene="code" data-label="how it works"><div class="inner">
-  <div class="panel ed" data-a="fu:0+0:.5">
-    <div class="tabbar"><span class="dot3"></span><span class="dot3"></span><span class="dot3"></span><span style="margin-left:14px">refund_agent.ts</span></div>
-<div class="code"><span class="ln" data-a="type:0+0.3:.5"><span class="tk-k">import</span> { chidori, run, defineTool } <span class="tk-k">from</span> <span class="tk-s">"chidori:agent"</span>;</span>
-<span class="ln" data-a="type:0+0.6:.4"><span class="tk-k">const</span> issueRefund = <span class="tk-f">defineTool</span>({ <span class="tk-c">/* payments API */</span> });</span>
-<span class="ln"> </span>
-<span class="ln" data-a="type:0+0.9:.5"><span class="tk-f">run</span>(<span class="tk-k">async</span> (input: { order: <span class="tk-t">string</span>; complaint: <span class="tk-t">string</span> }) =&gt; {</span>
-<span class="ln" data-a="type:0+1.2:.4,hl:1+0:.3">  <span class="tk-k">const</span> decision = <span class="tk-k">await</span> chidori.<span class="tk-f">prompt</span>(<span class="cp" data-a="pop:1+0:.3">checkpoint</span></span>
-<span class="ln" data-a="type:0+1.5:.4">    <span class="tk-s">`Decide a refund for ${input.order}: ${input.complaint}`</span>);</span>
-<span class="ln"> </span>
-<span class="ln" data-a="type:0+1.8:.4,hl:1+0.25:.3">  <span class="tk-k">const</span> answer = <span class="tk-k">await</span> chidori.<span class="tk-f">input</span>(<span class="tk-s">`Approve? ${decision}`</span>, {<span class="cp" data-a="pop:1+0.25:.3">checkpoint</span></span>
-<span class="ln" data-a="type:0+2.1:.4">    type: <span class="tk-s">"approval"</span>, choices: [<span class="tk-s">"approve"</span>, <span class="tk-s">"deny"</span>] });</span>
-<span class="ln" data-a="type:0+2.4:.4">  <span class="tk-k">if</span> (answer !== <span class="tk-s">"approve"</span>) <span class="tk-k">return</span> { status: <span class="tk-s">"denied"</span> };</span>
-<span class="ln"> </span>
-<span class="ln" data-a="type:0+2.7:.3,hl:1+0.5:.3">  <span class="tk-k">return await</span> issueRefund.<span class="tk-f">run</span>(<span class="cp" data-a="pop:1+0.5:.3">checkpoint</span></span>
-<span class="ln" data-a="type:0+2.9:.3">    { order: input.order, cents: <span class="tk-t">4200</span> }, chidori);</span>
-<span class="ln" data-a="type:0+3.2:.2">});</span></div>
+<!-- ===== 04 RECOVER ===== -->
+<section class="sc" id="recover"><div class="cam">
+  <div class="abs will" id="rc-k" style="left:110px; top:84px"><span class="kick">04 · Recover</span></div>
+  <div class="abs h3 will" id="rc-h" style="left:110px; top:122px">Picks up exactly <span class="grad">where it stopped.</span></div>
+  <div class="win term will" id="rc-term" style="left:110px; top:240px; width:1700px; height:640px">
+    <div class="bar"><i></i><i></i><i></i><span class="ttl">prod-worker-2</span></div>
+    <div class="tb" id="rc-tb"></div>
   </div>
-  <div class="rside" style="top:230px">
-    <div class="lab" data-a="fi:0+0.4:.4">you write</div>
-    <div style="font-size:52px; font-weight:780; letter-spacing:-.02em; line-height:1.1; margin-top:14px" data-a="fu:0+0.4:.5">Plain async<br>TypeScript</div>
-    <div style="display:flex; flex-direction:column; gap:14px; margin-top:34px; align-items:flex-start">
-      <span class="chip strike" data-a="fl:0+2.0:.35">node graphs</span>
-      <span class="chip strike" data-a="fl:0+2.5:.35">workflow DSL</span>
+  <div class="abs will" id="rc-big" style="left:0; right:0; top:420px; text-align:center">
+    <div class="punch" style="font-size:150px">Server died <span class="red">mid-run?</span></div>
+  </div>
+  <div class="abs sub will" id="rc-sub" style="left:110px; top:910px; width:1700px">Finished steps replay from the journal. Side effects never fire twice.</div>
+</div></section>
+
+<!-- ===== 05 ITERATE ===== -->
+<section class="sc" id="iterate"><div class="cam">
+  <div class="abs will" id="it-k" style="left:110px; top:84px"><span class="kick">05 · Iterate</span></div>
+  <div class="abs h3 will" id="it-h" style="left:110px; top:122px">Edit. Save. <span class="grad">See it instantly.</span></div>
+  <div class="win will" id="it-ed" style="left:110px; top:230px; width:1700px; height:270px">
+    <div class="bar"><i></i><i></i><i></i><span class="ttl">agent.ts</span></div>
+    <div class="code"><div class="codein" id="it-code"></div></div>
+  </div>
+  <div class="win term will" id="it-term" style="left:110px; top:530px; width:1700px; height:300px">
+    <div class="bar"><i></i><i></i><i></i><span class="ttl">chidori dev</span></div>
+    <div class="tb" id="it-tb"></div>
+    <div class="abs will" id="it-badge" style="right:36px; width:640px; top:86px; padding:22px 24px; border-radius:16px; background:rgba(134,239,172,.08); border:1px solid rgba(134,239,172,.35)">
+      <div class="mono mint" style="font-size:22px">↻ saved · re-ran agent</div>
+      <div class="mono muted" style="font-size:19px; margin-top:8px">seq 1 changed · re-recorded live from there</div>
     </div>
-    <div style="margin-top:50px; font-size:34px; font-weight:700; line-height:1.25" data-a="fu:1+0.3:.5">Every <span class="mono y">await</span> is a<br>durable checkpoint.</div>
+  </div>
+  <div class="card will" id="it-trace" style="left:110px; top:380px; width:1700px; height:330px">
+    <div class="abs mono" style="left:34px; top:26px; font-size:19px; color:var(--muted); letter-spacing:.1em"><span class="y">$</span> chidori trace 7f3a9c21</div>
+    <div class="abs mono" style="right:34px; top:26px; font-size:19px; color:var(--muted); letter-spacing:.1em">EVERY STEP, RECORDED</div>
+    <div class="abs" id="it-line" style="left:170px; top:130px; height:3px; width:1360px; background:linear-gradient(90deg,var(--y),rgba(250,204,21,.25)); transform-origin:left"></div>
+    <div id="it-nodes"></div>
+    <div class="abs" id="it-head" style="top:96px; width:3px; height:72px; background:#fff; box-shadow:0 0 16px #fff; margin-left:-1px"></div>
+    <div class="abs will" id="it-tip" style="top:236px; padding:14px 20px; border-radius:12px; background:#1f1f25; border:1px solid rgba(255,255,255,.14); font-family:GeistMono; font-size:19px; white-space:nowrap">
+      <span class="y">seq 2</span> · tool:lookup_order · <span class="muted">{"id":"1007"}</span> → <span class="mint">{"status":"shipped"}</span></div>
   </div>
 </div></section>
 
-<!-- ============ 5. CRASH / RESUME ============ -->
-<section class="scene" data-scene="crash" data-label="crash recovery"><div class="inner">
-  <div class="panel tm" style="left:110px; top:190px; width:1270px; height:700px" data-a="fu:0+0:.45,shake:0+2.5:.45">
-    <div class="tabbar"><span class="dot3"></span><span class="dot3"></span><span class="dot3"></span><span style="margin-left:14px">terminal · real chidori 3.8.1 output</span></div>
-    <div class="body">
-      <div class="row cmd" data-a="type:0+0.1:.6"><span class="prompt">$ </span>chidori run refund_agent.ts -i order=A-1007 --trusted</div>
-      <div class="row out" data-a="fi:0+0.8:.1">Run id: a3892d77-9c0f-4ffb-a8ad-f7da5453613d</div>
-      <div class="row out" data-a="fi:0+1.1:.1">seq 1: prompt started (gpt-4o-mini)</div>
-      <div class="row out" data-a="fi:0+1.5:.1">seq 1: prompt finished (0.0s)</div>
-      <div class="row text" data-a="fi:0+1.9:.1">Approve? Refund $42.00. Damaged on arrival, inside the 30-day window.</div>
-      <div class="row killed" data-a="pop:0+2.5:.25">Killed  ✗ process died mid-run</div>
-      <div class="row"> </div>
-      <div class="row cmd" data-a="type:1+0:.7"><span class="prompt">$ </span>chidori resume refund_agent.ts a3892d77-9c0f-4ffb-a8ad-f7da5453613d --trusted</div>
-      <div class="row text" data-a="fi:1+1.0:.1">Approve? Refund $42.00. Damaged on arrival, inside the 30-day window. <span class="y">approve</span></div>
-      <div class="row out" data-a="fi:1+1.6:.1">"refund": { "refundId": "re_1007", "status": "succeeded" }</div>
-      <div class="row sage hlrow" data-a="fi:1+2.3:.15,hl:1+2.5:.4">Resumed from a3892d77-9c0f-4ffb-a8ad-f7da5453613d</div>
-      <div class="row sage hlrow" data-a="fi:1+2.3:.15,hl:1+2.5:.4">(1 recorded calls replayed, 2 executed live)</div>
-    </div>
-    <div class="flashred" data-a="flash:0+2.5:.6"></div>
+<!-- ===== 06 SHIP ===== -->
+<section class="sc" id="ship"><div class="cam">
+  <div class="abs will" id="sh-k" style="left:110px; top:84px"><span class="kick">06 · Ship</span></div>
+  <div class="abs h3 will" id="sh-h" style="left:110px; top:122px">Lock it in as a test. <span class="muted">Serve it as an API.</span></div>
+  <div class="win term will" id="sh-term" style="left:110px; top:240px; width:1130px; height:400px">
+    <div class="bar"><i></i><i></i><i></i><span class="ttl">support-bot</span></div>
+    <div class="tb" id="sh-tb" style="font-size:21px"></div>
   </div>
-  <div class="stats" style="top:220px">
-    <div class="panel st" data-a="fr:1+2.4:.4,sageglow:1+2.8:.4"><div class="v sage">0</div><div class="l">model calls re-billed</div></div>
-    <div class="panel st" data-a="fr:1+2.7:.4"><div class="v">1</div><div class="l">refund issued, exactly once</div></div>
-    <div class="panel st" data-a="fr:1+3.0:.4"><div class="v">0</div><div class="l">steps redone</div></div>
+  <div class="card will" id="sh-ci" style="left:1290px; top:240px; width:520px; height:400px; padding:30px 32px">
+    <div class="mono muted" style="font-size:18px; letter-spacing:.14em">CI · PULL REQUEST #42</div>
+    <div style="margin-top:26px; display:flex; flex-direction:column; gap:18px">
+      <div class="mono" style="font-size:22px; display:flex; gap:14px"><span class="mint">✓</span>build</div>
+      <div class="mono" style="font-size:22px; display:flex; gap:14px"><span class="mint">✓</span>unit tests</div>
+      <div class="mono will" id="sh-row" style="font-size:22px; display:flex; gap:14px; padding:14px 16px; margin:0 -16px; border-radius:12px"><span id="sh-ic" class="muted">◌</span>agent replay · verify</div>
+    </div>
+    <div class="will" id="sh-pass" style="margin-top:34px; font-size:44px; font-weight:800; letter-spacing:-.03em" ><span class="mint">All checks passed</span></div>
+  </div>
+  <div class="win term will" id="sh-term2" style="left:110px; top:690px; width:1130px; height:200px">
+    <div class="bar"><i></i><i></i><i></i><span class="ttl">deploy</span></div>
+    <div class="tb" id="sh-tb2"></div>
+  </div>
+  <div class="abs" id="sh-chips" style="left:1290px; top:700px; width:540px; display:flex; flex-wrap:wrap; gap:14px">
+    <span class="chip will"><b>→</b> HTTP API</span><span class="chip will"><b>TS</b> SDK</span><span class="chip will"><b>Py</b> SDK</span>
   </div>
 </div></section>
 
-<!-- ============ 6. HUMAN ============ -->
-<section class="scene" data-scene="human" data-label="human in the loop"><div class="inner">
-  <div class="tl3">
-    <div class="tb" data-a="fu:0+0:.4,sagefill:0+0.2:.3"><div class="a">#1 prompt <span class="sage">✓</span></div><div class="b">recorded</div></div>
-    <div class="tb" data-a="fu:0+0.15:.4,yfill:0+0.6:.3,sagefill:1+1.6:.3"><div class="a">#2 input <span class="y">⏸</span></div><div class="b">waiting for approval</div></div>
-    <div class="tb" data-a="fu:0+0.3:.4,sagefill:1+2.4:.3"><div class="a">#3 issue_refund</div><div class="b" data-a="fi:1+2.4:.3">✓ executed once</div></div>
-  </div>
-  <div class="panel disk" data-a="fu:0+0.8:.5">
-    <div class="lab">saved to disk</div>
-<div class="f" style="margin-top:16px"><span class="y">.chidori/runs/a3892d77…/</span>
-  ├─ records.jsonl
-  ├─ pending.json   <span class="y">← waiting here</span>
-  └─ runtime.snapshot</div>
-    <div class="rowx" style="margin-top:24px; border-top:1px solid var(--line)" data-a="fi:0+2.0:.4"><span class="ic sage">●</span>live process held open: <b class="sage">none</b></div>
-  </div>
-  <div class="panel appr" data-a="fu:0+1.2:.5">
-    <div class="lab">approval request</div>
-    <div style="font-size:31px; font-weight:650; margin-top:18px; line-height:1.35">Approve? Refund $42.00. Damaged on arrival, inside the 30-day window.</div>
-    <div style="margin-top:34px"><span class="btn" data-a="press:1+1.2:.4">Approve</span><span class="btn muted">Deny</span></div>
-    <div class="mono muted" style="margin-top:28px; font-size:22px"><span data-a="fo:1+0:.2">Monday 9:14 AM</span><span class="y" style="position:relative; left:-190px" data-a="fi:1+0.1:.2">Wednesday 4:02 PM · 2 days later</span></div>
-  </div>
+<!-- ===== FEATURES ===== -->
+<section class="sc" id="features"><div class="cam">
+  <div class="abs h2 will" id="ft-h" style="left:0; right:0; top:110px; text-align:center">Everything production agents <span class="grad">need.</span></div>
+  <div id="ft-grid"></div>
 </div></section>
 
-<!-- ============ 7. TEST ============ -->
-<section class="scene" data-scene="test" data-label="regression tests"><div class="inner">
-  <div class="panel tm" style="left:120px; top:190px; width:1680px; height:400px" data-a="fu:0+0:.45">
-    <div class="tabbar"><span class="dot3"></span><span class="dot3"></span><span class="dot3"></span><span style="margin-left:14px">terminal · real chidori 3.8.1 output</span></div>
-    <div class="body" style="font-size:22px">
-      <div class="row cmd" data-a="type:0+0.2:.6"><span class="prompt">$ </span>chidori export a3892d77-9c0f-4ffb-a8ad-f7da5453613d --fixture tests/fixtures</div>
-      <div class="row out" data-a="fi:0+0.9:.1">exported fixture: 2.1 KB (run dir was 5.9 KB)</div>
-      <div class="row cmd" data-a="type:0+1.3:.3"><span class="prompt">$ </span>git add tests/fixtures</div>
-      <div class="row cmd" data-a="type:1+0:.6"><span class="prompt">$ </span>chidori verify refund_agent.ts a3892d77-9c0f-4ffb-a8ad-f7da5453613d --runs-dir tests/fixtures</div>
-      <div class="row sage hlrow" data-a="fi:1+0.9:.1,hl:1+1.0:.4">verified: 3 calls replayed, 0 workspace re-materialization(s), output identical — $0</div>
-    </div>
+<!-- ===== END ===== -->
+<section class="sc" id="end"><div class="cam">
+  <svg class="bolt abs" width="1920" height="1080" style="left:0;top:0"><path id="en-bolt" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"
+    d="M -40 470 L 520 470 L 566 436 L 626 504 L 690 428 L 734 470 L 1186 470 L 1230 436 L 1290 504 L 1354 428 L 1400 470 L 1960 470"/></svg>
+  <div class="abs wordmark will" id="en-wm" style="left:0; right:0; top:230px; text-align:center; font-size:180px">chi<span class="y">d</span>ori</div>
+  <div class="abs will" id="en-tag" style="left:0; right:0; top:530px; text-align:center; font-size:76px; font-weight:800; letter-spacing:-.045em">Build agents you can <span class="grad">trust.</span></div>
+  <div class="abs will" id="en-cmd" style="left:0; right:0; top:680px; text-align:center">
+    <span class="mono" style="display:inline-block; font-size:25px; padding:22px 32px; border-radius:16px; background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.12)"><span class="y">$</span> curl -fsSL https://raw.githubusercontent.com/ThousandBirdsInc/chidori/main/scripts/install.sh | sh</span>
   </div>
-  <div style="position:absolute; left:120px; right:120px; top:630px; display:grid; grid-template-columns: 1.3fr 1fr 1fr 1fr; gap:24px">
-    <div class="panel st" data-a="fu:1+1.2:.4,sageglow:1+1.6:.4"><div class="v sage" style="font-size:48px">✓ passed</div><div class="l">CI · agent regression test</div></div>
-    <div class="panel st" data-a="fu:1+1.4:.4"><div class="v"><span data-count="0,40,1,1.4,1.0,int">0</span><span style="font-size:36px"> ms</span></div><div class="l">to replay the run</div></div>
-    <div class="panel st" data-a="fu:1+1.6:.4"><div class="v">0</div><div class="l">model calls</div></div>
-    <div class="panel st" data-a="fu:1+1.8:.4"><div class="v y">$0</div><div class="l">per test run</div></div>
-  </div>
+  <div class="abs mono will" id="en-gh" style="left:0; right:0; top:800px; text-align:center; font-size:36px">github.com/ThousandBirdsInc/<span class="y">chidori</span></div>
+  <div class="abs mono will" id="en-foot" style="left:0; right:0; top:880px; text-align:center; font-size:20px; letter-spacing:.22em; color:var(--muted)">OPEN SOURCE · APACHE-2.0 · ONE RUST BINARY · ANY MODEL</div>
 </div></section>
 
-<!-- ============ 8. STACK ============ -->
-<section class="scene" data-scene="stack" data-label="under the hood"><div class="inner">
-  <div class="center" style="gap:44px; top:-10px">
-    <div class="kicker" data-a="fi:0+0:.4">drop-in, no infrastructure</div>
-    <div class="headline" style="text-align:center" data-a="fu:0+0:.5">One Rust binary.<br><span class="y">Your choice of model.</span></div>
-    <div class="chips">
-      <span class="chip" data-a="pop:0+0.9:.35">No Node · no V8</span>
-      <span class="chip" data-a="pop:0+1.1:.35">TypeScript + Python SDKs</span>
-      <span class="chip" data-a="pop:0+1.3:.35">OpenTelemetry traces</span>
-    </div>
-    <div class="chips">
-      <span class="chip y" data-a="pop:0+2.4:.35">Anthropic</span>
-      <span class="chip y" data-a="pop:0+2.6:.35">OpenAI</span>
-      <span class="chip y" data-a="pop:0+2.8:.35">OpenRouter</span>
-      <span class="chip y" data-a="pop:0+3.0:.35">Any OpenAI-compatible endpoint</span>
-    </div>
-    <div class="chips">
-      <span class="chip sage" data-a="pop:0+5.0:.4">Open source · Apache-2.0</span>
-    </div>
-  </div>
-</div></section>
-
-<!-- ============ 9. CTA ============ -->
-<section class="scene" data-scene="cta" data-label=""><div class="inner">
-  <svg class="bolt" width="1920" height="1080" style="position:absolute;left:0;top:0"><path data-a="draw:0+0:1.0" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"
-    d="M -20 404 L 520 404 L 556 386 L 600 422 L 646 380 L 676 404 L 1244 404 L 1274 386 L 1318 422 L 1364 380 L 1400 404 L 1940 404"/></svg>
-  <div class="center" style="gap:30px; top:-40px">
-    <div class="wordmark" style="font-size:150px">
-      <span data-a="fu:0+0.1:.45">c</span><span data-a="fu:0+0.16:.45">h</span><span data-a="fu:0+0.22:.45">i</span><span data-a="fu:0+0.28:.45" class="y">d</span><span data-a="fu:0+0.34:.45">o</span><span data-a="fu:0+0.4:.45">r</span><span data-a="fu:0+0.46:.45">i</span>
-    </div>
-    <div class="headline" style="font-size:72px; margin-top:44px" data-a="fu:0+0.9:.5">Ship agents you can <span class="y">trust.</span></div>
-    <div class="cmdbox" style="margin-top:30px" data-a="fu:1+0:.5"><span class="y">$ </span>curl -fsSL https://raw.githubusercontent.com/ThousandBirdsInc/chidori/main/scripts/install.sh | sh</div>
-    <div class="mono" style="font-size:34px; margin-top:6px" data-a="fu:1+0.4:.5"><span class="y">★</span> github.com/ThousandBirdsInc/chidori</div>
-    <div class="lab" style="margin-top:14px; font-size:22px" data-a="fi:1+1.0:.6">checkpoint · replay · resume</div>
-  </div>
-</div></section>
+<div id="redflash"></div><div id="flash"></div><div id="vig"></div><div id="grain"></div>
+</div>
 
 <script>
-// Driven entirely by setTime(t): every CSS animation is paused and scrubbed to an exact time.
-const T = window.TIMINGS;
-const byId = Object.fromEntries(T.scenes.map(s => [s.id, s]));
-const scenes = [...document.querySelectorAll('.scene')].map(el => ({ el, s: byId[el.dataset.scene], inner: el.querySelector('.inner') }));
-const EASE = { grow: 'cubic-bezier(.4,0,.2,1)', type: 'steps(30,end)', travel: 'linear', blink: 'step-end', shake: 'linear', glitch: 'linear', flash: 'ease-out' };
-const OUT = new Set(['fo', 'dimto']);
-const absT = (s, spec) => { const [c, o] = spec.split('+'); return s.start + s.cues[+c].t + (+o || 0); };
-for (const { el, s } of scenes) {
-  el.querySelectorAll('[data-a]').forEach(n => {
-    n.style.animation = n.dataset.a.split(',').map(part => {
-      const [name, at, d] = part.split(':');
-      return `${name} ${d}s ${EASE[name] || 'cubic-bezier(.2,.7,.2,1)'} ${absT(s, at).toFixed(3)}s 1 ${OUT.has(name) ? 'forwards' : 'both'}`;
-    }).join(',');
-  });
-  el.querySelectorAll('[data-count]').forEach(n => {
-    const [from, to, c, o, d, fmt] = n.dataset.count.split(',');
-    n._count = { from: +from, to: +to, at: absT(s, c + '+' + o), d: +d, fmt };
+const TL = window.TL;
+const $ = id => document.getElementById(id);
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const E = {
+  lin: t => t,
+  out: t => 1 - Math.pow(1 - t, 3),
+  expo: t => t >= 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inout: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  back: t => { const c1 = 1.5, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const pr = (t, a, d, e = E.expo) => e(clamp((t - a) / d));
+const mix = (a, b, k) => a + (b - a) * k;
+function st(el, o) {
+  const { op = 1, x = 0, y = 0, s = 1, rx = 0, ry = 0, rz = 0, b = 0 } = o;
+  el.style.opacity = op;
+  el.style.transform = `translate3d(${x}px,${y}px,0) rotateX(${rx}deg) rotateY(${ry}deg) rotate(${rz}deg) scale(${s})`;
+  el.style.filter = b > 0.05 ? `blur(${b.toFixed(2)}px)` : 'none';
+}
+// standard reveal / hide: rise + unblur in, blur out
+function rv(el, t, a, d = .7, o = {}) {
+  const k = pr(t, a, d), { dy = 50, out = 1e9, od = .35, s0 = 1, ds = 0 } = o;
+  const ko = pr(t, out, od, E.out);
+  st(el, { op: k * (1 - ko), y: (1 - k) * dy - ko * 20, b: (1 - k) * 14 + ko * 12, s: mix(s0, 1, k) + ds });
+}
+// punch: big word slam (scale down from 1.25 with blur), cut out at out
+function punch(el, t, a, out) {
+  const k = pr(t, a, .45), ko = pr(t, out - .12, .12, E.lin);
+  st(el, { op: k * (1 - ko), s: mix(1.22, 1, k) + (t - a) * 0.025, b: (1 - k) * 18 + ko * 10 });
+}
+function words(el) { // split text nodes into word spans once
+  if (el._w) return el._w;
+  const walk = n => { [...n.childNodes].forEach(c => {
+    if (c.nodeType === 3) { const frag = document.createDocumentFragment();
+      c.textContent.split(/(\s+)/).forEach(p => { if (!p) return; if (/^\s+$/.test(p)) { frag.appendChild(document.createTextNode(p)); return; }
+        const s = document.createElement('span'); s.className = 'w'; s.textContent = p; frag.appendChild(s); });
+      c.replaceWith(frag);
+    } else if (c.nodeType === 1 && !c.classList.contains('w')) { if (c.classList.contains('grad')) { c.classList.add('w'); } else walk(c); } }); };
+  walk(el); el._w = [...el.querySelectorAll('.w')]; el.style.opacity = 1; return el._w;
+}
+function wordsIn(el, t, a, stag = .07, d = .55, out = 1e9) {
+  const ws = words(el); const ko = pr(t, out, .3, E.out);
+  el.style.opacity = 1 - ko; el.style.filter = ko > .02 ? `blur(${ko * 12}px)` : 'none';
+  ws.forEach((w, i) => { const k = pr(t, a + i * stag, d); st(w, { op: k, y: (1 - k) * 40, b: (1 - k) * 10 }); });
+}
+
+/* ---------- tiny TS highlighter ---------- */
+const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function hl(src) {
+  const re = /(\/\/.*$)|(`[^`]*`|"[^"]*"|'[^']*')|\b(import|from|const|let|async|await|return|if|else|new|type|export)\b|\b(\d+)\b|([A-Za-z_$][\w$]*)(?=\s*\()|\b(string|number|boolean)\b/g;
+  let out = '', last = 0, m;
+  while ((m = re.exec(src))) {
+    out += esc(src.slice(last, m.index));
+    const cls = m[1] ? 'c' : m[2] ? 's' : m[3] ? 'k' : m[4] ? 'n' : m[5] ? 'f' : 't';
+    out += `<span class="${cls}">${esc(m[0])}</span>`; last = re.lastIndex;
+  }
+  return out + esc(src.slice(last));
+}
+const CH = 15.0; // GeistMono advance at 25px ≈ 0.6em
+function buildCode(host, lines, startNo = 1) {
+  host.innerHTML = '';
+  return lines.map((src, i) => {
+    const d = document.createElement('div'); d.className = 'cl';
+    d.innerHTML = `<div class="hlb"></div><div class="cpd"></div><span class="gut">${i + startNo}</span><span class="ct">${hl(src) || ' '}</span>`;
+    host.appendChild(d); return { el: d, ct: d.querySelector('.ct'), hlb: d.querySelector('.hlb'), cpd: d.querySelector('.cpd'), len: src.length, src };
   });
 }
-// data-loop elements may also carry data-a (fade in); loop keeps its own infinite animation appended.
-document.querySelectorAll('[data-loop]').forEach(n => {
-  const [name, off, d] = n.dataset.loop.split(':');
-  const loop = `${name} ${d}s ${EASE[name] || 'ease-in-out'} ${-off}s infinite`;
-  n.style.animation = n.style.animation ? n.style.animation + ',' + loop : loop;
+function typeLines(L, n, caret, x0 = 92, lh = 42, top = 26) { // reveal n chars across lines, place caret
+  let left = n, cur = 0;
+  L.forEach((l, i) => {
+    const show = clamp(left, 0, l.len); left -= l.len;
+    l.ct.style.width = (show * CH) + 'px';
+    l.el.style.visibility = (show > 0 || (i === 0)) ? 'visible' : 'hidden';
+    if (show > 0 || l.len === 0 && left >= 0) cur = i;
+    if (left >= 0 && l.len === 0) l.el.style.visibility = 'visible';
+    if (show > 0 && show < l.len) cur = i;
+  });
+  return cur;
+}
+
+/* ---------- code for 02 WRITE ---------- */
+const CODE = [
+  'import { chidori, run, defineTool } from "chidori:agent";',
+  '',
+  'const lookupOrder = defineTool({',
+  '  name: "lookup_order",',
+  '  description: "Fetch an order by id",',
+  '  parameters: { type: "object", properties: { id: { type: "string" } } },',
+  '  run: async ({ id }) => (await fetch(`${API}/orders/${id}`)).json(),',
+  '});',
+  '',
+  'run(async ({ ticket }: { ticket: string }) => {',
+  '  const reply = await chidori.prompt(`Resolve this ticket: ${ticket}`, {',
+  '    model: "claude-sonnet-4-6", tools: [lookupOrder], maxTurns: 6,',
+  '  });',
+  '',
+  '  const ok = await chidori.input("Send this reply?", {',
+  '    type: "approval", choices: ["yes", "no"], details: reply,',
+  '  });',
+  '',
+  '  if (ok === "yes") await fetch(`${API}/replies`, { method: "POST", body: reply });',
+  '  return { reply, sent: ok === "yes" };',
+  '});',
+];
+const WR = buildCode($('wr-code'), CODE);
+const wrCaret = document.createElement('div'); wrCaret.className = 'caret'; $('wr-code').appendChild(wrCaret);
+const totalChars = CODE.reduce((a, s) => a + Math.max(1, s.length), 0);
+// callouts: [callout id, line index to highlight, time]
+const CALL = [['co-0', 2, 18.6], ['co-1', 11, 20.9], ['co-2', 14, 23.2], ['co-3', 18, 25.6]];
+const AWAITS = [10, 14, 18];
+
+/* ---------- code for 05 ITERATE ---------- */
+const IT_BEFORE = '  const reply = await chidori.prompt(`Resolve this ticket: ${ticket}`, {';
+const IT_AFTER_INS = ' Be warm and brief.';
+const IT_LINES = [
+  'run(async ({ ticket }: { ticket: string }) => {',
+  IT_BEFORE,
+  '    model: "claude-sonnet-4-6", tools: [lookupOrder], maxTurns: 6,',
+  '  });',
+];
+const IT = buildCode($('it-code'), IT_LINES, 10);
+IT.forEach(l => { l.ct.style.width = 'auto'; });
+const itCaret = document.createElement('div'); itCaret.className = 'caret'; $('it-code').appendChild(itCaret);
+
+/* ---------- terminals ---------- */
+function buildTerm(host, rows) { // rows: {cmd?, html, at, d?}
+  host.innerHTML = '';
+  return rows.map(r => {
+    const d = document.createElement('div'); d.className = 'tl';
+    if (r.cmd) { d.innerHTML = `<span class="pr">$ </span><span class="ct">${esc(r.cmd)}</span>`; r.len = r.cmd.length; r.ct = d.querySelector('.ct'); }
+    else d.innerHTML = r.html;
+    host.appendChild(d); r.el = d; return r;
+  });
+}
+function termAt(rows, t, chw = 13.8) {
+  rows.forEach(r => {
+    const vis = t >= r.at; r.el.style.visibility = vis ? 'visible' : 'hidden';
+    if (r.out !== undefined) r.el.style.opacity = t >= r.out ? .25 : 1;
+    if (r.cmd) { const n = Math.round(r.len * clamp((t - r.at) / (r.d || .8))); r.ct.style.width = (n * chw) + 'px'; }
+    else if (vis) { const k = pr(t, r.at, .25, E.out); r.el.style.opacity = k * (r.out !== undefined && t >= r.out ? .25 : 1); r.el.style.transform = `translateX(${(1 - k) * -14}px)`; }
+  });
+}
+const RID = '7f3a9c21-4b8e-4d1a-9c3e-2f61d0b5a8e4';
+const INIT = buildTerm($('in-tb'), [
+  { cmd: 'chidori init support-bot --template worker', at: 12.4, d: .9 },
+  { html: `<span class="o">Scaffolding 'worker' template into support-bot</span>`, at: 13.55 },
+  { html: `<span class="o">  created </span>support-bot/agent.ts`, at: 13.75 },
+  { html: `<span class="o">  created </span>support-bot/README.md`, at: 13.95 },
+  { html: ` `, at: 14.0 },
+  { html: `<span class="o">Next:</span>`, at: 14.2 },
+  { html: `<span class="o">  cd support-bot</span>`, at: 14.35 },
+]);
+const RUN = buildTerm($('rn-tb'), [
+  { cmd: 'chidori run agent.ts -i ticket="Where is my order #1007?"', at: 30.4, d: 1.1 },
+  { html: `<span class="o">Run id: ${RID}</span>`, at: 31.7 },
+  { html: `<span class="o">seq 1:</span> prompt started <span class="o">(claude-sonnet-4-6)</span>`, at: 32.1 },
+  { html: `<span class="o">seq 2:</span> tool:lookup_order <span class="o">{"id":"1007"}</span>`, at: 32.6 },
+  { html: `<span class="o">seq 1:</span> prompt finished <span class="o">(2.4s)</span>`, at: 33.1 },
+  { html: ` `, at: 33.2 },
+  { html: `<span class="y">Send this reply?</span> <span class="o">[yes/no]</span>`, at: 33.7 },
+  { html: `<span class="o">⏸ paused · run saved to .chidori/runs/7f3a9c21…</span>`, at: 34.1 },
+  { html: `<span class="mint">yes</span>`, at: 36.9 },
+  { html: `<span class="mint">✓</span> reply sent · run complete`, at: 37.3 },
+]);
+const RID2 = 'b41e07d2-93a1-4c5e-8f20-6d7c3a9e1b54';
+const REC = buildTerm($('rc-tb'), [
+  { html: `<span class="o">seq 1:</span> prompt finished <span class="o">(2.1s)</span>`, at: 38.0 },
+  { html: `<span class="o">seq 3:</span> input · approval <span class="o">→ yes</span>`, at: 38.35 },
+  { html: `<span class="o">seq 4:</span> fetch <span class="o">POST /replies …</span>`, at: 38.7 },
+  { html: `<span class="red" style="font-weight:700">Killed</span>  <span class="o">worker lost · exit 137</span>`, at: 39.02 },
+  { html: ` `, at: 39.05 },
+  { cmd: `chidori resume agent.ts ${RID2}`, at: 40.8, d: .8 },
+  { html: `<span class="o">seq 1:</span> prompt <span class="tag rp">REPLAYED</span>  <span class="o">model not called again</span>`, at: 42.0 },
+  { html: `<span class="o">seq 2:</span> tool:lookup_order <span class="tag rp">REPLAYED</span>`, at: 42.2 },
+  { html: `<span class="o">seq 3:</span> input · approval <span class="tag rp">REPLAYED</span>  <span class="o">approval kept</span>`, at: 42.4 },
+  { html: `<span class="o">seq 4:</span> fetch POST /replies <span class="tag lv">LIVE</span>`, at: 42.6 },
+  { html: `<span class="mint">Resumed from ${RID2.slice(0, 8)}… (3 recorded calls replayed, 1 executed live)</span>`, at: 43.2 },
+]);
+const ITT = buildTerm($('it-tb'), [
+  { cmd: 'chidori dev agent.ts', at: 46.4, d: .7 },
+  { html: `<span class="o">watching agent.ts</span>`, at: 47.3 },
+]);
+const SHIP = buildTerm($('sh-tb'), [
+  { cmd: `chidori export ${RID.slice(0, 8)} --fixture tests/fixtures`, at: 56.3, d: .8 },
+  { html: `<span class="o">exported fixture: 2.1 KB</span>`, at: 57.25 },
+  { cmd: `chidori verify agent.ts ${RID.slice(0, 8)} --runs-dir tests/fixtures`, at: 57.6, d: .7 },
+  { html: `<span class="mint">verified: 4 calls replayed, output identical</span>`, at: 58.35 },
+]);
+const SHIP2 = buildTerm($('sh-tb2'), [
+  { cmd: 'chidori serve agent.ts --port 8080', at: 59.0, d: .7 },
+  { html: `<span class="mint">●</span> <span class="o">listening on</span> http://localhost:8080`, at: 59.85 },
+]);
+
+/* ---------- trace nodes ---------- */
+const NODES = [['prompt', 'claude-sonnet'], ['tool', 'lookup_order'], ['input', 'approval'], ['fetch', 'POST /replies'], ['done', 'output']];
+const nodeEls = NODES.map(([a, b], i) => {
+  const d = document.createElement('div'); d.className = 'node will';
+  d.style.left = (170 + i * 340) + 'px'; d.style.top = '118px';
+  d.innerHTML = `<div class="dot"></div><div class="nl">${a}</div><div class="ns">${b}</div>`;
+  $('it-nodes').appendChild(d); return d;
 });
-const fmt = (v, f) => {
-  if (f === 'int') return Math.round(v).toLocaleString('en-US');
-  if (f === 'hms') { const x = Math.round(v); return [x / 3600 | 0, (x / 60 | 0) % 60, x % 60].map(n => String(n).padStart(2, '0')).join(':'); }
-  return String(v);
+
+/* ---------- features ---------- */
+const FEAT = [
+  ['01', 'Crash recovery', 'Resume any run in a new process'],
+  ['02', 'Human-in-the-loop', 'Pause to disk for approval'],
+  ['03', 'Exactly-once effects', 'Side effects never fire twice'],
+  ['04', 'Time-travel replay', 'Step through any past run'],
+  ['05', 'Edit and resume', 'Fix the code, keep the run'],
+  ['06', 'Branching runs', 'Fork and compare strategies'],
+  ['07', 'Supervised actors', 'Concurrent agents with restarts'],
+  ['08', 'Signals and webhooks', 'Wake agents from outside'],
+  ['09', 'Durable memory', 'Lessons that persist'],
+  ['10', 'Saga rollback', 'Compensations, in reverse'],
+  ['11', 'npm without Node', 'chidori add zod'],
+  ['12', 'OpenTelemetry', 'Traces that link to the run'],
+];
+const ftEls = FEAT.map(([n, a, b], i) => {
+  const d = document.createElement('div'); d.className = 'card ft will';
+  const col = i % 4, row = (i / 4) | 0;
+  d.style.left = (110 + col * 430) + 'px'; d.style.top = (300 + row * 230) + 'px';
+  d.innerHTML = `<div class="fi">${n}</div><div class="fn">${a}</div><div class="fd">${b}</div>`;
+  $('ft-grid').appendChild(d); return d;
+});
+
+/* ---------- grain ---------- */
+const grains = [...Array(6)].map(() => { const c = document.createElement('canvas'); c.width = c.height = 256; const g = c.getContext('2d');
+  const im = g.createImageData(256, 256); for (let i = 0; i < im.data.length; i += 4) { const v = Math.random() * 255; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; }
+  g.putImageData(im, 0, 0); return `url(${c.toDataURL()})`; });
+
+/* ---------- scenes ---------- */
+const SEC = TL.sections;
+const scenes = Object.entries(SEC).map(([id, [a, b]]) => ({ id, a, b, el: $(id), cam: $(id).querySelector('.cam') }));
+const inSec = (t, id) => t >= SEC[id][0] && t < SEC[id][1];
+
+const R = {
+  hook(t) {
+    // editor fades up, then recedes behind the punch lines
+    const e = $('hk-ed'), k = pr(t, .1, 1.2, E.out), back = pr(t, 1.9, .5, E.inout);
+    st(e, { op: k * (1 - .82 * back), y: (1 - k) * 80, rx: mix(22, 8, k), s: mix(.92, 1, k) - back * .08, b: back * 10 });
+    $('hk-caret').style.opacity = (Math.floor(t * 2.2) % 2 === 0) ? 1 : 0;
+    rv($('hk-0'), t, .3, .8, { out: 1.85 });
+    const P = [[2.0, 3.0], [3.0, 4.0], [4.0, 5.0], [5.0, 6.45], [6.5, 7.75]];
+    P.forEach(([a, b], i) => punch($('hk-' + (i + 1)), t, a, b));
+    const z = pr(t, 7.55, .45, E.inout);
+    st($('hk-5').parentElement, { s: 1 + z * .5, b: z * 6 });
+  },
+  title(t) {
+    const a = 8.0;
+    $('tt-bolt').style.strokeDashoffset = 1 - pr(t, a + .05, .55, E.out);
+    const k = pr(t, a, .6);
+    st($('tt-wm'), { op: k, s: mix(1.35, 1, k) + (t - a) * .012, b: (1 - k) * 22 });
+    wordsIn($('tt-tag'), t, a + 1.0, .08, .6);
+    rv($('tt-small'), t, a + 1.9, .7);
+  },
+  init(t) {
+    rv($('in-k'), t, 12.05, .5);
+    wordsIn($('in-h'), t, 12.1, .06, .6);
+    const ch = $('in-chips').children; [...ch].forEach((c, i) => rv(c, t, 13.0 + i * .14, .5, { dy: 30 }));
+    const k = pr(t, 12.1, .9);
+    st($('in-term'), { op: k, x: (1 - k) * 160, ry: mix(-28, -10, k) + (t - 12) * .6, b: (1 - k) * 10 });
+    termAt(INIT, t);
+  },
+  write(t) {
+    rv($('wr-k'), t, 16.05, .5); wordsIn($('wr-h'), t, 16.1, .05, .55);
+    const k = pr(t, 16.0, .9);
+    st($('wr-ed'), { op: k, y: (1 - k) * 120, rx: mix(14, 0, k), b: (1 - k) * 8 });
+    const n = totalChars * clamp((t - 16.6) / (25.4 - 16.6));
+    const cur = typeLines(WR, n, wrCaret);
+    // scroll to keep caret in view (16 visible lines)
+    const scroll = Math.max(0, cur - 14) * 42;
+    const codein = $('wr-code'); codein.style.transform = `translateY(${-scroll}px)`;
+    let left = n, cx = 0; for (let i = 0; i <= cur; i++) { const l = Math.max(1, WR[i].len); if (i < cur) left -= l; }
+    cx = clamp(left, 0, WR[cur].len);
+    wrCaret.style.left = (92 + cx * CH + 2) + 'px'; wrCaret.style.top = (26 + cur * 42 + 6) + 'px';
+    wrCaret.style.opacity = t > 25.6 ? ((Math.floor(t * 2.2) % 2) ? 0 : 1) * (1 - pr(t, 26.6, .3)) : 1;
+    // callouts + highlight
+    CALL.forEach(([id, line, at], i) => {
+      const next = i < CALL.length - 1 ? CALL[i + 1][2] : 26.6;
+      const ko = pr(t, 26.6, .4, E.out);
+      const kk = pr(t, at, .6);
+      st($(id), { op: kk * (1 - ko) * (t < next ? 1 : .55), x: (1 - kk) * 80 + ko * 60, b: (1 - kk) * 10 + ko * 8 });
+      WR[line].hlb.style.opacity = clamp((t - at) / .2) * (t < next ? 1 : 0);
+    });
+    // checkpoints
+    AWAITS.forEach((line, i) => { const at = 27.0 + i * .5; const kk = pr(t, at, .35, E.back);
+      WR[line].cpd.style.opacity = clamp((t - at) / .15); WR[line].cpd.style.transform = `scale(${kk})`;
+      WR[line].hlb.style.opacity = Math.max(+WR[line].hlb.style.opacity || 0, clamp((t - at) / .2) * .9); });
+    wordsIn($('wr-cp'), t, 26.9, .06, .55);
+    // gentle camera drift
+    st(this.cam, { s: 1 + (t - 16) * .002, x: -(t - 16) * 1.2 });
+  },
+  run(t) {
+    rv($('rn-k'), t, 30.05, .5); wordsIn($('rn-h'), t, 30.1, .05, .55);
+    const k = pr(t, 30.0, .8);
+    st($('rn-term'), { op: k, y: (1 - k) * 100, b: (1 - k) * 8, s: 1 - pr(t, 34.4, .6, E.inout) * .03 });
+    termAt(RUN, t);
+    const c = pr(t, 34.4, .7, E.back);
+    const pressK = pr(t, 36.75, .12, E.out) * (1 - pr(t, 36.9, .25, E.out));
+    st($('rn-card'), { op: clamp((t - 34.4) / .25), y: (1 - c) * 120, s: mix(.85, 1, c), rx: (1 - c) * 18 });
+    st($('rn-yes'), { s: 1 - pressK * .08 });
+    const done = t >= 36.85;
+    $('rn-state').textContent = done ? 'APPROVED · RUN RESUMED' : 'SUPPORT-BOT · WAITING FOR YOU';
+    $('rn-state').style.color = done ? 'var(--mint)' : '';
+    $('rn-dot').style.background = done ? 'var(--mint)' : 'var(--y)';
+    $('rn-dot').style.boxShadow = done ? '0 0 14px var(--mint)' : '0 0 14px var(--y)';
+    $('rn-card').style.borderColor = done ? 'rgba(134,239,172,.5)' : '';
+  },
+  recover(t) {
+    const shake = t > 39.0 && t < 39.5 ? Math.sin(t * 190) * 18 * (1 - (t - 39) / .5) : 0;
+    const k = pr(t, 38.0, .5);
+    const dim = pr(t, 39.45, .2) * (1 - pr(t, 40.5, .3));
+    st($('rc-term'), { op: k * (1 - .8 * dim), x: shake, y: (1 - k) * 60, b: dim * 10 });
+    termAt(REC, t);
+    // the crash: earlier rows fade on resume; RGB split on terminal text while glitching
+    const g = t > 39.0 && t < 39.45;
+    $('rc-tb').style.textShadow = g ? `${4 + Math.sin(t * 300) * 6}px 0 rgba(255,0,60,.8), ${-4 - Math.cos(t * 260) * 6}px 0 rgba(0,220,255,.8)` : 'none';
+    const bk = pr(t, 39.55, .4);
+    st($('rc-big'), { op: bk * (1 - pr(t, 40.45, .25, E.out)), s: mix(1.25, 1, bk), b: (1 - bk) * 16 });
+    // dim pre-crash rows after resume begins
+    REC.slice(0, 5).forEach(r => { if (t > 40.7) r.el.style.opacity = .28; });
+    rv($('rc-k'), t, 38.05, .5);
+    wordsIn($('rc-h'), t, 43.2, .06, .55);
+    rv($('rc-sub'), t, 44.0, .6);
+    $('rc-h').style.visibility = t > 43.1 ? 'visible' : 'hidden';
+  },
+  iterate(t) {
+    rv($('it-k'), t, 46.05, .5); wordsIn($('it-h'), t, 46.1, .05, .55);
+    const k = pr(t, 46.0, .8);
+    const ko = pr(t, 50.45, .5, E.inout);
+    st($('it-ed'), { op: k * (1 - ko), x: (1 - k) * -80, y: -ko * 70, s: 1 - ko * .04, b: (1 - k) * 8 + ko * 10 });
+    st($('it-term'), { op: k * (1 - ko), x: (1 - k) * 80, y: ko * 70, s: 1 - ko * .04, b: (1 - k) * 8 + ko * 10 });
+    termAt(ITT, t);
+    // edit: insert text inside the template string, with a selection flash
+    const ins = Math.round(IT_AFTER_INS.length * clamp((t - 48.6) / 1.0));
+    const pos = IT_BEFORE.indexOf('${ticket}`') + '${ticket}'.length;
+    const src = IT_BEFORE.slice(0, pos) + IT_AFTER_INS.slice(0, ins) + IT_BEFORE.slice(pos);
+    IT[1].ct.innerHTML = hl(src);
+    IT[1].hlb.style.opacity = t > 48.4 && t < 50.3 ? .9 : 0;
+    itCaret.style.opacity = t > 48.3 && t < 50.0 ? 1 : 0;
+    itCaret.style.left = (92 + (pos + ins) * CH + 2) + 'px'; itCaret.style.top = (26 + 1 * 42 + 6) + 'px';
+    const bk = pr(t, 49.8, .5, E.back);
+    st($('it-badge'), { op: clamp((t - 49.8) / .2), s: mix(.8, 1, bk), y: (1 - bk) * 20 });
+    // trace
+    const tk = pr(t, 50.8, .7);
+    st($('it-trace'), { op: tk, y: (1 - tk) * 90, b: (1 - tk) * 8 });
+    $('it-line').style.transform = `scaleX(${pr(t, 51.0, 3.0, E.inout)})`;
+    nodeEls.forEach((n, i) => { const kk = pr(t, 51.2 + i * .5, .45, E.back); st(n, { op: clamp((t - 51.2 - i * .5) / .15), s: mix(.5, 1, kk), y: (1 - kk) * 20 }); });
+    const headX = 170 + 4 * 340 * pr(t, 51.2, 2.2, E.inout) - 3 * 340 * pr(t, 54.0, .7, E.inout);
+    $('it-head').style.left = headX + 'px'; $('it-head').style.opacity = clamp((t - 51.2) / .2);
+    const tip = pr(t, 54.5, .5, E.out);
+    st($('it-tip'), { op: tip, y: (1 - tip) * 16 }); $('it-tip').style.left = (170 + 340 - 60) + 'px';
+  },
+  ship(t) {
+    rv($('sh-k'), t, 56.05, .5); wordsIn($('sh-h'), t, 56.1, .05, .55);
+    const k = pr(t, 56.0, .8);
+    st($('sh-term'), { op: k, y: (1 - k) * 90, b: (1 - k) * 8 });
+    const k2 = pr(t, 56.25, .8);
+    st($('sh-ci'), { op: k2, x: (1 - k2) * 90, b: (1 - k2) * 8 });
+    termAt(SHIP, t, 12.6);
+    const pass = t >= 58.4;
+    $('sh-ic').textContent = pass ? '✓' : ['◐', '◓', '◑', '◒'][Math.floor(t * 8) % 4];
+    $('sh-ic').className = pass ? 'mint' : 'muted';
+    $('sh-row').style.background = pass ? 'rgba(134,239,172,.10)' : 'transparent';
+    $('sh-row').style.boxShadow = pass ? 'inset 0 0 0 1px rgba(134,239,172,.35)' : 'none';
+    rv($('sh-pass'), t, 58.45, .55, { dy: 24 });
+    const k3 = pr(t, 58.8, .7);
+    st($('sh-term2'), { op: k3, y: (1 - k3) * 60, b: (1 - k3) * 8 });
+    termAt(SHIP2, t);
+    [...$('sh-chips').children].forEach((c, i) => { const kk = pr(t, 60.3 + i * .3, .5, E.back); st(c, { op: clamp((t - 60.3 - i * .3) / .15), s: mix(.6, 1, kk) }); });
+    st(this.cam, { s: 1 + pr(t, 60.0, 2.0, E.inout) * .06 });
+  },
+  features(t) {
+    const hk = pr(t, 62.0, .6);
+    st($('ft-h'), { op: hk, s: mix(1.15, 1, hk), b: (1 - hk) * 14 });
+    ftEls.forEach((el, i) => { const a = 62.25 + i * .22; const kk = pr(t, a, .6);
+      st(el, { op: kk, y: (1 - kk) * 70, rx: (1 - kk) * 30, s: mix(.9, 1, kk), b: (1 - kk) * 10 }); });
+    st(this.cam, { s: 1.0 + (t - 62) * .006 });
+  },
+  end(t) {
+    const a = 68.0;
+    $('en-bolt').style.strokeDashoffset = 1 - pr(t, a + .05, .6, E.out);
+    const k = pr(t, a, .6);
+    st($('en-wm'), { op: k, s: mix(1.3, 1, k), b: (1 - k) * 20 });
+    wordsIn($('en-tag'), t, a + .8, .08, .6);
+    rv($('en-cmd'), t, a + 1.9, .7);
+    rv($('en-gh'), t, a + 2.4, .7);
+    rv($('en-foot'), t, a + 3.0, .8);
+    const fo = pr(t, 75.0, 1.0, E.inout);
+    $('stage').style.opacity = 1 - fo;
+  },
 };
-const counters = [...document.querySelectorAll('[data-count]')];
-const caps = T.scenes.flatMap(s => s.cues.map(c => ({ a: s.start + c.t, b: s.start + c.t + c.d + 0.25, text: c.text })));
-const capEl = document.getElementById('cap');
-const label = document.getElementById('sceneLabel'), prog = document.getElementById('progress');
-const clamp = x => Math.max(0, Math.min(1, x));
+
+function bg(t) {
+  // three drifting orbs; tint shifts per section (red during the crash)
+  const red = (t > 39.0 && t < 40.6) ? 1 : 0;
+  const o1 = $('o1'), o2 = $('o2'), o3 = $('o3');
+  o1.style.background = red ? '#7f1d1d' : '#FACC15';
+  o2.style.background = red ? '#991b1b' : '#FB923C';
+  o3.style.background = '#3b82f6';
+  const intro = t < 8 ? .45 + .55 * pr(t, 7.6, .4) : 1;
+  st(o1, { op: .22 * intro, x: 200 + Math.sin(t * .23) * 260, y: -150 + Math.cos(t * .19) * 120 });
+  st(o2, { op: .16 * intro, x: 1200 + Math.cos(t * .17) * 240, y: 500 + Math.sin(t * .21) * 160 });
+  st(o3, { op: .10, x: 700 + Math.sin(t * .13 + 2) * 400, y: 650 + Math.cos(t * .11) * 120 });
+  for (const o of [o1, o2, o3]) o.style.filter = 'blur(140px)';
+  $('grain').style.backgroundImage = grains[Math.floor(t * 24) % grains.length];
+  // flashes on drops / crash
+  const fl = Math.max(0, 1 - Math.abs(t - 8.0) / .18) * .9 + Math.max(0, 1 - Math.abs(t - 62.0) / .15) * .5 + Math.max(0, 1 - Math.abs(t - 68.0) / .18) * .6;
+  $('flash').style.opacity = clamp(fl);
+  $('redflash').style.opacity = (t > 39.0 && t < 39.45) ? (.35 + .25 * Math.sin(t * 120)) : 0;
+}
+
 window.setTime = (t) => {
-  for (const a of document.getAnimations()) { a.pause(); a.currentTime = t * 1000; }
-  label.textContent = '';
-  for (const { el, s, inner } of scenes) {
-    const end = s.start + s.dur;
-    const op = clamp((t - s.start) / 0.35) * clamp((end - t) / 0.35);
-    el.style.opacity = op;
-    el.style.visibility = op > 0 ? 'visible' : 'hidden';
-    const k = clamp((t - s.start) / 1.2), e = 1 - Math.pow(1 - k, 3);
-    inner.style.transform = `scale(${(1.025 - 0.025 * e).toFixed(4)})`;
-    if (t >= s.start && t < end) label.textContent = el.dataset.label;
+  bg(t);
+  for (const s of scenes) {
+    const on = t >= s.a && t < s.b;
+    s.el.style.display = on ? 'block' : 'none';
+    if (!on) continue;
+    // cut-in: quick zoom/unblur of the whole scene on its first 0.3s
+    const ci = pr(t, s.a, .32, E.out);
+    s.el.style.transform = `scale(${mix(1.04, 1, ci)})`;
+    s.el.style.filter = ci < .99 && s.a > 0 ? `blur(${(1 - ci) * 6}px)` : 'none';
+    R[s.id].call(s, t);
   }
-  for (const n of counters) {
-    const c = n._count, k = clamp((t - c.at) / c.d), e = 1 - Math.pow(1 - k, 2);
-    n.textContent = fmt(c.from + (c.to - c.from) * e, c.fmt);
-  }
-  const cur = caps.find(c => t >= c.a && t < c.b);
-  const txt = cur ? cur.text : '';
-  if (capEl.textContent !== txt) capEl.textContent = txt;
-  prog.style.width = (100 * t / T.total) + '%';
 };
 window.setTime(0);
 </script>
-</div></body></html>
+</body></html>
