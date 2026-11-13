@@ -919,10 +919,13 @@ fn run_chidori_without_providers(args: &[&str], cwd: &Path) -> Output {
     command.args(args).current_dir(cwd).env("HOME", cwd);
     for key in [
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "CHIDORI_OPENAI_COMPAT_URL",
         "CHIDORI_OPENAI_COMPAT_KEY",
+        "CHIDORI_ANTHROPIC_COMPAT_URL",
+        "CHIDORI_ANTHROPIC_COMPAT_KEY",
         "LITELLM_API_URL",
         "LITELLM_API_KEY",
         "OPENROUTER_API_KEY",

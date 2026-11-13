@@ -33,7 +33,8 @@ it instead:
 export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY, or a compatible endpoint
 ```
 
-Any Anthropic, OpenAI, or OpenAI-compatible provider works — see
+Any Anthropic, OpenAI, Anthropic-compatible, or OpenAI-compatible provider
+works — see
 [Providers & model selection](./host-api.md#providers--model-selection).
 
 > **No key at all?** The hello agent in step 4 runs without one, and so do

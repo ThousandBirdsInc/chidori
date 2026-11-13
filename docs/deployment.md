@@ -77,7 +77,8 @@ start it with `chidori serve --app chidori.app.yml`; see the
 ## Configuration (identical on every host)
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY, or CHIDORI_OPENAI_COMPAT_URL + _KEY (any OpenAI-compatible endpoint)
+ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY, or CHIDORI_OPENAI_COMPAT_URL + _KEY (any OpenAI-compatible endpoint),
+                                    # or CHIDORI_ANTHROPIC_COMPAT_URL + _KEY (any Anthropic-compatible endpoint)
 CHIDORI_API_KEY=<long random>       # bearer auth on everything except GET /health
 CHIDORI_DB_PATH=.chidori/sessions.sqlite3   # session index; this path is the default (`:memory:` opts out)
 CHIDORI_RUN_STORE=sqlite            # journal mirror for a persistent VM whose disk you back up;

@@ -6,9 +6,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use super::rate_limit::RateLimiter;
-use super::{ContentBlock, LlmProvider, LlmRequest, LlmResponse, TokenSink, ToolCall};
+use super::{url_host, ContentBlock, LlmProvider, LlmRequest, LlmResponse, TokenSink, ToolCall};
 
-const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
+pub(crate) const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 pub struct OpenAiProvider {
     api_key: String,
@@ -61,15 +61,6 @@ impl OpenAiProvider {
         self.rate_limiter = Some(Arc::new(RateLimiter::new(rpm)));
         self
     }
-}
-
-/// Best-effort host extraction for error labels; avoids pulling in a URL crate.
-fn url_host(url: &str) -> Option<&str> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let host = rest.split(['/', '?', '#']).next()?;
-    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
-    let host = host.split(':').next().unwrap_or(host);
-    (!host.is_empty()).then_some(host)
 }
 
 #[derive(Deserialize)]
@@ -147,6 +138,10 @@ impl LlmProvider for OpenAiProvider {
                 .any(|p| model.starts_with(p.as_str()));
         }
         model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3")
+    }
+
+    fn label(&self) -> String {
+        self.label.clone()
     }
 
     async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
