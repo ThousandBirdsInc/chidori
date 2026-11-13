@@ -272,6 +272,77 @@ CHIDORI_OPENAI_COMPAT_URL + CHIDORI_OPENAI_COMPAT_KEY at any OpenAI-compatible e
 CHIDORI_ANTHROPIC_COMPAT_KEY at any Anthropic-compatible endpoint (MiniMax, Moonshot, \
 Zhipu, LiteLLM, ...), or run `chidori model-login` to sign in with OpenRouter.";
 
+/// Anthropic's default model when an un-redirected `ANTHROPIC_API_KEY` is
+/// the configured vendor (and the last-resort fallback: OpenRouter's slug
+/// mapping serves it too).
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
+/// OpenAI's default model when an un-redirected `OPENAI_API_KEY` is the
+/// configured vendor.
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4.1";
+
+/// The default model for prompts that don't name one in code.
+///
+/// Resolution order:
+///   1. `CHIDORI_MODEL` (what `--model` sets); `ANTHROPIC_MODEL` and
+///      `OPENAI_MODEL` are accepted as aliases.
+///   2. The configured vendor's own default: `claude-sonnet-4-6` for an
+///      un-redirected `ANTHROPIC_API_KEY`, else `gpt-4.1` for an
+///      un-redirected `OPENAI_API_KEY`. Nothing here assumes one vendor: an
+///      OpenAI-only setup never defaults to a Claude model it can't serve.
+///   3. Otherwise `claude-sonnet-4-6`, which the OpenRouter fallback maps to
+///      its own slug. A redirected or compatible endpoint has a model
+///      namespace of its own, so there is no default to guess for it; it
+///      needs `--model`/`CHIDORI_MODEL`, and we say so once on stderr/tracing
+///      rather than fail silently with the endpoint's 404.
+pub fn default_model() -> String {
+    let lookup = |name: &str| std::env::var(name).ok();
+    let (model, note) = default_model_with(&lookup);
+    if let Some(note) = note {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| tracing::warn!("{note}"));
+    }
+    model
+}
+
+/// [`default_model`] with the environment abstracted for tests. Returns the
+/// model and, when the choice is a guess the configuration can't back, a
+/// one-line note explaining what to set.
+pub(crate) fn default_model_with(env: &dyn Fn(&str) -> Option<String>) -> (String, Option<String>) {
+    if let Some(model) = non_blank(env("CHIDORI_MODEL"))
+        .or_else(|| non_blank(env("ANTHROPIC_MODEL")))
+        .or_else(|| non_blank(env("OPENAI_MODEL")))
+    {
+        return (model, None);
+    }
+    let anthropic_vendor =
+        env("ANTHROPIC_API_KEY").is_some() && non_blank(env("ANTHROPIC_BASE_URL")).is_none();
+    let openai_vendor =
+        env("OPENAI_API_KEY").is_some() && non_blank(env("OPENAI_BASE_URL")).is_none();
+    if anthropic_vendor {
+        return (DEFAULT_ANTHROPIC_MODEL.to_string(), None);
+    }
+    if openai_vendor {
+        return (DEFAULT_OPENAI_MODEL.to_string(), None);
+    }
+    let custom_endpoint = [
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_BASE_URL",
+        "CHIDORI_ANTHROPIC_COMPAT_URL",
+        "CHIDORI_OPENAI_COMPAT_URL",
+        "LITELLM_API_URL",
+    ]
+    .iter()
+    .find_map(|name| non_blank(env(name)).map(|url| (*name, url)));
+    let note = custom_endpoint.map(|(name, url)| {
+        format!(
+            "no default model for the endpoint configured by {name} ({url}); prompts that don't \
+             set `model` in code will request '{DEFAULT_ANTHROPIC_MODEL}'. Set CHIDORI_MODEL \
+             (or pass --model) to a model that endpoint serves."
+        )
+    });
+    (DEFAULT_ANTHROPIC_MODEL.to_string(), note)
+}
+
 /// Registry of LLM providers. Routes requests to the right provider based on model name.
 pub struct ProviderRegistry {
     providers: Vec<Box<dyn LlmProvider>>,
@@ -659,6 +730,80 @@ mod tests {
             Some("localhost")
         );
         assert_eq!(url_host("https://"), None);
+    }
+
+    fn default_model_for(pairs: &[(&str, &str)]) -> (String, Option<String>) {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let lookup = move |name: &str| map.get(name).cloned();
+        default_model_with(&lookup)
+    }
+
+    #[test]
+    fn default_model_follows_the_configured_vendor() {
+        assert_eq!(
+            default_model_for(&[("ANTHROPIC_API_KEY", "a")]),
+            (DEFAULT_ANTHROPIC_MODEL.to_string(), None)
+        );
+        assert_eq!(
+            default_model_for(&[("OPENAI_API_KEY", "o")]),
+            (DEFAULT_OPENAI_MODEL.to_string(), None)
+        );
+        // Both vendors: Anthropic keeps precedence (the historical default).
+        assert_eq!(
+            default_model_for(&[("ANTHROPIC_API_KEY", "a"), ("OPENAI_API_KEY", "o")]).0,
+            DEFAULT_ANTHROPIC_MODEL
+        );
+        // Explicit settings win over any inference; aliases are honored.
+        assert_eq!(
+            default_model_for(&[("OPENAI_API_KEY", "o"), ("CHIDORI_MODEL", "gpt-4o-mini")]).0,
+            "gpt-4o-mini"
+        );
+        assert_eq!(
+            default_model_for(&[("OPENAI_API_KEY", "o"), ("OPENAI_MODEL", "o3")]).0,
+            "o3"
+        );
+        assert_eq!(
+            default_model_for(&[("ANTHROPIC_MODEL", "claude-opus-4-7")]).0,
+            "claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn default_model_warns_when_only_a_custom_endpoint_is_configured() {
+        // A redirected vendor key is not that vendor any more.
+        let (model, note) = default_model_for(&[
+            ("OPENAI_API_KEY", "o"),
+            ("OPENAI_BASE_URL", "https://api.deepseek.com"),
+        ]);
+        assert_eq!(model, DEFAULT_ANTHROPIC_MODEL);
+        let note = note.expect("custom endpoints without CHIDORI_MODEL should warn");
+        assert!(note.contains("OPENAI_BASE_URL") && note.contains("CHIDORI_MODEL"));
+
+        let (_, note) = default_model_for(&[
+            (
+                "CHIDORI_ANTHROPIC_COMPAT_URL",
+                "https://api.minimax.io/anthropic",
+            ),
+            ("CHIDORI_ANTHROPIC_COMPAT_KEY", "k"),
+        ]);
+        assert!(note.unwrap().contains("CHIDORI_ANTHROPIC_COMPAT_URL"));
+
+        // Naming the model silences it.
+        let (model, note) = default_model_for(&[
+            ("CHIDORI_OPENAI_COMPAT_URL", "https://api.deepseek.com"),
+            ("CHIDORI_MODEL", "deepseek-chat"),
+        ]);
+        assert_eq!((model.as_str(), note), ("deepseek-chat", None));
+
+        // Nothing configured at all (OpenRouter / test provider territory):
+        // the generic fallback, no warning.
+        assert_eq!(
+            default_model_for(&[]),
+            (DEFAULT_ANTHROPIC_MODEL.to_string(), None)
+        );
     }
 
     #[test]

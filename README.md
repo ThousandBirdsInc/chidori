@@ -222,9 +222,10 @@ chidori run summarizer.ts \
 
 **Any OpenAI-compatible provider (DeepSeek, Groq, Ollama, vLLM, LiteLLM…).**
 Point Chidori at any endpoint that speaks the OpenAI chat-completions
-protocol, and pick the model with `--model` (or the `CHIDORI_MODEL` env var —
-prompts that don't set `model` in code default to `claude-sonnet-4-6`
-otherwise):
+protocol, and pick the model with `--model` (or the `CHIDORI_MODEL` env var;
+a compatible endpoint has its own model namespace, so there is no default to
+guess — with a plain Anthropic or OpenAI key, unset prompts use that vendor's
+default model instead):
 
 ```bash
 export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com   # /v1 optional

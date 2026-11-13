@@ -102,7 +102,7 @@ up to `maxTurns` — and returns the final text.
 | Option | Meaning |
 |---|---|
 | `type` | Label for streamed prompt output — `"progress"`, `"draft"`, `"subagent"`, `"final"`, … |
-| `model` | Provider model override. Unset prompts use the run's default model (`--model` / `CHIDORI_MODEL`, falling back to `claude-sonnet-4-6`); the resolved default is recorded in the run manifest so `resume`/`branch-rerun` re-run under the same model automatically. Short aliases like `claude-sonnet` resolve to the current canonical id; samples here use canonical ids. |
+| `model` | Provider model override. Unset prompts use the run's default model (`--model` / `CHIDORI_MODEL`, falling back to the configured vendor's own default: `claude-sonnet-4-6` with an Anthropic key, `gpt-4.1` with an OpenAI key); the resolved default is recorded in the run manifest so `resume`/`branch-rerun` re-run under the same model automatically. Short aliases like `claude-sonnet` resolve to the current canonical id; samples here use canonical ids. |
 | `system` | System prompt for this call. |
 | `maxTokens` | Output token cap. Reasoning models spend the same budget on hidden reasoning first — budget generously. A truncated reply prints a warning to stderr. |
 | `maxTurns` | Cap on provider tool-use turns for the built-in tool loop. |
@@ -741,11 +741,18 @@ failed ("Anthropic-compatible endpoint api.minimax.io API error (…)"), so a
 misrouted model is obvious from the message.
 
 The default model for prompts that don't set `model` in code is
-`CHIDORI_MODEL` (or `--model` on `run`/`resume`), falling back to
-`claude-sonnet-4-6`. The resolved default is recorded in each run's
-manifest, so `resume`, `branch-resume`/`branch-rerun`, and server
-resume/replay routes re-run under the run's own model with no flags.
-Detached agents likewise carry their model in their registry descriptor.
+`CHIDORI_MODEL` (or `--model` on `run`/`resume`; `ANTHROPIC_MODEL` and
+`OPENAI_MODEL` are accepted as aliases). Unset, it follows the vendor you
+configured: `claude-sonnet-4-6` with an un-redirected `ANTHROPIC_API_KEY`,
+else `gpt-4.1` with an un-redirected `OPENAI_API_KEY`, else
+`claude-sonnet-4-6` (which the OpenRouter fallback maps to its own slug). A
+redirected or compatible endpoint has a model namespace of its own, so
+there is nothing to guess: set `--model`/`CHIDORI_MODEL`, or the runtime
+warns once and prompts request `claude-sonnet-4-6` from that endpoint. The
+resolved default is recorded in each run's manifest, so `resume`,
+`branch-resume`/`branch-rerun`, and server resume/replay routes re-run
+under the run's own model with no flags. Detached agents likewise carry
+their model in their registry descriptor.
 
 Cost estimation covers Anthropic/OpenAI models out of the box; teach it
 other models with `CHIDORI_PRICING` (JSON, model prefix → USD per MTok):

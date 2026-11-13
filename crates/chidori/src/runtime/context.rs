@@ -567,11 +567,10 @@ pub struct AgentConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        let model = std::env::var("CHIDORI_MODEL")
-            .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
-            .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
         Self {
-            model,
+            // `--model` / CHIDORI_MODEL, else the configured vendor's own
+            // default — never a model the configured provider can't serve.
+            model: crate::providers::default_model(),
             temperature: 0.7,
             max_tokens: 4096,
             max_turns: 10,
