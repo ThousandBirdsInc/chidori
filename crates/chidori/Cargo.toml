@@ -91,7 +91,7 @@ async-trait = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Cron scheduler for recipes
-cron = "0.12"
+cron = "0.17"
 
 # YAML recipe parsing
 serde_yaml = "0.9"
