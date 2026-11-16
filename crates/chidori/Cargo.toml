@@ -79,7 +79,7 @@ sha1 = "0.11"
 # Constant-time comparison for API-key checks (already in-tree via `digest`).
 subtle = "2"
 hmac = "0.13"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 rand = "0.9"
 
