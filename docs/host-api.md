@@ -102,7 +102,7 @@ up to `maxTurns` — and returns the final text.
 | Option | Meaning |
 |---|---|
 | `type` | Label for streamed prompt output — `"progress"`, `"draft"`, `"subagent"`, `"final"`, … |
-| `model` | Provider model override. Unset prompts use the run's default model (`--model` / `CHIDORI_MODEL`, falling back to `claude-sonnet-4-6`); the resolved default is recorded in the run manifest so `resume`/`branch-rerun` re-run under the same model automatically. Short aliases like `claude-sonnet` resolve to the current canonical id; samples here use canonical ids. |
+| `model` | Provider model override. Unset prompts use the run's default model (`--model` / `CHIDORI_MODEL`, falling back to the configured vendor's own default: `claude-sonnet-4-6` with an Anthropic key, `gpt-4.1` with an OpenAI key); the resolved default is recorded in the run manifest so `resume`/`branch-rerun` re-run under the same model automatically. Short aliases like `claude-sonnet` resolve to the current canonical id; samples here use canonical ids. |
 | `system` | System prompt for this call. |
 | `maxTokens` | Output token cap. Reasoning models spend the same budget on hidden reasoning first — budget generously. A truncated reply prints a warning to stderr. |
 | `maxTurns` | Cap on provider tool-use turns for the built-in tool loop. |
@@ -695,22 +695,64 @@ request into an agent event. The endpoint reference lives in
 
 ## Providers & model selection
 
+Chidori speaks both of the two wire formats the industry has settled on —
+the **Anthropic Messages API** shape (`POST /v1/messages`) and the **OpenAI
+chat-completions** shape (`POST /chat/completions`) — and either shape can
+serve any model. Which one a request uses is a deployment choice (which
+endpoint you configured), not a property of the model name: `claude-*`
+through a LiteLLM or Bedrock gateway that exposes OpenAI's shape works, and
+so does `gpt-*` or `MiniMax-M2` through an Anthropic-shaped proxy.
+
 Providers register from environment variables (all can coexist; requests
 route by model name, first match wins):
 
-| Variable | Provider |
-|---|---|
-| `ANTHROPIC_API_KEY` | Anthropic (`claude-*` models). |
-| `OPENAI_API_KEY` | OpenAI; `OPENAI_BASE_URL` redirects it at any OpenAI-compatible endpoint and widens it to match all model names. |
-| `CHIDORI_OPENAI_COMPAT_URL` + `CHIDORI_OPENAI_COMPAT_KEY` | Any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, LiteLLM…), matching all model names. `/v1` and bare hosts both work. |
-| `chidori model-login` | Zero-setup OpenRouter fallback. |
+| Variable | Shape | Provider |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Anthropic | Anthropic (`claude-*` models). `ANTHROPIC_BASE_URL` (the official SDKs' convention) redirects it at any Anthropic-compatible endpoint and widens it to match all model names. |
+| `CHIDORI_ANTHROPIC_COMPAT_URL` + `CHIDORI_ANTHROPIC_COMPAT_KEY` | Anthropic | Any endpoint speaking the Messages API (MiniMax, Moonshot/Kimi, Zhipu GLM, DeepSeek's Anthropic endpoint, LiteLLM, Bedrock/Vertex gateways…), matching all model names. The base URL may be bare, end in `/v1`, or be the full `/v1/messages`. |
+| `OPENAI_API_KEY` | OpenAI | OpenAI (`gpt-*`, `o1*`, `o3*`); `OPENAI_BASE_URL` redirects it at any OpenAI-compatible endpoint and widens it to match all model names. |
+| `CHIDORI_OPENAI_COMPAT_URL` + `CHIDORI_OPENAI_COMPAT_KEY` | OpenAI | Any OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, LiteLLM…), matching all model names. `/v1` and bare hosts both work. |
+| `chidori model-login` | OpenAI | Zero-setup OpenRouter fallback, always last. |
+
+A redirected or compatible endpoint matches every model name because its
+model namespace is its own. When two such catch-alls are configured (say an
+Anthropic-shaped MiniMax endpoint and an OpenAI-shaped DeepSeek one), narrow
+either with a comma-separated list of model-name prefixes:
+`CHIDORI_ANTHROPIC_MODELS`, `CHIDORI_ANTHROPIC_COMPAT_MODELS`,
+`CHIDORI_OPENAI_MODELS`, `CHIDORI_OPENAI_COMPAT_MODELS`. Providers with an
+explicit namespace (a prefix list, or an un-redirected vendor key's own
+`claude-*` / `gpt-*` names) are always consulted before catch-alls, so
+`ANTHROPIC_BASE_URL` pointed at a Claude gateway never steals `gpt-4o` from
+a plain `OPENAI_API_KEY`:
+
+```bash
+export CHIDORI_ANTHROPIC_COMPAT_URL=https://api.minimax.io/anthropic   # Anthropic shape
+export CHIDORI_ANTHROPIC_COMPAT_KEY=...
+export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com              # OpenAI shape
+export CHIDORI_OPENAI_COMPAT_KEY=sk-...
+export CHIDORI_OPENAI_COMPAT_MODELS=deepseek   # deepseek-* → DeepSeek; everything else → MiniMax
+```
+
+Per-provider request pacing: `CHIDORI_ANTHROPIC_RPM`,
+`CHIDORI_ANTHROPIC_COMPAT_RPM`, `CHIDORI_OPENAI_RPM`,
+`CHIDORI_OPENAI_COMPAT_RPM`, `CHIDORI_OPENROUTER_RPM` (requests per minute;
+unset means no client-side limit). Errors name the endpoint that actually
+failed ("Anthropic-compatible endpoint api.minimax.io API error (…)"), so a
+misrouted model is obvious from the message.
 
 The default model for prompts that don't set `model` in code is
-`CHIDORI_MODEL` (or `--model` on `run`/`resume`), falling back to
-`claude-sonnet-4-6`. The resolved default is recorded in each run's
-manifest, so `resume`, `branch-resume`/`branch-rerun`, and server
-resume/replay routes re-run under the run's own model with no flags.
-Detached agents likewise carry their model in their registry descriptor.
+`CHIDORI_MODEL` (or `--model` on `run`/`resume`; `ANTHROPIC_MODEL` and
+`OPENAI_MODEL` are accepted as aliases). Unset, it follows the vendor you
+configured: `claude-sonnet-4-6` with an un-redirected `ANTHROPIC_API_KEY`,
+else `gpt-4.1` with an un-redirected `OPENAI_API_KEY`, else
+`claude-sonnet-4-6` (which the OpenRouter fallback maps to its own slug). A
+redirected or compatible endpoint has a model namespace of its own, so
+there is nothing to guess: set `--model`/`CHIDORI_MODEL`, or the runtime
+warns once and prompts request `claude-sonnet-4-6` from that endpoint. The
+resolved default is recorded in each run's manifest, so `resume`,
+`branch-resume`/`branch-rerun`, and server resume/replay routes re-run
+under the run's own model with no flags. Detached agents likewise carry
+their model in their registry descriptor.
 
 Cost estimation covers Anthropic/OpenAI models out of the box; teach it
 other models with `CHIDORI_PRICING` (JSON, model prefix → USD per MTok):

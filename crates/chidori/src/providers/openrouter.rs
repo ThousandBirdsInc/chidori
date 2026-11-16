@@ -66,6 +66,10 @@ impl LlmProvider for OpenRouterProvider {
         true
     }
 
+    fn label(&self) -> String {
+        "OpenRouter".to_string()
+    }
+
     async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
         let mut req = request.clone();
         req.model = to_openrouter_slug(&request.model);

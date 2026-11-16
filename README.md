@@ -222,9 +222,10 @@ chidori run summarizer.ts \
 
 **Any OpenAI-compatible provider (DeepSeek, Groq, Ollama, vLLM, LiteLLM…).**
 Point Chidori at any endpoint that speaks the OpenAI chat-completions
-protocol, and pick the model with `--model` (or the `CHIDORI_MODEL` env var —
-prompts that don't set `model` in code default to `claude-sonnet-4-6`
-otherwise):
+protocol, and pick the model with `--model` (or the `CHIDORI_MODEL` env var;
+a compatible endpoint has its own model namespace, so there is no default to
+guess — with a plain Anthropic or OpenAI key, unset prompts use that vendor's
+default model instead):
 
 ```bash
 export CHIDORI_OPENAI_COMPAT_URL=https://api.deepseek.com   # /v1 optional
@@ -236,6 +237,23 @@ chidori run summarizer.ts --model deepseek-chat \
 `OPENAI_BASE_URL` (alongside `OPENAI_API_KEY`) works too, and
 `LITELLM_API_URL`/`LITELLM_API_KEY` remain as legacy aliases of the
 `CHIDORI_OPENAI_COMPAT_*` pair.
+
+**Any Anthropic-compatible provider (MiniMax, Moonshot/Kimi, Zhipu GLM, a
+LiteLLM proxy, a Bedrock/Vertex gateway…).** The same goes for endpoints that
+speak the Anthropic Messages API shape — both wire formats are first-class,
+and either can serve any model:
+
+```bash
+export CHIDORI_ANTHROPIC_COMPAT_URL=https://api.minimax.io/anthropic   # /v1 optional
+export CHIDORI_ANTHROPIC_COMPAT_KEY=...
+chidori run summarizer.ts --model MiniMax-M2 \
+  --input document="Rust is a systems programming language..."
+```
+
+`ANTHROPIC_BASE_URL` (alongside `ANTHROPIC_API_KEY`) works too. Running
+both shapes side by side? See
+[Providers & model selection](./docs/host-api.md#providers--model-selection)
+for pinning model prefixes to an endpoint.
 
 `chidori run` **asks before powerful effects by default**: tool calls, network
 access (`chidori.fetch`), and workspace writes pause for a one-keypress

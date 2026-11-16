@@ -322,6 +322,10 @@ Set one provider environment variable before runs that call the model:
 - `CHIDORI_OPENAI_COMPAT_URL` + `CHIDORI_OPENAI_COMPAT_KEY` for any
   OpenAI-compatible endpoint (DeepSeek, Groq, Ollama, vLLM, a LiteLLM
   proxy…) — pick the model with `--model` or `CHIDORI_MODEL`.
+- `CHIDORI_ANTHROPIC_COMPAT_URL` + `CHIDORI_ANTHROPIC_COMPAT_KEY` for any
+  endpoint speaking the Anthropic Messages API (MiniMax, Moonshot/Kimi,
+  Zhipu GLM, a LiteLLM proxy, a Bedrock/Vertex gateway…). `ANTHROPIC_BASE_URL`
+  alongside `ANTHROPIC_API_KEY` works too.
 
 No key handy? Run `chidori model-login` to sign in with OpenRouter in your browser.
 Chidori exchanges the sign-in for a user-scoped key (saved to

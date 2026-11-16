@@ -7,9 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::rate_limit::RateLimiter;
-use super::{CacheTtl, ContentBlock, LlmProvider, LlmRequest, LlmResponse, TokenSink, ToolCall};
+use super::{
+    url_host, CacheTtl, ContentBlock, LlmProvider, LlmRequest, LlmResponse, TokenSink, ToolCall,
+};
 
-const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+pub(crate) const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Beta header required for the extended (1h) cache TTL; only sent when a
 /// breakpoint actually requests it.
@@ -17,18 +19,59 @@ const ANTHROPIC_EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 /// Anthropic allows at most 4 cache breakpoints per request.
 const ANTHROPIC_MAX_CACHE_BREAKPOINTS: usize = 4;
 
+/// A provider speaking the Anthropic Messages API shape (`POST /v1/messages`,
+/// `x-api-key` + `anthropic-version` headers, block-based content, SSE
+/// `content_block_delta` streaming). Targets api.anthropic.com by default, but
+/// the same wire format is served by a growing set of other vendors and
+/// proxies (MiniMax, Moonshot/Kimi, Zhipu GLM, DeepSeek's Anthropic endpoint,
+/// LiteLLM, Bedrock/Vertex gateways…), so the endpoint and the model
+/// namespace it claims are both configurable — mirroring
+/// [`super::openai::OpenAiProvider`] for the OpenAI chat-completions shape.
 pub struct AnthropicProvider {
     api_key: String,
+    base_url: String,
     client: Client,
+    /// Model name prefixes this provider handles. Empty means the default
+    /// Anthropic namespace (`claude*`); a single empty-string prefix matches
+    /// every model (catch-all for a redirected/compatible endpoint).
+    model_prefixes: Vec<String>,
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// Display name used in error messages: "Anthropic" for the real
+    /// endpoint, otherwise "Anthropic-compatible endpoint <host>" so a
+    /// failure is attributed to the provider the user actually configured.
+    label: String,
 }
 
 impl AnthropicProvider {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
+            base_url: ANTHROPIC_API_URL.to_string(),
             client: Client::new(),
+            model_prefixes: Vec::new(),
             rate_limiter: None,
+            label: "Anthropic".to_string(),
+        }
+    }
+
+    /// Create a provider pointing at any endpoint that speaks the Anthropic
+    /// Messages API. `base_url` must be the full `/v1/messages` URL (see
+    /// [`super::messages_url`] for normalizing a user-supplied base). An empty
+    /// `model_prefixes` keeps the default `claude*` matching.
+    pub fn with_base_url(api_key: String, base_url: String, model_prefixes: Vec<String>) -> Self {
+        let label = match url_host(&base_url) {
+            Some(host) if host != "api.anthropic.com" => {
+                format!("Anthropic-compatible endpoint {host}")
+            }
+            _ => "Anthropic".to_string(),
+        };
+        Self {
+            api_key,
+            base_url,
+            client: Client::new(),
+            model_prefixes,
+            rate_limiter: None,
+            label,
         }
     }
 
@@ -217,7 +260,17 @@ pub(crate) fn resolve_alias(model: &str) -> &str {
 #[async_trait::async_trait]
 impl LlmProvider for AnthropicProvider {
     fn supports_model(&self, model: &str) -> bool {
+        if !self.model_prefixes.is_empty() {
+            return self
+                .model_prefixes
+                .iter()
+                .any(|p| model.starts_with(p.as_str()));
+        }
         model.starts_with("claude")
+    }
+
+    fn label(&self) -> String {
+        self.label.clone()
     }
 
     async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
@@ -231,7 +284,7 @@ impl LlmProvider for AnthropicProvider {
 
             let mut req = self
                 .client
-                .post(ANTHROPIC_API_URL)
+                .post(&self.base_url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json");
@@ -242,17 +295,17 @@ impl LlmProvider for AnthropicProvider {
                 .json(&body)
                 .send()
                 .await
-                .context("Failed to send request to Anthropic API")?;
+                .with_context(|| format!("Failed to send request to {}", self.base_url))?;
 
             let status = resp.status();
 
             if status.as_u16() == 429 {
                 attempt += 1;
                 if attempt >= 8 {
-                    bail!("Anthropic rate limit: exceeded max retries after 429");
+                    bail!("{} rate limit: exceeded max retries after 429", self.label);
                 }
                 let wait = retry_after_duration(resp.headers(), attempt);
-                tracing::warn!(attempt, ?wait, "Anthropic 429 — backing off");
+                tracing::warn!(attempt, ?wait, "{} 429 — backing off", self.label);
                 tokio::time::sleep(wait).await;
                 continue;
             }
@@ -260,16 +313,21 @@ impl LlmProvider for AnthropicProvider {
             let resp_text = resp
                 .text()
                 .await
-                .context("Failed to read Anthropic response")?;
+                .with_context(|| format!("Failed to read {} response", self.label))?;
             if !status.is_success() {
                 if let Ok(err) = serde_json::from_str::<AnthropicError>(&resp_text) {
-                    bail!("Anthropic API error ({}): {}", status, err.error.message);
+                    bail!(
+                        "{} API error ({}): {}",
+                        self.label,
+                        status,
+                        err.error.message
+                    );
                 }
-                bail!("Anthropic API error ({}): {}", status, resp_text);
+                bail!("{} API error ({}): {}", self.label, status, resp_text);
             }
 
-            let parsed: AnthropicResponseBody =
-                serde_json::from_str(&resp_text).context("Failed to parse Anthropic response")?;
+            let parsed: AnthropicResponseBody = serde_json::from_str(&resp_text)
+                .with_context(|| format!("Failed to parse {} response", self.label))?;
 
             let mut text_parts = Vec::new();
             let mut tool_calls = Vec::new();
@@ -329,7 +387,7 @@ impl LlmProvider for AnthropicProvider {
                 }
                 let mut req = self
                     .client
-                    .post(ANTHROPIC_API_URL)
+                    .post(&self.base_url)
                     .header("x-api-key", &self.api_key)
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     .header("content-type", "application/json")
@@ -341,15 +399,15 @@ impl LlmProvider for AnthropicProvider {
                     .json(&body)
                     .send()
                     .await
-                    .context("streaming request to Anthropic")?;
+                    .with_context(|| format!("streaming request to {}", self.base_url))?;
 
                 if r.status().as_u16() == 429 {
                     attempt += 1;
                     if attempt >= 8 {
-                        bail!("Anthropic rate limit: exceeded max retries after 429");
+                        bail!("{} rate limit: exceeded max retries after 429", self.label);
                     }
                     let wait = retry_after_duration(r.headers(), attempt);
-                    tracing::warn!(attempt, ?wait, "Anthropic 429 (stream) — backing off");
+                    tracing::warn!(attempt, ?wait, "{} 429 (stream) — backing off", self.label);
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -361,7 +419,7 @@ impl LlmProvider for AnthropicProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            bail!("Anthropic stream error ({}): {}", status, text);
+            bail!("{} stream error ({}): {}", self.label, status, text);
         }
 
         // Accumulators for the final response. Text chunks land in
@@ -385,7 +443,7 @@ impl LlmProvider for AnthropicProvider {
         let mut buffer = String::new();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("reading Anthropic stream")?;
+            let chunk = chunk.with_context(|| format!("reading {} stream", self.label))?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             // SSE frames are separated by \n\n. Drain complete frames and
@@ -670,6 +728,110 @@ mod tests {
             })
             .collect();
         assert_eq!(marked, vec![false, true, true]);
+    }
+
+    /// Spin up a local server speaking the Anthropic Messages shape and drive
+    /// a provider pointed at it, proving the shape is endpoint-agnostic: the
+    /// request lands on the configured URL with the Anthropic headers, and
+    /// both the JSON and SSE response forms parse into the same `LlmResponse`.
+    #[tokio::test]
+    async fn compatible_endpoint_receives_anthropic_shape_and_parses_both_response_forms() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct Seen {
+            headers: Arc<Mutex<Vec<(String, String)>>>,
+            bodies: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn messages(
+            State(seen): State<Seen>,
+            headers: axum::http::HeaderMap,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            seen.headers.lock().unwrap().extend(
+                headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string())),
+            );
+            let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+            seen.bodies.lock().unwrap().push(body);
+            if stream {
+                let frames = [
+                    r#"{"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":0}}}"#,
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}"#,
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}"#,
+                    r#"{"type":"content_block_stop","index":0}"#,
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+                    r#"{"type":"message_stop"}"#,
+                ];
+                let sse: String = frames
+                    .iter()
+                    .map(|f| format!("event: x\ndata: {f}\n\n"))
+                    .collect();
+                ([("content-type", "text/event-stream")], sse).into_response()
+            } else {
+                Json(json!({
+                    "content": [{ "type": "text", "text": "hello" }],
+                    "stop_reason": "end_turn",
+                    "usage": { "input_tokens": 7, "output_tokens": 2 }
+                }))
+                .into_response()
+            }
+        }
+
+        let seen = Seen::default();
+        let app = Router::new()
+            .route("/anthropic/v1/messages", post(messages))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = AnthropicProvider::with_base_url(
+            "test-key".to_string(),
+            super::super::messages_url(format!("http://{addr}/anthropic")),
+            vec![String::new()],
+        );
+        assert!(provider.supports_model("MiniMax-M2"));
+        assert_eq!(provider.label(), "Anthropic-compatible endpoint 127.0.0.1");
+
+        let mut request = base_request();
+        request.model = "MiniMax-M2".to_string();
+
+        let sent = provider.send(&request).await.unwrap();
+        assert_eq!(sent.content, "hello");
+        assert_eq!(sent.stop_reason, "end_turn");
+        assert_eq!((sent.input_tokens, sent.output_tokens), (7, 2));
+
+        let deltas = Arc::new(Mutex::new(String::new()));
+        let sink_deltas = Arc::clone(&deltas);
+        let mut sink: TokenSink = Box::new(move |d: &str| sink_deltas.lock().unwrap().push_str(d));
+        let streamed = provider.stream(&request, &mut sink).await.unwrap();
+        assert_eq!(*deltas.lock().unwrap(), "hello");
+        assert_eq!(streamed.content, "hello");
+        assert_eq!((streamed.input_tokens, streamed.output_tokens), (7, 2));
+
+        let headers = seen.headers.lock().unwrap();
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "x-api-key" && v == "test-key"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "anthropic-version" && v == ANTHROPIC_VERSION));
+        let bodies = seen.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        for body in bodies.iter() {
+            // Non-Anthropic model ids pass through untouched (no alias
+            // mapping), with the Messages-shape fields.
+            assert_eq!(body["model"], json!("MiniMax-M2"));
+            assert_eq!(body["system"], json!("be brief"));
+            assert_eq!(body["tools"][0]["input_schema"]["type"], json!("object"));
+            assert_eq!(body["messages"][0]["content"][0]["type"], json!("text"));
+        }
     }
 
     #[test]

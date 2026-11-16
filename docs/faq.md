@@ -25,11 +25,14 @@ verification ([Package Management](./package-management.md)).
 
 ### Which model providers work?
 
-Anthropic (`ANTHROPIC_API_KEY`), OpenAI (`OPENAI_API_KEY`, redirectable
-via `OPENAI_BASE_URL`), any OpenAI-compatible endpoint — DeepSeek, Groq,
-Ollama, vLLM, LiteLLM — via `CHIDORI_OPENAI_COMPAT_URL`, and a zero-setup
-OpenRouter fallback via `chidori model-login`. All can coexist; requests
-route by model name. Details:
+Anthropic (`ANTHROPIC_API_KEY`, redirectable via `ANTHROPIC_BASE_URL`),
+OpenAI (`OPENAI_API_KEY`, redirectable via `OPENAI_BASE_URL`), any
+OpenAI-compatible endpoint — DeepSeek, Groq, Ollama, vLLM, LiteLLM — via
+`CHIDORI_OPENAI_COMPAT_URL`, any Anthropic-compatible endpoint — MiniMax,
+Moonshot/Kimi, Zhipu GLM, LiteLLM, Bedrock/Vertex gateways — via
+`CHIDORI_ANTHROPIC_COMPAT_URL`, and a zero-setup OpenRouter fallback via
+`chidori model-login`. Both API shapes are first-class and either can serve
+any model. All can coexist; requests route by model name. Details:
 [Providers & model selection](./host-api.md#providers--model-selection).
 
 ### How is this different from graph frameworks (LangGraph-style) or durable execution engines (Temporal-style)?
