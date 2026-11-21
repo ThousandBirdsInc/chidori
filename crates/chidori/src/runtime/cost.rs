@@ -1,9 +1,12 @@
-/// Rough cost estimation for LLM calls.
+/// Cost estimation for LLM calls.
 ///
-/// Prices are USD per 1M tokens and matched by model-name prefix. They are
-/// deliberately approximate — the goal is a ballpark figure for the trace
-/// output and the `stats` command, not a billing-grade number. Update the
-/// table as new models ship.
+/// Built-in prices come from the `llm-prices` crate: provider list prices in
+/// USD per 1M tokens, each row citing the provider's pricing page and the date
+/// it was checked, with the provider's own cache-read and cache-write rates.
+/// Dated and provider-prefixed ids (`claude-sonnet-4-5-20250929`,
+/// `anthropic/claude-opus-4.1`) resolve to their base model. Ids it does not
+/// know (retired Claude 3 models, custom names) fall back to the prefix table
+/// below.
 ///
 /// Models the built-in table doesn't know (or knows wrong) can be priced via
 /// `CHIDORI_PRICING` — a JSON object of model prefix → per-MTok rates that is
@@ -181,6 +184,33 @@ const PRICING: &[Pricing] = &[
     },
 ];
 
+/// List price of one call from the built-in table, or `None` when the model is
+/// not in it (or the table lists no input/output price for it).
+fn list_price_cost(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+) -> Option<f64> {
+    let price = llm_prices::lookup(model)?;
+    // Anthropic bills 5-minute cache writes at their own rate. Providers that
+    // list no write rate (OpenAI, Gemini) bill those tokens as ordinary input.
+    let (cache_write_5m, written_as_input) = if price.cache_write("5m").is_some() {
+        (cache_creation_tokens, 0)
+    } else {
+        (0, cache_creation_tokens)
+    };
+    let usage = llm_prices::Usage {
+        input: input_tokens.saturating_add(written_as_input),
+        output: output_tokens,
+        cache_read: cache_read_tokens,
+        cache_write_5m,
+        ..Default::default()
+    };
+    price.cost_usage(&usage).map(|c| c.total)
+}
+
 /// Prompt-cache price multipliers relative to the base input rate. Anthropic
 /// bills cache writes at 1.25x and reads at 0.1x base input; OpenAI has no
 /// separate write charge and bills cached reads at 0.5x. Matched by model
@@ -198,7 +228,9 @@ fn cache_multipliers(model: &str) -> (f64, f64) {
 /// free" from "$0 because unpriced" — an unpriced model's cost is unknown,
 /// not zero.
 pub fn is_priced_model(model: &str) -> bool {
-    user_pricing_for(model).is_some() || PRICING.iter().any(|p| model.starts_with(p.prefix))
+    user_pricing_for(model).is_some()
+        || llm_prices::lookup(model).is_some_and(|p| p.input.is_some() && p.output.is_some())
+        || PRICING.iter().any(|p| model.starts_with(p.prefix))
 }
 
 /// Estimate USD cost for a single LLM call. Returns 0.0 for unknown models
@@ -217,20 +249,31 @@ pub fn estimate_cost_usd_with_cache(
     cache_creation_tokens: u64,
     cache_read_tokens: u64,
 ) -> f64 {
-    let (input_per_mtok, output_per_mtok, write_mult, read_mult) =
-        if let Some(user) = user_pricing_for(model) {
-            (
-                user.input_per_mtok,
-                user.output_per_mtok,
-                user.cache_write_multiplier.unwrap_or(1.0),
-                user.cache_read_multiplier.unwrap_or(0.5),
-            )
-        } else if let Some(p) = PRICING.iter().find(|p| model.starts_with(p.prefix)) {
-            let (write_mult, read_mult) = cache_multipliers(model);
-            (p.input_per_mtok, p.output_per_mtok, write_mult, read_mult)
-        } else {
-            return 0.0;
-        };
+    let user = user_pricing_for(model);
+    if user.is_none() {
+        if let Some(cost) = list_price_cost(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        ) {
+            return cost;
+        }
+    }
+    let (input_per_mtok, output_per_mtok, write_mult, read_mult) = if let Some(user) = user {
+        (
+            user.input_per_mtok,
+            user.output_per_mtok,
+            user.cache_write_multiplier.unwrap_or(1.0),
+            user.cache_read_multiplier.unwrap_or(0.5),
+        )
+    } else if let Some(p) = PRICING.iter().find(|p| model.starts_with(p.prefix)) {
+        let (write_mult, read_mult) = cache_multipliers(model);
+        (p.input_per_mtok, p.output_per_mtok, write_mult, read_mult)
+    } else {
+        return 0.0;
+    };
     let input = (input_tokens as f64 / 1_000_000.0) * input_per_mtok;
     let cache_write = (cache_creation_tokens as f64 / 1_000_000.0) * input_per_mtok * write_mult;
     let cache_read = (cache_read_tokens as f64 / 1_000_000.0) * input_per_mtok * read_mult;
@@ -258,7 +301,39 @@ mod tests {
     fn test_is_priced_model_distinguishes_unknown_from_free() {
         assert!(is_priced_model("claude-sonnet-4-6"));
         assert!(is_priced_model("gpt-4o"));
-        assert!(!is_priced_model("deepseek-v4-flash"));
+        assert!(!is_priced_model("my-local-finetune"));
+    }
+
+    #[test]
+    fn test_current_models_bill_at_their_own_list_price() {
+        // Opus 4.5 and later list at $5/$25, not the Opus 4/4.1 rate of $15/$75.
+        let opus = estimate_cost_usd("claude-opus-4-5-20251101", 1_000_000, 1_000_000);
+        assert!((opus - 30.0).abs() < 0.001, "opus 4.5 cost was {opus}");
+        let opus_41 = estimate_cost_usd("claude-opus-4-1-20250805", 1_000_000, 1_000_000);
+        assert!(
+            (opus_41 - 90.0).abs() < 0.001,
+            "opus 4.1 cost was {opus_41}"
+        );
+        // Haiku 4.5 is $1/$5, not Haiku 3.5's $0.80/$4.
+        let haiku = estimate_cost_usd("claude-haiku-4-5", 1_000_000, 1_000_000);
+        assert!((haiku - 6.0).abs() < 0.001, "haiku 4.5 cost was {haiku}");
+        // gpt-5-mini is $0.25/$2; a `gpt` catch-all would bill it at $2.50/$10.
+        let mini = estimate_cost_usd("gpt-5-mini", 1_000_000, 1_000_000);
+        assert!((mini - 2.25).abs() < 0.001, "gpt-5-mini cost was {mini}");
+        // o3 is $2/$8 since the June 2025 price cut.
+        let o3 = estimate_cost_usd("o3", 1_000_000, 1_000_000);
+        assert!((o3 - 10.0).abs() < 0.001, "o3 cost was {o3}");
+    }
+
+    #[test]
+    fn test_models_missing_from_list_prices_keep_the_prefix_table() {
+        // Retired Claude 3.5 Sonnet is not in llm-prices; the old table still prices it.
+        let cost = estimate_cost_usd("claude-3-5-sonnet-20241022", 1_000_000, 1_000_000);
+        assert!(
+            (cost - 18.0).abs() < 0.001,
+            "claude-3-5-sonnet cost was {cost}"
+        );
+        assert!(is_priced_model("deepseek-v4-flash"));
     }
 
     #[test]
